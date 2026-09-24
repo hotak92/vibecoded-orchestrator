@@ -385,13 +385,13 @@ impl Db {
         let guard = self.lock();
         let mut stmt = match guard.prepare(
             "SELECT key FROM secret_active_state
-              WHERE scope = 'shared' AND project_id = '_user_shared_' AND module_id = 'user'
+              WHERE scope = 'shared' AND project_id = ?1 AND module_id = 'user'
               ORDER BY key ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        let rows = match stmt.query_map([crate::secrets::SENTINEL_SHARED], |r| r.get::<_, String>(0)) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
@@ -417,13 +417,13 @@ impl Db {
         let guard = self.lock();
         let mut stmt = match guard.prepare(
             "SELECT key FROM secret_active_state
-              WHERE scope = 'global' AND project_id = '_global_' AND module_id = 'user'
+              WHERE scope = 'global' AND project_id = ?1 AND module_id = 'user'
               ORDER BY key ASC",
         ) {
             Ok(s) => s,
             Err(_) => return Vec::new(),
         };
-        let rows = match stmt.query_map([], |r| r.get::<_, String>(0)) {
+        let rows = match stmt.query_map([crate::secrets::SENTINEL_GLOBAL], |r| r.get::<_, String>(0)) {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
@@ -952,7 +952,7 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
             own_db,
             &shared_keys,
             "shared",
-            "_user_shared_",
+            crate::secrets::SENTINEL_SHARED,
             requester_project_id,
             &mut out,
             &mut degraded,
@@ -962,7 +962,7 @@ pub fn resolve_active_user_secret_pairs_for_requester_with_degraded(
         own_db,
         &global_keys,
         "global",
-        "_global_",
+        crate::secrets::SENTINEL_GLOBAL,
         requester_project_id,
         &mut out,
         &mut degraded,

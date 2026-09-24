@@ -309,6 +309,16 @@ pub fn shutdown_keychain_connection() {
     crate::secrets_ss_connection::shutdown();
 }
 
+/// The `project_id` slot of a `shared`-scope secret — in the keychain
+/// (`SecretScope::Shared { project_id: SENTINEL_SHARED }` →
+/// `vct._user_shared_.shared.<module>`) and in `secret_active_state`. THE one
+/// definition (R7b F15: until v0.2.97 seven files each declared their own
+/// copy); every writer and reader imports it from here.
+pub const SENTINEL_SHARED: &str = "_user_shared_";
+/// The `project_id` slot of a `global`-scope secret in `secret_active_state`
+/// (the keychain's `Global` scope carries no project). The one definition.
+pub const SENTINEL_GLOBAL: &str = "_global_";
+
 #[derive(Debug, Clone, Copy)]
 pub enum SecretScope<'a> {
     /// Per-project secret: one value per (project, module).

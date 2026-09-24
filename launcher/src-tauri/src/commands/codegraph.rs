@@ -178,11 +178,8 @@ pub async fn codegraph_summary(
         .get_project(&target_project_id)?
         .ok_or_else(|| format!("target project {} not found", target_project_id))?;
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
     let base = resolve_weaviate_url(&db);
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10))?;
 
     let project_tag = &target.name; // codegraph entities are tagged by project name
 
@@ -308,11 +305,8 @@ pub async fn codegraph_load_graph(
     let project_tag = target.name.replace('"', "\\\"");
 
     let limit_each = max_nodes.unwrap_or(120).min(500);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
     let base = resolve_weaviate_url(&db);
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(15))?;
 
     let mut nodes: Vec<CgVizNode> = Vec::new();
     let mut name_to_id: std::collections::HashMap<String, String> =
@@ -501,11 +495,8 @@ pub async fn codegraph_set_entity_access_bulk(
         _ => vec![],
     };
 
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
     let base = resolve_weaviate_url(&db);
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(15))?;
 
     let mut succeeded = 0usize;
     let mut failures: Vec<EntityBulkFailure> = Vec::new();

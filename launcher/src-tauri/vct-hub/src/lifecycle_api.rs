@@ -194,6 +194,7 @@ fn canonical_service_skeletons(db: &Db) -> Vec<ServiceRuntimeState> {
         container_name: None,
         zombie: false,
         pending_choice: false,
+        hand_to_vco_offered: false,
     });
     out
 }

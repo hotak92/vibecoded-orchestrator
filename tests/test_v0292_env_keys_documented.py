@@ -262,6 +262,7 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCO_HUB_STATE": "session-start-ensure-hub hook plumbing",
     "VCO_PROGRESS_STREAM": "install.py machine-readable progress channel for the launcher GUI",
     "VCO_RUNTIME": "container-hook plumbing (resolved runtime handoff)",
+    "VCO_SESSION_LOCK_HELD": "container-hook plumbing: `service_lifecycle with-session-lock` sets it for the hook it re-runs under the session lock (R7a F10)",
     "VCO_RUNTIME_REASON": "container-hook plumbing (runtime decision provenance)",
     "VCO_RUNTIME_REQUESTED": "container-hook plumbing (requested-runtime handoff)",
     "VCO_RUNTIME_STATE": "container-hook plumbing (runtime state handoff)",
@@ -318,6 +319,9 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCO_LC_ON_STOPPED": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
     "VCO_LC_ON_ZOMBIE": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
     "VCO_LC_SERVICE": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_WEAVIATE_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
+    "VCO_OLLAMA_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
+    "VCO_CODE_EMBED_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
     # --- v0.2.97 SE-3: caller → boot-wrapper handoffs (the launcher, the hub
     # --- watchdog and the session hook set them for ONE wrapper run; the
     # --- same kind of plumbing as VCT_STACK_WORKING_DIR).

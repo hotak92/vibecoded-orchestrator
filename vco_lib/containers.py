@@ -83,6 +83,7 @@ __all__ = [
     "canonical_name",
     "all_known_names",
     "find_existing_container",
+    "classify_container_probe",
     "UnknownServiceError",
     "ComposeIdentity",
     "compose_project_name",
@@ -95,6 +96,11 @@ __all__ = [
     "RESOLVE_EXIT_CODES",
     "runtime_preference_from_env",
     "runtime_candidate_order",
+    "runtime_pin",
+    "read_runtime_txt",
+    "runtime_txt_path",
+    "PIN_VIA_ENV",
+    "PIN_VIA_RUNTIME_TXT",
     "installed_runtime",
     "binary_works",
     "daemon_responsive",
@@ -192,24 +198,30 @@ def all_known_names(service: str) -> list[str]:
     return out
 
 
-def _resolve_runtime(runtime: str) -> Optional[str]:
-    """Resolve the runtime hint to an executable on PATH.
+def _resolve_runtime(runtime: str, install_root: object = None) -> Optional[str]:
+    """The runtime a container LOOKUP uses — THE pin rule (:func:`runtime_pin`:
+    ``VCT_CONTAINER_RUNTIME`` → ``state/install/runtime.txt`` → auto).
 
-    The ``VCT_CONTAINER_RUNTIME`` env var overrides the caller-passed
-    default (matching install.py's contract). Recognised values are
-    ``podman``, ``docker``, and ``auto`` (or unset). ``auto`` triggers
-    podman-first probing. Unknown values are ignored and we fall through
-    to the caller-passed default.
+    * Pinned: the pinned runtime when its binary is on PATH, else ``None`` —
+      never the other runtime. Podman and Docker keep separate containers and
+      volumes; answering "found" from the runtime the user did NOT pin names a
+      container next to empty volumes (plan invariants I1/I2), so a pinned
+      runtime that is missing means "not found".
+    * Unpinned: the caller's ``runtime`` when on PATH, else the other one
+      (auto-detection); an unknown ``runtime`` probes podman first.
 
-    Returns the actual executable name (``podman`` or ``docker``) that
-    is present on PATH, or ``None`` if neither is available.
+    ``install_root`` is the root whose runtime.txt :func:`runtime_pin` reads;
+    ``None`` (the default) resolves it the default way.
+
+    Returns the executable name (``podman`` / ``docker``) or ``None``.
     """
-    # Unrecognised env values fall through to the caller's default without
-    # a warning: this helper runs on hot probe paths (v0.2.92: same parser
-    # as `resolve()`, `warn` silenced).
-    pref = runtime_preference_from_env(warn=lambda _m: None)
-    effective = pref if pref is not None else (runtime or "podman").strip().lower()
+    pin = runtime_pin(install_root=_DEFAULT_ROOT if install_root is None else install_root,
+                      warn=lambda _m: None)
+    if pin is not None:
+        pinned = pin[0]
+        return pinned if shutil.which(pinned) else None
 
+    effective = (runtime or "podman").strip().lower()
     if effective not in ("podman", "docker"):
         # Caller passed something weird. Probe both in podman-first order.
         for candidate in ("podman", "docker"):
@@ -220,7 +232,7 @@ def _resolve_runtime(runtime: str) -> Optional[str]:
     if shutil.which(effective):
         return effective
 
-    # Effective choice missing — probe the other.
+    # Unpinned and the caller's choice is missing — auto-detect the other.
     other = "docker" if effective == "podman" else "podman"
     if shutil.which(other):
         return other
@@ -228,52 +240,95 @@ def _resolve_runtime(runtime: str) -> Optional[str]:
 
 
 def find_existing_container(
-    service: str, runtime: str = "podman",
+    service: str, runtime: str = "podman", *, install_root: object = None,
 ) -> Optional[str]:
     """Return the first container name from ``all_known_names(service)``
     that actually exists on the user's host, or ``None`` if none do.
 
-    Uses ``<runtime> container exists <name>`` which returns exit 0 when
-    the container exists (running OR stopped) and non-zero otherwise.
-    Read-only probe; never mutates state.
+    Uses ``<runtime> container inspect --format '{{.Name}}' <name>`` —
+    exit 0 means the container exists (running OR stopped), a non-zero
+    exit with a "no such" stderr means it does not, and any OTHER
+    non-zero exit is an error (:func:`classify_container_probe`). Docker
+    has no ``container exists`` subcommand (podman-only), so the old
+    ``container exists`` probe answered "not found" for EVERY Docker
+    lookup. Read-only probe; never mutates state.
 
-    Runtime selection follows the same contract as install.py:
-      * ``VCT_CONTAINER_RUNTIME`` env var (if set to ``podman`` or
-        ``docker``) wins over the ``runtime`` argument.
-      * ``runtime="podman"`` (default) is used when the env is unset or
-        set to ``auto``.
-      * If the chosen runtime isn't on PATH, the function probes the
-        OTHER runtime as a fallback before giving up.
+    Runtime selection is THE pin rule (:func:`runtime_pin`, via
+    :func:`_resolve_runtime`):
+      * pinned (``VCT_CONTAINER_RUNTIME=podman|docker``, else the runtime
+        ``state/install/runtime.txt`` records) — only that runtime is asked;
+        when it is missing or down the answer is ``None``, never a container
+        of the OTHER runtime (its containers sit on other volumes);
+      * unpinned — the ``runtime`` argument (default podman), and the other
+        runtime only when that one is not on PATH.
+    ``install_root`` is passed to :func:`runtime_pin` (``None`` = resolve it
+    the default way).
 
     Returns ``None`` when:
-      * Neither podman nor docker is on PATH.
-      * The runtime is present but ``<runtime> container exists`` fails
-        for every alias.
+      * The pinned runtime is missing, or its ``container inspect``
+        probe fails (e.g. the daemon is down) for every alias.
+      * Unpinned and neither podman nor docker is on PATH.
+      * The runtime is present but no alias's probe answers "exists".
       * ``service`` is not in the canonical registry — but in that case
         we raise ``UnknownServiceError`` instead of silently returning
         None, because a typo in the service name is a programming error,
         not a runtime condition.
+
+    A probe error (non-zero exit that is NOT a "no such" message —
+    daemon down, CLI failure) is soft-failed like a timeout, never
+    recorded as "not found": the two are different answers, exactly as
+    :class:`RuntimeState` keeps ABSENT and UNKNOWN apart.
     """
     # Validate first; bad service names are programmer errors.
     _validate_service(service)
 
-    bin_name = _resolve_runtime(runtime)
+    bin_name = _resolve_runtime(runtime, install_root)
     if bin_name is None:
         return None
 
     for name in all_known_names(service):
         try:
             res = subprocess.run(
-                [bin_name, "container", "exists", name],
+                [bin_name, "container", "inspect",
+                 "--format", "{{.Name}}", name],
                 capture_output=True, text=True, timeout=10,
             )
         except (subprocess.TimeoutExpired, OSError):
             # Don't let a single hung/missing probe poison the whole
             # search — try the next alias.
             continue
-        if res.returncode == 0:
+        if classify_container_probe(res) == "exists":
             return name
     return None
+
+
+#: How a failed ``container inspect`` says "no such container". Podman
+#: prints ``Error: no such container <name>``; Docker prints
+#: ``Error: No such container: <name>`` (and ``no such object`` for
+#: API-level misses). Case-insensitive on stderr+stdout so either
+#: runtime's phrasing matches.
+_NO_SUCH_CONTAINER_RE = re.compile(r"no such (?:container|object)", re.IGNORECASE)
+
+
+def classify_container_probe(
+    res: "subprocess.CompletedProcess[str]",
+) -> str:
+    """Classify a ``<runtime> container inspect`` probe result:
+    ``"exists"`` / ``"not_found"`` / ``"error"``.
+
+    * exit 0 → ``"exists"`` (running OR stopped — inspect reports both).
+    * non-zero exit whose stderr/stdout says "no such container/object"
+      → ``"not_found"`` — a POSITIVE answer that the name is absent.
+    * any other non-zero exit → ``"error"`` — the probe could not run
+      (daemon down, CLI failure); the name's absence is UNKNOWN, and
+      callers must not fold it into ``"not_found"``.
+    """
+    if res.returncode == 0:
+        return "exists"
+    blob = f"{res.stderr or ''}\n{res.stdout or ''}"
+    if _NO_SUCH_CONTAINER_RE.search(blob):
+        return "not_found"
+    return "error"
 
 # ===========================================================================
 # Compose identity — which compose project created a running container
@@ -501,6 +556,10 @@ class RuntimeResolution:
     #: preference). A PIN IS HONOURED OR REFUSED, never quietly swapped —
     #: see the ruling in :func:`resolve`.
     requested: Optional[str] = None
+    #: WHICH channel pinned ``requested``: :data:`PIN_VIA_ENV` or
+    #: :data:`PIN_VIA_RUNTIME_TXT` (``None`` = no pin). R7b F5: the install's
+    #: record is a pin on every surface, so a refusal must say which knob.
+    requested_via: Optional[str] = None
     #: Whether the pinned runtime's binary is on PATH at all. Splits "you
     #: pinned podman and it is not installed" (install it, or repin) from
     #: "you pinned podman and it is installed but down" (start it) — two
@@ -548,6 +607,72 @@ def runtime_preference_from_env(
     return None
 
 
+#: The two pin channels, named the way the Rust mirror names them
+#: (``container_runtime.rs::RuntimePinSource::label``).
+PIN_VIA_ENV = "VCT_CONTAINER_RUNTIME"
+PIN_VIA_RUNTIME_TXT = "state/install/runtime.txt"
+
+#: "Resolve the install root the default way" — distinct from ``None``, which
+#: a caller passes to say "there is no install root, so no runtime.txt".
+_DEFAULT_ROOT: object = object()
+
+
+def runtime_txt_path(install_root: Path) -> Path:
+    """``<install_root>/state/install/runtime.txt`` — written by install.py
+    ``_persist_runtime_txt`` with the runtime the install put the data on."""
+    return Path(install_root) / "state" / "install" / "runtime.txt"
+
+
+def read_runtime_txt(install_root: Optional[Path]) -> Optional[str]:
+    """The recorded runtime (``podman`` / ``docker``), or ``None`` when there
+    is no install root, no file, an unreadable file or an unknown token.
+    MUST MATCH ``container_runtime.rs::read_runtime_txt``."""
+    if install_root is None:
+        return None
+    try:
+        token = runtime_txt_path(install_root).read_text(encoding="utf-8").strip().lower()
+    except (OSError, ValueError):
+        return None
+    return token if token in RUNTIME_CANDIDATES else None
+
+
+def runtime_pin(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    install_root: object = _DEFAULT_ROOT,
+    warn: Optional[WarnFn] = None,
+) -> Optional[tuple[str, str, Optional[Path]]]:
+    """THE pin rule (R7b F5, owner ruling): ``VCT_CONTAINER_RUNTIME`` →
+    ``state/install/runtime.txt`` → no pin. Returns ``(runtime, via, file)``
+    — ``via`` is :data:`PIN_VIA_ENV` or :data:`PIN_VIA_RUNTIME_TXT` and
+    ``file`` the runtime.txt path for the latter — or ``None`` (auto-detect).
+
+    Every surface applies this same precedence: this module (the session-start
+    hooks, install.py, the doctor), ``services/runtime.rs`` (the launcher's
+    infra stack), ``container_runtime.rs`` (module containers, storage and
+    volumes — ``runtime_candidate_order`` / ``pinned_runtime``) and the hub
+    supervisor. Before v0.2.97 only the last two read runtime.txt, so a machine
+    whose install recorded docker had its stack brought up under podman by the
+    hooks while the storage page migrated the docker copies.
+
+    ``install_root`` defaults to :func:`vco_lib.python_exe.resolve_install_root`
+    (the clone this vco_lib belongs to); pass ``None`` for "no install root".
+    """
+    pref = runtime_preference_from_env(env, warn=warn)
+    if pref is not None:
+        return pref, PIN_VIA_ENV, None
+    if install_root is _DEFAULT_ROOT:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415 — stdlib-light, lazy
+
+        root: Optional[Path] = resolve_install_root()
+    else:
+        root = Path(install_root) if install_root is not None else None  # type: ignore[arg-type]
+    recorded = read_runtime_txt(root)
+    if recorded is not None and root is not None:
+        return recorded, PIN_VIA_RUNTIME_TXT, runtime_txt_path(root)
+    return None
+
+
 def runtime_candidate_order(preference: Optional[str]) -> list[str]:
     """A PIN IS THE WHOLE ORDER; no preference means the canonical order.
 
@@ -564,11 +689,14 @@ def runtime_candidate_order(preference: Optional[str]) -> list[str]:
 
 def installed_runtime(
     *, env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
+    install_root: object = _DEFAULT_ROOT,
 ) -> str:
     """The FIRST candidate binary on PATH regardless of whether its daemon
-    runs (env preference wins when installed). ``""`` when none is."""
+    runs (the pinned runtime — :func:`runtime_pin` — wins when installed).
+    ``""`` when none is."""
     _which = which or shutil.which
-    pref = runtime_preference_from_env(env, warn=lambda _m: None)
+    pin = runtime_pin(env, install_root=install_root, warn=lambda _m: None)
+    pref = pin[0] if pin is not None else None
     if pref is not None and _which(pref):
         return pref
     for cmd in RUNTIME_CANDIDATES:
@@ -716,17 +844,30 @@ def _evaluate_candidate(
 
 def _pin_refusal_reason(
     pref: str, pinned: _CandidateProbe, alternative: Optional[str],
+    *, via: str = PIN_VIA_ENV, recorded_file: Optional[Path] = None,
 ) -> str:
-    """The actionable hint a refused pin carries — names what was pinned,
-    why it is unusable, whether the other runtime IS usable, and the two
-    things the user can do about it."""
-    head = f"VCT_CONTAINER_RUNTIME={pref} is set but {pinned.why}"
+    """The actionable hint a refused pin carries — names what was pinned and
+    through WHICH channel, why it is unusable, whether the other runtime IS
+    usable, and the two things the user can do about it. Shaped like
+    ``container_runtime.rs::module_runtime_pin_refusal``."""
+    if via == PIN_VIA_RUNTIME_TXT:
+        where = str(recorded_file) if recorded_file is not None else PIN_VIA_RUNTIME_TXT
+        head = (
+            f"the install recorded {pref} as this machine's container runtime "
+            f"({where}) but {pinned.why}"
+        )
+        repin = (
+            f"set VCT_CONTAINER_RUNTIME={alternative} to override the record, or "
+            f"write `{alternative}` into {where}"
+        ) if alternative else ""
+    else:
+        head = f"VCT_CONTAINER_RUNTIME={pref} is set but {pinned.why}"
+        repin = f"unset VCT_CONTAINER_RUNTIME / set it to {alternative}"
     if alternative:
         return (
             f"{head}; {alternative} is usable but VCO will NOT drive it for you "
             f"(podman and docker have SEPARATE named volumes, so the stack would "
-            f"come up EMPTY on the other one) — start {pref}, or unset "
-            f"VCT_CONTAINER_RUNTIME / set it to {alternative}"
+            f"come up EMPTY on the other one) — start {pref}, or {repin}"
         )
     other = next(c for c in RUNTIME_CANDIDATES if c != pref)
     return (
@@ -744,6 +885,7 @@ def resolve(
     probe_daemon: bool = True,
     probe_compose: bool = True,
     home: Optional[Path] = None,
+    install_root: object = _DEFAULT_ROOT,
 ) -> RuntimeResolution:
     """Resolve the container runtime the caller should drive.
 
@@ -756,8 +898,9 @@ def resolve(
     RESOLVED with ``compose=None`` so an installer can print the real
     compose error instead of "no runtime".
 
-    ``VCT_CONTAINER_RUNTIME`` PINS the runtime: the candidate order becomes
-    that runtime alone, and a pinned runtime that is unusable is a REFUSAL
+    The PIN (:func:`runtime_pin`: ``VCT_CONTAINER_RUNTIME``, else the
+    install's ``state/install/runtime.txt`` under ``install_root``) makes the
+    candidate order that runtime alone, and a pinned runtime that is unusable is a REFUSAL
     (``ABSENT``) carrying ``requested`` / ``requested_installed`` /
     ``alternative_usable`` and an actionable ``reason`` — never a silent (or
     even a loud) fall-through to the other runtime.
@@ -783,8 +926,10 @@ def resolve(
     _which = which or shutil.which
     _run = run or subprocess.run
     _warn = warn or _default_warn
-    pref = runtime_preference_from_env(env, warn=warn)
-    installed = installed_runtime(env=env, which=_which) or None
+    pin = runtime_pin(env, install_root=install_root, warn=warn)
+    pref = pin[0] if pin is not None else None
+    via = pin[1] if pin is not None else None
+    installed = installed_runtime(env=env, which=_which, install_root=install_root) or None
 
     def _probe_one(candidate: str) -> _CandidateProbe:
         return _evaluate_candidate(
@@ -795,7 +940,7 @@ def resolve(
     def _resolved(candidate: str, p: _CandidateProbe) -> RuntimeResolution:
         return RuntimeResolution(
             RuntimeState.RESOLVED, candidate, installed, p.compose,
-            p.compose_form, p.daemon, p.why, requested=pref,
+            p.compose_form, p.daemon, p.why, requested=pref, requested_via=via,
             requested_installed=pref is not None and probes[pref].status != "missing",
             # Computed, not hardcoded: with a one-element pinned order this
             # can no longer be True, and the fixture asserts that on every row.
@@ -825,7 +970,7 @@ def resolve(
             RuntimeState.UNKNOWN, None, installed, None, None, None,
             "a runtime probe timed out or could not be spawned — could not "
             "determine whether a container runtime is usable",
-            requested=pref,
+            requested=pref, requested_via=via,
             requested_installed=pref is not None and probes[pref].status != "missing",
         )
     if pref is not None:
@@ -834,12 +979,15 @@ def resolve(
         # difference between "start podman" and "install a runtime".
         other = next(c for c in RUNTIME_CANDIDATES if c != pref)
         alternative = other if _probe_one(other).status == "usable" else None
-        reason = _pin_refusal_reason(pref, probes[pref], alternative)
+        reason = _pin_refusal_reason(
+            pref, probes[pref], alternative,
+            via=via or PIN_VIA_ENV, recorded_file=pin[2] if pin is not None else None,
+        )
         _warn(reason)
         return RuntimeResolution(
             RuntimeState.ABSENT, None, installed, None, None,
             False if probes[pref].status == "refused" else None,
-            reason, requested=pref,
+            reason, requested=pref, requested_via=via,
             requested_installed=probes[pref].status != "missing",
             alternative_usable=alternative,
         )
@@ -940,6 +1088,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print("VCO_COMPOSE_ARGV=(" + " ".join(shlex.quote(a) for a in argv) + ")")
             print(f"VCO_RUNTIME_REASON={shlex.quote(res.reason)}")
             print(f"VCO_RUNTIME_REQUESTED={shlex.quote(res.requested or '')}")
+            print(f"VCO_RUNTIME_REQUESTED_VIA={shlex.quote(res.requested_via or '')}")
             # These two have NO consumer today, and that is deliberate rather
             # than unwired: `--shell` and `--json` carry the SAME facts, so a
             # hook that wants to BRANCH on "is the other runtime usable?" can,

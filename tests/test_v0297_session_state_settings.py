@@ -134,6 +134,57 @@ def test_the_manifest_defaults_are_what_the_hook_applies() -> None:
 
 PWSH = shutil.which("pwsh")
 
+_MANIFEST_SETTINGS = json.loads(
+    (REPO / "launcher" / "bundled_manifests" / "vct-session-state.json").read_text()
+)["settings"]
+
+
+def _bound_cases(setting: dict) -> list[tuple[str, int]]:
+    """(value, what the hook must apply) at and around the manifest's bounds."""
+    lo, hi, default = setting["min"], setting["max"], setting["default"]
+    return [(str(lo - 1), default), (str(lo), lo), (str(hi), hi), (str(hi + 1), default), ("", default)]
+
+
+def _extract(source: str, pattern: str) -> str:
+    match = re.search(pattern, source, re.S | re.M)
+    assert match, pattern
+    return match.group(0)
+
+
+@pytest.mark.parametrize("setting", _MANIFEST_SETTINGS, ids=[s["key"] for s in _MANIFEST_SETTINGS])
+def test_the_bash_hook_applies_the_manifests_bounds(setting: dict) -> None:
+    """R7b F12: the hook's range check is the manifest's ``min``/``max`` — run
+    the hook's own ``resolve_threshold`` at and around them. Raise the
+    manifest ``max`` and the launcher accepts a value this hook would
+    silently ignore; this goes red instead."""
+    fn = _extract(HOOK.read_text(), r"^resolve_threshold\(\) \{\n.*?^\}\n")
+    for value, want in _bound_cases(setting):
+        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), setting["key"]: value}
+        snippet = f'RESOLVED_SETTINGS=""\n{fn}resolve_threshold {setting["key"]} {setting["default"]}\n'
+        done = subprocess.run([str(BASH), "-c", snippet], env=env, capture_output=True, text=True, timeout=30)
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == str(want), (setting["key"], value, done.stdout)
+
+
+@pytest.mark.skipif(PWSH is None, reason="PowerShell sibling needs pwsh")
+@pytest.mark.parametrize("setting", _MANIFEST_SETTINGS, ids=[s["key"] for s in _MANIFEST_SETTINGS])
+def test_the_powershell_hook_applies_the_manifests_bounds(setting: dict, tmp_path: Path) -> None:
+    fn = _extract(HOOK.with_suffix(".ps1").read_text(encoding="utf-8-sig"),
+                  r"^function Resolve-Threshold \{\n.*?^\}\n")
+    lib = tmp_path / "lib.ps1"
+    lib.write_text("$ResolvedSettings = @{}\n" + fn, encoding="utf-8")
+    for value, want in _bound_cases(setting):
+        env = {k: v for k, v in os.environ.items() if k != setting["key"]}
+        if value:
+            env[setting["key"]] = value
+        done = subprocess.run(
+            [str(PWSH), "-NoProfile", "-NonInteractive", "-Command",
+             f'. "{lib}"; Resolve-Threshold -Key "{setting["key"]}" -Default {setting["default"]}'],
+            env=env, capture_output=True, text=True, timeout=60,
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == str(want), (setting["key"], value, done.stdout)
+
 
 @pytest.mark.skipif(PWSH is None, reason="PowerShell sibling needs pwsh")
 def test_the_powershell_sibling_resolves_the_same_way(tmp_path: Path) -> None:

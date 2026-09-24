@@ -1088,7 +1088,14 @@ mod tests {
         assert_eq!(resp.status(), 204, "body: {:?}", resp.text().await);
 
         let after = std::fs::read_to_string(&settings_path).unwrap();
-        assert_eq!(after, before, "re-enable via HTTP restores the exact original bytes");
+        // Byte-for-byte, except the deliberate v0.2.97 change: a VCO-shipped
+        // hook parked in the RELATIVE form comes back anchored at the project
+        // root (`vco_lib.hooks_settings.insert_hook`).
+        assert_eq!(
+            after,
+            before.replace(r#""bash .claude/hooks/notify-stop.sh""#, r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#),
+            "re-enable via HTTP restores the original bytes, the hook path anchored"
+        );
     }
 
     /// Leave-alone: an unknown `hook_id` for a real project must 404 with a

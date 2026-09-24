@@ -161,6 +161,10 @@ def test_vct_get_miss_points_at_resolver_when_hub_has_key(vct_env, tmp_path):
     state_dir = tmp_path / "vct-state"
     env = dict(vct_env)
     env["VCT_STATE_DIR"] = str(state_dir)
+    # conftest pins VCT_HUB_PORT=9 suite-wide (never the real hub); a VALID
+    # pin wins over hub.port in `vct`'s `_hub_port`, so drop it here or the
+    # stub's hub.port is never consulted and the probe reads port 9.
+    env.pop("VCT_HUB_PORT", None)
     with _stub_hub(state_dir, has_key=True):
         cp = _vct(env, "get", "--project", "myproj", "--key", "MYGUIKEY", "--trusted")
     assert cp.returncode == 2, cp.stderr
@@ -176,6 +180,7 @@ def test_vct_get_miss_unchanged_when_hub_lacks_key(vct_env, tmp_path):
     state_dir = tmp_path / "vct-state"
     env = dict(vct_env)
     env["VCT_STATE_DIR"] = str(state_dir)
+    env.pop("VCT_HUB_PORT", None)  # stub hub.port must win over the conftest pin
     with _stub_hub(state_dir, has_key=False):
         cp = _vct(env, "get", "--project", "myproj", "--key", "NOSUCH", "--trusted")
     assert cp.returncode == 2, cp.stderr
@@ -189,6 +194,7 @@ def test_vct_get_miss_unchanged_when_hub_down(vct_env, tmp_path):
     state_dir = tmp_path / "vct-state"
     env = dict(vct_env)
     env["VCT_STATE_DIR"] = str(state_dir)
+    env.pop("VCT_HUB_PORT", None)  # exercise the dead hub.port file below, not the conftest pin
     # Point at a closed port so the probe fails fast (curl connection refused).
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / "hub.port").write_text("9")  # unlikely-to-listen low port

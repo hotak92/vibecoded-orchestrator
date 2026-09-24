@@ -131,7 +131,7 @@ import os
 import re
 import sys
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
 from vco_lib import jsonc_edit
 from vco_lib.atomic import atomic_write_text
@@ -216,21 +216,29 @@ def invoked_script_tokens(command: str) -> Iterator[str]:
         return
     norm = command.replace("\\", "/").replace('"', " ").replace("'", " ")
     tokens = norm.split()
-    if not tokens:
-        return
+    for index in _anchor_indices(tokens):
+        yield tokens[index]
 
+
+def _anchor_indices(tokens: Sequence[str]) -> Iterator[int]:
+    """The anchor walk behind :func:`invoked_script_tokens`, over a token list
+    — the indices of the tokens at an invocation anchor. Empty tokens are
+    skipped (:func:`anchor_hook_command` walks a whitespace-preserving split,
+    which yields one when the command starts with whitespace)."""
     at_command_start = True
     expect_script_value = False  # set after a -File/-Command flag
-    for tok in tokens:
+    for index, tok in enumerate(tokens):
+        if not tok:
+            continue
         low = tok.lower()
         if expect_script_value:
             # This token is the explicit script value of -File/-Command.
-            yield tok
+            yield index
             expect_script_value = False
             at_command_start = False
             continue
         if at_command_start:
-            yield tok
+            yield index
             if low in INTERPRETER_TOKENS:
                 # The NEXT token is the script this interpreter runs.
                 continue
@@ -246,6 +254,98 @@ def invoked_script_tokens(command: str) -> Iterator[str]:
             expect_script_value = True
             continue
         # Plain argument — never an invocation.
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# Anchoring hook paths at the project root (v0.2.97)
+# ═══════════════════════════════════════════════════════════════════════
+
+#: Claude Code's "project root where the session started". It substitutes
+#: this placeholder in a hook's ``command`` AND exports it as an environment
+#: variable, so the double-quoted shell form below resolves either way: where
+#: Claude Code substitutes it the shell sees a literal quoted path; where it
+#: only exports it, ``sh`` / Git Bash expand ``${CLAUDE_PROJECT_DIR}`` inside
+#: the double quotes. The quotes keep a project path with spaces one argument.
+PROJECT_DIR_PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
+
+#: An INVOKED hook script under the project's ``.claude/hooks/`` — relative
+#: (``.claude/hooks/x.sh``, ``./.claude/hooks/x.sh``) or already anchored at
+#: the project root (``$CLAUDE_PROJECT_DIR/…``, ``${CLAUDE_PROJECT_DIR}/…``),
+#: after quote-stripping and ``\`` → ``/``. The group is the basename.
+_PROJECT_HOOK_SCRIPT_RE = re.compile(
+    r"^(?:\./|\$CLAUDE_PROJECT_DIR/|\$\{CLAUDE_PROJECT_DIR\}/)?"
+    r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$"
+)
+
+
+def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -> str:
+    """``command`` with every INVOKED project hook script anchored at the
+    project root: ``.claude/hooks/x.sh`` → ``"${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"``.
+
+    Why (v0.2.97): Claude Code runs a hook command in the session's CURRENT
+    directory, and that follows ``cd`` and worktrees. Every hook VCO shipped
+    was ``bash .claude/hooks/x.sh`` (or ``… -File .claude/hooks/x.ps1``), so
+    once a session's cwd moved every one of them failed with "No such file or
+    directory". Anchored at ``${CLAUDE_PROJECT_DIR}`` they resolve from
+    anywhere; at the session's starting directory the two forms name the same
+    file, so the rewrite changes nothing else.
+
+    Only tokens at an invocation anchor (the same walk as
+    :func:`invoked_script_tokens`) are rewritten — a hook path that is an
+    ARGUMENT (``bash wrap.sh --target .claude/hooks/x.sh``) is left alone —
+    and everything else in the command (interpreter, flags, trailing
+    arguments, whitespace) is kept byte-for-byte. An already-anchored token is
+    normalised to the one quoted form, so the result is idempotent. ``only``
+    limits the rewrite to those script basenames (the hooks VCO ships).
+    """
+    if not isinstance(command, str) or not command:
+        return command
+    allowed = None if only is None else set(only)
+    pieces = re.split(r"(\s+)", command)
+    tokens = pieces[0::2]
+    norm = [t.replace("\\", "/").strip("\"'") for t in tokens]
+    changed = False
+    for index in _anchor_indices(norm):
+        match = _PROJECT_HOOK_SCRIPT_RE.match(norm[index])
+        if match is None or (allowed is not None and match.group(1) not in allowed):
+            continue
+        anchored = f'"{PROJECT_DIR_PLACEHOLDER}/.claude/hooks/{match.group(1)}"'
+        if tokens[index] != anchored:
+            tokens[index] = anchored
+            changed = True
+    if not changed:
+        return command
+    pieces[0::2] = tokens
+    return "".join(pieces)
+
+
+def shipped_hook_scripts(install_root: Optional[Path] = None) -> Optional[set]:
+    """The ``.claude/hooks/<name>`` basenames VCO's settings templates
+    register (both OS flavours), read from the orchestrator clone — or
+    ``None`` when the templates cannot be read (the caller then anchors
+    nothing: a user's own hook is never rewritten on a guess)."""
+    from vco_lib.hook_retirements import vco_hook_script_identity  # noqa: PLC0415 — import cycle
+    from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+    root = install_root if install_root is not None else resolve_install_root()
+    if root is None:
+        return None
+    names: set = set()
+    for flavour in ("linux", "windows"):
+        path = Path(root) / "templates" / f"settings.json.{flavour}.template"
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        for groups in (data.get("hooks") or {}).values():
+            for group in groups if isinstance(groups, list) else []:
+                for item in (group.get("hooks") or []) if isinstance(group, dict) else []:
+                    ident = vco_hook_script_identity(item.get("command") or "") if isinstance(item, dict) else None
+                    if ident:
+                        names.add(ident)
+    return names
+
+
 
 
 # Script-looking tokens we are willing to seed a starter file for. A hook
@@ -274,6 +374,13 @@ def extract_hook_script_path(command: str) -> Optional[str]:
         low = tok.lower()
         if not low.endswith(_STARTER_SUFFIXES):
             continue
+        # v0.2.97: the project-root-anchored form VCO ships and suggests
+        # (`bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`) names the same
+        # project-relative script.
+        for prefix in (PROJECT_DIR_PLACEHOLDER + "/", "$CLAUDE_PROJECT_DIR/"):
+            if tok.startswith(prefix):
+                tok = tok[len(prefix):]
+                break
         if not _SAFE_REL_TOKEN_RE.match(tok):
             return None
         if ".." in tok.split("/"):
@@ -699,13 +806,22 @@ def _locate(
     doc: SettingsDoc, event: str, matcher: str, command: str
 ) -> Optional[Tuple[int, int]]:
     """Return ``(group_index, hook_index)`` of the first inner item
-    matching the natural key, or ``None``."""
+    matching the natural key, or ``None``.
+
+    An exact command match wins. Failing that (v0.2.97), the ONE item under
+    the event + matcher whose command is the same registration in another
+    spelling (:func:`vco_lib.hook_retirements.hook_command_key` — the relative
+    ``.claude/hooks/`` form a launcher DB mirror row still holds vs the
+    ``${CLAUDE_PROJECT_DIR}``-anchored form a bundle update wrote, or the
+    pre-v0.2.97 guard prefix). More than one such item is ambiguous and
+    matches nothing."""
     hooks = doc.data.get("hooks")
     if not isinstance(hooks, dict):
         return None
     groups = hooks.get(event)
     if not isinstance(groups, list):
         return None
+    candidates: List[Tuple[int, int, str]] = []
     for g_idx, group in enumerate(groups):
         if not isinstance(group, dict) or normalize_matcher(group) != matcher:
             continue
@@ -713,9 +829,18 @@ def _locate(
         if not isinstance(inner, list):
             continue
         for h_idx, item in enumerate(inner):
-            if isinstance(item, dict) and item.get("command") == command:
+            other = item.get("command") if isinstance(item, dict) else None
+            if other == command:
                 return g_idx, h_idx
-    return None
+            if isinstance(other, str) and other:
+                candidates.append((g_idx, h_idx, other))
+    if not isinstance(command, str) or not command or not candidates:
+        return None
+    from vco_lib.hook_retirements import hook_command_key  # noqa: PLC0415 — import cycle
+
+    key = hook_command_key(command)
+    same = [(g, h) for g, h, other in candidates if hook_command_key(other) == key]
+    return same[0] if len(same) == 1 else None
 
 
 def remove_hook(
@@ -809,8 +934,22 @@ def _hook_present_in_another_form(
     return False
 
 
-def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
+def insert_hook(
+    doc: SettingsDoc,
+    parked: Dict[str, Any],
+    *,
+    anchor_scripts: Optional[Iterable[str]] = None,
+) -> bool:
     """Restore a parked entry. Returns ``True`` when the document changed.
+
+    ``anchor_scripts`` (v0.2.97): the ``.claude/hooks/`` script basenames VCO
+    ships (:func:`shipped_hook_scripts`). A parked entry for one of THOSE that
+    still invokes it by the relative path every release before v0.2.97 wrote
+    is restored ANCHORED at ``${CLAUDE_PROJECT_DIR}``
+    (:func:`anchor_hook_command`) — the form the bundle update now writes —
+    rather than as the relative command, which fails as soon as the session's
+    cwd moves. Everything else in the parked item is restored verbatim, and a
+    user's own hook is never rewritten.
 
     Position is honoured when it still makes sense and clamped otherwise.
     When the disable left the group in place, the recorded group is
@@ -857,6 +996,12 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     raw_matcher = parked.get("matcher")
     matcher = raw_matcher if isinstance(raw_matcher, str) else ""
     command = item.get("command")
+    if anchor_scripts is not None and isinstance(command, str) and command:
+        anchored = anchor_hook_command(command, only=anchor_scripts)
+        if anchored != command:
+            item = dict(item)
+            item["command"] = anchored
+            command = anchored
 
     # F7 (v0.2.95). A parked entry OUTLIVES the thing it restores.
     #
@@ -1161,23 +1306,41 @@ def _emit(payload: Dict[str, Any]) -> None:
 
 
 def _cmd_list(args: argparse.Namespace) -> int:
+    from vco_lib.hook_retirements import hook_command_key  # noqa: PLC0415 — import cycle
+
     path = _settings_path(args)
     doc = load_settings(path)
     entries, skipped = list_hooks(doc)
-    _emit(
-        {
-            "ok": True,
-            "settings_path": str(path),
-            # `--with-items` keeps each inner hook object: the launcher's
-            # `project_hooks` mirror stores it as the row's config when it
-            # reads a JSONC settings.json through this verb (v0.2.97).
-            "hooks": [
-                e if args.with_items else {k: v for k, v in e.items() if k != "item"}
-                for e in entries
-            ],
-            "skipped": skipped,
-        }
-    )
+    payload: Dict[str, Any] = {
+        "ok": True,
+        "settings_path": str(path),
+        # `--with-items` keeps each inner hook object: the launcher's
+        # `project_hooks` mirror stores it as the row's config when it
+        # reads a JSONC settings.json through this verb (v0.2.97).
+        "hooks": [
+            e if args.with_items else {k: v for k, v in e.items() if k != "item"}
+            for e in entries
+        ],
+        "skipped": skipped,
+    }
+    if args.keys_for_json is not None:
+        # v0.2.97: the launcher's Hooks tab matches its DB rows (mirror +
+        # parked, which may hold an older spelling of a command) to these
+        # entries by `hook_command_key` — computed HERE, the one home of the
+        # rule, instead of in a Rust copy of it.
+        try:
+            extra = json.loads(args.keys_for_json)
+        except json.JSONDecodeError as exc:
+            raise HooksSettingsError(
+                "invalid_argument", f"--keys-for-json is not valid JSON: {exc.msg}"
+            ) from None
+        if not isinstance(extra, list) or not all(isinstance(c, str) for c in extra):
+            raise HooksSettingsError(
+                "invalid_argument", "--keys-for-json must be a JSON array of strings."
+            )
+        commands = [e["command"] for e in entries if isinstance(e.get("command"), str)]
+        payload["keys"] = {c: hook_command_key(c) for c in [*commands, *extra]}
+    _emit(payload)
     return 0
 
 
@@ -1236,7 +1399,9 @@ def _cmd_enable(args: argparse.Namespace) -> int:
             "parked_entry_invalid", f"--entry-json is not valid JSON: {exc.msg}"
         ) from None
     doc = load_settings(path)
-    changed = insert_hook(doc, parked)
+    # Anchor a VCO-shipped hook restored from a pre-v0.2.97 park; the set
+    # comes from the orchestrator clone's templates (None → anchor nothing).
+    changed = insert_hook(doc, parked, anchor_scripts=shipped_hook_scripts())
     if changed:
         write_settings(doc)
     _emit({"ok": True, "settings_path": str(path), "changed": changed})
@@ -1308,6 +1473,12 @@ def build_parser() -> argparse.ArgumentParser:
     p_list.add_argument(
         "--with-items", action="store_true",
         help="Include each entry's whole inner hook object as `item`.",
+    )
+    p_list.add_argument(
+        "--keys-for-json", default=None,
+        help="A JSON array of extra commands; the output then carries `keys`, "
+        "mapping every listed and extra command to its registration key "
+        "(two spellings of one hook share a key).",
     )
     p_list.set_defaults(func=_cmd_list)
 

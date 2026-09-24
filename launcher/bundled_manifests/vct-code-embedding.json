@@ -104,7 +104,7 @@
       "url": "http://localhost:{code_embed_port}/health",
       "timeout_s": 10,
       "interval_s": 60,
-      "_note": "{code_embed_port} is the port the launcher resolves for the service (docs/VCT_MODULE_MANIFEST_SPEC.md section 15): the app_state override, else the services.toml adoption, else 11440 - CODE_EMBED_PORT's default in claude_mcp_servers/code_embedding_service/server.py, infrastructure/docker-compose.yml and the setting above. The same chain feeds CODE_EMBED_PORT in every project's env, so the hub's health poller (vct-hub src/module_health.rs) probes the port the service was moved to. Pinned by bundled_manifests::tests::code_embedding_manifest_names_the_services_real_default_port and project_env_settings::tests::code_embedding_health_url_is_the_resolvers_default. It once said 11438, a port nothing serves."
+      "_note": "{code_embed_port} is the port the launcher resolves for the service (docs/VCT_MODULE_MANIFEST_SPEC.md section 15): its row in the launcher.db service_endpoints table, else 11440 - CODE_EMBED_PORT's default in claude_mcp_servers/code_embedding_service/server.py, infrastructure/docker-compose.yml and the setting above. The same row feeds CODE_EMBED_PORT in every project's env, so the hub's health poller (vct-hub src/module_health.rs) probes the port the service was moved to (Services page, Move to another port). Pinned by bundled_manifests::tests::code_embedding_manifest_names_the_services_real_default_port and project_env_settings::tests::code_embedding_health_url_is_the_resolvers_default. It once said 11438, a port nothing serves."
     },
     "auto_restart": true,
     "log_file": "{VCT_LOGS}/vct-code-embedding.log"

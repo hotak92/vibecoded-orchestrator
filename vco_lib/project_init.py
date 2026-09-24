@@ -2504,7 +2504,7 @@ def _default_restart_container() -> str:
     gracefully with "no such container" if the user has truly nothing).
 
     Called lazily by `_attempt_container_restart` rather than evaluated at
-    module import — `podman container exists` shells out and we don't
+    module import — `podman container inspect` shells out and we don't
     want to pay that on every `import vco_lib.project_init` in test code.
     """
     from vco_lib.containers import canonical_name, find_existing_container

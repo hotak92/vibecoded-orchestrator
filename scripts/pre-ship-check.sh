@@ -323,6 +323,19 @@ else
     gate_fail "cargo test --lib (keychain-safe)" "See /tmp/preship-cargo-test.log"
 fi
 
+# Gate 2b (v0.2.97): vct-cli is a SEPARATE Cargo workspace
+# (launcher/tools/vct-cli, not a member of launcher/src-tauri's workspace), so
+# the run above never builds or tests it. CI runs it explicitly
+# (.github/workflows/ci.yml, "cargo test (vct-cli sub-workspace)"); this leg
+# MUST match that step, or a vct-cli regression passes here and fails there.
+echo "  [running cargo test (vct-cli sub-workspace)...]"
+if cargo test --tests --manifest-path launcher/tools/vct-cli/Cargo.toml \
+        -- --test-threads=1 > /tmp/preship-vct-cli-test.log 2>&1; then
+    gate_pass "cargo test (vct-cli sub-workspace)"
+else
+    gate_fail "cargo test (vct-cli sub-workspace)" "See /tmp/preship-vct-cli-test.log"
+fi
+
 # Gate 2c (v0.2.90): launcher boot smoke. The v0.2.89 binary panicked in
 # setup() (bare tokio::spawn on the main thread — no reactor context) and
 # died before the window existed; cargo test is structurally blind to that

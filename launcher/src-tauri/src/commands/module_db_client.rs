@@ -200,10 +200,7 @@ async fn module_db_read_row_with_fields_inner(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HUB_READ_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(HUB_READ_TIMEOUT_SECS))?;
 
     let resp = client
         .get(&url)

@@ -21,11 +21,15 @@
 //!    unreadable.
 //! 3. [`DEFAULT_HUB_PORT`].
 //!
-//! The Python/shell CLIENT resolvers (`vco_lib/project_config.py`,
-//! `vco_lib/hub_ensure.py`, `templates/scripts/vct_project_config.sh`) put
-//! `$VCT_HUB_PORT` FIRST on purpose: there it is a caller's explicit pin (a
-//! test harness pointing one process at one hub). Here the question is "where
-//! is the hub that is running", which only the port file answers.
+//! The Python/shell CLIENT resolvers (`vco_lib.hub_ensure.resolve_hub_port`,
+//! `templates/scripts/vct_project_config.sh`, …) put `$VCT_HUB_PORT` FIRST on
+//! purpose: there it is a caller's explicit pin (a test harness pointing one
+//! process at one hub). Here the question is "where is the hub that is
+//! running", which only the port file answers — the Python mirror of THIS
+//! ladder is `vco_lib.hub_ensure.running_hub_port` (`install.py --bootstrap
+//! --json`, R7b F7), and of the strict read `hub_ensure.read_hub_port_file`.
+//! Every reader applies one VALUE rule ([`parse_hub_port`], R7b F9), run by
+//! every language from `tests/fixtures/hub_port_cases.json`.
 
 use std::path::{Path, PathBuf};
 
@@ -44,6 +48,22 @@ pub const HUB_PORT_FILE: &str = "hub.port";
 /// `<vct_root_dir>/hub.port`.
 pub fn hub_port_file() -> PathBuf {
     vct_root_dir().join(HUB_PORT_FILE)
+}
+
+/// THE hub-port value rule (R7b F9), for `$VCT_HUB_PORT` and the WHOLE
+/// content of `hub.port` alike: trim C-locale whitespace at the ends, then
+/// ASCII `[0-9]{1,5}` in 1..=65535. A sign (`+7822` — `str::parse::<u16>`
+/// accepts it), `_`, a non-ASCII numeral or INTERNAL whitespace (`78 11`, a
+/// second line) is invalid, and `0` is not a port. MUST MATCH
+/// `vco_lib.hub_ensure.parse_hub_port` and every other reader — they all run
+/// `tests/fixtures/hub_port_cases.json` (this module's
+/// `hub_port_readers_match_the_parity_table`).
+pub fn parse_hub_port(raw: &str) -> Option<u16> {
+    let value = raw.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    if value.is_empty() || value.len() > 5 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok().filter(|p| (1..=65535).contains(p)).map(|p| p as u16)
 }
 
 /// STRICT: the port in `<vct_root_dir>/hub.port`, or an error naming why
@@ -65,9 +85,8 @@ pub fn read_hub_port_file() -> Result<u16, String> {
 pub fn read_hub_port_file_in(vct_root: &Path) -> Result<u16, String> {
     let raw = std::fs::read_to_string(vct_root.join(HUB_PORT_FILE))
         .map_err(|e| format!("read hub.port: {e}"))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {e}"))
+    parse_hub_port(&raw)
+        .ok_or_else(|| format!("parse hub.port: not a port in 1-65535: {:?}", raw.trim()))
 }
 
 /// The running hub's port: `hub.port` → `$VCT_HUB_PORT` → 7700 (see the
@@ -79,7 +98,7 @@ pub fn resolve_hub_port() -> u16 {
     }
     std::env::var(HUB_PORT_ENV)
         .ok()
-        .and_then(|p| p.trim().parse().ok())
+        .and_then(|p| parse_hub_port(&p))
         .unwrap_or(DEFAULT_HUB_PORT)
 }
 
@@ -118,6 +137,39 @@ mod tests {
         std::fs::write(guard.path().join(HUB_PORT_FILE), " 7712\n").unwrap();
         assert_eq!(read_hub_port_file(), Ok(7712));
         assert_eq!(read_hub_port_file_in(guard.path()), Ok(7712));
+    }
+
+    /// R7b F9: the SHARED table every hub-port reader runs. This module is
+    /// the DESCRIBE ladder (`expect_running`: file → env → 7700) and the
+    /// strict file read (`expect_file`); the client ladder column
+    /// (`expect`) is run by the Python / sh / ps1 clients and vct-cli.
+    #[test]
+    fn hub_port_readers_match_the_parity_table() {
+        let text = include_str!("../../../../../tests/fixtures/hub_port_cases.json");
+        let table: serde_json::Value = serde_json::from_str(text).expect("fixture parses");
+        let cases = table["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 20, "the table shrank: {}", cases.len());
+        let guard = state_dir_guard_with(&[(HUB_PORT_ENV, None)]);
+        let port_file = guard.path().join(HUB_PORT_FILE);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            match case["env_port"].as_str() {
+                // The guard holds GLOBAL_ENV_MUTEX and restores on drop.
+                Some(v) => unsafe { std::env::set_var(HUB_PORT_ENV, v) },
+                None => unsafe { std::env::remove_var(HUB_PORT_ENV) },
+            }
+            match case["file_port"].as_str() {
+                Some(v) => std::fs::write(&port_file, v).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&port_file);
+                }
+            }
+            let running = case["expect_running"].as_u64().unwrap() as u16;
+            assert_eq!(resolve_hub_port(), running, "case `{name}`: resolve_hub_port");
+            let strict = read_hub_port_file_in(guard.path()).ok();
+            let want = case["expect_file"].as_u64().map(|p| p as u16);
+            assert_eq!(strict, want, "case `{name}`: read_hub_port_file_in");
+        }
     }
 
     #[test]

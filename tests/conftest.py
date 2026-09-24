@@ -439,6 +439,74 @@ def _seed_unroutable_service_endpoints(state_dir: Path) -> None:
 if not _ALLOW_REAL_STATE:
     _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
 
+
+# ─── W-TRANSPORT (v0.2.97 R7): the gRPC leg cannot bypass the URL pins ──────
+#
+# W-WEAVIATE pins the HTTP transport (`WEAVIATE_URL` → 127.0.0.1:9), but the
+# weaviate-client v4 channel takes its gRPC port from `GRPC_PORT` /
+# `WEAVIATE_GRPC_PORT` (`vco_lib/weaviate_helpers.py`, and
+# `claude_mcp_servers/weaviate_mcp/server.py` the same way) — defaulting to
+# 50052, the LIVE Weaviate gRPC on a developer's machine. A test whose code
+# path opened a v4 connection would read real counts / write real data through
+# gRPC while its HTTP assertions said "unroutable". Both keys are pinned to
+# the same discard port, at import (module-scope readers snapshot during
+# COLLECTION) and per test below — the same two moments W-WEAVIATE uses.
+#
+# ─── W-OLLAMA / W-HUB-PORT (v0.2.97 R7): the remaining localhost defaults ───
+#
+# Two more resolvers a shipped reader consults were the only localhost-default
+# backends without a pin:
+#
+#   * `OLLAMA_URL` — `vco_lib/embedding_service.py` (and the KG-summary
+#     fallbacks) default to `http://localhost:11435`, the live Ollama
+#     container. Pinned to the unroutable sentinel like the other two
+#     backends (W-WEAVIATE / W-CODE-EMBED).
+#   * `VCT_HUB_PORT` — `vco_lib/hub_ensure.resolve_hub_port`'s 7700 default
+#     is the LIVE hub. Every hub client that mattered already pinned it per
+#     test; this is cheap suite-wide insurance so one forgotten pin cannot
+#     reach the real hub (an unauthenticated 401 at worst, but still contact).
+#     The state-dir redirect already moves `hub.token`, so a leaked request
+#     carries no credential.
+#
+# A test that needs another value sets it itself (`monkeypatch.setenv`
+# restores after); a child-process harness that builds an explicit env dict
+# (`tests/integration/step22_multi_project/fixture.py`) overrides the pin in
+# the dict, exactly as it does for `VCT_STATE_DIR`.
+_UNROUTABLE_PORT_STR = str(_UNROUTABLE_PORT)
+_PINNED_LOCALHOST_KEYS: tuple[tuple[str, str], ...] = (
+    ("GRPC_PORT", _UNROUTABLE_PORT_STR),
+    ("WEAVIATE_GRPC_PORT", _UNROUTABLE_PORT_STR),
+    ("OLLAMA_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
+    ("VCT_HUB_PORT", _UNROUTABLE_PORT_STR),
+)
+
+if not _ALLOW_REAL_STATE:
+    for _key, _value in _PINNED_LOCALHOST_KEYS:
+        os.environ[_key] = _value
+
+# ─── W-INSTALL-ROOT (v0.2.97): in-process install-root readers see THIS checkout.
+#
+# `tests/common/child_env.py` has pinned `VCT_INSTALL_ROOT` for CHILD
+# processes since review round 7 (see its docstring); the IN-PROCESS side was
+# missing. `vco_lib.python_exe.resolve_install_root()` puts the env var FIRST
+# on its ladder, and everything that rides it — `vco_lib.containers.
+# runtime_pin()` reading `<root>/state/install/runtime.txt` foremost —
+# followed an ambient `$VCT_INSTALL_ROOT` exported by a launcher-started
+# shell (a session inside a real install is exactly how this suite runs on
+# the dev box; measured: `runtime_pin()` answered the REAL install's `podman`
+# pin locally and `None` on CI, where the var is unset and the ladder settles
+# on `vco_lib/..` = this checkout). Pinned to the CHECKOUT — the same value
+# child_env pins children to, and the same OUTCOME CI gets (the checkout has
+# no `state/install/runtime.txt`, so no runtime pin) — so local and CI agree.
+# A neutral temp root would NOT give that: it fails
+# `looks_like_orchestrator_root`, the ladder skips it, and the var would point
+# at a directory no rung ever uses. A test that sets its own value still wins
+# (`monkeypatch.setenv` / `patch.dict` run after this fixture's setup, below).
+# Set at import (module-scope readers resolve during COLLECTION) and
+# RE-ESTABLISHED per test below, like the other W-* pins.
+if not _ALLOW_REAL_STATE:
+    os.environ["VCT_INSTALL_ROOT"] = str(_REPO_ROOT)
+
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
 # `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
@@ -546,10 +614,19 @@ def _redirect_user_state_dir(request):
         "VCT_CLAUDE_DIR": str(_VCO_CLAUDE_REDIRECT),
         "VCT_USER_HOME_OVERRIDE": str(_VCO_USER_HOME_REDIRECT),
     }
+    # W-INSTALL-ROOT: re-established UNCONDITIONALLY. It is deliberately NOT
+    # part of the self-isolated stand-aside below — that list exists because
+    # `VCT_STATE_DIR` is an earlier TIER of the launcher-db resolver those
+    # files test, which says nothing about the install-root ladder. A test
+    # that sets its own `VCT_INSTALL_ROOT` still wins: it runs after this
+    # setup, and the `finally` below only restores what was there at setup.
+    install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
     )
-    prev = {k: os.environ.get(k) for k in (*keys, *claude_keys)}
+    prev = {
+        k: os.environ.get(k) for k in (*keys, *claude_keys, *install_root_keys)
+    }
     if self_isolated:
         # Stand aside DETERMINISTICALLY (pop, don't restore the ambient value)
         # so the file's own isolation is what governs on every machine —
@@ -562,6 +639,7 @@ def _redirect_user_state_dir(request):
         # leave the next test's machine resolvers on the live default ports.
         _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
     os.environ.update(claude_keys)
+    os.environ.update(install_root_keys)
     try:
         yield
     finally:
@@ -1817,6 +1895,29 @@ def _pin_code_embed_url():
     prev = {k: os.environ.get(k) for k in _CODE_EMBED_URL_KEYS}
     for key in _CODE_EMBED_URL_KEYS:
         os.environ[key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    try:
+        yield
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _pin_localhost_default_backends():
+    """W-TRANSPORT / W-OLLAMA / W-HUB-PORT: re-establish the pins for EVERY
+    test (see the import-time block). Same reason as the Weaviate pin: a test
+    that sets one of these keys itself and restores by
+    ``os.environ.update(backup)`` cannot remove a key the backup lacked, so
+    one such test would un-pin everything after it."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    prev = {k: os.environ.get(k) for k, _ in _PINNED_LOCALHOST_KEYS}
+    for key, value in _PINNED_LOCALHOST_KEYS:
+        os.environ[key] = value
     try:
         yield
     finally:

@@ -49,13 +49,21 @@ supported ways to bring the stack back:
 # the session hook (same code path every session start uses)
 bash <install_root>/.claude/hooks/ensure-containers.sh
 
-# or ask for the plan first, then let the lifecycle act on it
-python -m vco_lib.service_endpoints plan
+# or a full install/update run — it reconciles the rows and starts
+# everything they allow (VCO-managed through compose, adopted by name)
+python <install_root>/install.py --update
+
+# afterwards, re-check the rows against what is actually running
+python -m vco_lib.service_endpoints plan --json
 python -m vco_lib.service_endpoints reconcile
 ```
 
-The plan reads the `service_endpoints` rows and says what may be
-started: VCO-managed services through compose, adopted containers by
+`reconcile` re-checks the `service_endpoints` rows against the live
+services (and starts ADOPTED containers by name) — it never composes a
+`vco_managed` service itself, so a down VCO-managed container needs the
+hook or the install/update run above, not `reconcile`. The plan reads
+the rows and says what may be started: VCO-managed services through
+compose, adopted containers by
 name only (never removed, never recreated). The legacy
 `claude_mcp_servers/` compose home is no longer composed from — a
 container created there is adopted as it stands. The `SessionStart`
@@ -85,11 +93,19 @@ you when you click "Start" on a red row.
 
 ## Podman vs Docker: which runtime is active
 
-Auto-detected at install. Force a runtime with
-`VCT_CONTAINER_RUNTIME=podman|docker` in `<project>/.claude/env` or
-shell rc — env var wins over auto-probe. Authoritative on-disk source:
-`<install_root>/state/install/runtime.txt` (single word). Don't edit
-by hand; rerun install to regenerate.
+Auto-detected at the first install and recorded in
+`<install_root>/state/install/runtime.txt` (single word). From then on
+that record PINS the runtime everywhere — the session hooks, the
+launcher's services and storage pages, module containers and the hub —
+and a recorded runtime that is down is refused, never swapped for the
+other one (the two keep separate volumes, so a swap starts an empty
+stack). `VCT_CONTAINER_RUNTIME=podman|docker`, in the environment the
+process starts from (shell rc, `<project>/.claude/env`, or the login
+session for the launcher), overrides the record. To switch for good:
+set `VCT_CONTAINER_RUNTIME` and re-run `python <install_root>/install.py
+--update` (it records the runtime it used), or write the one word into
+`runtime.txt`; a running launcher keeps the environment it started with,
+so quit and relaunch it afterwards.
 
 **Daemon-vs-binary**: the CLI binary AND the daemon both need to run.
 Symptom: `docker --version` works but `docker ps` errors `Cannot

@@ -36,9 +36,10 @@
 use serde::{Deserialize, Serialize};
 
 use crate::services::runtime::{
-    detect_runtime, invalidate_cache as invalidate_runtime_cache, pinned_runtime, probe_runtime,
-    runtime_on_path,
+    detect_runtime, invalidate_cache as invalidate_runtime_cache, probe_runtime, runtime_on_path,
+    runtime_pin,
 };
+use vct_launcher_core::services::container_runtime::RuntimePinSource;
 
 /// Result of the install-pipeline preflight check.
 ///
@@ -65,12 +66,16 @@ pub struct RuntimeAvailability {
     /// unknown platforms or when a runtime IS already available (no link
     /// needed in the success case).
     pub install_url: Option<String>,
-    /// `VCT_CONTAINER_RUNTIME`, when it names a runtime (`auto` / empty /
-    /// unrecognised → `None`). v0.2.92 BLOCKER-4: a pin is honoured or
-    /// REFUSED, never swapped for the other runtime — podman and docker have
-    /// per-runtime named volumes, so driving the other one would bring the
-    /// stack up on an empty data plane.
+    /// The pinned runtime — `VCT_CONTAINER_RUNTIME` when it names one, else
+    /// the install's `state/install/runtime.txt` record (R7b F5). v0.2.92
+    /// BLOCKER-4: a pin is honoured or REFUSED, never swapped for the other
+    /// runtime — podman and docker have per-runtime named volumes, so
+    /// driving the other one would bring the stack up on an empty data plane.
     pub pinned: Option<String>,
+    /// WHERE the pin came from, so the modal names the knob to turn:
+    /// `"VCT_CONTAINER_RUNTIME"`, or the ABSOLUTE path of the runtime.txt
+    /// record. `None` when nothing is pinned.
+    pub pinned_via: Option<String>,
     /// True when a pin is set and nothing resolved — i.e. the runtime the
     /// user pinned is the one that is unusable. Lets the modal say "podman is
     /// pinned but unusable" instead of the false "no container runtime is
@@ -165,7 +170,9 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
     // under a pin means "the runtime you pinned is unusable" — NOT "no
     // container runtime is installed". Those are different sentences and
     // different user actions, and the modal could not tell them apart.
-    let pinned = if info.is_none() { pinned_runtime() } else { None };
+    let pin = if info.is_none() { runtime_pin() } else { None };
+    let pinned = pin.map(|(runtime, _)| runtime);
+    let pinned_via = pin.map(|(_, source)| pin_source_label(source));
     let pinned_installed = pinned.map(runtime_on_path).unwrap_or(false);
     let alternative_usable = match pinned {
         // Probe the runtime the user did NOT pin, so the modal can name the
@@ -183,10 +190,26 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
         platform,
         install_url,
         pinned: pinned.map(|p| p.binary().to_string()),
+        pinned_via,
         pinned_unusable: pinned.is_some(),
         pinned_installed,
         alternative_usable,
     })
+}
+
+/// What the modal shows as the pin's origin: the env var's name, or the
+/// ABSOLUTE path of the runtime.txt record (the file the user would edit).
+fn pin_source_label(source: RuntimePinSource) -> String {
+    match source {
+        RuntimePinSource::EnvOverride => source.label().to_string(),
+        RuntimePinSource::RuntimeTxt => {
+            vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
+                .map(|root| {
+                    root.join("state").join("install").join("runtime.txt").display().to_string()
+                })
+                .unwrap_or_else(|| source.label().to_string())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +218,16 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_pin_source_names_the_env_var_or_the_record_file() {
+        assert_eq!(pin_source_label(RuntimePinSource::EnvOverride), "VCT_CONTAINER_RUNTIME");
+        let record = pin_source_label(RuntimePinSource::RuntimeTxt);
+        assert!(
+            record.ends_with("runtime.txt"),
+            "the record label must name the file: {record}"
+        );
+    }
 
     #[test]
     fn install_url_known_platforms_resolve() {

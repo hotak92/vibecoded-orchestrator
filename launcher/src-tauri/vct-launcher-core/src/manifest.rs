@@ -2031,6 +2031,37 @@ pub struct UninstallBlock {
     pub clear_secrets: bool,
 }
 
+/// One `provides` entry of kind `http_api`, as the launcher shows it: its
+/// `base_url` with every placeholder RESOLVED (`{hub_port}` → the running
+/// hub's port, `{weaviate_port}` … → the service row's port), so the page
+/// never states a wrong port. Built by [`ModuleManifest::provided_http_apis`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvidedHttpApi {
+    pub base_url: String,
+    pub description: String,
+}
+
+impl ModuleManifest {
+    /// Every `provides` entry `{ "kind": "http_api", "base_url": … }`, its
+    /// `base_url` resolved through `ctx` ([`PlaceholderCtx::resolve`]).
+    /// Entries without a string `base_url` are skipped. The reader is the
+    /// launcher's Preferences → Modules list (`module_settings_schema::
+    /// list_module_settings`, rendered by `CoreModuleSettingsPanel.svelte`).
+    pub fn provided_http_apis(&self, ctx: &PlaceholderCtx) -> Vec<ProvidedHttpApi> {
+        self.provides
+            .iter()
+            .filter(|p| p.get("kind").and_then(|k| k.as_str()) == Some("http_api"))
+            .filter_map(|p| {
+                let raw = p.get("base_url")?.as_str()?;
+                Some(ProvidedHttpApi {
+                    base_url: ctx.resolve(raw),
+                    description: p.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
 // ─── Parsing ─────────────────────────────────────────────────────────────
 
 impl ModuleManifest {

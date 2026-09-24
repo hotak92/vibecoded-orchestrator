@@ -70,19 +70,33 @@ def _probes(sc: dict):
     return which, run
 
 
+def _install_root(tmp_path: Path, runtime_txt: Optional[str]) -> Path:
+    """An install root holding the scenario's ``state/install/runtime.txt``
+    (or none) — never the machine's own clone, whose record would leak in."""
+    root = tmp_path / "install-root"
+    root.mkdir()
+    if runtime_txt is not None:
+        containers.runtime_txt_path(root).parent.mkdir(parents=True)
+        containers.runtime_txt_path(root).write_text(runtime_txt + "\n", encoding="utf-8")
+    return root
+
+
 @pytest.mark.parametrize("sc", SCENARIOS, ids=[s["name"] for s in SCENARIOS])
 def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
     which, run = _probes(sc)
     env = {} if sc["env"] is None else {"VCT_CONTAINER_RUNTIME": sc["env"]}
     warnings: list[str] = []
+    root = _install_root(tmp_path, sc.get("runtime_txt"))
     res = containers.resolve(
         env=env, which=which, run=run, warn=warnings.append, home=tmp_path,
+        install_root=root,
     )
     exp = sc["expect"]
     got = {
         "state": res.state.value, "runtime": res.runtime,
         "compose_form": res.compose_form, "installed": res.installed,
-        "requested": res.requested, "substituted": res.substituted,
+        "requested": res.requested, "requested_via": res.requested_via,
+        "substituted": res.substituted,
     }
     assert got == exp, f"{sc['name']}: {got} != {exp} ({res.reason})"
     if sc["env"] == "bogus":
@@ -101,8 +115,18 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
         assert res.runtime is None and res.compose is None
         assert res.alternative_usable in (None, "podman", "docker")
         assert res.alternative_usable != exp["requested"]
-        assert f"VCT_CONTAINER_RUNTIME={exp['requested']}" in res.reason
-        assert "unset VCT_CONTAINER_RUNTIME" in res.reason or "install it" in res.reason
+        if exp["requested_via"] == containers.PIN_VIA_RUNTIME_TXT:
+            # R7b F5: the record pins, and the refusal names the FILE (its
+            # absolute path) and the override that supersedes it.
+            assert str(containers.runtime_txt_path(root)) in res.reason
+            assert f"recorded {exp['requested']}" in res.reason
+            assert (
+                f"set VCT_CONTAINER_RUNTIME={res.alternative_usable}" in res.reason
+                or "install it" in res.reason
+            )
+        else:
+            assert f"VCT_CONTAINER_RUNTIME={exp['requested']}" in res.reason
+            assert "unset VCT_CONTAINER_RUNTIME" in res.reason or "install it" in res.reason
         assert any(exp["requested"] in w for w in warnings), (
             f"refusal was silent: warnings={warnings!r}"
         )
@@ -235,20 +259,33 @@ def test_a_pinned_probe_timeout_stays_unknown_not_a_refusal(tmp_path: Path):
     assert res.requested_installed is True
 
 
-def test_the_rust_mirror_pins_the_same_one_element_order():
-    """Class-C mirror parity for the arm the fixture cannot express (the Rust
-    side derives its probe list from `candidate_order` before probing, so a
-    divergence here is invisible to `select_runtime`)."""
-    import re
-
+def test_a_pin_is_the_whole_candidate_order():
+    """A pin is the ONLY candidate. The Rust side is held to the same rule by
+    EXECUTION, not by a source pattern: ``runtime.rs``'s
+    ``parity_fixture_select_runtime_matches_every_scenario`` drives
+    ``candidate_order(env, runtime_txt)`` through every pinned row of the
+    shared fixture (``env_pref_unusable_*``, ``runtime_txt_pin_unusable_*``),
+    so a runtime.rs that fell through to the other runtime turns those rows
+    red there."""
     assert containers.runtime_candidate_order("podman") == ["podman"]
     assert containers.runtime_candidate_order("docker") == ["docker"]
     assert containers.runtime_candidate_order(None) == ["podman", "docker"]
-    rs = (REPO_ROOT / "launcher" / "src-tauri" / "vct-launcher-core" / "src"
-          / "services" / "runtime.rs").read_text(encoding="utf-8")
-    for pref, variant in (("podman", "Podman"), ("docker", "Docker")):
-        pattern = rf'Some\("{pref}"\)\s*=>\s*vec!\[ContainerRuntime::{variant}\]'
-        assert re.search(pattern, rs), f"runtime.rs no longer pins {pref} strictly"
+
+
+def test_runtime_pin_precedence_env_then_record_then_none(tmp_path: Path):
+    """R7b F5: ONE precedence — ``VCT_CONTAINER_RUNTIME`` → runtime.txt →
+    no pin; ``auto`` and garbage are no preference; ``None`` means no install
+    root at all (so no record)."""
+    root = _install_root(tmp_path, "docker")
+    rec = containers.runtime_txt_path(root)
+    assert containers.runtime_pin({}, install_root=root) == ("docker", containers.PIN_VIA_RUNTIME_TXT, rec)
+    assert containers.runtime_pin({"VCT_CONTAINER_RUNTIME": "podman"}, install_root=root) == (
+        "podman", containers.PIN_VIA_ENV, None)
+    auto = containers.runtime_pin({"VCT_CONTAINER_RUNTIME": "auto"}, install_root=root)
+    assert auto is not None and auto[0] == "docker"
+    assert containers.runtime_pin({}, install_root=None) is None
+    rec.write_text("nerdctl\n", encoding="utf-8")
+    assert containers.runtime_pin({}, install_root=root) is None, "an unknown token is no record"
 
 
 def test_tri_state_is_never_collapsed():
@@ -496,3 +533,32 @@ def test_rust_mirror_reads_the_same_fixture():
     rs = (REPO_ROOT / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "services" / "runtime.rs").read_text(encoding="utf-8")
     assert "container_runtime_parity.json" in rs
     assert "fn select_runtime" in rs and "fn candidate_order" in rs
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim scripts")
+def test_the_hooks_entry_point_honours_the_install_record(tmp_path: Path):
+    """R7b F5, end to end through the CLI the session-start hooks run
+    (``python -m vco_lib.containers resolve --json``): both runtimes answer,
+    nothing pins the env, and the install recorded docker — the hooks must
+    drive docker, the runtime storage/volumes and the module plane already
+    followed. Before v0.2.97 they auto-detected podman (podman-first)."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    for rt in ("podman", "docker"):
+        shim = bin_dir / rt
+        shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        shim.chmod(0o755)
+    root = tmp_path / "clone"
+    (root / "vco_lib").mkdir(parents=True)      # what resolve_install_root
+    (root / ".claude").mkdir()                  # accepts as a clone
+    containers.runtime_txt_path(root).parent.mkdir(parents=True)
+    containers.runtime_txt_path(root).write_text("docker\n", encoding="utf-8")
+    proc = subprocess.run(
+        [sys.executable, "-m", "vco_lib.containers", "resolve", "--json"],
+        env=child_env(PATH=str(bin_dir), VCT_CONTAINER_RUNTIME="", VCT_INSTALL_ROOT=str(root)),
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    payload = json.loads(proc.stdout)
+    assert (payload["runtime"], payload["requested"], payload["requested_via"]) == (
+        "docker", "docker", "state/install/runtime.txt")

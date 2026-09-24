@@ -1058,6 +1058,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
 
     p_hand = sub.add_parser("hand-to-vco", help="let VCO's compose manage an adopted container (same data mount)")
     p_hand.add_argument("--service", required=True, choices=("weaviate", "ollama"))
+    db_arg(p_hand)
     root_arg(p_hand)
     p_hand.set_defaults(handler=reconcile_verb("hand-to-vco"))
 

@@ -17,11 +17,77 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #
 # Bypass: $env:VCT_SKIP_PORT_WATCHDOG = "1"
 # Verbose: $env:VCT_PORT_WATCHDOG_VERBOSE = "1"
+#
+# Log: every run appends ONE JSON line to
+# <project>/.claude/logs/container_port_check.jsonl (<project> =
+# $env:CLAUDE_PROJECT_DIR, else the project this hook is installed in):
+# timestamp, runtime, each service's result (healthy | slow | zombie |
+# absent, with the container and port) and the action taken (none | skipped
+# + reason | lock_busy | recovered + what was done to each zombie).
+# Soft-fail: a log that cannot be written never changes what the hook does.
+# MUST MATCH the record verify-container-ports.sh writes.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/compose-invocation.ps1"
 
 if ($env:VCT_SKIP_PORT_WATCHDOG -eq "1") { return }
+
+# ── The run log (see the header) ─────────────────────────────────────────
+$PortCheckProject = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { Join-Path $PSScriptRoot "..\.." }
+$PortCheckLog = Join-Path $PortCheckProject ".claude/logs/container_port_check.jsonl"
+$script:LogRuntime = ""
+$script:LogContainers = [System.Collections.ArrayList]::new()
+$script:LogRecovery = [System.Collections.ArrayList]::new()
+function Get-VcoServiceOf {
+    param([string]$Name)
+    if ($Name -like "*weaviate*") { return "weaviate" }
+    if ($Name -like "*ollama*") { return "ollama" }
+    if ($Name -like "*code_embed*") { return "code_embed" }
+    return ""
+}
+function Add-VcoLogContainer {
+    param([string]$Name, [int]$Port, [string]$Result)
+    [void]$script:LogContainers.Add(@{ service = (Get-VcoServiceOf $Name); container = $Name; port = $Port; result = $Result })
+}
+function Add-VcoLogRecovery {
+    param([string]$Name, [string]$Action, [string]$Detail = "")
+    [void]$script:LogRecovery.Add([ordered]@{ container = $Name; service = (Get-VcoServiceOf $Name); action = $Action; detail = $Detail })
+}
+function Write-VcoPortCheckLog {
+    param([string]$Action, [string]$Reason = "")
+    try {
+        # The per-service summary: the most telling state of the service's
+        # watched containers (zombie > slow > healthy); absent when none runs.
+        $services = [ordered]@{}
+        foreach ($svc in @("weaviate", "ollama", "code_embed")) {
+            $best = $null
+            $rank = 0
+            foreach ($c in $script:LogContainers) {
+                if ($c.service -ne $svc) { continue }
+                $rk = switch ($c.result) { "zombie" { 3 } "slow" { 2 } "healthy" { 1 } default { 0 } }
+                if ($rk -gt $rank) { $rank = $rk; $best = $c }
+            }
+            if ($best) {
+                $services[$svc] = [ordered]@{ result = $best.result; container = $best.container; port = [int]$best.port }
+            } else {
+                $services[$svc] = [ordered]@{ result = "absent" }
+            }
+        }
+        $record = [ordered]@{
+            timestamp = (Get-Date).ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss'Z'")
+            hook      = "verify-container-ports"
+            runtime   = [string]$script:LogRuntime
+            services  = $services
+            action    = $Action
+        }
+        if ($Reason) { $record.reason = $Reason }
+        if ($script:LogRecovery.Count -gt 0) { $record.recovery = @($script:LogRecovery.ToArray()) }
+        $line = ConvertTo-Json -InputObject $record -Compress -Depth 6
+        $dir = Split-Path $PortCheckLog -Parent
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir -Force -ErrorAction Stop | Out-Null }
+        [System.IO.File]::AppendAllText($PortCheckLog, $line + "`n")
+    } catch { }
+}
 
 # Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
 # (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
@@ -45,6 +111,7 @@ if (Test-Path $VenvLib) {
 }
 if (-not $RunPy) {
     Write-Output "verify-container-ports: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    Write-VcoPortCheckLog -Action "skipped" -Reason "no Python interpreter for vco_lib (broken VCO install?)"
     return
 }
 $VcoRt = $null
@@ -64,6 +131,7 @@ if (-not $VcoRt) {
     if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }
     Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
     Write-Output "verify-container-ports: vco_lib.containers resolve failed (rc=$VcoRtRc): $VcoRtWhy; skipping"
+    Write-VcoPortCheckLog -Action "skipped" -Reason "vco_lib.containers resolve failed (rc=$VcoRtRc)"
     return
 }
 Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
@@ -77,11 +145,30 @@ if ($VcoRt.state -ne "resolved") {
     # Probe-only watchdog: quiet on a plain "no runtime" host (ensure-containers
     # already said it), but a REFUSED PIN is a user action, so it is reported.
     if ($VcoRt.requested) { Write-Output "verify-container-ports: $($VcoRt.reason); skipping" }
+    Write-VcoPortCheckLog -Action "skipped" -Reason $(if ($VcoRt.reason) { [string]$VcoRt.reason } else { "no usable container runtime" })
     return
 }
 $runtime = $VcoRt.runtime
+$script:LogRuntime = $runtime
 # Compose driver as an argv array.
 $composeArgs = if ($VcoRt.compose) { @($VcoRt.compose) } else { @($runtime, "compose") }
+
+# v0.2.97 (R7a F10, parity with the .sh sibling — the rationale is there):
+# detection runs unlocked; a zombie is recovered only under the per-user
+# session lock shared with ensure-containers, after the session reconcile,
+# and detection is REPEATED under the lock (ensure-containers may have
+# recovered it meanwhile). Ports are the rows' (the plan), not literals.
+function Read-VcoLifecyclePlan {
+    try { return ((& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json) } catch { return $null }
+}
+$lcPlan = Read-VcoLifecyclePlan
+function Get-VcoProbePort {
+    param([string]$Service, [int]$Default)
+    if ($lcPlan -and $lcPlan.services -and $lcPlan.services.$Service -and $lcPlan.services.$Service.port) {
+        return [int]$lcPlan.services.$Service.port
+    }
+    return $Default
+}
 
 # Container | host_port | probe_kind | probe_endpoint
 #
@@ -98,20 +185,24 @@ $composeArgs = if ($VcoRt.compose) { @($VcoRt.compose) } else { @($runtime, "com
 # templates/hooks/_lib/container-names.{sh,ps1} (shell). Sync this list
 # when those change — the test_pr2_templates_portability tests pin
 # them together.
-$watch = @(
+function Get-VcoWatchList {
+    $wv = Get-VcoProbePort -Service "weaviate" -Default 8081
+    $ol = Get-VcoProbePort -Service "ollama" -Default 11435
+    $ce = Get-VcoProbePort -Service "code_embed" -Default 11440
+    return @(
     # Weaviate — canonical first
-    @{ Name = "vco_weaviate";        Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
-    @{ Name = "weaviate";            Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
-    @{ Name = "weaviate_claude";     Port = 8081;  Kind = "http"; Endpoint = "/v1/meta" }
+    @{ Name = "vco_weaviate";        Port = $wv; Kind = "http"; Endpoint = "/v1/meta" }
+    @{ Name = "weaviate";            Port = $wv; Kind = "http"; Endpoint = "/v1/meta" }
+    @{ Name = "weaviate_claude";     Port = $wv; Kind = "http"; Endpoint = "/v1/meta" }
     # Ollama
-    @{ Name = "vco_ollama";          Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
-    @{ Name = "ollama";              Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
-    @{ Name = "ollama_claude";       Port = 11435; Kind = "http"; Endpoint = "/api/tags" }
+    @{ Name = "vco_ollama";          Port = $ol; Kind = "http"; Endpoint = "/api/tags" }
+    @{ Name = "ollama";              Port = $ol; Kind = "http"; Endpoint = "/api/tags" }
+    @{ Name = "ollama_claude";       Port = $ol; Kind = "http"; Endpoint = "/api/tags" }
     # Code-embedding service
-    @{ Name = "vco_code_embed";      Port = 11440; Kind = "tcp";  Endpoint = "" }
-    @{ Name = "vct_code_embed";      Port = 11440; Kind = "tcp";  Endpoint = "" }
-    @{ Name = "code_embed";          Port = 11440; Kind = "tcp";  Endpoint = "" }
-    @{ Name = "code_embed_claude";   Port = 11440; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "vco_code_embed";      Port = $ce; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "vct_code_embed";      Port = $ce; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "code_embed";          Port = $ce; Kind = "tcp";  Endpoint = "" }
+    @{ Name = "code_embed_claude";   Port = $ce; Kind = "tcp";  Endpoint = "" }
     # NOTE: v0.2.50 audit F3 (2026-06-08) — the `model_router_claude;11436`
     # row that previously lived here was a maintainer-machine leak (same
     # shape as the `_claude` suffix family v0.2.15 already cleaned up
@@ -119,7 +210,8 @@ $watch = @(
     # `vco_model_router` service in compose or install.py; the model-
     # router runs only on the maintainer's host. Drop the row to stop
     # this hook from polling port 11436 on every install.
-)
+    )
+}
 
 $verbose = ($env:VCT_PORT_WATCHDOG_VERBOSE -eq "1")
 
@@ -167,40 +259,68 @@ function Test-ContainerPidAlive {
     return Test-Path "/proc/$pidStr"
 }
 
+function Find-VcoZombies {
 $zombies = @()
-$healthy = 0
-$absent = 0
+$script:healthy = 0
+$script:absent = 0
+$script:LogContainers.Clear()
 
-foreach ($entry in $watch) {
+foreach ($entry in (Get-VcoWatchList)) {
     $name = $entry.Name
     $port = $entry.Port
     $kind = $entry.Kind
     $endpoint = $entry.Endpoint
 
     if (-not (Test-ContainerRunning $name)) {
-        $absent++
+        $script:absent++
         if ($verbose) { Write-Output "verify-container-ports: $name not running (skip)" }
         continue
     }
 
-    $ok = if ($kind -eq "http") { Test-PortHttp $port $endpoint } else { Test-PortTcp $port }
-
-    if ($ok) {
-        $healthy++
-        if ($verbose) { Write-Output "verify-container-ports: $name :$port OK" }
-        continue
-    }
-
+    # A dead main PID is a zombie whatever its port says; the port is probed
+    # only for a live (or uncheckable) PID (parity with the .sh sibling).
     if (Test-ContainerPidAlive $name) {
-        if ($verbose) { Write-Output "verify-container-ports: $name :$port slow (PID alive, starting up?)" }
+        $ok = if ($kind -eq "http") { Test-PortHttp $port $endpoint } else { Test-PortTcp $port }
+        if ($ok) {
+            $script:healthy++
+            Add-VcoLogContainer -Name $name -Port $port -Result "healthy"
+            if ($verbose) { Write-Output "verify-container-ports: $name :$port OK" }
+        } else {
+            Add-VcoLogContainer -Name $name -Port $port -Result "slow"
+            if ($verbose) { Write-Output "verify-container-ports: $name :$port slow (PID alive, starting up?)" }
+        }
         continue
     }
 
+    Add-VcoLogContainer -Name $name -Port $port -Result "zombie"
     $zombies += @{ Name = $name; Port = $port }
 }
+return ,$zombies
+}
 
+$zombies = Find-VcoZombies
 if ($zombies.Count -eq 0) {
-    if ($verbose) { Write-Output "verify-container-ports: $healthy healthy, $absent absent, 0 zombies" }
+    if ($verbose) { Write-Output "verify-container-ports: $($script:healthy) healthy, $($script:absent) absent, 0 zombies" }
+    Write-VcoPortCheckLog -Action "none"
+    return
+}
+# Recover only under the session lock, after the reconcile, on a repeated
+# detection (see the header of this section).
+. (Join-Path $LibDir "session-lock.ps1")
+$VcoSessionLock = Enter-VcoSessionLock -RunPy $RunPy -WaitSeconds 20
+if (-not $VcoSessionLock.Held) {
+    Write-Output "verify-container-ports: $($zombies.Count) zombie container(s) seen, but ensure-containers still holds the session lock; not recovered here (the next session re-checks)"
+    Write-VcoPortCheckLog -Action "lock_busy" -Reason "ensure-containers held the session lock"
+    return
+}
+# Exit 5 = the rows are not known to be current: nothing is removed on them.
+& $RunPy -m vco_lib.service_lifecycle session-reconcile --if-stale 60 --require-fresh 2>$null | ForEach-Object { Write-Output $_ }
+$rowsChecked = ($LASTEXITCODE -eq 0)
+$lcPlan = Read-VcoLifecyclePlan
+$zombies = Find-VcoZombies
+if ($zombies.Count -eq 0) {
+    if ($verbose) { Write-Output "verify-container-ports: recovered meanwhile (ensure-containers); nothing to do" }
+    Write-VcoPortCheckLog -Action "none"
     return
 }
 
@@ -232,12 +352,11 @@ foreach ($path in $composeCandidates) {
 }
 
 # v0.2.97 (plan invariant I1 + the zombie gate, parity with the .sh
-# sibling): only a VCO-managed service (launcher.db service_endpoints plan)
-# is `rm -f`'d and re-created, by compose naming that ONE service with
-# `--no-deps`. An adopted container is never removed. No readable plan ->
+# sibling): only a VCO-managed service (launcher.db service_endpoints plan,
+# re-read above after the reconcile) is `rm -f`'d and re-created, by compose
+# naming that ONE service with `--no-deps`. An adopted container, or one
+# whose service has no row yet, is never removed. No readable plan ->
 # nothing is re-created.
-$lcPlan = $null
-try { $lcPlan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json } catch { $lcPlan = $null }
 
 foreach ($z in $zombies) {
     $name = $z.Name
@@ -246,13 +365,22 @@ foreach ($z in $zombies) {
     if ($runtime -eq "podman") {
         if (-not $lcPlan) {
             Write-Output "     ! the service_endpoints plan could not be read - $name left as is (manual: $runtime start $name)"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "the service_endpoints plan could not be read"
             continue
         }
         $policy = @($lcPlan.containers | Where-Object { $_.container -eq $name }) | Select-Object -First 1
         if (-not $policy -or $policy.on_zombie -ne 'recreate') {
-            # Not VCO-managed (adopted / unlisted): ensure-containers cleans
-            # its orphan runtime state and starts it BY NAME; never removed.
+            # Not VCO-managed (adopted / unlisted / no row yet - ownership
+            # unknown): ensure-containers cleans its orphan runtime state and
+            # starts it BY NAME; never removed.
             Write-Output "     ! $name is not VCO-managed - never removed or re-created here (manual: $runtime start $name)"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "not VCO-managed"
+            continue
+        }
+        if (-not $rowsChecked) {
+            # The session reconcile did not complete: the row may be stale.
+            Write-Output "     ! the service_endpoints rows could not be re-checked this session - $name left as is (manual: $runtime start $name)"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "the service_endpoints rows could not be re-checked"
             continue
         }
         $service = [string]$policy.service
@@ -262,6 +390,7 @@ foreach ($z in $zombies) {
         } catch { $upArgs = $null }
         if (-not $upArgs -or $upArgs.Count -eq 0) {
             Write-Output "     ! no compose argv for $service - $name left as is"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "no compose argv"
             continue
         }
         # Podman state-DB desync: force-rm + recreate. `podman restart`
@@ -281,15 +410,20 @@ foreach ($z in $zombies) {
                     & $composeInvocation.Head @($composeInvocation.Rest) @upArgs *>$null
                     if ($LASTEXITCODE -ne 0) {
                         Write-Output "     ! $($composeArgs -join ' ') $($upArgs -join ' ') failed; manual: cd $composeDir; $($composeArgs -join ' ') $($upArgs -join ' ')"
+                        Add-VcoLogRecovery -Name $name -Action "failed" -Detail "removed; compose up failed"
+                    } else {
+                        Add-VcoLogRecovery -Name $name -Action "recreated" -Detail ($upArgs -join ' ')
                     }
                 } finally {
                     Pop-Location
                 }
             } else {
                 Write-Output "     ! could not auto-detect compose dir; manual: $($composeArgs -join ' ') $($upArgs -join ' ')"
+                Add-VcoLogRecovery -Name $name -Action "failed" -Detail "removed; no compose directory found"
             }
         } else {
             Write-Output "     ! $runtime rm -f $name failed"
+            Add-VcoLogRecovery -Name $name -Action "failed" -Detail "$runtime rm -f failed"
         }
     } else {
         # Docker silent-crash: state DB is reliable, so the app inside
@@ -297,8 +431,12 @@ foreach ($z in $zombies) {
         & $runtime restart $name *>$null
         if ($LASTEXITCODE -ne 0) {
             Write-Output "     ! $runtime restart $name failed; manual: $runtime logs $name"
+            Add-VcoLogRecovery -Name $name -Action "failed" -Detail "$runtime restart failed"
+        } else {
+            Add-VcoLogRecovery -Name $name -Action "restarted"
         }
     }
 }
+Write-VcoPortCheckLog -Action "recovered"
 
 Write-Output "   recovery complete; first KG/Ollama call may take 20-30s while services warm up"

@@ -744,11 +744,10 @@ fn weaviate_url(db: &Db) -> String {
     vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
-fn weaviate_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))
+/// A client for `wurl` (the machine's Weaviate — loopback unless adopted
+/// elsewhere): `vct_launcher_core::services::loopback_http::client_for`.
+fn weaviate_client(wurl: &str) -> Result<reqwest::Client, String> {
+    vct_launcher_core::services::loopback_http::client_for(wurl, std::time::Duration::from_secs(15))
 }
 
 /// Hub-side mirror of `commands::kg::require_kg_read`. Same DB table,
@@ -936,11 +935,11 @@ struct CollectionSummary {
 }
 
 async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&state.0.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let wurl = weaviate_url(&state.0.0);
     let names = match detect_orchestrator_kg_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
@@ -964,11 +963,11 @@ async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Respo
 }
 
 async fn codegraph_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&state.0.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let wurl = weaviate_url(&state.0.0);
     let names = match detect_codegraph_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
@@ -1030,11 +1029,11 @@ async fn kg_search(
     }
     let limit = req.limit.unwrap_or(20).min(100);
 
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&h.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let wurl = weaviate_url(&h.0);
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (v, false),
@@ -1227,11 +1226,11 @@ async fn codegraph_search(
             .into_response();
     }
 
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&h.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let wurl = weaviate_url(&h.0);
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (filter_codegraph_by_scope(v, &scope), false),
@@ -1585,7 +1584,7 @@ mod cli_kg_integration_tests {
             .expect("insert project");
 
         // Grant read on every detected orchestrator-shaped collection.
-        let client = weaviate_client().unwrap();
+        let client = weaviate_client(&weaviate_url(&handle.0)).unwrap();
         let cols =
             detect_orchestrator_kg_collections(&client, &weaviate_url(&handle.0)).await.unwrap_or_default();
         for c in &cols {
@@ -1705,7 +1704,7 @@ mod cli_kg_integration_tests {
         .unwrap();
 
         // Pick a real orchestrator-shaped collection but DON'T grant it.
-        let wclient = weaviate_client().unwrap();
+        let wclient = weaviate_client(&weaviate_url(&h.0)).unwrap();
         let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
@@ -1767,7 +1766,7 @@ mod cli_kg_integration_tests {
         let (base, h) = spawn_real_weaviate_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
-        let wclient = weaviate_client().unwrap();
+        let wclient = weaviate_client(&weaviate_url(&h.0)).unwrap();
         let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
@@ -1920,7 +1919,7 @@ mod cli_kg_integration_tests {
 
         let wurl = format!("http://{}", addr);
 
-        let client = weaviate_client().unwrap();
+        let client = weaviate_client(&wurl).unwrap();
         let detected =
             detect_orchestrator_kg_collections(&client, &wurl).await.unwrap();
 
@@ -1945,7 +1944,7 @@ mod cli_kg_integration_tests {
 
         let wurl = format!("http://{}", addr);
 
-        let client = weaviate_client().unwrap();
+        let client = weaviate_client(&wurl).unwrap();
         let detected =
             detect_orchestrator_kg_collections(&client, &wurl).await;
 

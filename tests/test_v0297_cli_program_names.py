@@ -258,17 +258,24 @@ def test_the_classifier(text: str, markdown: bool, expected: list[str]) -> None:
 def test_vct_cli_reads_the_file_the_telemetry_uploader_writes(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``vct-cli telemetry pending`` mirrors the uploader's path as two string
-    constants (the CLI is a standalone binary; a Python spawn to learn a path
-    would be the wrong trade). The uploader runs for real under a scratch
-    home, and the file must land where the Rust constants point."""
+    """``vct-cli telemetry pending`` reads where the uploader parks events:
+    ``<home>/.vibecoded/telemetry_pending.jsonl``.
+
+    This is the PYTHON half of the parity pin and asserts behaviour only —
+    the uploader runs for real under a scratch home and must land the file at
+    exactly that layout. The RUST half is
+    ``launcher/tools/vct-cli/tests/cli_telemetry_pending.rs`` (the repo's
+    existing black-box pattern: it runs the BUILT binary via
+    ``CARGO_BIN_EXE_vct-cli`` and asserts the ``path`` it reports is the same
+    layout under its scratch home). The old regex read of ``main.rs``'s
+    constants is gone: a wrong-but-dead constant passed it, and the pytest
+    suite never builds the Rust binary to check the live one.
+    """
     from VCThelpers.telemetry import uploader
 
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
     assert uploader._write_pending_jsonl([{"event": "probe"}]) == 1
 
-    source = (REPO / "launcher" / "tools" / "vct-cli" / "src" / "main.rs").read_text(encoding="utf-8")
-    consts = dict(re.findall(r'const (TELEMETRY_PENDING_\w+): &str = "([^"]+)";', source))
-    written = tmp_path / consts["TELEMETRY_PENDING_DIR"] / consts["TELEMETRY_PENDING_FILE"]
+    written = tmp_path / ".vibecoded" / "telemetry_pending.jsonl"
     assert written.read_text(encoding="utf-8") == '{"event":"probe"}\n'

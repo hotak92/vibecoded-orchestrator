@@ -32,6 +32,17 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Bypass: VCT_SKIP_PORT_WATCHDOG=1
 # Verbose:  VCT_PORT_WATCHDOG_VERBOSE=1 (default: only prints when it
 #           actually finds drift)
+#
+# Log: every run appends ONE JSON line to
+# <project>/.claude/logs/container_port_check.jsonl (<project> =
+# $CLAUDE_PROJECT_DIR, else the project this hook is installed in):
+# timestamp, runtime, each service's result (healthy | slow | zombie |
+# absent, with the container and port) and the action taken (none | skipped
+# + reason | waiting_for_session_lock | recovered + what was done to each
+# zombie). A run that finds a zombie re-runs itself under the session lock,
+# so it writes the detection line and the re-run writes the recovery line.
+# Soft-fail: a log that cannot be written never changes what the hook does.
+# MUST MATCH the record verify-container-ports.ps1 writes.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
@@ -40,6 +51,67 @@ set -uo pipefail
 [ "${VCT_SKIP_PORT_WATCHDOG:-0}" = "1" ] && exit 0
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ── The run log (see the header) ─────────────────────────────────────────
+PORT_CHECK_LOG="${CLAUDE_PROJECT_DIR:-$(cd "$SCRIPT_DIR/../.." 2>/dev/null && pwd)}/.claude/logs/container_port_check.jsonl"
+LOG_RUNTIME=""
+LOG_SERVICES=""   # "service|container|port|result" lines, one per watched container
+LOG_RECOVERY=""   # "container|service|action|detail" lines
+json_str() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/}"
+    s="${s//$'\t'/\\t}"
+    printf '"%s"' "$s"
+}
+# The per-service summary: the most telling state of the service's watched
+# containers (zombie > slow > healthy); absent when none of them runs.
+log_services_json() {
+    local out="" svc best bc bp rank line s c p r rk
+    for svc in weaviate ollama code_embed; do
+        best="absent"; bc=""; bp=""; rank=0
+        while IFS='|' read -r s c p r; do
+            [ "$s" = "$svc" ] || continue
+            case "$r" in zombie) rk=3 ;; slow) rk=2 ;; healthy) rk=1 ;; *) rk=0 ;; esac
+            if [ "$rk" -gt "$rank" ]; then rank=$rk; best="$r"; bc="$c"; bp="$p"; fi
+        done <<< "$LOG_SERVICES"
+        line="$(json_str "$svc"):{\"result\":$(json_str "$best")"
+        [ -n "$bc" ] && line="$line,\"container\":$(json_str "$bc")"
+        case "$bp" in ''|*[!0-9]*) ;; *) line="$line,\"port\":$bp" ;; esac
+        out="${out:+$out,}$line}"
+    done
+    printf '{%s}' "$out"
+}
+log_recovery_json() {
+    local out="" c s a d
+    while IFS='|' read -r c s a d; do
+        [ -n "$c" ] || continue
+        out="${out:+$out,}{\"container\":$(json_str "$c"),\"service\":$(json_str "$s"),\"action\":$(json_str "$a"),\"detail\":$(json_str "$d")}"
+    done <<< "$LOG_RECOVERY"
+    printf '[%s]' "$out"
+}
+log_run() {  # $1 = action, $2 = reason ("" = none)
+    local ts line
+    ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null)"
+    line="{\"timestamp\":$(json_str "$ts"),\"hook\":\"verify-container-ports\",\"runtime\":$(json_str "$LOG_RUNTIME"),\"services\":$(log_services_json),\"action\":$(json_str "$1")"
+    [ -n "${2:-}" ] && line="$line,\"reason\":$(json_str "$2")"
+    [ -n "$LOG_RECOVERY" ] && line="$line,\"recovery\":$(log_recovery_json)"
+    line="$line}"
+    { mkdir -p "$(dirname "$PORT_CHECK_LOG")" && printf '%s\n' "$line" >> "$PORT_CHECK_LOG"; } 2>/dev/null || true
+}
+service_of() {
+    case "$1" in
+        *weaviate*) echo weaviate ;;
+        *ollama*) echo ollama ;;
+        *code_embed*) echo code_embed ;;
+        *) echo "" ;;
+    esac
+}
+log_container() { LOG_SERVICES="${LOG_SERVICES}$(service_of "$1")|$1|$2|$3"$'\n'; }
+log_recovered() { LOG_RECOVERY="${LOG_RECOVERY}$1|$(service_of "$1")|$2|$3"$'\n'; }
+
 # Container runtime + compose: ONE home — `python -m vco_lib.containers resolve`
 # (v0.2.92 PLAN-EXTENSION §3.5 / R13). This hook used to mirror the
 # podman/docker + compose-form detection inline (as did two sibling hooks,
@@ -58,6 +130,7 @@ fi
 RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
 if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
     echo "verify-container-ports: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
+    log_run skipped "no Python interpreter for vco_lib (broken VCO install?)"
     exit 0
 fi
 __vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
@@ -67,6 +140,7 @@ case "$__vco_rt_rc" in
     *)
         echo "verify-container-ports: vco_lib.containers resolve failed (rc=$__vco_rt_rc): $(tail -n 3 "$__vco_rt_err" 2>/dev/null | tr '\n' ' ')"
         rm -f "$__vco_rt_err"
+        log_run skipped "vco_lib.containers resolve failed (rc=$__vco_rt_rc)"
         exit 0
         ;;
 esac
@@ -85,18 +159,50 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     if [ -n "${VCO_RUNTIME_REQUESTED:-}" ]; then
         echo "verify-container-ports: $VCO_RUNTIME_REASON; skipping"
     fi
+    log_run skipped "${VCO_RUNTIME_REASON:-no usable container runtime}"
     exit 0
 fi
 RUNTIME="$VCO_RUNTIME"
+LOG_RUNTIME="$RUNTIME"
 # Compose driver as an argv array (the resolver quotes each token).
 if [ "${#VCO_COMPOSE_ARGV[@]}" -gt 0 ]; then COMPOSE_CMD=("${VCO_COMPOSE_ARGV[@]}"); else COMPOSE_CMD=("$RUNTIME" "compose"); fi
 case "$RUNTIME" in
     podman|docker)
         ;;
     *)
+        log_run skipped "unsupported container runtime: $RUNTIME"
         exit 0
         ;;
 esac
+
+# v0.2.97 (R7a F10): this watchdog and ensure-containers both act on the
+# containers at session start, concurrently (`async` hooks). Recovery here now
+# happens only under the per-user session lock ensure-containers holds for its
+# own "reconcile → plan → act" (`vco_lib.service_lifecycle with-session-lock`),
+# and only after that reconcile — so a zombie is judged against CORRECTED rows,
+# never removed on a stale one, and never recovered by both hooks at once.
+# Detection runs unlocked; when it finds a zombie, the script re-runs itself
+# under the lock (detection repeats there: ensure-containers may have
+# recovered it meanwhile).
+LOCK_HELD="${VCO_SESSION_LOCK_HELD:-}"
+ROWS_CHECKED=false
+if [ -n "$LOCK_HELD" ]; then
+    # Reconcile first (once per minute across both hooks); exit 5 = the rows
+    # are not known to be current, so nothing is removed on them below.
+    "$RUN_PY" -m vco_lib.service_lifecycle session-reconcile --if-stale 60 --require-fresh 2>/dev/null
+    [ $? -eq 0 ] && ROWS_CHECKED=true
+fi
+
+# The lifecycle plan: which container is which service's, its port (the
+# row's, not a literal), and what may be done to it. Read-only.
+unset VCO_WEAVIATE_PORT VCO_OLLAMA_PORT VCO_CODE_EMBED_PORT
+__vcp_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || __vcp_plan=""
+[ -n "$__vcp_plan" ] && eval "$__vcp_plan"
+# Where each service answers: the row's port (VCO_<SERVICE>_PORT from the
+# plan), else the compiled default when no plan could be read.
+WEAVIATE_PROBE_PORT="${VCO_WEAVIATE_PORT:-8081}"
+OLLAMA_PROBE_PORT="${VCO_OLLAMA_PORT:-11435}"
+CODE_EMBED_PROBE_PORT="${VCO_CODE_EMBED_PORT:-11440}"
 
 # Container | host_port | probe_kind | probe_endpoint
 # probe_kind: "http" → curl with --max-time 3
@@ -116,18 +222,18 @@ esac
 # change — the test_pr2_templates_portability tests pin them together.
 WATCH=(
     # Weaviate — canonical first
-    "vco_weaviate|8081|http|/v1/meta"
-    "weaviate|8081|http|/v1/meta"
-    "weaviate_claude|8081|http|/v1/meta"
+    "vco_weaviate|$WEAVIATE_PROBE_PORT|http|/v1/meta"
+    "weaviate|$WEAVIATE_PROBE_PORT|http|/v1/meta"
+    "weaviate_claude|$WEAVIATE_PROBE_PORT|http|/v1/meta"
     # Ollama
-    "vco_ollama|11435|http|/api/tags"
-    "ollama|11435|http|/api/tags"
-    "ollama_claude|11435|http|/api/tags"
+    "vco_ollama|$OLLAMA_PROBE_PORT|http|/api/tags"
+    "ollama|$OLLAMA_PROBE_PORT|http|/api/tags"
+    "ollama_claude|$OLLAMA_PROBE_PORT|http|/api/tags"
     # Code-embedding service
-    "vco_code_embed|11440|tcp|"
-    "vct_code_embed|11440|tcp|"
-    "code_embed|11440|tcp|"
-    "code_embed_claude|11440|tcp|"
+    "vco_code_embed|$CODE_EMBED_PROBE_PORT|tcp|"
+    "vct_code_embed|$CODE_EMBED_PROBE_PORT|tcp|"
+    "code_embed|$CODE_EMBED_PROBE_PORT|tcp|"
+    "code_embed_claude|$CODE_EMBED_PROBE_PORT|tcp|"
     # NOTE: v0.2.50 audit F2 (2026-06-08) — the `model_router_claude|11436`
     # row that previously lived here was a maintainer-machine leak (same
     # shape as the `_claude` suffix family v0.2.15 already cleaned up
@@ -184,23 +290,37 @@ for entry in "${WATCH[@]}"; do
         [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $name not running (skip)"
         continue
     fi
-    if probe_port "$kind" "$port" "$endpoint"; then
-        healthy=$((healthy + 1))
-        [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $name :$port OK"
-        continue
-    fi
-    # Probe failed AND container "running" → suspect zombie. Cross-check
-    # the actual PID — if alive, the port is just slow to bind; skip.
+    # "Running" with a DEAD main PID is a zombie whatever its port says —
+    # nothing in the container can be serving it — so the PID is checked
+    # first and a dead container's port is never probed (v0.2.97). A live
+    # (or uncheckable) PID: probe the port; failing → slow to bind, skip.
     if container_pid_alive "$name"; then
-        [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $name :$port slow (PID alive, starting up?)"
+        if probe_port "$kind" "$port" "$endpoint"; then
+            healthy=$((healthy + 1))
+            log_container "$name" "$port" healthy
+            [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $name :$port OK"
+        else
+            log_container "$name" "$port" slow
+            [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $name :$port slow (PID alive, starting up?)"
+        fi
         continue
     fi
+    log_container "$name" "$port" zombie
     zombies+=("$name|$port")
 done
 
 if [ "${#zombies[@]}" -eq 0 ]; then
     [ "$VERBOSE" = "1" ] && echo "verify-container-ports: $healthy healthy, $absent absent, 0 zombies"
+    log_run none
     exit 0
+fi
+if [ -z "$LOCK_HELD" ]; then
+    # The re-run under the lock appends the recovery line.
+    log_run waiting_for_session_lock
+    # Recover only under the session lock, after the reconcile (see above).
+    exec "$RUN_PY" -m vco_lib.service_lifecycle with-session-lock --wait 20 \
+        --busy "verify-container-ports: ${#zombies[@]} zombie container(s) seen, but ensure-containers still holds the session lock; not recovered here (the next session re-checks)" \
+        -- bash "${BASH_SOURCE[0]}" "$@"
 fi
 
 echo "🩺 Container port-binding watchdog: ${#zombies[@]} zombie state(s) detected"
@@ -230,8 +350,6 @@ done
 # re-create would put it on the installer's default, EMPTY volume. No
 # readable plan → nothing is re-created.
 up_args=()
-__vcp_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || __vcp_plan=""
-[ -n "$__vcp_plan" ] && eval "$__vcp_plan"
 zombie_policy() {  # container → "<service|-> <on_zombie>"
     local i
     for i in "${!VCO_LC_CONTAINER[@]}"; do
@@ -249,13 +367,24 @@ for entry in "${zombies[@]}"; do
     if [ "$RUNTIME" = "podman" ]; then
         if [ -z "$__vcp_plan" ]; then
             echo "     ! the service_endpoints plan could not be read — $name left as is (manual: $RUNTIME start $name)"
+            log_recovered "$name" left_as_is "the service_endpoints plan could not be read"
             continue
         fi
         read -r service on_zombie <<< "$(zombie_policy "$name")"
         if [ "$on_zombie" != "recreate" ]; then
-            # Not VCO-managed (adopted / unlisted): ensure-containers cleans
-            # its orphan runtime state and starts it BY NAME; never removed.
+            # Not VCO-managed (adopted / unlisted / no row yet — ownership
+            # unknown): ensure-containers cleans its orphan runtime state and
+            # starts it BY NAME; never removed.
             echo "     ! $name is not VCO-managed — never removed or re-created here (manual: $RUNTIME start $name)"
+            log_recovered "$name" left_as_is "not VCO-managed"
+            continue
+        fi
+        if [ "$ROWS_CHECKED" != true ]; then
+            # The session reconcile did not complete: the row may be stale (a
+            # container another compose project now owns), and a re-create
+            # would put the service on the installer's default volume.
+            echo "     ! the service_endpoints rows could not be re-checked this session — $name left as is (manual: $RUNTIME start $name)"
+            log_recovered "$name" left_as_is "the service_endpoints rows could not be re-checked"
             continue
         fi
         # Podman state-DB desync: force-rm + recreate. `podman restart`
@@ -263,28 +392,39 @@ for entry in "${zombies[@]}"; do
         up_line="$("$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services "$service" 2>/dev/null)" || up_line=""
         if [ -z "$up_line" ]; then
             echo "     ! no compose argv for $service — $name left as is"
+            log_recovered "$name" left_as_is "no compose argv"
             continue
         fi
         eval "up_args=($up_line)"
         if "$RUNTIME" rm -f "$name" >/dev/null 2>&1; then
             if [ -n "$compose_dir" ]; then
-                ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" "${up_args[@]}" >/dev/null 2>&1 ) || \
+                if ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" "${up_args[@]}" >/dev/null 2>&1 ); then
+                    log_recovered "$name" recreated "$up_line"
+                else
                     echo "     ! ${COMPOSE_CMD[*]} $up_line failed; manual: cd $compose_dir && ${COMPOSE_CMD[*]} $up_line"
+                    log_recovered "$name" failed "removed; compose up failed"
+                fi
             else
                 echo "     ! could not auto-detect compose dir; manual: ${COMPOSE_CMD[*]} $up_line"
+                log_recovered "$name" failed "removed; no compose directory found"
             fi
         else
             echo "     ! $RUNTIME rm -f $name failed"
+            log_recovered "$name" failed "$RUNTIME rm -f failed"
         fi
     else
         # Docker silent-crash: state DB is reliable, so this means the
         # app inside the container has wedged. `docker restart` cycles
         # PID 1 and is enough.
-        if ! "$RUNTIME" restart "$name" >/dev/null 2>&1; then
+        if "$RUNTIME" restart "$name" >/dev/null 2>&1; then
+            log_recovered "$name" restarted ""
+        else
             echo "     ! $RUNTIME restart $name failed; manual: $RUNTIME logs $name"
+            log_recovered "$name" failed "$RUNTIME restart failed"
         fi
     fi
 done
+log_run recovered
 
 echo "   recovery complete; first KG/Ollama call may take 20-30s while services warm up"
 exit 0

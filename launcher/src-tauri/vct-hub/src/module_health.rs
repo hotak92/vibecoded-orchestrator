@@ -62,8 +62,10 @@ use vct_launcher_core::services::container_runtime::{
 
 use crate::modules_api::LauncherDbHandle;
 
-/// Env switch: `VCT_HUB_MODULE_HEALTH=0` disables the poller (every status
-/// then stays `unknown`).
+/// Env switch: `VCT_HUB_MODULE_HEALTH=0` (or `false` / `no` / `off`, any
+/// case — the hub's one opt-out parser, `infra_watchdog::parse_enabled`)
+/// disables the poller (every status then stays `unknown`). Documented in
+/// `docs/CONFIGURATION.md` (the vct-hub table).
 pub const ENV_ENABLED: &str = "VCT_HUB_MODULE_HEALTH";
 pub const MIN_INTERVAL: Duration = Duration::from_secs(5);
 pub const MAX_INTERVAL: Duration = Duration::from_secs(3600);
@@ -137,10 +139,37 @@ fn clamp(d: Duration, lo: Duration, hi: Duration) -> Duration {
     d.max(lo).min(hi)
 }
 
-fn is_loopback_host(host: &str) -> bool {
-    let bare = host.trim_start_matches('[').trim_end_matches(']');
-    bare.eq_ignore_ascii_case("localhost")
-        || bare.parse::<IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
+// The one loopback rule (R7b F14) — this file carried a second copy with
+// different rules until v0.2.97.
+use vct_launcher_core::services::service_endpoints::is_loopback_host;
+
+/// The core service whose port a health-check URL names through its §15
+/// placeholder (`{code_embed_port}` …), if any.
+fn core_service_named_in(raw_url: &str) -> Option<vct_launcher_core::services::service_endpoints::CoreService> {
+    vct_launcher_core::manifest::SERVICE_PORT_PLACEHOLDERS
+        .iter()
+        .find(|(token, _)| raw_url.contains(token))
+        .map(|(_, svc)| *svc)
+}
+
+/// R7b F6: a core-service check whose service is recorded on ANOTHER host
+/// (an `adopted_external` row such as a LAN GPU box). Its port placeholder
+/// resolves the port only, so probing `localhost:<port>` would report a
+/// healthy remote service as down; the hub contacts only this machine, so the
+/// honest answer is unknown, with the reason. `None` = probe as usual.
+fn core_service_on_another_host(
+    raw_url: &str,
+    row_host: impl Fn(vct_launcher_core::services::service_endpoints::CoreService) -> Option<String>,
+) -> Option<String> {
+    let svc = core_service_named_in(raw_url)?;
+    let host = row_host(svc)?;
+    if is_loopback_host(&host) {
+        return None;
+    }
+    Some(format!(
+        "{} runs on another host ({host}); the hub checks only services on this machine",
+        svc.name()
+    ))
 }
 
 /// A port mapping's bind address reaches the host's loopback: unset (the
@@ -228,6 +257,11 @@ pub fn target_for(manifest: &ModuleManifest, instance: Instance<'_>) -> Option<P
     let Some(raw) = hc.url.as_deref().filter(|u| !u.trim().is_empty()) else {
         return Some(unprobed("http_get health_check has no url".into()));
     };
+    if let Some(reason) = core_service_on_another_host(raw, |svc| {
+        vct_launcher_core::services::service_endpoints::machine_row_from_disk(svc).map(|r| r.host)
+    }) {
+        return Some(unprobed(reason));
+    }
     let placeholders = match instance {
         Instance::Bundled => HashMap::new(),
         Instance::Global => rl_placeholders_global(GLOBAL_RL_PORT),
@@ -446,9 +480,7 @@ pub fn registry() -> &'static Arc<HealthRegistry> {
 /// The probe client: no redirects, no proxy. The per-probe timeout is set on
 /// each request.
 pub fn probe_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .no_proxy()
+    vct_launcher_core::services::loopback_http::builder()
         .build()
         .map_err(|e| format!("health probe client: {e}"))
 }
@@ -501,20 +533,27 @@ fn refresh_targets(registry: &HealthRegistry, db: &Db, now: Instant) {
     }
 }
 
-/// Start the poller (a detached task), unless `VCT_HUB_MODULE_HEALTH=0`.
+/// Start the poller (a detached task), unless [`ENV_ENABLED`] turns it off.
 pub fn spawn_module_health_poller(db: LauncherDbHandle) {
-    if std::env::var(ENV_ENABLED).is_ok_and(|v| v.trim() == "0") {
+    spawn_module_health_poller_with(db, std::env::var(ENV_ENABLED).ok().as_deref());
+}
+
+/// [`spawn_module_health_poller`] with the switch's raw value passed in, so a
+/// test never touches the process env. Returns whether the poller started.
+pub fn spawn_module_health_poller_with(db: LauncherDbHandle, switch: Option<&str>) -> bool {
+    if !crate::infra_watchdog::parse_enabled(switch) {
         tracing::info!(
-            "[vct-hub] module health poller DISABLED via {ENV_ENABLED}=0; every module's \
-             health shows as unknown."
+            "[vct-hub] module health poller DISABLED via {ENV_ENABLED}={}; every module's \
+             health shows as unknown.",
+            switch.unwrap_or_default()
         );
-        return;
+        return false;
     }
     let client = match probe_client() {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "[vct-hub] module health poller not started");
-            return;
+            return false;
         }
     };
     tokio::spawn(async move {
@@ -534,11 +573,22 @@ pub fn spawn_module_health_poller(db: LauncherDbHandle) {
             tokio::time::sleep(sleep).await;
         }
     });
+    true
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R7b F13: every opt-out spelling the hub's other switches accept turns
+    /// the poller off — not only `0`.
+    #[tokio::test]
+    async fn the_health_switch_accepts_every_opt_out_spelling() {
+        let db = || LauncherDbHandle(Arc::new(Db::open_in_memory().unwrap()));
+        for off in ["0", "false", "FALSE", "no", " off "] {
+            assert!(!spawn_module_health_poller_with(db(), Some(off)), "{off:?} must disable it");
+        }
+    }
     use axum::{http::StatusCode, routing::get, Router};
 
     fn manifest(runtime_type: &str, health_check: &str, ports: &str) -> ModuleManifest {
@@ -556,6 +606,53 @@ mod tests {
 
     fn http(url: &str) -> String {
         format!(r#"{{ "type": "http_get", "url": "{url}", "timeout_s": 2, "interval_s": 30 }}"#)
+    }
+
+    /// R7b F6: a core-service check whose service is recorded on another
+    /// host reads unknown with that reason — never a `localhost` probe that
+    /// would report a healthy remote service as down. A loopback row, a URL
+    /// naming no core service, or no row at all: probed as usual. (Ollama and
+    /// Weaviate can be adopted on another host; code-embed is always VCO's own
+    /// — the `service_endpoints` CHECK — so for `{code_embed_port}` this only
+    /// ever says "probe".)
+    #[test]
+    fn a_core_service_on_another_host_is_unknown_not_down() {
+        use vct_launcher_core::services::service_endpoints::CoreService;
+        let url = "http://localhost:{ollama_port}/api/tags";
+        let on = |host: &'static str| move |svc: CoreService| {
+            assert_eq!(svc, CoreService::Ollama);
+            Some(host.to_string())
+        };
+        let reason = core_service_on_another_host(url, on("192.168.7.9")).expect("unknown");
+        assert!(reason.contains("another host (192.168.7.9)"), "{reason}");
+        assert_eq!(core_service_on_another_host(url, on("localhost")), None);
+        assert_eq!(core_service_on_another_host(url, on("127.0.0.1")), None);
+        assert_eq!(core_service_on_another_host(url, |_| None), None);
+        assert_eq!(core_service_on_another_host("http://localhost:8080/h", on("192.168.7.9")), None);
+    }
+
+    /// The same through `target_for` and the real row reader: an
+    /// `adopted_external` Ollama row on a LAN host makes a module whose check
+    /// names `{ollama_port}` read unknown.
+    #[test]
+    fn target_for_reads_the_core_service_row_host() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+                "ollama",
+                EndpointMode::AdoptedExternal,
+                "192.168.7.9",
+                11434,
+            ))
+            .unwrap();
+        let m = manifest("service", &http("http://localhost:{ollama_port}/api/tags"), "[]");
+        let t = target_for(&m, Instance::Bundled).expect("a target");
+        match t.probe {
+            Probe::Unprobed { reason } => assert!(reason.contains("192.168.7.9"), "{reason}"),
+            other => panic!("expected unknown, got {other:?}"),
+        }
     }
 
     /// A local server on an ephemeral loopback port: `/ok` 200, `/fail` 503,

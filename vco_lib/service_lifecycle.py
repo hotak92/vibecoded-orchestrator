@@ -17,9 +17,10 @@ launcher read the same rows):
 * :func:`container_policies` / :func:`zombie_action` — per container, what to
   do when it is missing, stopped, or a podman zombie (running with a dead
   PID). A zombie ``vco_managed`` container is removed and re-created; a zombie
-  ADOPTED container only gets its orphan runtime state cleaned and a
-  ``start`` — never ``rm``, because a compose re-create would bring it back on
-  the installer's default (empty) volume;
+  ADOPTED container — or one whose service has NO row yet (ownership
+  unknown) — only gets its orphan runtime state cleaned and a ``start`` —
+  never ``rm``, because a compose re-create would bring it back on the
+  installer's default (empty) volume;
 * :func:`compose_up_args` — the ``up`` argv for an explicit service list
   (``--no-deps`` always: code_embed's ``depends_on: ollama`` must never create
   an Ollama when Ollama is adopted);
@@ -40,7 +41,9 @@ CLI (the hooks and the boot wrapper)::
     python -m vco_lib.service_lifecycle plan --shell|--json [--required "a b"]
     python -m vco_lib.service_lifecycle compose-args --services "a b"
         [--build] [--gpu-mode gpu|cpu|unknown] --shell|--json
-    python -m vco_lib.service_lifecycle session-reconcile [--timeout S]
+    python -m vco_lib.service_lifecycle session-reconcile [--timeout S] [--if-stale S] [--require-fresh]
+    python -m vco_lib.service_lifecycle session-lock-path
+    python -m vco_lib.service_lifecycle with-session-lock [--wait S] [--busy LINE] -- CMD...
 """
 from __future__ import annotations
 
@@ -52,12 +55,12 @@ import shlex
 import subprocess
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import service_endpoints as _se
+from vco_lib.service_probe_http import open_probe
 
 __all__ = [
     "CACHE_DESTINATION",
@@ -69,6 +72,9 @@ __all__ = [
     "lifecycle_plan",
     "migrate_code_embed",
     "migrate_managed_service",
+    "run_with_session_lock",
+    "session_lock_path",
+    "session_reconcile_fresh",
     "zombie_action",
 ]
 
@@ -187,7 +193,17 @@ class ContainerPolicy:
 _IGNORE = ("ignore", "ignore", "ignore")
 
 
-def _policy_for(mode: str, enabled: bool, autostart: bool) -> tuple[str, str, str]:
+def _policy_for(mode: str, enabled: bool, autostart: bool,
+                present: bool = True) -> tuple[str, str, str]:
+    if not present:
+        # NO row (`service_registry_unavailable`, the window before the root
+        # update records the rows, hooks rendered before install.py ran):
+        # ownership is UNKNOWN — the container may be the legacy compose
+        # project's, on a bind the installer's compose does not mount. A
+        # missing one may be created (nothing exists to lose); an existing
+        # one is at most STARTED by name — a zombie gets orphan-state cleanup
+        # + start, never `rm` + re-create onto the installer's default volume.
+        return ("compose", "start", "start")
     if mode == "vco_managed":
         return ("compose", "recreate", "start") if enabled else _IGNORE
     if mode == "adopted_container":
@@ -220,6 +236,7 @@ def container_policies(
             continue
         on_missing, on_zombie, on_stopped = _policy_for(
             entry["mode"], bool(entry["enabled"]), bool(entry["autostart"]),
+            bool(entry["present"]),
         )
         known.append(ContainerPolicy(container, service, entry["mode"],
                                      on_missing, on_zombie, on_stopped))
@@ -301,7 +318,7 @@ TcpOpenFn = Callable[[str, int, float], bool]
 
 def _default_fetch_json(url: str, timeout: float) -> Optional[dict]:
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 — localhost health probe
+        with open_probe(url, timeout) as resp:  # a redirect is an error, never followed
             if int(resp.status) != 200:
                 return None
             body = json.loads(resp.read().decode("utf-8", "replace") or "{}")
@@ -519,6 +536,28 @@ def _published_problem(row: "_se.EndpointRow", state: Any) -> str:
 def _default_commit(root: Path, db_path: Optional[Path]) -> Callable[[Sequence["_se.EndpointRow"]], Any]:
     def commit(rows: Sequence["_se.EndpointRow"]) -> Any:
         return _se.commit_rows(rows, orchestrator_root=root, db_path=db_path)
+    return commit
+
+
+def commit_without_mcp_registration(
+    root: Path, db_path: Optional[Path] = None
+) -> Callable[[Sequence["_se.EndpointRow"]], Any]:
+    """A ``commit`` for a caller that registers the MCPs from the rows ITSELF.
+
+    The installer's step [5b] seam: the run's own step-11 registration
+    (unless ``--skip-mcp-registration``) is the only one, so the row commits
+    a migration triggers must not spawn a second
+    ``--register-default-mcps`` — the default registrar fires at
+    ``commit_rows``'s ``apply_change`` step, twice per migration, rewriting
+    ``~/.claude.json`` mid-step and logging failures on a first install
+    where no launcher binary exists yet (v0.2.97 F6). Everything ELSE in
+    the follow-up chain (infra ``.env``, re-projection) still runs. The
+    reconcile shim passes the same seam via ``apply_kwargs``.
+    """
+    def commit(rows: Sequence["_se.EndpointRow"]) -> Any:
+        return _se.commit_rows(
+            rows, orchestrator_root=root, db_path=db_path,
+            register_mcps=lambda _root: True)
     return commit
 
 
@@ -901,11 +940,124 @@ def session_reconcile_argv() -> list[str]:
             "--json"]
 
 
+# ─── the session-start serialisation (R7a F10) ──────────────────────────
+#
+# Two SessionStart hooks act on containers: `ensure-containers` (reconcile →
+# plan → start / zombie recovery) and `verify-container-ports` (port-binding
+# watchdog → zombie recovery). Both are `async`, so they ran CONCURRENTLY, and
+# the watchdog read the plan without the reconcile that corrects it: it could
+# `rm -f` + re-create a container on a stale row, or race ensure-containers'
+# own recovery of the same zombie. Now both take ONE per-user lock around
+# "reconcile → plan → act", and the reconcile runs once per window (a stamp),
+# whichever hook gets there first.
+#
+# The lock is an OS advisory lock on a file under the VCT state dir, held
+# by a process that exits with the work it guards, so a killed hook never
+# leaves a stale lock: the bash hooks re-run themselves under
+# `with-session-lock` (this module holds `flock(2)` on a NON-inheritable
+# descriptor and runs the hook as its child — a descriptor the child
+# inherited would outlive the hook in every `conmon` a `podman start`
+# spawns); the PowerShell hooks hold a `FileShare.None` FileStream (.NET
+# implements it with the same flock on Unix, a share-mode lock on Windows;
+# its handle is not inherited either). The path is decided here only
+# (:func:`session_lock_path`).
+
+#: Seconds a session reconcile's result stays fresh: a second hook (or a
+#: second session) inside this window reads the rows it just corrected.
+SESSION_RECONCILE_FRESH_S = 60.0
+#: `session-reconcile --require-fresh`: the rows are NOT known to be current.
+SESSION_RECONCILE_EXIT_STALE = 5
+#: Set for the hook re-run under `with-session-lock` (the hook's cue that it
+#: holds the lock and must not re-run itself again).
+SESSION_LOCK_HELD_ENV = "VCO_SESSION_LOCK_HELD"
+
+
+def session_lock_path() -> Path:
+    """The per-user file both container hooks lock (created, with its
+    directory, if missing)."""
+    from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+
+    path = vct_root_dir() / "locks" / "container-session.lock"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.touch(exist_ok=True)
+    return path
+
+
+def session_stamp_path() -> Path:
+    from vco_lib.paths import vct_root_dir  # noqa: PLC0415
+
+    return vct_root_dir() / "locks" / "session-reconcile.stamp"
+
+
+def acquire_session_lock_fd(fd: int, wait_s: float, *,
+                            sleep: Callable[[float], None] = time.sleep,
+                            clock: Callable[[], float] = time.monotonic) -> str:
+    """``flock(LOCK_EX)`` on descriptor *fd*, polling for up to *wait_s*:
+    ``acquired`` | ``timeout`` | ``unsupported`` (no ``fcntl`` — Windows,
+    whose hooks lock in PowerShell)."""
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError:
+        return "unsupported"
+    deadline = clock() + max(0.0, wait_s)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return "acquired"
+        except BlockingIOError:
+            if clock() >= deadline:
+                return "timeout"
+            sleep(0.2)
+        except OSError:
+            return "unsupported"
+
+
+def run_with_session_lock(command: Sequence[str], *, wait_s: float, busy: str = "",
+                          run: Optional[RunFn] = None, out: LogFn = print) -> int:
+    """Run *command* (a hook re-running itself) holding the session lock; the
+    child gets ``VCO_SESSION_LOCK_HELD=1``. The lock descriptor is not
+    inherited (PEP 446), so nothing the hook spawns can keep it. Lock busy
+    past *wait_s* → *busy* is printed and the hook is NOT run (exit 0: the
+    other hook is acting on the same containers, and a session-start hook
+    never fails the session). No ``fcntl`` → the hook runs unlocked."""
+    lock = session_lock_path()
+    with open(lock, "a", encoding="utf-8") as fh:
+        verdict = acquire_session_lock_fd(fh.fileno(), wait_s)
+        if verdict == "timeout":
+            if busy:
+                out(busy)
+            return 0
+        env = dict(os.environ)
+        env[SESSION_LOCK_HELD_ENV] = "1"
+        proc = (run or subprocess.run)(list(command), env=env)
+        return int(proc.returncode)
+
+
+def session_reconcile_fresh(max_age_s: float = SESSION_RECONCILE_FRESH_S, *,
+                            now: Optional[float] = None) -> bool:
+    """Did a session reconcile complete within *max_age_s*?"""
+    try:
+        mtime = session_stamp_path().stat().st_mtime
+    except OSError:
+        return False
+    return (time.time() if now is None else now) - mtime <= max_age_s
+
+
+def _stamp_session_reconcile() -> None:
+    try:
+        path = session_stamp_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"{time.time():.3f}\n", encoding="utf-8")
+    except OSError:
+        pass  # best-effort: without a stamp the next hook simply reconciles again
+
+
 def run_session_reconcile(
     *,
     timeout_s: float = SESSION_RECONCILE_TIMEOUT_S,
     argv: Optional[Sequence[str]] = None,
     run: Optional[RunFn] = None,
+    on_complete: Optional[Callable[[], None]] = None,
 ) -> list[str]:
     """Run the session reconcile as a CHILD PROCESS with a hard time bound,
     and return the lines the session should see (usually none).
@@ -940,6 +1092,8 @@ def run_session_reconcile(
         payload = json.loads(proc.stdout or "{}")
     except ValueError:
         return ["ensure-containers: service_endpoints reconcile printed no readable JSON"]
+    if on_complete is not None:
+        on_complete()  # the rows are now current (the stamp: R7a F10)
     entries = [str(e) for e in (payload.get("entries") or [])] if isinstance(payload, dict) else []
     if not entries:
         return []
@@ -951,9 +1105,29 @@ def run_session_reconcile(
 
 
 def _cli_session_reconcile(args: argparse.Namespace) -> int:
-    for line in run_session_reconcile(timeout_s=args.timeout):
-        print(line)
+    if args.if_stale is None or not session_reconcile_fresh(args.if_stale):
+        for line in run_session_reconcile(timeout_s=args.timeout,
+                                          on_complete=_stamp_session_reconcile):
+            print(line)
+    if args.require_fresh and not session_reconcile_fresh(
+            args.if_stale if args.if_stale is not None else SESSION_RECONCILE_FRESH_S):
+        return SESSION_RECONCILE_EXIT_STALE
     return 0
+
+
+def _cli_session_lock_path(_args: argparse.Namespace) -> int:
+    print(session_lock_path())
+    return 0
+
+
+def _cli_with_session_lock(args: argparse.Namespace) -> int:
+    command = list(args.command)
+    if command and command[0] == "--":
+        command = command[1:]
+    if not command:
+        print("service_lifecycle with-session-lock: no command", file=sys.stderr)
+        return 2
+    return run_with_session_lock(command, wait_s=args.wait, busy=args.busy)
 
 
 def _split_names(raw: Optional[str]) -> Optional[list[str]]:
@@ -1015,9 +1189,27 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
 
     p_rec = sub.add_parser(
         "session-reconcile",
-        help="`service_endpoints reconcile --phase session --json`, time-bounded; always exits 0")
+        help="`service_endpoints reconcile --phase session --json`, time-bounded; exits 0 "
+             "(or 5 with --require-fresh when the rows are not known to be current)")
     p_rec.add_argument("--timeout", type=float, default=SESSION_RECONCILE_TIMEOUT_S)
+    p_rec.add_argument("--if-stale", type=float, default=None, metavar="SECONDS",
+                       help="skip when a session reconcile completed within SECONDS")
+    p_rec.add_argument("--require-fresh", action="store_true",
+                       help="exit 5 unless a session reconcile completed within the window")
     p_rec.set_defaults(handler=_cli_session_reconcile)
+
+    p_lp = sub.add_parser("session-lock-path",
+                          help="the per-user file the container session hooks lock")
+    p_lp.set_defaults(handler=_cli_session_lock_path)
+
+    p_lock = sub.add_parser(
+        "with-session-lock",
+        help="run a container hook holding the per-user session lock (busy past --wait: "
+             "print --busy and run nothing)")
+    p_lock.add_argument("--wait", type=float, default=20.0)
+    p_lock.add_argument("--busy", default="", help="the line printed when the lock stays busy")
+    p_lock.add_argument("command", nargs=argparse.REMAINDER)
+    p_lock.set_defaults(handler=_cli_with_session_lock)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))

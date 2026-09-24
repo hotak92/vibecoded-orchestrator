@@ -55,6 +55,11 @@ if ($UnsetSettings.Count -gt 0) {
     }
 }
 
+# MUST MATCH resolve_threshold in context-size-check.sh, AND the bounds
+# 50..2000 and the defaults 500 / 200 MUST MATCH the `min` / `max` /
+# `default` of launcher/bundled_manifests/vct-session-state.json (R7b F12 —
+# tests/test_v0297_session_state_settings.py drives this function with the
+# manifest's own bounds).
 function Resolve-Threshold {
     param([string]$Key, [int]$Default)
     $value = [Environment]::GetEnvironmentVariable($Key)

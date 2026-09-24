@@ -8,6 +8,11 @@
 
   Mount site: /preferences/modules, under the host-wide enable toggles.
 
+  Each module also shows the HTTP APIs its manifest `provides`
+  (`{ "kind": "http_api", "base_url": … }`), with the URL's placeholder
+  RESOLVED by Rust (`PlaceholderCtx::resolve`: `vct-hub-api`'s `{hub_port}` →
+  the running hub's port) — the one reader of `provides[].base_url` (R7b F11).
+
   Before this panel no launcher surface read a manifest's `settings` block,
   so `docs/VCT_MODULE_MANIFEST_SPEC.md` §8's "user-editable via the launcher
   GUI" was false — `vct-hub-api`'s machine-wide `VCT_HUB_PORT` could only be
@@ -67,6 +72,7 @@
     settingWidget,
     splitByScope,
     textSettingControl,
+    httpApiLines,
     type ListedModuleSettings,
     type ListedSetting,
     type LiveSettingValue,
@@ -345,7 +351,7 @@
   {:else if loadError}
     <p class="load-error" role="alert">{loadError}</p>
   {:else if modules.length === 0}
-    <p class="loading">No module declares a setting.</p>
+    <p class="loading">No module declares a setting or an HTTP API.</p>
   {:else}
     {#if hasPerProject}
       <div class="project-picker">
@@ -378,8 +384,22 @@
             <code class="module-id">{m.module_id}</code>
             {#if m.origin === 'installed'}
               <span class="badge">Installed module</span>
+            {:else if m.origin === 'dev_passthrough'}
+              <span class="badge" title="Shown because VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH is set. Not installed: only its config tab reads these values until it is.">Module in development</span>
             {/if}
           </h3>
+
+          {#each httpApiLines(m) as api (api.url)}
+            <!-- The manifest's `provides` http_api, its port resolved for
+                 this machine (Rust `PlaceholderCtx::resolve`). -->
+            <p class="provides" data-testid="module-http-api">
+              <span class="badge">HTTP API</span>
+              <code>{api.url}</code>
+              {#if api.description}
+                <span class="field-desc">{api.description}</span>
+              {/if}
+            </p>
+          {/each}
 
           {#if groups.machineWide.length > 0}
             <div class="group">
@@ -595,6 +615,18 @@
     border: none;
     margin: 0;
     padding: 0;
+  }
+  .provides {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 0.45rem;
+    margin: 0 0 0.75rem 0;
+    font-size: 0.85rem;
+  }
+  .provides .field-desc {
+    flex-basis: 100%;
+    margin: 0;
   }
   .field-desc {
     margin: 0.35rem 0 0;

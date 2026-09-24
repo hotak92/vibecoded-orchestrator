@@ -41,11 +41,12 @@ import socket
 import subprocess
 import time
 import urllib.error
-import urllib.request
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
 from vco_lib import containers as _containers
+from vco_lib import service_adoption as _service_adoption
+from vco_lib.service_probe_http import open_probe
 from vco_lib.weaviate_helpers import schema_class_names
 
 __all__ = [
@@ -68,6 +69,7 @@ __all__ = [
     "default_tcp_open",
     "detect",
     "list_containers",
+    "list_containers_or_none",
     "ollama_vco_markers",
     "parse_inspect",
     "probe_endpoint",
@@ -195,9 +197,11 @@ def default_fetch(url: str, timeout: float, *, deadline_s: float = READ_DEADLINE
                   clock: Callable[[], float] = time.monotonic) -> Optional[HttpResponse]:
     """GET *url*; ``None`` when nothing answers or the body did not arrive in
     time. An HTTP error status is an answer (a 401 from ``/v1/meta`` is how an
-    auth-enabled Weaviate shows)."""
+    auth-enabled Weaviate shows). A redirect is NOT followed
+    (:mod:`vco_lib.service_probe_http`): it is a 3xx answer, which no
+    fingerprint reads as the service."""
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:  # noqa: S310 - local probe
+        with open_probe(url, timeout) as resp:
             body = read_within(resp, deadline_s, clock=clock)
             if body is None:
                 return None
@@ -267,18 +271,11 @@ class ContainerInfo:
         }
 
 
-def _mount_from(entry: Mapping[str, Any]) -> Optional[Mount]:
-    kind = str(entry.get("Type", "") or "").lower()
-    if kind not in ("bind", "volume"):
-        return None
-    source = str(entry.get("Source", "") or "")
-    if kind == "volume":
-        # Name is the volume name; Source is its mountpoint on the host.
-        source = str(entry.get("Name", "") or "") or source
-    destination = str(entry.get("Destination", "") or "")
-    if not source or not destination:
-        return None
-    return Mount(kind, source, destination)
+def _mount_from(entry: Any) -> Optional[Mount]:
+    """The row-shaped projection of the ONE inspect-mount parser
+    (:func:`vco_lib.service_adoption.mount_from_inspect`)."""
+    spec = _service_adoption.mount_from_inspect(entry)
+    return Mount(*spec.key()) if spec is not None else None
 
 
 def parse_inspect(obj: Mapping[str, Any]) -> Optional[ContainerInfo]:
@@ -307,7 +304,7 @@ def parse_inspect(obj: Mapping[str, Any]) -> Optional[ContainerInfo]:
                 host_ports[int(port_s)] = int(host_port)
                 break
     mounts = tuple(
-        m for m in (_mount_from(e) for e in (obj.get("Mounts") or []) if isinstance(e, Mapping))
+        m for m in (_mount_from(e) for e in (obj.get("Mounts") or []))
         if m is not None
     )
     env: dict[str, str] = {}
@@ -319,33 +316,48 @@ def parse_inspect(obj: Mapping[str, Any]) -> Optional[ContainerInfo]:
                          host_ports=host_ports, mounts=mounts, env=env)
 
 
-def list_containers(runtime: Optional[str], *, run: Optional[RunFn] = None) -> list[ContainerInfo]:
-    """Every container on *runtime* (running or not). ``[]`` without a runtime
-    or on any failure — detection then rests on the HTTP probes alone."""
+def list_containers(runtime: Optional[str], *, run: Optional[RunFn] = None,
+                    names: Optional[Iterable[str]] = None) -> list[ContainerInfo]:
+    """Every container on *runtime* (running or not) — or, with *names*, only
+    those of them that exist (one ``ps`` either way; only they are
+    inspected). ``[]`` without a runtime or on any failure — detection then
+    rests on the HTTP probes alone."""
+    return list_containers_or_none(runtime, run=run, names=names) or []
+
+
+def list_containers_or_none(runtime: Optional[str], *, run: Optional[RunFn] = None,
+                            names: Optional[Iterable[str]] = None) -> Optional[list[ContainerInfo]]:
+    """:func:`list_containers`, but ``None`` when the runtime could not be
+    asked (none, or ``ps`` / ``inspect`` failed) — so "no such container"
+    (``[]``: the runtime answered) is told apart from "could not look"."""
     if not runtime:
-        return []
+        return None
     run = run or subprocess.run
     try:
         res = run([runtime, "ps", "-a", "--format", "{{.Names}}"],
                   capture_output=True, text=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
     if res.returncode != 0:
-        return []
-    names = [n.strip() for n in (res.stdout or "").splitlines() if n.strip()]
+        return None
+    names_found = [n.strip() for n in (res.stdout or "").splitlines() if n.strip()]
+    if names is not None:
+        wanted = set(names)
+        names_found = [n for n in names_found if n in wanted]
+    names = names_found
     if not names:
         return []
     try:
         res = run([runtime, "inspect", "--type", "container", *names],
                   capture_output=True, text=True, timeout=30)
     except (subprocess.TimeoutExpired, OSError):
-        return []
+        return None
     if res.returncode != 0:
-        return []
+        return None
     try:
         payload = json.loads(res.stdout or "[]")
     except ValueError:
-        return []
+        return None
     out = []
     for obj in payload if isinstance(payload, list) else []:
         if isinstance(obj, Mapping):
@@ -378,7 +390,10 @@ def container_ownership(c: ContainerInfo, service: str, installer_project: str) 
         return "installer"
     if c.name == _containers.canonical_name(service):
         return "legacy_vco"
-    home = c.compose_home.replace("\\", "/")
+    # Stripped: `compose_home` joins working_dir and config_files with a
+    # space, so a container carrying only the working_dir label ends in one
+    # and `endswith("/claude_mcp_servers")` would miss VCO's legacy home.
+    home = c.compose_home.strip().replace("\\", "/")
     if any(f"/{d}/" in f"{home}/" or home.endswith(f"/{d}") for d in _LEGACY_VCO_COMPOSE_DIRS):
         return "legacy_vco"
     return "third_party"
@@ -434,8 +449,12 @@ def _json(resp: Optional[HttpResponse]) -> Any:
         return None
 
 
-def probe_endpoint(service: str, base_url: str, *, fetch: FetchFn, timeout: float = 3.0) -> Probe:
-    """Fingerprint whatever answers at *base_url* as *service*."""
+def probe_endpoint(service: str, base_url: str, *, fetch: FetchFn, timeout: float = 3.0,
+                   read_schema: bool = True) -> Probe:
+    """Fingerprint whatever answers at *base_url* as *service*.
+    ``read_schema=False`` (the session drift check): a Weaviate's liveness and
+    version only — its ``/v1/schema`` is not read, so ``vco_markers`` is
+    empty and says nothing about the data it holds."""
     base = base_url.rstrip("/")
     health = fetch(f"{base}{_HEALTH_PATHS[service]}", timeout)
     answered = health is not None and 200 <= health.status < 300
@@ -449,7 +468,7 @@ def probe_endpoint(service: str, base_url: str, *, fetch: FetchFn, timeout: floa
             return Probe(service, base, detail="nothing answers")
         classes: set[str] = set()
         unread = False
-        if not auth:
+        if not auth and read_schema:
             schema = _json(fetch(f"{base}/v1/schema", timeout))
             unread = not isinstance(schema, dict)
             classes = schema_class_names(schema)
@@ -560,6 +579,9 @@ def compatibility(service: str, probe: Optional[Probe], grpc_port: Optional[int]
 class Detection:
     containers: list[ContainerInfo] = field(default_factory=list)
     candidates: dict[str, list[Candidate]] = field(default_factory=dict)
+    #: The runtime answered the listing: a container absent from
+    #: ``containers`` does not exist (``False``: could not look).
+    listed: bool = False
 
     def for_service(self, service: str) -> list[Candidate]:
         return list(self.candidates.get(service, []))
@@ -590,16 +612,32 @@ def detect(
     fetch: Optional[FetchFn] = None,
     tcp_open: Optional[TcpFn] = None,
     services: Sequence[str] = SERVICES,
+    containers: Optional[Sequence[ContainerInfo]] = None,
+    probe_defaults: bool = True,
+    read_schema: Optional[Callable[[str, int], bool]] = None,
+    containers_listed: bool = True,
 ) -> Detection:
     """Every candidate for every service in *services*, probed.
 
     One candidate per (host, port) that something answers on or a container
     publishes; a RUNNING container there owns what answers. A STOPPED
     container is listed on its own (never probed — whatever answers on its
-    port is some other listener, listed separately)."""
+    port is some other listener, listed separately).
+
+    The session drift check narrows it (plan §4a.3): *containers* — the
+    already-listed containers to consider (default: every container on
+    *runtime*; *containers_listed* — whether that listing succeeded);
+    ``probe_defaults=False`` — no sweep of VCO's and upstream's
+    default ports, only *extra_endpoints* and the given containers' ports;
+    *read_schema* — ``(host, port) → bool``, whether a Weaviate's
+    ``/v1/schema`` is read there (default: everywhere)."""
     fetch = fetch or default_fetch
     tcp_open = tcp_open or default_tcp_open
-    detection = Detection(containers=list_containers(runtime, run=run))
+    if containers is not None:
+        detection = Detection(containers=list(containers), listed=containers_listed)
+    else:
+        listed = list_containers_or_none(runtime, run=run)
+        detection = Detection(containers=listed or [], listed=listed is not None)
     for service in services:
         slots: dict[tuple[str, int], dict[str, Any]] = {}
 
@@ -626,7 +664,7 @@ def detect(
                 entry["running"] = c
             else:
                 entry["stopped"].append(c)
-        for port in PROBE_PORTS[service]:
+        for port in PROBE_PORTS[service] if probe_defaults else ():
             slot("localhost", port, f"port:{port}")
         for ep in extra_endpoints:
             if ep.service == service:
@@ -635,7 +673,8 @@ def detect(
 
         out: list[Candidate] = []
         for (host, port), entry in slots.items():
-            probe = probe_endpoint(service, f"{entry['scheme']}://{host}:{port}", fetch=fetch)
+            probe = probe_endpoint(service, f"{entry['scheme']}://{host}:{port}", fetch=fetch,
+                                   read_schema=read_schema is None or read_schema(host, port))
             running: Optional[ContainerInfo] = entry["running"]
             if running is not None or probe.answered:
                 out.append(_candidate(service, host, port, entry, running, probe,

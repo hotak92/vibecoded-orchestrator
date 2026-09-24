@@ -166,16 +166,22 @@ pub async fn get_module_nav_items(
 fn declared_setting(db: &Db, module_id: &str, key: &str) -> Option<FoundSetting> {
     let bundled = module_settings_schema::bundled_module_settings();
     if let Some(d) = module_settings_schema::find_setting(&bundled, module_id, key) {
-        return Some(FoundSetting { decl: d.clone(), origin: DeclOrigin::Bundled });
+        return Some(FoundSetting::bundled(d.clone()));
     }
+    // Installed manifests first; a manifest found ONLY under the dev
+    // passthrough is a module under development, not an installed one
+    // (R7b F24). The orchestrator's own `vct-module.json` declares no
+    // settings; it keeps the installed origin it always had.
+    let dev = crate::commands::installed_modules::dev_paid_modules_paths(db);
     for path in manifest_scan_paths(db) {
         let Ok(raw) = std::fs::read_to_string(&path) else { continue };
         let Ok(manifest) = ModuleManifest::from_json(&raw) else { continue };
         if manifest.id != module_id {
             continue;
         }
-        if let Some(d) = manifest.settings.into_iter().find(|s| s.key == key) {
-            return Some(FoundSetting { decl: d, origin: DeclOrigin::Installed });
+        if let Some(d) = manifest.settings.iter().find(|s| s.key == key).cloned() {
+            let origin = if dev.contains(&path) { DeclOrigin::DevPassthrough } else { DeclOrigin::Installed };
+            return Some(FoundSetting::in_manifest(&manifest, d, origin));
         }
     }
     None
@@ -187,9 +193,21 @@ fn declared_setting(db: &Db, module_id: &str, key: &str) -> Option<FoundSetting>
 /// that does not parse is skipped with a warning.
 fn installed_manifests(db: &Db) -> Vec<ModuleManifest> {
     let bundled_dir = crate::paths::vct_root_dir().join("bundled_manifests");
-    crate::commands::installed_modules::installed_module_manifest_paths(db)
-        .into_iter()
-        .filter(|p| !p.starts_with(&bundled_dir))
+    parse_manifests(
+        crate::commands::installed_modules::installed_module_manifest_paths(db)
+            .into_iter()
+            .filter(|p| !p.starts_with(&bundled_dir)),
+    )
+}
+
+/// The parsed manifests of the modules under development the launcher shows
+/// because `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is set (empty otherwise).
+fn dev_passthrough_manifests(db: &Db) -> Vec<ModuleManifest> {
+    parse_manifests(crate::commands::installed_modules::dev_paid_modules_paths(db).into_iter())
+}
+
+fn parse_manifests(paths: impl Iterator<Item = PathBuf>) -> Vec<ModuleManifest> {
+    paths
         .filter_map(|p| {
             let raw = std::fs::read_to_string(&p).ok()?;
             ModuleManifest::from_json(&raw)
@@ -251,7 +269,7 @@ pub async fn set_module_setting(
 pub async fn list_module_settings(
     db: State<'_, Db>,
 ) -> Result<Vec<module_settings_schema::ListedModuleSettings>, String> {
-    module_settings_schema::list_module_settings(&db, &installed_manifests(&db))
+    module_settings_schema::list_module_settings(&db, &installed_manifests(&db), &dev_passthrough_manifests(&db))
 }
 
 /// The live value of one setting whose home is not `module_settings`.
@@ -369,7 +387,7 @@ fn read_setting(
 }
 
 /// The body of [`set_module_setting`] (no Tauri `State`, so tests call it).
-fn write_setting(
+pub(crate) fn write_setting(
     db: &Db,
     module_id: &str,
     key: &str,
@@ -565,6 +583,60 @@ mod tests {
             Some(serde_json::json!(150)),
             "a refused write left the stored value alone"
         );
+    }
+
+    /// R7b F24: with `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` set, a module in
+    /// `<install root>/paid-modules/` (no install row) is found as a module
+    /// under development: its config-tab save of a declared setting is stored
+    /// (validated), and the settings panel lists it for every project.
+    #[test]
+    fn a_dev_passthrough_modules_setting_is_saved_and_listed() {
+        let root = tempfile::tempdir().unwrap();
+        for marker in ["CLAUDE.md", "install.py"] {
+            std::fs::write(root.path().join(marker), "").unwrap();
+        }
+        std::fs::create_dir_all(root.path().join("state")).unwrap();
+        std::fs::write(root.path().join("state/install-manifest.json"), r#"{"installed": true}"#).unwrap();
+        let module_dir = root.path().join("paid-modules").join("vct-dev-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            r#"{
+              "id": "vct-dev-probe", "name": "Dev probe", "version": "0.0.1", "category": "core",
+              "license": { "required": false },
+              "install": { "method": "local", "install_dir": "{VCT_MODULES}/vct-dev-probe" },
+              "settings": [ { "key": "DEV_LIMIT", "type": "integer", "min": 1, "max": 10 } ],
+              "runtime": { "type": "cli" }
+            }"#,
+        )
+        .unwrap();
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[(
+            crate::commands::installed_modules::DEV_CATALOG_PASSTHROUGH_ENV,
+            Some("1"),
+        )]);
+        let (db, project_id) = open_db_with_project();
+        db.app_state_set(
+            crate::commands::installer::APP_STATE_KEY_INSTALL_PATH,
+            &root.path().to_string_lossy(),
+        )
+        .unwrap();
+
+        write_setting(&db, "vct-dev-probe", "DEV_LIMIT", Some(&project_id), &serde_json::json!(4))
+            .expect("a dev module's save is stored");
+        assert_eq!(db.get_setting(&project_id, "vct-dev-probe", "DEV_LIMIT").unwrap(), Some(serde_json::json!(4)));
+        assert!(write_setting(&db, "vct-dev-probe", "DEV_LIMIT", Some(&project_id), &serde_json::json!(40))
+            .unwrap_err()
+            .contains("at most 10"));
+
+        let listed = module_settings_schema::list_module_settings(
+            &db,
+            &installed_manifests(&db),
+            &dev_passthrough_manifests(&db),
+        )
+        .unwrap();
+        let dev = listed.iter().find(|m| m.module_id == "vct-dev-probe").expect("listed");
+        assert_eq!(dev.origin, DeclOrigin::DevPassthrough);
+        assert_eq!(dev.projects, None);
     }
 
     /// An undeclared key (a config_tab control's state) keeps the old

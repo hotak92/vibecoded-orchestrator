@@ -677,7 +677,7 @@ def test_a_trickling_body_is_cut_off_by_the_deadline(monkeypatch):
     """Uncapped in size, bounded in time: a body that keeps trickling past
     the read deadline is "could not look" (None), never a partial body."""
     ticks = iter(range(10_000))
-    monkeypatch.setattr(det.urllib.request, "urlopen", lambda *_a, **_k: _Trickle())
+    monkeypatch.setattr(det, "open_probe", lambda *_a, **_k: _Trickle())
     got = det.default_fetch("http://h:1/v1/schema", 1.0, deadline_s=5, clock=lambda: float(next(ticks)))
     assert got is None
     # the same body within the deadline arrives WHOLE (no size cap)
@@ -903,6 +903,18 @@ def test_awaits_choice_parity(case):
     if raw is not None:
         row = se.EndpointRow(service=case["service"], source="install_probe", **raw)
     assert se.awaits_choice(case["service"], row) is case["expect"]
+
+
+@pytest.mark.parametrize("case", PARITY["hand_to_vco_cases"], ids=lambda c: c["name"])
+def test_hand_to_vco_row_rule_parity(case):
+    """The row checks `hand-to-vco` makes before asking the runtime — the
+    shared table the Rust `hand_to_vco_allowed` (which gates the Services
+    page's "Let VCO manage it") runs too."""
+    raw = case["row"]
+    row = None
+    if raw is not None:
+        row = se.EndpointRow(service=case["service"], source="install_probe", **raw)
+    assert (sr.hand_to_vco_refusal(case["service"], row) is None) is case["expect"]
 
 
 def test_the_confirmation_probe_is_the_parity_rule(tmp_path):

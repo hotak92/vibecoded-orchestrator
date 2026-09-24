@@ -28,7 +28,8 @@ use vct_launcher_core::db::Db;
 // v0.2.97 (lane V round 3): the hub-private const that lived here is retired —
 // every module-declared and orchestrator-bundled secret this route serves now
 // resolves through `vct_launcher_core::module_secrets_env::resolve_module_secret`,
-// whose `SENTINEL_SHARED` is the one copy. Its history, kept:
+// which uses `vct_launcher_core::secrets::SENTINEL_SHARED` — the one
+// definition every writer and reader imports (R7b F15). Its history, kept:
 //
 // The slot is the one
 // `commands::installer::register_github_pat` writes to and the same slot
@@ -865,18 +866,57 @@ async fn project_env(
         .filter_map(|install| manifests.iter().find(|(_, m)| m.id == install.module_id))
         .map(|(_, m)| m)
         .collect();
+    // R7b F23: a module installed MACHINE-WIDE serves this project when that
+    // install is enabled and the enable cascade leaves it on here — the same
+    // rule the settings editor offers the project's fields by
+    // (`module_settings_schema::global_install_serves_project`).
+    for row in h.0.list_global_module_installs().unwrap_or_default() {
+        let serves = vct_launcher_core::module_settings_schema::global_install_serves_project(
+            &h.0,
+            &row.module_id,
+            &project.id,
+        )
+        .unwrap_or(false);
+        if !serves || active.iter().any(|m| m.id == row.module_id) {
+            continue;
+        }
+        if let Some((_, m)) = manifests.iter().find(|(_, m)| m.id == row.module_id) {
+            active.push(m);
+        }
+    }
+    let mut bundled_ids: Vec<&str> = Vec::new();
     for (path, manifest) in &manifests {
-        if vct_launcher_core::bundled_manifests::is_bundled_manifest_path(&vct_root, path)
-            && !active.iter().any(|m| m.id == manifest.id)
-        {
-            active.push(manifest);
+        if vct_launcher_core::bundled_manifests::is_bundled_manifest_path(&vct_root, path) {
+            bundled_ids.push(&manifest.id);
+            if !active.iter().any(|m| m.id == manifest.id) {
+                active.push(manifest);
+            }
         }
     }
 
     for manifest in active {
-        // Settings (non-secret)
+        // Settings (non-secret). An installed module's value is the
+        // project's row, else (and always, for a `scope: "global"` setting)
+        // the machine-wide row (`module_settings_env::stored_setting_value`,
+        // the spawns' precedence) — R7b F23: a machine-wide value used to be
+        // stored and served by nothing. A BUNDLED module is served its
+        // per-project rows only: each of its machine-wide settings has its
+        // own named reader (`module_setting_bindings` — e.g. the hub reads
+        // `VCT_HUB_PORT` itself; clients find the hub through `hub.port`,
+        // never through this route).
+        let bundled = bundled_ids.contains(&manifest.id.as_str());
         for s in &manifest.settings {
-            if let Ok(Some(v)) = h.0.get_setting(&project.id, &manifest.id, &s.key) {
+            let value = if bundled {
+                h.0.get_setting(&project.id, &manifest.id, &s.key).ok().flatten()
+            } else {
+                vct_launcher_core::module_settings_env::stored_setting_value(
+                    &h.0,
+                    &manifest.id,
+                    s,
+                    Some(&project.id),
+                )
+            };
+            if let Some(v) = value.filter(|v| !v.is_null()) {
                 let as_str = match v {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
@@ -1657,6 +1697,76 @@ mod tests {
         );
     }
 
+    /// R7b F23, per kind: `/env` serves the settings of a module installed
+    /// MACHINE-WIDE (enabled, and on for the project) — a `global` setting
+    /// from the machine-wide row, a per-project one from the project's row
+    /// else the machine-wide row — for every runtime type; a project the
+    /// enable cascade turns it off for gets none; a per-project install falls
+    /// back to the machine-wide row too. A BUNDLED module's machine-wide row
+    /// (the hub's own `VCT_HUB_PORT`) is not served.
+    #[tokio::test]
+    async fn project_env_serves_machine_wide_installs_and_machine_wide_rows() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path());
+        for kind in ["mcp_stdio", "mcp_http", "cli", "container", "service"] {
+            let id = format!("vct-f23-{}", kind.replace('_', "-"));
+            let manifest = serde_json::json!({
+                "id": id, "name": id, "version": "1.0.0", "category": "core",
+                "license": { "required": false },
+                "install": { "method": "local", "install_dir": format!("{{VCT_MODULES}}/{id}") },
+                "settings": [
+                    { "key": format!("{}_PER", kind.to_uppercase()), "type": "string" },
+                    { "key": format!("{}_GLOBAL", kind.to_uppercase()), "type": "string", "scope": "global" }
+                ],
+                "runtime": { "type": kind }
+            });
+            let dir = guard.path().join("modules").join(&id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        }
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-on", "On", "/tmp/f23-on");
+        seed_project(&h.0, "p-off", "Off", "/tmp/f23-off");
+        let env_of = |pid: &'static str| {
+            let base = base.clone();
+            async move {
+                reqwest::get(format!("{}/projects/{pid}/env", base))
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        for kind in ["mcp_stdio", "mcp_http", "cli", "container", "service"] {
+            let id = format!("vct-f23-{}", kind.replace('_', "-"));
+            let (per, global) = (format!("{}_PER", kind.to_uppercase()), format!("{}_GLOBAL", kind.to_uppercase()));
+            h.0.insert_global_module_install(&format!("g-{id}"), &id, "1.0.0", "/tmp/g").unwrap();
+            h.0.module_set_enabled_for_project("p-off", &id, false).unwrap();
+            h.0.set_global_setting(&id, &global, &serde_json::json!("machine")).unwrap();
+            h.0.set_global_setting(&id, &per, &serde_json::json!("machine-default")).unwrap();
+            h.0.set_setting("p-on", &id, &per, &serde_json::json!("project")).unwrap();
+
+            let on = env_of("p-on").await;
+            assert_eq!(on[&global].as_str(), Some("machine"), "{kind}: {on}");
+            assert_eq!(on[&per].as_str(), Some("project"), "{kind}: the project's row wins");
+            let off = env_of("p-off").await;
+            assert!(off.get(&global).is_none() && off.get(&per).is_none(), "{kind}: {off}");
+        }
+
+        // A per-project install with only a machine-wide row: served.
+        seed_project(&h.0, "p-per", "Per", "/tmp/f23-per");
+        h.0.insert_module_install("mi-f23", "p-per", "vct-f23-cli", "1.0.0", "/tmp/m").unwrap();
+        h.0.delete_global_module_install("vct-f23-cli").ok();
+        let per = env_of("p-per").await;
+        assert_eq!(per["CLI_PER"].as_str(), Some("machine-default"), "{per}");
+
+        // The bundled hub module's machine-wide port is not served.
+        h.0.set_global_setting("vct-hub-api", "VCT_HUB_PORT", &serde_json::json!(7811)).unwrap();
+        assert!(env_of("p-on").await.get("VCT_HUB_PORT").is_none());
+    }
+
     /// v0.2.97 (lane V round 2): an installed module's declared secret is
     /// served by `/env` through the shared gate
     /// (`module_secrets_env::resolve_module_secret`) — active → served;
@@ -1962,7 +2072,7 @@ mod tests {
     //
     // H1 fixes both:
     //   * Hub maps `scope='shared'` keychain lookups to SENTINEL_SHARED
-    //     (`_user_shared_`) — see `module_secrets_env::SENTINEL_SHARED` (core), named at the top of
+    //     (`_user_shared_`) — see `vct_launcher_core::secrets::SENTINEL_SHARED`, named at the top of
     //     this module.
     //   * `OrchestratorManifest::bundled_secrets` lets the orchestrator
     //     core declare its own secrets the hub iterates alongside

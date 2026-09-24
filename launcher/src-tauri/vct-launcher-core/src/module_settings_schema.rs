@@ -34,7 +34,7 @@ use serde::Serialize;
 use serde_json::Value;
 
 use crate::db::Db;
-use crate::manifest::{ModuleManifest, SettingDecl};
+use crate::manifest::{ModuleManifest, PlaceholderCtx, ProvidedHttpApi, SettingDecl};
 use crate::module_setting_bindings::{self, SettingBinding};
 
 /// One value per project (the default).
@@ -69,16 +69,117 @@ fn label(decl: &SettingDecl) -> &str {
     }
 }
 
+/// Why a manifest `validation` pattern is outside the PORTABLE subset both of
+/// the launcher's regex engines read the same way, or `None` when it is
+/// inside. The page checks with JavaScript `RegExp` (flags `us`), this gate
+/// with the Rust `regex` crate (`.` matching every character, as with JS `s`);
+/// they agree on literals, `.`, `^` / `$`, `|`, `(...)` / `(?:...)`, the
+/// quantifiers `* + ? {n} {n,} {n,m}` (and their lazy forms), and bracket
+/// classes `[...]` / `[^...]` with ranges — and on escaping one of
+/// `\ ^ $ . | ? * + ( ) [ ] { } /` (plus `-` inside a class). Everything else
+/// differs between them or exists in only one (R7b F21): letter/digit escapes
+/// (`\d \w \s \b` are Unicode in Rust and ASCII in JS; `\p{..}`, `\1`, `\k<..>`
+/// exist in one only), `(?` groups other than `(?:` (lookaround, inline flags,
+/// named groups), nested `[` in a class (POSIX `[:alpha:]`, Rust nesting), the
+/// class operators `&&` `--` `~~`, `{,n}`, and a stray `{` `}` `]`.
+///
+/// Must match `portablePatternProblem` in `launcher/src/lib/module-settings.ts`
+/// (the shared case table runs both).
+pub fn portable_pattern_problem(pattern: &str) -> Option<&'static str> {
+    const ESCAPABLE: &str = "\\^$.|?*+()[]{}/";
+    let chars: Vec<char> = pattern.chars().collect();
+    let mut i = 0;
+    let mut in_class = false;
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '\\' {
+            let Some(&next) = chars.get(i + 1) else {
+                return Some("a trailing backslash");
+            };
+            if !(ESCAPABLE.contains(next) || (in_class && next == '-')) {
+                return Some(
+                    "an escape other than a punctuation character (write a class such as [0-9] \
+                     instead of \\d)",
+                );
+            }
+            i += 2;
+            continue;
+        }
+        if in_class {
+            match c {
+                ']' => in_class = false,
+                '[' => return Some("a '[' inside a character class"),
+                '&' | '-' | '~' if chars.get(i + 1) == Some(&c) => {
+                    return Some("a class operator (&&, --, ~~)");
+                }
+                _ => {}
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            '[' => {
+                in_class = true;
+                // A leading `^` negates, and a `]` right after the opening
+                // (or after `^`) is where the engines part ways: refuse it.
+                let mut j = i + 1;
+                if chars.get(j) == Some(&'^') {
+                    j += 1;
+                }
+                if chars.get(j) == Some(&']') {
+                    return Some("an empty or ']'-first character class");
+                }
+                i = j;
+                continue;
+            }
+            ']' | '}' => return Some("a stray ']' or '}' (escape it)"),
+            '(' if chars.get(i + 1) == Some(&'?') => {
+                if chars.get(i + 2) != Some(&':') {
+                    return Some("a (? group other than (?: (lookaround, flags, named groups)");
+                }
+            }
+            '{' => {
+                let mut j = i + 1;
+                let digits = |from: usize| chars[from..].iter().take_while(|d| d.is_ascii_digit()).count();
+                let n = digits(j);
+                if n == 0 {
+                    return Some("a '{' that is not a {n}, {n,} or {n,m} quantifier (escape it)");
+                }
+                j += n;
+                if chars.get(j) == Some(&',') {
+                    j += 1;
+                    j += digits(j);
+                }
+                if chars.get(j) != Some(&'}') {
+                    return Some("a '{' that is not a {n}, {n,} or {n,m} quantifier (escape it)");
+                }
+                i = j + 1;
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_class {
+        return Some("an unclosed character class");
+    }
+    None
+}
+
 /// Check `value` against its declaration. `Ok(())` means the value may be
 /// stored; `Err` carries a one-line, user-facing reason.
 ///
 /// Rules (must match `checkSettingValue` in `launcher/src/lib/module-settings.ts`):
-/// * `integer` — a JSON whole number (never a numeric string), within
-///   `min` / `max` when declared;
+/// * `integer` — a JSON integer: never a numeric string, and never a number
+///   written with a fraction or exponent (`7700.0`, `7.7e3`) — the readers
+///   (`/env`, the hub's port read) take only an integer's text (R7b F20) —
+///   within `min` / `max` when declared;
 /// * `boolean` — a JSON boolean;
 /// * `string` / `path` — a JSON string; `required` refuses a blank one; a
 ///   non-blank one must be one of `options` (when declared) and must match
-///   `validation` (when declared — an unanchored regex search);
+///   `validation` (when declared — an unanchored regex search; a pattern
+///   outside [`portable_pattern_problem`]'s subset refuses every value, so
+///   the page and this gate can never disagree);
 /// * `multiselect` — a JSON array of strings, each one of `options` (when
 ///   declared); `required` refuses an empty array;
 /// * any other `type` is refused — a value for a type this launcher does not
@@ -88,9 +189,7 @@ pub fn validate_setting_value(decl: &SettingDecl, value: &Value) -> Result<(), S
     match decl.r#type.as_str() {
         "integer" => {
             let n = match value {
-                Value::Number(n) => n
-                    .as_i64()
-                    .or_else(|| n.as_f64().filter(|f| f.fract() == 0.0 && f.abs() < 9.0e15).map(|f| f as i64)),
+                Value::Number(n) => n.as_i64(),
                 _ => None,
             };
             let Some(n) = n else {
@@ -127,9 +226,16 @@ pub fn validate_setting_value(decl: &SettingDecl, value: &Value) -> Result<(), S
                 return Err(format!("{name}: must be one of {}", decl.options.join(", ")));
             }
             if let Some(pattern) = decl.validation.as_deref().filter(|p| !p.is_empty()) {
-                let re = regex::Regex::new(pattern).map_err(|e| {
-                    format!("{name}: the module's validation pattern is invalid ({e})")
-                })?;
+                if let Some(problem) = portable_pattern_problem(pattern) {
+                    return Err(format!(
+                        "{name}: the module's validation pattern uses {problem}, which the \
+                         launcher does not support"
+                    ));
+                }
+                let re = regex::RegexBuilder::new(pattern)
+                    .dot_matches_new_line(true)
+                    .build()
+                    .map_err(|e| format!("{name}: the module's validation pattern is invalid ({e})"))?;
                 if !re.is_match(s) {
                     return Err(format!("{name}: does not match the required format {pattern}"));
                 }
@@ -244,6 +350,12 @@ pub enum DeclOrigin {
     /// An installed (catalog) module's manifest — present only where the
     /// module is installed / enabled ([`projects_offering_module`]).
     Installed,
+    /// A module under development: a manifest in `<install root>/paid-modules/`
+    /// the launcher shows because `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is
+    /// set. It has no install row, so it is offered for every project
+    /// (R7b F24: it used to be taken for an installed module and every write
+    /// was refused "not installed or enabled").
+    DevPassthrough,
 }
 
 /// A setting declaration and where it came from.
@@ -251,18 +363,42 @@ pub enum DeclOrigin {
 pub struct FoundSetting {
     pub decl: SettingDecl,
     pub origin: DeclOrigin,
+    /// The declaring manifest's `runtime.type` (decides who delivers an
+    /// installed module's setting — [`module_setting_bindings::catalog_binding`]).
+    pub runtime_type: String,
+    /// Whether the manifest lists the key in `runtime.env_from_settings`.
+    pub env_listed: bool,
 }
 
 impl FoundSetting {
-    /// Its [`SettingBinding`]: the bundled table's row, or
-    /// [`module_setting_bindings::CATALOG_BINDING`] for an installed module.
+    /// A bundled module's declaration (its binding comes from the bundled
+    /// table, so the runtime fields are not consulted).
+    pub fn bundled(decl: SettingDecl) -> Self {
+        FoundSetting { decl, origin: DeclOrigin::Bundled, runtime_type: String::new(), env_listed: false }
+    }
+
+    /// The declaration of `decl` in `manifest`, found under `origin`.
+    pub fn in_manifest(manifest: &ModuleManifest, decl: SettingDecl, origin: DeclOrigin) -> Self {
+        let env_listed = manifest.runtime.env_from_settings.iter().any(|k| k == &decl.key);
+        FoundSetting { decl, origin, runtime_type: manifest.runtime.r#type.clone(), env_listed }
+    }
+
+    /// Its [`SettingBinding`], or `None` when no reader delivers the value
+    /// (not offered; a write is refused): the bundled table's row; for an
+    /// installed module, [`module_setting_bindings::catalog_binding`]; for a
+    /// module under development, [`module_setting_bindings::DEV_PASSTHROUGH_BINDING`].
     /// A bundled setting missing from the table is treated as stored (a test
     /// keeps the table complete).
-    pub fn binding(&self, module_id: &str) -> SettingBinding {
+    pub fn binding(&self, module_id: &str) -> Option<SettingBinding> {
         match self.origin {
-            DeclOrigin::Bundled => module_setting_bindings::bundled_binding(module_id, &self.decl.key)
-                .unwrap_or(module_setting_bindings::CATALOG_BINDING),
-            DeclOrigin::Installed => module_setting_bindings::CATALOG_BINDING,
+            DeclOrigin::Bundled => Some(
+                module_setting_bindings::bundled_binding(module_id, &self.decl.key)
+                    .unwrap_or(module_setting_bindings::CATALOG_BINDING),
+            ),
+            DeclOrigin::Installed => {
+                module_setting_bindings::catalog_binding(&self.runtime_type, self.env_listed)
+            }
+            DeclOrigin::DevPassthrough => Some(module_setting_bindings::DEV_PASSTHROUGH_BINDING),
         }
     }
 }
@@ -280,7 +416,7 @@ pub fn projects_offering_module(db: &Db, module_id: &str) -> Result<Vec<String>,
         .filter(|r| r.enabled)
         .filter_map(|r| r.project_id)
         .collect();
-    if db.get_global_module_install(module_id)?.is_some() {
+    if db.get_global_module_install(module_id)?.is_some_and(|r| r.enabled) {
         for p in db.list_projects()? {
             if db.module_effective_enabled(&p.id, module_id)? {
                 out.push(p.id);
@@ -290,6 +426,17 @@ pub fn projects_offering_module(db: &Db, module_id: &str) -> Result<Vec<String>,
     out.sort();
     out.dedup();
     Ok(out)
+}
+
+/// True when `module_id` has an ENABLED machine-wide install that the enable
+/// cascade (`Db::module_effective_enabled`) leaves on for `project_id` — the
+/// same rule [`projects_offering_module`] applies, which the hub's `/env` uses
+/// to serve such a module's settings to the project (R7b F23).
+pub fn global_install_serves_project(db: &Db, module_id: &str, project_id: &str) -> Result<bool, String> {
+    if !db.get_global_module_install(module_id)?.is_some_and(|r| r.enabled) {
+        return Ok(false);
+    }
+    db.module_effective_enabled(project_id, module_id)
 }
 
 /// One declared setting as the settings editor lists it.
@@ -310,17 +457,32 @@ pub struct ListedModuleSettings {
     /// every project (a bundled module).
     pub projects: Option<Vec<String>>,
     pub settings: Vec<ListedSetting>,
+    /// The module's `provides` `http_api` entries, placeholders resolved
+    /// (`{hub_port}` → the running hub's port): the page shows where the
+    /// module's API answers (R7b F11 — the one reader of `base_url`).
+    pub http_apis: Vec<ProvidedHttpApi>,
 }
 
-/// Every module whose settings the editor lists: the bundled modules (for
-/// every project), then each installed (catalog) module in `installed` that
-/// declares settings and is installed somewhere (for the projects
+/// `m`'s `provides` http_api entries, resolved for this machine.
+fn http_apis_of(m: &ModuleManifest) -> Vec<ProvidedHttpApi> {
+    m.provided_http_apis(&PlaceholderCtx::new(&m.id))
+}
+
+/// Every module the editor lists: the bundled modules (for every project),
+/// then each installed (catalog) module in `installed` that declares
+/// settings or an http_api and is installed somewhere (for the projects
 /// [`projects_offering_module`] names). A module id that is bundled is never
-/// listed twice.
+/// listed twice. A module with neither settings nor an http_api is left out.
 pub fn list_module_settings(
     db: &Db,
     installed: &[ModuleManifest],
+    dev_passthrough: &[ModuleManifest],
 ) -> Result<Vec<ListedModuleSettings>, String> {
+    let bundled: Vec<ModuleManifest> = crate::bundled_manifests::BUNDLED_MANIFESTS
+        .iter()
+        .filter_map(|(_, body)| ModuleManifest::from_json(body).ok())
+        .collect();
+    let bundled_apis = |id: &str| bundled.iter().find(|m| m.id == id).map(http_apis_of).unwrap_or_default();
     let mut out: Vec<ListedModuleSettings> = bundled_module_settings()
         .into_iter()
         .map(|m| ListedModuleSettings {
@@ -333,34 +495,76 @@ pub fn list_module_settings(
                     decl,
                 })
                 .collect(),
+            http_apis: bundled_apis(&m.module_id),
             module_id: m.module_id,
             name: m.name,
             origin: DeclOrigin::Bundled,
             projects: None,
         })
         .collect();
-    for m in declared_settings_of(installed) {
-        if out.iter().any(|o| o.module_id == m.module_id) {
+    // A bundled module that declares an http_api but no setting.
+    for m in &bundled {
+        let apis = http_apis_of(m);
+        if apis.is_empty() || out.iter().any(|o| o.module_id == m.id) {
             continue;
         }
-        let installed_anywhere = db.get_global_module_install(&m.module_id)?.is_some()
-            || !db.list_per_project_installs_for_module(&m.module_id)?.is_empty();
+        out.push(ListedModuleSettings {
+            module_id: m.id.clone(),
+            name: m.name.clone(),
+            origin: DeclOrigin::Bundled,
+            projects: None,
+            settings: Vec::new(),
+            http_apis: apis,
+        });
+    }
+    let lists_something = |m: &&ModuleManifest| !m.settings.is_empty() || !http_apis_of(m).is_empty();
+    for m in installed.iter().filter(lists_something) {
+        if out.iter().any(|o| o.module_id == m.id) {
+            continue;
+        }
+        let installed_anywhere = db.get_global_module_install(&m.id)?.is_some()
+            || !db.list_per_project_installs_for_module(&m.id)?.is_empty();
         if !installed_anywhere {
             continue;
         }
         out.push(ListedModuleSettings {
-            projects: Some(projects_offering_module(db, &m.module_id)?),
-            settings: m
-                .settings
-                .into_iter()
-                .map(|decl| ListedSetting { decl, binding: module_setting_bindings::CATALOG_BINDING })
-                .collect(),
-            module_id: m.module_id,
-            name: m.name,
+            projects: Some(projects_offering_module(db, &m.id)?),
+            settings: offered_settings(m, DeclOrigin::Installed),
+            http_apis: http_apis_of(m),
+            module_id: m.id.clone(),
+            name: m.name.clone(),
             origin: DeclOrigin::Installed,
         });
     }
+    // Modules under development (R7b F24): every project, like a bundled one.
+    for m in dev_passthrough.iter().filter(lists_something) {
+        if out.iter().any(|o| o.module_id == m.id) {
+            continue;
+        }
+        out.push(ListedModuleSettings {
+            projects: None,
+            settings: offered_settings(m, DeclOrigin::DevPassthrough),
+            http_apis: http_apis_of(m),
+            module_id: m.id.clone(),
+            name: m.name.clone(),
+            origin: DeclOrigin::DevPassthrough,
+        });
+    }
+    out.retain(|m| !m.settings.is_empty() || !m.http_apis.is_empty());
     Ok(out)
+}
+
+/// `m`'s settings that some reader delivers, each with its binding — a
+/// setting no reader delivers is not offered (R7b F23).
+fn offered_settings(m: &ModuleManifest, origin: DeclOrigin) -> Vec<ListedSetting> {
+    m.settings
+        .iter()
+        .filter_map(|decl| {
+            let found = FoundSetting::in_manifest(m, decl.clone(), origin);
+            let binding = found.binding(&m.id)?;
+            Some(ListedSetting { decl: found.decl, binding })
+        })
+        .collect()
 }
 
 /// Validate (when declared) and store one setting value — the write path of
@@ -381,8 +585,18 @@ pub fn write_module_setting(
     value: &Value,
 ) -> Result<(), String> {
     if let Some(f) = found {
-        if let SettingBinding::Elsewhere { home, .. } = f.binding(module_id) {
-            return Err(format!("{module_id}/{key} is not stored in module settings: {home}"));
+        match f.binding(module_id) {
+            Some(SettingBinding::Elsewhere { home, .. }) => {
+                return Err(format!("{module_id}/{key} is not stored in module settings: {home}"));
+            }
+            None => {
+                return Err(format!(
+                    "{module_id}/{key}: nothing delivers a setting of a '{}' module, so it is \
+                     not stored",
+                    f.runtime_type
+                ));
+            }
+            Some(SettingBinding::Stored { .. }) => {}
         }
         validate_setting_value(&f.decl, value)?;
     }
@@ -446,10 +660,7 @@ mod tests {
 
     fn bundled(module_id: &str, key: &str) -> FoundSetting {
         let modules = bundled_module_settings();
-        FoundSetting {
-            decl: find_setting(&modules, module_id, key).cloned().expect("declared"),
-            origin: DeclOrigin::Bundled,
-        }
+        FoundSetting::bundled(find_setting(&modules, module_id, key).cloned().expect("declared"))
     }
 
     /// An installed (catalog) module: the session-state manifest under
@@ -465,10 +676,88 @@ mod tests {
 
     fn catalog(key: &str) -> FoundSetting {
         let m = catalog_manifest();
-        FoundSetting {
-            decl: m.settings.iter().find(|s| s.key == key).cloned().unwrap(),
-            origin: DeclOrigin::Installed,
+        let decl = m.settings.iter().find(|s| s.key == key).cloned().unwrap();
+        FoundSetting::in_manifest(&m, decl, DeclOrigin::Installed)
+    }
+
+    /// A catalog manifest of `runtime_type` declaring one per-project and one
+    /// global setting, `LISTED` in `env_from_settings`.
+    fn manifest_of_type(id: &str, runtime_type: &str) -> ModuleManifest {
+        let raw = format!(
+            r#"{{
+              "id": "{id}", "name": "{id}", "version": "1.0.0", "category": "core",
+              "license": {{ "required": false }},
+              "install": {{ "method": "local", "install_dir": "{{VCT_MODULES}}/{id}" }},
+              "settings": [
+                {{ "key": "LISTED", "type": "string" }},
+                {{ "key": "UNLISTED", "type": "string", "scope": "global" }}
+              ],
+              "runtime": {{ "type": "{runtime_type}", "env_from_settings": ["LISTED"] }}
+            }}"#
+        );
+        ModuleManifest::from_json(&raw).expect("fixture parses")
+    }
+
+    /// R7b F23, per kind: every runtime type's settings are offered with the
+    /// reader that actually delivers them — the container (listed keys) and
+    /// `/env` for a VCO-started container/service module, `/env` for an MCP or
+    /// a CLI. A type no reader serves is neither offered nor stored.
+    #[test]
+    fn each_runtime_type_is_offered_with_the_reader_that_delivers_it() {
+        for (runtime_type, listed_reader, unlisted_reader) in [
+            ("container", "container at its next start", "not passed to the container"),
+            ("service", "container at its next start", "not passed to the container"),
+            ("mcp_stdio", "through the hub's /env", "through the hub's /env"),
+            ("mcp_http", "through the hub's /env", "through the hub's /env"),
+            ("cli", "through the hub's /env", "through the hub's /env"),
+        ] {
+            let m = manifest_of_type("vct-kind", runtime_type);
+            let offered = offered_settings(&m, DeclOrigin::Installed);
+            let reader = |key: &str| match offered.iter().find(|s| s.decl.key == key).map(|s| s.binding) {
+                Some(SettingBinding::Stored { reader }) => reader,
+                other => panic!("{runtime_type}/{key}: {other:?}"),
+            };
+            assert!(reader("LISTED").contains(listed_reader), "{runtime_type}: {}", reader("LISTED"));
+            assert!(reader("UNLISTED").contains(unlisted_reader), "{runtime_type}: {}", reader("UNLISTED"));
         }
+
+        // No reader: not offered, and a write is refused.
+        let mut m = manifest_of_type("vct-kind", "cli");
+        m.runtime.r#type = "unknown_kind".into();
+        assert!(offered_settings(&m, DeclOrigin::Installed).is_empty());
+        let db = Db::open_in_memory().unwrap();
+        db.insert_global_module_install("g", "vct-kind", "1.0.0", "/tmp/g").unwrap();
+        let found = FoundSetting::in_manifest(&m, m.settings[1].clone(), DeclOrigin::Installed);
+        let err = write_module_setting(&db, Some(&found), "vct-kind", "UNLISTED", None, &json!("v")).unwrap_err();
+        assert!(err.contains("nothing delivers"), "{err}");
+        assert_eq!(db.get_global_setting("vct-kind", "UNLISTED").unwrap(), None);
+    }
+
+    /// R7b F24: a module under development (no install row) is listed for
+    /// every project and its per-project writes are stored — not refused "not
+    /// installed or enabled"; still validated.
+    #[test]
+    fn a_dev_passthrough_module_is_listed_and_its_writes_are_stored() {
+        let (db, pid) = db_with_project();
+        let dev = catalog_manifest();
+        let listed = list_module_settings(&db, &[], std::slice::from_ref(&dev)).unwrap();
+        let m = listed.iter().find(|m| m.module_id == "vct-test-catalog").expect("listed");
+        assert_eq!(m.origin, DeclOrigin::DevPassthrough);
+        assert_eq!(m.projects, None, "every project");
+        assert!(m.settings.iter().all(|s| s.binding == module_setting_bindings::DEV_PASSTHROUGH_BINDING));
+
+        let decl = dev.settings.iter().find(|s| s.key == "MEMORY_MAX_LINES").cloned().unwrap();
+        let found = FoundSetting::in_manifest(&dev, decl, DeclOrigin::DevPassthrough);
+        write_module_setting(&db, Some(&found), "vct-test-catalog", "MEMORY_MAX_LINES", Some(&pid), &json!(300))
+            .expect("stored");
+        assert_eq!(db.get_setting(&pid, "vct-test-catalog", "MEMORY_MAX_LINES").unwrap(), Some(json!(300)));
+        assert!(write_module_setting(&db, Some(&found), "vct-test-catalog", "MEMORY_MAX_LINES", Some(&pid), &json!("x"))
+            .is_err());
+        // The same module INSTALLED somewhere is listed as installed instead.
+        db.insert_module_install("i", &pid, "vct-test-catalog", "1.0.0", "/tmp/i").unwrap();
+        let listed = list_module_settings(&db, std::slice::from_ref(&dev), std::slice::from_ref(&dev)).unwrap();
+        let m = listed.iter().find(|m| m.module_id == "vct-test-catalog").unwrap();
+        assert_eq!(m.origin, DeclOrigin::Installed);
     }
 
     /// p1 has the catalog module installed + enabled, p2 installed but
@@ -507,7 +796,7 @@ mod tests {
     #[test]
     fn installed_module_settings_are_listed_for_the_projects_it_is_in() {
         let db = db_with_catalog_installs();
-        let listed = list_module_settings(&db, &[catalog_manifest()]).unwrap();
+        let listed = list_module_settings(&db, &[catalog_manifest()], &[]).unwrap();
         let cat = listed.iter().find(|m| m.module_id == "vct-test-catalog").expect("listed");
         assert_eq!(cat.origin, DeclOrigin::Installed);
         assert_eq!(cat.projects, Some(vec!["p1".to_string()]), "p2 is disabled, p3 never installed");
@@ -522,8 +811,45 @@ mod tests {
         assert!(!kg.settings.iter().any(|s| s.binding.is_stored()), "every vct-kg field lives elsewhere");
         // A manifest whose module is installed nowhere is not listed.
         let empty = Db::open_in_memory().unwrap();
-        let listed = list_module_settings(&empty, &[catalog_manifest()]).unwrap();
+        let listed = list_module_settings(&empty, &[catalog_manifest()], &[]).unwrap();
         assert!(!listed.iter().any(|m| m.module_id == "vct-test-catalog"));
+    }
+
+    /// R7b F11: `provides[].base_url` has a production reader — the listed
+    /// module carries its http_api entries with `{hub_port}` RESOLVED to the
+    /// running hub's port (`hub.port`), in the payload the Preferences →
+    /// Modules page renders; the serialized JSON never holds the placeholder.
+    #[test]
+    fn the_listing_carries_each_http_api_with_its_placeholder_resolved() {
+        let guard = crate::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", None)]);
+        std::fs::write(guard.path().join("hub.port"), "8123\n").unwrap();
+        let db = Db::open_in_memory().unwrap();
+        let listed = list_module_settings(&db, &[], &[]).unwrap();
+        let hub = listed.iter().find(|m| m.module_id == "vct-hub-api").expect("hub-api listed");
+        assert_eq!(
+            hub.http_apis,
+            vec![ProvidedHttpApi {
+                base_url: "http://127.0.0.1:8123/api/v1".into(),
+                description: hub.http_apis[0].description.clone(),
+            }]
+        );
+        assert!(hub.http_apis[0].description.contains("/apps/register"));
+        let wire = serde_json::to_value(&listed).unwrap();
+        assert!(!wire.to_string().contains("{hub_port}"), "no unresolved placeholder reaches the page");
+        // A module whose provides has no http_api carries none.
+        let kg = listed.iter().find(|m| m.module_id == "vct-kg").unwrap();
+        assert!(kg.http_apis.is_empty());
+
+        // An installed module that declares ONLY an http_api (no setting) is
+        // listed for it, resolved the same way.
+        let mut m = catalog_manifest();
+        m.settings.clear();
+        m.provides = vec![json!({"kind": "http_api", "base_url": "http://127.0.0.1:{hub_port}/x", "description": "d"})];
+        let db = db_with_catalog_installs();
+        let listed = list_module_settings(&db, std::slice::from_ref(&m), &[]).unwrap();
+        let cat = listed.iter().find(|l| l.module_id == "vct-test-catalog").expect("listed for its http_api");
+        assert_eq!(cat.http_apis[0].base_url, "http://127.0.0.1:8123/x");
+        assert!(cat.settings.is_empty());
     }
 
     /// A GLOBAL install offers every project the enable cascade leaves the

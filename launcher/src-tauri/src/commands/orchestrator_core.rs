@@ -578,15 +578,11 @@ fn health_check_urls(db: &Db) -> Vec<(String, String)> {
 pub async fn orchestrator_health_check(
     db: State<'_, Db>,
 ) -> Result<HealthReport, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
-
     let checks = health_check_urls(&db);
 
     let mut services = Vec::with_capacity(checks.len());
     for (name, endpoint) in checks {
+        let client = vct_launcher_core::services::loopback_http::client_for(&endpoint, Duration::from_secs(1))?;
         let started = std::time::Instant::now();
         let result = client.get(&endpoint).send().await;
         let latency_ms = started.elapsed().as_millis() as u64;

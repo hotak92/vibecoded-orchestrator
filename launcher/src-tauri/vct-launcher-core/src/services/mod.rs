@@ -41,6 +41,15 @@ pub mod service_endpoints;
 // (the hub used to hand-mirror the launcher's structs), built from the rows.
 pub mod service_status;
 
+// v0.2.97 (R7a F7): the ONE service-probe HTTP client rule — no redirect is
+// followed, only a 2xx is "answers" (mirror of vco_lib/service_probe_http.py).
+pub mod probe_http;
+
+// v0.2.97 (R7b F19): the ONE client for a request to this machine — the hub,
+// the gateway, a module's loopback port, VCO's own services: no proxy, no
+// redirects, the caller's timeout.
+pub mod loopback_http;
+
 // v0.2.97 (SE-4 × SE-3): the `compose up` argv for an explicit service list —
 // the ONE rule is Python's (`vco_lib.service_lifecycle.compose_up_args`:
 // `--no-deps`, `--profile gpu` for code_embed, nothing for an empty list);

@@ -386,3 +386,109 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
     assert not log.exists(), (
         f"sourcing wrote to log: {log.read_text() if log.exists() else '(none)'}"
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.97: THE pin rule in Find-Runtime (parity with the bash sibling's
+# tests/test_launch_runtime_detection.py). PR-12 "Bug B" let a pinned runtime
+# that is down fall through to the OTHER runtime; that is SUPERSEDED by the
+# pin rule every VCO surface follows (vco_lib.containers.runtime_pin:
+# VCT_CONTAINER_RUNTIME → runtime.txt → auto): the other runtime would start
+# the stack on its EMPTY volumes (plan invariants I1/I2). A pinned runtime
+# that is not usable → '' plus one line naming the pin and the fix.
+# ---------------------------------------------------------------------------
+
+import os  # noqa: E402
+
+_BASH = shutil.which("bash")
+_ENV = shutil.which("env")
+
+
+def _fake_bin(tmp_path: Path, stubs: dict) -> Path:
+    """A PATH holding ONLY the given runtime stubs (bash scripts) plus
+    `bash`/`env` for their shebang — the host's podman/docker never run."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name, real in (("bash", _BASH), ("env", _ENV)):
+        if real:
+            (fake / name).symlink_to(real)
+    for name, body in stubs.items():
+        (fake / name).write_text("#!/usr/bin/env bash\n" + body)
+        (fake / name).chmod(0o755)
+    return fake
+
+
+_DOCKER_UP = 'if [ "$1" = "info" ]; then echo "Server:"; echo " Server Version: 20.10.0"; exit 0; fi\n'
+_DOCKER_DOWN = 'if [ "$1" = "info" ]; then echo "Client:"; exit 1; fi\n'
+_PODMAN_UP = "exit 0\n"
+_PODMAN_DOWN = 'if [ "$1" = "info" ]; then exit 125; fi\nexit 0\n'
+
+
+def _find_runtime(tmp_path: Path, stubs: dict, **env: str) -> tuple[str, bool, str]:
+    """(Find-Runtime's answer, RuntimePinRefused, the whole stdout)."""
+    fake = _fake_bin(tmp_path, stubs)
+    full = {k: v for k, v in os.environ.items() if k not in ("VCT_CONTAINER_RUNTIME", "VCT_STACK_RUNTIME_FILE",
+                                                              "VCT_ORCHESTRATOR_ROOT", "VCT_STACK_WORKING_DIR")}
+    full.update({"PATH": str(fake), "HOME": str(tmp_path),
+                 "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log"),
+                 "VCT_STACK_WORKING_DIR": str(tmp_path / "noexist")})
+    full.update(env)
+    proc = subprocess.run(
+        [_PWSH or "pwsh", "-NoProfile", "-NonInteractive", "-Command",
+         f". {_ps_quote(str(SCRIPT))}; $r = Find-Runtime; "
+         "[Console]::Out.WriteLine('RESULT=' + $r + '|' + $script:RuntimePinRefused)"],
+        capture_output=True, text=True, timeout=60, env=full,
+    )
+    assert proc.returncode == 0, proc.stderr
+    line = [ln for ln in proc.stdout.splitlines() if ln.startswith("RESULT=")][-1]
+    answer, _, refused = line[len("RESULT="):].rpartition("|")
+    return answer, refused == "True", proc.stdout
+
+
+def _runtime_txt(root: Path, token: str) -> Path:
+    target = root / "state" / "install" / "runtime.txt"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(token + "\n", encoding="utf-8")
+    return target
+
+
+@pytest.mark.skipif(_BASH is None or os.name == "nt", reason="bash-script runtime stubs need a POSIX bash")
+def test_ps1_a_runtime_txt_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):
+    pin = _runtime_txt(tmp_path / "install", "docker")
+    answer, refused, out = _find_runtime(
+        tmp_path, {"docker": _DOCKER_DOWN, "podman": _PODMAN_UP, "podman-compose": "exit 0\n"},
+        VCT_STACK_WORKING_DIR=str(tmp_path / "install"))
+    assert (answer, refused) == ("", True), out
+    lines = [ln for ln in out.splitlines() if "pinned to docker" in ln]
+    assert len(lines) == 1, out
+    assert str(pin) in lines[0] and "starting nothing" in lines[0] and "Fix: start docker" in lines[0]
+
+
+@pytest.mark.skipif(_BASH is None or os.name == "nt", reason="bash-script runtime stubs need a POSIX bash")
+def test_ps1_an_env_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):
+    answer, refused, out = _find_runtime(
+        tmp_path, {"podman": _PODMAN_DOWN, "docker": _DOCKER_UP}, VCT_CONTAINER_RUNTIME="podman")
+    assert (answer, refused) == ("", True), out
+    assert "pinned to podman by VCT_CONTAINER_RUNTIME" in out
+    assert "unset VCT_CONTAINER_RUNTIME" in out
+
+
+@pytest.mark.skipif(_BASH is None or os.name == "nt", reason="bash-script runtime stubs need a POSIX bash")
+def test_ps1_a_down_runtime_txt_is_still_the_pin(tmp_path: Path):
+    """A second, differently-recorded runtime.txt is never consulted once the
+    first names a runtime (formerly Bug B's fall-through)."""
+    explicit = _runtime_txt(tmp_path / "stale", "docker")
+    _runtime_txt(tmp_path / "fresh", "podman")
+    answer, refused, out = _find_runtime(
+        tmp_path, {"docker": _DOCKER_DOWN, "podman": _PODMAN_UP, "podman-compose": "exit 0\n"},
+        VCT_STACK_RUNTIME_FILE=str(explicit), VCT_STACK_WORKING_DIR=str(tmp_path / "fresh"))
+    assert (answer, refused) == ("", True), out
+
+
+@pytest.mark.skipif(_BASH is None or os.name == "nt", reason="bash-script runtime stubs need a POSIX bash")
+def test_ps1_unpinned_auto_detection_keeps_its_fallback(tmp_path: Path):
+    answer, refused, out = _find_runtime(
+        tmp_path, {"podman": 'if [ "$1" = "compose" ]; then exit 125; fi\nexit 0\n', "docker": _DOCKER_UP},
+        VCT_CONTAINER_RUNTIME="auto")
+    assert (answer, refused) == ("docker", False), out
+

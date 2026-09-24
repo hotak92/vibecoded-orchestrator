@@ -566,10 +566,7 @@ pub async fn list_legacy_codegraph_collections(
 ) -> Result<LegacyCodegraphReport, String> {
     let include_untracked = include_untracked_projects.unwrap_or(false);
     let base = resolve_weaviate_url(&db);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => return Err(format!("http client: {}", e)),
     };
@@ -954,10 +951,7 @@ pub async fn cleanup_legacy_codegraph_collections(
     db: State<'_, Db>,
 ) -> Result<CleanupLegacyReport, String> {
     let base = resolve_weaviate_url(&db);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10))?;
 
     let mut deleted: Vec<String> = Vec::new();
     let mut failed: Vec<CleanupFailure> = Vec::new();
@@ -1091,10 +1085,7 @@ pub async fn cleanup_orphan_codegraph_collections(
     db: State<'_, Db>,
 ) -> Result<CleanupLegacyReport, String> {
     let base = resolve_weaviate_url(&db);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10))?;
 
     let mut deleted: Vec<String> = Vec::new();
     let mut failed: Vec<CleanupFailure> = Vec::new();
@@ -1495,10 +1486,7 @@ pub async fn list_orchestrator_kg_collections(
     db: State<'_, Db>,
 ) -> Result<Vec<String>, String> {
     let base = resolve_weaviate_url(&db);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[vct] list_orchestrator_kg_collections http client: {}", e);

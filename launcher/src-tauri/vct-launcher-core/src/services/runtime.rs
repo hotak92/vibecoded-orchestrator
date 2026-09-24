@@ -758,27 +758,58 @@ pub async fn detect_runtime() -> Option<RuntimeInfo> {
 // print compose's own error; this module returns `None` because it has
 // nothing to drive.
 
-/// Parse `VCT_CONTAINER_RUNTIME` into the probe order. MUST MATCH
-/// `vco_lib.containers.runtime_candidate_order` for the auto / unset /
-/// unrecognised arms (pinned by the parity fixture); see the divergence note
-/// above for the explicit-preference arm.
-pub(crate) fn candidate_order(override_pref: Option<&str>) -> Vec<ContainerRuntime> {
-    // Preference order: env override first; else Podman > Docker.
-    // Per user policy: "check for availability on podman first".
-    match override_pref {
-        Some("podman") => vec![ContainerRuntime::Podman],
-        Some("docker") => vec![ContainerRuntime::Docker],
+/// The probe order for the normalised `VCT_CONTAINER_RUNTIME` value and the
+/// install's `state/install/runtime.txt` record. R7b F5 (owner ruling): the
+/// PIN RULE has ONE home, `container_runtime::runtime_candidate_order` —
+/// `VCT_CONTAINER_RUNTIME` → runtime.txt → podman-then-docker, a pin being
+/// the whole order — and this delegates to it, so the infra stack, the
+/// module plane, storage/volumes and the hub supervisor cannot order
+/// differently again. Before v0.2.97 this read the env var only, so a machine
+/// whose install recorded docker brought its stack up under podman while the
+/// storage page migrated the docker copies. MUST MATCH
+/// `vco_lib.containers.runtime_pin` + `runtime_candidate_order` (the parity
+/// fixture pins all three surfaces).
+pub(crate) fn candidate_order(
+    override_pref: Option<&str>,
+    runtime_txt: Option<&str>,
+) -> Vec<ContainerRuntime> {
+    let env_pin = match override_pref {
+        Some(p @ ("podman" | "docker")) => Some(p),
         Some(other) => {
             tracing::warn!(
                 value = ?other,
                 "[vct] runtime: VCT_CONTAINER_RUNTIME not recognized (expected \
-                 'podman', 'docker', or 'auto'); falling back to podman-then-docker \
-                 auto-detection"
+                 'podman', 'docker', or 'auto'); falling back to the install's \
+                 recorded runtime, then podman-then-docker auto-detection"
             );
-            vec![ContainerRuntime::Podman, ContainerRuntime::Docker]
+            None
         }
-        None => vec![ContainerRuntime::Podman, ContainerRuntime::Docker],
+        None => None,
+    };
+    let recorded = runtime_txt.filter(|t| matches!(*t, "podman" | "docker"));
+    super::container_runtime::runtime_candidate_order(env_pin, recorded)
+        .iter()
+        .map(|name| runtime_named(name))
+        .collect()
+}
+
+fn runtime_named(name: &str) -> ContainerRuntime {
+    if name == "docker" {
+        ContainerRuntime::Docker
+    } else {
+        ContainerRuntime::Podman
     }
+}
+
+/// The install's recorded runtime (`<clone>/state/install/runtime.txt`),
+/// read through the ONE reader `container_runtime::read_runtime_txt`, from
+/// the clone this binary belongs to.
+fn recorded_runtime() -> Option<String> {
+    recorded_runtime_in(crate::orchestrator_manifest::orchestrator_install_root().as_deref())
+}
+
+fn recorded_runtime_in(install_root: Option<&std::path::Path>) -> Option<String> {
+    install_root.and_then(super::container_runtime::read_runtime_txt)
 }
 
 /// Normalise the raw env value the way `resolve_runtime` always has:
@@ -818,6 +849,13 @@ pub(crate) fn select_runtime(
 }
 
 async fn resolve_runtime() -> Option<RuntimeInfo> {
+    resolve_runtime_in(crate::orchestrator_manifest::orchestrator_install_root().as_deref()).await
+}
+
+/// [`resolve_runtime`] against an explicit clone root (where the install's
+/// `state/install/runtime.txt` lives) — a test hands it a temp dir so this
+/// machine's own record cannot change the answer.
+async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<RuntimeInfo> {
     // PR-43 (v0.2.12): honor VCT_CONTAINER_RUNTIME env override so the
     // GUI matches the hooks' behavior (templates/hooks/ensure-containers.sh,
     // verify-container-ports.sh, ensure-code-embed-service.sh — since
@@ -831,7 +869,8 @@ async fn resolve_runtime() -> Option<RuntimeInfo> {
     let override_pref = normalise_override(
         std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref(),
     );
-    let order = candidate_order(override_pref.as_deref());
+    let recorded = recorded_runtime_in(install_root);
+    let order = candidate_order(override_pref.as_deref(), recorded.as_deref());
 
     for runtime in order {
         // Probe lazily (stop at the first acceptable runtime), but feed the
@@ -850,18 +889,21 @@ pub fn runtime_on_path(runtime: ContainerRuntime) -> bool {
     which_on_path(runtime.binary()).is_some()
 }
 
-/// The runtime the user PINNED via `VCT_CONTAINER_RUNTIME`, normalised the
-/// same way `resolve_runtime` normalises it (`""` / `auto` / unrecognised →
-/// no pin). Exposed so the install preflight can say "podman is pinned but
-/// unusable; docker is usable" instead of "no runtime installed" (BLOCKER-4).
-pub fn pinned_runtime() -> Option<ContainerRuntime> {
-    match normalise_override(std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref())
-        .as_deref()
-    {
-        Some("podman") => Some(ContainerRuntime::Podman),
-        Some("docker") => Some(ContainerRuntime::Docker),
-        _ => None,
-    }
+/// The pin `resolve_runtime` honours and which channel set it —
+/// `VCT_CONTAINER_RUNTIME` (normalised the way `resolve_runtime` normalises
+/// it: `""` / `auto` / unrecognised → no env pin), else the install's
+/// `runtime.txt` (R7b F5; this was `pinned_runtime()`, the env channel
+/// only). `None` = auto-detect. The install preflight uses it to say
+/// "podman is pinned but unusable; docker is usable" — naming the right knob
+/// — instead of "no container runtime is installed" (BLOCKER-4).
+pub fn runtime_pin() -> Option<(ContainerRuntime, super::container_runtime::RuntimePinSource)> {
+    let env = normalise_override(std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref());
+    let recorded = recorded_runtime();
+    super::container_runtime::pinned_runtime(
+        env.as_deref().filter(|p| matches!(*p, "podman" | "docker")),
+        recorded.as_deref(),
+    )
+    .map(|(name, source)| (runtime_named(name), source))
 }
 
 /// Probe ONE named runtime end-to-end — PATH, `version`, daemon, compose —
@@ -975,7 +1017,10 @@ mod tests {
         for sc in fx["scenarios"].as_array().unwrap() {
             let name = sc["name"].as_str().unwrap();
             let env = sc["env"].as_str();
-            let order = candidate_order(normalise_override(env).as_deref());
+            let order = candidate_order(
+                normalise_override(env).as_deref(),
+                sc.get("runtime_txt").and_then(|v| v.as_str()),
+            );
             let on_path = names(sc, "on_path");
             let version_ok = names(sc, "version_ok");
             let daemon_ok = names(sc, "daemon_ok");
@@ -1044,10 +1089,13 @@ mod tests {
 
     #[test]
     #[serial]
-    fn pinned_runtime_reads_the_pin_and_ignores_non_pins() {
+    fn runtime_pin_reads_the_env_pin_and_ignores_non_pins() {
         // Mirrors `vco_lib.containers.runtime_preference_from_env`: only the
-        // two known names pin; `auto` / empty / garbage do not. The guard
-        // holds GLOBAL_ENV_MUTEX and restores the prior value on drop.
+        // two known names pin through the env; `auto` / empty / garbage do
+        // not (what is left is the install's record, whatever this clone
+        // holds — so a non-pin is asserted as "not the env channel"). The
+        // guard holds GLOBAL_ENV_MUTEX and restores the prior value on drop.
+        use super::super::container_runtime::RuntimePinSource;
         let _env = crate::test_env::env_guard(&[("VCT_CONTAINER_RUNTIME", None)]);
         for (value, want) in [
             ("podman", Some(ContainerRuntime::Podman)),
@@ -1057,10 +1105,62 @@ mod tests {
             ("bogus", None),
         ] {
             std::env::set_var("VCT_CONTAINER_RUNTIME", value);
-            assert_eq!(pinned_runtime(), want, "value = {:?}", value);
+            let pin = runtime_pin();
+            match want {
+                Some(rt) => assert_eq!(pin, Some((rt, RuntimePinSource::EnvOverride)), "value = {value:?}"),
+                None => assert_ne!(
+                    pin.map(|(_, source)| source),
+                    Some(RuntimePinSource::EnvOverride),
+                    "value = {value:?}"
+                ),
+            }
         }
         std::env::remove_var("VCT_CONTAINER_RUNTIME");
-        assert_eq!(pinned_runtime(), None);
+    }
+
+    /// R7b F5, through the real probe path: docker works, podman does not.
+    /// Unpinned, the launcher's infra stack drives docker; with the install's
+    /// record naming podman it drives NOTHING — the record is a pin, and a
+    /// pinned runtime that is down is refused, never swapped for docker (whose
+    /// volumes are a different, possibly empty, copy). Before R7b F5
+    /// `resolve_runtime` never read the record and answered docker both times.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn resolve_runtime_honours_the_install_record() {
+        let bins = tempfile::tempdir().unwrap();
+        write_fake_runtime(bins.path(), "docker", "Server: Docker Engine - Community", 0);
+        write_fake_runtime(bins.path(), "podman", "", 1);
+        let bare_root = tempfile::tempdir().unwrap();
+        let pinned_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pinned_root.path().join("state/install")).unwrap();
+        std::fs::write(pinned_root.path().join("state/install/runtime.txt"), "podman\n").unwrap();
+        let _env = crate::test_env::env_guard(&[("VCT_CONTAINER_RUNTIME", None)]);
+        let (unpinned, pinned) = crate::paths::with_lookup_path(Some(bins.path().as_os_str()), || {
+            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+            rt.block_on(async {
+                (
+                    resolve_runtime_in(Some(bare_root.path())).await.map(|i| i.runtime),
+                    resolve_runtime_in(Some(pinned_root.path())).await.map(|i| i.runtime),
+                )
+            })
+        });
+        assert_eq!(unpinned, Some(ContainerRuntime::Docker));
+        assert_eq!(pinned, None, "the recorded podman must pin, not fall through to docker");
+    }
+
+    /// R7b F5: one precedence — env pin, else the install's record, else
+    /// podman-then-docker; an unrecognised env value is no pin, so the
+    /// record still applies.
+    #[test]
+    fn candidate_order_env_then_record_then_auto() {
+        use ContainerRuntime::{Docker, Podman};
+        assert_eq!(candidate_order(None, None), vec![Podman, Docker]);
+        assert_eq!(candidate_order(None, Some("docker")), vec![Docker]);
+        assert_eq!(candidate_order(Some("podman"), Some("docker")), vec![Podman]);
+        assert_eq!(candidate_order(Some("bogus"), Some("docker")), vec![Docker]);
+        assert_eq!(candidate_order(Some("bogus"), None), vec![Podman, Docker]);
+        assert_eq!(candidate_order(None, Some("nerdctl")), vec![Podman, Docker]);
     }
 
     #[test]

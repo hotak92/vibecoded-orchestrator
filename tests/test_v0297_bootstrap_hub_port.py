@@ -7,9 +7,12 @@
 envelope) spelled ``127.0.0.1:7700`` as a literal. The hub's port is
 configurable (``VCT_HUB_PORT``, the ``vct-hub-api`` setting) and the hub walks
 past a taken port, so an agent reading the envelope on such a machine was sent
-to the wrong port. Both now go through the ONE Python port reader,
-``vco_lib.hub_ensure.resolve_hub_port`` (``$VCT_HUB_PORT`` → ``hub.port`` →
-7700), the same one ``vco_lib.project_config._discover_hub`` uses.
+to the wrong port. Both DESCRIBE the running hub, so since R7b F7 they read
+``vco_lib.hub_ensure.running_hub_port`` — ``hub.port`` FIRST (the port the hub
+actually bound), then ``$VCT_HUB_PORT``, then 7700 — the file-first rule of
+Rust ``services::hub_port::resolve_hub_port``. (They used the CLIENT ladder,
+env first, so an exported ``VCT_HUB_PORT=7700`` hid a hub that had walked to
+7701.)
 """
 
 from __future__ import annotations
@@ -62,7 +65,16 @@ def test_bootstrap_reports_the_hub_port_file(tmp_path: Path) -> None:
 
 
 def test_bootstrap_reports_the_env_pin(tmp_path: Path) -> None:
+    """No ``hub.port``: the configured port is the best description left."""
     _assert_port(_bootstrap(tmp_path, VCT_HUB_PORT="7822"), 7822)
+
+
+def test_bootstrap_reports_the_port_the_hub_bound_over_the_env(tmp_path: Path) -> None:
+    """R7b F7: ``VCT_HUB_PORT=7700`` exported, 7700 taken, the hub walked to
+    7701 and wrote it — the envelope must name 7701, not the configured 7700."""
+    (tmp_path / "vct-state").mkdir()
+    (tmp_path / "vct-state" / "hub.port").write_text("7701\n", encoding="utf-8")
+    _assert_port(_bootstrap(tmp_path, VCT_HUB_PORT="7700"), 7701)
 
 
 def test_bootstrap_reports_the_default_with_nothing_set(tmp_path: Path) -> None:

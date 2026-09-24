@@ -218,9 +218,9 @@ fn refresh_env_after_user_secret_change(
 /// These scopes don't tie a secret to a specific project; the frontend
 /// passes a stable sentinel so the audit log + keychain service name
 /// remain well-formed. `_global_` for global scope, `_user_shared_` for
-/// shared (per-user, across all projects).
-const SENTINEL_GLOBAL: &str = "_global_";
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// shared (per-user, across all projects). Defined once, in
+/// `vct_launcher_core::secrets` (R7b F15).
+use vct_launcher_core::secrets::{SENTINEL_GLOBAL, SENTINEL_SHARED};
 
 /// Reject path-traversal-ish project_ids and enforce that per-project
 /// secrets target a project that actually exists in the DB.
@@ -1068,6 +1068,11 @@ pub async fn get_setting_v2(
     db.get_setting(&project_id, &module_id, &key)
 }
 
+/// Store one module setting for a project. R7b F2: this went straight to
+/// `Db::set_setting`, around the validator, the binding table (a setting whose
+/// value lives elsewhere is never stored a second time) and the install gate;
+/// it now takes the one write path, `module_settings_schema::write_module_setting`
+/// (through `module_gui::write_setting`, the body of `set_module_setting`).
 #[command]
 pub async fn set_setting_v2(
     project_id: String,
@@ -1076,7 +1081,17 @@ pub async fn set_setting_v2(
     value: serde_json::Value,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    db.set_setting(&project_id, &module_id, &key, &value)
+    set_setting_v2_body(&db, &project_id, &module_id, &key, &value)
+}
+
+fn set_setting_v2_body(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    crate::commands::module_gui::write_setting(db, module_id, key, Some(project_id), value)
 }
 
 #[command]
@@ -1729,6 +1744,30 @@ mod tests {
         conn.pragma_update(None, "foreign_keys", "ON").unwrap();
         crate::db::migrations::apply(&conn).unwrap();
         Db(Mutex::new(conn))
+    }
+
+    /// R7b F2: `set_setting_v2` goes through the one write path — an invalid
+    /// value for a declared setting, and a setting whose live value lives
+    /// elsewhere (the project's KG binding), are refused and store nothing;
+    /// a valid value is stored.
+    #[test]
+    fn set_setting_v2_validates_and_honours_the_binding_table() {
+        let db = make_db();
+        db.insert_project("p-f2", "P", "/tmp/p-f2", crate::db::models::ProjectHost::Base, "p-f2")
+            .unwrap();
+        let (session, lines) = ("vct-session-state", "CONTEXT_STATE_MAX_LINES");
+
+        let err = set_setting_v2_body(&db, "p-f2", session, lines, &serde_json::json!("abc")).unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+        assert_eq!(db.get_setting("p-f2", session, lines).unwrap(), None);
+
+        let err = set_setting_v2_body(&db, "p-f2", "vct-kg", "KG_COLLECTION", &serde_json::json!("X"))
+            .unwrap_err();
+        assert!(err.contains("not stored in module settings"), "{err}");
+        assert_eq!(db.get_setting("p-f2", "vct-kg", "KG_COLLECTION").unwrap(), None);
+
+        set_setting_v2_body(&db, "p-f2", session, lines, &serde_json::json!(300)).unwrap();
+        assert_eq!(db.get_setting("p-f2", session, lines).unwrap(), Some(serde_json::json!(300)));
     }
 
     /// Acquire the process-wide keychain test mutex. Every test in this
@@ -3953,10 +3992,7 @@ async fn post_secrets_to_hub(
     project_id: Option<&str>,
 ) -> Result<HubMigrateResponse, String> {
     let (port, token) = hub_port_token()?;
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(30))?;
     let url = format!("http://127.0.0.1:{}/api/v1/secrets/migrate", port);
     // GAP-1: forward the owning project id so the hub's scope policy (S1)
     // routes the keys to this project's scope (or Shared for the

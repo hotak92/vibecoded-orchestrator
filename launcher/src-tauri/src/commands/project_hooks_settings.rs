@@ -347,14 +347,25 @@ pub async fn effective_hooks_view(
     // Mirror rows supply the metadata settings.json does not carry (which
     // bundle a hook came from, whether it is a paid-module hook).
     let mirror = db.list_project_hooks(project_id).unwrap_or_default();
-    let meta = |event: &str, matcher: &str, command: &str| {
-        mirror
-            .iter()
-            .find(|h| h.event == event && h.matcher == matcher && h.command == command)
-            .cloned()
-    };
 
-    let listed = match run_hooks_cli(db, &folder, &["list"]).await {
+    // v0.2.97: a DB row (mirror or parked) may hold an OLDER SPELLING of a
+    // command settings.json now carries — the relative `.claude/hooks/x.sh`
+    // every release before v0.2.97 wrote, now anchored at
+    // `${CLAUDE_PROJECT_DIR}` by the bundle update; or the pre-v0.2.97
+    // `VCT_DISABLE_HOOKS` guard prefix. Rows are matched to entries by the
+    // registration KEY, which the hooks editor computes (`--keys-for-json`,
+    // `vco_lib.hook_retirements.hook_command_key` — the one home of the rule;
+    // no Rust copy of it). Without this every migrated VCO hook rendered
+    // twice: once active with no metadata, once as an orphan row.
+    let parked_before = db.list_parked_project_hooks(project_id).unwrap_or_default();
+    let row_commands: Vec<&str> = mirror
+        .iter()
+        .map(|h| h.command.as_str())
+        .chain(parked_before.iter().map(|p| p.command.as_str()))
+        .collect();
+    let keys_arg = serde_json::to_string(&row_commands).unwrap_or_else(|_| "[]".to_string());
+
+    let listed = match run_hooks_cli(db, &folder, &["list", "--keys-for-json", &keys_arg]).await {
         Ok(v) => v,
         Err(e) => {
             // Honest degradation: no rows, the reason, controls off. Never
@@ -368,6 +379,26 @@ pub async fn effective_hooks_view(
                 skipped: Vec::new(),
             });
         }
+    };
+
+    let keys = listed.get("keys").and_then(JsonValue::as_object);
+    // The registration key of `command`; the command itself when the editor
+    // gave none (an older vco_lib) — exact matching, the pre-v0.2.97 rule.
+    let key_of = |command: &str| -> String {
+        keys.and_then(|k| k.get(command))
+            .and_then(JsonValue::as_str)
+            .unwrap_or(command)
+            .to_string()
+    };
+    let meta = |event: &str, matcher: &str, command: &str| {
+        let slot = || mirror.iter().filter(|h| h.event == event && h.matcher == matcher);
+        slot()
+            .find(|h| h.command == command)
+            .or_else(|| {
+                let key = key_of(command);
+                slot().find(|h| key_of(&h.command) == key)
+            })
+            .cloned()
     };
 
     let mut hooks: Vec<EffectiveHook> = Vec::new();
@@ -386,7 +417,7 @@ pub async fn effective_hooks_view(
                 .and_then(JsonValue::as_i64)
                 .map(|s| s.saturating_mul(1000))
                 .or_else(|| row.as_ref().and_then(|r| r.timeout_ms));
-            active_keys.push((event.to_string(), matcher.to_string(), command.to_string()));
+            active_keys.push((event.to_string(), matcher.to_string(), key_of(command)));
             hooks.push(EffectiveHook {
                 id: row.as_ref().map(|r| r.id),
                 event: event.to_string(),
@@ -415,7 +446,7 @@ pub async fn effective_hooks_view(
     // line back by hand) the active entry above already covers it — skip the
     // duplicate rather than render the same hook twice.
     for p in parked {
-        let key = (p.event.clone(), p.matcher.clone(), p.command.clone());
+        let key = (p.event.clone(), p.matcher.clone(), key_of(&p.command));
         if active_keys.contains(&key) {
             continue;
         }
@@ -435,8 +466,17 @@ pub async fn effective_hooks_view(
     // parked. Rendered as an orphan so the user can see (and clear) the stale
     // wiring instead of believing a hook exists that does not.
     for row in &mirror {
-        let key = (row.event.clone(), row.matcher.clone(), row.command.clone());
-        if active_keys.contains(&key) || hooks.iter().any(|h| h.id == Some(row.id)) {
+        let key = (row.event.clone(), row.matcher.clone(), key_of(&row.command));
+        let rendered_as_parked = hooks.iter().any(|h| {
+            h.state == HookState::Disabled
+                && h.event == row.event
+                && h.matcher == row.matcher
+                && key_of(&h.command) == key.2
+        });
+        if active_keys.contains(&key)
+            || rendered_as_parked
+            || hooks.iter().any(|h| h.id == Some(row.id))
+        {
             continue;
         }
         hooks.push(EffectiveHook {
@@ -1295,7 +1335,17 @@ mod tests {
             .await
             .expect("enable must succeed");
 
-        assert_eq!(f.raw(), before, "re-enable restores the exact original bytes");
+        // Byte-for-byte, except the one deliberate change: a VCO-shipped hook
+        // parked in the pre-v0.2.97 RELATIVE form is restored anchored at the
+        // project root (the relative form fails once the session's cwd moves).
+        assert_eq!(
+            f.raw(),
+            before.replace(
+                r#""bash .claude/hooks/notify-stop.sh""#,
+                r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#,
+            ),
+            "re-enable restores the original bytes, the hook path anchored"
+        );
         assert_eq!(
             f.db.get_parked_project_hook_entry(
                 &f.pid,
@@ -1307,6 +1357,73 @@ mod tests {
             None,
             "the parked entry is cleared once it is back in the file"
         );
+    }
+
+    // ─── v0.2.97: one hook, two spellings ──────────────────────────────
+    //
+    // A bundle update rewrites every VCO hook from `bash .claude/hooks/x.sh`
+    // to `bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`; the launcher DB's
+    // mirror and parked rows keep the spelling they were written with.
+
+    const ANCHORED_STOP: &str = r#"bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh""#;
+
+    fn anchored_settings() -> String {
+        SETTINGS_JSON.replace(
+            r#""bash .claude/hooks/notify-stop.sh""#,
+            r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#,
+        )
+    }
+
+    /// The Hooks tab identity match: an OLD-spelling mirror row is the
+    /// migrated entry's metadata, not a second (orphan) hook. Before, the
+    /// view matched by exact command and rendered the hook twice — active
+    /// with no metadata, plus an "orphan" for the old row.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_hooks_tab_matches_an_old_spelling_row_to_the_anchored_entry() {
+        let f = Fixture::with_settings(&anchored_settings());
+        let row = f
+            .db
+            .register_project_hook(
+                &f.pid,
+                "Stop",
+                "",
+                "bash .claude/hooks/notify-stop.sh",
+                "bundled",
+                None,
+                None,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let stop: Vec<&EffectiveHook> = view.hooks.iter().filter(|h| h.event == "Stop").collect();
+        assert_eq!(stop.len(), 1, "one hook, one row: {stop:?}");
+        assert_eq!(stop[0].state, HookState::Active);
+        assert_eq!(stop[0].command, ANCHORED_STOP);
+        assert_eq!(stop[0].id, Some(row.id), "the old row's metadata is this hook's");
+        assert_eq!(stop[0].source, "bundled");
+    }
+
+    /// Disable by the OLD spelling (what the hub's `PATCH /hooks/{id}` sends:
+    /// the mirror row's command) removes the anchored entry and parks it under
+    /// the old row; the view renders it Disabled once, and re-enabling
+    /// restores the anchored form.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_old_spelling_disables_and_restores_the_anchored_entry() {
+        let f = Fixture::with_settings(&anchored_settings());
+        let old = "bash .claude/hooks/notify-stop.sh";
+        f.db.register_project_hook(&f.pid, "Stop", "", old, "bundled", None, None, &serde_json::json!({}))
+            .unwrap();
+
+        disable_hook(&f.db, &f.pid, "Stop", "", old).await.expect("disable by the old spelling");
+        assert!(f.commands_under("Stop").is_empty());
+        let view = effective_hooks_view(&f.db, &f.pid).await.unwrap();
+        let stop: Vec<&EffectiveHook> = view.hooks.iter().filter(|h| h.event == "Stop").collect();
+        assert_eq!(stop.len(), 1, "{stop:?}");
+        assert_eq!(stop[0].state, HookState::Disabled);
+
+        enable_hook(&f.db, &f.pid, "Stop", "", old).await.expect("enable");
+        assert_eq!(f.commands_under("Stop"), vec![ANCHORED_STOP.to_string()]);
     }
 
     // ─── Refusals: act vs leave-alone ───────────────────────────────────

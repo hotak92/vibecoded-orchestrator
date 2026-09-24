@@ -934,10 +934,7 @@ async fn upsert_global_weight_row(
         }
     });
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HUB_WRITE_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(HUB_WRITE_TIMEOUT_SECS))?;
 
     let resp = client
         .post(&url)

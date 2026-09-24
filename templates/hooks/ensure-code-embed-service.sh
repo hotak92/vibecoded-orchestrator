@@ -3,9 +3,13 @@
 # Uses flock to prevent race conditions when multiple sessions start simultaneously.
 # Called by SessionStart hook (background, non-blocking).
 #
-# Optional service: only runs if the user has uncommented `code_embed` in
-# claude_mcp_servers/compose.yaml. Free tier defaults to Ollama for code
-# embeddings, so this hook silently no-ops when the container doesn't exist.
+# Optional service: whether compose may create the code_embed container is
+# decided by the launcher.db `service_endpoints` plan (v0.2.97) — the
+# launcher's Services page or `python -m vco_lib.service_endpoints show` /
+# `plan --json` — never by editing a compose file (it ships active in
+# infrastructure/docker-compose.yml). When the plan does not list code_embed
+# as a VCO-managed, enabled service, this hook silently no-ops (a CPU host
+# falls back to Ollama for code embeddings).
 
 # Scrub sensitive env vars before any subprocess
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null

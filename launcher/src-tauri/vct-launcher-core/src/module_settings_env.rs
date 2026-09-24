@@ -53,6 +53,62 @@ fn env_value(v: &Value) -> Option<String> {
     }
 }
 
+/// The STORED value of one declared setting for `project_id`: the project's
+/// row (unless the declaration is `scope: "global"`, or there is no project),
+/// else the machine-wide row; a JSON `null` counts as absent. No default.
+/// The precedence the spawns below use (before their default) and the hub's
+/// `/env` uses for an installed module (R7b F23) — one rule.
+/// `lookup(Some(project_id), key)` answers the project's row,
+/// `lookup(None, key)` the machine-wide row.
+pub fn stored_setting_value_with(
+    machine_wide_only: bool,
+    project_id: Option<&str>,
+    key: &str,
+    lookup: impl Fn(Option<&str>, &str) -> Option<Value>,
+) -> Option<Value> {
+    let project_value = match project_id {
+        Some(pid) if !machine_wide_only => lookup(Some(pid), key).filter(|v| !v.is_null()),
+        _ => None,
+    };
+    project_value.or_else(|| lookup(None, key).filter(|v| !v.is_null()))
+}
+
+/// [`stored_setting_value_with`] against the launcher DB for `module_id`'s
+/// declared `decl`. An unreadable row counts as absent and is logged.
+pub fn stored_setting_value(
+    db: &Db,
+    module_id: &str,
+    decl: &crate::manifest::SettingDecl,
+    project_id: Option<&str>,
+) -> Option<Value> {
+    stored_setting_value_with(
+        crate::module_settings_schema::is_global(decl),
+        project_id,
+        &decl.key,
+        |pid, key| db_row(db, module_id, pid, key),
+    )
+}
+
+/// One `module_settings` row; an unreadable row is logged and absent.
+fn db_row(db: &Db, module_id: &str, project_id: Option<&str>, key: &str) -> Option<Value> {
+    let read = match project_id {
+        Some(pid) => db.get_setting(pid, module_id, key),
+        None => db.get_global_setting(module_id, key),
+    };
+    match read {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(
+                module_id = %module_id,
+                key = %key,
+                error = %e,
+                "[module_settings_env] setting row unreadable; using the next source"
+            );
+            None
+        }
+    }
+}
+
 /// The resolver, over an injected lookup. `lookup(Some(project_id), key)`
 /// answers the project's row, `lookup(None, key)` the machine-wide row.
 pub fn resolve_env_from_settings_with(
@@ -76,13 +132,8 @@ pub fn resolve_env_from_settings_with(
         }
         let decl = manifest.settings.iter().find(|s| &s.key == key);
         let machine_wide_only = decl.is_some_and(crate::module_settings_schema::is_global);
-        let project_value = match project_id {
-            Some(pid) if !machine_wide_only => lookup(Some(pid), key),
-            _ => None,
-        };
-        let value = project_value
+        let value = stored_setting_value_with(machine_wide_only, project_id, key, &lookup)
             .and_then(|v| env_value(&v))
-            .or_else(|| lookup(None, key).and_then(|v| env_value(&v)))
             .or_else(|| decl.and_then(|d| env_value(&d.default)));
         if let Some(v) = value {
             out.push((key.clone(), v));
@@ -99,24 +150,7 @@ pub fn resolve_env_from_settings(
     project_id: Option<&str>,
     db: &Db,
 ) -> Vec<(String, String)> {
-    resolve_env_from_settings_with(manifest, project_id, |pid, key| {
-        let read = match pid {
-            Some(pid) => db.get_setting(pid, &manifest.id, key),
-            None => db.get_global_setting(&manifest.id, key),
-        };
-        match read {
-            Ok(v) => v,
-            Err(e) => {
-                tracing::warn!(
-                    module_id = %manifest.id,
-                    key = %key,
-                    error = %e,
-                    "[module_settings_env] setting row unreadable; using the next source"
-                );
-                None
-            }
-        }
-    })
+    resolve_env_from_settings_with(manifest, project_id, |pid, key| db_row(db, &manifest.id, pid, key))
 }
 
 #[cfg(test)]

@@ -15,6 +15,7 @@
     wizardServiceQuestions,
     type WeaviateChoice,
   } from '$lib/components/onboarding-service-choice';
+  import { runtimeOwnerRefusal } from '$lib/components/onboarding-runtime-refusal';
   import type {
     OpenAiValidationResult,
     RegisterOpenAiResponse,
@@ -150,6 +151,11 @@
   }
   let volumesConfig = $state<VolumesConfig | null>(null);
   let volumesError = $state<string | null>(null);
+  // R7b F8: the storage commands' refusal to act on volumes that exist only
+  // under the other container runtime. Shown as a blocking panel with its
+  // remedy (quit, set the variable where the launcher starts, relaunch) —
+  // it used to fall into the generic error line and the wizard just stopped.
+  let runtimeRefusal = $state<string | null>(null);
   let volumeChoice = $state<'default' | 'custom'>('default');
   let customVolumesPath = $state('');
   let volumesPickError = $state<string | null>(null);
@@ -591,8 +597,10 @@
     // chooser (no volumes) or the read-only info panel (volumes exist).
     try {
       volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+      runtimeRefusal = null;
     } catch (e) {
-      volumesError = String(e);
+      runtimeRefusal = runtimeOwnerRefusal(e);
+      volumesError = runtimeRefusal ? null : String(e);
     }
   }
 
@@ -652,9 +660,15 @@
           path: chosenPath,
         });
       } catch (e) {
+        installing = false;
+        runtimeRefusal = runtimeOwnerRefusal(e);
+        if (runtimeRefusal) {
+          // Not a picker error: the panel above the Install button says what
+          // happened and how to clear it.
+          return;
+        }
         volumesPickError = String(e);
         installError = String(e);
-        installing = false;
         return;
       }
 
@@ -1448,6 +1462,16 @@
           {:else if volumesError}
             <p class="ow-secondary">Couldn't probe volumes ({volumesError}).</p>
           {/if}
+          {#if runtimeRefusal}
+            <div class="ow-runtime-refusal" role="alert">
+              <p>
+                <strong>Your container data is under the other container runtime.</strong>
+                The install is paused here: continuing would set VCO up against a copy
+                of the volumes that does not hold your data.
+              </p>
+              <p class="ow-error">{runtimeRefusal}</p>
+            </div>
+          {/if}
 
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
@@ -1455,7 +1479,7 @@
             <button
               class="ow-btn-primary"
               onclick={requestInstall}
-              disabled={installing || !!sourceError || !installPath || (serviceQuestions.weaviate !== null && weaviateChoice === null)}
+              disabled={installing || !!sourceError || !!runtimeRefusal || !installPath || (serviceQuestions.weaviate !== null && weaviateChoice === null)}
             >
               {installing ? 'Installing…' : 'Install'}
             </button>
@@ -2112,6 +2136,13 @@
   .ow-secondary { color: #888; font-size: 12px; }
   .ow-mono { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
   .ow-error { color: #f99; font-size: 12px; }
+  .ow-runtime-refusal {
+    margin: 10px 0;
+    padding: 10px 12px;
+    border: 1px solid #ff4fa0;
+    border-radius: 8px;
+    background: rgba(255, 79, 160, 0.08);
+  }
   .ow-ok { color: #0fc; font-size: 12px; }
   .ow-table { font-size: 12px; border-collapse: collapse; }
   .ow-table th { text-align: left; color: #888; font-weight: 500; padding: 4px 12px 4px 0; }

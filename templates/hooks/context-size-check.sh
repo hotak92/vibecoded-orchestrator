@@ -65,7 +65,12 @@ if [ -n "$unset_settings" ]; then
 fi
 
 # resolve_threshold KEY DEFAULT — see "Configuration" above. MUST MATCH
-# Resolve-Threshold in context-size-check.ps1.
+# Resolve-Threshold in context-size-check.ps1, AND the bounds 50..2000 and
+# the defaults 500 / 200 MUST MATCH the `min` / `max` / `default` that
+# launcher/bundled_manifests/vct-session-state.json declares (the launcher
+# validates saves against those): R7b F12 —
+# tests/test_v0297_session_state_settings.py drives this function with the
+# manifest's own bounds, so raising `max` there without here turns it red.
 resolve_threshold() {
     local key="$1" default="$2" value="" line
     value="${!key:-}"

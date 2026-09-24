@@ -3,7 +3,7 @@ title: Safe-Install — Content-Based Service Detection
 type: concept
 tags: [install, weaviate, ollama, podman, services, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-07-20T00:00:00Z
+updated: 2026-09-24T00:00:00Z
 status: active
 ---
 
@@ -13,7 +13,7 @@ status: active
 
 **Not to be confused with "Safe add"** — a distinct per-project protection mechanism in the project-add flow (`vco_lib/project_init.py`): with Safe add ON, VCO leaves the project-root `.env` untouched (it may be VCS-tracked), writing the full env to `.claude/settings.json` `env` + `.claude/env` instead, and mirroring the intended `.env` keys to an inert `.env.vco.reference` sidecar. Safe-*install* is about backing SERVICES on ports; Safe *add* is about a project's `.env` FILE.
 
-**Where the logic lives**: the service probe/decision logic described here runs in `install.py`. The orchestrator-root `.claude/` content install itself is delegated (install.py Step 5b) to the one bundle engine — `vco_lib/self_install.py::run_root_bundle_install` runs `python -m vco_lib.project_init install-bundle --json` in a subprocess; there is no separate root-install code path.
+**Where the logic lives**: the service probe/decision logic described here runs in `vco_lib/service_detection.py` (probes) and `vco_lib/service_reconcile.py` (decisions), driven by `install.py` step [5b]. The orchestrator-root `.claude/` content install itself is delegated (install.py Step 5b) to the one bundle engine — `vco_lib/self_install.py::run_root_bundle_install` runs `python -m vco_lib.project_init install-bundle --json` in a subprocess; there is no separate root-install code path.
 
 ## What it is
 
@@ -23,15 +23,16 @@ Before bringing up its own Podman/Docker containers, install.py issues HTTP prob
 
 | State | Detection | Action |
 |---|---|---|
-| **not running** | connect refused / timeout | start the orchestrator's container on the default port |
-| **vct-managed** | response matches AND `~/.vct/services.toml` has a matching entry | auto-adopt, no prompt |
-| **foreign** | response matches but no services.toml entry | interactive prompt: alt-port (default), adopt, abort |
+| **not running** | connect refused / timeout | start the orchestrator's container on the port the `service_endpoints` row names |
+| **vct-managed** | response matches AND holds VCO data (marker classes / models), or the launcher.db `service_endpoints` row already points here | auto-adopt, no prompt |
+| **foreign Ollama** | response matches, no VCO marker | adopted unattended (an informational record names it and gives the one command to switch to a VCO copy) |
+| **foreign Weaviate** | response matches, no VCO data, no row | never adopted or duplicated unattended: interactive runs prompt; unattended runs record the `service_adoption_confirmation_required` deferral until you answer |
 | **incompatible** | port responds but content doesn't match (e.g. Postgres on 8081) | refuse with a clear error |
 
 ## How probing works
 
 - **Weaviate**: `GET /v1/.well-known/ready` + `GET /v1/schema`. Foreign vs vct-managed is decided by whether the schema contains any vct-prefixed collections.
-- **Ollama**: `GET /api/tags`. Always foreign-vs-managed by services.toml since Ollama has no vct-specific marker.
+- **Ollama**: `GET /api/tags`. No vct-specific marker exists, so a live third-party Ollama is adopted unattended (v0.2.97) and named in an informational record.
 - **code-embed**: `GET /health`. Returns `{"model": "CodeSage-Large-v2"}` (or the configured fallback) if it's our service; anything else is foreign.
 
 Probes never depend on container name (`docker ps`, `podman ps`). A user might run Weaviate via Helm, brew, systemd, or a different compose project — the orchestrator only cares about wire-protocol behavior.
@@ -50,19 +51,20 @@ python install.py --on-conflict abort      # bail
 
 `adopt` is the dangerous mode: the orchestrator writes its own collection schema into the user's running Weaviate. Only safe if the user knows the foreign Weaviate has spare capacity and won't conflict on collection names.
 
-## Adoption lock — `~/.vct/services.toml`
+## Where the decisions live — launcher.db `service_endpoints` rows
 
-Persists each service's resolved action so the launcher and install.py agree:
+Since v0.2.97 each service's resolved endpoint is a row in the launcher.db
+`service_endpoints` table (migration 047): mode (`vco_managed` /
+`adopted_container` / `adopted_external`), host/port, container identity,
+data mount. Every surface — install.py, the hooks, the launcher, the MCP
+registration — reads the rows; they are written only through
+`python -m vco_lib.service_endpoints` verbs (`adopt`, `use-vco-copy`,
+`move`, `hand-to-vco`, `reconcile`).
 
-```toml
-[[services]]
-name = "weaviate"
-mode = "adopt"          # or: "parallel", "unresolved", "refuse"
-external_url = "http://localhost:8081"
-parallel_port = 8082    # only when mode = "parallel"
-```
-
-Schema mirrors `launcher/src-tauri/src/services/adoption.rs::AdoptionMode`. install.py uses a hand-rolled TOML writer because it runs **before** pip-install (no dependency on `tomli_w`). A cross-compat test pins the schema both sides agree on.
+The pre-v0.2.97 adoption lock `~/.vct/services.toml` is RETIRED: the first
+v0.2.97 install/update imports it once (`vco_lib/service_reconcile.py`) and
+renames it `services.toml.migrated-v0297` — never deleted, but no longer
+read by anything.
 
 ## Per-install collection naming
 
@@ -90,17 +92,17 @@ Compose container names are namespaced (`vco_weaviate`, `vco_ollama`) for collis
 
 **Safety**: a developer with an unrelated Weaviate at port 8081 should not have their schema mutated by an OSS install. The orchestrator's "adopt mode" requires explicit `--on-conflict adopt` opt-in for exactly this reason.
 
-**Multi-machine reuse**: developers with several projects using the orchestrator can share one Weaviate. The vct-managed branch detects "we already started this" via services.toml and skips the prompt.
+**Multi-machine reuse**: developers with several projects using the orchestrator can share one Weaviate. The vct-managed branch detects "we already started this" through the `service_endpoints` rows (and the VCO data markers) and skips the prompt.
 
-**Foreign-service operators**: someone running Ollama for personal LLM use shouldn't be blocked from using the orchestrator. Alt-port is the default action precisely because it's the lowest-risk option.
+**Foreign-service operators**: someone running Ollama for personal LLM use shouldn't be blocked from using the orchestrator — a third-party Ollama is adopted unattended (v0.2.97). A third-party Weaviate without VCO data waits for an explicit choice (`service_adoption_confirmation_required`), and alt-port remains the lowest-risk answer.
 
 ## Files
 
-- `install.py` — probe + decision logic + TOML writer
-- `launcher/src-tauri/src/services/adoption.rs` — Rust mirror of the schema
+- `install.py` — entry point; the probe/decision logic lives in `vco_lib/service_detection.py` + `vco_lib/service_reconcile.py`
+- `vco_lib/service_endpoints.py` — the `service_endpoints` rows: the one writer and every verb
 - `infrastructure/docker-compose.override.yml` — generated when alt-port chosen
-- `~/.vct/services.toml` — runtime adoption lock
-- `tests/test_install_shared_containers.py` — 12+ tests covering probe / decision / TOML round-trip
+- `~/.vct/services.toml` — RETIRED adoption lock (imported once on the first v0.2.97 run, then renamed `.migrated-v0297`)
+- `tests/test_v0297_service_reconcile.py` — the reconcile/adoption decision tests
 
 ## Lesson: probe choice for "is Weaviate usable?" — `/v1/meta` not `/v1/.well-known/ready` (added 2026-05-06)
 

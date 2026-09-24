@@ -416,14 +416,15 @@ impl ServiceSnapshot {
     }
 }
 
-/// Fast HTTP probe: short-timeout GET, treats 2xx/3xx as up. Returns
-/// `false` on timeout, connection refused, DNS error, etc.
+/// Fast HTTP probe: short-timeout GET, a 2xx is up; a redirect is never
+/// followed (`vct_launcher_core::services::probe_http`). Returns `false` on timeout, connection refused, DNS
+/// error, etc.
 async fn probe_one(url: &str) -> bool {
-    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+    let client = match vct_launcher_core::services::loopback_http::client_for(url, PROBE_TIMEOUT) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
+    matches!(client.get(url).send().await, Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()))
 }
 
 /// The tray's probe URLs: each service's health URL at its launcher.db

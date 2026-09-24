@@ -233,7 +233,7 @@ notes = """v0.2.97: more than one running instance holds VCO data; the ranking p
 
 [conditions.legacy_service_statement_unimported]
 class = "action_required"
-owner = "install.py"
+owner = "vco_lib.service_reconcile"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 dismiss_key = ["source", "value"]

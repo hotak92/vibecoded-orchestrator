@@ -241,6 +241,60 @@
         "started": ["vco_weaviate"],
         "disposition": {"weaviate": "skip"}
       }
+    },
+    {
+      "id": "stopped_vco_ollama_and_live_native_ollama",
+      "doc": "R7a F1: after a reboot VCO's legacy-compose Ollama (the models bind) is STOPPED and the Ollama desktop app answers on 11434 with no VCO models. VCO's own container outranks the live third-party one: kept and started by name; the app is left alone and nothing is adopted without a prompt.",
+      "phase": "update",
+      "has_gpu": false,
+      "containers": [
+        {"name": "vco_ollama", "image": "docker.io/ollama/ollama:0.20.2", "state": "exited", "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "ollama", "ports": {"11434": 11435}, "mounts": [{"Type": "bind", "Source": "/home/u/volumes/ollama/models", "Destination": "/root/.ollama"}]}
+      ],
+      "http": {"localhost:11434": {"service": "ollama", "models": ["llama3:8b"]}},
+      "expect": {
+        "rows": {"ollama": {"mode": "adopted_container", "container_name": "vco_ollama", "port": 11435, "data_mount": {"kind": "bind", "source": "/home/u/volumes/ollama/models", "destination": "/root/.ollama"}}},
+        "started": ["vco_ollama"],
+        "disposition": {"ollama": "skip"},
+        "managed_services_absent": ["ollama"],
+        "entries_absent": ["service_adopted_without_prompt", "service_endpoint_ambiguous"]
+      }
+    },
+    {
+      "id": "stopped_vco_weaviate_and_live_third_party_weaviate",
+      "doc": "R7a F1: VCO's legacy-compose Weaviate (every KG, on vco_weaviate_data) is STOPPED; another project's Weaviate answers on 8080 with no VCO classes. VCO's own is kept and started by name — never parked, never a question whose premise is wrong.",
+      "phase": "update",
+      "has_gpu": false,
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "exited", "project": "vibecoded", "working_dir": "/home/u/vco/claude_mcp_servers", "service_label": "weaviate", "ports": {"8080": 8081, "50051": 50052}, "mounts": [{"Type": "volume", "Name": "vco_weaviate_data", "Source": "/var/lib/containers/storage/volumes/vco_weaviate_data/_data", "Destination": "/var/lib/weaviate"}]},
+        {"name": "their_weaviate", "image": "semitechnologies/weaviate:1.30.0", "state": "running", "project": "theirs", "working_dir": "/srv/theirs", "ports": {"8080": 8080, "50051": 50051}}
+      ],
+      "http": {"localhost:8080": {"service": "weaviate", "version": "1.30.0", "classes": ["Articles"]}},
+      "busy_ports": [8080, 50051],
+      "expect": {
+        "rows": {"weaviate": {"mode": "adopted_container", "container_name": "vco_weaviate", "port": 8081, "grpc_port": 50052, "confirmed_by_user": true}},
+        "started": ["vco_weaviate"],
+        "disposition": {"weaviate": "skip"},
+        "weaviate_pending": false,
+        "entries_absent": ["service_adoption_confirmation_required", "service_adopted_without_prompt", "service_endpoint_ambiguous"]
+      }
+    },
+    {
+      "id": "stopped_installer_weaviate_and_live_third_party_weaviate",
+      "doc": "R7a F1: VCO's own installer-compose Weaviate is STOPPED and a third-party Weaviate answers on 8080. VCO's stays VCO-managed and step 5 starts it (compose, its own container) — the third-party one is not adopted and not asked about.",
+      "phase": "install",
+      "has_gpu": false,
+      "containers": [
+        {"name": "vco_weaviate", "image": "cr.weaviate.io/semitechnologies/weaviate:1.28.4", "state": "exited", "project": "infrastructure", "service_label": "weaviate", "ports": {"8080": 8081, "50051": 50052}, "mounts": [{"Type": "volume", "Name": "vco_weaviate_data", "Source": "/var/lib/containers/storage/volumes/vco_weaviate_data/_data", "Destination": "/var/lib/weaviate"}]},
+        {"name": "their_weaviate", "image": "semitechnologies/weaviate:1.30.0", "state": "running", "project": "theirs", "working_dir": "/srv/theirs", "ports": {"8080": 8080, "50051": 50051}}
+      ],
+      "http": {"localhost:8080": {"service": "weaviate", "version": "1.30.0", "classes": ["Articles"]}},
+      "busy_ports": [8080, 50051],
+      "expect": {
+        "rows": {"weaviate": {"mode": "vco_managed", "container_name": "vco_weaviate", "port": 8081, "enabled": true}},
+        "disposition": {"weaviate": "start"},
+        "weaviate_pending": false,
+        "entries_absent": ["service_adoption_confirmation_required", "service_adopted_without_prompt"]
+      }
     }
   ]
 }

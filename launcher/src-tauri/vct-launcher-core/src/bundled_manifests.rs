@@ -211,7 +211,11 @@ mod tests {
     /// `runtime.health_check.url` and `provides[http_api].base_url` name
     /// `{hub_port}` — resolved through `services::hub_port`, the ladder the
     /// supervisor uses — and never the default as a literal. With `:7700`
-    /// spelled out, this resolves to the default port and fails.
+    /// spelled out, this resolves to the default port and fails. (Readers:
+    /// the health URL — the hub's health poller; the `base_url` — the
+    /// Preferences → Modules listing, `module_settings_schema::
+    /// list_module_settings` (R7b F11). Programs find the hub through
+    /// `hub.port`, never through a manifest.)
     #[test]
     fn hub_api_urls_follow_the_running_hubs_port() {
         let guard = crate::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", None)]);

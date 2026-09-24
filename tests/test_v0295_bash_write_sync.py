@@ -405,8 +405,10 @@ def test_the_hook_is_registered_on_both_operating_systems() -> None:
         encoding="utf-8"
     )
     for name, text, needle in (
-        ("linux", linux, "bash .claude/hooks/post-bash-file-sync.sh"),
-        ("windows", windows, ".claude/hooks/post-bash-file-sync.ps1"),
+        # Anchored at the project root since v0.2.97 (a relative hook path
+        # fails once the session's cwd moves).
+        ("linux", linux, 'bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-file-sync.sh"'),
+        ("windows", windows, '"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-file-sync.ps1"'),
     ):
         doc = json.loads(text)
         entries = [

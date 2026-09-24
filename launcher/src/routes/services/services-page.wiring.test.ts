@@ -99,6 +99,39 @@ describe('Services page wiring', () => {
   });
 });
 
+describe('Move to another port wiring (R7b F22)', () => {
+  it('each row renders moveOffer(svc), and the button only for kind "move"', () => {
+    const each = [...walk(PAGE.fragment)].find(
+      (n) =>
+        n.type === 'EachBlock' &&
+        (n.expression as Node)?.type === 'MemberExpression' &&
+        isIdent((n.expression as Node).object, 'snapshot'),
+    );
+    const offers = calls(each, 'moveOffer');
+    expect(offers.length).toBe(1);
+    expect(isIdent((offers[0].arguments as Node[])[0], 'svc')).toBe(true);
+    // The button that opens the dialog sits under an {#if move.kind === 'move'}.
+    const guarded = [...walk(each)].find(
+      (n) =>
+        n.type === 'IfBlock' &&
+        [...walk(n.test)].some((t) => t.type === 'Literal' && t.value === 'move') &&
+        calls((n as Node).consequent, 'openMove').length === 1,
+    );
+    expect(guarded, "{#if move.kind === 'move'} … openMove(…)").toBeDefined();
+  });
+
+  it('the dialog sends moveRequest(…) through moveService, then refreshes', () => {
+    const script = (PAGE.instance as Node).content;
+    const sends = calls(script, 'moveService');
+    expect(sends.length).toBe(1);
+    expect(calls(sends[0], 'moveRequest').length).toBe(1);
+    const confirm = [...walk(script)].find(
+      (n) => n.type === 'FunctionDeclaration' && isIdent(n.id, 'confirmMove'),
+    );
+    expect(confirm && calls(confirm, 'refresh').length).toBe(1);
+  });
+});
+
 describe('Adoption dialog wiring', () => {
   it('"Use this one" sends adoptActionFor(service, c); "Run VCO’s own copy" sends vcoCopyAction', () => {
     const runs = calls(DIALOG.fragment, 'run');

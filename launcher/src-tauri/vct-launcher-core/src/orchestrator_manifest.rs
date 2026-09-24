@@ -82,6 +82,15 @@ pub fn find_orchestrator_manifest() -> Option<PathBuf> {
     }
 }
 
+/// The orchestrator clone root — the directory holding `vct-module.json`
+/// ([`find_orchestrator_manifest`]'s parent). The ONE core answer to "where
+/// is this binary's install", used where `state/install/runtime.txt` must be
+/// read (`services::runtime`, the hub supervisor) and by the hub's gateway /
+/// hook-enforcement subprocess `cwd`.
+pub fn orchestrator_install_root() -> Option<PathBuf> {
+    find_orchestrator_manifest().and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+}
+
 pub fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
     let path = find_orchestrator_manifest()?;
     let raw = std::fs::read_to_string(&path).ok()?;

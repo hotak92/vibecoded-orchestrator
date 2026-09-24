@@ -49,56 +49,56 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/check-no-fork-bomb.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/check-no-fork-bomb.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/ensure-containers.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ensure-containers.sh\"",
             "timeout": 15,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/verify-container-ports.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/verify-container-ports.sh\"",
             "timeout": 30,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/ensure-code-embed-service.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/ensure-code-embed-service.sh\"",
             "timeout": 15,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-start-ensure-hub.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start-ensure-hub.sh\"",
             "timeout": 5,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-start-kg-loader.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start-kg-loader.sh\"",
             "timeout": 10
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-start-deferral-surface.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start-deferral-surface.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/session-start-retrieval-health.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/session-start-retrieval-health.sh\"",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/embedding-failures-surface.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/embedding-failures-surface.sh\"",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/context-size-check.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/context-size-check.sh\"",
             "timeout": 2
           }
         ]
@@ -108,12 +108,12 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/compact-context-reinject.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/compact-context-reinject.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.sh\"",
             "timeout": 4
           }
         ]
@@ -125,7 +125,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-compact-save.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-compact-save.sh\"",
             "timeout": 5
           }
         ]
@@ -137,7 +137,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-compact.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-compact.sh\"",
             "timeout": 10
           }
         ]
@@ -148,22 +148,22 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/user-prompt-submit-reminder.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/user-prompt-submit-reminder.sh\"",
             "timeout": 2
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/diff-context-inject.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/diff-context-inject.sh\"",
             "timeout": 3
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.sh\"",
             "timeout": 4
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/agent-skill-keyword-suggest.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/agent-skill-keyword-suggest.sh\"",
             "timeout": 2
           }
         ]
@@ -174,17 +174,17 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/subagent-start-suggest.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-start-suggest.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/subagent-start-kg-inject.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-start-kg-inject.sh\"",
             "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/subagent-start-isolation-check.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-start-isolation-check.sh\"",
             "timeout": 3
           }
         ]
@@ -195,7 +195,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/subagent-stop-reconcile.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/subagent-stop-reconcile.sh\"",
             "timeout": 2
           }
         ]
@@ -206,7 +206,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/worktree-guard.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/worktree-guard.sh\"",
             "timeout": 3
           }
         ]
@@ -218,7 +218,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-vercel-token-guard.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-vercel-token-guard.sh\" \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 2
           }
         ]
@@ -228,7 +228,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/lean-ctx-rewrite.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/lean-ctx-rewrite.sh\"",
             "timeout": 5
           }
         ]
@@ -238,7 +238,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-bash-context-inject.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-bash-context-inject.sh\"",
             "timeout": 8
           }
         ]
@@ -248,7 +248,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-tool-use.sh \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-tool-use.sh\" \"$CLAUDE_TOOL_NAME\" \"$CLAUDE_USER_MESSAGE\"",
             "timeout": 3
           }
         ]
@@ -258,7 +258,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-edit-context-inject.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-edit-context-inject.sh\"",
             "timeout": 8,
             "if": "Edit(*)"
           }
@@ -269,7 +269,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-diagram-path-validation.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-diagram-path-validation.sh\"",
             "timeout": 3
           }
         ]
@@ -279,7 +279,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/pre-diagram-path-validation.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/pre-diagram-path-validation.sh\"",
             "timeout": 3
           }
         ]
@@ -290,7 +290,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/config-change-audit.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/config-change-audit.sh\"",
             "timeout": 2,
             "async": true
           }
@@ -302,25 +302,25 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/notify-stop.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"",
             "timeout": 5,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/stop-drain-citations.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop-drain-citations.sh\"",
             "timeout": 30,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/stop-codegraph-reminder.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop-codegraph-reminder.sh\"",
             "timeout": 5,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/stop-codegraph-drain.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop-codegraph-drain.sh\"",
             "timeout": 15,
             "async": true
           }
@@ -332,7 +332,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/stop-failure-notify.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/stop-failure-notify.sh\"",
             "timeout": 5,
             "async": true
           }
@@ -345,7 +345,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-file-edit.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-file-edit.sh\"",
             "timeout": 5
           }
         ]
@@ -355,7 +355,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-edit-outcome.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-edit-outcome.sh\"",
             "timeout": 5,
             "async": true
           }
@@ -366,7 +366,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-bash-context-record.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-context-record.sh\"",
             "timeout": 5,
             "async": true
           }
@@ -377,7 +377,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-bash-file-sync.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-file-sync.sh\"",
             "timeout": 10
           }
         ]
@@ -387,7 +387,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-tool-security.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-tool-security.sh\"",
             "timeout": 5
           }
         ]
@@ -397,7 +397,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/py-compile-check.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/py-compile-check.sh\"",
             "timeout": 10
           }
         ]
@@ -407,7 +407,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-summary-generator.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.sh\"",
             "timeout": 5,
             "async": true,
             "if": "Edit(knowledge/**/*.md)"
@@ -419,7 +419,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-summary-generator.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.sh\"",
             "timeout": 5,
             "async": true,
             "if": "Write(knowledge/**/*.md)"
@@ -431,7 +431,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-summary-generator.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.sh\"",
             "timeout": 5,
             "async": true
           }
@@ -443,13 +443,13 @@
           {
             "type": "command",
             "if": "Bash(git commit *)",
-            "command": "bash .claude/hooks/post-git-commit-kg-sync.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-git-commit-kg-sync.sh\"",
             "timeout": 10,
             "async": true
           },
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-file-delete.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-file-delete.sh\"",
             "timeout": 5,
             "async": true
           }
@@ -459,7 +459,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/kg-update-nudge.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.sh\"",
             "async": true,
             "timeout": 3
           }
@@ -471,7 +471,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash .claude/hooks/post-mcp-retrieval-record.sh",
+            "command": "bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-mcp-retrieval-record.sh\"",
             "timeout": 5
           }
         ]

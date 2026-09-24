@@ -19,6 +19,7 @@ import {
   isMachineWide,
   editorHref,
   hasEditableMachineWide,
+  httpApiLines,
   isEditable,
   listModuleSettings,
   liveSettingValues,
@@ -73,7 +74,14 @@ describe('the shared validation case table (parity with the Rust write gate)', (
       ),
       'utf8',
     ),
-  ) as Array<{ name: string; decl: ManifestSettingDecl; value: unknown; ok: boolean }>;
+  ) as Array<{
+    name: string;
+    decl: ManifestSettingDecl;
+    value: unknown;
+    ok: boolean;
+    /** A JSON spelling (`7700.0`) only the wire can carry — see below. */
+    json_spelling_only?: boolean;
+  }>;
 
   it('covers accept and reject', () => {
     expect(cases.length).toBeGreaterThanOrEqual(20);
@@ -82,6 +90,15 @@ describe('the shared validation case table (parity with the Rust write gate)', (
   });
 
   for (const c of cases) {
+    if (c.json_spelling_only) {
+      // `JSON.parse` turns `7700.0` into the number 7700, so this row is the
+      // Rust gate's alone. What the page can pin: it never SENDS such a
+      // spelling — an integer serializes with no fraction or exponent.
+      it(`never sends the spelling of: ${c.name}`, () => {
+        expect(JSON.stringify(c.value)).toMatch(/^-?[0-9]+$/);
+      });
+      continue;
+    }
     it(`${c.ok ? 'accepts' : 'refuses'}: ${c.name}`, () => {
       const problem = checkSettingValue(c.decl, c.value);
       expect(problem === null, String(problem)).toBe(c.ok);
@@ -241,6 +258,7 @@ function listed(
     origin: projects === null ? 'bundled' : 'installed',
     projects,
     settings: m.settings.map((d) => ({ ...d, binding: bindings[d.key] ?? STORED })),
+    http_apis: [],
   };
 }
 
@@ -311,5 +329,92 @@ describe('an installed (catalog) module', () => {
       value: 300,
       projectId: 'p1',
     });
+  });
+});
+
+describe('the HTTP APIs a module provides (R7b F11)', () => {
+  it('shows each resolved base_url with its description', () => {
+    const m = {
+      http_apis: [
+        { base_url: 'http://127.0.0.1:8123/api/v1', description: 'POST /apps/register, GET /health' },
+        { base_url: 'http://127.0.0.1:9000/x', description: '  ' },
+      ],
+    };
+    expect(httpApiLines(m)).toEqual([
+      { url: 'http://127.0.0.1:8123/api/v1', description: 'POST /apps/register, GET /health' },
+      { url: 'http://127.0.0.1:9000/x', description: null },
+    ]);
+  });
+
+  it('never shows a URL whose placeholder was not resolved, nor an empty one', () => {
+    expect(
+      httpApiLines({
+        http_apis: [
+          { base_url: 'http://127.0.0.1:{hub_port}/api/v1', description: 'd' },
+          { base_url: '', description: 'd' },
+        ],
+      }),
+    ).toEqual([]);
+    expect(httpApiLines({ http_apis: [] })).toEqual([]);
+  });
+
+  it('the listing the panel reads carries them (Rust payload shape)', async () => {
+    const payload = [
+      {
+        module_id: 'vct-hub-api',
+        name: 'Hub API Server',
+        origin: 'bundled',
+        projects: null,
+        settings: [],
+        http_apis: [{ base_url: 'http://127.0.0.1:7700/api/v1', description: 'd' }],
+      },
+    ];
+    invokeMock.mockResolvedValueOnce(payload);
+    const got = await listModuleSettings();
+    expect(httpApiLines(got[0]).map((l) => l.url)).toEqual(['http://127.0.0.1:7700/api/v1']);
+  });
+});
+
+describe('CoreModuleSettingsPanel renders the provided HTTP APIs', () => {
+  // Parsed with the Svelte compiler (a name in a comment does not satisfy
+  // it); `vitest.config.ts` has no component runner.
+  it('each module card renders {#each httpApiLines(m)} with the resolved URL', async () => {
+    const { parse } = await import('svelte/compiler');
+    type N = Record<string, unknown>;
+    const here = dirname(fileURLToPath(import.meta.url));
+    const ast = parse(readFileSync(resolve(here, 'components/CoreModuleSettingsPanel.svelte'), 'utf8'), {
+      modern: true,
+    }) as unknown as N;
+    function* walk(node: unknown): Generator<N> {
+      if (node === null || typeof node !== 'object') return;
+      if (Array.isArray(node)) {
+        for (const c of node) yield* walk(c);
+        return;
+      }
+      const o = node as N;
+      if (typeof o.type === 'string') yield o;
+      for (const [k, v] of Object.entries(o)) if (k !== 'parent' && k !== 'loc') yield* walk(v);
+    }
+    const isId = (n: unknown, name: string) => (n as N)?.type === 'Identifier' && (n as N).name === name;
+    const modulesEach = [...walk(ast.fragment)].find(
+      (n) => n.type === 'EachBlock' && isId(n.expression, 'modules'),
+    );
+    expect(modulesEach, '{#each modules as m}').toBeDefined();
+    const apiEach = [...walk(modulesEach)].find(
+      (n) =>
+        n.type === 'EachBlock' &&
+        (n.expression as N).type === 'CallExpression' &&
+        isId((n.expression as N).callee, 'httpApiLines') &&
+        isId(((n.expression as N).arguments as N[])[0], 'm'),
+    );
+    expect(apiEach, '{#each httpApiLines(m) as api}').toBeDefined();
+    const shown = [...walk((apiEach as N).body)].filter(
+      (n) =>
+        n.type === 'ExpressionTag' &&
+        (n.expression as N).type === 'MemberExpression' &&
+        isId(((n.expression as N).object as N), 'api') &&
+        isId((n.expression as N).property, 'url'),
+    );
+    expect(shown.length, '{api.url} rendered').toBe(1);
   });
 });

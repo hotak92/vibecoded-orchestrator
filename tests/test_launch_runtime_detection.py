@@ -1,7 +1,18 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Tests for the new runtime-detection logic in
-``scripts/launch-claude-mcp-stack.sh`` (PR-12 v0.2.11 Bug A + Bug B).
+"""Tests for the runtime-detection logic in
+``scripts/launch-claude-mcp-stack.sh`` (PR-12 v0.2.11 Bug A + Bug C, and the
+v0.2.97 pin rule that superseded Bug B).
+
+PR-12 "Bug B" let a runtime.txt — or ``VCT_CONTAINER_RUNTIME`` — whose runtime
+was down fall through to the OTHER runtime. v0.2.97 reverses that: the boot
+wrapper follows THE pin rule every other VCO surface follows
+(``vco_lib.containers.runtime_pin``: ``VCT_CONTAINER_RUNTIME`` →
+``state/install/runtime.txt`` → auto-detect). Starting the stack under the
+other runtime creates its containers on that runtime's EMPTY volumes next to
+the real data (service-endpoints plan invariants I1/I2), so a pinned runtime
+that is down starts nothing and logs one line naming the pin and the fix.
+Unpinned auto-detection keeps its podman-then-docker fallback.
 
 We exercise three pure helpers by sourcing the script:
 
@@ -235,9 +246,12 @@ def test_resolve_runtime_file_explicit_env_wins(tmp_path: Path):
     assert out == str(explicit_path)
 
 
-def test_resolve_runtime_file_falls_through_when_runtime_unusable(tmp_path: Path):
-    """Bug B core scenario: explicit runtime.txt names docker but docker
-    daemon isn't reachable → fall through to the next candidate."""
+def test_resolve_runtime_file_a_down_runtime_is_still_the_pin(tmp_path: Path):
+    """Formerly PR-12 Bug B ("fall through to the next candidate when the
+    recorded runtime is down") — SUPERSEDED by the v0.2.97 pin rule
+    (``vco_lib.containers.runtime_pin``): the first runtime.txt that records a
+    runtime IS the pin, reachable or not. detect_runtime refuses it (below);
+    a second, differently-recorded file is never consulted."""
     fake_bin = tmp_path / "bin"
     _seed_fake_bin(fake_bin)
     # docker stub fails the daemon-access check.
@@ -262,11 +276,28 @@ def test_resolve_runtime_file_falls_through_when_runtime_unusable(tmp_path: Path
         "VCT_STACK_RUNTIME_FILE": str(explicit_path),
         "VCT_STACK_WORKING_DIR": str(fallback_dir),
     }
+    _, out, _err = _run_bash('resolve_runtime_file', env=env)
+    # The explicit (docker) file is the pin; the fresh podman one is ignored.
+    assert out == str(explicit_path)
+    assert out != str(fallback_path)
+
+
+def test_resolve_runtime_file_skips_a_file_that_names_no_runtime(tmp_path: Path):
+    """PR-12 Bug C is kept: a candidate that is missing, empty or names no
+    runtime is not a pin — the next candidate is."""
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    garbage = _make_runtime_txt(tmp_path / "garbage", "nerdctl")
+    real = _make_runtime_txt(tmp_path / "install", "podman")
+    env = {
+        "PATH": str(fake_bin),
+        "HOME": str(tmp_path),
+        "VCT_STACK_RUNTIME_FILE": str(garbage),
+        "VCT_STACK_WORKING_DIR": str(tmp_path / "install"),
+    }
     _, out, err = _run_bash('resolve_runtime_file', env=env)
-    # Falls through to the WORKING_DIR candidate.
-    assert out == str(fallback_path)
-    # The fall-through is logged for diagnosability.
-    assert "daemon is not reachable" in err or "falling through" in err
+    assert out == str(real)
+    assert "not podman or docker" in err
 
 
 def test_resolve_runtime_file_uses_orchestrator_root(tmp_path: Path):
@@ -393,3 +424,101 @@ def test_detect_runtime_honors_runtime_txt_when_usable(tmp_path: Path):
     }
     _, out, _ = _run_bash('detect_runtime', env=env)
     assert out == "podman-compose"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.97: THE pin rule (supersedes PR-12 Bug B's fall-through)
+# ---------------------------------------------------------------------------
+
+
+def _stub(fake_bin: Path, name: str, body: str) -> None:
+    (fake_bin / name).write_text("#!/usr/bin/env bash\n" + body)
+    (fake_bin / name).chmod(0o755)
+
+
+_DOCKER_UP = 'if [ "$1" = "info" ]; then echo "Server:"; echo " Server Version: 20.10.0"; exit 0; fi\n'
+_DOCKER_DOWN = 'if [ "$1" = "info" ]; then echo "Client:"; exit 1; fi\n'
+_PODMAN_UP = "exit 0\n"
+_PODMAN_DOWN = 'if [ "$1" = "info" ]; then exit 125; fi\nexit 0\n'
+
+
+def _detect(env: dict) -> tuple[str, int, str]:
+    """detect_runtime's (stdout, return code, stderr)."""
+    _, out, err = _run_bash('out="$(detect_runtime)"; rc=$?; printf "%s|%s" "$out" "$rc"', env=env)
+    answer, _, rc = out.rpartition("|")
+    return answer, int(rc), err
+
+
+def test_a_runtime_txt_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):
+    """The install recorded docker; docker is down; podman (with compose)
+    is up. Pre-v0.2.97 (PR-12 Bug B) the wrapper started the stack under
+    podman — on podman's EMPTY volumes. Now: nothing, rc 4, one line naming
+    the pin (the runtime.txt path) and the fix."""
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "docker", _DOCKER_DOWN)
+    _stub(fake_bin, "podman", _PODMAN_UP)
+    _stub(fake_bin, "podman-compose", "exit 0\n")
+    pin = _make_runtime_txt(tmp_path / "install", "docker")
+    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
+                            "VCT_STACK_WORKING_DIR": str(tmp_path / "install")})
+    assert (out, rc) == ("", 4), err
+    lines = [ln for ln in err.splitlines() if "pinned to docker" in ln]
+    assert len(lines) == 1, err
+    assert str(pin) in lines[0]
+    assert "starting nothing" in lines[0]
+    assert "Fix: start docker" in lines[0]
+    assert "VCT_CONTAINER_RUNTIME=podman" in lines[0]
+
+
+def test_an_env_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "podman", _PODMAN_DOWN)
+    _stub(fake_bin, "docker", _DOCKER_UP)
+    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
+                            "VCT_CONTAINER_RUNTIME": "podman",
+                            "VCT_STACK_WORKING_DIR": str(tmp_path / "noexist")})
+    assert (out, rc) == ("", 4), err
+    assert "pinned to podman by VCT_CONTAINER_RUNTIME" in err
+    assert "unset VCT_CONTAINER_RUNTIME" in err
+
+
+def test_a_pinned_podman_without_a_compose_front_end_never_becomes_docker(tmp_path: Path):
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    # podman answers `info` but has no `compose` subcommand, and there is
+    # no podman-compose on PATH.
+    _stub(fake_bin, "podman", 'if [ "$1" = "compose" ]; then exit 125; fi\nexit 0\n')
+    _stub(fake_bin, "docker", _DOCKER_UP)
+    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
+                            "VCT_CONTAINER_RUNTIME": "podman",
+                            "VCT_STACK_WORKING_DIR": str(tmp_path / "noexist")})
+    assert (out, rc) == ("", 4), err
+    assert "podman compose" in err
+
+
+def test_the_env_pin_outranks_runtime_txt(tmp_path: Path):
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "docker", _DOCKER_UP)
+    _stub(fake_bin, "podman", _PODMAN_UP)
+    _stub(fake_bin, "podman-compose", "exit 0\n")
+    _make_runtime_txt(tmp_path / "install", "podman")
+    out, rc, _ = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
+                          "VCT_CONTAINER_RUNTIME": "docker",
+                          "VCT_STACK_WORKING_DIR": str(tmp_path / "install")})
+    assert (out, rc) == ("docker", 0)
+
+
+def test_unpinned_auto_detection_keeps_its_fallback(tmp_path: Path):
+    """No pin (no env, no runtime.txt): podman without a compose front-end
+    still falls through to a usable docker — auto-detection is unchanged."""
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "podman", 'if [ "$1" = "compose" ]; then exit 125; fi\nexit 0\n')
+    _stub(fake_bin, "docker", _DOCKER_UP)
+    out, rc, _ = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
+                          "VCT_CONTAINER_RUNTIME": "auto",
+                          "VCT_STACK_WORKING_DIR": str(tmp_path / "noexist")})
+    assert (out, rc) == ("docker", 0)

@@ -544,32 +544,58 @@ fn free_bytes_at(_path: &Path) -> Option<u64> {
 /// On a docker-pinned machine with a leftover podman copy, that inspected
 /// and migrated the podman copy. podman and docker keep separate volumes, so
 /// a volume only the other runtime has is refused, never adopted.
+///
+/// R7b F4: PER VOLUME. This used to ask the other runtime only when the
+/// chosen one had NO orchestrator volume at all, so with docker owning
+/// `ollama_data` and `weaviate_data` only under podman, a migration moved
+/// `ollama_data` and said nothing about `weaviate_data` (compose would then
+/// create an empty one). Now every name in `ORCHESTRATOR_VOLUME_NAMES` is
+/// checked, and any the chosen runtime lacks but the other one HAS is
+/// refused by name. A failed inspect under the chosen runtime is an error,
+/// not "absent" (R7b F25(b)); under the other runtime it is not ownership.
 async fn existing_volumes_owned_by(
     rt: &super::storage_ux::StorageRuntime,
     action: &str,
 ) -> Result<Vec<ExistingVolume>, String> {
+    use super::storage_ux::{probe_volume, VolumeProbe};
     use vct_launcher_core::services::container_runtime::{check_runtime_owns, other_runtime};
-    let under_chosen = super::installer::detect_existing_volumes_under(&rt.name).await;
-    if !under_chosen.is_empty() {
-        return Ok(under_chosen);
+    let other = other_runtime(&rt.name);
+    let mut owned: Vec<ExistingVolume> = Vec::new();
+    let mut only_elsewhere: Vec<String> = Vec::new();
+    for name in super::installer::ORCHESTRATOR_VOLUME_NAMES {
+        match probe_volume(&rt.name, name).await {
+            VolumeProbe::Found { mountpoint, driver } => {
+                owned.push(ExistingVolume { name: name.to_string(), mountpoint, driver });
+            }
+            VolumeProbe::Unknown(why) => {
+                return Err(format!(
+                    "could not tell whether {} holds the orchestrator volume `{name}` ({why}); \
+                     refusing to {action} the volumes until `{} volume inspect {name}` answers",
+                    rt.name, rt.name
+                ));
+            }
+            VolumeProbe::Missing => {
+                if matches!(probe_volume(other, name).await, VolumeProbe::Found { .. }) {
+                    only_elsewhere.push(format!("`{name}`"));
+                }
+            }
+        }
     }
-    let under_other = super::installer::detect_existing_volumes_under(other_runtime(&rt.name)).await;
-    let names: Vec<String> = under_other.iter().map(|v| format!("`{}`", v.name)).collect();
     check_runtime_owns(
         action,
-        &format!("the orchestrator volume(s) {}", names.join(", ")),
+        &format!("the orchestrator volume(s) {}", only_elsewhere.join(", ")),
         &rt.name,
         rt.pin,
         false,
-        !under_other.is_empty(),
+        !only_elsewhere.is_empty(),
     )?;
-    Ok(Vec::new())
+    Ok(owned)
 }
 
 /// [`existing_volumes_owned_by`] for the read-only and install-time
 /// commands. No usable runtime → an empty list, as before (a machine before
 /// its first install has none); the only error is the ownership refusal.
-async fn existing_volumes_on_storage_runtime(
+pub(crate) async fn existing_volumes_on_storage_runtime(
     action: &str,
 ) -> Result<Vec<ExistingVolume>, String> {
     let install_root = super::installer::find_local_repo_root().ok();
@@ -578,7 +604,7 @@ async fn existing_volumes_on_storage_runtime(
 
 /// [`existing_volumes_on_storage_runtime`] with the install root passed in
 /// (tests point it at a temp dir, so no machine's `runtime.txt` leaks in).
-async fn existing_volumes_on_storage_runtime_at(
+pub(crate) async fn existing_volumes_on_storage_runtime_at(
     install_root: Option<&Path>,
     action: &str,
 ) -> Result<Vec<ExistingVolume>, String> {
@@ -1075,7 +1101,8 @@ fn healthy_probe_urls() -> Vec<String> {
 }
 
 /// HTTP-probe Weaviate and Ollama in a tight loop until they both respond
-/// 2xx/3xx, or `timeout_secs` elapses.
+/// 2xx (a redirect is never followed — `probe_http`), or `timeout_secs`
+/// elapses.
 async fn wait_until_healthy(timeout_secs: u64) -> bool {
     let urls = healthy_probe_urls();
     wait_until_urls_healthy(&urls, timeout_secs).await
@@ -1084,20 +1111,16 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
 /// [`wait_until_healthy`] over explicit `urls` (the test seam).
 async fn wait_until_urls_healthy(urls: &[String], timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
     // /v1/meta is the right liveness probe for Weaviate (see
     // `service_status::health_path`).
     while std::time::Instant::now() < deadline {
         let mut all_ok = true;
         for u in urls {
+            let Ok(client) = vct_launcher_core::services::loopback_http::client_for(u, std::time::Duration::from_secs(2)) else {
+                return false;
+            };
             match client.get(u.as_str()).send().await {
-                Ok(r) if r.status().as_u16() < 400 => {}
+                Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()) => {}
                 _ => {
                     all_ok = false;
                     break;
@@ -1111,13 +1134,6 @@ async fn wait_until_urls_healthy(urls: &[String], timeout_secs: u64) -> bool {
     }
     false
 }
-
-// Force ExistingVolume to be used so the import isn't dead code (the
-// type is consumed implicitly via tokio process JSON deserialization
-// inside `installer::detect_existing_volumes_under`, which
-// `existing_volumes_owned_by` delegates to).
-#[allow(dead_code)]
-fn _force_existing_volume_used(_: ExistingVolume) {}
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -1156,6 +1172,27 @@ mod tests {
         ] {
             assert!(err.contains(needle), "{needle:?} missing from {err:?}");
         }
+    }
+
+    /// R7b F4 — the MIXED case: docker (pinned) owns `ollama_data`,
+    /// `weaviate_data` exists only under podman. The refusal is per volume:
+    /// it names `weaviate_data` and only it. Before, docker owning ANY
+    /// orchestrator volume meant podman was never asked, and the migration
+    /// went ahead without `weaviate_data`.
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_only_the_other_runtime_owns_is_refused_even_beside_owned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        assert!(
+            err.contains("refusing to migrate the orchestrator volume(s) `weaviate_data`:"),
+            "{err}"
+        );
+        assert!(!err.contains("`ollama_data`"), "a volume docker owns was named: {err}");
     }
 
     /// Leave-alone: the runtime VCO drives owns the volumes → exactly its

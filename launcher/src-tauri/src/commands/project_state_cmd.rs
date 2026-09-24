@@ -1090,10 +1090,7 @@ fn ensure_target_url(db: &Db, requested: Option<&str>) -> String {
 }
 
 async fn ensure_kg_collection(weaviate_url: &str, collection_name: &str) -> Result<(), String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client_for(weaviate_url, std::time::Duration::from_secs(10))?;
 
     // Probe first — if the schema endpoint already lists this class,
     // skip the POST. Cheaper than relying on the 422 path.

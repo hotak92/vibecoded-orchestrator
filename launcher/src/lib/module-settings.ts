@@ -72,6 +72,76 @@ function hasOptions(decl: ManifestSettingDecl): boolean {
 }
 
 /**
+ * Why a `validation` pattern is outside the PORTABLE subset JavaScript
+ * `RegExp` (flags `us`) and the Rust `regex` crate read the same way, or
+ * `null` when it is inside: literals, `.`, `^` / `$`, `|`, `(...)` /
+ * `(?:...)`, the quantifiers `* + ? {n} {n,} {n,m}` (and lazy forms), bracket
+ * classes with ranges, and escaping one of `\ ^ $ . | ? * + ( ) [ ] { } /`
+ * (plus `-` inside a class). Must match `portable_pattern_problem` in
+ * `module_settings_schema.rs` (the shared case table runs both).
+ */
+export function portablePatternProblem(pattern: string): string | null {
+  const ESCAPABLE = '\\^$.|?*+()[]{}/';
+  const chars = Array.from(pattern);
+  const braceProblem = "a '{' that is not a {n}, {n,} or {n,m} quantifier (escape it)";
+  const digitsAt = (from: number): number => {
+    let n = 0;
+    while (from + n < chars.length && /^[0-9]$/.test(chars[from + n])) n += 1;
+    return n;
+  };
+  let i = 0;
+  let inClass = false;
+  while (i < chars.length) {
+    const c = chars[i];
+    if (c === '\\') {
+      const next = chars[i + 1];
+      if (next === undefined) return 'a trailing backslash';
+      if (!(ESCAPABLE.includes(next) || (inClass && next === '-'))) {
+        return 'an escape other than a punctuation character (write a class such as [0-9] instead of \\d)';
+      }
+      i += 2;
+      continue;
+    }
+    if (inClass) {
+      if (c === ']') inClass = false;
+      else if (c === '[') return "a '[' inside a character class";
+      else if ((c === '&' || c === '-' || c === '~') && chars[i + 1] === c) {
+        return 'a class operator (&&, --, ~~)';
+      }
+      i += 1;
+      continue;
+    }
+    if (c === '[') {
+      inClass = true;
+      let j = i + 1;
+      if (chars[j] === '^') j += 1;
+      if (chars[j] === ']') return "an empty or ']'-first character class";
+      i = j;
+      continue;
+    }
+    if (c === ']' || c === '}') return "a stray ']' or '}' (escape it)";
+    if (c === '(' && chars[i + 1] === '?' && chars[i + 2] !== ':') {
+      return 'a (? group other than (?: (lookaround, flags, named groups)';
+    }
+    if (c === '{') {
+      let j = i + 1;
+      const n = digitsAt(j);
+      if (n === 0) return braceProblem;
+      j += n;
+      if (chars[j] === ',') {
+        j += 1;
+        j += digitsAt(j);
+      }
+      if (chars[j] !== '}') return braceProblem;
+      i = j + 1;
+      continue;
+    }
+    i += 1;
+  }
+  return inClass ? 'an unclosed character class' : null;
+}
+
+/**
  * Check `value` against its declaration: `null` = acceptable, otherwise a
  * one-line reason. Same rules as the Rust write gate (see the file header).
  */
@@ -82,6 +152,10 @@ export function checkSettingValue(
   const name = settingLabel(decl);
   switch (settingType(decl)) {
     case 'integer': {
+      // The Rust gate also refuses an integer SPELLED with a fraction or
+      // exponent (`7700.0`); a JS number cannot carry that spelling, and the
+      // page serializes an integer without one, so it never sends it. The
+      // case table marks those rows `json_spelling_only`.
       if (typeof value !== 'number' || !Number.isInteger(value)) {
         return `${name}: must be a whole number`;
       }
@@ -105,9 +179,15 @@ export function checkSettingValue(
         return `${name}: must be one of ${decl.options!.join(', ')}`;
       }
       if (decl.validation) {
+        const problem = portablePatternProblem(decl.validation);
+        if (problem !== null) {
+          return `${name}: the module's validation pattern uses ${problem}, which the launcher does not support`;
+        }
         let re: RegExp;
         try {
-          re = new RegExp(decl.validation);
+          // `u`: match by code point, like the Rust side; `s`: `.` matches
+          // every character, like the Rust side's `dot_matches_new_line`.
+          re = new RegExp(decl.validation, 'us');
         } catch (e) {
           return `${name}: the module's validation pattern is invalid (${String(e)})`;
         }
@@ -225,11 +305,43 @@ export type ListedSetting = ManifestSettingDecl & { binding: SettingBinding };
 export interface ListedModuleSettings {
   module_id: string;
   name: string;
-  /** 'bundled' (every project) | 'installed' (a catalog module). */
-  origin: 'bundled' | 'installed';
+  /**
+   * 'bundled' (every project) | 'installed' (a catalog module) |
+   * 'dev_passthrough' (a module under development, shown because
+   * VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH is set — every project).
+   */
+  origin: 'bundled' | 'installed' | 'dev_passthrough';
   /** Projects its per-project settings may be edited for; `null` = all. */
   projects: string[] | null;
   settings: ListedSetting[];
+  /**
+   * The module's `provides` http_api entries, `base_url` RESOLVED by Rust
+   * (`PlaceholderCtx::resolve`: `{hub_port}` → the running hub's port).
+   */
+  http_apis: ProvidedHttpApi[];
+}
+
+/** Rust `manifest::ProvidedHttpApi`. */
+export interface ProvidedHttpApi {
+  base_url: string;
+  description: string;
+}
+
+/** One "Provides" line the panel shows for a module's HTTP API. */
+export interface HttpApiLine {
+  url: string;
+  description: string | null;
+}
+
+/**
+ * The HTTP APIs a module provides, as the panel shows them. The URL is the
+ * resolved one; an entry whose URL still holds a `{placeholder}` (a token
+ * the launcher does not know) is left out rather than shown wrong.
+ */
+export function httpApiLines(module: Pick<ListedModuleSettings, 'http_apis'>): HttpApiLine[] {
+  return (module.http_apis ?? [])
+    .filter((a) => a.base_url !== '' && !/\{[^}]*\}/.test(a.base_url))
+    .map((a) => ({ url: a.base_url, description: a.description.trim() === '' ? null : a.description }));
 }
 
 /** Rust `module_gui::LiveSettingValue`. */

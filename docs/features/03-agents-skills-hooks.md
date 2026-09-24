@@ -218,7 +218,7 @@ Auto-start required containers (Weaviate, Ollama, code embedding service) if sto
 <details>
 <summary>Details</summary>
 
-Non-blocking (background). Container names configurable via `VCT_REQUIRED_CONTAINERS` (space-separated). Container runtime auto-detected (podman preferred, falls back to docker). Compose dir resolves relative to hook location; override with `VCT_COMPOSE_DIR` (a directory already containing the compose file) or `VCT_INFRASTRUCTURE_DIR` (an `infrastructure/` directory used as the compose dir). Uses `flock` to prevent race conditions when multiple sessions start simultaneously.
+Non-blocking (background). Container names configurable via `VCT_REQUIRED_CONTAINERS` (space-separated). Container runtime auto-detected (podman preferred, falls back to docker). Compose dir resolves relative to hook location; override with `VCT_COMPOSE_DIR` (a directory already containing the compose file) or `VCT_INFRASTRUCTURE_DIR` (an `infrastructure/` directory used as the compose dir). Its reconcile → plan → act runs under a per-user session lock (`flock`, taken by `python -m vco_lib.service_lifecycle with-session-lock`; the `.ps1` sibling holds the same lock file), shared with `verify-container-ports` and with sessions that start at the same moment, and the session reconcile runs at most once a minute across them (v0.2.97).
 
 </details>
 
@@ -349,7 +349,11 @@ If you are seeing that storm, `vco doctor` now reads Claude Code's `hasTrustDial
 Counts substantive work tokens since the last KG node write; nudges to write a KG node when the threshold (~150k tokens) is exceeded. Bypass with `KG_NUDGE_OFF=1`.
 
 ### `verify-container-ports.sh` — SessionStart (startup, background)
-Verifies that the Weaviate / Ollama / code-embed container ports are bound and reachable. Logs to `.claude/logs/container_port_check.jsonl`. Non-blocking.
+Verifies that the Weaviate / Ollama / code-embed container ports are bound and reachable. Non-blocking.
+
+Every run appends one JSON line to `<project>/.claude/logs/container_port_check.jsonl` (`<project>` = `CLAUDE_PROJECT_DIR`, else the project the hook is installed in): `timestamp` (UTC), `runtime`, `services` — for each of `weaviate` / `ollama` / `code_embed` its `result` (`healthy`, `slow` = PID alive but the port not answering yet, `zombie`, or `absent`) with the `container` and `port` — and `action`: `none`, `skipped` (with a `reason`), `lock_busy` (`.ps1`: `ensure-containers` held the session lock), `waiting_for_session_lock` (`.sh`: the run found a zombie and re-runs itself under the lock, which appends its own line) or `recovered`, with a `recovery` list saying what was done to each zombie (`recreated`, `restarted`, `left_as_is` or `failed`, and why). A log that cannot be written never changes what the hook does.
+
+It probes each service on the port its `service_endpoints` row records (v0.2.97), and treats a container that `ps` calls running but whose main PID is dead as a zombie without probing it. It recovers a zombie only under the per-user session lock it shares with `ensure-containers` (`python -m vco_lib.service_lifecycle with-session-lock`; the `.ps1` siblings hold the same lock file), and only after the session reconcile has re-checked the rows: the two hooks never act on the same container at once, and a container is never removed on a row that could not be re-checked. Only a VCO-managed row's zombie is removed and re-created. An adopted container, or one whose service has no row yet, is only ever started by name.
 
 ### `pre-vercel-token-guard.sh` — PreToolUse Bash (blocking)
 Blocks `vercel ... --token=...` invocations because the Vercel CLI echoes the token back in the `next:` block of stdout, leaking it into tool output. Forces use of `VERCEL_TOKEN` env var instead. Exit 2 on `--token=` match.

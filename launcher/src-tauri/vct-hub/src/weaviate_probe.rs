@@ -132,7 +132,7 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
 
     // 3. Probe each class via HEAD /v1/schema/{class}. Weaviate
     // returns 200 if the class exists, 404 if not.
-    let client = reqwest::Client::builder()
+    let client = vct_launcher_core::services::loopback_http::builder_for(weaviate_url)
         .timeout(Duration::from_secs(2))
         // A DISCRETE connect timeout, matching the sibling probe
         // (`weaviate_schema_probe.rs`, which gained one in v0.2.75 and

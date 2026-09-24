@@ -183,7 +183,8 @@ class _Machine:
             "FAKE_RECONCILE_LOG": str(self.rt_log),
         })
         for key in ("VCT_DISABLE_HOOKS", "VCT_LAUNCHER_DB_PATH", "VCT_REQUIRED_CONTAINERS",
-                    "VCT_VENV", "VCT_INSTALL_ROOT", "VCO_COMPOSE_SERVICES", "VCT_STACK_BUILD"):
+                    "VCT_VENV", "VCT_INSTALL_ROOT", "VCO_COMPOSE_SERVICES", "VCT_STACK_BUILD",
+                    "VCO_SESSION_LOCK_HELD"):
             env.pop(key, None)
         env.update(extra)
         return env
@@ -383,38 +384,282 @@ class HookSessionReconcileTests(_TmpCase, _Shells):
                 self.assertEqual(len(m.compose_calls()), 1, proc.stdout)
 
 
-@unittest.skipIf(IS_WINDOWS, "bash hook")
-class VerifyContainerPortsZombieGateTests(_TmpCase):
-    """`verify-container-ports.sh` — the second zombie-recovery site.
+class VerifyContainerPortsZombieGateTests(_TmpCase, _Shells):
+    """`verify-container-ports.{sh,ps1}` — the second zombie-recovery site.
 
-    Bash only: the hook probes the LITERAL default ports (8081, …), and a
-    fake `curl` on PATH keeps the bash probe off the network. The .ps1
-    sibling probes with Invoke-WebRequest / TcpClient, which no PATH fake
-    can intercept, so driving it here would contact whatever real service
-    listens on 8081 — the lane rules forbid that; its gate mirrors this one
-    line for line."""
-
-    def _run(self, m: _Machine) -> subprocess.CompletedProcess:
-        return subprocess.run(["bash", str(HOOKS / "verify-container-ports.sh")],
-                              env=m.env(), capture_output=True, text=True, timeout=120,
-                              cwd=str(REPO_ROOT))
+    Both shells: the hook checks a container's PID before its port and never
+    probes a DEAD one (v0.2.97), and these cases use only zombie (dead-PID)
+    or missing containers, so neither the bash `curl` nor the PowerShell
+    Invoke-WebRequest / TcpClient probe reaches any port (the managed rows
+    are on the unroutable port 9 besides)."""
 
     def test_an_adopted_zombie_is_never_removed(self):
-        m = self.machine(DOGFOOD_ROWS, {"vco_weaviate": "zombie"})
-        proc = self._run(m)
-        self.assertIn("zombie state(s) detected", proc.stdout, proc.stderr)
-        self.assertFalse([c for c in m.runtime_calls() if c[0] == "rm"], m.runtime_calls())
-        self.assertEqual(m.compose_calls(), [])
-        self.assertIn("vco_weaviate is not VCO-managed", proc.stdout)
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(DOGFOOD_ROWS, {"vco_weaviate": "zombie"})
+                proc = _run_verify(m, shell)
+                self.assertIn("zombie state(s) detected", proc.stdout, proc.stderr)
+                self.assertFalse([c for c in m.runtime_calls() if c[0] == "rm"], m.runtime_calls())
+                self.assertEqual(m.compose_calls(), [])
+                self.assertIn("vco_weaviate is not VCO-managed", proc.stdout)
 
     def test_a_managed_zombie_is_recreated_alone_with_no_deps(self):
-        m = self.machine([_row("weaviate"), _row("ollama"), _row("code_embed")],
-                         {"vco_weaviate": "zombie"})
-        proc = self._run(m)
-        self.assertIn(["rm", "-f", "vco_weaviate"], m.runtime_calls(), proc.stdout)
-        calls = m.compose_calls()
-        self.assertEqual(len(calls), 1, f"{calls}\n{proc.stdout}")
-        _assert_explicit_managed_only(self, calls[0], ["weaviate"], forbidden=("ollama",))
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                proc = _run_verify(m, shell)
+                self.assertIn(["rm", "-f", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
+                calls = m.compose_calls()
+                self.assertEqual(len(calls), 1, f"{calls}\n{proc.stdout}")
+                _assert_explicit_managed_only(self, calls[0], ["weaviate"], forbidden=("ollama",))
+
+
+# ===========================================================================
+# (3) R7a F3 — no row = ownership unknown: a zombie is started, never removed
+# ===========================================================================
+
+def _run_verify(machine: _Machine, shell: str, **env) -> subprocess.CompletedProcess:
+    """`verify-container-ports.{sh,ps1}`. Only DEAD-PID (zombie) or missing
+    containers are used here: the hook checks the PID first and never probes
+    a dead container's port, so no test reaches a real service; the rows'
+    ports are unroutable (9) where a row exists."""
+    if shell == "bash":
+        argv = ["bash", str(HOOKS / "verify-container-ports.sh")]
+    else:
+        argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                str(HOOKS / "verify-container-ports.ps1")]
+    return subprocess.run(argv, env=machine.env(**env), capture_output=True, text=True,
+                          timeout=180, cwd=str(REPO_ROOT))
+
+
+#: VCO-managed rows on an unroutable port: a probe (if any) is refused locally.
+SENTINEL_MANAGED = [_row("weaviate", port=9), _row("ollama", port=9), _row("code_embed", port=9)]
+
+
+class NoRowZombieTests(_TmpCase, _Shells):
+    """R7a F3: with NO service_endpoints row (registry unavailable, the window
+    before the root update) a zombie `vco_*` container may be the legacy
+    compose project's, on a bind the installer's compose does not mount — an
+    `rm` + compose would bring it back on the installer's EMPTY default
+    volume. Both zombie-recovery hooks start it by name, never remove it."""
+
+    def test_ensure_containers_starts_a_rowless_zombie_and_never_removes_it(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(None, {"vco_weaviate": "running", "vco_ollama": "zombie",
+                                        "vco_code_embed": "running"})
+                proc = _run_hook(m, shell)
+                rt = m.runtime_calls()
+                self.assertFalse([c for c in rt if c[0] == "rm"], f"{rt}\n{proc.stdout}\n{proc.stderr}")
+                self.assertIn(["start", "vco_ollama"], rt, proc.stdout + proc.stderr)
+                self.assertEqual(m.compose_calls(), [], proc.stdout)
+
+    def test_verify_container_ports_never_removes_a_rowless_zombie(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(None, {"vco_weaviate": "zombie"})
+                proc = _run_verify(m, shell)
+                self.assertIn("zombie state(s) detected", proc.stdout, proc.stderr)
+                self.assertFalse([c for c in m.runtime_calls() if c[0] == "rm"], m.runtime_calls())
+                self.assertEqual(m.compose_calls(), [])
+                self.assertIn("vco_weaviate is not VCO-managed", proc.stdout)
+
+
+# ===========================================================================
+# (3b) verify-container-ports' run log (docs/features/03-agents-skills-hooks.md)
+# ===========================================================================
+
+class VerifyContainerPortsLogTests(_TmpCase, _Shells):
+    """Every run of `verify-container-ports.{sh,ps1}` appends ONE JSON line
+    to `<project>/.claude/logs/container_port_check.jsonl` (<project> =
+    CLAUDE_PROJECT_DIR — here a temp project): timestamp, runtime, each
+    service's result and the action taken. Soft-fails when it cannot write.
+    Containers are zombie (dead PID, never probed) or running on the
+    unroutable row port 9, so no probe reaches a real service."""
+
+    def _project(self, m: _Machine) -> Path:
+        project = m.tmp / "project"
+        project.mkdir(exist_ok=True)
+        return project
+
+    def _log(self, project: Path) -> list[dict]:
+        path = project / ".claude" / "logs" / "container_port_check.jsonl"
+        if not path.exists():
+            return []
+        return [json.loads(ln) for ln in path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+
+    def test_a_clean_run_logs_each_services_result_and_no_action(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_ollama": "running"})
+                project = self._project(m)
+                proc = _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                lines = self._log(project)
+                self.assertEqual(len(lines), 1, f"{lines}\n{proc.stdout}\n{proc.stderr}")
+                rec = lines[0]
+                self.assertRegex(rec["timestamp"], r"^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$")
+                self.assertEqual(rec["hook"], "verify-container-ports")
+                self.assertEqual(rec["runtime"], "podman")
+                self.assertEqual(rec["action"], "none")
+                # A live PID whose port does not answer (row port 9) is "slow".
+                self.assertEqual(rec["services"]["ollama"],
+                                 {"result": "slow", "container": "vco_ollama", "port": 9})
+                self.assertEqual(rec["services"]["weaviate"], {"result": "absent"})
+                self.assertEqual(rec["services"]["code_embed"], {"result": "absent"})
+                self.assertNotIn("recovery", rec)
+
+    def test_a_recovery_logs_the_zombie_and_what_was_done(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                project = self._project(m)
+                proc = _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project))
+                lines = self._log(project)
+                self.assertTrue(lines, proc.stdout + proc.stderr)
+                last = lines[-1]
+                self.assertEqual(last["action"], "recovered", lines)
+                self.assertEqual(last["services"]["weaviate"],
+                                 {"result": "zombie", "container": "vco_weaviate", "port": 9})
+                self.assertEqual(len(last["recovery"]), 1, last)
+                step = last["recovery"][0]
+                self.assertEqual((step["container"], step["service"], step["action"]),
+                                 ("vco_weaviate", "weaviate", "recreated"), last)
+                self.assertIn("weaviate", step["detail"])
+                # bash re-runs itself under the session lock: the detection
+                # run logs first; PowerShell takes the lock in-process.
+                if shell == "bash":
+                    self.assertEqual([r["action"] for r in lines], ["waiting_for_session_lock", "recovered"])
+                else:
+                    self.assertEqual(len(lines), 1, lines)
+
+    def test_an_adopted_zombie_is_logged_as_left_as_is(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(DOGFOOD_ROWS, {"vco_weaviate": "zombie"})
+                project = self._project(m)
+                _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project))
+                last = self._log(project)[-1]
+                self.assertEqual(last["action"], "recovered")
+                self.assertEqual(last["recovery"][0]["action"], "left_as_is")
+                self.assertEqual(last["recovery"][0]["detail"], "not VCO-managed")
+
+    def test_a_skipped_run_names_why(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {})
+                project = self._project(m)
+                # A pinned runtime that does not answer (a fake `docker` that
+                # fails every call, first on PATH — the host's is never run):
+                # the resolver refuses the pin.
+                fake_docker = m.bin / "docker"
+                fake_docker.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                fake_docker.chmod(0o755)
+                proc = _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project),
+                                   VCT_CONTAINER_RUNTIME="docker")
+                lines = self._log(project)
+                self.assertEqual(len(lines), 1, f"{lines}\n{proc.stdout}\n{proc.stderr}")
+                self.assertEqual(lines[0]["action"], "skipped")
+                self.assertTrue(lines[0].get("reason"), lines[0])
+
+    def test_an_unwritable_log_changes_nothing_the_hook_does(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                project = self._project(m)
+                (project / ".claude").write_text("a file where the log directory would go\n")
+                proc = _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                self.assertIn(["rm", "-f", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
+                self.assertEqual(len(m.compose_calls()), 1, proc.stdout)
+                self.assertTrue((project / ".claude").is_file())
+
+
+# ===========================================================================
+# (4) R7a F10 — the two container hooks are serialised, reconcile first
+# ===========================================================================
+
+class _HeldSessionLock:
+    """Hold the per-user session lock (the file `service_lifecycle
+    session-lock-path` names under the machine's VCT_STATE_DIR) for
+    *seconds*, from a thread, then write `RELEASED` into the runtime log —
+    so the order of the hook's calls relative to the release is visible."""
+
+    def __init__(self, machine: _Machine, seconds: float):
+        import fcntl
+        import threading
+
+        lock = machine.state / "locks" / "container-session.lock"
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        self._fh = open(lock, "a", encoding="utf-8")  # noqa: SIM115 - held across the thread
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        self._log = machine.rt_log
+        self._thread = threading.Timer(seconds, self._release)
+        self._thread.start()
+
+    def _release(self):
+        import fcntl
+
+        with open(self._log, "a", encoding="utf-8") as fh:
+            fh.write("RELEASED\n")
+        fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+        self._fh.close()
+
+    def join(self):
+        self._thread.join()
+
+
+@unittest.skipIf(IS_WINDOWS, "the test holds the lock with fcntl")
+class SessionLockTests(_TmpCase, _Shells):
+    def test_ensure_containers_waits_for_the_lock_before_its_reconcile(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(DOGFOOD_ROWS, {"vco_weaviate": "running", "vco_ollama": "running",
+                                                "vco_code_embed": "running"})
+                held = _HeldSessionLock(m, 3.0)
+                proc = _run_hook(m, shell)
+                held.join()
+                rt = m.runtime_calls()
+                self.assertIn(["RECONCILE"], rt, proc.stdout + proc.stderr)
+                self.assertLess(rt.index(["RELEASED"]), rt.index(["RECONCILE"]), rt)
+
+    def test_verify_recovers_only_after_the_lock_and_the_reconcile(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                held = _HeldSessionLock(m, 3.0)
+                proc = _run_verify(m, shell)
+                held.join()
+                rt = m.runtime_calls()
+                self.assertIn(["rm", "-f", "vco_weaviate"], rt, proc.stdout + proc.stderr)
+                released, reconciled = rt.index(["RELEASED"]), rt.index(["RECONCILE"])
+                removed = rt.index(["rm", "-f", "vco_weaviate"])
+                self.assertLess(released, reconciled, rt)
+                self.assertLess(reconciled, removed, rt)
+                calls = m.compose_calls()
+                self.assertEqual(len(calls), 1, f"{calls}\n{proc.stdout}")
+                _assert_explicit_managed_only(self, calls[0], ["weaviate"], forbidden=("ollama",))
+
+    def test_verify_removes_nothing_when_the_rows_could_not_be_rechecked(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                proc = _run_verify(m, shell, FAKE_RECONCILE_EXIT="3")
+                self.assertIn(["RECONCILE"], m.runtime_calls(), proc.stdout + proc.stderr)
+                self.assertFalse([c for c in m.runtime_calls() if c[0] == "rm"], m.runtime_calls())
+                self.assertEqual(m.compose_calls(), [])
+                self.assertIn("could not be re-checked", proc.stdout)
+
+    def test_one_reconcile_serves_both_hooks(self):
+        """Whichever hook holds the lock first reconciles; the other reads
+        the rows it corrected (the stamp) instead of a second reconcile."""
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
+                _run_hook(m, shell)
+                proc = _run_verify(m, shell)
+                self.assertEqual(m.runtime_calls().count(["RECONCILE"]), 1,
+                                 f"{m.runtime_calls()}\n{proc.stdout}")
 
 
 # ===========================================================================
@@ -422,6 +667,29 @@ class VerifyContainerPortsZombieGateTests(_TmpCase):
 # ===========================================================================
 
 class WrapperServiceListTests(_TmpCase, _Shells):
+    def test_a_pinned_runtime_that_is_down_starts_nothing_at_boot(self):
+        """v0.2.97 (supersedes PR-12 "Bug B"): the boot wrapper follows THE
+        pin rule. VCT_CONTAINER_RUNTIME pins docker, docker does not answer
+        (a fake that fails every call, first on PATH), podman is up: the
+        wrapper exits 3 with ONE line naming the pin and the fix, and
+        composes / starts nothing under podman."""
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine([_row("weaviate"), _row("ollama"), _row("code_embed")], {})
+                docker = m.bin / "docker"
+                docker.write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
+                docker.chmod(0o755)
+                proc = _run_wrapper(m, shell, [], VCT_CONTAINER_RUNTIME="docker")
+                self.assertEqual(proc.returncode, 3, proc.stdout + proc.stderr)
+                self.assertEqual(m.compose_calls(), [], proc.stdout)
+                self.assertFalse([c for c in m.runtime_calls() if c and c[0] in ("start", "compose", "run")],
+                                 m.runtime_calls())
+                both = proc.stdout + proc.stderr
+                lines = [ln for ln in both.splitlines() if "pinned to docker by VCT_CONTAINER_RUNTIME" in ln]
+                self.assertEqual(len(set(lines)), 1, both)
+                self.assertIn("starting nothing", lines[0])
+                self.assertNotIn("no container runtime found", both)
+
     def test_an_explicit_request_for_adopted_services_composes_nothing(self):
         for shell in self.shells():
             with self.subTest(shell=shell):

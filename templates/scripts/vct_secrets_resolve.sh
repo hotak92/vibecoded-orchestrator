@@ -201,10 +201,15 @@ _hub_request_max_time() {
 # and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every client by
 # `tests/test_v0297_hub_port_clients.py`.
 _hub_port_value() {
-    local v="$1"
-    v="${v#"${v%%[![:space:]]*}"}"
-    v="${v%"${v##*[![:space:]]}"}"
-    [[ "$v" =~ ^[0-9]{1,10}$ ]] || return 1
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # A sign, `_`, a non-ASCII numeral or INTERNAL whitespace is invalid. The
+    # numeral class is spelled out: `[0-9]` follows the collation locale.
+    local v="$1" pad=$' \t\n\v\f\r'
+    v="${v#"${v%%[!$pad]*}"}"
+    v="${v%"${v##*[!$pad]}"}"
+    [[ "$v" =~ ^[0123456789]{1,5}$ ]] || return 1
     (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
     printf '%s\n' "$((10#$v))"
 }
@@ -217,7 +222,7 @@ hub_port() {
     local port_file="$state_dir/hub.port"
     if [[ -f "$port_file" ]]; then
         local p
-        p=$(tr -d '[:space:]' < "$port_file" 2>/dev/null)
+        p=$(cat -- "$port_file" 2>/dev/null)
         _hub_port_value "$p" && return 0
     fi
     # Default — matches launcher's server.rs::DEFAULT_PORT.

@@ -346,7 +346,16 @@ _MAIN_SPAN_MAX = 1645
 # left the file; round 2 retired the superseded legacy legs of
 # `_resolve_compose_working_dir` and `_probe_compose_working_dir_via_ps`.
 # Measured with `wc -l`, not predicted.
-_TOTAL_LINES_MAX = 23191
+#
+# v0.2.97 gate-fix round — re-pinned DOWNWARD 23191 -> 23168: the R7b/F6
+# lanes (running-hub-port reading, the code-embed migration commit seam,
+# the hub health probe's strict port reader) had grown the file past the
+# pin; the probe body moved to `vco_lib.hub_ensure.probe_hub_health`
+# (install.py keeps a thin `_probe_vct_hub_health` shim) and the
+# migration's no-registrar commit callable to
+# `vco_lib.service_lifecycle.commit_without_mcp_registration`. Measured
+# with `wc -l`, not predicted.
+_TOTAL_LINES_MAX = 23168
 
 
 def _measure() -> tuple:

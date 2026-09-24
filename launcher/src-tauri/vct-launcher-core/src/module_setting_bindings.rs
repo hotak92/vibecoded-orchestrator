@@ -80,10 +80,54 @@ impl SettingBinding {
     }
 }
 
-/// The binding of every setting an installed (catalog) module declares.
+/// The generic stored binding — the fallback for a bundled setting the table
+/// below does not list (a test keeps that from happening).
 pub const CATALOG_BINDING: SettingBinding = SettingBinding::Stored {
     reader: "the module itself: the hub's /env for each project it is installed in, \
              or its runtime environment",
+};
+
+/// Where an installed (catalog) module's setting is DELIVERED, keyed on the
+/// module's `runtime.type` and on whether the setting is listed in
+/// `runtime.env_from_settings` (R7b F23). `None` = no reader delivers it, so
+/// the editor does not offer it and `set_module_setting` refuses it (the
+/// manifest parser admits only the five known types, so today every type has
+/// one).
+///
+/// The two readers (`docs/VCT_MODULE_MANIFEST_SPEC.md` §8):
+/// * the hub's `GET /projects/{id}/env` — every declared setting of every
+///   module installed for the project, per-project installs and ENABLED
+///   machine-wide installs alike: the project's row, else (and always, for a
+///   `scope: "global"` setting) the machine-wide row;
+/// * for a `container` / `service` module VCO starts, the container's
+///   environment — the `env_from_settings` keys only (`module_settings_env`).
+pub fn catalog_binding(runtime_type: &str, env_listed: bool) -> Option<SettingBinding> {
+    let reader = match (runtime_type, env_listed) {
+        ("container" | "service", true) => {
+            "the module's container at its next start (runtime.env_from_settings), and the \
+             hub's /env for each project the module is enabled in"
+        }
+        ("container" | "service", false) => {
+            "the hub's /env for each project the module is enabled in (not passed to the \
+             container: not listed in runtime.env_from_settings)"
+        }
+        ("mcp_stdio" | "mcp_http" | "cli", _) => {
+            "the module itself, through the hub's /env for each project it is enabled in"
+        }
+        _ => return None,
+    };
+    Some(SettingBinding::Stored { reader })
+}
+
+/// The binding of a setting declared by a module under development — a
+/// manifest in `<install root>/paid-modules/` shown because
+/// `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is set (R7b F24). It is not
+/// installed, so the hub's `/env` does not serve it yet; the module's config
+/// tab reads the stored value, and `/env` serves the same rows once the module
+/// is installed.
+pub const DEV_PASSTHROUGH_BINDING: SettingBinding = SettingBinding::Stored {
+    reader: "the module under development (VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH): its config \
+             tab now; the hub's /env once it is installed",
 };
 
 /// Every setting the bundled manifests (`launcher/bundled_manifests/`)
@@ -137,12 +181,13 @@ pub const BUNDLED_SETTING_BINDINGS: &[(&str, &str, SettingBinding)] = &[
         "WEAVIATE_URL",
         SettingBinding::Elsewhere {
             live: LiveSource::WeaviateUrl,
-            home: "One Weaviate for this computer, recorded in the launcher database when \
-                   VCO is installed or updated (the Weaviate it runs, or the one it adopted); \
-                   default http://localhost:8081. `python -m vco_lib.service_endpoints show` \
-                   prints it.",
-            editor_route: None,
-            editor_label: None,
+            home: "One Weaviate for this computer, recorded in the launcher database (the \
+                   Weaviate VCO runs, or the one it adopted; default http://localhost:8081). \
+                   The Services page shows it: move VCO's own Weaviate with “Move to another \
+                   port” — VCO re-creates it there with the same data — or use another \
+                   Weaviate with “Change…”.",
+            editor_route: Some("/services"),
+            editor_label: Some("Open Services"),
         },
     ),
     (
@@ -174,8 +219,8 @@ pub const BUNDLED_SETTING_BINDINGS: &[(&str, &str, SettingBinding)] = &[
         SettingBinding::Elsewhere {
             live: LiveSource::CodeEmbedPort,
             home: "The port the code-embedding service runs on, recorded in the launcher \
-                   database when VCO is installed or updated (default 11440). \
-                   `python -m vco_lib.service_endpoints show` prints it.",
+                   database (default 11440). Change it on the Services page with “Move to \
+                   another port” — VCO re-creates the service there with the same data.",
             editor_route: Some("/services"),
             editor_label: Some("Open Services"),
         },
@@ -239,6 +284,27 @@ mod tests {
         keys.sort();
         keys.dedup();
         assert_eq!(keys.len(), BUNDLED_SETTING_BINDINGS.len(), "one row per setting");
+    }
+
+    /// The service endpoints the Services page shows and moves — Weaviate's
+    /// URL and code-embed's port — link there, and their home text names the
+    /// page's move action (`service-endpoint-move.ts` offers "Move to another
+    /// port…" for a `vco_managed` row). Red if WEAVIATE_URL goes back to "no
+    /// editor" while the page can change it.
+    #[test]
+    fn service_endpoint_settings_link_to_the_services_page() {
+        for (m, k) in [("vct-kg", "WEAVIATE_URL"), ("vct-code-embedding", "CODE_EMBED_PORT")] {
+            match bundled_binding(m, k).expect("a row") {
+                SettingBinding::Elsewhere { home, editor_route, editor_label, .. } => {
+                    assert_eq!(editor_route, Some("/services"), "{m}/{k}");
+                    assert_eq!(editor_label, Some("Open Services"), "{m}/{k}");
+                    assert!(home.contains("Services page"), "{m}/{k}: {home}");
+                    assert!(home.contains("Move to another port"), "{m}/{k}: {home}");
+                    assert!(home.contains("same data"), "{m}/{k}: {home}");
+                }
+                other => panic!("{m}/{k} must live elsewhere, got {other:?}"),
+            }
+        }
     }
 
     /// A Stored binding names its reader; an Elsewhere one names its home.

@@ -111,6 +111,12 @@ def test_plan_case(case) -> None:
     assert p["adopted_containers"] == case["expect_adopted_containers"]
     for svc, want in case["expect_containers"].items():
         assert p["services"][svc]["container"] == want, svc
+    # F3 (R7a): a zombie is re-created ONLY for a VCO-managed row; with NO row
+    # the ownership is unknown and the container is at most started by name.
+    from vco_lib.service_lifecycle import zombie_action
+
+    for svc, want in case["expect_on_zombie"].items():
+        assert zombie_action(rows, svc) == want, svc
 
 
 @pytest.mark.parametrize("case", TABLE["ignored_input_cases"], ids=lambda c: c["name"])

@@ -561,25 +561,101 @@ pub(crate) async fn storage_runtime_at(
 /// would act on a copy without the user's data). Empty when neither
 /// runtime has it; the caller reports "not found" as before. The other
 /// runtime is asked only on that miss, and only to word the refusal.
+///
+/// R7b F25(b): an inspect that FAILED is not an answer. This counted any
+/// failed `volume inspect` under `rt` as "not owned", so a transient error
+/// produced a refusal claiming the volume "exists only under" the other
+/// runtime. Now a failure under `rt` is an error saying it could not be
+/// inspected; a failure under the OTHER runtime is only "not known to own
+/// it" — a refusal needs a positive answer.
 async fn mountpoint_on_owning_runtime(
     rt: &StorageRuntime,
     volume: &str,
     action: &str,
 ) -> Result<String, String> {
-    let (mountpoint, _) = inspect_volume(&rt.name, volume).await;
-    if !mountpoint.is_empty() {
-        return Ok(mountpoint);
+    match probe_volume(&rt.name, volume).await {
+        VolumeProbe::Found { mountpoint, .. } => return Ok(mountpoint),
+        VolumeProbe::Unknown(why) => {
+            return Err(format!(
+                "could not tell whether {} holds volume `{volume}` ({why}); refusing to \
+                 {action} it until `{} volume inspect {volume}` answers",
+                rt.name, rt.name
+            ))
+        }
+        VolumeProbe::Missing => {}
     }
-    let (elsewhere, _) = inspect_volume(container_runtime::other_runtime(&rt.name), volume).await;
+    let other = container_runtime::other_runtime(&rt.name);
+    let owned_by_other = match probe_volume(other, volume).await {
+        VolumeProbe::Found { .. } => true,
+        VolumeProbe::Missing => false,
+        VolumeProbe::Unknown(why) => {
+            tracing::info!("[storage_ux] {other} could not be asked about `{volume}` ({why})");
+            false
+        }
+    };
     container_runtime::check_runtime_owns(
         action,
         &format!("volume `{volume}`"),
         &rt.name,
         rt.pin,
         false,
-        !elsewhere.is_empty(),
+        owned_by_other,
     )?;
     Ok(String::new())
+}
+
+/// What `<runtime> volume inspect <name>` established — tri-state, because
+/// "no such volume" and "the inspect failed" are different answers (R7b
+/// F25(b)). The ONE parser of that command's output: `inspect_volume` below
+/// and `commands::volumes::existing_volumes_owned_by` go through it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum VolumeProbe {
+    Found { mountpoint: String, driver: String },
+    /// The runtime answered that it has no such volume — or the runtime is
+    /// not installed at all, which holds nothing.
+    Missing,
+    /// The inspect could not answer (spawn failure other than "not
+    /// installed", a daemon/transport error, unparseable output).
+    Unknown(String),
+}
+
+/// `<runtime> volume inspect <name>`, classified. Read-only.
+pub(crate) async fn probe_volume(runtime: &str, name: &str) -> VolumeProbe {
+    let out = tokio::process::Command::new(vct_launcher_core::paths::spawn_program(runtime))
+        .silent()
+        .args(["volume", "inspect", name])
+        .output()
+        .await;
+    let out = match out {
+        Ok(o) => o,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return VolumeProbe::Missing,
+        Err(e) => return VolumeProbe::Unknown(format!("could not run `{runtime}`: {e}")),
+    };
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        // podman: "Error: no such volume <n>"; docker: "Error: No such volume: <n>"
+        // / "Error response from daemon: get <n>: no such volume".
+        if stderr.to_ascii_lowercase().contains("no such volume") {
+            return VolumeProbe::Missing;
+        }
+        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+        return VolumeProbe::Unknown(if first.is_empty() {
+            format!("`{runtime} volume inspect` exited {}", out.status)
+        } else {
+            first.to_string()
+        });
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&out.stdout) {
+        Ok(v) => v,
+        Err(e) => return VolumeProbe::Unknown(format!("unreadable `volume inspect` output: {e}")),
+    };
+    match parsed.as_array().and_then(|a| a.first()) {
+        Some(item) => VolumeProbe::Found {
+            mountpoint: item.get("Mountpoint").and_then(|v| v.as_str()).unwrap_or("").to_string(),
+            driver: item.get("Driver").and_then(|v| v.as_str()).unwrap_or("local").to_string(),
+        },
+        None => VolumeProbe::Missing,
+    }
 }
 
 /// Parse one line of `podman volume ls --format '{{.Name}}'` output and
@@ -610,42 +686,10 @@ pub fn filter_legacy_volume_names<'a>(lines: impl IntoIterator<Item = &'a str>) 
 /// Inspect a single volume by name. Returns mountpoint + driver. On
 /// any failure returns empty strings (the FE renders "(unavailable)").
 async fn inspect_volume(runtime: &str, name: &str) -> (String, String) {
-    let out = tokio::process::Command::new(vct_launcher_core::paths::spawn_program(runtime))
-        .silent()
-        .args(["volume", "inspect", name])
-        .output()
-        .await;
-    let out = match out {
-        Ok(o) => o,
-        Err(_) => return (String::new(), String::new()),
-    };
-    if !out.status.success() {
-        return (String::new(), String::new());
+    match probe_volume(runtime, name).await {
+        VolumeProbe::Found { mountpoint, driver } => (mountpoint, driver),
+        VolumeProbe::Missing | VolumeProbe::Unknown(_) => (String::new(), String::new()),
     }
-    let body = String::from_utf8_lossy(&out.stdout);
-    let parsed: serde_json::Value = match serde_json::from_str(&body) {
-        Ok(v) => v,
-        Err(_) => return (String::new(), String::new()),
-    };
-    let arr = match parsed.as_array() {
-        Some(a) => a,
-        None => return (String::new(), String::new()),
-    };
-    let item = match arr.first() {
-        Some(i) => i,
-        None => return (String::new(), String::new()),
-    };
-    let mp = item
-        .get("Mountpoint")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .to_string();
-    let dr = item
-        .get("Driver")
-        .and_then(|v| v.as_str())
-        .unwrap_or("local")
-        .to_string();
-    (mp, dr)
 }
 
 /// Inner detection routine — separate from the Tauri command so tests
@@ -1371,10 +1415,17 @@ pub(crate) mod fake_runtime_support {
     use std::path::Path;
 
     /// A fake runtime on the injected lookup PATH: answers `info` and
-    /// `--version`, and `volume inspect <v>` for each owned volume only.
+    /// `--version`, and `volume inspect <v>` for each owned volume only —
+    /// any other volume gets the real runtimes' "no such volume" answer.
     pub(crate) fn fake_runtime(dir: &Path, name: &str, owned: &[&str]) {
+        fake_runtime_with(dir, name, owned, &[]);
+    }
+
+    /// [`fake_runtime`] whose `volume inspect` FAILS (a transport error, not
+    /// "no such volume") for each volume in `failing` (R7b F25(b)).
+    pub(crate) fn fake_runtime_with(dir: &Path, name: &str, owned: &[&str], failing: &[&str]) {
         use std::os::unix::fs::PermissionsExt;
-        let arms: String = owned
+        let mut arms: String = owned
             .iter()
             .map(|v| {
                 format!(
@@ -1382,8 +1433,13 @@ pub(crate) mod fake_runtime_support {
                 )
             })
             .collect();
+        for v in failing {
+            arms.push_str(&format!(
+                "      {v}) echo 'Error: cannot connect to the {name} service: timed out' >&2; exit 125;;\n"
+            ));
+        }
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  info|--version) exit 0;;\n  volume)\n    [ \"$2\" = inspect ] || exit 1\n    case \"$3\" in\n{arms}    esac\n    exit 1;;\nesac\nexit 1\n"
+            "#!/bin/sh\ncase \"$1\" in\n  info|--version) exit 0;;\n  volume)\n    [ \"$2\" = inspect ] || exit 1\n    case \"$3\" in\n{arms}    esac\n    echo \"Error: no such volume $3\" >&2\n    exit 125;;\nesac\nexit 1\n"
         );
         let path = dir.join(name);
         std::fs::write(&path, script).unwrap();
@@ -1462,7 +1518,7 @@ pub(crate) mod fake_runtime_support {
 mod tests {
     use super::*;
     #[cfg(unix)]
-    use super::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+    use super::fake_runtime_support::{fake_runtime, fake_runtime_with, with_fake_runtimes};
 
     // ----- Runtime choice (v0.2.97 owner ruling "Honour the pin") ----------
 
@@ -1557,6 +1613,33 @@ mod tests {
         });
         assert_eq!(owned.unwrap(), "/fake/docker/weaviate_data");
         assert_eq!(unknown.unwrap(), "");
+    }
+
+    /// R7b F25(b): a FAILED inspect under the runtime VCO drives is an
+    /// error, never "not owned" — before, it produced a refusal claiming the
+    /// volume "exists only under" the other runtime. A failed inspect under
+    /// the OTHER runtime is only "not known to own it": no refusal.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_inspect_is_not_read_as_not_owned() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime_with(dir.path(), "docker", &[], &["weaviate_data"]);
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), async {
+            mountpoint_on_owning_runtime(&rt, "weaviate_data", "migrate").await
+        })
+        .unwrap_err();
+        assert!(err.contains("could not tell whether docker holds volume `weaviate_data`"), "{err}");
+        assert!(!err.contains("exists only under"), "a failed inspect became a refusal: {err}");
+
+        let other = tempfile::tempdir().unwrap();
+        fake_runtime(other.path(), "docker", &[]);
+        fake_runtime_with(other.path(), "podman", &[], &["weaviate_data"]);
+        let out = with_fake_runtimes(other.path(), Some("docker"), async {
+            mountpoint_on_owning_runtime(&rt, "weaviate_data", "migrate").await
+        });
+        assert_eq!(out.unwrap(), "", "an unknown answer from the other runtime is not ownership");
     }
 
     // ----- Allowlist filtering ---------------------------------------------

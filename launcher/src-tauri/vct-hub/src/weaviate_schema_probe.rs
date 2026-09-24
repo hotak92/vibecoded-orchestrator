@@ -196,7 +196,7 @@ fn store_cached(weaviate_url: &str, map: HashMap<String, String>, probe_ok: bool
 
 /// Fetch `<weaviate_url>/v1/schema` and build the lowercased→actual map.
 async fn fetch_schema_map(weaviate_url: &str) -> Result<HashMap<String, String>, String> {
-    let client = reqwest::Client::builder()
+    let client = vct_launcher_core::services::loopback_http::builder_for(weaviate_url)
         .timeout(Duration::from_secs(2))
         // Bound the CONNECT phase separately from the total request timeout.
         // On a reachable-but-slow Weaviate the 2s total still applies; the

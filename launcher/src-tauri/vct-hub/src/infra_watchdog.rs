@@ -125,7 +125,7 @@ use vct_launcher_core::db::models::ProjectHost;
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::db::Db;
 use vct_launcher_core::services::service_endpoints::{
-    is_compose_managed, lifecycle_container, machine_row, CoreService,
+    is_compose_managed, lifecycle_container, machine_row, zombie_action, CoreService, ZombieAction,
 };
 use vct_launcher_core::services::runtime::{detect_runtime, RuntimeInfo};
 use vct_launcher_core::services::watchdog_pause;
@@ -305,6 +305,14 @@ pub struct Supervision {
     pub compose_managed: bool,
     /// The container to probe: the row's name, else the compose default.
     pub container: String,
+    /// R7a F3: a row positively says VCO's compose owns this container
+    /// ([`ZombieAction::Recreate`]). Without a row the ownership is UNKNOWN
+    /// (the container may be the legacy compose project's, on a bind the
+    /// installer's compose does not mount): the heal is a `start` BY NAME,
+    /// and compose only CREATES a container that does not exist — never a
+    /// compose `up` against an existing one (which re-creates it on the
+    /// installer's config when that differs).
+    pub recreate_ok: bool,
 }
 
 /// [`Supervision`] for `service` on this machine. `default_container` is
@@ -317,7 +325,48 @@ pub fn supervision_for(db: &Db, service: &str, default_container: &str) -> Super
         container: svc
             .and_then(|s| lifecycle_container(s, row.as_ref()))
             .unwrap_or_else(|| default_container.to_string()),
+        recreate_ok: zombie_action(row.as_ref()) == ZombieAction::Recreate,
     }
+}
+
+/// Did `<runtime> start` fail because the container does not exist? (The
+/// same authoritative wording [`classify_probe`] recognises.)
+pub fn start_failed_as_missing(stderr: &str) -> bool {
+    let lc = stderr.to_lowercase();
+    lc.contains("no such container") || lc.contains("no such object") || lc.contains("not found")
+}
+
+/// Heal a service whose ownership is UNKNOWN (no row): `start` the existing
+/// container BY NAME; only a container that does not exist is created
+/// through compose (nothing exists to lose). Never an `up` against an
+/// existing container.
+async fn heal_by_name(
+    runtime: &RuntimeInfo,
+    infra_dir: &Path,
+    service: &str,
+    container: &str,
+) -> Result<(), String> {
+    let output = Command::new(&runtime.binary_path)
+        .silent()
+        .args(["start", container])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .await
+        .map_err(|e| format!("spawn {} start: {}", runtime.runtime.display_name(), e))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if start_failed_as_missing(&stderr) {
+        return restart_service(runtime, infra_dir, service).await;
+    }
+    Err(format!(
+        "{} start {} failed (no service_endpoints row: VCO starts it by name only): {}",
+        runtime.runtime.display_name(),
+        container,
+        stderr.trim()
+    ))
 }
 
 /// Exponential-backoff wait (seconds) before the Nth restart attempt,
@@ -1007,7 +1056,12 @@ async fn run_one_tick(
             "[vct-hub] infra watchdog: service is DOWN and VCO-managed; \
              attempting restart."
         );
-        match restart_service(&runtime, &infra_dir, service).await {
+        let heal = if supervision.recreate_ok {
+            restart_service(&runtime, &infra_dir, service).await
+        } else {
+            heal_by_name(&runtime, &infra_dir, service, container).await
+        };
+        match heal {
             Ok(()) => {
                 tracing::info!(
                     service,
@@ -1183,6 +1237,28 @@ mod tests {
         c.enabled = false;
         db.service_endpoint_seed_for_tests(&c).unwrap();
         assert!(!supervision_for(&db, "code_embed", "vco_code_embed").compose_managed);
+    }
+
+    /// R7a F3: with NO row the ownership is unknown — the heal may start the
+    /// container by name (or create a missing one) but never compose `up`
+    /// against an existing one. Red if `recreate_ok` reads "no row" as VCO's.
+    #[test]
+    fn a_service_without_a_row_is_healed_by_name_only() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        // About the absent row itself (no request is made): without this the
+        // test harness answers a sentinel row for an empty in-memory DB.
+        let _allow = vct_launcher_core::services::service_endpoints::allow_compiled_default_on_this_thread();
+        let db = Db::open_in_memory().unwrap();
+        let none = supervision_for(&db, "ollama", "vco_ollama");
+        assert!(none.compose_managed, "a missing container may still be created");
+        assert!(!none.recreate_ok, "no row: never an `up` against an existing container");
+        assert_eq!(none.container, "vco_ollama");
+        let mut o = ServiceEndpointRow::new("ollama", EndpointMode::VcoManaged, "localhost", 11435);
+        o.container_name = Some("vco_ollama".into());
+        db.service_endpoint_seed_for_tests(&o).unwrap();
+        assert!(supervision_for(&db, "ollama", "vco_ollama").recreate_ok);
+        assert!(start_failed_as_missing("Error: no such container vco_ollama"));
+        assert!(!start_failed_as_missing("Error: port 11435 is already allocated"));
     }
 
     /// Owner ruling Q1: the Weaviate "waiting for your choice" row

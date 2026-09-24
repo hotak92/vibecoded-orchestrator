@@ -173,11 +173,18 @@ pub fn render_grpc_port(row: Option<&ServiceEndpointRow>) -> u16 {
 /// infrastructure compose stack defines for its own services.
 pub const CONTAINER_HOST_ALIAS: &str = "host.containers.internal";
 
-/// Is `host` a loopback name (this machine)? An empty host — never written
-/// by the one writer — counts as loopback (the compiled default's host).
-/// Pure.
+/// Is `host` a loopback name (this machine)? `localhost` in any case, any
+/// `127.0.0.0/8` address, `::1` with or without brackets. An empty host —
+/// never written by the one writer — counts as loopback (the compiled
+/// default's host). Pure.
+///
+/// The ONE Rust loopback rule (R7b F14): the hub's module health poller
+/// (`vct_hub::module_health`, which contacts only loopback) uses this too.
 pub fn is_loopback_host(host: &str) -> bool {
-    matches!(host.trim(), "localhost" | "127.0.0.1" | "::1" | "[::1]" | "")
+    let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
+    bare.is_empty()
+        || bare.eq_ignore_ascii_case("localhost")
+        || bare.parse::<std::net::IpAddr>().map(|ip| ip.is_loopback()).unwrap_or(false)
 }
 
 /// The URL for `service` as seen from INSIDE a module container (lane Y).
@@ -383,6 +390,34 @@ pub fn canonical_container_name(service: CoreService) -> &'static str {
     }
 }
 
+/// The row checks `hand-to-vco` makes before asking the runtime (plan §12,
+/// R7a F2): the row exists, is not an adopted URL, names a container, and
+/// that container is under the name VCO's compose creates — any other name
+/// would come back as a second container on the same data. (The verb then
+/// checks the container still exists.) Pure.
+///
+/// MUST MATCH `vco_lib.service_reconcile.hand_to_vco_refusal(...) is None`;
+/// both run the `hand_to_vco_cases` of `tests/fixtures/service_endpoint_parity.json`.
+pub fn hand_to_vco_allowed(service: CoreService, row: Option<&ServiceEndpointRow>) -> bool {
+    let Some(row) = row else { return false };
+    row.mode != EndpointMode::AdoptedExternal
+        && row
+            .container_name
+            .as_deref()
+            .is_some_and(|name| !name.is_empty() && name == canonical_container_name(service))
+}
+
+/// Whether the Services page offers "Let VCO manage it" for `service`: an
+/// ADOPTED container of Weaviate or Ollama (code-embed is always VCO's own;
+/// a `vco_managed` row is VCO's already) that [`hand_to_vco_allowed`]
+/// admits. The one home of the page's gate — it reads
+/// `ServiceRuntimeState::hand_to_vco_offered`, never a copy of the rule.
+pub fn hand_to_vco_offered(service: CoreService, row: Option<&ServiceEndpointRow>) -> bool {
+    service != CoreService::CodeEmbed
+        && row.is_some_and(|r| r.mode == EndpointMode::AdoptedContainer)
+        && hand_to_vco_allowed(service, row)
+}
+
 /// The endpoint mode `row` states; a service with no row is VCO's own.
 pub fn mode_of(row: Option<&ServiceEndpointRow>) -> EndpointMode {
     row.map(|r| r.mode).unwrap_or(EndpointMode::VcoManaged)
@@ -393,6 +428,53 @@ pub fn mode_of(row: Option<&ServiceEndpointRow>) -> EndpointMode {
 /// service is NEVER named in a compose invocation (plan invariant I1).
 pub fn is_compose_managed(row: Option<&ServiceEndpointRow>) -> bool {
     row.map_or(true, |r| r.mode == EndpointMode::VcoManaged && r.enabled)
+}
+
+/// What a ZOMBIE container of a service gets (podman says `running`, its
+/// PID is dead) — and, for the hub watchdog, whether a stopped one may be
+/// healed through compose at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZombieAction {
+    /// `rm --force` + compose re-create: VCO's own (`vco_managed` + enabled)
+    /// ONLY — the row proves VCO's compose owns it and its data source.
+    Recreate,
+    /// Orphan-state cleanup + `start` BY NAME, never `rm`: an adopted
+    /// container, or a service with NO row (ownership unknown — it may be
+    /// the legacy compose project's container on a bind the installer's
+    /// compose does not mount; re-creating it would land on an empty volume).
+    Start,
+    /// Nothing (disabled, not autostarted, or an external URL).
+    Ignore,
+}
+
+impl ZombieAction {
+    /// The parity table's word for it (`expect_on_zombie`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ZombieAction::Recreate => "recreate",
+            ZombieAction::Start => "start",
+            ZombieAction::Ignore => "ignore",
+        }
+    }
+}
+
+/// [`ZombieAction`] for a service's row. MUST MATCH
+/// `vco_lib/service_lifecycle.py::zombie_action` (the `on_zombie` column the
+/// session hooks act on) — both execute the parity table's
+/// `expect_on_zombie`.
+pub fn zombie_action(row: Option<&ServiceEndpointRow>) -> ZombieAction {
+    let Some(r) = row else {
+        return ZombieAction::Start;
+    };
+    match r.mode {
+        EndpointMode::VcoManaged if r.enabled => ZombieAction::Recreate,
+        EndpointMode::AdoptedContainer
+            if r.autostart && r.container_name.as_deref().is_some_and(|n| !n.is_empty()) =>
+        {
+            ZombieAction::Start
+        }
+        _ => ZombieAction::Ignore,
+    }
 }
 
 /// The container VCO starts BY NAME for an adopted service whose row asks
@@ -617,6 +699,26 @@ mod tests {
 
     fn service(name: &str) -> CoreService {
         CoreService::from_name(name).unwrap_or_else(|| panic!("unknown service {name}"))
+    }
+
+    /// R7b F14: the one loopback rule — the whole of 127/8, `localhost` in
+    /// any case, `::1` bracketed or not, and the empty host; a LAN address or
+    /// a name that merely starts with `localhost` is not loopback.
+    #[test]
+    fn is_loopback_host_is_the_whole_loopback_range() {
+        for yes in ["localhost", "LocalHost", "127.0.0.1", "127.0.0.2", "::1", "[::1]", "", " 127.1.2.3 "] {
+            assert!(is_loopback_host(yes), "{yes:?}");
+        }
+        for no in ["192.168.1.5", "10.0.0.1", "localhost.example.com", "gpu-box", "::2", "0.0.0.0"] {
+            assert!(!is_loopback_host(no), "{no:?}");
+        }
+        // A loopback row other than 127.0.0.1 is reached through the runtime
+        // alias from a container — its own 127.0.0.2 is not the host's.
+        let row = ServiceEndpointRow::new("ollama", EndpointMode::VcoManaged, "127.0.0.2", 21435);
+        assert_eq!(
+            render_url_from_container(CoreService::Ollama, Some(&row)),
+            format!("http://{CONTAINER_HOST_ALIAS}:21435")
+        );
     }
 
     /// A table row object → a `ServiceEndpointRow` (unset fields at the DDL
@@ -1048,8 +1150,79 @@ mod tests {
                 let want = case["expect_containers"][svc.name()].as_str().unwrap();
                 let row = rows.iter().find(|(s, _)| *s == svc).and_then(|(_, r)| r.as_ref());
                 assert_eq!(lifecycle_container(svc, row).unwrap_or_default(), want, "case `{name}` {:?}", svc);
+                // R7a F3: re-created only for a VCO-managed row; NO row = at
+                // most a start by name (the same column the hooks read).
+                let want_zombie = case["expect_on_zombie"][svc.name()].as_str().unwrap();
+                assert_eq!(zombie_action(row).as_str(), want_zombie, "case `{name}` {:?} zombie", svc);
             }
         }
+    }
+
+    /// F12 (v0.2.97 review round 7): the boot gate's own parity leg. Python
+    /// executes these cases (`tests/test_v0297_service_reconcile.py::
+    /// test_awaits_choice_parity`); before this test the Rust mirror was
+    /// unlocked, so a drift (e.g. Python starting to park Ollama too) would
+    /// have passed every test while the launcher's `pending_choices` gate
+    /// disagreed with the reconcile that writes the rows.
+    #[test]
+    fn awaits_choice_cases_match_the_parity_table() {
+        let t = table();
+        let cases = t["awaits_choice_cases"].as_array().expect("awaits_choice_cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let svc = service(case["service"].as_str().unwrap());
+            let row = if case["row"].is_null() {
+                None
+            } else {
+                let mut r = row_from(svc.name(), &case["row"]);
+                if let Some(e) = case["row"].get("enabled").and_then(|e| e.as_bool()) {
+                    r.enabled = e;
+                }
+                Some(r)
+            };
+            assert_eq!(
+                awaits_choice(svc, row.as_ref()),
+                case["expect"].as_bool().unwrap(),
+                "case `{name}`"
+            );
+        }
+    }
+
+    /// Plan §12 (R7a F2): the row checks of `hand-to-vco`, shared with
+    /// Python (`tests/test_v0297_service_reconcile.py::
+    /// test_hand_to_vco_row_rule_parity`) — the rule the Services page's
+    /// "Let VCO manage it" is gated on.
+    #[test]
+    fn hand_to_vco_cases_match_the_parity_table() {
+        let t = table();
+        let cases = t["hand_to_vco_cases"].as_array().expect("hand_to_vco_cases");
+        assert!(cases.len() >= 5);
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let svc = service(case["service"].as_str().unwrap());
+            let row = if case["row"].is_null() { None } else { Some(row_from(svc.name(), &case["row"])) };
+            assert_eq!(hand_to_vco_allowed(svc, row.as_ref()), case["expect"].as_bool().unwrap(), "case `{name}`");
+        }
+    }
+
+    /// The page's offer: only an adopted container the verb admits — not
+    /// VCO's own (vco_managed) row, not code-embed, not a foreign name.
+    #[test]
+    fn hand_to_vco_is_offered_only_for_an_admissible_adopted_container() {
+        let adopted = |svc: &str, name: &str| {
+            let mut r = ServiceEndpointRow::new(svc, EndpointMode::AdoptedContainer, "localhost", 8081);
+            r.container_name = Some(name.into());
+            r
+        };
+        assert!(hand_to_vco_offered(CoreService::Weaviate, Some(&adopted("weaviate", "vco_weaviate"))));
+        assert!(hand_to_vco_offered(CoreService::Ollama, Some(&adopted("ollama", "vco_ollama"))));
+        assert!(!hand_to_vco_offered(CoreService::Weaviate, Some(&adopted("weaviate", "their_weaviate"))));
+        assert!(!hand_to_vco_offered(CoreService::CodeEmbed, Some(&adopted("code_embed", "vco_code_embed"))));
+        let mut ours = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "localhost", 8081);
+        ours.container_name = Some("vco_weaviate".into());
+        assert!(!hand_to_vco_offered(CoreService::Weaviate, Some(&ours)), "already VCO's");
+        assert!(!hand_to_vco_offered(CoreService::Weaviate, None));
     }
 
     #[test]

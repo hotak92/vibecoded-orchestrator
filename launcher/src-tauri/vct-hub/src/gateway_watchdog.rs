@@ -225,7 +225,7 @@ pub fn classify_health(success: bool, service: Option<&str>) -> HealthProbe {
 
 /// Probe `http://127.0.0.1:<port>/health`. Never panics.
 pub async fn probe_health(port: u16) -> HealthProbe {
-    let client = match reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() {
+    let client = match vct_launcher_core::services::loopback_http::client(HEALTH_TIMEOUT) {
         Ok(c) => c,
         Err(_) => return HealthProbe::Ambiguous,
     };
@@ -511,8 +511,7 @@ fn clear_condition(db: &LauncherDbHandle) {
 /// `hooks_enforcement` calls the same function and only wraps the failure in
 /// an HTTP error type.
 fn orchestrator_root() -> Option<PathBuf> {
-    vct_launcher_core::orchestrator_manifest::find_orchestrator_manifest()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
+    vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
 }
 
 /// `python -m vco_lib.gateway_ensure ensure --json [--folder ROOT]`.

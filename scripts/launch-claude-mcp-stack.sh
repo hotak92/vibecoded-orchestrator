@@ -12,8 +12,10 @@
 # and stayed dead until the user manually started them hours later.
 #
 # Fix: this script wraps the compose invocation with:
-#   1. Runtime detection (docker preferred, else podman-compose, else podman compose).
-#      An optional state/install/runtime.txt is the authoritative source.
+#   1. Runtime selection — THE pin rule (vco_lib.containers.runtime_pin):
+#      VCT_CONTAINER_RUNTIME, else state/install/runtime.txt, is a PIN; a
+#      pinned runtime that is not usable starts NOTHING (one log line naming
+#      the pin and the fix). Unpinned: podman first, then docker.
 #   2. NVIDIA presence probe (`nvidia-smi -L`).
 #   3. CDI-ready wait — poll /var/run/cdi/nvidia.yaml up to 30s, parse-check.
 #   4. On success: compose-up with the GPU overlay.
@@ -41,10 +43,11 @@ set -u
 #                                 (default: ${VCT_ORCHESTRATOR_ROOT:-<script_dir>/..}/claude_mcp_servers)
 #   - VCT_STACK_LOG_FILE      — log path (default: /tmp/claude-mcp-containers.log)
 #   - VCT_STACK_CDI_TIMEOUT   — seconds to wait for CDI yaml (default: 30)
-#   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path. When set, this
-#                                 wins over all candidate-path search (PR-12
-#                                 Bug B). When unset, candidates probed in
-#                                 order — see resolve_runtime_file().
+#   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path. When set, it is
+#                                 the first candidate; otherwise candidates
+#                                 are probed in order — see
+#                                 resolve_runtime_file(). The first one that
+#                                 records podman/docker is the PIN.
 #   - VCT_ORCHESTRATOR_ROOT   — orchestrator install root (used as one of
 #                                 the runtime.txt candidate-path roots).
 #   - VCT_STACK_GPU_OVERLAY   — overlay filename for podman path
@@ -85,11 +88,13 @@ fi
 VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-$_VCT_DEFAULT_STACK_DIR}"
 VCT_STACK_LOG_FILE="${VCT_STACK_LOG_FILE:-/tmp/claude-mcp-containers.log}"
 VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
-# NOTE (PR-12 Bug B): VCT_STACK_RUNTIME_FILE is no longer eagerly defaulted
-# to ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt — that single path
-# was too narrow when systemd's WorkingDirectory pointed at a stale install
-# location (Bug C). resolve_runtime_file() now probes multiple candidates
-# and picks the first one that contains a USABLE runtime token.
+# NOTE (PR-12 Bug C): VCT_STACK_RUNTIME_FILE is not eagerly defaulted to
+# ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt — that single path was
+# too narrow when systemd's WorkingDirectory pointed at a stale install
+# location. resolve_runtime_file() probes several candidate paths and the
+# first that EXISTS with a podman/docker token is the pin. (PR-12 Bug B's
+# "skip a runtime.txt whose runtime is down" is superseded by the pin rule,
+# v0.2.97: see detect_runtime.)
 # v0.2.97: remember which file knobs the CALLER set, so main() can adapt the
 # defaults to the working dir's layout (infrastructure/ holds
 # docker-compose.yml + its overlays side by side; the legacy
@@ -136,8 +141,8 @@ log() {
 
 # ---------------------------------------------------------------------------
 # resolve_runtime_file :: prints the path to the FIRST runtime.txt candidate
-# that exists on disk and contains a usable runtime token. Empty string if
-# none usable (PR-12 Bug B).
+# that exists and records a runtime token (podman / docker) — THE runtime.txt
+# pin. Empty string when none does (unpinned).
 #
 # Probe order (first hit wins):
 #   1. ${VCT_STACK_RUNTIME_FILE} if explicitly set (caller override).
@@ -146,13 +151,10 @@ log() {
 #   4. <script_dir>/../state/install/runtime.txt   (script lives in
 #      <orchestrator>/scripts/, so .. is the orchestrator root).
 #
-# A candidate is "usable" iff:
-#   - the file exists + is readable + non-empty, AND
-#   - the token it contains corresponds to a runtime whose daemon access
-#     check passes (_runtime_usable).
-#
-# We log every candidate that exists-but-is-not-usable so a stale unit
-# WorkingDirectory pointing at a dead install doesn't fail silently.
+# A candidate that is missing, empty or names no runtime is skipped (PR-12
+# Bug C: a stale WorkingDirectory). A candidate whose runtime is DOWN is NOT
+# skipped: it is the pin, and detect_runtime refuses it (v0.2.97 — PR-12
+# Bug B's fall-through is superseded by the pin rule).
 # ---------------------------------------------------------------------------
 resolve_runtime_file() {
     local candidates=()
@@ -179,13 +181,14 @@ resolve_runtime_file() {
         [ -r "$cand" ] || continue
         local token
         token="$(head -n 1 "$cand" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        [ -z "$token" ] && continue
-        if _runtime_usable "$token"; then
-            printf '%s\n' "$cand"
-            return 0
-        else
-            log "runtime.txt at $cand names '$token' but its daemon is not reachable — falling through to live probe"
-        fi
+        case "$token" in
+            podman|docker)
+                printf '%s\n' "$cand"
+                return 0
+                ;;
+            '') ;;
+            *) log "runtime.txt at $cand names '$token', not podman or docker — ignoring it" >&2 ;;
+        esac
     done
     printf ''
 }
@@ -237,73 +240,76 @@ _runtime_usable() {
 }
 
 # ---------------------------------------------------------------------------
+# refuse_pin :: log THE one line for a pinned runtime that cannot be used —
+# naming the pin's source and the fix — on stderr and in the log file (never
+# on stdout: detect_runtime's stdout is its answer).
+#   $1 = pinned runtime, $2 = pin source (VCT_CONTAINER_RUNTIME or the
+#   runtime.txt path), $3 = what is wrong with it.
+# MUST MATCH Write-RuntimePinRefusal in launch-claude-mcp-stack.ps1.
+# ---------------------------------------------------------------------------
+refuse_pin() {
+    local pinned="$1" source="$2" why="$3" other="docker" change
+    [ "$pinned" = "docker" ] && other="podman"
+    if [ "$source" = "VCT_CONTAINER_RUNTIME" ]; then
+        change="unset VCT_CONTAINER_RUNTIME (or set it to $other) if the data is not in $pinned"
+    else
+        change="set VCT_CONTAINER_RUNTIME=$other if the data is not in $pinned (the install recorded $pinned in $source)"
+    fi
+    log "FATAL: the container runtime is pinned to $pinned by $source, but $why — starting nothing (the stack's data is in $pinned's volumes; $other would start it on empty ones). Fix: start $pinned, or $change." >&2
+}
+
+# ---------------------------------------------------------------------------
 # detect_runtime :: prints one of "docker", "podman-compose", "podman compose", or ""
 #
-# Order (PR-12 Bug A + v0.2.14 Bug #3 — every candidate validated via
-# _runtime_usable):
-#   0. VCT_CONTAINER_RUNTIME env var — if set to "podman" or "docker" and
-#      that runtime is usable, return it. "auto" / unset / unknown → fall
-#      through to step 1. Honoring this env var here matches the contract
-#      shipped in PR-43 (launcher Rust) + the install.py + the hook scripts;
-#      previously detect_runtime ignored it, causing split-brain between
-#      the env-honoring surfaces and the boot-wrapper.
-#   1. resolve_runtime_file → token from runtime.txt → expand to compose
-#      invocation IFF the runtime is usable. Otherwise log + fall through.
-#   2. Probe podman first (preferred default — it's the VCO-recommended
-#      runtime, has no group-permission gotcha).
-#   3. Probe docker.
-#   4. Empty (no usable runtime).
+# THE pin rule (vco_lib.containers.runtime_pin, v0.2.97 — the same rule as
+# the session hooks, install.py and the launcher):
+#   1. VCT_CONTAINER_RUNTIME=podman|docker is a PIN ("auto"/unset: none).
+#   2. Else the first runtime.txt resolve_runtime_file finds is a PIN.
+#   A pinned runtime is the ONLY candidate. When it is not usable (binary
+#   missing, daemon / machine down, or podman without a compose front-end)
+#   refuse_pin logs one line and this returns 4 with empty output: starting
+#   the stack under the OTHER runtime would create its containers on that
+#   runtime's empty volumes next to the real data (plan invariants I1/I2).
+#   This supersedes PR-12 Bug B's fall-through to the other runtime.
+#   3. Unpinned: podman first (preferred default, no group-permission
+#      gotcha), then docker; podman without a compose front-end falls
+#      through to docker.
+#   4. Empty (no usable runtime), return 0.
 #
 # A "usable" docker means `docker info` reaches the daemon (Server section
-# present); a "usable" podman means `podman info` succeeds. This prevents
-# the boot-time "permission denied" failure when Docker Desktop is present
-# but the user is not in the `docker` group.
+# present); a "usable" podman means `podman info` succeeds (_runtime_usable).
 # ---------------------------------------------------------------------------
 detect_runtime() {
-    # 0. VCT_CONTAINER_RUNTIME explicit preference (v0.2.14 Bug #3 fix).
-    local pref
+    local pref pin="" pin_source=""
     pref="$(printf '%s' "${VCT_CONTAINER_RUNTIME:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
     case "$pref" in
-        podman)
-            if _runtime_usable podman; then
-                if command -v podman-compose >/dev/null 2>&1; then
-                    printf 'podman-compose\n'
-                    return 0
-                fi
-                if podman compose --help >/dev/null 2>&1; then
-                    printf 'podman compose\n'
-                    return 0
-                fi
-                log "VCT_CONTAINER_RUNTIME=podman but no compose front-end available — falling through to runtime.txt / auto-detect"
-            else
-                log "VCT_CONTAINER_RUNTIME=podman but podman not usable — falling through to runtime.txt / auto-detect"
-            fi
-            ;;
-        docker)
-            if _runtime_usable docker; then
-                printf 'docker\n'
-                return 0
-            fi
-            log "VCT_CONTAINER_RUNTIME=docker but docker not usable — falling through to runtime.txt / auto-detect"
+        podman|docker)
+            pin="$pref"
+            pin_source="VCT_CONTAINER_RUNTIME"
             ;;
         ''|auto)
-            : # no preference; auto-detect path below
+            : # no env pin
             ;;
         *)
-            log "VCT_CONTAINER_RUNTIME=${pref} unrecognized (expected 'podman'/'docker'/'auto') — ignoring"
+            log "VCT_CONTAINER_RUNTIME=${pref} unrecognized (expected 'podman'/'docker'/'auto') — ignoring" >&2
             ;;
     esac
+    if [ -z "$pin" ]; then
+        local runtime_file
+        runtime_file="$(resolve_runtime_file)"
+        if [ -n "$runtime_file" ]; then
+            pin="$(head -n 1 "$runtime_file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            pin_source="$runtime_file"
+        fi
+    fi
 
-    # 1. runtime.txt — only honored if its named runtime is actually usable.
-    local runtime_file
-    runtime_file="$(resolve_runtime_file)"
-    if [ -n "$runtime_file" ]; then
-        local persisted
-        persisted="$(head -n 1 "$runtime_file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        case "$persisted" in
+    if [ -n "$pin" ]; then
+        if ! _runtime_usable "$pin"; then
+            refuse_pin "$pin" "$pin_source" "$pin is not usable (not installed, or \`$pin info\` fails: daemon / machine not running)"
+            return 4
+        fi
+        case "$pin" in
             docker)
-                # _runtime_usable already validated docker daemon access in
-                # resolve_runtime_file; we trust that result here.
                 printf 'docker\n'
                 return 0
                 ;;
@@ -316,14 +322,13 @@ detect_runtime() {
                     printf 'podman compose\n'
                     return 0
                 fi
-                # podman is usable but no compose front-end available —
-                # fall through to live probe (which will also fail, but at
-                # least surfaces the right diagnostic).
+                refuse_pin podman "$pin_source" "neither podman-compose nor \`podman compose\` is available"
+                return 4
                 ;;
         esac
     fi
 
-    # 2. Probe podman first — preferred default, no group-perm gotcha.
+    # Unpinned: podman first — preferred default, no group-perm gotcha.
     if _runtime_usable podman; then
         if command -v podman-compose >/dev/null 2>&1; then
             printf 'podman-compose\n'
@@ -334,16 +339,16 @@ detect_runtime() {
             return 0
         fi
         # podman daemon usable but no compose front-end — log and try docker.
-        log "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker"
+        log "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker" >&2
     fi
 
-    # 3. Probe docker (only if its daemon is actually reachable).
+    # Then docker (only if its daemon is actually reachable).
     if _runtime_usable docker; then
         printf 'docker\n'
         return 0
     fi
 
-    # 4. No usable runtime.
+    # No usable runtime.
     printf ''
 }
 
@@ -678,10 +683,13 @@ main() {
         exit 0
     fi
 
-    local runtime
+    local runtime runtime_rc
     runtime="$(detect_runtime)"
+    runtime_rc=$?
     if [ -z "$runtime" ]; then
-        log "FATAL: no container runtime found (tried runtime.txt, docker, podman-compose, podman compose)"
+        # rc 4: a pinned runtime is not usable — refuse_pin already logged
+        # the one line that names the pin and the fix.
+        [ "$runtime_rc" -eq 4 ] || log "FATAL: no container runtime found (tried runtime.txt, docker, podman-compose, podman compose)"
         exit 3
     fi
     log "runtime=$runtime"

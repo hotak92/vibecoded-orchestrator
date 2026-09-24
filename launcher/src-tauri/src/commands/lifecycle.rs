@@ -8,7 +8,8 @@ use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow}
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::services::service_endpoints::{
     adopted_autostart_container, awaits_choice, compose_managed_services, is_compose_managed,
-    lifecycle_container, machine_row_from_disk, machine_rows_from_disk, CoreService,
+    lifecycle_container, machine_row_from_disk, machine_rows_from_disk, zombie_action, CoreService,
+    ZombieAction,
 };
 use vct_launcher_core::services::service_status::{health_url, service_state};
 
@@ -47,16 +48,14 @@ pub use vct_launcher_core::services::service_status::{
 // and the launcher's services watcher.
 // ---------------------------------------------------------------------------
 
-/// HTTP probe with 2s timeout. Returns true on 2xx/3xx.
+/// HTTP probe with 2s timeout. Returns true on a 2xx; a redirect is never
+/// followed (`vct_launcher_core::services::probe_http`: an answer from another endpoint is not this one's).
 async fn probe_url(url: &str) -> bool {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(url, std::time::Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
+    matches!(client.get(url).send().await, Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()))
 }
 
 /// PR-15 G2 (v0.2.11): detect zombie containers (Podman state-DB desync —
@@ -314,6 +313,29 @@ pub(crate) fn lifecycle_route(service: CoreService, row: Option<&ServiceEndpoint
     }
 }
 
+/// Where zombie recovery goes, decided from the row (R7a F3): `rm` +
+/// compose ONLY for a VCO-managed row ([`ZombieAction::Recreate`]); a
+/// container VCO does not positively own — an adopted one, or one whose
+/// service has NO row yet (ownership unknown) — is at most started BY NAME.
+/// MUST MATCH `vco_lib.service_lifecycle.zombie_action` (the parity table's
+/// `expect_on_zombie`). Pure.
+pub(crate) fn zombie_route(service: CoreService, row: Option<&ServiceEndpointRow>) -> LifecycleRoute {
+    match zombie_action(row) {
+        ZombieAction::Recreate => LifecycleRoute::Compose { service: service.name() },
+        ZombieAction::Start => match lifecycle_container(service, row) {
+            Some(name) => LifecycleRoute::Container { name },
+            None => lifecycle_route(service, row),
+        },
+        ZombieAction::Ignore => match lifecycle_route(service, row) {
+            // Never reached for a recreate-eligible row; kept total.
+            LifecycleRoute::Compose { .. } => LifecycleRoute::NoLifecycle {
+                reason: format!("{} is not VCO-managed on this machine", service.name()),
+            },
+            other => other,
+        },
+    }
+}
+
 /// Probe the three core services on their rows' endpoints.
 #[command]
 pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
@@ -357,14 +379,14 @@ pub async fn services_get_endpoints() -> Result<Vec<(String, Option<ServiceEndpo
 
 /// PR-15 G2 (v0.2.11) + v0.2.97: recover a stuck (zombie) service.
 ///
-/// Row-gated (plan §4b):
+/// Row-gated (plan §4b, [`zombie_route`]):
 ///   * `vco_managed` — force-remove the stale record of VCO's OWN container,
 ///     then bring THIS service back up (`up -d <service>` through the
 ///     wrapper — CDI-wait preserved — else direct compose).
-///   * `adopted_container` — NEVER removed: a `rm` would let compose recreate
-///     the service on VCO's default (empty) data volume. VCO only tries
-///     `<runtime> start <name>`; if that cannot clear the stale state, the
-///     error says the container's owner has to.
+///   * `adopted_container`, or NO row yet (ownership unknown) — NEVER
+///     removed: a `rm` would let compose recreate the service on VCO's
+///     default (empty) data volume. VCO only tries `<runtime> start <name>`;
+///     if that cannot clear the stale state, the error says why.
 ///   * `adopted_external` — nothing to recover.
 #[command]
 pub async fn recover_zombie(name: String) -> Result<(), String> {
@@ -374,7 +396,7 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
         .await
         .ok_or("No container runtime found; cannot recover a stuck container")?;
     let row = machine_row_from_disk(service);
-    match lifecycle_route(service, row.as_ref()) {
+    match zombie_route(service, row.as_ref()) {
         LifecycleRoute::Compose { service: svc } => {
             let container = lifecycle_container(service, row.as_ref())
                 .unwrap_or_else(|| vct_launcher_core::services::service_endpoints::canonical_container_name(service).to_string());
@@ -399,15 +421,25 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
             start_managed(&info, &[svc], false, true).await
         }
         LifecycleRoute::Container { name: container } => {
+            let unowned = row.is_none();
             control_container(&info, &container, "start").await.map_err(|e| {
-                format!(
-                    "{} (VCO never removes an adopted container: if it stays stuck, \
-                     its owner has to clear it, e.g. `{} rm -f {}` then recreate it \
-                     with the same data)",
-                    e,
-                    info.runtime.binary(),
-                    container
-                )
+                if unowned {
+                    format!(
+                        "{} (no service_endpoints row records who owns {} yet, so VCO does not \
+                         remove it — `python install.py --update` records the rows; until then \
+                         clear it with whoever created it, keeping its data mount)",
+                        e, container
+                    )
+                } else {
+                    format!(
+                        "{} (VCO never removes an adopted container: if it stays stuck, \
+                         its owner has to clear it, e.g. `{} rm -f {}` then recreate it \
+                         with the same data)",
+                        e,
+                        info.runtime.binary(),
+                        container
+                    )
+                }
             })
         }
         LifecycleRoute::NoLifecycle { reason } => Err(structured_err(ERR_KIND_NO_LIFECYCLE, reason)),
@@ -687,12 +719,30 @@ pub enum EndpointAction {
     /// an adopted Weaviate/Ollama container, with mount verification and
     /// rollback (owner ruling Q2). The page shows the data mount first.
     HandToVco { service: String },
+    /// "Move to another port…" (R7b F22) — re-create one of VCO's OWN
+    /// (`vco_managed`) services on another host port with the SAME data
+    /// mount, checked before and after, rolled back on failure
+    /// (`vco_lib.service_reconcile.move_endpoint`). Weaviate may name its
+    /// gRPC port too (absent = keep its offset). An adopted service is never
+    /// moved by VCO — the page offers no move for one, and the verb refuses.
+    Move {
+        service: String,
+        port: u16,
+        #[serde(default)]
+        grpc_port: Option<u16>,
+    },
 }
+
+/// The lowest port a service may be moved or pinned to — the privileged
+/// range is refused (`use-vco-copy --port` and `move --port` alike). The FE
+/// mirror is `MIN_MOVE_PORT` in `lib/api/service-endpoint-move.ts`.
+pub const MIN_SERVICE_PORT: u16 = 1024;
 
 /// The argv (after `-m vco_lib.service_endpoints`, before the bridge's
 /// `--root <root>`) for `action`, or why it is refused. Pure. MUST MATCH the
 /// parser in `vco_lib/service_endpoints.py::_build_arg_parser` (`adopt`,
-/// `use-vco-copy`, `hand-to-vco`) — pinned by `endpoint_action_argv_shapes`
+/// `use-vco-copy`, `hand-to-vco`, `move`) — the ONE builder of a
+/// service-endpoint verb argv — pinned by `endpoint_action_argv_shapes`
 /// and, against the real parser, by `endpoint_action_argv_is_accepted_by_the_python_parser`.
 pub(crate) fn endpoint_action_argv(action: &EndpointAction) -> Result<Vec<String>, String> {
     let adoptable = |s: &str| -> Result<(), String> {
@@ -726,9 +776,7 @@ pub(crate) fn endpoint_action_argv(action: &EndpointAction) -> Result<Vec<String
             validate_service_name(service)?;
             argv.extend(["use-vco-copy".into(), "--service".into(), service.clone()]);
             if let Some(p) = port {
-                if *p < 1024 {
-                    return Err(format!("port {} is privileged; pick 1024–65535", p));
-                }
+                unprivileged("port", *p)?;
                 argv.extend(["--port".into(), p.to_string()]);
             }
             if *accept_empty_kg {
@@ -740,8 +788,36 @@ pub(crate) fn endpoint_action_argv(action: &EndpointAction) -> Result<Vec<String
             // The GUI showed the data mount and the user confirmed it.
             argv.extend(["hand-to-vco".into(), "--service".into(), service.clone()]);
         }
+        EndpointAction::Move { service, port, grpc_port } => {
+            validate_service_name(service)?;
+            unprivileged("port", *port)?;
+            argv.extend([
+                "move".into(),
+                "--service".into(),
+                service.clone(),
+                "--port".into(),
+                port.to_string(),
+            ]);
+            if let Some(g) = grpc_port {
+                if service != "weaviate" {
+                    return Err(format!("only Weaviate has a gRPC port; {} has none", service));
+                }
+                unprivileged("gRPC port", *g)?;
+                if g == port {
+                    return Err("the gRPC port must differ from the HTTP port".into());
+                }
+                argv.extend(["--grpc-port".into(), g.to_string()]);
+            }
+        }
     }
     Ok(argv)
+}
+
+fn unprivileged(what: &str, port: u16) -> Result<(), String> {
+    if port < MIN_SERVICE_PORT {
+        return Err(format!("{} {} is privileged; pick {}–65535", what, port, MIN_SERVICE_PORT));
+    }
+    Ok(())
 }
 
 /// An adopted URL: `http(s)://…`, no whitespace, bounded.
@@ -1013,6 +1089,35 @@ mod services_lifecycle_tests {
         ));
     }
 
+    /// R7a F3: zombie recovery re-creates ONLY a VCO-managed row. A service
+    /// with NO row (ownership unknown: `service_registry_unavailable`, the
+    /// window before the root update) is started by name, never `rm`'d — red
+    /// if the route falls back to "no row = VCO's own stack = compose".
+    #[test]
+    fn zombie_recovery_never_recreates_a_service_without_a_row() {
+        assert_eq!(
+            zombie_route(CoreService::Ollama, None),
+            LifecycleRoute::Container { name: "vco_ollama".into() }
+        );
+        assert_eq!(
+            zombie_route(CoreService::Weaviate, Some(&row("weaviate", EndpointMode::VcoManaged, 8081))),
+            LifecycleRoute::Compose { service: "weaviate" }
+        );
+        let mut w = row("weaviate", EndpointMode::AdoptedContainer, 8081);
+        w.container_name = Some("their_weaviate".into());
+        assert_eq!(
+            zombie_route(CoreService::Weaviate, Some(&w)),
+            LifecycleRoute::Container { name: "their_weaviate".into() }
+        );
+        let mut parked = row("weaviate", EndpointMode::VcoManaged, 8082);
+        parked.enabled = false;
+        assert!(matches!(zombie_route(CoreService::Weaviate, Some(&parked)), LifecycleRoute::NoLifecycle { .. }));
+        assert!(matches!(
+            zombie_route(CoreService::Ollama, Some(&row("ollama", EndpointMode::AdoptedExternal, 11434))),
+            LifecycleRoute::NoLifecycle { .. }
+        ));
+    }
+
     /// Owner ruling Q1: the Weaviate "waiting for your choice" row
     /// (`vco_managed`, disabled) is never started — not by "Start all", not
     /// by its own Start button (no lifecycle), not by boot. Red if the gate
@@ -1145,6 +1250,22 @@ mod services_lifecycle_tests {
                 EndpointAction::HandToVco { service: "ollama".into() },
                 vec!["hand-to-vco", "--service", "ollama"],
             ),
+            (
+                EndpointAction::Move { service: "code_embed".into(), port: 11441, grpc_port: None },
+                vec!["move", "--service", "code_embed", "--port", "11441"],
+            ),
+            (
+                EndpointAction::Move { service: "weaviate".into(), port: 8091, grpc_port: Some(50062) },
+                vec!["move", "--service", "weaviate", "--port", "8091", "--grpc-port", "50062"],
+            ),
+            (
+                EndpointAction::Move { service: "ollama".into(), port: 65535, grpc_port: None },
+                vec!["move", "--service", "ollama", "--port", "65535"],
+            ),
+            (
+                EndpointAction::Move { service: "ollama".into(), port: MIN_SERVICE_PORT, grpc_port: None },
+                vec!["move", "--service", "ollama", "--port", "1024"],
+            ),
         ]
     }
 
@@ -1197,6 +1318,13 @@ mod services_lifecycle_tests {
             EndpointAction::UseVcoCopy { service: "weaviate".into(), port: Some(80), accept_empty_kg: false },
             EndpointAction::UseVcoCopy { service: "postgres".into(), port: None, accept_empty_kg: false },
             EndpointAction::HandToVco { service: "code_embed".into() },
+            EndpointAction::Move { service: "postgres".into(), port: 9000, grpc_port: None },
+            EndpointAction::Move { service: "weaviate; id".into(), port: 9000, grpc_port: None },
+            EndpointAction::Move { service: "ollama".into(), port: 80, grpc_port: None },
+            EndpointAction::Move { service: "ollama".into(), port: 1023, grpc_port: None },
+            EndpointAction::Move { service: "ollama".into(), port: 12000, grpc_port: Some(12001) },
+            EndpointAction::Move { service: "weaviate".into(), port: 8091, grpc_port: Some(80) },
+            EndpointAction::Move { service: "weaviate".into(), port: 8091, grpc_port: Some(8091) },
         ];
         for a in refused {
             assert!(endpoint_action_argv(&a).is_err(), "{:?}", a);
@@ -1210,6 +1338,17 @@ mod services_lifecycle_tests {
         let a: EndpointAction =
             serde_json::from_value(serde_json::json!({"action": "use_vco_copy", "service": "weaviate"})).unwrap();
         assert_eq!(a, EndpointAction::UseVcoCopy { service: "weaviate".into(), port: None, accept_empty_kg: false });
+        // `moveService` in `lib/api/service-endpoint-move.ts` sends this shape.
+        let m: EndpointAction = serde_json::from_value(
+            serde_json::json!({"action": "move", "service": "weaviate", "port": 8091, "grpc_port": 50062}),
+        )
+        .unwrap();
+        assert_eq!(m, EndpointAction::Move { service: "weaviate".into(), port: 8091, grpc_port: Some(50062) });
+        let m: EndpointAction = serde_json::from_value(
+            serde_json::json!({"action": "move", "service": "ollama", "port": 12000, "grpc_port": null}),
+        )
+        .unwrap();
+        assert_eq!(m, EndpointAction::Move { service: "ollama".into(), port: 12000, grpc_port: None });
     }
 
     // ---- boot ----------------------------------------------------------

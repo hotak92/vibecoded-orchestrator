@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
 use crate::services::service_endpoints::{
-    awaits_choice, lifecycle_container, mode_of, render_port, render_url, CoreService,
+    awaits_choice, hand_to_vco_offered, lifecycle_container, mode_of, render_port, render_url, CoreService,
 };
 
 /// One service in the snapshot.
@@ -57,6 +57,13 @@ pub struct ServiceRuntimeState {
     /// ([`crate::services::service_endpoints::awaits_choice`]).
     #[serde(default)]
     pub pending_choice: bool,
+    /// The Services page offers "Let VCO manage it" (the opt-in hand-over,
+    /// owner ruling Q2) — computed by
+    /// [`crate::services::service_endpoints::hand_to_vco_offered`], the rule
+    /// `hand-to-vco` enforces (plan §12). The page reads this field; it holds
+    /// no copy of the rule.
+    #[serde(default)]
+    pub hand_to_vco_offered: bool,
 }
 
 /// The whole snapshot.
@@ -107,6 +114,7 @@ pub fn service_state(service: CoreService, row: Option<ServiceEndpointRow>) -> S
         mode: Some(mode),
         container_name: lifecycle_container(service, row.as_ref()),
         pending_choice: awaits_choice(service, row.as_ref()),
+        hand_to_vco_offered: hand_to_vco_offered(service, row.as_ref()),
         endpoint: row,
         zombie: false,
     }
@@ -115,6 +123,26 @@ pub fn service_state(service: CoreService, row: Option<ServiceEndpointRow>) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plan §12: the Services page's "Let VCO manage it" is shown from this
+    /// field, computed by the verb's own rule — an adopted container under
+    /// VCO's compose name is offered; a foreign name, an adopted URL, VCO's
+    /// own row and no row are not. Red if `service_state` stops computing it.
+    #[test]
+    fn the_hand_over_offer_is_computed_from_the_row() {
+        let mut ours = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 8081);
+        ours.container_name = Some("vco_weaviate".into());
+        assert!(service_state(CoreService::Weaviate, Some(ours.clone())).hand_to_vco_offered);
+        let wire = serde_json::to_value(service_state(CoreService::Weaviate, Some(ours))).unwrap();
+        assert_eq!(wire["hand_to_vco_offered"], true, "the page reads this key");
+
+        let mut foreign = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedContainer, "localhost", 8081);
+        foreign.container_name = Some("their_weaviate".into());
+        assert!(!service_state(CoreService::Weaviate, Some(foreign)).hand_to_vco_offered);
+        let url = ServiceEndpointRow::new("ollama", EndpointMode::AdoptedExternal, "gpu.lan", 11434);
+        assert!(!service_state(CoreService::Ollama, Some(url)).hand_to_vco_offered);
+        assert!(!service_state(CoreService::Weaviate, None).hand_to_vco_offered);
+    }
 
     #[test]
     fn a_state_carries_the_rows_host_port_and_mode() {

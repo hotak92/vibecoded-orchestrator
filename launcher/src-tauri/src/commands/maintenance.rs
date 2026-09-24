@@ -719,10 +719,7 @@ pub async fn schema_migration_status(
         .get_orchestrator_root_kg_collection()
         .unwrap_or_else(|_| DEFAULT_SHARED_KG_CLASS.to_string());
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(_) => {
             return Ok(SchemaMigrationStatusReport {

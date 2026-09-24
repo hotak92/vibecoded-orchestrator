@@ -30,6 +30,10 @@
 //! * Only keys in `runtime.env_from_secrets` are resolved and injected.
 //! * A listed key with no `secrets[]` declaration has no scope, so it cannot
 //!   be looked up: skipped with a warning.
+//! * A key no container can receive — not an environment-variable name, or
+//!   a name the runtime process or VCO's module identity uses
+//!   (`services::container_runtime::is_reserved_spawn_env`) — is skipped with
+//!   a warning when optional and REFUSES the start when `required`.
 //! * Paused, not granted, not set, empty, or a keychain error: SKIPPED with a
 //!   log line naming the key and the reason — unless the declaration is
 //!   `required` (the manifest default), in which case the start is REFUSED
@@ -41,12 +45,9 @@
 use crate::db::secret_active::{is_secret_active_cross_launcher_for_requester, REQUESTER_ANY};
 use crate::db::Db;
 use crate::manifest::{ModuleManifest, SecretDecl};
-use crate::secrets::{get_with_context, CallContext, KeychainError, SecretScope};
-
-/// The keychain slot `project_id` of a `shared`-scope secret.
-pub const SENTINEL_SHARED: &str = "_user_shared_";
-/// The keychain slot `project_id` of a `global`-scope secret.
-pub const SENTINEL_GLOBAL: &str = "_global_";
+use crate::secrets::{
+    get_with_context, CallContext, KeychainError, SecretScope, SENTINEL_GLOBAL, SENTINEL_SHARED,
+};
 
 /// The outcome of one gated lookup. `Value` is the only variant carrying a
 /// secret; its `Debug` is redacted.
@@ -133,16 +134,32 @@ pub fn resolve_env_from_secrets_with(
         if out.iter().any(|(k, _)| k == key) {
             continue;
         }
-        if !crate::module_settings_env::is_env_var_name(key) {
-            tracing::warn!(module_id = %manifest.id, key = %key,
-                "[module_secrets_env] env_from_secrets names a key that is not an environment-variable name; not injected");
-            continue;
-        }
         let Some(decl) = manifest.secrets.iter().find(|s| &s.key == key) else {
             tracing::warn!(module_id = %manifest.id, key = %key,
                 "[module_secrets_env] env_from_secrets lists a key with no secrets[] declaration (no scope to resolve it in); not injected");
             continue;
         };
+        // A name no container can receive it under. R7b F18: a REQUIRED
+        // secret dropped here used to be a warning and a start without it.
+        let unusable = if !crate::module_settings_env::is_env_var_name(key) {
+            Some("not an environment-variable name")
+        } else if crate::services::container_runtime::is_reserved_spawn_env(key) {
+            Some("a name the container runtime or VCO itself sets")
+        } else {
+            None
+        };
+        if let Some(why) = unusable {
+            if decl.required {
+                return Err(format!(
+                    "module {} needs its required secret {key}, but {key} is {why}, so it \
+                     cannot be passed to the container. The module's manifest must rename it.",
+                    manifest.id
+                ));
+            }
+            tracing::warn!(module_id = %manifest.id, key = %key, reason = why,
+                "[module_secrets_env] optional secret not injected");
+            continue;
+        }
         let found = lookup(decl);
         let found = match found {
             SecretLookup::Value(v) if v.trim().is_empty() => SecretLookup::Missing,
@@ -224,6 +241,36 @@ mod tests {
         })
         .unwrap();
         assert_eq!(got, vec![pair("API_TOKEN", "v-api")]);
+    }
+
+    /// R7b F18: a secret whose NAME no container can receive — not an env
+    /// name, the runtime's own env (`PATH` …), or VCO's module identity
+    /// (`VCT_MODULE_TOKEN`) — refuses the start when it is `required`, and is
+    /// skipped (never looked up) when optional.
+    #[test]
+    fn a_required_secret_with_an_unusable_name_refuses_the_start() {
+        let with = |key: &str, required: bool| {
+            let raw = format!(
+                r#"{{
+                  "id": "vct-sec", "name": "Sec", "version": "1.0.0", "category": "core",
+                  "license": {{ "required": false }},
+                  "install": {{ "method": "local", "install_dir": "{{VCT_MODULES}}/vct-sec" }},
+                  "secrets": [ {{ "key": "{key}", "scope": "global", "required": {required} }} ],
+                  "runtime": {{ "type": "container", "env_from_secrets": ["{key}"] }}
+                }}"#
+            );
+            ModuleManifest::from_json(&raw).expect("fixture parses")
+        };
+        for key in ["PATH", "home", "VCT_MODULE_TOKEN", "VCT_HUB_BASE_URL", "BAD-NAME"] {
+            let err = resolve_env_from_secrets_with(&with(key, true), |_| SecretLookup::Value("v".into()))
+                .expect_err(key);
+            assert!(err.contains(key) && err.contains("cannot be passed"), "{err}");
+            let got = resolve_env_from_secrets_with(&with(key, false), |_| {
+                panic!("an unusable name is never looked up")
+            })
+            .unwrap();
+            assert!(got.is_empty(), "{key}: {got:?}");
+        }
     }
 
     /// A `required` secret (the manifest default) that does not resolve

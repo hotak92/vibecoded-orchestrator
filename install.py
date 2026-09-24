@@ -1545,8 +1545,11 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "base": "http://localhost:11440",
         "health": "http://localhost:11440/health",
     }
-    from vco_lib.hub_ensure import resolve_hub_port  # stdlib-only: bootstrap-safe
-    hub_base = f"http://127.0.0.1:{resolve_hub_port()}"
+    # R7b F7: DESCRIBE the running hub — `hub.port` first (the hub walks past a
+    # taken port and writes the one it bound), then `$VCT_HUB_PORT`, then 7700;
+    # the same file-first rule as Rust `services::hub_port::resolve_hub_port`.
+    from vco_lib.hub_ensure import running_hub_port  # stdlib-only: bootstrap-safe
+    hub_base = f"http://127.0.0.1:{running_hub_port()}"
     vct_hub_endpoints = {"base": hub_base, "health": f"{hub_base}/api/v1/health"}
 
     missing = _bootstrap_compute_missing_prereqs(system_block)
@@ -12134,9 +12137,11 @@ def _migrate_code_embed_with_cache(row, runtime: str, deferral_report) -> None:
     """code-embed runs under another compose project: re-create it under the
     installer's, on the SAME cache (plan §4c; ``service_lifecycle``). A
     refusal leaves it running as it is and records why."""
-    from vco_lib.service_lifecycle import migrate_code_embed  # noqa: PLC0415
+    from vco_lib.service_lifecycle import (  # noqa: PLC0415
+        commit_without_mcp_registration, migrate_code_embed)
 
-    result = migrate_code_embed(PROJECT_ROOT, row, runtime=runtime, log=print)
+    result = migrate_code_embed(PROJECT_ROOT, row, runtime=runtime, log=print,
+                                commit=commit_without_mcp_registration(PROJECT_ROOT))
     _log_install_event("5b/10", "code_embed_migration", result.status,
                        data={"reason": result.reason})
     if not result.ok:
@@ -19678,46 +19683,18 @@ def _delete_vct_hub_cutover_sentinel() -> None:
 
 
 def _probe_vct_hub_health(timeout: float = 0.5) -> bool:
-    """Probe ``http://localhost:<hub.port>/api/v1/health``. Returns True when
-    the hub responds with status<400, False otherwise.
+    """Thin shim over :func:`vco_lib.hub_ensure.probe_hub_health`.
 
-    Reads the hub port from ``vct_root_dir()/hub.port`` (written by
-    vct-hub on startup). Soft-fail on every error (file missing, port
-    unparseable, connection refused, timeout).
-
-    v0.2.43 V0243-1: corrected endpoint from ``/health`` to
-    ``/api/v1/health`` (the hub's actual health route; ``/health`` 404s
-    on all vct-hub versions shipped since v0.2.21). This endpoint
-    intentionally requires NO auth header — the probe runs before the
-    hub token file is readable.
-
-    On a successful probe, any pre-existing ``~/.vct/v0.2.21-cutover.flag``
-    is unlinked (cleanup of a stale migration sentinel that an interrupted
-    v0.2.21 install may have left behind).
+    The body moved there (v0.2.97 R7b F3) so the probe has one home next to
+    the strict file-only port reader it uses — see that docstring for the
+    full contract (``/api/v1/health``, auth-free, ``status < 400``, the
+    stale v0.2.21-cutover.flag cleanup, soft-fail on every error). Kept
+    under this name for the tests and the twin contract named in
+    ``vco_lib.deferral_probes.hub_answers_health``.
     """
-    try:
-        from vco_lib.paths import vct_root_dir
-        root = vct_root_dir()
-        port_file = root / "hub.port"
-        if not port_file.is_file():
-            return False
-        port_raw = port_file.read_text(encoding="utf-8").strip()
-        if not port_raw.isdigit():
-            return False
-        url = f"http://127.0.0.1:{port_raw}/api/v1/health"
-        resp = urllib.request.urlopen(url, timeout=timeout)
-        healthy = resp.status < 400
-        if healthy:
-            # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
-            legacy_flag = root / "v0.2.21-cutover.flag"
-            try:
-                if legacy_flag.is_file():
-                    legacy_flag.unlink()
-            except OSError:
-                pass  # Best-effort; not critical.
-        return healthy
-    except Exception:
-        return False
+    from vco_lib.hub_ensure import probe_hub_health  # stdlib-only: bootstrap-safe
+
+    return probe_hub_health(timeout=timeout)
 
 
 def _wait_for_vct_hub_health(deadline_seconds: float = 10.0) -> bool:

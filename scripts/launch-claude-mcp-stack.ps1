@@ -283,9 +283,10 @@ function Test-RuntimeUsable {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve-RuntimeFile :: returns the path to the FIRST runtime.txt
-# candidate that exists on disk and contains a usable runtime token.
-# Empty string if none usable. Mirrors bash resolve_runtime_file.
+# Resolve-RuntimeFile :: returns the path to the FIRST runtime.txt candidate
+# that exists and records a runtime token (podman / docker) — THE runtime.txt
+# pin. Empty string when none does (unpinned). Mirrors bash
+# resolve_runtime_file.
 #
 # Probe order (first hit wins):
 #   1. $env:VCT_STACK_RUNTIME_FILE if explicitly set (caller override)
@@ -293,6 +294,11 @@ function Test-RuntimeUsable {
 #   3. $env:VCT_ORCHESTRATOR_ROOT\state\install\runtime.txt
 #   4. <script_dir>\..\state\install\runtime.txt   (script lives in
 #      <orchestrator>\scripts\, so .. is the orchestrator root)
+#
+# A candidate that is missing, empty or names no runtime is skipped (PR-12
+# Bug C). One whose runtime is DOWN is NOT skipped: it is the pin, and
+# Find-Runtime refuses it (v0.2.97 — PR-12 Bug B's fall-through is
+# superseded by the pin rule).
 # ---------------------------------------------------------------------------
 function Resolve-RuntimeFile {
     $candidates = New-Object System.Collections.Generic.List[string]
@@ -335,94 +341,111 @@ function Resolve-RuntimeFile {
         } catch {
             continue
         }
-        if ([string]::IsNullOrEmpty($token)) { continue }
-        if (Test-RuntimeUsable -Token $token) {
-            return $cand
-        } else {
-            Write-StackLog "runtime.txt at $cand names '$token' but its daemon is not reachable — falling through to live probe"
+        if ($token -eq 'podman' -or $token -eq 'docker') { return $cand }
+        if (-not [string]::IsNullOrEmpty($token)) {
+            Write-StackLog "runtime.txt at $cand names '$token', not podman or docker — ignoring it"
         }
     }
     return ''
 }
 
 # ---------------------------------------------------------------------------
+# Write-RuntimePinRefusal :: THE one line for a pinned runtime that cannot be
+# used — naming the pin's source and the fix. MUST MATCH bash refuse_pin.
+# ---------------------------------------------------------------------------
+function Write-RuntimePinRefusal {
+    param(
+        [Parameter(Mandatory=$true)][string] $Pinned,
+        [Parameter(Mandatory=$true)][string] $Source,
+        [Parameter(Mandatory=$true)][string] $Why
+    )
+    $other = if ($Pinned -eq 'docker') { 'podman' } else { 'docker' }
+    $change = if ($Source -eq 'VCT_CONTAINER_RUNTIME') {
+        "unset VCT_CONTAINER_RUNTIME (or set it to $other) if the data is not in $Pinned"
+    } else {
+        "set VCT_CONTAINER_RUNTIME=$other if the data is not in $Pinned (the install recorded $Pinned in $Source)"
+    }
+    Write-StackLog "FATAL: the container runtime is pinned to $Pinned by $Source, but $Why — starting nothing (the stack's data is in $Pinned's volumes; $other would start it on empty ones). Fix: start $Pinned, or $change."
+}
+
+# ---------------------------------------------------------------------------
 # Find-Runtime :: returns one of "docker", "podman-compose", "podman compose"
 # or "". Mirrors bash detect_runtime.
 #
-# Order:
-#   1. VCT_CONTAINER_RUNTIME env preference (v0.2.14 Bug #3 pattern) —
-#      explicit user override, only honored if the named runtime is
-#      actually usable.
-#   2. resolve_runtime_file → token from runtime.txt → expand to
-#      compose invocation IFF the runtime is usable.
-#   3. Probe podman first (preferred default — no group-perm gotcha
-#      on Windows since podman-machine runs in WSL2 with the user's
-#      own subordinate uids).
-#   4. Probe docker.
-#   5. Empty (no usable runtime).
+# THE pin rule (vco_lib.containers.runtime_pin, v0.2.97):
+#   1. VCT_CONTAINER_RUNTIME=podman|docker is a PIN ("auto"/unset: none).
+#   2. Else the first runtime.txt Resolve-RuntimeFile finds is a PIN.
+#   A pinned runtime is the ONLY candidate. When it is not usable (binary
+#   missing, daemon / machine down, or podman without a compose front-end)
+#   Write-RuntimePinRefusal logs one line, $script:RuntimePinRefused is set
+#   and '' is returned: starting the stack under the OTHER runtime would
+#   create its containers on that runtime's empty volumes next to the real
+#   data (plan invariants I1/I2). Supersedes PR-12 Bug B's fall-through.
+#   3. Unpinned: podman first (preferred default — no group-perm gotcha on
+#      Windows since podman-machine runs in WSL2 with the user's own
+#      subordinate uids), then docker.
+#   4. '' (no usable runtime).
 # ---------------------------------------------------------------------------
+$script:RuntimePinRefused = $false
+function Get-PodmanComposeForm {
+    if (Test-CommandExists 'podman-compose') { return 'podman-compose' }
+    $help = Invoke-WithTimeout -Executable 'podman' -ArgumentList @('compose','--help') -TimeoutSec 3
+    if (-not $help.TimedOut -and $help.ExitCode -eq 0) { return 'podman compose' }
+    return ''
+}
+
 function Find-Runtime {
-    # 1. Explicit env preference. VCT_CONTAINER_RUNTIME is the highest-
-    # priority signal — v0.2.14 Bug #3 added this check ahead of the
-    # runtime.txt probe to give users a way to force a specific runtime
-    # at boot without editing on-disk state.
+    $script:RuntimePinRefused = $false
+    $pin = ''
+    $pinSource = ''
     $envPref = [Environment]::GetEnvironmentVariable('VCT_CONTAINER_RUNTIME')
     if (-not [string]::IsNullOrEmpty($envPref)) {
         $envPref = $envPref.Trim().ToLowerInvariant()
-        if ($envPref -eq 'docker' -and (Test-RuntimeUsable -Token 'docker')) {
-            return 'docker'
-        }
-        if ($envPref -eq 'podman' -and (Test-RuntimeUsable -Token 'podman')) {
-            if (Test-CommandExists 'podman-compose') { return 'podman-compose' }
-            $help = Invoke-WithTimeout -Executable 'podman' -ArgumentList @('compose','--help') -TimeoutSec 3
-            if (-not $help.TimedOut -and $help.ExitCode -eq 0) { return 'podman compose' }
-        }
-        if ($envPref -ne '' -and -not @('docker','podman').Contains($envPref)) {
+        if ($envPref -eq 'podman' -or $envPref -eq 'docker') {
+            $pin = $envPref
+            $pinSource = 'VCT_CONTAINER_RUNTIME'
+        } elseif ($envPref -ne '' -and $envPref -ne 'auto') {
             Write-StackLog "VCT_CONTAINER_RUNTIME='$envPref' is not a recognized runtime token; ignoring"
-        } else {
-            Write-StackLog "VCT_CONTAINER_RUNTIME='$envPref' but that runtime is not usable; falling through"
+        }
+    }
+    if (-not $pin) {
+        $runtimeFile = Resolve-RuntimeFile
+        if (-not [string]::IsNullOrEmpty($runtimeFile)) {
+            try {
+                $line = Get-Content -LiteralPath $runtimeFile -TotalCount 1 -ErrorAction SilentlyContinue
+                if ($null -ne $line) { $pin = ($line.Trim()).ToLowerInvariant() }
+            } catch { }
+            $pinSource = $runtimeFile
         }
     }
 
-    # 2. runtime.txt — only honored if its named runtime is actually usable.
-    $runtimeFile = Resolve-RuntimeFile
-    if (-not [string]::IsNullOrEmpty($runtimeFile)) {
-        $persisted = ''
-        try {
-            $line = Get-Content -LiteralPath $runtimeFile -TotalCount 1 -ErrorAction SilentlyContinue
-            if ($null -ne $line) {
-                $persisted = ($line.Trim()).ToLowerInvariant()
-            }
-        } catch { }
-        switch ($persisted) {
-            'docker' {
-                # Test-RuntimeUsable already validated docker daemon access
-                # in Resolve-RuntimeFile; we trust that result here.
-                return 'docker'
-            }
-            'podman' {
-                if (Test-CommandExists 'podman-compose') { return 'podman-compose' }
-                $help = Invoke-WithTimeout -Executable 'podman' -ArgumentList @('compose','--help') -TimeoutSec 3
-                if (-not $help.TimedOut -and $help.ExitCode -eq 0) { return 'podman compose' }
-                # podman is usable but no compose front-end — fall through.
-            }
+    if ($pin) {
+        if (-not (Test-RuntimeUsable -Token $pin)) {
+            Write-RuntimePinRefusal -Pinned $pin -Source $pinSource -Why "$pin is not usable (not installed, or ``$pin info`` fails: daemon / machine not running)"
+            $script:RuntimePinRefused = $true
+            return ''
         }
+        if ($pin -eq 'docker') { return 'docker' }
+        $form = Get-PodmanComposeForm
+        if ($form) { return $form }
+        Write-RuntimePinRefusal -Pinned 'podman' -Source $pinSource -Why "neither podman-compose nor ``podman compose`` is available"
+        $script:RuntimePinRefused = $true
+        return ''
     }
 
-    # 3. Probe podman first — preferred default.
+    # Unpinned: podman first — preferred default.
     if (Test-RuntimeUsable -Token 'podman') {
-        if (Test-CommandExists 'podman-compose') { return 'podman-compose' }
-        $help = Invoke-WithTimeout -Executable 'podman' -ArgumentList @('compose','--help') -TimeoutSec 3
-        if (-not $help.TimedOut -and $help.ExitCode -eq 0) { return 'podman compose' }
+        $form = Get-PodmanComposeForm
+        if ($form) { return $form }
         Write-StackLog "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker"
     }
 
-    # 4. Probe docker.
+    # Then docker.
     if (Test-RuntimeUsable -Token 'docker') {
         return 'docker'
     }
 
-    # 5. No usable runtime.
+    # No usable runtime.
     return ''
 }
 
@@ -791,7 +814,11 @@ function Invoke-Main {
 
         $runtime = Find-Runtime
         if ([string]::IsNullOrEmpty($runtime)) {
-            Write-StackLog "FATAL: no container runtime found (tried VCT_CONTAINER_RUNTIME, runtime.txt, podman, docker)"
+            # A refused pin already logged the one line naming the pin and
+            # the fix (Write-RuntimePinRefusal).
+            if (-not $script:RuntimePinRefused) {
+                Write-StackLog "FATAL: no container runtime found (tried VCT_CONTAINER_RUNTIME, runtime.txt, podman, docker)"
+            }
             return 3
         }
         Write-StackLog "runtime=$runtime"

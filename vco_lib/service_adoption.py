@@ -80,10 +80,9 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 # PyYAML is NOT imported at module scope. This module's own comment used to
 # say it was "a hard dep of the orchestrator venv (not the install path)" —
@@ -402,7 +401,15 @@ def _inspect_json(ref: str, fmt: str, runtime: str, run: RunFn) -> Optional[Any]
         return None
 
 
-def _normalize_mount(entry: dict) -> Optional[MountSpec]:
+def mount_from_inspect(entry: Any) -> Optional[MountSpec]:
+    """ONE ``inspect .Mounts`` entry (podman or docker shape) →
+    :class:`MountSpec`; ``None`` for anything that is not a bind or a named
+    volume with a source and a destination. The one parser of that shape —
+    ``service_detection`` (the candidate detector) projects it to its
+    row-shaped ``Mount`` (the SELinux relabel option is not part of a data
+    source's identity: :meth:`MountSpec.key`)."""
+    if not isinstance(entry, dict):
+        return None
     kind = str(entry.get("Type", "") or "").lower()
     if kind not in ("bind", "volume"):
         return None
@@ -436,7 +443,7 @@ def live_service_state(ref: str, runtime: str, run: RunFn) -> Optional[LiveServi
         return None
 
     mounts = tuple(
-        m for m in (_normalize_mount(e) for e in raw_mounts if isinstance(e, dict))
+        m for m in (mount_from_inspect(e) for e in raw_mounts)
         if m is not None
     )
     env: dict[str, str] = {}
@@ -1043,8 +1050,10 @@ HEALTH_PATHS: dict[str, str] = {
 
 
 def _default_fetch(url: str, timeout: float) -> Optional[int]:
+    from vco_lib.service_probe_http import open_probe  # noqa: PLC0415
+
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with open_probe(url, timeout) as resp:  # a redirect is an error, never followed
             return int(resp.status)
     except Exception:  # noqa: BLE001 — every failure is "not answering (yet)"
         return None
@@ -1237,10 +1246,17 @@ def _declares_devices(service_cfg: dict) -> bool:
 def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
               resolution: Optional[Any] = None,
               services: Sequence[str] = ADOPTION_ORDER,
+              container_refs: Optional[Mapping[str, str]] = None,
               ) -> tuple[list[ServicePlan], list[Path]]:
     """Read-only phase: per-service verdicts for *services* (in
     :data:`ADOPTION_ORDER`; a service not named is not planned, so it can
-    never be touched).  Nothing is stopped here."""
+    never be touched).  Nothing is stopped here.
+
+    ``container_refs``: service → the EXACT container to plan (``hand-to-vco``
+    passes the adopted row's ``container_name``). A named container is never
+    substituted by a canonically-named one — a stale ``vco_weaviate`` from an
+    earlier install must not be taken over in place of the container the row
+    says VCO uses — and a named container that does not exist refuses."""
     unknown = [s for s in services if s not in ADOPTION_ORDER]
     if unknown:
         raise ValueError(f"not adoptable services: {unknown} (known: {ADOPTION_ORDER})")
@@ -1265,10 +1281,20 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
     for service in (s for s in ADOPTION_ORDER if s in services):
         plan = ServicePlan(service=service)
         plans.append(plan)
-        try:
-            ref = _containers.find_existing_container(service, runtime)
-        except Exception:  # noqa: BLE001 — probe failure → nothing to adopt
-            ref = None
+        if container_refs is not None and service in container_refs:
+            ref = container_refs[service] or None
+            if not ref:
+                plan.reason = "no container named — nothing to adopt"
+                continue
+            container_id = _inspect_json(ref, "{{json .Id}}", runtime, run)
+            if not (isinstance(container_id, str) and container_id):
+                plan.reason = f"container '{ref}' does not exist (or could not be inspected)"
+                continue
+        else:
+            try:
+                ref = _containers.find_existing_container(service, runtime)
+            except Exception:  # noqa: BLE001 — probe failure → nothing to adopt
+                ref = None
         if not ref:
             plan.reason = "no existing container — nothing to adopt"
             continue
@@ -1551,6 +1577,7 @@ def adopt_services(
     commit_rows: Optional[CommitRowsFn] = None,
     db_path: Optional[Path] = None,
     row_source: str = "user_cli",
+    container_refs: Optional[Mapping[str, str]] = None,
 ) -> AdoptionResult:
     """The whole guarded adoption.  See the module docstring for the flow
     and the constraint map.  ``run``/``fetch``/``resolution`` are injection
@@ -1565,7 +1592,10 @@ def adopt_services(
     ``extra_verify(service, host_port)``: a stricter post-check whose
     problem triggers the same rollback. On success the adopted services'
     ``service_endpoints`` rows are written through ``commit_rows`` (default
-    ``service_endpoints.commit_rows`` on ``db_path``) with ``row_source``."""
+    ``service_endpoints.commit_rows`` on ``db_path``) with ``row_source``.
+    ``container_refs``: service → the exact container to adopt (see
+    :func:`_plan_all`); without it the canonical/historical names are
+    searched (the v0.2.96 bulk adoption)."""
     run = run or subprocess.run  # type: ignore[assignment]
     fetch = fetch or _default_fetch
     log = log or (lambda msg: print(msg))
@@ -1573,7 +1603,7 @@ def adopt_services(
     result = AdoptionResult()
 
     plans, files = _plan_all(root, runtime, run, log, resolution=resolution,
-                             services=services)
+                             services=services, container_refs=container_refs)
     if not files:
         result.refused = {p.service: p.reason or "unknown" for p in plans
                           if p.reason}

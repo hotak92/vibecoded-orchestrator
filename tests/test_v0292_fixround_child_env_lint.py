@@ -427,6 +427,48 @@ class TestChildEnvPinsTheOrchestratorRoot(unittest.TestCase):
         env = child_env({"VCT_ORCHESTRATOR_ROOT": "/somewhere/else"})
         self.assertEqual(env["VCT_ORCHESTRATOR_ROOT"], str(REPO_ROOT))
 
+    def test_install_root_is_pinned_to_this_checkout_too(self) -> None:
+        """Review round 7: `VCT_INSTALL_ROOT` is the FIRST rung of every
+        install-root reader, ahead of `VCT_ORCHESTRATOR_ROOT`; a developer
+        shell that exports it sent children to another checkout (and its
+        venv) while CI, which never sets it, used this one."""
+        from tests.common.child_env import REPO_ROOT, child_env
+
+        env = child_env({"VCT_INSTALL_ROOT": "/somewhere/else"})
+        self.assertEqual(env["VCT_INSTALL_ROOT"], str(REPO_ROOT))
+        self.assertEqual(child_env(VCT_INSTALL_ROOT="/opt")["VCT_INSTALL_ROOT"], "/opt")
+
+    def test_the_childs_install_root_ladder_never_reaches_another_checkout(self) -> None:
+        """Behavioural: an inherited `VCT_INSTALL_ROOT` naming ANOTHER clone
+        (a scratch tree shaped like one: `vco_lib/` + `.claude/` + a venv) is
+        not what the child's `vco_lib.python_exe` ladder resolves — neither
+        its install root nor its venv interpreter."""
+        import os as _os
+        import subprocess
+        import sys as _sys
+        import tempfile
+
+        from tests.common.child_env import REPO_ROOT, child_env
+
+        with tempfile.TemporaryDirectory(prefix="vco-other-checkout-") as other:
+            for d in ("vco_lib", ".claude", ".venv/bin"):
+                _os.makedirs(_os.path.join(other, d), exist_ok=True)
+            fake_py = _os.path.join(other, ".venv", "bin", "python")
+            with open(fake_py, "w", encoding="utf-8") as fh:
+                fh.write("#!/bin/sh\nexit 1\n")
+            _os.chmod(fake_py, 0o755)
+            base = dict(_os.environ)
+            base["VCT_INSTALL_ROOT"] = other
+            proc = subprocess.run(
+                [_sys.executable, "-c",
+                 "from vco_lib import python_exe as p;"
+                 "print(p.resolve_install_root());"
+                 "print([c.path for c in p.ladder_candidates() if c.ok])"],
+                env=child_env(base), capture_output=True, text=True, cwd=str(REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertNotIn(other, proc.stdout, proc.stdout)
+
     def test_an_explicit_override_still_wins(self) -> None:
         """Opting out must remain possible — but written down at the call site."""
         from tests.common.child_env import child_env

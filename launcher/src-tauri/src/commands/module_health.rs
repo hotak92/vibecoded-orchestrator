@@ -61,13 +61,25 @@ pub async fn module_health_snapshot() -> Result<BTreeMap<String, ModuleHealthVie
     let token = vct_launcher_core::services::boot_token::read_nonempty_token_file(
         &crate::paths::vct_root_dir().join("hub.token"),
     )?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client: {e}"))?;
+    fetch_snapshot(&snapshot_client()?, port, &token).await
+}
+
+/// The client for the snapshot read. `.no_proxy()`: the request carries the
+/// hub bearer token to 127.0.0.1, and with `HTTP_PROXY` set (and no
+/// `NO_PROXY`) reqwest's environment proxy would otherwise send it — token
+/// included — to the proxy (R7b F19).
+fn snapshot_client() -> Result<reqwest::Client, String> {
+    vct_launcher_core::services::loopback_http::client(Duration::from_secs(5))
+}
+
+async fn fetch_snapshot(
+    client: &reqwest::Client,
+    port: u16,
+    token: &str,
+) -> Result<BTreeMap<String, ModuleHealthView>, String> {
     let resp = client
         .get(format!("http://127.0.0.1:{port}/api/v1/modules/catalog"))
-        .bearer_auth(&token)
+        .bearer_auth(token)
         .send()
         .await
         .map_err(|e| format!("hub GET /modules/catalog: {e}"))?;
@@ -82,6 +94,35 @@ pub async fn module_health_snapshot() -> Result<BTreeMap<String, ModuleHealthVie
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// R7b F19: with `HTTP_PROXY` pointing somewhere (here: a port nothing
+    /// listens on), the snapshot still goes straight to the hub on 127.0.0.1
+    /// — the bearer token never reaches a proxy.
+    #[tokio::test]
+    async fn the_snapshot_read_never_goes_through_a_proxy() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/api/v1/modules/catalog",
+            axum::routing::get(|| async {
+                axum::Json(json!({ "modules": [{ "id": "m", "health": { "state": "up" } }] }))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let client = {
+            let _env = vct_launcher_core::test_env::env_guard(&[
+                ("HTTP_PROXY", Some("http://127.0.0.1:9")),
+                ("http_proxy", Some("http://127.0.0.1:9")),
+                ("ALL_PROXY", Some("http://127.0.0.1:9")),
+                ("NO_PROXY", None),
+                ("no_proxy", None),
+            ]);
+            snapshot_client().unwrap()
+        };
+        let got = fetch_snapshot(&client, port, "test-token").await.expect("direct to the hub");
+        assert_eq!(got["m"].health, json!({ "state": "up" }));
+    }
 
     #[test]
     fn keeps_only_modules_with_health_and_carries_project_instances() {

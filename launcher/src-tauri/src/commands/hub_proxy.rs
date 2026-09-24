@@ -61,11 +61,10 @@ fn hub_token() -> Result<String, String> {
     )
 }
 
+/// The hub carries the bearer token: never through a proxy, never
+/// redirected (`vct_launcher_core::services::loopback_http`).
 fn hub_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| format!("http client: {}", e))
+    vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(8))
 }
 
 async fn hub_get(path: &str) -> Result<Value, String> {
@@ -212,5 +211,42 @@ mod tests {
     #[test]
     fn min_tier_is_pro() {
         assert_eq!(MIN_TIER, "pro");
+    }
+
+    /// R7b F19 (generalised): with every proxy variable pointing at a dead
+    /// port and no `NO_PROXY`, `hub_get` still reaches the hub on 127.0.0.1
+    /// with its bearer token — it never goes through the proxy. A test-owned
+    /// axum server on an ephemeral port stands in for the hub (`hub.port`
+    /// and `hub.token` in a scratch state dir). Red if `hub_client` is built
+    /// without `services::loopback_http`.
+    #[tokio::test]
+    async fn hub_get_never_goes_through_a_proxy() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/api/v1/apps",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                axum::Json(serde_json::json!({ "auth": auth }))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let dead = Some("http://127.0.0.1:9");
+        let guard = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("HTTP_PROXY", dead),
+            ("http_proxy", dead),
+            ("HTTPS_PROXY", dead),
+            ("https_proxy", dead),
+            ("ALL_PROXY", dead),
+            ("all_proxy", dead),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+            ("VCT_HUB_PORT", None),
+        ]);
+        std::fs::write(guard.path().join("hub.port"), format!("{port}\n")).unwrap();
+        std::fs::write(guard.path().join("hub.token"), "test-token\n").unwrap();
+        let got = hub_get("/apps").await.expect("direct to the hub, not through the proxy");
+        assert_eq!(got["auth"], "Bearer test-token");
     }
 }

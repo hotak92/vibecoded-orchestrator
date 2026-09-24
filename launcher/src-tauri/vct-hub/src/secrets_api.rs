@@ -81,12 +81,10 @@ use serde::{Deserialize, Serialize};
 
 use super::modules_api::LauncherDbHandle;
 
-/// Mirror of `SENTINEL_SHARED` in `commands/secrets_cmd.rs` and
-/// `commands/secrets_import.rs`. Kept as a module-private const because
-/// the two writer paths (Tauri command + this hub route) need the same
-/// keychain slot, and exposing it publicly from `secrets_cmd` would leak
-/// an implementation detail across crate boundaries.
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// The shared-scope keychain slot. The Tauri writer and this hub route need
+/// the same one, so both import the one definition in
+/// `vct_launcher_core::secrets` (R7b F15).
+use vct_launcher_core::secrets::SENTINEL_SHARED;
 
 /// Module ID slot for user-shared secrets. Matches `IMPORT_MODULE_ID` in
 /// `secrets_import.rs` and the bucket the SecretsPanel "Shared (this user)"

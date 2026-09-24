@@ -232,10 +232,8 @@ pub(crate) fn extract_cg_prefix_old(deferred_md: &str) -> Option<String> {
 /// Fetch `/v1/schema` once and return the LOWERCASED class-name set.
 /// `Err` = probe failed (the caller must then do nothing at all).
 async fn fetch_schema_classes_lower(weaviate_url: &str) -> Result<HashSet<String>, String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("binding_reconcile: reqwest client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client_for(weaviate_url, std::time::Duration::from_secs(5))
+        .map_err(|e| format!("binding_reconcile: {}", e))?;
     let url = format!("{}/v1/schema", weaviate_url.trim_end_matches('/'));
     let resp = client
         .get(&url)

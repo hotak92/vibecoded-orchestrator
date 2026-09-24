@@ -19,6 +19,9 @@ use crate::secrets::{self, SecretScope};
 // pair — see `UpdateStatus::remote_check`.
 use vct_launcher_core::check_state::CheckState;
 use vct_launcher_core::process::pid_is_alive;
+// `.silent()` for the test modules' process fixtures (they `use super::*`);
+// the module body's own spawns import it where they build a command.
+#[cfg(test)]
 use vct_launcher_core::process::CommandExt as _;
 
 /// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
@@ -683,16 +686,14 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
 // resolves through `vct_launcher_core::services::service_endpoints` (the
 // row, else ITS compiled defaults, the one copy).
 
-/// HTTP probe with short timeout. Returns the URL on 2xx/3xx, None otherwise.
+/// HTTP probe with short timeout. Returns the URL on a 2xx, None otherwise;
+/// a redirect is never followed (`vct_launcher_core::services::probe_http`).
 /// Takes an owned String so callers can compose URLs via format! without
 /// having to keep the formatted string alive themselves.
 async fn probe_http(url: String) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
+    let client = vct_launcher_core::services::loopback_http::client_for(&url, std::time::Duration::from_secs(2)).ok()?;
     match client.get(&url).send().await {
-        Ok(resp) if resp.status().as_u16() < 400 => Some(url),
+        Ok(resp) if vct_launcher_core::services::probe_http::answered(resp.status()) => Some(url),
         _ => None,
     }
 }
@@ -2384,88 +2385,33 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
     "vct_code_embed",
 ];
 
-/// Read-only volume detection for the install preflight: the orchestrator
-/// volumes under the first installed runtime of the shared candidate order
-/// (`container_runtime::runtime_candidate_order` — a `VCT_CONTAINER_RUNTIME`
-/// or `state/install/runtime.txt` pin is the ONLY candidate; unpinned,
-/// podman then docker, as before). If none is installed we return an empty
-/// list (not an error — the user may not have a container runtime yet,
-/// which is fine pre-install).
+/// Read-only volume detection for the install preflight — the SAME answer the
+/// install's next step (`volumes::set_volumes_config_for_install`) acts on:
+/// the orchestrator volumes under the runtime storage commands drive
+/// (`storage_ux::storage_runtime`, the shared pin-first, daemon-aware
+/// detector), or the ownership REFUSAL when some exist only under the other
+/// runtime (returned as the second field, surfaced as a risk line). No
+/// usable runtime → an empty list (a machine before its first install may
+/// have none).
 ///
-/// v0.2.97 owner ruling "Honour the pin": the walk used to be a hard-coded
-/// podman-then-docker, so a docker-pinned machine's preflight listed a
-/// leftover podman copy as "your data". `commands::volumes`, which used to
-/// reach this through `detect_existing_volumes_for_volumes_module`, now asks
-/// [`detect_existing_volumes_under`] for the runtime the shared daemon-aware
-/// detector chose.
-async fn detect_existing_volumes() -> Vec<ExistingVolume> {
-    use vct_launcher_core::services::container_runtime as cr;
-    let recorded = find_local_repo_root().ok().and_then(|root| cr::read_runtime_txt(&root));
-    let order = cr::runtime_candidate_order(cr::runtime_preference_from_env().as_deref(), recorded.as_deref());
-    for runtime in &order {
-        let runtime_path = match which_on_path(runtime) {
-            Some(p) => p,
-            None => continue,
-        };
-        let found = detect_existing_volumes_under(&runtime_path.to_string_lossy()).await;
-        if !found.is_empty() {
-            return found;
-        }
-    }
-    Vec::new()
+/// R7b F25(a): this was a SECOND runtime chooser — the shared candidate
+/// order walked with a PATH probe and no daemon check, taking the first
+/// runtime that had volumes. Unpinned, both runtimes up, volumes only under
+/// docker: the preflight showed docker's volumes as "yours" and the very
+/// next step, which auto-chose podman, refused.
+async fn detect_existing_volumes() -> (Vec<ExistingVolume>, Option<String>) {
+    detect_existing_volumes_at(find_local_repo_root().ok().as_deref()).await
 }
 
-/// The orchestrator volumes that exist under ONE runtime (`podman`,
-/// `docker`, or a path to either). v0.2.97 owner ruling "Honour the pin":
-/// split out of [`detect_existing_volumes`] so `commands::volumes` can ask
-/// the runtime the shared pin-first detector chose — and the other one,
-/// only to refuse — instead of taking whichever runtime answered first.
-/// Spawns through `paths::spawn_program` (the bare name in production).
-pub(crate) async fn detect_existing_volumes_under(runtime: &str) -> Vec<ExistingVolume> {
-    let program = vct_launcher_core::paths::spawn_program(runtime);
-    let mut found: Vec<ExistingVolume> = Vec::new();
-    for name in ORCHESTRATOR_VOLUME_NAMES {
-        // `volume inspect <name>` returns 0 with JSON if it exists,
-        // non-zero if not. Read-only — never mutates state.
-        let out = tokio::process::Command::new(&program).silent()
-            .args(["volume", "inspect", name])
-            .output()
-            .await;
-        let out = match out {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
-        if !out.status.success() {
-            continue;
-        }
-        let body = String::from_utf8_lossy(&out.stdout);
-        // Both podman and docker emit a JSON array of volume objects.
-        let arr: serde_json::Value = match serde_json::from_str(&body) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Some(items) = arr.as_array() {
-            for item in items {
-                let mountpoint = item
-                    .get("Mountpoint")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let driver = item
-                    .get("Driver")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("local")
-                    .to_string();
-                found.push(ExistingVolume {
-                    name: name.to_string(),
-                    mountpoint,
-                    driver,
-                });
-            }
-        }
+/// [`detect_existing_volumes`] with the install root (where
+/// `state/install/runtime.txt` lives) passed in — tests use a temp dir.
+async fn detect_existing_volumes_at(install_root: Option<&Path>) -> (Vec<ExistingVolume>, Option<String>) {
+    match super::volumes::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
+        Ok(found) => (found, None),
+        Err(refusal) => (Vec::new(), Some(refusal)),
     }
-    found
 }
+
 
 /// v0.2.77 (Part 7c task 3): delegates to the shared
 /// `vct_launcher_core::paths::which_on_path` (one home). Behaviour upgrade
@@ -2476,23 +2422,27 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     vct_launcher_core::paths::which_on_path(name)
 }
 
-/// Read-only Weaviate schema probe. Returns the list of class names
-/// already present on the running instance; empty Vec if Weaviate is
-/// not reachable.
-async fn detect_existing_collections() -> Vec<String> {
-    // v0.2.97: the machine's Weaviate (its `service_endpoints` row), not the
-    // literal 8081 — the preflight reported an adopted or moved instance's
-    // classes as absent.
-    let url = format!(
+/// The URL the preflight's schema probe GETs: the machine's Weaviate (its
+/// `service_endpoints` row via `machine_url_from_disk`), not the literal
+/// 8081 — the preflight reported an adopted or moved instance's classes as
+/// absent (v0.2.97). In a test harness (a state dir under the OS temp dir)
+/// an absent row is the unroutable sentinel `127.0.0.1:9`, never a real
+/// local Weaviate — pinned by `the_preflight_schema_probe_is_the_sentinel_in_tests`.
+fn existing_collections_probe_url() -> String {
+    format!(
         "{}/v1/schema",
         vct_launcher_core::services::service_endpoints::machine_url_from_disk(
             vct_launcher_core::services::service_endpoints::CoreService::Weaviate
         )
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    )
+}
+
+/// Read-only Weaviate schema probe. Returns the list of class names
+/// already present on the running instance; empty Vec if Weaviate is
+/// not reachable.
+async fn detect_existing_collections() -> Vec<String> {
+    let url = existing_collections_probe_url();
+    let client = match vct_launcher_core::services::loopback_http::client_for(&url, std::time::Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -2567,8 +2517,9 @@ pub async fn preflight_install_safety_check(
         Vec::new()
     };
 
-    // 3. Existing volumes — never touched.
-    let existing_volumes = detect_existing_volumes().await;
+    // 3. Existing volumes — never touched. Same runtime + ownership answer
+    //    the install's volumes step acts on (R7b F25(a)).
+    let (existing_volumes, volume_refusal) = detect_existing_volumes().await;
 
     // 4. Existing Weaviate classes — preserved.
     let existing_collections = detect_existing_collections().await;
@@ -2624,6 +2575,11 @@ pub async fn preflight_install_safety_check(
         } else {
             risks.push(format!("Will overwrite orchestrator-managed path: {}", path));
         }
+    }
+    if let Some(refusal) = volume_refusal {
+        // The install's volumes step will refuse with this exact text; say
+        // it here, before the user clicks Install.
+        risks.push(refusal);
     }
     if !existing_volumes.is_empty() {
         // Bug 32 #4 + Bug 31: bind-mount override is suppressed when
@@ -3112,6 +3068,11 @@ fn valid_adopt_url(url: &str) -> bool {
         return false;
     }
     let authority = after.split('/').next().unwrap_or("");
+    // No userinfo (`user:password@host`): an endpoint holds no credentials,
+    // and refusing it here keeps a secret out of every echo of the flag.
+    if authority.contains('@') {
+        return false;
+    }
     let host = if authority.starts_with('[') {
         // IPv6 literal: everything up to and including the closing bracket.
         match authority.find(']') {
@@ -10411,11 +10372,9 @@ pub(crate) use inspect::*;
 // fallback below).
 // ---------------------------------------------------------------------------
 
-/// Sentinel project_id for shared scope (mirrors `commands::secrets_cmd`).
-/// Kept as a module-private constant because this file is the only
-/// non-secrets-cmd caller of `SecretScope::Shared`; widening it to a
-/// pub-crate const in `secrets.rs` would just hide the dependency.
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// Sentinel project_id for shared scope — the one definition in
+/// `vct_launcher_core::secrets` (R7b F15).
+use crate::secrets::SENTINEL_SHARED;
 
 /// Module identifier used to namespace the keychain entry for the
 /// onboarding-wizard GitHub PAT. Pinned here because the migration
@@ -13145,10 +13104,11 @@ MemAvailable:   23456789 kB
 
     #[tokio::test]
     async fn test_detect_existing_services_returns_struct() {
-        // We can't guarantee anything about whether the test machine has
-        // local services up — this test only verifies the command returns
-        // a well-formed ServicesStatus and doesn't panic. Detail-level
-        // probe testing is covered by test_probe_http_returns_none_on_unreachable.
+        // Verifies the command returns a well-formed ServicesStatus and
+        // doesn't panic. Held on a scratch state dir: with no rows there the
+        // probes go to the unroutable sentinel (127.0.0.1:9), never to a real
+        // local service — whatever VCT_STATE_DIR the test runner exported.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
         let s = detect_existing_services().await.expect("command must not error");
         // The Option fields are mutually consistent with the booleans.
         let count = [&s.weaviate_url, &s.ollama_url, &s.code_embed_url]
@@ -13418,6 +13378,34 @@ MemAvailable:   23456789 kB
         std::fs::remove_file(&target).ok();
     }
 
+    /// Review round 7: the preflight's schema probe
+    /// (`detect_existing_collections`) resolves through the rows' harness
+    /// guard — on a test state dir with no rows its URL is the unroutable
+    /// sentinel, so no test reaches a real Weaviate on 8081. With a row, the
+    /// row's endpoint (the production answer).
+    #[test]
+    fn the_preflight_schema_probe_is_the_sentinel_in_tests() {
+        use vct_launcher_core::services::service_endpoints as se;
+        let g = vct_launcher_core::test_env::state_dir_guard();
+        let url = existing_collections_probe_url();
+        assert_eq!(
+            url,
+            format!("http://{}:{}/v1/schema", se::HARNESS_SENTINEL_HOST, se::HARNESS_SENTINEL_PORT)
+        );
+        assert!(!url.contains(":8081"), "{url}");
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18089,
+        );
+        row.grpc_port = Some(50089);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        assert_eq!(existing_collections_probe_url(), "http://localhost:18089/v1/schema");
+        drop(g);
+    }
+
     /// Bug 32: preflight_install_safety_check returns a well-formed
     /// SafetyReport for a fresh install path. Cannot assert on
     /// existing_volumes / existing_collections deterministically (they
@@ -13429,6 +13417,9 @@ MemAvailable:   23456789 kB
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&target).unwrap();
+        // A scratch state dir: the preflight's service and schema probes go
+        // to the sentinel, never to a real local Weaviate (review round 7).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
         // Pre-seed user-code that should appear in will_preserve_user_code.
         std::fs::create_dir_all(target.join("my_app")).unwrap();
         std::fs::write(target.join("README_USER.md"), "user readme").unwrap();
@@ -13477,6 +13468,8 @@ MemAvailable:   23456789 kB
         // Pre-seed `.claude` so will_overwrite_orchestrator_files contains it
         // → expected risk line about read-merge-write.
         std::fs::create_dir_all(target.join(".claude")).unwrap();
+        // Scratch state dir: the probes reach the sentinel only.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
 
         let report =
             preflight_install_safety_check(target.to_string_lossy().to_string())
@@ -13496,6 +13489,36 @@ MemAvailable:   23456789 kB
         );
 
         std::fs::remove_dir_all(&target).ok();
+    }
+
+    /// R7b F25(a): the preflight's volume answer is the one the install's
+    /// next step acts on. Unpinned, both runtimes up, the orchestrator
+    /// volumes only under docker: podman is the runtime VCO drives, so the
+    /// preflight lists NO volumes as reused and names the refusal the volumes
+    /// step will give — it used to list docker's volumes as "yours".
+    #[cfg(unix)]
+    #[test]
+    fn preflight_volumes_follow_the_storage_runtime_and_surface_its_refusal() {
+        use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &[]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
+        let root = tempfile::tempdir().unwrap();
+        let (found, refusal) =
+            with_fake_runtimes(dir.path(), None, detect_existing_volumes_at(Some(root.path())));
+        assert!(found.is_empty(), "docker's volumes were offered for reuse: {found:?}");
+        let refusal = refusal.expect("the volumes step refuses, so the preflight must say so");
+        assert!(refusal.contains("exists only under docker"), "{refusal}");
+        assert!(refusal.contains("podman was auto-detected"), "{refusal}");
+
+        // Leave-alone: podman owns them → they are listed, no refusal.
+        let owned = tempfile::tempdir().unwrap();
+        fake_runtime(owned.path(), "podman", &["weaviate_data"]);
+        fake_runtime(owned.path(), "docker", &[]);
+        let (found, refusal) =
+            with_fake_runtimes(owned.path(), None, detect_existing_volumes_at(Some(root.path())));
+        assert_eq!(found.len(), 1);
+        assert!(refusal.is_none());
     }
 
     /// Reviewer B blocker: orchestrator data sprawl across ~/podman_volumes,

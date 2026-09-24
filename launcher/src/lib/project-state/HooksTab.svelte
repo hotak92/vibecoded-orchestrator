@@ -274,7 +274,7 @@
         </label>
         <label><span>Matcher</span><input bind:value={nMatcher} placeholder="Edit(*) — blank matches everything" /></label>
         <label class="ps-span2"><span>Command</span>
-          <input bind:value={nCommand} placeholder="bash .claude/hooks/my-hook.sh" />
+          <input bind:value={nCommand} placeholder={'bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.sh"'} />
         </label>
         <label><span>Timeout (seconds)</span><input bind:value={nTimeout} placeholder="optional" inputmode="numeric" /></label>
       </div>

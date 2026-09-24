@@ -91,6 +91,17 @@
     type ServiceRuntimeState,
     type ServicesRuntimeSnapshot,
   } from '$lib/api/service_endpoints';
+  // v0.2.97 (R7b F22): "Move to another port" for VCO's own services. The
+  // decisions live in `$lib/api/service-endpoint-move` (vitest-pinned).
+  import {
+    checkGrpcPort,
+    checkMovePort,
+    moveOffer,
+    moveRequest,
+    moveService,
+    resultLines,
+    type MovableService,
+  } from '$lib/api/service-endpoint-move';
 
   interface LifecycleProgress {
     phase: string;
@@ -287,6 +298,43 @@
       error = String(e);
     } finally {
       handBusy = false;
+    }
+  }
+
+  // ─── Move to another port (v0.2.97, R7b F22) ─────────────────────────
+  let moveOpen = $state(false);
+  let moveTarget = $state<{ service: MovableService; label: string; port: number } | null>(null);
+  let movePort = $state('');
+  let moveGrpc = $state('');
+  let moveBusy = $state(false);
+  let moveLines = $state<string[]>([]);
+  let moveFailed = $state(false);
+  const movePortError = $derived(moveTarget ? checkMovePort(movePort, moveTarget.port) : null);
+  const moveGrpcError = $derived(moveTarget?.service === 'weaviate' ? checkGrpcPort(moveGrpc, movePort) : null);
+
+  function openMove(svc: ServiceRuntimeState, service: MovableService) {
+    moveTarget = { service, label: serviceLabel(svc.name), port: svc.port };
+    movePort = '';
+    moveGrpc = '';
+    moveLines = [];
+    moveFailed = false;
+    moveOpen = true;
+  }
+
+  async function confirmMove() {
+    if (!moveTarget || movePortError || moveGrpcError) return;
+    moveBusy = true;
+    moveLines = [];
+    moveFailed = false;
+    try {
+      const out = await moveService(moveRequest(moveTarget.service, movePort, moveGrpc));
+      moveLines = resultLines(out.output);
+    } catch (e) {
+      moveFailed = true;
+      moveLines = resultLines(String(e));
+    } finally {
+      moveBusy = false;
+      await refresh();
     }
   }
 
@@ -528,6 +576,7 @@
         {#each snapshot.services as svc (svc.name)}
           {@const badge = modeBadge(svc)}
           {@const mount = parseDataMount(svc.endpoint?.data_mount_json)}
+          {@const move = moveOffer(svc)}
           <tr data-testid="service-row-{svc.name}">
             <td><strong>{serviceLabel(svc.name)}</strong></td>
             <td>
@@ -570,6 +619,13 @@
                   {action === 'change' && svc.pending_choice ? 'Choose…' : ACTION_LABELS[action]}
                 </button>
               {/each}
+              {#if move.kind === 'move'}
+                <button class="secondary" onclick={() => openMove(svc, move.service)} disabled={loading}>
+                  Move to another port…
+                </button>
+              {:else if move.kind === 'follows_owner'}
+                <span class="muted small follows-owner">{move.note}</span>
+              {/if}
             </td>
           </tr>
         {/each}
@@ -985,6 +1041,65 @@
       </div>
     {/snippet}
   </DialogRoot>
+
+  <DialogRoot bind:open={moveOpen} ariaLabelledBy="move-service-title" width="560px">
+    {#snippet header()}
+      <h2 id="move-service-title">Move {moveTarget?.label ?? ''} to another port</h2>
+    {/snippet}
+    {#snippet body()}
+      {#if moveTarget}
+        <p>
+          VCO re-creates its {moveTarget.label} container on the new port with the SAME data, checks
+          that it answers there, and puts it back on port {moveTarget.port} if it does not. Every
+          project's settings and the MCP registration follow.
+        </p>
+        <label class="move-field">
+          New port
+          <input
+            class="gw-model"
+            class:invalid={movePort !== '' && movePortError !== null}
+            inputmode="numeric"
+            bind:value={movePort}
+            placeholder={String(moveTarget.port + 1)}
+            disabled={moveBusy}
+          />
+        </label>
+        {#if movePort !== '' && movePortError}
+          <p class="gw-model-error">{movePortError}</p>
+        {/if}
+        {#if moveTarget.service === 'weaviate'}
+          <label class="move-field">
+            gRPC port (optional — empty keeps its distance from the HTTP port)
+            <input
+              class="gw-model"
+              class:invalid={moveGrpcError !== null}
+              inputmode="numeric"
+              bind:value={moveGrpc}
+              disabled={moveBusy}
+            />
+          </label>
+          {#if moveGrpcError}
+            <p class="gw-model-error">{moveGrpcError}</p>
+          {/if}
+        {/if}
+        {#if moveLines.length > 0}
+          <div class="banner {moveFailed ? 'error' : 'info'} move-result">
+            {#each moveLines as line, i (i)}
+              <div>{line}</div>
+            {/each}
+          </div>
+        {/if}
+      {/if}
+    {/snippet}
+    {#snippet footer()}
+      <div class="bulk-actions">
+        <button class="secondary" onclick={() => (moveOpen = false)} disabled={moveBusy}>Close</button>
+        <button onclick={confirmMove} disabled={moveBusy || movePortError !== null || moveGrpcError !== null}>
+          {moveBusy ? 'Moving…' : 'Move'}
+        </button>
+      </div>
+    {/snippet}
+  </DialogRoot>
 </section>
 
 <style>
@@ -1140,6 +1255,28 @@
     flex-basis: 100%;
     color: var(--color-pink, #ff4fa0);
     font-size: 0.8rem;
+  }
+  /* R7b F22: the move dialog + the adopted row's "VCO follows" note. */
+  .move-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    margin: 0.6rem 0 0.2rem;
+    color: var(--color-mid, #94a3b8);
+    font-size: 0.85rem;
+  }
+  .move-field input {
+    max-width: 10rem;
+  }
+  .move-result {
+    font-family: ui-monospace, monospace;
+    font-size: 0.8rem;
+    margin-top: 0.8rem;
+  }
+  .follows-owner {
+    display: block;
+    max-width: 16rem;
+    margin-top: 0.3rem;
   }
   .gw-options {
     display: flex;

@@ -257,6 +257,25 @@ pub fn env_guard(vars: &[(&str, Option<&str>)]) -> EnvGuard {
     }
 }
 
+/// Every proxy variable reqwest reads pointed at `http://127.0.0.1:9` (a
+/// port nothing listens on) and no bypass list — for tests proving a client
+/// never sends a loopback request through a proxy
+/// (`services::loopback_http`). Build the client while the guard is held:
+/// reqwest reads the proxy environment when the client is built.
+#[cfg(any(test, debug_assertions))]
+pub fn dead_proxy_env_guard() -> EnvGuard {
+    env_guard(&[
+        ("HTTP_PROXY", Some("http://127.0.0.1:9")),
+        ("http_proxy", Some("http://127.0.0.1:9")),
+        ("HTTPS_PROXY", Some("http://127.0.0.1:9")),
+        ("https_proxy", Some("http://127.0.0.1:9")),
+        ("ALL_PROXY", Some("http://127.0.0.1:9")),
+        ("all_proxy", Some("http://127.0.0.1:9")),
+        ("NO_PROXY", None),
+        ("no_proxy", None),
+    ])
+}
+
 /// The save-and-restore half, on its own so both guards share ONE
 /// implementation of "put it back exactly as it was".
 ///

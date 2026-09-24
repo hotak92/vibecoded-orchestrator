@@ -222,7 +222,7 @@ Seven commands cover the GUI keychain + module settings surface:
 - `is_secret_set(scope, module_id, key)` — boolean presence check (no read). Answers the launcher's **permission** question — true ⇔ the OS keychain holds a value AND the per-`(secret, requester)` active flag is set — so it deliberately ignores the tier-2 file store, which that matrix does not govern. It has no in-tree caller: every launcher surface uses `get_secret_status_v2`, which returns the same `is_set` boolean *plus* the two-store `StoreReport` the GUI badges need. Kept as a stable IPC surface for module authors who want the gate alone. **Do not widen it to consult the file store** — that would silently extend a permission decision over a store the matrix has no authority over; render presence from `StoreReport` instead.
 - `get_secret_preview(scope, module_id, key)` — first 4 + last 4 chars (never the full value); used for "currently set" display.
 - `get_setting_v2(project_id, module_id, setting_key)` — read a non-secret per-(project, module) setting from `module_settings`.
-- `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret setting (JSON value).
+- `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret per-project setting (JSON value) through the one settings write gate (`module_settings_schema::write_module_setting`, as `set_module_setting` does): a declared setting is validated against its manifest declaration, a setting whose value lives elsewhere is refused, and an installed module's setting is stored only for a project it is enabled in (v0.2.97).
 - `list_module_settings_v2(project_id, module_id)` — return all settings for one module.
 
 ---

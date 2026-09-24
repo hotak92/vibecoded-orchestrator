@@ -50,10 +50,20 @@ fn prints_the_parked_events_with_the_launcher_down() {
     assert_eq!(code, 0, "stderr: {err}");
     assert_eq!(json["count"], 2);
     assert_eq!(json["events"][0]["event"], "install_start");
-    assert!(json["path"]
-        .as_str()
-        .unwrap()
-        .ends_with(".vibecoded/telemetry_pending.jsonl"));
+    // MUST MATCH the one writer `VCThelpers/telemetry/uploader.py`
+    // (`Path.home() / ".vibecoded" / "telemetry_pending.jsonl"`); the Python
+    // half of the pin is
+    // `tests/test_v0297_cli_program_names.py::
+    // test_vct_cli_reads_the_file_the_telemetry_uploader_writes`, which runs
+    // the uploader under a scratch home. FULL-path equality (not endswith):
+    // a drift in the layout the binary actually uses must red this test.
+    assert_eq!(
+        json["path"].as_str().unwrap(),
+        home.join(".vibecoded")
+            .join("telemetry_pending.jsonl")
+            .to_str()
+            .unwrap()
+    );
     std::fs::remove_dir_all(&home).unwrap();
 }
 

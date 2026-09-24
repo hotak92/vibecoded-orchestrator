@@ -564,8 +564,8 @@ def owning_compose_identity(runtime: str = "podman"):
 
     ``None`` when there is no such container, when it carries no compose
     labels, or when the runtime cannot be asked. Read-only: two probes
-    (``container exists`` and ``inspect``) through
-    :mod:`vco_lib.containers`, the one home for both.
+    (``container inspect`` for existence, ``inspect`` for the labels)
+    through :mod:`vco_lib.containers`, the one home for both.
 
     Why the doctor needs this at all (v0.2.95 F2): the rebuild command is only
     true if it is run in the project that owns the container. Compose derives

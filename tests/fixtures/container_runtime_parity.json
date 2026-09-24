@@ -17,12 +17,20 @@
     "resolver still COMPUTES it (`pref is not None and candidate != pref`) so reintroducing a fall-through fails here.",
     "v0.2.92 delivery-audit M1 added the THIRD leg: `expect_module_plane` is what",
     "launcher/.../services/container_runtime.rs (module containers: install, pull,",
-    "start, supervise) decides for the same host via runtime_candidate_order +",
-    "decide_module_runtime. It differs from `expect_rust` where compose is the",
-    "question (module containers need no compose: `usable_runtime_but_no_compose_anywhere`",
-    "is ok=podman here and null there) and it is the only surface that reads",
-    "`runtime_txt` (install.py's recorded runtime — a pin channel that exists only",
-    "on the module plane; see the runtime_txt_* scenarios). The module plane is",
+    "start, supervise; since v0.2.97 also the storage / volumes commands) decides for",
+    "the same host via runtime_candidate_order + decide_module_runtime. It differs from",
+    "`expect_rust` where compose is the question (module containers need no compose:",
+    "`usable_runtime_but_no_compose_anywhere` is ok=podman here and null there).",
+    "v0.2.97 R7b F5 (owner ruling): `runtime_txt` — install.py's recorded runtime,",
+    "state/install/runtime.txt — is a PIN on EVERY surface with ONE precedence,",
+    "VCT_CONTAINER_RUNTIME -> runtime.txt -> auto: Python reads it through",
+    "`containers.runtime_pin` (the test hands `resolve` an install root holding the",
+    "file), runtime.rs through `candidate_order(env, runtime_txt)`, the module plane as",
+    "before. Before v0.2.97 only the module plane read it, and the fixture RECORDED the",
+    "split (`runtime_txt_pin_unusable_*` expected docker from the other two) — the hooks",
+    "brought the stack up under one runtime while storage migrated the other's copies.",
+    "`expect.requested_via` names the pin channel (`VCT_CONTAINER_RUNTIME` /",
+    "`state/install/runtime.txt`, the labels of RuntimePinSource). The module plane is",
     "two-state over its Err: a probe that times out collapses into the same refusal",
     "arm as a dead daemon (`probe_timeout_is_unknown_not_absent` stays unknown ONLY",
     "on the Python side)."
@@ -43,6 +51,7 @@
         "compose_form": null,
         "installed": null,
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -73,6 +82,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -106,6 +116,7 @@
         "compose_form": "standalone",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -141,6 +152,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -178,6 +190,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -215,6 +228,7 @@
         "compose_form": "subcommand",
         "installed": "docker",
         "requested": "docker",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
         "substituted": false
       },
       "expect_rust": {
@@ -252,6 +266,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -285,6 +300,7 @@
         "compose_form": "subcommand",
         "installed": "docker",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -320,6 +336,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -356,6 +373,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -387,6 +405,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -415,6 +434,7 @@
         "compose_form": null,
         "installed": "docker",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -441,6 +461,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -473,6 +494,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
         "substituted": false
       },
       "expect_rust": null,
@@ -485,8 +507,8 @@
       }
     },
     {
-      "name": "runtime_txt_pin_usable_resolves_it_on_the_module_plane",
-      "_why": "install.py recorded podman in state/install/runtime.txt at install time; the module plane pins on that record (the module's named volumes live under the recorded runtime). The env-var-free surfaces (Python resolve + runtime.rs) never read the file, so they auto-detect — a deliberate, documented asymmetry: the pin channel that exists only on the module plane pins only there.",
+      "name": "runtime_txt_pin_usable_resolves_it_everywhere",
+      "_why": "install.py recorded podman in state/install/runtime.txt; with both runtimes usable every surface drives podman because the record PINS it (R7b F5).",
       "env": null,
       "runtime_txt": "podman",
       "on_path": [
@@ -512,7 +534,8 @@
         "runtime": "podman",
         "compose_form": "subcommand",
         "installed": "podman",
-        "requested": null,
+        "requested": "podman",
+        "requested_via": "state/install/runtime.txt",
         "substituted": false
       },
       "expect_rust": {
@@ -525,7 +548,7 @@
     },
     {
       "name": "runtime_txt_pin_unusable_is_refused_not_substituted",
-      "_why": "Delivery-audit v0.2.92 M1, the runtime.txt arm: install recorded podman, the podman machine is stopped after a reboot, Docker Desktop is running, no env var set. Pre-M1 the module plane fell through to docker and pulled/started the module image against docker's EMPTY copy of every named volume; the supervisor's next pass re-selected podman. The refusal names the file the pin came from and the env override that supersedes it. The env-free surfaces auto-detect docker for the INFRA stack (no pin exists for them) — recorded here so the asymmetry is a ruled fact, not an accident.",
+      "_why": "Delivery-audit v0.2.92 M1 + R7b F5: install recorded podman, the podman machine is stopped after a reboot, Docker Desktop is running, no env var set. Pre-M1 the module plane fell through to docker (docker's EMPTY volumes); until R7b F5 the hooks and the launcher's infra stack still auto-detected docker. Now EVERY surface refuses, naming the file the pin came from and the env override that supersedes it.",
       "env": null,
       "runtime_txt": "podman",
       "on_path": [
@@ -545,11 +568,53 @@
       ],
       "standalone_on_path": [],
       "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "podman",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "podman",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_docker_beats_podman_first",
+      "_why": "R7b F5's live scenario: both runtimes installed and up, no env pin, the install recorded docker (podman was down that day). Podman-first auto-detect used to bring the infra stack up under podman while storage/volumes (runtime.txt-aware) migrated the docker copies. The record is a pin everywhere now: docker on every surface.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
         "state": "resolved",
         "runtime": "docker",
         "compose_form": "subcommand",
-        "installed": "podman",
-        "requested": null,
+        "installed": "docker",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
         "substituted": false
       },
       "expect_rust": {
@@ -557,11 +622,87 @@
         "compose_form": "subcommand"
       },
       "expect_module_plane": {
-        "refused": {
-          "pinned": "podman",
-          "via": "state/install/runtime.txt",
-          "alternative_usable": true
-        }
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "env_pin_beats_runtime_txt",
+      "_why": "One precedence everywhere: the explicit env choice wins over the install's record.",
+      "env": "podman",
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "env_auto_defers_to_runtime_txt",
+      "_why": "`auto` is no preference, so the install's record still pins.",
+      "env": "auto",
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "docker",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "docker"
       }
     }
   ]

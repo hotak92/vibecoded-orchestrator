@@ -69,11 +69,9 @@ use crate::secrets::{self, SecretScope};
 
 // ─── Constants ───────────────────────────────────────────────────────────
 
-/// Sentinel project_id for shared scope (mirrors `commands::secrets_cmd`
-/// and `commands::installer`). Kept module-private; widening to a
-/// pub-crate const elsewhere would just hide the dependency on the
-/// shared-scope writer / reader contract.
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// Sentinel project_id for shared scope — the one definition in
+/// `vct_launcher_core::secrets` (R7b F15).
+use crate::secrets::SENTINEL_SHARED;
 
 /// Module identifier for the user-bucket keychain entry. Matches the
 /// SecretsPanel "Shared (this user)" tab AND `register_github_pat`'s
@@ -924,10 +922,7 @@ pub fn choose_best_local_code_default() -> String {
 async fn probe_code_embed_reachable() -> bool {
     let health_url = code_embed_health_url();
 
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_millis(CODE_EMBED_HEALTH_TIMEOUT_MS))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(&health_url, std::time::Duration::from_millis(CODE_EMBED_HEALTH_TIMEOUT_MS)) {
         Ok(c) => c,
         Err(_) => return false,
     };

@@ -86,6 +86,7 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 # (tests swap ``vco_lib.config_projection`` in ``sys.modules`` to stub the
 # --fix writer; the comparison must not be stubbed along with it).
 from vco_lib.env_projection_check import check_env_surfaces, surface_label
+from vco_lib.hub_ensure import resolve_hub_port
 from vco_lib.jsonc_edit import read_object
 
 
@@ -563,10 +564,13 @@ def _check_mcp_wrappers() -> _CheckResult:
 
 
 def _vct_hub_base_url() -> str:
-    """Resolve the hub base URL. ``$VCT_HUB_PORT`` honoured; fallback to
-    7700 (the default documented in CLAUDE.md)."""
-    port = os.environ.get("VCT_HUB_PORT", "7700").strip() or "7700"
-    return f"http://127.0.0.1:{port}"
+    """Resolve the hub base URL through the ONE client port reader,
+    :func:`vco_lib.hub_ensure.resolve_hub_port` (``$VCT_HUB_PORT`` →
+    ``hub.port`` → 7700). R7b F3: this used to read ``$VCT_HUB_PORT`` else
+    7700 and never ``hub.port`` — so once the hub moved without an env var
+    (Preferences → Modules, or a taken 7700), check 5 probed the wrong port
+    and reported a false failure."""
+    return f"http://127.0.0.1:{resolve_hub_port()}"
 
 
 def _vct_hub_token() -> Optional[str]:

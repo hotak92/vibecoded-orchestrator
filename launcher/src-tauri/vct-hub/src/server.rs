@@ -54,7 +54,11 @@ pub(crate) const HUB_PORT_KEY: &str = vct_launcher_core::services::hub_port::HUB
 /// hooks, boot units) passing it in, so the port never depends on who
 /// started it.
 fn resolve_bind_port(env_value: Option<&str>, setting: Option<&serde_json::Value>) -> u16 {
-    if let Some(port) = env_value.and_then(|v| v.trim().parse::<u16>().ok()) {
+    // The ONE hub-port value rule (`services::hub_port::parse_hub_port`, the
+    // shared table `tests/fixtures/hub_port_cases.json`): no sign (`+7822`),
+    // no `0`, no `_`, no non-ASCII numerals, no internal whitespace.
+    let parse = vct_launcher_core::services::hub_port::parse_hub_port;
+    if let Some(port) = env_value.and_then(parse) {
         return port;
     }
     let Some(value) = setting else {
@@ -62,7 +66,7 @@ fn resolve_bind_port(env_value: Option<&str>, setting: Option<&serde_json::Value
     };
     let parsed = match value {
         serde_json::Value::Number(n) => n.as_u64(),
-        serde_json::Value::String(s) => s.trim().parse::<u64>().ok(),
+        serde_json::Value::String(s) => parse(s).map(u64::from),
         _ => None,
     };
     match parsed {
@@ -632,21 +636,30 @@ fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
     ip
 }
 
+/// The ports the bind ladder tries: `base`, then up to `retries` more, never
+/// past 65535 (v0.2.97 R7b F10: `base + offset` overflowed `u16` — a panic in
+/// a debug build, a wrap to a low port in release, which the hub would then
+/// have written to `hub.port`). Pure.
+fn bind_ladder(base: u16, retries: u16) -> Vec<u16> {
+    (0..=retries).map_while(|offset| base.checked_add(offset)).collect()
+}
+
 async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::TcpListener, String> {
-    for offset in 0..=retries {
-        let addr = SocketAddr::from((base_addr.ip(), base_addr.port() + offset));
-        match tokio::net::TcpListener::bind(addr).await {
+    let ports = bind_ladder(base_addr.port(), retries);
+    let last = ports.last().copied().unwrap_or(base_addr.port());
+    let mut last_err = None;
+    for port in ports {
+        match tokio::net::TcpListener::bind(SocketAddr::from((base_addr.ip(), port))).await {
             Ok(listener) => return Ok(listener),
-            Err(_) if offset < retries => continue,
-            Err(e) => return Err(format!(
-                "Cannot bind to ports {}-{}: {}",
-                base_addr.port(),
-                base_addr.port() + retries,
-                e
-            )),
+            Err(e) => last_err = Some(e),
         }
     }
-    unreachable!()
+    Err(format!(
+        "Cannot bind to ports {}-{}: {}",
+        base_addr.port(),
+        last,
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "no port tried".into())
+    ))
 }
 
 /// Discovery file recording the hub's ACTUAL bind IP (v0.2.75 P1a).
@@ -708,6 +721,15 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
+    // ── v0.2.97 R7b F10: the bind ladder stops at 65535 ──────────────
+
+    #[test]
+    fn bind_ladder_never_steps_past_the_last_port() {
+        assert_eq!(bind_ladder(7700, 5), vec![7700, 7701, 7702, 7703, 7704, 7705]);
+        assert_eq!(bind_ladder(65534, 5), vec![65534, 65535]);
+        assert_eq!(bind_ladder(65535, 5), vec![65535]);
+    }
+
     // ── v0.2.97 review R6: the hub port setting is a real knob ───────
 
     #[test]
@@ -724,6 +746,46 @@ mod tests {
         assert_eq!(resolve_bind_port(None, Some(&number)), 8800);
         assert_eq!(resolve_bind_port(None, Some(&text)), 8801);
         assert_eq!(resolve_bind_port(Some("not-a-port"), Some(&number)), 8800);
+    }
+
+    /// R7b F9 / review round 7: the hub's own bind-port parse is the one
+    /// hub-port value rule. Runs the env rows of the shared table
+    /// `tests/fixtures/hub_port_cases.json`: a valid `VCT_HUB_PORT` is bound,
+    /// an invalid one (`+7822`, `0`, `7_700`, non-ASCII numerals, `78 11`)
+    /// falls through — for the hub to its setting, else the default (the hub
+    /// never reads `hub.port`: it WRITES it). Red when the env is parsed with
+    /// `str::parse::<u16>`, which accepts `+7822` and `0`.
+    #[test]
+    fn bind_port_env_follows_the_shared_hub_port_table() {
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/fixtures/hub_port_cases.json")).unwrap();
+        let setting = serde_json::json!(8800);
+        let mut checked = 0;
+        for case in table["cases"].as_array().unwrap() {
+            let Some(env) = case["env_port"].as_str() else { continue };
+            let name = case["name"].as_str().unwrap();
+            // The client ladder used the env pin iff its answer is not what
+            // the file alone gives (every row's env and file ports differ).
+            let from_file = case["expect_file"].as_u64().unwrap_or(u64::from(DEFAULT_PORT));
+            let expect = case["expect"].as_u64().unwrap();
+            let env_port = (expect != from_file).then_some(expect as u16);
+            assert_eq!(resolve_bind_port(Some(env), None), env_port.unwrap_or(DEFAULT_PORT), "case `{name}`");
+            assert_eq!(
+                resolve_bind_port(Some(env), Some(&setting)),
+                env_port.unwrap_or(8800),
+                "case `{name}` + setting"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "the table's env rows ran ({checked})");
+        for bad in ["+7822", "0", "7_700", "78 11"] {
+            assert_eq!(resolve_bind_port(Some(bad), None), DEFAULT_PORT, "{bad:?}");
+        }
+        // A string setting follows the same rule (and the 1024 floor).
+        for bad in ["+8800", "8_800", "88 00", "0"] {
+            assert_eq!(resolve_bind_port(None, Some(&serde_json::json!(bad))), DEFAULT_PORT, "{bad:?}");
+        }
+        assert_eq!(resolve_bind_port(None, Some(&serde_json::json!(" 8801\n"))), 8801);
     }
 
     #[test]

@@ -156,10 +156,11 @@ class CallSiteSemanticsTests(unittest.TestCase):
     def test_the_hub_port_readers_use_the_shared_one(self) -> None:
         """Three files parsed ``hub.port`` privately, whole-file.
 
-        ``access_resolver`` shares the READER; ``hub_ensure.resolve_hub_port``
-        (which ``project_config`` calls) shares the PARSER only, because it
-        must classify "unreadable" and "nonsense" into two different warnings
-        that the .sh/.ps1 siblings also emit.
+        ``access_resolver`` calls ``hub_ensure.resolve_hub_port`` (which
+        ``project_config`` calls too); since v0.2.97 R7b F9 that reader's value
+        rule is ``hub_ensure.parse_hub_port``, shared by table with every
+        non-Python reader, and it classifies "unreadable" and "nonsense" into
+        the two different warnings the .sh/.ps1 siblings also emit.
         """
         from vco_lib import access_resolver
 
@@ -167,12 +168,11 @@ class CallSiteSemanticsTests(unittest.TestCase):
             os.environ.pop("VCT_HUB_PORT", None)
             self._file("hub.port", "7801\n")
             self.assertEqual(access_resolver._hub_port(), 7801)
-            self._file("hub.port", "7801\nstray line\n")
-            self.assertEqual(
-                access_resolver._hub_port(), 7801,
-                "a trailing line must read the number, not the default",
-            )
-            for junk in ("", "junk", "0", "70000"):
+            # v0.2.97 R7b F9: hub.port left the first-line reader — every
+            # hub-port reader (Python, sh, ps1, Rust, vct) applies ONE value
+            # rule to the whole content, and a second line is internal
+            # whitespace (tests/fixtures/hub_port_cases.json).
+            for junk in ("", "junk", "0", "70000", "7801\nstray line\n", "+7801", "7_801"):
                 with self.subTest(junk=junk):
                     self._file("hub.port", junk)
                     self.assertEqual(access_resolver._hub_port(), 7700)

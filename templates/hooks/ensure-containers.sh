@@ -149,6 +149,19 @@ if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
     echo "ensure-containers: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
     exit 0
 fi
+# v0.2.97 (R7a F10): this hook and verify-container-ports both act on the
+# containers at session start, and both are `async` — they ran concurrently,
+# and the watchdog could act on the plan before this hook's reconcile had
+# corrected it. Now the "reconcile → plan → act" below runs under ONE
+# per-user lock (`vco_lib.service_lifecycle with-session-lock`, which holds
+# it on a descriptor nothing this hook spawns inherits and re-runs this
+# script as its child). Busy past 6 s (the watchdog is recovering a
+# container): nothing is done this session — never a second actor.
+if [ -z "${VCO_SESSION_LOCK_HELD:-}" ]; then
+    exec "$RUN_PY" -m vco_lib.service_lifecycle with-session-lock --wait 6 \
+        --busy "ensure-containers: verify-container-ports is recovering a container right now; left the containers to it this session (the next session re-checks them)" \
+        -- bash "${BASH_SOURCE[0]}" "$@"
+fi
 __vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
 __vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?
 case "$__vco_rt_rc" in
@@ -189,7 +202,9 @@ COMPOSE_CMD="${VCT_COMPOSE_CMD:-$VCO_COMPOSE_CMD}"
 # the reconcile's verdict (it never creates adopted containers), so running
 # it after would only act on stale rows. Its own start-by-name of a stopped
 # adopted container makes this hook's start of it a no-op.
-"$RUN_PY" -m vco_lib.service_lifecycle session-reconcile 2>/dev/null || true
+# `--if-stale 60`: the reconcile runs once per minute across both container
+# hooks and every session — whichever holds the lock first (R7a F10).
+"$RUN_PY" -m vco_lib.service_lifecycle session-reconcile --if-stale 60 2>/dev/null || true
 
 # The lifecycle plan: which containers, and what may be done to each
 # (v0.2.97 — see the header). Loud-fail like the runtime resolver above: a

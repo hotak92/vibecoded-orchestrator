@@ -209,11 +209,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any `<KEY>_old` values, and the header at the top of a `.env` VCO created,
   while that header is unedited — the current one, or the one every earlier
   version wrote ("Edit values to override defaults… Created by vco
-  <date>"). Anywhere else — outside those blocks, and in
-  the `env` blocks of `.claude/settings.json` and `.vscode/settings.json` — a
-  routing key such as `KG_COLLECTION` is removed only when it holds the value
-  VCO writes for that project. A different value is yours: it stays, and the
-  unregister result names it, as it names your `<KEY>_old` values. When VCO
+  <date>"). In `.env`, a line outside those sections is yours whatever it
+  holds: it stays, and the result names it. In `.claude/env` outside VCO's
+  block, and in the `env` blocks of `.claude/settings.json` and
+  `.vscode/settings.json`, a routing key such as `KG_COLLECTION` is removed
+  only when it holds the value VCO writes for that project. A different value
+  is yours: it stays, and the unregister result names it, as it names your `<KEY>_old` values. When VCO
   cannot work out its own values for the project, only the marked blocks go,
   and the result says so. A `# KEY=` comment line is never removed.
 
@@ -273,16 +274,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hub now checks every active module's declared health check, on this
   machine only (loopback addresses; a container's check goes to its local
   port mapping), and the module tiles show **Running**, **Down** or **Status
-  unknown**. A check that cannot run — no URL, or the hub unreachable — reads
-  unknown, never down. `VCT_HUB_MODULE_HEALTH=0` turns the checks off.
+  unknown**. A check that cannot run — no URL, a service that runs on another
+  machine, or the hub unreachable — reads unknown, never down (until the hub
+  has answered once, no status is shown). `VCT_HUB_MODULE_HEALTH=0` (or
+  `false`/`no`/`off`) turns the checks off.
+- Every launcher, hub and `vct-cli` request to this machine — the hub, the
+  model gateway, module ports, VCO's own services — now bypasses
+  `HTTP_PROXY` and follows no redirects, so the hub's token never reaches a
+  proxy. A service adopted on another machine still goes through your proxy.
+- **Preferences → Modules** shows each module's HTTP API address with its
+  live port.
 - Container modules the orchestrator starts now receive the settings their
   manifest lists in `runtime.env_from_settings`, and the secrets it lists in
   `runtime.env_from_secrets` — through the same permission checks as the
-  hub's `/env` (a paused secret is not delivered). A secret's value never
-  appears on the `podman run`/`docker run` command line; note that, as with
-  any container environment, it is visible to `podman inspect`. A missing
-  secret the manifest marks required stops the start and leaves the running
-  container alone. Before, both lists were ignored.
+  hub's `/env`. A secret paused for the whole machine is not delivered; a
+  pause for one project holds for that project's own container and its
+  `/env`, but not for a machine-wide container that serves every project,
+  which cannot enforce a per-project pause. A secret's value — and a
+  machine-wide container's hub token — never appears on the
+  `podman run`/`docker run` command line; as with any container environment,
+  it is visible to `podman inspect`. A missing secret the manifest marks
+  required, or one whose name cannot be used as an environment variable,
+  stops the start — including a restart — and leaves the running container
+  alone. Before, both lists were ignored.
+- Settings of modules installed machine-wide now reach each project's `/env`,
+  with the machine-wide value used where no per-project value is set, and the
+  settings page offers only fields something actually delivers. Modules under
+  development (`VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH`) are listed and their
+  settings save. A setting's `validation` pattern must use a portable subset
+  (no `\d`, lookaround or inline flags), and whole-number settings refuse
+  `7700.0`.
 
 ### Changed — one record of where Weaviate, Ollama and code-embed run (v0.2.97)
 
@@ -319,6 +340,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Weaviate or Ollama, with the same checks (Weaviate must come back with the
   same collections) — to a new port; for a Weaviate or Ollama you run, it
   follows the new address you gave it.
+- **Your data wins over a stranger's service.** A stopped VCO container that
+  holds your knowledge graph or models outranks a running Weaviate or Ollama
+  that someone else runs: VCO starts its own and never switches to the other
+  one. When it cannot tell which of several is yours, it asks through
+  `UPDATE_DEFERRED.md` instead of picking. A container with no record yet is
+  only ever started by name, never removed and re-created. Interrupting the
+  "use this Weaviate?" question (Ctrl-C) no longer counts as yes. A service
+  that someone else starts on VCO's own port is noticed, not trusted.
+- The session-start check looks only at the recorded services — no port
+  scans, no reading other people's Weaviate. The two container hooks no
+  longer act at the same moment, and the port check removes nothing it could
+  not re-check; it now logs every run to
+  `.claude/logs/container_port_check.jsonl`, as its documentation said it did.
+  Service checks do not follow redirects, only a successful
+  reply counts as the service answering, and addresses with a
+  `user:pass@` part are refused.
+- **Services → Move to another port** moves VCO's own Weaviate, Ollama or
+  code-embed with the same checks as the command; for a service you run
+  yourself, VCO follows your port instead. **Let VCO manage it** takes over
+  exactly the container VCO uses, and only when it carries the name VCO's
+  own setup gives it — the button appears only where that holds; otherwise
+  the command explains why and changes nothing. The Weaviate address setting
+  links to the Services page too.
 - The Services page shows where each service runs and offers these choices;
   the old "Reset adoption" button and container picker are gone. Module
   containers reach an Ollama on another machine at its real address, and
@@ -370,21 +414,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `VCT_CODE_EMBED_CACHE_SOURCE` (a folder or an existing volume) and the
   matching `…_VOLUME_NAME` knobs — so services that already store their data
   somewhere can adopt it without copying. See `docs/CONFIGURATION.md`.
-- The launcher's storage and volume commands now use the container runtime
-  you pinned with `VCT_CONTAINER_RUNTIME` (or the one the install recorded),
-  like the rest of VCO, instead of always preferring podman. If a volume
-  exists only under the other runtime, they refuse to inspect or migrate it
-  and say how to fix that, rather than acting on the wrong copy.
-- A `VCT_HUB_PORT` that is not a valid port now produces a warning, and
-  every VCO client (Python, shell and PowerShell) then uses the port the
-  running hub recorded, then 7700. Some clients used to build a broken hub
-  URL from the bad value.
-- `install.py --bootstrap --json` reports the hub's actual port instead of
-  always 7700, and the hub module's catalog entry names the running hub's
+- The container runtime is chosen by one rule everywhere — the session
+  hooks, the launcher's services and storage pages, module containers, the
+  hub, the boot wrapper: `VCT_CONTAINER_RUNTIME` if you set it, otherwise the
+  runtime the install recorded (`state/install/runtime.txt`), otherwise
+  auto-detection. A pinned runtime that is down is refused, naming where the
+  pin comes from — never swapped for the other runtime, which could start
+  containers on empty volumes. At boot, the start-up wrapper then logs why
+  and starts nothing. Before, only the pin was honoured, and only
+  in some places; the storage commands always preferred podman.
+- The storage and volume commands refuse any volume that exists only under
+  the other runtime, naming each one, rather than acting on the wrong copy.
+  The message says how to fix it: quit the launcher, set or unset
+  `VCT_CONTAINER_RUNTIME` where it starts (or edit `runtime.txt`), and
+  relaunch. The first-install wizard shows this as a step to resolve instead
+  of failing, and its pre-install check lists the same volumes the install
+  will use.
+- Every VCO client (Python, shell, PowerShell, `vct-cli`, the launcher, and
+  `vco verify-diagrams`) now finds the hub the same way, and agrees on what a
+  valid port is: 1–65535 in plain digits (a sign, `_`, other numerals or
+  spaces make it invalid). An invalid `VCT_HUB_PORT` is skipped — the
+  resolver scripts say so — and the client uses the port the running hub
+  recorded, then 7700. Some clients used to build a broken hub URL from a
+  bad value, one PowerShell script failed on it, `vco verify-diagrams`
+  never looked for the running hub's port, and the hub itself accepted
+  `+7822` or `0` for its own port. The hub itself no longer
+  overflows past port 65535 when every port it tries is taken.
+- `install.py --bootstrap --json` reports the port the running hub is on
+  instead of always 7700, and the hub module's catalog entry names the running hub's
   port too. The code-embedding module's entry named port 11438; the service
   runs on 11440.
 - The launcher finds its bundled scripts (code graph, KG sync, KG summary)
   through one shared lookup instead of two copies that could disagree.
+- On Docker, VCO never found an existing container by name: it asked with
+  a command only podman has, so every lookup answered "not found". It now
+  asks in a way both understand, and a runtime that cannot answer is treated
+  as an error, never as "not found".
+- `install.ps1 -WithMaoAgents` aborted the whole install: it passed a flag
+  `install.py` does not accept. The switch now only warns that it is no
+  longer needed (the specialist agents install unless you pass `-NoAgents`).
+- On Windows, editing a file under `docs/` never re-synced it to the project's
+  development collection: the hook called a script VCO does not ship. It now
+  syncs the same way it does on Linux and macOS.
+- The shipped `.claude/settings.json` pointed every project at a knowledge
+  note that is not shipped; it now explains the Bash-compression setting
+  inline.
 
 ### Changed — the launcher's command-line tool is now `vct-cli` (v0.2.97)
 
@@ -428,6 +502,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `[ -n "$VCT_DISABLE_HOOKS" ] ||`; every hook script already checks that
   variable itself. Existing projects are rewritten in place on their next
   update. `VCT_DISABLE_HOOKS=1` works exactly as before.
+- Every VCO hook now runs from the project root whatever directory the
+  session has moved to: hook commands start from `${CLAUDE_PROJECT_DIR}`.
+  Before, they named `.claude/hooks/…` relative to the current directory, so
+  after a `cd` or inside a worktree every VCO hook failed. Your next bundle
+  update rewrites existing projects' VCO hooks in place and leaves your own
+  hooks alone; re-enabling a hook you had turned off restores the new form.
 - Bundled agents and skills now ask for `medium` reasoning effort instead of
   `high`, following current guidance for Opus-class models, and the
   instructions tell Claude to brief ad-hoc subagents at `medium` too. Five

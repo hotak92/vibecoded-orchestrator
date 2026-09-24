@@ -134,10 +134,12 @@ pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime
 //
 //   * hardcoded podman-first PATH probing — ignoring the user's
 //     `VCT_CONTAINER_RUNTIME` choice and the install-time
-//     `state/install/runtime.txt` record that install.py + the hooks +
-//     the launcher's infra-stack path (services/runtime.rs) all honor
-//     (C-RT-1: dual-runtime hosts ended up with infra under docker and
-//     paid-module containers under podman, silently); and
+//     `state/install/runtime.txt` record (C-RT-1: dual-runtime hosts ended
+//     up with infra under docker and paid-module containers under podman,
+//     silently). NOTE: until v0.2.97 R7b F5 this comment claimed install.py,
+//     the hooks and services/runtime.rs honoured runtime.txt — they did not
+//     (only this module did, for module containers and storage/volumes).
+//     Since R7b F5 they all do, with the ONE precedence below; and
 //
 //   * probed with `--version`, which only proves the CLIENT BINARY
 //     exists — it never contacts the daemon/machine. A macOS/Windows
@@ -168,7 +170,13 @@ pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime
 //      put the data, so it is probed ALONE; unusable → refusal that
 //      names the file and the env override that can supersede it.
 //      (Only consulted when the env override is absent — the explicit
-//      env choice wins.)
+//      env choice wins.) R7b F5 (owner ruling): this is a pin on EVERY
+//      surface with this same precedence — `runtime_candidate_order` /
+//      `pinned_runtime` below are the Rust home (services/runtime.rs's
+//      `candidate_order` delegates here; the hub supervisor passes the
+//      clone root), `vco_lib.containers.runtime_pin` the Python one (the
+//      session-start hooks, install.py), and
+//      `tests/fixtures/container_runtime_parity.json` pins all three.
 //   3. No pin: daemon-aware probe of `["podman", "docker"]`
 //      (podman-first, matching install.py + services/runtime.rs
 //      policy) via `<cmd> info` — the round-trip that exercises the
@@ -284,11 +292,13 @@ async fn runtime_binary_present(cmd: &str) -> bool {
 ///   (the recorded runtime is where the install put the data); only
 ///   consulted when `env_pref` is `None`.
 ///
-/// The unpinned arm is byte-identical to `runtime.rs::candidate_order`
-/// and `vco_lib.containers.runtime_candidate_order`; the fixture
+/// This is THE Rust pin rule: `runtime.rs::candidate_order` delegates here
+/// (R7b F5), and `vco_lib.containers.runtime_pin` +
+/// `runtime_candidate_order` is the Python mirror. The fixture
 /// `tests/fixtures/container_runtime_parity.json` (read by this module's
-/// `parity_fixture_module_plane_matches_every_scenario` test) pins all
-/// three surfaces to the same answers so they cannot drift again.
+/// `parity_fixture_module_plane_matches_every_scenario` test, by runtime.rs
+/// and by the Python suite) pins all three surfaces to the same answers —
+/// the runtime.txt rows included — so they cannot drift again.
 pub fn runtime_candidate_order(
     env_pref: Option<&str>,
     runtime_txt: Option<&str>,
@@ -468,10 +478,10 @@ pub fn decide_module_runtime(
 ///
 /// `install_root`: the orchestrator clone root, used to locate
 /// `state/install/runtime.txt`. The launcher passes
-/// `find_local_repo_root().ok()`; the hub passes `None` (it has no
-/// clone-root resolver today — env override + daemon-aware probing
-/// still apply, which closes C-RT-2 fully and C-RT-1 for the
-/// env-var channel on the hub path).
+/// `find_local_repo_root().ok()`; the hub passes
+/// `orchestrator_manifest::orchestrator_install_root()` (R7b F5 — it
+/// passed `None` before, so the supervisor ignored the record). `None`
+/// means "no record": env override + daemon-aware probing only.
 ///
 /// Error message names every candidate whose binary exists but whose
 /// daemon didn't respond, so a user debugging "module container won't
@@ -573,18 +583,40 @@ pub fn wrong_runtime_owner_refusal(
         ),
         None => format!("{chosen} was auto-detected (podman is preferred when both respond)"),
     };
+    // R7b F8: the pin is read from the LAUNCHER PROCESS's environment (and
+    // the record file) when it starts; nothing inside the running launcher
+    // changes it, so "set it and retry" could not be followed — a user who
+    // exported the variable in a shell and clicked retry got this same
+    // refusal. Every remedy therefore goes through a quit and a relaunch, and
+    // names WHERE the variable must be set.
+    let record = crate::orchestrator_manifest::orchestrator_install_root()
+        .map(|root| root.join("state").join("install").join("runtime.txt").display().to_string())
+        .unwrap_or_else(|| "<VCO install>/state/install/runtime.txt".to_string());
     let repin = match pin {
-        Some(RuntimePinSource::EnvOverride) => {
-            format!("unset VCT_CONTAINER_RUNTIME or set VCT_CONTAINER_RUNTIME={owner}")
-        }
-        _ => format!("set VCT_CONTAINER_RUNTIME={owner}"),
+        Some(RuntimePinSource::EnvOverride) => format!(
+            "quit the launcher, unset VCT_CONTAINER_RUNTIME (or set \
+             VCT_CONTAINER_RUNTIME={owner}) in the environment the launcher starts from \
+             — your login session, or the shell you start it from — then relaunch it"
+        ),
+        Some(RuntimePinSource::RuntimeTxt) => format!(
+            "quit the launcher, then either write `{owner}` into {record} or set \
+             VCT_CONTAINER_RUNTIME={owner} in the environment the launcher starts from \
+             — your login session, or the shell you start it from — then relaunch it"
+        ),
+        None => format!(
+            "quit the launcher, set VCT_CONTAINER_RUNTIME={owner} in the environment \
+             the launcher starts from — your login session, or the shell you start it \
+             from — then relaunch it"
+        ),
     };
     format!(
         "refusing to {action} {object}: it exists only under {owner}, but {why}. \
          podman and docker keep SEPARATE volumes and containers, so doing this with \
-         {chosen} would act on a copy that does not hold your data. To fix: {repin} \
-         and retry, so it runs under {owner}, which owns the data — or, to stay on \
-         {chosen}, first move the data from {owner} into {chosen} yourself."
+         {chosen} would act on a copy that does not hold your data. To fix: {repin}, \
+         so it runs under {owner}, which owns the data (a running launcher keeps the \
+         environment it was started with, so setting the variable elsewhere and \
+         retrying changes nothing) — or, to stay on {chosen}, first move the data \
+         from {owner} into {chosen} yourself."
     )
 }
 
@@ -1019,6 +1051,23 @@ pub const RESERVED_SPAWN_ENV: &[&str] = &[
     "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP",
 ];
 
+/// Env names VCO itself gives a global module container: its per-spawn
+/// identity token and where the hub is (`vct_hub::module_supervisor`). A
+/// module's secret or setting may not take one of these names.
+pub const MODULE_IDENTITY_ENV: &[&str] = &["VCT_MODULE_TOKEN", "VCT_HUB_BASE_URL"];
+
+/// True when a module secret may not be injected under `name`: the runtime
+/// process's own env ([`RESERVED_SPAWN_ENV`]) or the identity VCO gives a
+/// container ([`MODULE_IDENTITY_ENV`]); case-insensitive (Windows env names
+/// are). `crate::module_secrets_env` refuses the start when such a secret is
+/// `required` (R7b F18).
+pub fn is_reserved_spawn_env(name: &str) -> bool {
+    RESERVED_SPAWN_ENV
+        .iter()
+        .chain(MODULE_IDENTITY_ENV)
+        .any(|r| r.eq_ignore_ascii_case(name))
+}
+
 /// What a container spawn runs: the `podman run` argv and the SECRET values
 /// that must reach the container without appearing in it (v0.2.97, lane V
 /// round 2). Each secret is named in `args` as a bare `-e KEY` — the runtime
@@ -1276,15 +1325,12 @@ pub fn build_podman_run_args_global(
     engine: &str,
     gpu_mode: Option<GpuMode>,
     // v0.2.61 (Option H): caller-injected `-e KEY=VALUE` pairs appended
-    // after the manifest's own env. The hub uses this to inject the
-    // per-spawn module-identity token (`VCT_MODULE_TOKEN`) it minted +
-    // registered in its in-memory set — the credential the global
-    // container presents to the hub's `/modules/{id}/projects/{pid}/rl/events`
-    // route. Kept as a caller param (not resolved inside this pure
-    // builder) so the secret never lives in core logic and only the
-    // spawn site — which has the hub's in-memory state — controls it.
-    // SECURITY: values here may be secrets (e.g. the Option-H
-    // `VCT_MODULE_TOKEN`). DO NOT log the returned argv — it contains the
+    // after the manifest's own env — the listed settings and the hub's
+    // `VCT_HUB_BASE_URL`. (Until v0.2.97 R7b F19 the per-spawn module token
+    // `VCT_MODULE_TOKEN` came through here too, on the argv; the hub now
+    // passes it by name through [`spawn_args_global`]'s secret env.)
+    // SECURITY: never put a secret here — a value in these pairs is in the
+    // argv. DO NOT log the returned argv — it contains the
     // `-e KEY=VALUE` pairs verbatim. The current sole caller
     // (`start_global_container_supervisor`) logs only container_name + the
     // run's stderr on failure, never the argv, so the token cannot leak. If
@@ -4138,17 +4184,39 @@ mod tests {
             "refusing to migrate volume `weaviate_data`",
             "exists only under podman",
             "VCT_CONTAINER_RUNTIME=docker pins VCO to docker",
-            "unset VCT_CONTAINER_RUNTIME or set VCT_CONTAINER_RUNTIME=podman",
+            "unset VCT_CONTAINER_RUNTIME (or set VCT_CONTAINER_RUNTIME=podman)",
             "first move the data from podman into docker",
         ] {
             assert!(env.contains(needle), "{needle:?} missing from {env:?}");
         }
+        // R7b F8: every remedy is one the user can follow — the pin is read
+        // when the launcher STARTS, so each one goes through quit + relaunch
+        // and says where the variable must be set; "set it and retry" is gone.
         let recorded =
             check_runtime_owns("inspect", "x", "podman", Some(RuntimePinSource::RuntimeTxt), false, true)
                 .unwrap_err();
-        assert!(recorded.contains("state/install/runtime.txt"), "{recorded}");
-        assert!(recorded.contains("set VCT_CONTAINER_RUNTIME=docker"), "{recorded}");
         let auto = check_runtime_owns("inspect", "x", "podman", None, false, true).unwrap_err();
+        for refusal in [&env, &recorded, &auto] {
+            for needle in [
+                "quit the launcher",
+                "in the environment the launcher starts from",
+                "then relaunch it",
+            ] {
+                assert!(refusal.contains(needle), "{needle:?} missing from {refusal:?}");
+            }
+            assert!(!refusal.contains("and retry,"), "an unfollowable remedy: {refusal}");
+        }
+        // The record case names the FILE to edit, as an absolute path.
+        let record_file = crate::orchestrator_manifest::orchestrator_install_root()
+            .expect("tests run from inside the clone")
+            .join("state")
+            .join("install")
+            .join("runtime.txt");
+        assert!(
+            recorded.contains(&format!("write `docker` into {}", record_file.display())),
+            "{recorded}"
+        );
+        assert!(recorded.contains("set VCT_CONTAINER_RUNTIME=docker"), "{recorded}");
         assert!(auto.contains("auto-detected"), "{auto}");
 
         assert!(check_runtime_owns("migrate", "x", "docker", None, true, true).is_ok());

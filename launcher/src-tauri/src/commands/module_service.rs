@@ -305,6 +305,34 @@ pub async fn start_container_for_module_with_gpu_mode(
     // (`container_runtime::spawn_args_for_project`).
     db: &Db,
 ) -> Result<String, String> {
+    let podman = detect_container_runtime().await?;
+    let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    launch_prepared_start(manifest, ctx, project, rl_port, prepared, &SystemContainerCli).await
+}
+
+/// A per-project start that passed every check that can refuse it: the
+/// container name, the image, and the run argv with the module's listed
+/// settings and secrets resolved. Built BEFORE anything is stopped or
+/// removed, so a refused start leaves the running container alone.
+pub(crate) struct PreparedStart {
+    podman: String,
+    container_name: String,
+    image: String,
+    spawn: vct_launcher_core::services::container_runtime::SpawnArgs,
+}
+
+/// Everything in a per-project start that can refuse it, with no container
+/// touched. `Err`: not a container/service module, a name/image that does not
+/// resolve, or a required secret that does not (`spawn_args_for_project`).
+pub(crate) fn prepare_container_start(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    podman: String,
+    db: &Db,
+) -> Result<PreparedStart, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -328,8 +356,6 @@ pub async fn start_container_for_module_with_gpu_mode(
     // bearing manifests get the right `-cuda` / `-rocm` / `-cpu` suffix.
     let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
-    let podman = detect_container_runtime().await?;
-
     // v0.2.97 (lane V): the run argv with the module's listed settings
     // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
     // in this spawn's env, below). Built before the pre-pull and the `rm -f`
@@ -338,6 +364,52 @@ pub async fn start_container_for_module_with_gpu_mode(
     let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
+    Ok(PreparedStart { podman, container_name, image, spawn })
+}
+
+/// The container CLI's fire-and-forget subcommands (`stop`, `rm`) — output
+/// discarded, exit status ignored (both are idempotent cleanups). A trait so a
+/// test can record them without a container runtime on the machine.
+pub(crate) trait ContainerCli: Sync {
+    fn run_quiet<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [&'a str],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+/// The real [`ContainerCli`]: the runtime binary, output discarded.
+pub(crate) struct SystemContainerCli;
+
+impl ContainerCli for SystemContainerCli {
+    fn run_quiet<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [&'a str],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = Command::new(program)
+                .silent()
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        })
+    }
+}
+
+/// Run a [`PreparedStart`]: pre-pull, `rm -f` any same-named container,
+/// create the volume dirs, `podman run`. Returns the container name.
+async fn launch_prepared_start(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    prepared: PreparedStart,
+    cli: &dyn ContainerCli,
+) -> Result<String, String> {
+    let PreparedStart { podman, container_name, image, spawn } = prepared;
 
     // v0.2.47: pre-pull the variant-correct image with auth context
     // attached, so a cache-evicted host doesn't fall through to
@@ -367,12 +439,7 @@ pub async fn start_container_for_module_with_gpu_mode(
     }
 
     // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman).silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    cli.run_quiet(&podman, &["rm", "-f", &container_name]).await;
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
@@ -1181,22 +1248,36 @@ fn allocate_random_rl_port() -> u16 {
 /// available (no podman / docker on PATH).
 pub async fn stop_container_for_project(container_name: &str) -> Result<(), String> {
     let podman = detect_container_runtime().await?;
-
-    let _ = Command::new(&podman).silent()
-        .args(["stop", "-t", "10", container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let _ = Command::new(&podman).silent()
-        .args(["rm", container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
+    stop_container_with(&SystemContainerCli, &podman, container_name).await;
     Ok(())
+}
+
+/// `stop -t 10` then `rm` through `cli` (both idempotent; failures ignored).
+async fn stop_container_with(cli: &dyn ContainerCli, podman: &str, container_name: &str) {
+    cli.run_quiet(podman, &["stop", "-t", "10", container_name]).await;
+    cli.run_quiet(podman, &["rm", container_name]).await;
+}
+
+/// Restart one project's container: resolve EVERYTHING that can refuse the
+/// start first ([`prepare_container_start`] — a required secret that is
+/// paused or unset refuses here), and only then stop + remove the running
+/// container and start the new one. R7b F1: the restart used to stop first,
+/// so a refused start left the module stopped.
+#[allow(clippy::too_many_arguments)]
+async fn restart_container_with(
+    cli: &dyn ContainerCli,
+    podman: String,
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    container_name: &str,
+    rl_port: u16,
+    gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    db: &Db,
+) -> Result<String, String> {
+    let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    stop_container_with(cli, &prepared.podman, container_name).await;
+    launch_prepared_start(manifest, ctx, project, rl_port, prepared, cli).await
 }
 
 /// Is a container with this name currently running? Returns Ok(false)
@@ -1298,9 +1379,20 @@ pub async fn restart_rl_container(
 
     let rl_port = ensure_project_rl_port(&db, &project)?;
 
-    stop_container_for_project(&container_name).await?;
+    let podman = detect_container_runtime().await?;
     let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
-    let _ = start_container_for_module(&manifest, &ctx, &project, rl_port, &db).await?;
+    restart_container_with(
+        &SystemContainerCli,
+        podman,
+        &manifest,
+        &ctx,
+        &project,
+        &container_name,
+        rl_port,
+        read_persisted_gpu_mode(),
+        &db,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1356,10 +1448,7 @@ fn hub_token_for_proxy() -> Result<String, String> {
 async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bool, String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(5))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/status",
         port, project_id, module_id
@@ -1390,10 +1479,7 @@ async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bo
 async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(30))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/stop",
         port, project_id, module_id
@@ -1433,10 +1519,7 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     // loaded machine without making a genuinely-down hub hang the caller.
     const ATTEMPTS: u32 = 10;
     const DELAY_MS: u64 = 300;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(2))?;
     // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
     // is restarting (update flow / crash-restart) it may bind a different port
     // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
@@ -1476,13 +1559,10 @@ async fn wait_for_hub_ready() -> Result<(), String> {
 async fn hub_proxy_global_module_start(module_id: &str) -> Result<String, String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        // Generous timeout: the hub-side start does an (optionally authed)
-        // image pre-pull + `podman run` before responding, matching the
-        // 60s ceiling the old launcher-side direct spawn used.
-        .timeout(Duration::from_secs(90))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    // Generous timeout: the hub-side start does an (optionally authed)
+    // image pre-pull + `podman run` before responding, matching the
+    // 60s ceiling the old launcher-side direct spawn used.
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(90))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/modules/{}/start",
         port, module_id
@@ -1754,10 +1834,7 @@ pub async fn signal_rotate_weights(
     project_id: &str,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/rotate_weights", rl_port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(15))?;
 
     let resp = client
         .post(&url)
@@ -2021,10 +2098,7 @@ async fn run_finetune_then_rotate_async(
     let finetune_url = format!("http://127.0.0.1:{}/finetune", rl_port);
     let status_url = format!("http://127.0.0.1:{}/finetune_status", rl_port);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("build http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(30))?;
 
     let project = db
         .get_project(&project_id)?
@@ -2478,10 +2552,7 @@ pub async fn get_rl_dashboard_state(
 /// failure. 2s timeout matches the existing per-call timeouts in this
 /// file (see `signal_rotate_weights`, `apply_weights_update`, etc.).
 async fn probe_state_summary(port: u16) -> (Option<u32>, Option<bool>) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => return (None, None),
     };
@@ -3703,6 +3774,61 @@ mod tests {
             db: None,
             kg_collections: None,
         }
+    }
+
+    // ─── restart ordering (R7b F1) ────────────────────────────────────
+
+    /// Records every container-CLI call instead of running it.
+    #[derive(Default)]
+    struct RecordingCli(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl ContainerCli for RecordingCli {
+        fn run_quiet<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [&'a str],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            let mut call = vec![program.to_string()];
+            call.extend(args.iter().map(|a| a.to_string()));
+            self.0.lock().unwrap().push(call);
+            Box::pin(async {})
+        }
+    }
+
+    /// A restart whose start is refused — a REQUIRED listed secret that is
+    /// not set — issues neither `stop` nor `rm`: the running container is
+    /// left alone, and the error names the secret.
+    #[tokio::test]
+    async fn a_refused_restart_stops_and_removes_nothing() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let mut manifest = make_manifest(true, true);
+        manifest.secrets = serde_json::from_value(serde_json::json!([
+            { "key": "RL_API_TOKEN", "scope": "per-project" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_secrets = vec!["RL_API_TOKEN".into()];
+        let project = make_project();
+        let db = Db::open_in_memory().unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let cli = RecordingCli::default();
+
+        let err = restart_container_with(
+            &cli,
+            "podman".into(),
+            &manifest,
+            &ctx,
+            &project,
+            "vct-rl-reranker-acme-corp",
+            11533,
+            None,
+            &db,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("RL_API_TOKEN"), "{err}");
+        assert!(cli.0.lock().unwrap().is_empty(), "calls: {:?}", cli.0.lock().unwrap());
     }
 
     // ─── resolve_container_name ──────────────────────────────────────

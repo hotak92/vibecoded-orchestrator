@@ -139,8 +139,7 @@ fn project_folder(db: &Db, project_id: &str) -> Result<PathBuf, HookEnforceError
 }
 
 fn orchestrator_root() -> Result<PathBuf, HookEnforceError> {
-    vct_launcher_core::orchestrator_manifest::find_orchestrator_manifest()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
         .ok_or_else(|| {
             refuse(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -497,7 +496,14 @@ mod tests {
             .await
             .expect("enable must succeed");
 
-        assert_eq!(f.raw(), before, "re-enable restores the exact original bytes");
+        // Byte-for-byte, except the deliberate v0.2.97 change: a VCO-shipped
+        // hook parked in the RELATIVE form comes back anchored at the project
+        // root (`vco_lib.hooks_settings.insert_hook`).
+        assert_eq!(
+            f.raw(),
+            before.replace(r#""bash .claude/hooks/notify-stop.sh""#, r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#),
+            "re-enable restores the original bytes, the hook path anchored"
+        );
         assert_eq!(
             f.db
                 .get_parked_project_hook_entry(&f.pid, "Stop", "", "bash .claude/hooks/notify-stop.sh")

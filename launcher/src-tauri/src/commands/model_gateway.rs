@@ -722,9 +722,9 @@ pub struct ModelGatewayStatus {
 // ─── Health probe ─────────────────────────────────────────────────────────
 
 async fn probe_health(port: u16) -> (Option<bool>, Option<GatewayHealth>, Option<String>) {
-    let client = match reqwest::Client::builder().timeout(HEALTH_TIMEOUT).build() {
+    let client = match vct_launcher_core::services::loopback_http::client(HEALTH_TIMEOUT) {
         Ok(c) => c,
-        Err(e) => return (None, None, Some(format!("http client: {}", e))),
+        Err(e) => return (None, None, Some(e)),
     };
     let url = format!("{}/health", base_url(port));
     match client.get(&url).send().await {

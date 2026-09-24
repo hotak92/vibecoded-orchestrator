@@ -309,21 +309,42 @@ function Emit-Warning {
 # The port `$Value` names as an [int], or $null when it is not an integer in
 # 1..65535. Never throws.
 function ConvertTo-HubPort {
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # `\d` is NOT used: .NET matches every Unicode numeral with it, and the
+    # `[long]` cast of such a value then THREW under `$ErrorActionPreference =
+    # 'Stop'` — this function must never throw. `-cmatch` + `\z` pin an
+    # ASCII-only, whole-string match (`$` would also accept a trailing LF).
     param([string]$Value)
     if ($null -eq $Value) { return $null }
-    $v = $Value.Trim()
-    if ($v -match '^\d{1,10}$') {
-        $n = [long]$v
-        if ($n -ge 1 -and $n -le 65535) { return [int]$n }
+    $v = $Value.Trim([char[]]@([char]32, [char]9, [char]10, [char]11, [char]12, [char]13))
+    if ($v -cmatch '\A[0-9]{1,5}\z') {
+        $n = [int]::Parse($v, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($n -ge 1 -and $n -le 65535) { return $n }
     }
     return $null
+}
+
+# A hub-PORT warning, through the same rate-limited emitter. R7b F25(c): the
+# default Emit-Warning line ends "Falling back to env.", which is true for a
+# config-resolution failure and FALSE here — a bad port falls back to
+# hub.port / 7700 (the detail says which) and resolution carries on against
+# the hub. MUST MATCH `_emit_port_warning` in vct_project_config.sh.
+function Emit-PortWarning {
+    param(
+        [Parameter(Mandatory = $true)][string]$ErrorKind,
+        [string]$Detail = ""
+    )
+    Emit-Warning -ErrorKind $ErrorKind -Detail $Detail `
+        -StderrLine "[vct] project_config: ${ErrorKind}: ${Detail}. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
 }
 
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
         $fromEnv = ConvertTo-HubPort $Env:VCT_HUB_PORT
         if ($null -ne $fromEnv) { return $fromEnv }
-        Emit-Warning -ErrorKind "hub_port_invalid" `
+        Emit-PortWarning -ErrorKind "hub_port_invalid" `
             -Detail "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700"
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
@@ -331,16 +352,20 @@ function Get-HubPort {
     if (Test-Path $portFile) {
         $raw = $null
         try {
-            $raw = (Get-Content -Raw -Path $portFile -ErrorAction Stop).Trim()
+            # The WHOLE content, untrimmed here: `ConvertTo-HubPort` trims the
+            # ends only, so `78 11` / a second line stays invalid. An empty
+            # file reads as $null — that is "no port", not "unreadable".
+            $raw = Get-Content -Raw -Path $portFile -ErrorAction Stop
         } catch {
-            Emit-Warning -ErrorKind "hub_port_unreadable" `
+            Emit-PortWarning -ErrorKind "hub_port_unreadable" `
                 -Detail "hub.port is not readable; using default 7700"
             return 7700
         }
+        if ($null -eq $raw) { $raw = "" }
         $fromFile = ConvertTo-HubPort $raw
         if ($null -ne $fromFile) { return $fromFile }
-        if ($raw.Length -gt 0) {
-            Emit-Warning -ErrorKind "hub_port_invalid" `
+        if ($raw.Trim().Length -gt 0) {
+            Emit-PortWarning -ErrorKind "hub_port_invalid" `
                 -Detail "hub.port does not hold a port (1-65535); using default 7700"
         }
         # empty (whitespace-only / truncated write) → silent default.

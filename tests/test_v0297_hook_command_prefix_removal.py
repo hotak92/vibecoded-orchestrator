@@ -252,7 +252,9 @@ class ReenabledParkedEntryTests(unittest.TestCase):
     def test_reenable_restores_parked_bytes_and_next_update_heals(self) -> None:
         template = _load_template()
         old_form = OLD_GUARD + "bash .claude/hooks/notify-stop.sh"
-        new_form = "bash .claude/hooks/notify-stop.sh"
+        # The CURRENT template form — anchored at the project root since
+        # v0.2.97 (a relative path failed once the session's cwd moved).
+        new_form = 'bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh"'
 
         # 1. A pre-v0.2.97 install disables the hook from the launcher: the
         #    entry is REMOVED from settings.json and parked in launcher.db

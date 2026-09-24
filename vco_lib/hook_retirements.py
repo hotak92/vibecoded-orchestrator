@@ -83,7 +83,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from vco_lib.hooks_settings import invoked_script_tokens
+from vco_lib.hooks_settings import anchor_hook_command, invoked_script_tokens
 
 #: Matcher kinds. See the module docstring for what each one is safe for.
 KIND_HOOK_SCRIPT = "hook_script"
@@ -124,6 +124,23 @@ def normalize_command(command: str) -> str:
         return ""
     collapsed = " ".join(command.split())
     return _DISABLE_GUARD_RE.sub("", collapsed).strip()
+
+
+def hook_command_key(command: str) -> str:
+    """The key under which two spellings of ONE hook registration compare
+    equal: :func:`normalize_command` of the command with its project hook
+    scripts anchored (:func:`vco_lib.hooks_settings.anchor_hook_command`).
+
+    v0.2.97: the relative ``bash .claude/hooks/x.sh`` a pre-v0.2.97 install
+    (or a launcher-parked entry, or the launcher DB's mirror row) still holds
+    and the ``bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`` a bundle update
+    now writes are the same hook; so are the guard-prefixed and bare forms.
+    Narrower than ``parked_hooks.same_hook_command`` (script basename): it is
+    what the hooks editor matches a named entry by, and what the launcher's
+    Hooks tab keys rows by, so it must not merge two DIFFERENT commands that
+    happen to run the same script.
+    """
+    return normalize_command(anchor_hook_command(command))
 
 
 @dataclass(frozen=True)
@@ -638,6 +655,7 @@ __all__ = [
     "RetiredRegistration",
     "build_parser",
     "emit_removal_audit_rows",
+    "hook_command_key",
     "main",
     "match_retired_registration",
     "normalize_command",

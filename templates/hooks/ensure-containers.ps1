@@ -136,6 +136,15 @@ if (-not $RunPy) {
     Write-Output "ensure-containers: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
     exit 0
 }
+# v0.2.97 (R7a F10, parity with the .sh sibling — the rationale is there):
+# "reconcile -> plan -> act" runs under the per-user session lock shared with
+# verify-container-ports. Busy past 6 s: nothing is done this session.
+. (Join-Path $LibDir "session-lock.ps1")
+$VcoSessionLock = Enter-VcoSessionLock -RunPy $RunPy -WaitSeconds 6
+if (-not $VcoSessionLock.Held) {
+    Write-Output "ensure-containers: verify-container-ports is recovering a container right now; left the containers to it this session (the next session re-checks them)"
+    exit 0
+}
 $VcoRt = $null
 $VcoRtRc = $null
 # Capture the resolver's stderr instead of discarding it (v0.2.92 MAJOR-6):
@@ -179,7 +188,8 @@ $ComposeCmd = if ($env:VCT_COMPOSE_CMD) { $env:VCT_COMPOSE_CMD } elseif ($VcoRt.
 # soft-failing to one stdout line. The emit site of
 # `service_endpoint_unreachable`; it corrects the rows the plan below reads.
 try {
-    & $RunPy -m vco_lib.service_lifecycle session-reconcile 2>$null | ForEach-Object { Write-Output $_ }
+    # `--if-stale 60`: once per minute across both container hooks (R7a F10).
+    & $RunPy -m vco_lib.service_lifecycle session-reconcile --if-stale 60 2>$null | ForEach-Object { Write-Output $_ }
 } catch { }
 
 # The lifecycle plan: which containers, and what may be done to each

@@ -114,9 +114,31 @@ describe('row actions', () => {
     ]);
   });
 
-  it('an adopted container gets lifecycle by name and the opt-in "Let VCO manage it"', () => {
-    const s = state('ollama', row('ollama', 'adopted_container', { container_name: 'legacy_ollama' }));
-    expect(serviceActions(s)).toEqual(['start', 'stop', 'restart', 'change', 'hand_to_vco']);
+  it('an adopted container gets lifecycle by name; "Let VCO manage it" only where the snapshot offers it', () => {
+    // Offered (Rust `hand_to_vco_offered`: VCO's compose name).
+    const offered = state('ollama', row('ollama', 'adopted_container', { container_name: 'vco_ollama' }), {
+      hand_to_vco_offered: true,
+    });
+    expect(serviceActions(offered)).toEqual(['start', 'stop', 'restart', 'change', 'hand_to_vco']);
+    // Not offered: a container under another name (the verb would refuse it).
+    const foreign = state('ollama', row('ollama', 'adopted_container', { container_name: 'legacy_ollama' }), {
+      hand_to_vco_offered: false,
+    });
+    expect(serviceActions(foreign)).toEqual(['start', 'stop', 'restart', 'change']);
+    // An older snapshot without the field offers nothing.
+    const legacy = state('ollama', row('ollama', 'adopted_container', { container_name: 'vco_ollama' }));
+    expect(serviceActions(legacy)).not.toContain('hand_to_vco');
+  });
+
+  it('the page never re-derives the hand-over rule from the row', () => {
+    // A row that LOOKS admissible is not offered unless the server says so,
+    // and the server's word is followed — the rule lives in Rust only.
+    const s = state('weaviate', row('weaviate', 'adopted_container', { container_name: 'vco_weaviate' }), {
+      hand_to_vco_offered: false,
+    });
+    expect(serviceActions(s)).not.toContain('hand_to_vco');
+    const url = state('weaviate', row('weaviate', 'adopted_external'), { hand_to_vco_offered: true });
+    expect(serviceActions(url)).toContain('hand_to_vco');
   });
 
   it('an adopted URL has no lifecycle — only Change…', () => {
@@ -300,10 +322,33 @@ describe('from the detector’s reply to the dialog', () => {
 describe('the service list is the shared parity table’s', () => {
   // The Rust/Python resolvers both execute tests/fixtures/service_endpoint_parity.json;
   // the frontend's service list is pinned to the same data.
+  const table = JSON.parse(
+    readFileSync(fileURLToPath(new URL('../../../../tests/fixtures/service_endpoint_parity.json', import.meta.url)), 'utf8'),
+  );
+
   it('CORE_SERVICES matches the parity table', () => {
-    const table = JSON.parse(
-      readFileSync(fileURLToPath(new URL('../../../../tests/fixtures/service_endpoint_parity.json', import.meta.url)), 'utf8'),
-    );
     expect([...CORE_SERVICES].sort()).toEqual(Object.keys(table.constants.default_ports).sort());
+  });
+
+  // O-A3 (v0.2.97 review round 7): rowUrl claims "the same render as the
+  // Rust/Python mirror" — so it runs the SAME render_cases the Rust and
+  // Python resolvers execute. Two inline cases cannot see a divergence that
+  // would show on the Services page and be caught by nothing.
+  it('rowUrl renders every parity render_case the way the mirror does', () => {
+    for (const c of table.render_cases as Array<Record<string, unknown>>) {
+      const spec = c.row as Record<string, unknown>;
+      const r = row(
+        c.service as string,
+        spec.mode as EndpointMode,
+        {
+          scheme: (spec.scheme as string) ?? 'http',
+          host: (spec.host as string) ?? 'localhost',
+          port: spec.port as number,
+          grpc_port: (spec.grpc_port as number | undefined) ?? null,
+          container_name: (spec.container_name as string | undefined) ?? null,
+        },
+      );
+      expect(rowUrl(r), `case "${c.name}"`).toBe(c.expect_url as string);
+    }
   });
 });

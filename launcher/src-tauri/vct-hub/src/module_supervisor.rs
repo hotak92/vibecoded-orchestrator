@@ -94,15 +94,21 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 
 /// Detect which container runtime to use. v0.2.54 (C-RT-1/C-RT-2):
 /// thin wrapper over the promoted daemon-aware detector in
-/// `vct-launcher-core::services::container_runtime`. Honors
-/// `VCT_CONTAINER_RUNTIME` and probes daemon liveness via `<cmd> info`
-/// (the pre-v0.2.54 local copy probed `--version` only and could pick
-/// a dead podman over a live docker). The hub has no orchestrator-
-/// clone-root resolver, so `install_root=None` — the
-/// `state/install/runtime.txt` channel is launcher-side only; env
-/// override + daemon-aware probing still apply here.
+/// `vct-launcher-core::services::container_runtime`. Honors the pin —
+/// `VCT_CONTAINER_RUNTIME`, else the install's `state/install/runtime.txt`
+/// — and probes daemon liveness via `<cmd> info` (the pre-v0.2.54 local
+/// copy probed `--version` only and could pick a dead podman over a live
+/// docker). R7b F5: this passed `install_root = None`, so the hub
+/// supervisor ignored runtime.txt and could restart a module container
+/// under podman that the launcher had installed under the recorded docker;
+/// it now reads the clone root through the core resolver
+/// (`orchestrator_manifest::orchestrator_install_root`).
 async fn detect_container_runtime() -> Result<String, String> {
-    vct_launcher_core::services::container_runtime::detect_container_runtime(None).await
+    let install_root = vct_launcher_core::orchestrator_manifest::orchestrator_install_root();
+    vct_launcher_core::services::container_runtime::detect_container_runtime(
+        install_root.as_deref(),
+    )
+    .await
 }
 
 // v0.2.47: `sanitize_path_component` + `container_weights_path` moved
@@ -1053,10 +1059,15 @@ fn resolve_global_spawn_env(manifest: &ModuleManifest, db: &Db) -> Result<Global
 }
 
 /// The global spawn's argv + secret env: the listed settings as
-/// `-e KEY=VALUE`, THEN the Option-H identity pair (last of the valued env, so
-/// a setting that shares its name can never shadow it — a later `-e` wins),
-/// then each secret as a bare `-e KEY` with its value only in the returned
-/// [`SpawnArgs`]. SECURITY: the argv holds `VCT_MODULE_TOKEN` — never log it.
+/// `-e KEY=VALUE` (a setting named like the module identity —
+/// [`MODULE_IDENTITY_ENV`] — is dropped with a warning, so it can never shadow
+/// it), then `VCT_HUB_BASE_URL=…`, then the per-spawn module token as a BARE
+/// `-e VCT_MODULE_TOKEN`, then each secret the same way. The token and the
+/// secret values live only in the returned [`SpawnArgs`] — the environment of
+/// the runtime process, never its argv (R7b F19: the token used to be on argv,
+/// visible in `ps`).
+///
+/// [`MODULE_IDENTITY_ENV`]: vct_launcher_core::services::container_runtime::MODULE_IDENTITY_ENV
 #[allow(clippy::too_many_arguments)]
 fn global_spawn_args(
     manifest: &ModuleManifest,
@@ -1069,12 +1080,25 @@ fn global_spawn_args(
     module_token: String,
     hub_port: u16,
 ) -> Result<vct_launcher_core::services::container_runtime::SpawnArgs, String> {
-    let mut valued = env.settings;
-    valued.push(("VCT_MODULE_TOKEN".to_string(), module_token));
+    use vct_launcher_core::services::container_runtime::MODULE_IDENTITY_ENV;
+    let is_identity = |k: &str| MODULE_IDENTITY_ENV.iter().any(|i| i.eq_ignore_ascii_case(k));
+    let mut valued: Vec<(String, String)> = env
+        .settings
+        .into_iter()
+        .filter(|(k, _)| {
+            if is_identity(k) {
+                tracing::warn!(module_id = %manifest.id, key = %k,
+                    "[module_supervisor] a module setting may not be named like the module identity; not injected");
+            }
+            !is_identity(k)
+        })
+        .collect();
     valued.push((
         "VCT_HUB_BASE_URL".to_string(),
         format!("http://host.containers.internal:{}", hub_port),
     ));
+    let mut inherited = vec![("VCT_MODULE_TOKEN".to_string(), module_token)];
+    inherited.extend(env.secrets);
     vct_launcher_core::services::container_runtime::spawn_args_global(
         manifest,
         ctx,
@@ -1084,7 +1108,7 @@ fn global_spawn_args(
         engine,
         gpu_mode,
         &valued,
-        env.secrets,
+        inherited,
     )
 }
 
@@ -1729,11 +1753,11 @@ mod tests {
     }
 
     /// v0.2.97 (lane V): a GLOBAL spawn carries the module's listed
-    /// settings (the machine-wide row, else the default), then the identity
-    /// pair — last of the valued env, so a same-named setting cannot shadow
-    /// the token — then each listed secret as a bare `-e KEY` (value only in
-    /// the spawn env, resolved as REQUESTER_ANY). A required secret that does
-    /// not resolve refuses the start before anything is spawned.
+    /// settings (the machine-wide row, else the default; a setting named
+    /// like the identity is dropped), then `VCT_HUB_BASE_URL`, then the
+    /// module token and each listed secret as a bare `-e KEY` (values only in
+    /// the spawn env; secrets resolved as REQUESTER_ANY). A required secret
+    /// that does not resolve refuses the start before anything is spawned.
     #[test]
     fn global_spawn_carries_settings_then_identity_then_secrets_by_name() {
         let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
@@ -1772,8 +1796,9 @@ mod tests {
         .unwrap();
         let env = resolve_global_spawn_env(&manifest, &db).expect("resolves");
         let ctx = PlaceholderCtx::new(&manifest.id);
+        let token = "tok-9f3c1e";
         let spawn = global_spawn_args(
-            &manifest, &ctx, "c", "img:tag", "podman", None, env, "tok".into(), 7711,
+            &manifest, &ctx, "c", "img:tag", "podman", None, env, token.into(), 7711,
         )
         .unwrap();
         let image_at = spawn.args.iter().position(|a| a == "img:tag").unwrap();
@@ -1783,17 +1808,22 @@ mod tests {
             .map(|w| w[1].as_str())
             .collect();
         let n = env_flags.len();
+        // R7b F19: the token is passed BY NAME like a secret — its value is
+        // only in the runtime process's env — and a setting named like it is
+        // dropped rather than relying on "a later -e wins".
         assert_eq!(
-            &env_flags[n - 6..],
+            &env_flags[n - 5..],
             &[
                 "ACTIVE_EMBEDDING=arctic",
                 "RL_MODE=online",
-                "VCT_MODULE_TOKEN=not-a-token",
-                "VCT_MODULE_TOKEN=tok",
                 "VCT_HUB_BASE_URL=http://host.containers.internal:7711",
+                "VCT_MODULE_TOKEN",
                 "G_API_KEY",
             ]
         );
+        assert!(!env_flags.iter().any(|e| e.starts_with("VCT_MODULE_TOKEN=")), "{env_flags:?}");
+        assert!(!spawn.args.iter().any(|a| a.contains(token)), "module token in argv");
+        assert_eq!(spawn.secret_value_for_tests("VCT_MODULE_TOKEN"), Some(token));
         assert!(!spawn.args.iter().any(|a| a.contains(value)), "secret value in argv");
         assert_eq!(spawn.secret_value_for_tests("G_API_KEY"), Some(value));
     }

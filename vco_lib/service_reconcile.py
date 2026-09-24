@@ -16,6 +16,12 @@ written only through :mod:`vco_lib.service_endpoints` (the one writer).
 2. A single live candidate holding VCO data → take it.
 3. Several → the continuity pick, else the one on VCO's canonical port, else
    the installer-owned one; ``service_endpoint_ambiguous`` lists them all.
+3b. (R7a F1) VCO's OWN container exists but is STOPPED — created by VCO's
+   compose (installer or legacy home, or VCO's name), or publishing the
+   endpoint VCO's clients last used — → kept (started by name, or composed
+   when it is the installer's), and it OUTRANKS rank 4: a stopped container
+   cannot be probed for "holds VCO data", but it is where that data is.
+   Several with nothing to tell them apart → ``service_endpoint_ambiguous``.
 4. Live and compatible, no VCO data (a third-party instance) → the §4b offer:
    an interactive run asks (default: use it); ``--on-conflict`` answers for a
    script; unattended, an **Ollama** is adopted
@@ -145,7 +151,12 @@ def _norm_host(host: str) -> str:
 
 
 def parse_url(value: str) -> Optional[tuple[str, str, int]]:
-    """``scheme://host[:port]`` → ``(scheme, host, port)``; ``None`` if unusable."""
+    """``scheme://host[:port]`` → ``(scheme, host, port)``; ``None`` if unusable.
+
+    A URL carrying userinfo (``user:password@host``) is unusable: an endpoint
+    row holds no credentials (VCO needs anonymous access), and refusing it
+    HERE keeps the secret out of every candidate list, printed line and
+    probe that would otherwise echo it before the row writer refused it."""
     s = (value or "").strip()
     if "://" not in s:
         return None
@@ -154,6 +165,8 @@ def parse_url(value: str) -> Optional[tuple[str, str, int]]:
     if scheme not in ("http", "https"):
         return None
     authority = rest.split("/", 1)[0]
+    if "@" in authority:
+        return None
     if authority.startswith("["):
         host = authority[: authority.find("]") + 1] if "]" in authority else ""
     else:
@@ -544,6 +557,14 @@ class ServiceInputs:
     prompt: Optional[PromptFn] = None
     containers: Sequence[_det.ContainerInfo] = ()
     now_ms: int = 0
+    #: The session drift check (plan §4a.3): detection covered only the
+    #: rows' own endpoints and containers, so nothing here may conclude
+    #: anything about instances it did not look at (e.g. that the Weaviate a
+    #: parked row waits on is gone).
+    session: bool = False
+    #: The runtime answered the container listing (``containers`` is then
+    #: complete for what was asked about, so a name absent from it is gone).
+    containers_listed: bool = False
 
 
 @dataclass
@@ -715,8 +736,63 @@ def _decide_fresh(inp: ServiceInputs) -> Outcome:
         return out
     third = [c for c in live if c.compatible]
     if third:
+        # A STOPPED container that is VCO's own (or that VCO's clients last
+        # used) outranks a live instance holding no VCO data: it is where the
+        # user's KG / pulled models live, one `start` away. Re-routing to the
+        # live one would orphan that data (and pull every model a second time).
+        ours = _stopped_vco_candidates(inp)
+        if ours:
+            return _decide_stopped_ours(inp, out, ours, third)
         return _decide_third_party(inp, out, _pick_third_party(third, inp))
     return _decide_nothing_live(inp, out)
+
+
+def _stopped_vco_candidates(inp: ServiceInputs) -> list[_det.Candidate]:
+    """Stopped containers with positive evidence that they hold VCO's data:
+    created by VCO (the installer's compose project, VCO's canonical name, or
+    VCO's legacy compose home), or publishing the endpoint VCO's clients were
+    last pointed at (continuity) or a legacy statement names. A stopped
+    container is never probed, so "holds VCO data" cannot be READ from it —
+    this is the evidence that stands in for it."""
+    named = {st.endpoint for st in inp.statements}
+    named |= {inp.continuity.endpoint} if inp.continuity is not None else set()
+    pinned = {st.container_name for st in inp.statements if st.container_name}
+    out: list[_det.Candidate] = []
+    for c in inp.candidates:
+        if c.container is None or c.container.running or not c.port:
+            continue
+        if (c.ownership in ("installer", "legacy_vco")
+                or ("localhost", c.port) in named or c.container.name in pinned):
+            out.append(c)
+    return out
+
+
+def _decide_stopped_ours(inp: ServiceInputs, out: Outcome, ours: Sequence[_det.Candidate],
+                         live_third: Sequence[_det.Candidate]) -> Outcome:
+    """VCO's own stopped container is kept (and started by name, or composed
+    when it is the installer's) — never the live third-party instance. More
+    than one stopped candidate with no continuity to tell them apart →
+    ``service_endpoint_ambiguous``."""
+    svc = inp.service
+    pick = _pick(list(ours), inp)
+    out.row = _row_for(inp, pick, source=_source_for(inp, pick),
+                       confirmed=pick.ownership == "legacy_vco")
+    out.chosen, out.how = pick, "kept_stopped_container"
+    decided_by_continuity = (inp.continuity is not None
+                             and (_norm_host(pick.host), pick.port) == inp.continuity.endpoint)
+    if len(ours) > 1 and not decided_by_continuity:
+        out.ambiguous = list(ours)
+    others = ", ".join(c.url for c in live_third)
+    name = pick.container.name if pick.container else "?"
+    out.lines.append(
+        f"  [{svc}] keeping VCO's own {name} (stopped; it holds VCO's data) — the {svc} "
+        f"running at {others} holds no VCO data and is left alone")
+    blocker = next((c for c in live_third
+                    if c.port == pick.port and _norm_host(c.host) == "localhost"), None)
+    if blocker is not None:
+        out.unreachable = (f"{name} holds VCO's data but cannot start: another {svc} "
+                           f"answers on its port {pick.port}")
+    return out
 
 
 def _decide_third_party(inp: ServiceInputs, out: Outcome, tp: _det.Candidate) -> Outcome:
@@ -802,6 +878,15 @@ def _decide_nothing_live(inp: ServiceInputs, out: Outcome) -> Outcome:
     stopped = _stopped_container_at(inp, target) if local and svc != "code_embed" else None
     if stopped is not None and eff is None and stopped.ownership == "third_party":
         stopped = None  # someone else's stopped container is not ours to pick
+    if stopped is None and eff is None and svc != "code_embed":
+        # No statement, nothing on the canonical port: VCO's own stopped
+        # container ELSEWHERE (e.g. moved) is still where its data lives —
+        # never replaced by a fresh, empty copy on the canonical port.
+        ours = _stopped_vco_candidates(inp)
+        if ours:
+            stopped = _pick(ours, inp)
+            if len(ours) > 1:
+                out.ambiguous, out.chosen = list(ours), stopped
     if stopped is not None:
         out.row = _row_for(inp, stopped, source=_source_for(
             inp, stopped, f"migrated:{eff.kind}" if eff else "install_probe"),
@@ -880,7 +965,7 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
                         and _norm_host(c.host) == _norm_host(row.host)), None)
     if row.mode == "adopted_container":
         present = any(x.name == row.container_name for x in inp.containers)
-        if not present and inp.containers:
+        if not present and (inp.containers_listed or inp.containers):
             out.unreachable = f"your container {row.container_name} no longer exists"
         drifted = _container_drift(inp, row) if present else None
         if drifted is not None:
@@ -889,6 +974,8 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
     elif row.mode == "adopted_external":
         if live_at_row is None:
             out.unreachable = f"{_se.render_url(svc, row)} does not answer"
+    elif svc == "weaviate" and not row.enabled and inp.session:
+        pass  # the waiting state is settled by a full run (install/update), never here
     elif svc == "weaviate" and not row.enabled:
         third = [c for c in inp.candidates if c.live and c.compatible and not c.has_vco_data]
         if third and (inp.on_conflict is not None or (inp.interactive and inp.prompt is not None)):
@@ -902,9 +989,12 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
     else:
         c = next((x for x in inp.candidates if x.container is not None and x.port == row.port
                   and x.container.running), None)
+        foreign = _foreign_at_managed_port(inp, row) if svc != "code_embed" else None
         if svc != "code_embed" and c is not None and c.ownership == "legacy_vco":
             out.row = _row_for(inp, c, source="migrated:legacy_compose", confirmed=True)
             out.how = "legacy_container_adopted"
+        elif foreign is not None:
+            return _decide_foreign_at_managed_port(inp, row, foreign)
         elif svc == "code_embed":
             cur = row
             if inp.has_gpu is not None and cur.enabled != bool(inp.has_gpu):
@@ -915,12 +1005,85 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
                 mount = _mount_of(svc, c.container)
                 if mount and mount != (dict(cur.data_mount) if cur.data_mount else None):
                     cur = replace(cur, data_mount=mount, source="live_reconcile")
-                out.migrate_code_embed = bool(cur.enabled and c.ownership != "installer")
+            # Eligibility does not depend on the container RUNNING: a stopped
+            # code-embed container another compose project owns still holds
+            # the name VCO's compose would create — `compose up` would fail on
+            # the name conflict. It is migrated exactly like on the import run
+            # (_decide_code_embed; migrate_managed_service handles a stopped one).
+            owner = c or next((x for x in inp.candidates if x.container is not None
+                               and x.container.name == row.container_name), None)
+            if owner is not None:
+                out.migrate_code_embed = bool(cur.enabled and owner.ownership != "installer")
             out.row = cur
     final = out.row if out.row is not None else row
     if final.verified_at is None and live_at_row is not None and final.port == row.port:
         final = replace(final, verified_at=inp.now_ms)
     out.row = final
+    return out
+
+
+def _foreign_at_managed_port(inp: ServiceInputs, row: _se.EndpointRow) -> Optional[_det.Candidate]:
+    """The instance answering on a ``vco_managed`` row's port when it is
+    POSITIVELY not VCO's container: a running container of another compose
+    project, or an answer with no container while the row's own container is
+    known to be stopped. An instance holding VCO data is not "foreign" (it is
+    where the data is). With no runtime, nothing is known — ``None``."""
+    mine = next((x for x in inp.containers if x.name == row.container_name), None)
+    for c in inp.candidates:
+        if not (c.live and c.port == row.port and _norm_host(c.host) == _norm_host(row.host)):
+            continue
+        if c.has_vco_data:
+            return None
+        if c.container is not None:
+            if (c.container.running and c.container.name != row.container_name
+                    and c.ownership == "third_party"):
+                return c
+        elif mine is not None and not mine.running:
+            return c
+    return None
+
+
+def _decide_foreign_at_managed_port(inp: ServiceInputs, row: _se.EndpointRow,
+                                    tp: _det.Candidate) -> Outcome:
+    """Another instance (holding no VCO data) answers where VCO's own
+    ``vco_managed`` service should: VCO's clients would write into it without
+    the owner-ruling-Q1 consent. Never stamped verified.
+
+    * Weaviate: the Q1 waiting state — the row is PARKED (``enabled=0``, on a
+      free port, keeping its container name and data mount, so VCO's own
+      copy resumes on its data) and ``service_adoption_confirmation_required``
+      names both choices; ``service_endpoint_unreachable`` says VCO's own is
+      not what answers.
+    * Ollama: VCO's own container still there (it holds the pulled models) →
+      the row is kept and reported unreachable (never re-routed away from
+      the data); no container of VCO's left → the Q1 default, adopt it with
+      the ``service_adopted_without_prompt`` record."""
+    svc = inp.service
+    out = Outcome(svc, row=row, how="existing")
+    what = (f"{tp.url} is answered by another {svc}"
+            + (f" (container {tp.container.name})" if tp.container else "")
+            + f", not by VCO's own {row.container_name or svc}")
+    if svc == "weaviate":
+        port = _free_port(_se.DEFAULT_PORTS[svc], inp, avoid=[tp.port, row.port])
+        grpc = (_free_port(_se.DEFAULT_WEAVIATE_GRPC_PORT + (port - _se.DEFAULT_PORTS[svc]), inp,
+                           avoid=[port, tp.port, row.port]) if port is not None else None)
+        if port is None or grpc is None:
+            out.abort = f"{svc}: no free port to park VCO's own copy while it waits for your choice"
+            return out
+        out.row = replace(row, port=port, grpc_port=grpc, enabled=False, source="live_reconcile",
+                          verified_at=None)
+        out.how, out.pending, out.unreachable = "awaiting_confirmation", tp, what
+        out.lines.append(f"  [weaviate] {what} — VCO's own is parked on :{port} (disabled) until "
+                         "you choose; nothing is written into the other one")
+        return out
+    mine = next((x for x in inp.containers if x.name == row.container_name), None)
+    if mine is not None:
+        out.unreachable = f"{what}; VCO's container holds its models and cannot start there"
+        out.lines.append(f"  [{svc}] {out.unreachable}")
+        return out
+    out.row = _row_for(inp, tp, source="live_reconcile", confirmed=False)
+    out.chosen, out.how, out.adopted_without_prompt = tp, "third_party_adopted", tp
+    out.lines.append(f"  [{svc}] using the {svc} already at {tp.url} (VCO's own container is gone)")
     return out
 
 
@@ -1095,8 +1258,16 @@ class ReconcileResult:
         return "start"
 
 
+#: The prompt's "no answer" — Ctrl-C, or stdin closed mid-question. It is NOT
+#: consent: :func:`_decide_third_party` treats it as the unattended case
+#: (owner ruling Q1 — Ollama adopted with an informational record; a Weaviate
+#: parked, nothing started or written, ``service_adoption_confirmation_required``).
+UNDECIDED = ""
+
+
 def _interactive_prompt(service: str, cand: _det.Candidate) -> str:
-    """The §4b offer, on a TTY. Default: use it."""
+    """The §4b offer, on a TTY. Default (an explicit Enter): use it. An
+    interrupted question (Ctrl-C / EOF) is :data:`UNDECIDED`, never "adopt"."""
     print()
     print(f"  Found a {service} at {cand.url} that VCO did not start"
           + (f" (container {cand.container.name})" if cand.container else "") + ".")
@@ -1107,7 +1278,9 @@ def _interactive_prompt(service: str, cand: _det.Candidate) -> str:
         ans = input(f"  Choice for {service} [1/2/3, default 1]: ").strip()
     except (EOFError, KeyboardInterrupt):
         print()
-        return "adopt"
+        print(f"  (no answer for {service} — handled as an unattended run; "
+              "see UPDATE_DEFERRED.md)")
+        return UNDECIDED
     return {"2": "alt-port", "3": "abort"}.get(ans, "adopt")
 
 
@@ -1176,8 +1349,13 @@ def reconcile(
     for row in existing.values():
         extra.append(_det.Endpoint(row.service, row.host, row.port, row.scheme, row.grpc_port,
                                    origin="row"))
-    detection = _det.detect(runtime=runtime, installer_project=installer_project,
-                            extra_endpoints=extra, run=run, fetch=fetch, tcp_open=tcp_open)
+    if phase == "session":
+        detection = _session_detection(existing, runtime=runtime,
+                                       installer_project=installer_project, extra=extra,
+                                       run=run, fetch=fetch, tcp_open=tcp_open)
+    else:
+        detection = _det.detect(runtime=runtime, installer_project=installer_project,
+                                extra_endpoints=extra, run=run, fetch=fetch, tcp_open=tcp_open)
     result.detection = detection
 
     taken = {c.port for s in SERVICES for c in detection.for_service(s) if c.port}
@@ -1195,7 +1373,8 @@ def reconcile(
             taken_ports=frozenset((taken | others) - ({existing[service].port} if service in existing else set())),
             port_free=port_free or default_port_free,
             prompt=prompt or (_interactive_prompt if interactive else None),
-            containers=detection.containers, now_ms=now,
+            containers=detection.containers, now_ms=now, session=phase == "session",
+            containers_listed=detection.listed,
         )
         out = decide(inp)
         result.outcomes[service] = out
@@ -1238,6 +1417,32 @@ def reconcile(
     _autostart_adopted(result, runtime, run)
     result.entries.extend(_outcome_entries(result, root))
     return result
+
+
+def _session_detection(existing: Mapping[str, _se.EndpointRow], *, runtime: Optional[str],
+                       installer_project: str, extra: Sequence[_det.Endpoint],
+                       run: Optional[RunFn], fetch: Optional[_det.FetchFn],
+                       tcp_open: Optional[_det.TcpFn]) -> _det.Detection:
+    """The session drift check's detection (plan §4a.3), scoped to the
+    RECORDED rows: only the rows' containers are inspected (one ``ps``, then
+    an ``inspect`` of those names — not of every container on the machine),
+    only the rows' endpoints (and the ports those containers publish) are
+    probed — no sweep of VCO's or upstream's default ports — and a
+    Weaviate's ``/v1/schema`` is read only where the recorded endpoint
+    changed: something answers there while the row's own container is
+    stopped (whether it holds VCO data decides what VCO does,
+    ``_foreign_at_managed_port``)."""
+    wanted = {r.container_name for r in existing.values() if r.container_name}
+    listed = _det.list_containers_or_none(runtime, run=run, names=wanted)
+    containers = listed or []
+    by_name = {c.name: c for c in containers}
+    changed = {(_norm_host(r.host), r.port) for r in existing.values()
+               if r.container_name in by_name and not by_name[r.container_name].running}
+    return _det.detect(runtime=runtime, installer_project=installer_project,
+                       extra_endpoints=extra, run=run, fetch=fetch, tcp_open=tcp_open,
+                       containers=containers, containers_listed=listed is not None,
+                       probe_defaults=False,
+                       read_schema=lambda host, port: (_norm_host(host), port) in changed)
 
 
 def legacy_has_anything(ev: LegacyEvidence) -> bool:
@@ -1438,21 +1643,35 @@ def _unreachable_entry(dead: Sequence[tuple[str, str, str]],
 
 def _ambiguous_entry(service: str, chosen: _det.Candidate,
                      cands: Sequence[_det.Candidate]) -> DeferralEntry:
+    def evidence(c: _det.Candidate) -> str:
+        if c.probe is not None:
+            return ", ".join(c.probe.vco_markers[:4])
+        return f"stopped, {c.ownership.replace('_', ' ')} container"
+
     lines = "\n".join(
         f"  - {c.url}" + (f" (container {c.container.name})" if c.container else "")
-        + f": {', '.join(c.probe.vco_markers[:4]) if c.probe else ''}"
+        + f": {evidence(c)}"
         + ("   ← chosen" if c is chosen else "")
         for c in cands)
+    if chosen.live:
+        title = f"More than one {service} holds VCO data — VCO picked one"
+        detected = f"{len(cands)} running {service} instances hold VCO data:\n{lines}"
+        remedy = (f"# Keep the chosen one (silences this entry):\n"
+                  f"{_CLI} adopt --service {service} --url {chosen.url}\n"
+                  f"# Or pick another:\n{_CLI} adopt --service {service} --url <url>")
+    else:
+        title = f"More than one stopped VCO {service} container — VCO picked one"
+        detected = (f"{len(cands)} stopped {service} containers were created by VCO; any of them "
+                    f"may hold your data:\n{lines}")
+        remedy = (f"# Keep the chosen one: nothing to do (dismiss this entry).\n"
+                  f"# Or start another and pick it:\n"
+                  f"{_CLI} adopt --service {service} --container <name>")
     return DeferralEntry(
         condition_id=CID_AMBIGUOUS,
-        title=f"More than one {service} holds VCO data — VCO picked one",
-        detected=f"{len(cands)} running {service} instances hold VCO data:\n{lines}",
+        title=title,
+        detected=detected,
         why_deferred="Only you know which one is current; VCO will not merge them.",
-        command_to_apply=(
-            f"# Keep the chosen one (silences this entry):\n"
-            f"{_CLI} adopt --service {service} --url {chosen.url}\n"
-            f"# Or pick another:\n{_CLI} adopt --service {service} --url <url>"
-        ),
+        command_to_apply=remedy,
         severity="warning",
         dismiss_fields={"service": service,
                         "candidates": ",".join(sorted(c.url for c in cands))},
@@ -1544,18 +1763,24 @@ def _outcome_entries(result: ReconcileResult, root: Path) -> list[DeferralEntry]
             f"  - {s} ({name}): " + ", ".join(f"{k}={live!r} (VCO sets {want!r})"
                                               for k, (live, want) in d.items())
             for s, name, d in drift_items)
+        handable = [(s, n) for s, n, _d in drift_items if can_hand_to_vco(s, n)]
+        foreign = [(s, n) for s, n, _d in drift_items if not can_hand_to_vco(s, n)]
+        remedy = ""
+        if handable:
+            remedy += ("# Let VCO manage the container (recreated under VCO's compose with the SAME\n"
+                       "# data mount, verified, rolled back on failure):\n"
+                       + "\n".join(f"{_CLI} hand-to-vco --service {s}" for s, _n in handable) + "\n")
+        if foreign:
+            remedy += "".join(
+                f"# {n} ({s}) is yours: apply the settings above in its own compose, if you want them.\n"
+                for s, n in foreign)
         entries.append(DeferralEntry(
             condition_id=CID_CONFIG_DRIFT,
             title="A container VCO uses lacks some of VCO's tuning",
             detected=f"These containers run without VCO's behaviour-critical settings:\n{detail}",
             why_deferred=("VCO never recreates a container it adopted. The service works; it "
                           "just does not carry these fixes."),
-            command_to_apply=(
-                "# Let VCO manage the container (recreated under VCO's compose with the SAME\n"
-                "# data mount, verified, rolled back on failure):\n"
-                + "\n".join(f"{_CLI} hand-to-vco --service {s}" for s, _n, _d in drift_items)
-                + "\n# Or keep it as it is and dismiss this entry."
-            ),
+            command_to_apply=remedy + "# Or keep it as it is and dismiss this entry.",
             severity="info",
             dismiss_fields={"service": ",".join(s for s, _n, _d in drift_items),
                             "drift_keys": ",".join(sorted({k for _s, _n, d in drift_items for k in d}))},
@@ -1622,7 +1847,11 @@ def probe_ambiguous(entry: Any, *, runtime: Optional[str] = None, run: Optional[
             continue
         det = _det.detect(runtime=runtime if runtime is not None else _runtime(),
                           run=run, fetch=fetch, tcp_open=tcp_open, services=(s,))
-        if len([c for c in det.for_service(s) if c.has_vco_data]) > 1:
+        holders = [c for c in det.for_service(s) if c.has_vco_data]
+        stopped_ours = [c for c in det.for_service(s)
+                        if c.container is not None and not c.container.running and c.port
+                        and c.ownership in ("installer", "legacy_vco")]
+        if len(holders) > 1 or (not holders and len(stopped_ours) > 1):
             return True
     return False
 
@@ -1932,14 +2161,86 @@ def _move_managed(row: _se.EndpointRow, rows: Mapping[str, _se.EndpointRow], *,
     return 1
 
 
+def can_hand_to_vco(service: str, container_name: Optional[str]) -> bool:
+    """Can VCO's compose take *container_name* over for *service*? Only a
+    container under the name VCO's compose creates (its ``container_name:``,
+    :func:`vco_lib.containers.canonical_name`): the takeover re-creates the
+    container under the installer's project, and compose re-creates it under
+    THAT name. Any other container would come back as a second, differently
+    named container on the same data — never done."""
+    return bool(container_name) and container_name == _containers.canonical_name(service)
+
+
+def hand_to_vco_refusal(service: str, row: Optional[_se.EndpointRow]) -> Optional[str]:
+    """Why ``hand-to-vco`` refuses *row* before asking the runtime anything,
+    or ``None`` when the row allows it: the row must exist, must not be an
+    adopted URL, must name a container, and that container must be under the
+    name VCO's compose creates (:func:`can_hand_to_vco`). The one remaining
+    check — the container still exists — needs the runtime and is made by
+    :func:`hand_to_vco` itself.
+
+    MUST MATCH ``vct_launcher_core::services::service_endpoints::
+    hand_to_vco_allowed`` (the Services page shows "Let VCO manage it" only
+    where this returns ``None``); both run the ``hand_to_vco_cases`` of
+    ``tests/fixtures/service_endpoint_parity.json``."""
+    if row is None:
+        return "no row yet"
+    if row.mode == "adopted_external":
+        return "VCO uses it by URL, not as a container"
+    if not row.container_name:
+        return "its row names no container"
+    if not can_hand_to_vco(service, row.container_name):
+        return "not_canonical"
+    return None
+
+
+def _container_exists(runtime: str, name: str, run: Optional[RunFn]) -> bool:
+    try:
+        proc = (run or subprocess.run)([runtime, "inspect", "--type", "container", "--format",
+                                        "{{.Id}}", name], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return proc.returncode == 0 and bool((proc.stdout or "").strip())
+
+
+AdoptFn = Callable[..., Any]
+
+
 def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str] = None,
-                out: LogFn = print) -> int:
+                db_path: Optional[Path] = None, run: Optional[RunFn] = None,
+                adopt: Optional[AdoptFn] = None, out: LogFn = print) -> int:
     """``hand-to-vco --service S`` — the opt-in ownership transfer (owner
-    ruling Q2): VCO's compose takes the adopted container over, with the
-    SAME data mount, verified, rolled back on failure
-    (:func:`vco_lib.service_adoption.adopt_services`)."""
-    result = _service_adoption.adopt_services(
-        Path(orchestrator_root), services=(service,), runtime=runtime or _runtime() or "podman")
+    ruling Q2): VCO's compose takes over THE container the row names (an
+    ``adopted_container``, or a ``vco_managed`` row whose container another
+    compose project created), never another one found by name (a stale
+    ``vco_weaviate`` from an earlier install is not the container holding the
+    data VCO uses), with the SAME data mount, verified, rolled back on failure
+    (:func:`vco_lib.service_adoption.adopt_services`). Refused, with nothing
+    touched, when there is no such row, the row names no container, the
+    container is gone, or it is not under the name VCO's compose creates
+    (:func:`can_hand_to_vco`)."""
+    row = _se.load_rows(db_path).get(service)
+    refusal = hand_to_vco_refusal(service, row)
+    if refusal is not None and refusal != "not_canonical":
+        out(f"{service}: nothing to hand over — {refusal}. `hand-to-vco` takes over a container "
+            f"VCO uses by name (`{_CLI} show`).")
+        return 1
+    assert row is not None and row.container_name  # hand_to_vco_refusal checked both
+    name = row.container_name
+    rt = runtime or _runtime() or "podman"
+    if not _container_exists(rt, name, run):
+        out(f"{service}: the container VCO uses, {name}, does not exist — nothing to hand over "
+            f"(`{_CLI} reconcile` re-checks what is running).")
+        return 1
+    if refusal == "not_canonical":
+        out(f"{service}: {name} is not under the name VCO's compose creates "
+            f"({_containers.canonical_name(service)}); taking it over would re-create it as a "
+            "second, differently named container on the same data, so VCO leaves it as it is. "
+            "It stays yours: VCO starts and stops it by name.")
+        return 1
+    result = (adopt or _service_adoption.adopt_services)(
+        Path(orchestrator_root), services=(service,), runtime=rt, db_path=db_path,
+        container_refs={service: name})
     for line in result.lines:
         out(line)
     return 0 if service in result.adopted else 1
@@ -1969,7 +2270,7 @@ def cli(verb: str, args: argparse.Namespace) -> int:
         return use_vco_copy(args.service, port=args.port, orchestrator_root=root,
                             accept_empty_kg=args.accept_empty_kg, db_path=db)
     if verb == "hand-to-vco":
-        return hand_to_vco(args.service, orchestrator_root=root)
+        return hand_to_vco(args.service, orchestrator_root=root, db_path=db)
     if verb == "move":
         return move_endpoint(args.service, orchestrator_root=root, port=args.port, url=args.url,
                              grpc_port=args.grpc_port, accept_empty_kg=args.accept_empty_kg,

@@ -59,6 +59,13 @@ export interface ServiceRuntimeState {
   zombie?: boolean;
   /** Where this service runs waits for the user's choice (Rust `awaits_choice`). */
   pending_choice?: boolean;
+  /**
+   * Offer "Let VCO manage it" — computed server-side by the rule the
+   * `hand-to-vco` verb enforces (Rust `service_endpoints::hand_to_vco_offered`:
+   * an adopted Weaviate/Ollama container under the name VCO's compose
+   * creates). The page reads this; it keeps no copy of the rule.
+   */
+  hand_to_vco_offered?: boolean;
 }
 
 export interface ServicesRuntimeSnapshot {
@@ -167,7 +174,9 @@ export interface CandidateReport {
 export type EndpointAction =
   | { action: 'adopt'; service: CoreServiceName; container?: string; url?: string; accept_empty_kg?: boolean }
   | { action: 'use_vco_copy'; service: CoreServiceName; port?: number; accept_empty_kg?: boolean }
-  | { action: 'hand_to_vco'; service: CoreServiceName };
+  | { action: 'hand_to_vco'; service: CoreServiceName }
+  /** "Move to another port…" — built by `moveAction` in `service-endpoint-move.ts`. */
+  | { action: 'move'; service: CoreServiceName; port: number; grpc_port: number | null };
 
 export const CORE_SERVICES: readonly CoreServiceName[] = ['weaviate', 'ollama', 'code_embed'];
 
@@ -260,8 +269,8 @@ export type ServiceActionId = 'start' | 'stop' | 'restart' | 'recover' | 'change
 /**
  * The buttons a Services row offers. Never "refuse" or "reset": changing
  * where a service runs is "Change…" (pick another endpoint), and the
- * opt-in ownership transfer is "Let VCO manage it" (Weaviate/Ollama
- * containers only — owner ruling Q2).
+ * opt-in ownership transfer is "Let VCO manage it" (owner ruling Q2), shown
+ * exactly where the snapshot says `hand_to_vco_offered` (plan §12).
  */
 export function serviceActions(s: ServiceRuntimeState): ServiceActionId[] {
   const out: ServiceActionId[] = [];
@@ -276,7 +285,7 @@ export function serviceActions(s: ServiceRuntimeState): ServiceActionId[] {
     if (s.zombie) out.push('recover');
   }
   if (adoptable) out.push('change');
-  if (mode === 'adopted_container' && adoptable) out.push('hand_to_vco');
+  if (s.hand_to_vco_offered === true) out.push('hand_to_vco');
   return out;
 }
 
