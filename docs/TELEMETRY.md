@@ -40,9 +40,13 @@ user-identifying information beyond an installer-generated UUID hash.
 # Default location:
 cat ~/.vibecoded/telemetry_pending.jsonl | jq .
 
-# Or via the `vco` CLI (built from launcher/tools/vct-cli/):
-vco telemetry status
+# Or via the launcher CLI (built from launcher/tools/vct-cli/); works with
+# the launcher closed, prints {path, exists, count, unparsed_lines, events}:
+vct-cli telemetry pending
 ```
+
+`vct-cli telemetry status` shows the launcher's telemetry consent, not the
+pending events.
 
 Each line is one event. Safe to delete or hand-edit at any time.
 

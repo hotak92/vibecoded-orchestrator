@@ -19,7 +19,7 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
-  import { runUnregister } from '$lib/unregister-escape';
+  import { DEFAULT_UNREGISTER_OPTIONS, runUnregister } from '$lib/unregister-escape';
   import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
   import type {
     ProjectView,
@@ -152,8 +152,8 @@
   //   - purgeCollections: OFF by default (opt-in); drops the project's
   //     own Weaviate collections. Shared never touched. Tooltip
   //     surfaces the rebuild path so users don't fear the choice.
-  let purgeLauncherFiles = $state(true);
-  let purgeCollections = $state(false);
+  let purgeLauncherFiles = $state(DEFAULT_UNREGISTER_OPTIONS.purgeLauncherFiles);
+  let purgeCollections = $state(DEFAULT_UNREGISTER_OPTIONS.purgeCollections);
   let unregisterConfirmText = $state('');
   let unregistering = $state(false);
   // The Unregister button is enabled only when the user has typed the
@@ -917,13 +917,14 @@
             <strong>Remove launcher-managed files</strong>
             <small>
               Removes <code>.claude/hooks/</code>, <code>.claude/scripts/</code>,
-              infra compose YAMLs, the launcher's routing keys and its managed
-              block from your <code>.env</code> / <code>.claude/env</code> /
-              <code>.claude/settings.json</code> /
-              <code>.vscode/settings.json</code>, and a secret value in them
-              only where it equals the one the launcher stores (so VCO wrote
-              it). A same-named secret you typed yourself is kept, and listed
-              when the unregister finishes.
+              infra compose YAMLs, VCO's managed blocks in your
+              <code>.env</code> / <code>.claude/env</code>, the launcher's
+              routing keys in <code>.claude/settings.json</code> /
+              <code>.vscode/settings.json</code> where they still hold the
+              value the launcher writes, and a secret value in them only where
+              it equals the one the launcher stores (so VCO wrote it). A value
+              you set yourself is kept, and listed when the unregister
+              finishes.
               Your agents, skills, <code>CONTEXT_STATE.md</code>,
               <code>CLAUDE.md</code>, source code, and user-added
               <code>.env</code> values are preserved.

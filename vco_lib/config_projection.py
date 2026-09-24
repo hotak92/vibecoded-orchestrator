@@ -211,7 +211,7 @@ import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Iterable, Mapping, NotRequired, Optional, TypedDict
 
 from vco_lib import jsonc_edit, settings_refusal
 from vco_lib.atomic import atomic_rewrite_text
@@ -422,9 +422,10 @@ def list_canonical_keys() -> set[str]:
 
 # ─── Bracket markers for the .claude/env surface ────────────────────────
 #
-# Must remain byte-identical to the Rust ``CLAUDE_ENV_MANAGED_BEGIN`` /
-# ``CLAUDE_ENV_MANAGED_END`` constants in projects_v2.rs. The in-place
-# replace on the next call depends on substring match.
+# The ONE definition (v0.2.97 review R6 retired the Rust copies with the
+# Rust splice): the writer below and the unregister's strip
+# (:mod:`vco_lib.unregister_env`) both use these. The in-place replace on the
+# next call depends on substring match.
 
 CLAUDE_ENV_MANAGED_BEGIN: str = "# vco-managed-begin"
 CLAUDE_ENV_MANAGED_END: str = "# vco-managed-end"
@@ -3627,9 +3628,9 @@ def strip_env_keys(
 ) -> list[str]:
     """Remove ``keys`` from one JSON surface's env block; nothing else.
 
-    The removal-only twin of :func:`write_env_block`, for the launcher's
-    unregister strips (canonical keys, and a project's user-secret KEY
-    names — ``projects_v2.rs`` calls it through the ``strip-env-keys`` CLI).
+    The removal-only twin of :func:`write_env_block`: every ``apply`` uses
+    it for the proven secret values in ``.vscode/settings.json``, and the
+    unregister's value-checked twin is :func:`strip_env_keys_holding`.
     Unlike a write it never CREATES anything: a missing file, a missing env
     block, or an env block holding none of ``keys`` is left alone and costs
     no write. An env block the strip empties is removed, so no ``"env": {}``
@@ -3642,6 +3643,42 @@ def strip_env_keys(
         ConfigProjectionError: an unknown surface.
         SettingsWriteRefused: as :func:`write_env_block`.
     """
+    wanted = set(keys)
+    return _strip_json_env(project_folder, surface, lambda key, _value: key in wanted)[0]
+
+
+def strip_env_keys_holding(
+    project_folder: Path, surface: str, expected: Mapping[str, str], keys: Iterable[str],
+) -> tuple[list[str], list[str]]:
+    """The evidence-rule strip (v0.2.97 review R6): of ``keys``, remove from
+    one JSON surface's env block only those whose value EQUALS ``expected``
+    (what VCO projects for this project); a key holding anything else is the
+    user's and stays. Returns ``(removed, left)`` — sorted key names; ``left``
+    are the ``keys`` present with a different value (or none expected).
+    Same file discipline and refusals as :func:`strip_env_keys`.
+    """
+    wanted = set(keys)
+    return _strip_json_env(
+        project_folder, surface,
+        lambda key, value: key in wanted and key in expected and value == expected[key],
+        report=wanted,
+    )
+
+
+def _strip_json_env(
+    project_folder: Path,
+    surface: str,
+    remove: Callable[[str, Any], bool],
+    *,
+    report: "set[str] | None" = None,
+) -> tuple[list[str], list[str]]:
+    """Remove from one JSON surface's env block every entry ``remove(key,
+    value)`` accepts — the ONE removal core of :func:`strip_env_keys` and
+    :func:`strip_env_keys_holding`. Returns ``(removed, left)``: ``left`` =
+    the ``report`` keys present but not removed. Never creates a file; drops
+    an env block it empties; a file it cannot edit safely is refused and
+    recorded (:class:`SettingsWriteRefused`).
+    """
     if surface not in _JSON_SURFACE_FILES:
         raise ConfigProjectionError(
             f"unknown JSON surface {surface!r}; valid: {sorted(_JSON_SURFACE_FILES)}"
@@ -3649,29 +3686,30 @@ def strip_env_keys(
     rel, env_key = _JSON_SURFACE_FILES[surface]
     path = project_folder / rel
     if not path.exists():
-        return []
+        return [], []
 
-    def _strip() -> list[str]:
+    def _strip() -> tuple[list[str], list[str]]:
         root, jsonc_text = _read_json_env_root(path)
         block = root.get(env_key)
         if not isinstance(block, dict):
-            return []
-        removed = sorted(k for k in dict.fromkeys(keys) if k in block)
+            return [], []
+        removed = sorted(k for k, v in block.items() if remove(k, v))
+        left = sorted(k for k in block if k in (report or ()) and k not in removed)
         if not removed:
-            return []
+            return [], left
         remaining = {k: v for k, v in block.items() if k not in removed}
         if remaining:
             root[env_key] = remaining
         else:
             del root[env_key]
         _atomic_write_text(path, _serialise_json_env_root(path, root, jsonc_text))
-        return removed
+        return removed, left
 
     refusals: list[settings_refusal.Refusal] = []
-    removed = _write_json_surface(project_folder, surface, refusals, None, _strip)
+    outcome = _write_json_surface(project_folder, surface, refusals, None, _strip)
     if refusals:
         raise SettingsWriteRefused(refusals)
-    return removed
+    return outcome
 
 
 def _write_shell_env_managed_block(
@@ -3683,8 +3721,7 @@ def _write_shell_env_managed_block(
 ) -> list[str]:
     """Write the canonical env between bracket markers in ``.claude/env``.
 
-    Behaviour (the splice mirrors Rust's ``merge_claude_env_managed_block``,
-    still used by the launcher's unregister strip):
+    Behaviour (the splice is :func:`_merge_managed_block`):
 
       * If the file doesn't exist: create it with just the managed block.
       * If the file exists and contains :data:`CLAUDE_ENV_MANAGED_BEGIN`:
@@ -3851,7 +3888,8 @@ def _build_managed_block(
 def _merge_managed_block(prior: Optional[str], managed: str) -> str:
     """Splice ``managed`` into ``prior`` between the bracket markers.
 
-    Behaviour matches Rust's ``merge_claude_env_managed_block``:
+    The one splice (its Rust mirror retired in v0.2.97 review R6 with its
+    only caller, the unregister strip — now :mod:`vco_lib.unregister_env`):
 
       * ``prior is None``: return ``managed`` as-is.
       * ``prior`` lacks the BEGIN marker: append ``managed`` at EOF
@@ -3998,32 +4036,6 @@ def _cli_write_env_block(args: argparse.Namespace) -> int:
         print(json.dumps({"ok": False, "error": "write_failed", "message": str(exc)}))
         return 4
     print(json.dumps({"ok": True, "surface": args.surface, "written": written}))
-    return 0
-
-
-def _cli_strip_env_keys(args: argparse.Namespace) -> int:
-    """``python -m vco_lib.config_projection strip-env-keys``.
-
-    stdin: ``{"keys": [KEY, ...]}``. Same one-JSON-object stdout contract and
-    exit codes as ``write-env-block`` (0 done, 2 bad request, 4 refused or
-    failed); success reports ``removed``.
-    """
-    try:
-        request = json.loads(sys.stdin.read() or "{}")
-        keys = request.get("keys") if isinstance(request, dict) else None
-        if not isinstance(keys, list) or not all(isinstance(k, str) for k in keys):
-            raise ConfigProjectionError('stdin must be {"keys": ["KEY", ...]}')
-        removed = strip_env_keys(Path(args.project_folder), args.surface, keys)
-    except SettingsWriteRefused as exc:
-        print(json.dumps({"ok": False, **_refused_payload(exc)}))
-        return 4
-    except (ConfigProjectionError, ValueError) as exc:
-        print(json.dumps({"ok": False, "error": "bad_request", "message": str(exc)}))
-        return 2
-    except OSError as exc:
-        print(json.dumps({"ok": False, "error": "write_failed", "message": str(exc)}))
-        return 4
-    print(json.dumps({"ok": True, "surface": args.surface, "removed": removed}))
     return 0
 
 
@@ -4263,18 +4275,10 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_block.set_defaults(handler=_cli_write_env_block)
 
-    # v0.2.97: its removal-only twin, for the launcher's unregister strips.
-    p_strip = sub.add_parser(
-        "strip-env-keys",
-        help="remove keys from one JSON surface's env block (request JSON on "
-             "stdin; never creates a file; refuses one it cannot safely edit)",
-    )
-    p_strip.add_argument("--project-folder", required=True)
-    p_strip.add_argument(
-        "--surface", default=_SURFACE_CLAUDE_SETTINGS,
-        choices=sorted(_JSON_SURFACE_FILES),
-    )
-    p_strip.set_defaults(handler=_cli_strip_env_keys)
+    # v0.2.97 review R6: the `strip-env-keys` verb (a by-name strip, whose
+    # only caller was the launcher's unregister) is retired — SUPERSEDED by
+    # `python -m vco_lib.unregister_env strip-routing`, which removes a key
+    # only where its value is VCO's.
 
     # v0.2.97: the unregister's evidence step (names + verdicts only).
     p_proven = sub.add_parser(

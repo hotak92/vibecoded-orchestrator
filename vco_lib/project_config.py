@@ -204,11 +204,12 @@ class FieldNotFound(ResolverError):
 class Forbidden(ResolverError):
     """The hub responded 403 on a per-project ``/env`` / ``/config`` route.
 
-    v0.2.77 flip. A HARD scoped-credential boundary refusal — the hub
-    ACCEPTED the request and knows the project, but refused the bearer:
-    either the coarse global ``hub.token`` on a per-project route with the
-    compat window closed (``VCT_HUB_LEGACY_GLOBAL_ENV`` unset/deny), or a
-    per-project token minted for a DIFFERENT project.
+    v0.2.77 flip (window REMOVED v0.2.97). A HARD scoped-credential
+    boundary refusal — the hub ACCEPTED the request and knows the project,
+    but refused the bearer: the coarse global ``hub.token`` on a
+    per-project route (refused unconditionally since v0.2.97 removed the
+    ``VCT_HUB_LEGACY_GLOBAL_ENV`` opt-in), or a per-project token minted
+    for a DIFFERENT project.
 
     Deliberately NOT a :class:`HubUnreachable` subclass: unreachability is
     a transient condition callers degrade to env-fallback on, whereas a 403
@@ -218,8 +219,8 @@ class Forbidden(ResolverError):
     resolving stale env values. The scoped ``hub.token.<id>`` is already
     preferred by the resolver's token picker; a 403 means that file was
     absent/unreadable (so we rode the global token) or the wrong project's
-    token was presented. Fix: ensure the scoped token file exists, or set
-    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` on the hub to reopen the compat window.
+    token was presented. Fix: ensure the scoped token file exists (the hub
+    lazy-mints one on the first request for a project added mid-session).
     """
 
 
@@ -1515,9 +1516,10 @@ def resolve(project_root: Path | str) -> ProjectConfig:
         # caller catching HubUnreachable for env-fallback will not mask it.
         raise Forbidden(
             f"hub returned 403 forbidden for project {pid}: {err_msg}. "
-            f"Present the scoped hub.token.{pid}, or set "
-            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
-            f"one-release compat window."
+            f"Present the scoped hub.token.{pid} (the resolver prefers "
+            f"it; the hub mints one on first request). The legacy "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in "
+            f"v0.2.97."
         )
     if resp.status_code == 404:
         if err_code == "field_not_found":
@@ -1610,9 +1612,10 @@ def resolve_field(
         # HubUnreachable subclass so env-fallback callers don't mask it.
         raise Forbidden(
             f"hub returned 403 forbidden for project {pid}: {err_msg}. "
-            f"Present the scoped hub.token.{pid}, or set "
-            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
-            f"one-release compat window."
+            f"Present the scoped hub.token.{pid} (the resolver prefers "
+            f"it; the hub mints one on first request). The legacy "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in "
+            f"v0.2.97."
         )
     if resp.status_code == 404:
         if err_code == "field_not_found":

@@ -820,7 +820,9 @@ pub async fn migrate_volumes(
     let _plan = set_volumes_config_dry_run(path.clone()).await?;
     let target = validate_custom_volumes_path(path.trim())?;
 
-    let runtime = which_container_runtime()
+    // The one podman-then-docker PATH probe (v0.2.97 review R6: this file
+    // walked `$PATH` by hand, and missed `podman.exe` on Windows).
+    let runtime = super::storage_ux::which_runtime()
         .ok_or("no container runtime (podman/docker) found on PATH")?;
 
     let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
@@ -1034,19 +1036,6 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
         tokio::time::sleep(std::time::Duration::from_secs(2)).await;
     }
     false
-}
-
-fn which_container_runtime() -> Option<String> {
-    for runtime in &["podman", "docker"] {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                if dir.join(runtime).is_file() {
-                    return Some(runtime.to_string());
-                }
-            }
-        }
-    }
-    None
 }
 
 // Force ExistingVolume to be used so the import isn't dead code (the

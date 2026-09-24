@@ -85,6 +85,20 @@ An explicit `VCT_HUB_BIND_ALL` value wins in both directions. Every
 `/api/v1/*` route stays bearer-token gated while widened. Full runbook:
 `docs/TROUBLESHOOTING.md` § "Hub bind posture".
 
+### Several keys, and a bound on the hub wait (v0.2.97)
+
+`vct_secrets_resolve.{sh,ps1} resolve-many <project> KEY [KEY...]` resolves
+several keys in ONE process, each through the same three tiers: the project is
+looked up once, the hub is not asked again once it has stopped answering, and
+the output is one `KEY=VALUE` line per resolved key (keys must be env-var
+shaped; a value holding a line break is reported and left to the single-key
+form). The exit code is 0 when every key resolved, else the single-key code of
+the first that did not. `VCT_RESOLVE_MAX_TIME=<seconds>` bounds the TOTAL time
+one invocation spends on the hub (connect + read, across all its requests);
+unset, each request keeps its 5 s cap. The `context-size-check` hook uses both,
+with a 1 s budget, so a hub that accepts and then hangs costs a session start
+about a second. The single-key form and its exit codes are unchanged.
+
 ### Per-project resolver tokens (tier 1, v0.2.76)
 
 The two per-project routes — `GET /api/v1/projects/{id}/env` and
@@ -113,7 +127,7 @@ fail-open-to-`write` contract is untouched — it is just reached less
 often), `vco_lib/project_config.py`, the wrapper
 MCPs (`claude_mcp_servers/wrappers/_base.py`), the weaviate MCP's
 writable-collections probe, `vco verify-diagrams`, the codegraph-resync
-spawn registration, `vco` (`launcher/tools/vct-cli`) and `vct`
+spawn registration, `vct-cli` (`launcher/tools/vct-cli`) and `vct`
 (`tools/vct-secrets`) — reacts to a
 **provable** refusal (401/403) by retrying **once** with the on-disk
 token when the two provably differ, preserving each call site's
@@ -136,19 +150,16 @@ refusal. The decision function is
 thirteen surfaces are mirrors, locked by
 `tests/test_stale_env_token_parity_v0291.py`.
 
-As of **v0.2.77 the global `hub.token` is REFUSED by default** on these two
-routes (`/env` + `/config`) — the one-release compatibility window that
-v0.2.76 opened is now closed by default. A per-project scoped token is
-required; a wrong-project token is always a hard `403`. If a bespoke caller
-still presents the global token and cannot migrate yet, set
-`VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true` / `TRUE` / `yes`) on the **hub
-process** to re-open the compat window for one more release, then restart the
-hub. Any other value — including **unset**, `0`, `false`, `no`, or a typo —
-**denies** (fail-closed); note that unset now DENIES (the opposite of the
-v0.2.76 default). This escape hatch will be removed in a future release. The
-hub lazy-mints a scoped token on the first request for a project added while
-it was running, so standard installs need nothing. POSIX and PowerShell
-resolvers behave identically — see the must-match triplet above.
+Since **v0.2.97 the global `hub.token` is REFUSED unconditionally** on
+these two routes (`/env` + `/config`). A per-project scoped token is
+required; a wrong-project token is always a hard `403`. (From v0.2.77 to
+v0.2.96 the opt-in env flag `VCT_HUB_LEGACY_GLOBAL_ENV` re-opened the
+global-token path for bespoke callers; it was removed in v0.2.97 — a hub
+started with it still set logs one removal notice at startup.) The
+hub lazy-mints a scoped token on the first request for a project added
+while it was running, so standard installs need nothing. POSIX and
+PowerShell resolvers behave identically — see the must-match triplet
+above.
 
 ---
 

@@ -2171,10 +2171,12 @@ pub fn run() {
             // v0.2.97: materialize the bundled core-module manifests into the
             // state dir (the hub does the same at its own start) — every
             // manifest reader looks there, and nothing used to write it.
-            if let Err(e) = vct_launcher_core::bundled_manifests::sync_bundled_manifests(
+            if let Some(warning) = vct_launcher_core::bundled_manifests::sync_bundled_manifests(
                 &crate::paths::vct_root_dir(),
-            ) {
-                tracing::warn!("[vct] could not materialize bundled manifests: {}", e);
+            )
+            .warning()
+            {
+                tracing::warn!("[vct] could not materialize bundled manifests: {}", warning);
             }
 
             // v0.2.18 Commit 3: OpenAI key startup recovery state machine.

@@ -53,10 +53,32 @@
 #       Print the project_id (UUID) registered for <folder>. Same exit
 #       codes (1=hub unreachable, 2=project not registered).
 #
+#   vct_secrets_resolve.sh resolve-many <project_id_or_folder> KEY [KEY...]
+#       (v0.2.97) Resolve several keys in ONE process — each through the
+#       same chain as the single-key form. The project is looked up ONCE,
+#       and once the hub is unreachable (or the time budget below is spent)
+#       it is not asked again for the remaining keys; tiers 2 and 3 still
+#       run for every key. Prints one `KEY=VALUE` line per RESOLVED key, in
+#       argument order; an unresolved key prints nothing. Keys must be
+#       env-var shaped ([A-Za-z_][A-Za-z0-9_]*, else exit 64). A value
+#       holding a line break cannot be one line: it is reported on stderr
+#       and treated as unresolved (exit 4) — use the single-key form for it.
+#       Exit 0 when every key resolved, else the single-key code of the
+#       FIRST key that did not.
+#       Used by the context-size-check hook (both its settings, one spawn).
+#
+# Time budget (v0.2.97): VCT_RESOLVE_MAX_TIME=<seconds>, up to three
+#   decimals (e.g. `1` or `0.5`), bounds the TOTAL time this invocation
+#   spends on the hub — connect + read, across every request it makes. Each
+#   request is capped at what is left (and at the usual 5 s); once nothing
+#   is left the hub is treated as unreachable and tiers 2 and 3 answer.
+#   Unset: every request keeps its own 5 s cap, as before. A value that is
+#   not a number is ignored with one stderr line.
+#
 # Hub discovery:
 #   1. $VCT_HUB_PORT env var (set by tests / dev launchers)
 #   2. ${VCT_STATE_DIR:-$HOME/.vct}/hub.port (written by the launcher
-#      on startup; mirrors `launcher/src-tauri/src/hub/server.rs`)
+#      on startup; mirrors `launcher/src-tauri/vct-hub/src/server.rs`)
 #   3. Default 7700 (matches `DEFAULT_PORT` in server.rs).
 #
 # Auth (H5, 2026-05-08):
@@ -65,7 +87,7 @@
 #     1. $VCT_HUB_TOKEN env var (tests / dev harnesses)
 #     2. ${VCT_STATE_DIR:-$HOME/.vct}/hub.token (written by the
 #        launcher on startup, mode 0o600 on Unix). Mirrors
-#        `launcher/src-tauri/src/hub/auth.rs::write_token_file`.
+#        `launcher/src-tauri/vct-hub/src/auth.rs::write_token_file`.
 #   If the token file is missing → exit 1 ("hub unreachable" — the
 #   launcher hasn't started yet, or it crashed before persisting the
 #   token). The hub also returns 401 if the token is wrong (e.g. file
@@ -121,6 +143,56 @@ set -euo pipefail
 # VCO-REWIRE-END: orchestrator-root-resolution
 
 err() { printf '[vct-secrets-resolve] %s\n' "$*" >&2; }
+
+# ── Time budget (VCT_RESOLVE_MAX_TIME) ──────────────────────────────────
+# Milliseconds since the epoch. $EPOCHREALTIME (bash 5+; its decimal mark
+# follows the locale) → GNU `date +%s%3N` → whole seconds (macOS's bash 3.2
+# + BSD date: coarser, still a bound). MUST MATCH the budget rule of
+# vct_secrets_resolve.ps1 (Get-HubRequestTimeoutMs).
+_now_ms() {
+    local t="${EPOCHREALTIME:-}"
+    if [[ -n "$t" ]]; then
+        t="${t/,/.}"
+        local whole="${t%%.*}" frac="${t#*.}000"
+        printf '%s' "$(( 10#$whole * 1000 + 10#${frac:0:3} ))"
+        return 0
+    fi
+    t=$(date +%s%3N 2>/dev/null || true)
+    if [[ "$t" =~ ^[0-9]+$ ]]; then
+        printf '%s' "$t"
+        return 0
+    fi
+    printf '%s' "$(( $(date +%s) * 1000 ))"
+}
+
+# The deadline of this invocation, in epoch ms; empty = no budget.
+_RESOLVE_DEADLINE_MS=""
+if [[ -n "${VCT_RESOLVE_MAX_TIME:-}" ]]; then
+    if [[ "$VCT_RESOLVE_MAX_TIME" =~ ^([0-9]+)(\.([0-9]{1,3}))?$ ]]; then
+        _budget_frac="${BASH_REMATCH[3]}000"
+        _RESOLVE_DEADLINE_MS=$(( $(_now_ms) + 10#${BASH_REMATCH[1]} * 1000 + 10#${_budget_frac:0:3} ))
+        unset _budget_frac
+    else
+        err "VCT_RESOLVE_MAX_TIME is not a number of seconds; ignored"
+    fi
+fi
+
+# The --max-time for the next hub request: 5 s, or what is left of the
+# budget when that is less. Returns 1 (nothing printed) when the budget is
+# spent — the caller treats that exactly like an unreachable hub.
+_hub_request_max_time() {
+    if [[ -z "$_RESOLVE_DEADLINE_MS" ]]; then
+        printf '5'
+        return 0
+    fi
+    local left=$(( _RESOLVE_DEADLINE_MS - $(_now_ms) ))
+    (( left > 0 )) || return 1
+    if (( left >= 5000 )); then
+        printf '5'
+    else
+        printf '%d.%03d' $(( left / 1000 )) $(( left % 1000 ))
+    fi
+}
 
 # ── Hub port discovery ──────────────────────────────────────────────────
 hub_port() {
@@ -286,8 +358,10 @@ _hub_curl() {
     # off argv. The `<<<` here-string gives us a single-line stdin
     # without an extra subshell.
     local url="$1" token="$2"
-    local body status
-    if ! body=$(curl --silent --show-error --max-time 5 \
+    local body status max_time
+    max_time=$(_hub_request_max_time) || return 1
+    if ! body=$(curl --silent --show-error --max-time "$max_time" \
+                     --connect-timeout "$max_time" \
                      --header @- \
                      --output - --write-out '\n%{http_code}' "$url" \
                      <<<"Authorization: Bearer ${token}" 2>&1); then
@@ -528,6 +602,13 @@ read_key_hub() {
         # resolve_project_id already printed the diagnostic (1 or 2).
         return $rc
     fi
+    read_key_hub_env "$pid" "$key"
+}
+
+# Tier 1 for an ALREADY-RESOLVED project id (resolve-many looks the project
+# up once and calls this per key). Same return codes as read_key_hub.
+read_key_hub_env() {
+    local pid="$1" key="$2" rc
     local result status body
     set +e
     # Per-project route → pass the resolved project id so hub_token
@@ -590,7 +671,7 @@ read_key_hub() {
             # (tier 2) + project .env (tier 3) — legitimate secrets tiers — so
             # a keychain-route refusal does not strand a file-store key; exit 5
             # only surfaces if those also miss.
-            err "hub returned 403 forbidden for $key (project $pid): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
+            err "hub returned 403 forbidden for $key (project $pid): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97."
             return 5
             ;;
         503)
@@ -781,23 +862,11 @@ dotenv_get() {
     return 1
 }
 
-# ── Main subcommand: read a single key through the full chain ───────────
-read_key() {
-    # $1 = project_id_or_folder, $2 = key.
-    # Chain: hub (tier 1) → file store (tier 2) → project .env (tier 3).
-    # The final exit code on all-miss is TIER 1's code, preserving the
-    # historical contract (exit 3 = key_not_active only after tiers 2
-    # and 3 also missed).
+# ── Tiers 2 + 3 for one key (shared by read_key and read_many) ──────────
+read_key_local() {
+    # $1 = project_id_or_folder, $2 = key. Prints the value; return 1 on miss.
     local pid_arg="$1" key="$2"
-    local val tier1_rc
-    set +e
-    val=$(read_key_hub "$pid_arg" "$key")
-    tier1_rc=$?
-    set -e
-    if [[ $tier1_rc -eq 0 ]]; then
-        printf '%s' "$val"
-        return 0
-    fi
+    local val
     # Tier 2: file store.
     set +e
     val=$(file_store_get "$pid_arg" "$key")
@@ -824,17 +893,105 @@ read_key() {
     else
         err "tier 3 (.env) skipped: first arg is a project id, not a folder — re-invoke with the project folder to consult its .env"
     fi
+    return 1
+}
+
+# ── Main subcommand: read a single key through the full chain ───────────
+read_key() {
+    # $1 = project_id_or_folder, $2 = key.
+    # Chain: hub (tier 1) → file store (tier 2) → project .env (tier 3).
+    # The final exit code on all-miss is TIER 1's code, preserving the
+    # historical contract (exit 3 = key_not_active only after tiers 2
+    # and 3 also missed).
+    local pid_arg="$1" key="$2"
+    local val tier1_rc
+    set +e
+    val=$(read_key_hub "$pid_arg" "$key")
+    tier1_rc=$?
+    set -e
+    if [[ $tier1_rc -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    set +e
+    val=$(read_key_local "$pid_arg" "$key")
+    local rc_local=$?
+    set -e
+    if [[ $rc_local -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
     err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
     return $tier1_rc
 }
 
+# ── resolve-many: several keys, one process (see Usage) ─────────────────
+# MUST MATCH Read-Many in vct_secrets_resolve.ps1.
+read_many() {
+    local pid_arg="$1"
+    shift
+    local key
+    for key in "$@"; do
+        if ! [[ "$key" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+            err "resolve-many: not an env-var-shaped key name: $key"
+            return 64
+        fi
+    done
+    # The project is looked up ONCE; its code stands for tier 1 of every key
+    # until a key's own tier-1 answer says otherwise.
+    local pid hub_rc
+    set +e
+    pid=$(resolve_project_id "$pid_arg")
+    hub_rc=$?
+    set -e
+    local first_miss=0 val rc
+    for key in "$@"; do
+        rc=$hub_rc
+        val=""
+        if [[ $hub_rc -eq 0 ]]; then
+            set +e
+            val=$(read_key_hub_env "$pid" "$key")
+            rc=$?
+            set -e
+            # The hub stopped answering (or the budget is spent): do not
+            # wait on it again for the remaining keys.
+            [[ $rc -eq 1 ]] && hub_rc=1
+        fi
+        if [[ $rc -ne 0 ]]; then
+            set +e
+            val=$(read_key_local "$pid_arg" "$key")
+            local rc_local=$?
+            set -e
+            if [[ $rc_local -eq 0 ]]; then
+                rc=0
+            else
+                err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+            fi
+        fi
+        if [[ $rc -eq 0 && ( "$val" == *$'\n'* || "$val" == *$'\r'* ) ]]; then
+            err "resolve-many: the value of $key holds a line break and cannot be printed as one KEY=VALUE line — resolve it with the single-key form"
+            rc=4
+        fi
+        if [[ $rc -eq 0 ]]; then
+            printf '%s=%s\n' "$key" "$val"
+        elif [[ $first_miss -eq 0 ]]; then
+            first_miss=$rc
+        fi
+    done
+    return $first_miss
+}
+
 # ── Entry point ─────────────────────────────────────────────────────────
 main() {
-    if [[ $# -lt 2 ]]; then
+    if [[ $# -lt 2 || ( "$1" == "resolve-many" && $# -lt 3 ) ]]; then
         cat >&2 <<EOF
 Usage:
   $0 <project_id_or_folder> <secret_key>
   $0 resolve-project <folder>
+  $0 resolve-many <project_id_or_folder> KEY [KEY...]
+      (one KEY=VALUE line per resolved key)
+
+VCT_RESOLVE_MAX_TIME=<seconds> bounds the total time spent on the hub.
 
 Resolution chain: hub (keychain) -> file store (~/.vct-secrets) ->
 project .env (read-only; folder arg only).
@@ -853,6 +1010,10 @@ EOF
     case "$1" in
         resolve-project)
             resolve_project_id "$2"
+            ;;
+        resolve-many)
+            shift
+            read_many "$@"
             ;;
         *)
             read_key "$1" "$2"

@@ -559,12 +559,15 @@ mod tests {
 
     /// R1 (v0.2.91): pin `$RL_EVENTS_ARCHIVE_DIR` at a temp dir for the life of
     /// a prune test so the hermetic suite never deposits a retention sidecar in
-    /// the developer's real `~/.vct/rl_archive`. `--test-threads=1` (pinned by
-    /// `scripts/test-keychain-safe.sh`) makes the process-global env mutation
-    /// safe here. Restores the prior value on drop.
+    /// the developer's real `~/.vct/rl_archive`. The shared `env_guard` sets it,
+    /// holds GLOBAL_ENV_MUTEX while the guard lives and restores the prior value
+    /// on drop (v0.2.97 review R6: this used to rely on `--test-threads=1`,
+    /// which the plain `cargo test` gate does not pass).
     struct ArchiveDirGuard {
+        // Field order is drop order: the env comes back (and the lock is
+        // released) before the directory it pointed at is removed.
+        _env: vct_launcher_core::test_env::EnvGuard,
         _dir: tempfile::TempDir,
-        prev: Option<String>,
         path: std::path::PathBuf,
     }
 
@@ -572,10 +575,9 @@ mod tests {
         fn new() -> Self {
             let dir = tempfile::tempdir().expect("temp archive dir");
             let key = vct_launcher_core::db::rl_events::RL_ARCHIVE_DIR_ENV;
-            let prev = std::env::var(key).ok();
-            std::env::set_var(key, dir.path());
             let path = dir.path().to_path_buf();
-            Self { _dir: dir, prev, path }
+            let env = vct_launcher_core::test_env::env_guard(&[(key, Some(&*path.to_string_lossy()))]);
+            Self { _env: env, _dir: dir, path }
         }
 
         /// Published (non-`.pending`) archive sidecars currently in the dir.
@@ -594,16 +596,6 @@ mod tests {
                         .collect()
                 })
                 .unwrap_or_default()
-        }
-    }
-
-    impl Drop for ArchiveDirGuard {
-        fn drop(&mut self) {
-            let key = vct_launcher_core::db::rl_events::RL_ARCHIVE_DIR_ENV;
-            match &self.prev {
-                Some(v) => std::env::set_var(key, v),
-                None => std::env::remove_var(key),
-            }
         }
     }
 

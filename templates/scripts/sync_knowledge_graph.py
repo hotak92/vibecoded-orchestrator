@@ -5881,9 +5881,12 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
                 "python templates/scripts/sync_knowledge_graph.py --all"
             ),
             severity="warning",
-            kg_node_refs=[
-                "knowledge/concepts/embedding-service-v0218.md",
-            ],
+            # v0.2.97: this used to list a maintainer-private
+            # embedding-service node no install ships, so the deferral
+            # promised a file the user cannot open. The facts live
+            # inline above (why_deferred) and in the failures JSONL it
+            # already points at; no curated node covers this topic.
+            kg_node_refs=[],
         )
         emit(install_root, entry)
     except Exception as inner:

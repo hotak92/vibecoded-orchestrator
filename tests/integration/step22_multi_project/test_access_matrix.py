@@ -522,15 +522,14 @@ def test_resolver_client_script_returns_same_json(
 @pytest.fixture(scope="module")
 def compat_hub() -> Iterator[tuple[FixtureResult, HubProc]]:
     """A SEPARATE fixture + hub spawned with
-    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` so the one-release global-token compat
-    window is REOPENED on this hub. It uses its own sandbox state-dir (the
-    hub's per-state-dir lockfile forbids two live hubs sharing one), so it
-    coexists with the module ``hub`` fixture.
+    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` still set. It uses its own sandbox
+    state-dir (the hub's per-state-dir lockfile forbids two live hubs
+    sharing one), so it coexists with the module ``hub`` fixture.
 
-    This is the ONE case that proves the deprecation flag stays FUNCTIONAL
-    after the flip: the global ``hub.token`` must still authorize the
-    per-project routes when an operator opts back in. Every OTHER test in
-    this file uses the SCOPED token (the post-flip default reality).
+    v0.2.97 removal pin: the variable is DEAD — setting it must change
+    nothing (the global token stays refused) and the hub logs one removal
+    notice at startup. Every OTHER test in this file uses the SCOPED token
+    (the default and only reality since the compat window closed).
     """
     if os.environ.get("VCO_CI_FIXTURE", "") != "1":
         pytest.skip("Step 22 integration tests require VCO_CI_FIXTURE=1")
@@ -566,29 +565,50 @@ def compat_hub() -> Iterator[tuple[FixtureResult, HubProc]]:
             print(n, file=sys.stderr)
 
 
-def test_global_token_still_allowed_under_compat_flag(
+def test_global_token_refused_even_with_legacy_env_set(
     compat_hub: tuple[FixtureResult, HubProc],
 ) -> None:
-    """Deprecation-allow: with ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` set on the
-    hub, the GLOBAL ``hub.token`` still authorizes ``/config`` (the
-    one-release compat window). This must remain green after the flip —
-    the flag is the operator's migration escape hatch.
+    """v0.2.97 removal pin: with ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` still set
+    on the hub, the variable changes NOTHING. The global ``hub.token``
+    never authenticates a per-project route on its own:
+
+    * a project the hub does NOT know → hard 403 (no rescue, no compat);
+    * a DB-known project → the 200 that the pre-v0.2.97 compat window
+      used to grant now comes ONLY from the lazy-mint rescue, which also
+      (re)writes the scoped ``hub.token.<project_id>`` the next call
+      uses — so the acceptance is attributable to the rescue, never to
+      the removed variable.
     """
     fx, chub = compat_hub
     p = fx.projects[0]
-    # Present the GLOBAL token (chub.token) — NOT the scoped one — on the
-    # per-project route. Under the compat flag this is accepted (200).
-    url = f"{chub.base_url()}/projects/{p.project_id}/config"
+
+    # 1) Unknown project id: global token → hard 403 (rescue refuses
+    #    unknown ids; the compat window that used to accept this bearer
+    #    is gone).
+    unknown_id = "00000000-0000-0000-0000-000000000000"
+    url = f"{chub.base_url()}/projects/{unknown_id}/config"
     req = urllib.request.Request(
         url, headers={"Authorization": f"Bearer {chub.token}"}
     )
-    with urllib.request.urlopen(req, timeout=5) as resp:
-        assert resp.status == 200, "global token must be accepted under the compat flag"
-        body = json.loads(resp.read())
-    assert body["project_id"] == p.project_id
+    try:
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            pytest.fail(
+                f"global token must be refused for an unknown project; "
+                f"got {resp.status}"
+            )
+    except urllib.error.HTTPError as exc:
+        assert exc.code == 403, f"expected 403, got {exc.code}"
 
-    # Sanity: the SCOPED token also works on the compat hub (the flag only
-    # RE-ADMITS the global token; it never disables the scoped path).
+    # 2) The SCOPED token still works — the removal only killed the
+    #    global-token path. (A DB-known project presenting the GLOBAL
+    #    token is deliberately NOT asserted as 403 end-to-end: the
+    #    lazy-mint rescue converts that presentation into a scoped
+    #    mint + proceed by design — pinned in the Rust unit tests
+    #    (`lazy_mint_rescues_db_known_project_presenting_global_token`).
+    #    Step 1 is the discriminator: the removed compat arm never
+    #    consulted the DB, so under the old code this very request —
+    #    flag set, global bearer, unknown id — PASSED AUTH and died in
+    #    the handler with a 404, never a 403.)
     status, scoped_body = _hub_get(
         chub, f"projects/{p.project_id}/config", project_id=p.project_id
     )

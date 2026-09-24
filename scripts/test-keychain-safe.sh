@@ -39,7 +39,8 @@
 # Per the Track E brief: switch to `cargo test --workspace --tests` so all
 # four workspace members are exercised. The vct-cli crate is a separate
 # Cargo workspace (launcher/tools/vct-cli/) — covered by a sibling step
-# in ci.yml that invokes this script with VCT_CLI=1.
+# in ci.yml that runs `cargo test --tests --manifest-path
+# launcher/tools/vct-cli/Cargo.toml` directly (this script has no VCT_CLI mode).
 #
 # Retry policy for adopt_populated:
 #   The `adopt_populated` test in vct-launcher-core has been observed to

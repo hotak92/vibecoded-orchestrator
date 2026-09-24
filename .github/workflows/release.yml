@@ -16,7 +16,7 @@
 #      - Windows x64:  vibecoded-orchestrator-<version>-windows-x64.zip
 #      - macOS arm64:  vibecoded-orchestrator-<version>-macos-arm64.tar.gz
 #      Each archive contains:
-#        - launcher binary + vct-cli (vco) binary
+#        - launcher binary + vct-cli binary
 #        - claude_mcp_servers/ (Python MCP stack — venv stripped)
 #        - templates/ (agents, skills, hooks templates)
 #        - .claude/ (hooks, scripts, settings.json — no runtime state)
@@ -868,18 +868,18 @@ jobs:
           esac
           ls -lh "$stage"
 
-      # Build the vct-cli (`vco`) binary that ships alongside the launcher.
+      # Build the `vct-cli` binary that ships alongside the launcher.
       # Separate Cargo workspace at launcher/tools/vct-cli/Cargo.toml. The
-      # binary name is `vco` (renamed from `vct` to avoid collision with
-      # the bash secrets tool at tools/vct-secrets/vct — see
-      # launcher/tools/vct-cli/Cargo.toml `[[bin]] name = "vco"` for the
-      # rationale and docs/CLI.md for the user-facing rename note).
+      # binary was `vco` until v0.2.96; it is `vct-cli` because `vco` is the
+      # Python console script pyproject.toml registers and `vct` is the bash
+      # secrets tool at tools/vct-secrets/vct — see the `[[bin]]` comment in
+      # launcher/tools/vct-cli/Cargo.toml and launcher/docs/CLI.md.
       #
       # We don't reuse `Swatinem/rust-cache` for this build — the
       # workspace is only ~7 deps and the build is sub-30s on a cold
       # cache. Adding a second cache entry would risk cache thrash with
       # the launcher's much larger entry above.
-      - name: Build vct-cli (vco) binary
+      - name: Build vct-cli binary
         shell: bash
         run: |
           cargo build --release \
@@ -996,25 +996,25 @@ jobs:
             chmod +x "$stage_root/${HUB_BINARY}"
           fi
 
-          # 2. vct-cli (vco) binary
+          # 2. vct-cli binary
           if [ "${MATRIX_TARGET}" = "windows-x64" ]; then
-            vco_src="launcher/tools/vct-cli/target/release/vco.exe"
-            vco_dst="$stage_root/vco.exe"
+            cli_src="launcher/tools/vct-cli/target/release/vct-cli.exe"
+            cli_dst="$stage_root/vct-cli.exe"
           else
-            vco_src="launcher/tools/vct-cli/target/release/vco"
-            vco_dst="$stage_root/vco"
+            cli_src="launcher/tools/vct-cli/target/release/vct-cli"
+            cli_dst="$stage_root/vct-cli"
           fi
-          if [ ! -f "$vco_src" ]; then
-            echo "::error::Expected vct-cli binary at $vco_src"
+          if [ ! -f "$cli_src" ]; then
+            echo "::error::Expected vct-cli binary at $cli_src"
             ls -la launcher/tools/vct-cli/target/release/ || true
             exit 1
           fi
-          cp "$vco_src" "$vco_dst"
+          cp "$cli_src" "$cli_dst"
           # Preserve executable bit on Unix (rsync below also preserves
           # it for the directory copies, but a direct cp drops it on
           # some host configurations).
           if [ "${MATRIX_TARGET}" != "windows-x64" ]; then
-            chmod +x "$stage_root/${MATRIX_BINARY}" "$vco_dst"
+            chmod +x "$stage_root/${MATRIX_BINARY}" "$cli_dst"
           fi
 
           # 3. Subtree copies — claude_mcp_servers, templates, .claude,

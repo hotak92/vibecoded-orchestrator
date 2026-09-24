@@ -874,7 +874,7 @@
       }
     },
     "GpuImageVariants": {
-      "description": "Per-GPU-mode image tag variants. Each variant ships as a separate OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`) because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at pip-install time. See `knowledge/concepts/gpu-mode-decision-policy.md` > \"Why CUDA wheels vs ROCm wheels need different containers\" for the full rationale.\n\nAll three variants are REQUIRED when the block is present — the launcher would have no fallback if one were missing. Modules that only ship a CPU build should simply omit `gpu_image_variants` and rely on the legacy single-tag path.",
+      "description": "Per-GPU-mode image tag variants. Each variant ships as a separate OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`) because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at pip-install time — one container cannot serve two wheel families, so there is nothing to derive: every variant a module ships is built and pinned independently.\n\nAll three variants are REQUIRED when the block is present — the launcher would have no fallback if one were missing. Modules that only ship a CPU build should simply omit `gpu_image_variants` and rely on the legacy single-tag path.",
       "type": "object",
       "required": [
         "cpu",

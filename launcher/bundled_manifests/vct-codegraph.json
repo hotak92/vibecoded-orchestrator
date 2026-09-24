@@ -33,7 +33,7 @@
   "install": {
     "method": "local",
     "install_dir": "{VCT_MODULES}/vct-kg",
-    "_note": "Code graph lives inside the same orchestrator repo as vct-kg. Installing vct-kg already brings the code graph scripts; this module just registers them as a separate named MCP capability for the Store/Dashboard UI."
+    "_note": "Code graph lives inside the same orchestrator repo as vct-kg. Installing vct-kg already brings the code graph scripts; this module describes them as a separate capability for the Store/Dashboard UI."
   },
 
   "secrets": [],
@@ -53,22 +53,16 @@
   "runtime": {
     "type": "cli",
     "command": "{install_dir}/.venv/bin/python",
-    "args": ["{install_dir}/.claude/scripts/analyze_code_graph.py", "--help"],
+    "args": ["{install_dir}/templates/scripts/analyze_code_graph.py", "--help"],
     "platform_command": {
       "windows": "{install_dir}\\.venv\\Scripts\\python.exe"
     },
     "cwd": "{install_dir}",
     "env_from_settings": ["CODE_EMBED_BACKEND"],
-    "_note": "Code graph is invoked on demand (analyze_code_graph.py / query_code_graph.py) rather than as a long-running process. The MCP entry points live in vct-kg's weaviate_mcp/server.py."
+    "_note": "Code graph is invoked on demand (templates/scripts/analyze_code_graph.py / templates/scripts/query_code_graph.py, delivered to each project as .claude/scripts/) rather than as a long-running process. The MCP entry points live in vct-kg's claude_mcp_servers/weaviate_mcp/server.py."
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "mcp_name": "codegraph",
-    "target_projects": "all",
-    "scope": "user",
-    "_note": "Disabled by default; tools are already exposed via weaviate-kg MCP. Turn on only for a separate CLI workflow."
-  },
+  "_mcp_note": "No MCP of its own, so no mcp_registration: search_code_graph and query_code_structure are tools of the weaviate-kg MCP, which vct-kg (a depends_on of this module) serves and registers. This block used to register a `codegraph` MCP that no module or bundled server provides. It must not name weaviate-kg instead: uninstall deregisters the MCP an mcp_registration names, so uninstalling this module would remove vct-kg's MCP.",
 
   "upgrade": {
     "strategy": "git_pull"
@@ -77,15 +71,15 @@
   "uninstall": {
     "remove_install_dir": false,
     "preserve_paths": [],
-    "deregister_mcp": true,
-    "_note": "Shared install_dir with vct-kg — do not remove the dir on uninstall."
+    "deregister_mcp": false,
+    "_note": "Shared install_dir with vct-kg — do not remove the dir on uninstall. No MCP to deregister: the code graph tools belong to vct-kg's weaviate-kg MCP."
   },
 
   "provides": [
     {
       "kind": "mcp_tools",
-      "tool_prefix": "codegraph",
-      "description": "search_code_graph, query_code_structure (dependencies/callers/methods/interactions)"
+      "tool_prefix": "weaviate-kg",
+      "description": "search_code_graph, query_code_structure (dependencies/callers/methods/interactions) — served by the weaviate-kg MCP that vct-kg registers"
     }
   ]
 }

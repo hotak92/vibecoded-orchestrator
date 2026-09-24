@@ -128,7 +128,8 @@ Usage:
 Environment:
   VCT_STATE_DIR  Override the launcher state-root (default: ~/.vct/).
                  Affects hub.pid, hub.port, hub.token, etc.
-  VCT_HUB_PORT   Bind port (default: 7700).
+  VCT_HUB_PORT   Bind port. Overrides the vct-hub-api module's global
+                 VCT_HUB_PORT setting (launcher.db); default 7700.
 "
 }
 

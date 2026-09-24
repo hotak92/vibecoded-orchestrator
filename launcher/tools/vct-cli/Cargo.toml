@@ -5,11 +5,15 @@ edition = "2021"
 description = "Command-line interface for the VCT Launcher (escape hatch for power users / CI)."
 
 [[bin]]
-# Renamed from `vct` to `vco` to avoid colliding with the bash secrets tool
-# at tools/vct-secrets/vct (which predates this CLI and is already widely
-# integrated with git credentials, MCP launchers, etc.). `vco` matches the
-# `vibecoded-orchestrator` repo name. See docs/CLI.md.
-name = "vco"
+# The binary is named after its crate, like vct-hub / vct-launcher /
+# vct-updater. History: first `vct`, renamed to `vco` in v0.1.0 because `vct`
+# is the bash secrets tool (tools/vct-secrets/vct); renamed to `vct-cli` in
+# v0.2.97 because `vco` is the Python console script `pyproject.toml`
+# registers (`vco doctor`, `vco project move`, ...), and both defined
+# `vco project`, so whichever came first on PATH hid the other.
+# tests/test_v0297_cli_program_names.py fails if two shipped programs share a
+# command name. See launcher/docs/CLI.md (repo-root relative).
+name = "vct-cli"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,7 +23,7 @@ serde = { version = "1", features = ["derive"] }
 # v0.2.92 (WP-19). MUST MATCH the `serde_json` entry in
 # `launcher/src-tauri/Cargo.toml` [workspace.dependencies]. This crate is a
 # SEPARATE workspace (its own Cargo.lock), so it cannot inherit and a
-# feature added there does not reach here. `preserve_order` keeps `vco`'s
+# feature added there does not reach here. `preserve_order` keeps `vct-cli`'s
 # `--json` output in the order the hub sent it instead of alphabetising it.
 # Lockstep is pinned by
 # `launcher/src-tauri/tests/serde_json_preserve_order.rs`.

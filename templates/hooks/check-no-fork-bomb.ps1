@@ -11,7 +11,8 @@
 # wrapper would manifest the same way (lean-ctx process count blowing
 # past anything legitimate). This hook is the safety net for either OS.
 #
-# See knowledge/concepts/lean-ctx-shim-disabled.md for forensics.
+# (A fuller forensic write-up exists in the maintainer's private KG; it does
+# not ship with the orchestrator.)
 
 # Ported from sibling .sh in PR-32 (Group K Phase B): scrub sensitive env
 # vars before any subprocess spawning — defence-in-depth parity with every
@@ -58,7 +59,7 @@ $hookTag = "[check-no-fork-bomb $ts]"
 
 [Console]::Error.WriteLine("$hookTag Fork-bomb detected: $count lean-ctx processes (threshold $threshold).")
 [Console]::Error.WriteLine("$hookTag Killing all lean-ctx processes for the current user...")
-[Console]::Error.WriteLine("$hookTag See knowledge/concepts/lean-ctx-shim-disabled.md for context.")
+[Console]::Error.WriteLine("$hookTag Context: the pre-0.2.11 BASH_ENV lean-ctx shim could recurse into this; it was removed in 0.2.11 and replaced by the PreToolUse lean-ctx-rewrite hook.")
 
 # Stop-Process -Force = SIGKILL-equivalent. By default Stop-Process
 # operates on processes the current session can signal — i.e. owned by

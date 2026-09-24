@@ -9,9 +9,11 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import {
+  DEFAULT_UNREGISTER_OPTIONS,
   UNREGISTER_ANYWAY_LABEL,
   UNREGISTER_STOPPED_PREFIX,
   isUnregisterStopped,
+  quickUnregister,
   runUnregister,
 } from './unregister-escape';
 import type { UnregisterOptions, UnregisterReport } from '$lib/types/launcher';
@@ -63,11 +65,11 @@ describe('the unregister stop and its escape', () => {
       throw STOP;
     });
     const ask = vi.fn(async () => false);
-    const out = await runUnregister(del, null, ask);
+    const out = await runUnregister(del, { ...DEFAULT_UNREGISTER_OPTIONS }, ask);
     expect(out).toEqual({ kind: 'kept', message: STOP });
     expect(ask).toHaveBeenCalledWith(STOP);
     expect(del).toHaveBeenCalledTimes(1);
-    expect(del.mock.calls[0][0]).toBeNull();
+    expect(del.mock.calls[0][0]).toEqual({ ...DEFAULT_UNREGISTER_OPTIONS, leaveUnremovable: false });
   });
 
   it('"Unregister anyway" re-runs with leaveUnremovable and keeps the other options', async () => {
@@ -91,7 +93,47 @@ describe('the unregister stop and its escape', () => {
       throw 'project p1 not found';
     });
     const ask = vi.fn(async () => true);
-    await expect(runUnregister(del, null, ask)).rejects.toBe('project p1 not found');
+    await expect(runUnregister(del, { ...DEFAULT_UNREGISTER_OPTIONS }, ask)).rejects.toBe(
+      'project p1 not found',
+    );
     expect(ask).not.toHaveBeenCalled();
+  });
+});
+
+describe("the project list's quick unregister (review R6 F46)", () => {
+  it('is the settings page default unregister: launcher files purged, collections kept', async () => {
+    expect(DEFAULT_UNREGISTER_OPTIONS).toEqual({ purgeLauncherFiles: true, purgeCollections: false });
+    const del = vi.fn(async (_o: UnregisterOptions) => report());
+    await quickUnregister(del, async () => true);
+    expect(del.mock.calls[0][0]).toEqual({
+      purgeLauncherFiles: true,
+      purgeCollections: false,
+      leaveUnremovable: false,
+    });
+  });
+
+  it('its stop offers the escape, and the escape differs ONLY by leaveUnremovable', async () => {
+    const del = vi
+      .fn(async (_o: UnregisterOptions) => report({ leftInPlace: ['OPENAI_API_KEY in .claude/env'] }))
+      .mockImplementationOnce(async () => {
+        throw STOP;
+      });
+    const ask = vi.fn(async () => true);
+    const out = await quickUnregister(del, ask);
+    expect(ask).toHaveBeenCalledWith(STOP);
+    expect(out.kind).toBe('done');
+    expect(del).toHaveBeenCalledTimes(2);
+    const [first, second] = del.mock.calls.map((c) => c[0]);
+    expect({ ...second, leaveUnremovable: false }).toEqual(first);
+    expect(second.leaveUnremovable).toBe(true);
+  });
+
+  it('its stop stands when the user keeps the project', async () => {
+    const del = vi.fn(async (_o: UnregisterOptions) => {
+      throw STOP;
+    });
+    const out = await quickUnregister(del, async () => false);
+    expect(out).toEqual({ kind: 'kept', message: STOP });
+    expect(del).toHaveBeenCalledTimes(1);
   });
 });

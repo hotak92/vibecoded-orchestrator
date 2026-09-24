@@ -102,24 +102,13 @@ mod tests {
     use tracing::Level;
 
     /// Restores `VCO_LOG_LEVEL` to whatever the runner had, so a test that
-    /// sets it cannot leak into a sibling.
-    struct EnvGuard(Option<std::ffi::OsString>);
+    /// sets it cannot leak into a sibling — through the shared
+    /// `test_env::env_guard`, which also holds GLOBAL_ENV_MUTEX while it
+    /// lives (v0.2.97 review R6: this guard used to hold no lock at all).
+    struct EnvGuard(#[allow(dead_code)] vct_launcher_core::test_env::EnvGuard);
     impl EnvGuard {
         fn set(value: Option<&str>) -> Self {
-            let guard = EnvGuard(std::env::var_os(core_logging::LOG_LEVEL_ENV));
-            match value {
-                Some(v) => std::env::set_var(core_logging::LOG_LEVEL_ENV, v),
-                None => std::env::remove_var(core_logging::LOG_LEVEL_ENV),
-            }
-            guard
-        }
-    }
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            match self.0.take() {
-                Some(v) => std::env::set_var(core_logging::LOG_LEVEL_ENV, v),
-                None => std::env::remove_var(core_logging::LOG_LEVEL_ENV),
-            }
+            EnvGuard(vct_launcher_core::test_env::env_guard(&[(core_logging::LOG_LEVEL_ENV, value)]))
         }
     }
 

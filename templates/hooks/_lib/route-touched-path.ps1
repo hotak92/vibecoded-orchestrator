@@ -517,14 +517,30 @@ try {
         # against DEVELOPMENT_COLLECTION (the docs/ target).
         # 2026-06-18: debounced (same coalesce semantics + sync-time gate as
         # the knowledge/ branch above).
-        $venvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-        $uploadScript = Join-Path $ProjectRoot ".claude/scripts/upload_docs.py"
-        if ($venvPy -and (Test-Path $uploadScript)) {
-            $pyEsc = $venvPy -replace "'", "''"
-            $upEsc = $uploadScript -replace "'", "''"
-            $efEsc = $Path -replace "'", "''"
-            $docsSyncExpr = "& '$pyEsc' '$upEsc' '$efEsc' *> `$null"
-            $docsCmd = Build-GatedSyncCommand -Project $VctProjectId -Collection $Env:DEVELOPMENT_COLLECTION -SyncExpr $docsSyncExpr
+        # v0.2.97 (promise sweep B1): this branch used to invoke the
+        # retired upload_docs.py — a script nothing ships, so Windows docs
+        # auto-sync silently never ran. Mirror
+        # the .sh sibling exactly: route docs/*.md through kg-sync
+        # (kg-sync.ps1 preferred, bash kg-sync fallback), which targets the
+        # development collection the same way the bash branch does.
+        $relPath = $Path
+        if ($Path.StartsWith($ProjectRoot, [StringComparison]::OrdinalIgnoreCase)) {
+            $relPath = $Path.Substring($ProjectRoot.Length).TrimStart('\','/')
+        }
+        $kgSyncPs1 = Join-Path $ProjectRoot ".claude/scripts/kg-sync.ps1"
+        $kgSyncSh = Join-Path $ProjectRoot ".claude/scripts/kg-sync"
+        $relEsc = $relPath -replace "'", "''"
+        $syncExpr = $null
+        if (Test-Path $kgSyncPs1) {
+            $ps1Esc = $kgSyncPs1 -replace "'", "''"
+            $psEscape = $PsExe -replace "'", "''"
+            $syncExpr = "& '$psEscape' -NoProfile -File '$ps1Esc' '$relEsc' *> `$null"
+        } elseif ((Test-Path $kgSyncSh) -and (Get-Command bash -ErrorAction SilentlyContinue)) {
+            $shEsc = $kgSyncSh -replace "'", "''"
+            $syncExpr = "& bash '$shEsc' '$relEsc' *> `$null"
+        }
+        if ($syncExpr) {
+            $docsCmd = Build-GatedSyncCommand -Project $VctProjectId -Collection $Env:DEVELOPMENT_COLLECTION -SyncExpr $syncExpr
             Invoke-KgDebounceSchedule -ProjectRoot $ProjectRoot -FilePath $Path -WorkingDir $ProjectRoot -Command $docsCmd -Channel "docs"
         }
     }

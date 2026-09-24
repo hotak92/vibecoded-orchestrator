@@ -564,6 +564,26 @@ that is what re-renders the registration, now verifying the argv before it \
 writes. No dismiss_key: an unrunnable registration is a real break, not a \
 description of the machine to acknowledge."""
 
+[conditions.former_launcher_cli_on_path]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:former_launcher_cli_still_on_path"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97. The launcher's Rust CLI was `vco` until v0.2.96 — the name \
+of the orchestrator's Python console script — and `vct` before v0.1.0 (now the \
+secrets tool); it is `vct-cli` since v0.2.97. A copy left on PATH under an old \
+name hides, or is hidden by, the real program of that name, so "run \
+`vco doctor`" answers "unrecognized subcommand". The doctor's \
+`former_launcher_cli` probe (install root, full scope) identifies each `vco` / \
+`vct` on PATH by what it prints — `--version` = "<name> <digit>" AND `-h` \
+carries the CLI's tagline — through `vco_lib.launcher_cli_identity`, the same \
+rule `launcher/tools/vct-cli/install.sh` uses to remove the copy it installed. \
+The doctor never deletes a binary. The clear probe re-runs the reading: first \
+on the paths the entry names (so a PATH that differs from the user's shell \
+cannot clear it), then on the current PATH. action_required: removing the copy \
+is the user's act. No dismiss_key — keeping it is a dismissal with manual \
+semantics."""
+
 [conditions.code_embed_image_stale]
 class = "action_required"
 owner = "vco_lib.doctor"

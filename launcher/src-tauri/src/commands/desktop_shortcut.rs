@@ -304,6 +304,9 @@ mod tests {
         // env::set_var is global to the process — serialize the
         // XDG/HOME-mutating tests via the dedicated mutex below.
         let _g = crate::secrets::test_serialize::keychain_serialize_lock();
+        // Then THE env lock (review R6) — keychain first, env second, the
+        // one order every test that takes both uses (see dashboard::tests).
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev_home = std::env::var_os("HOME");
         let prev_xdg = std::env::var_os("XDG_DATA_HOME");
         let prev_optout = std::env::var_os("VCT_NO_DESKTOP_ICON");
@@ -341,6 +344,9 @@ mod tests {
         std::fs::create_dir_all(&home).unwrap();
 
         let _g = crate::secrets::test_serialize::keychain_serialize_lock();
+        // Then THE env lock (review R6) — keychain first, env second, the
+        // one order every test that takes both uses (see dashboard::tests).
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev_home = std::env::var_os("HOME");
         let prev_optout = std::env::var_os("VCT_NO_DESKTOP_ICON");
         std::env::set_var("HOME", &home);
@@ -359,10 +365,10 @@ mod tests {
         assert!(!on_desktop.exists(), "opt-out must skip Desktop write");
     }
 
-    // HOME/XDG_DATA_HOME mutations are serialized via the shared
-    // `crate::secrets::test_serialize::keychain_serialize_lock` mutex so
-    // we don't race against the dashboard tests' EnvGuard (which also
-    // mutates HOME). A module-private mutex would only block intra-module
-    // races and would still race vs dashboard::tests cross-module — that
-    // race was the cause of a flaky cargo-test pre-merge.
+    // HOME/XDG_DATA_HOME mutations hold the shared
+    // `crate::secrets::test_serialize::keychain_serialize_lock` mutex AND
+    // then GLOBAL_ENV_MUTEX (`test_env::env_lock`), in that order — the order
+    // dashboard::tests uses. A module-private mutex would only block
+    // intra-module races — that race was the cause of a flaky cargo-test
+    // pre-merge — and since review R6 every env mutation holds the global one.
 }

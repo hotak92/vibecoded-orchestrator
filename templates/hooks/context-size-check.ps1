@@ -24,18 +24,41 @@ $ProjectDir = if ($env:CLAUDE_PROJECT_DIR) { $env:CLAUDE_PROJECT_DIR } else { (G
 # shipped resolver .claude/scripts/vct_secrets_resolve.ps1 (hub -> file store ->
 # the project's .env) -> the default; outside 50..2000 or not a number -> the
 # default. MUST MATCH resolve_threshold in context-size-check.sh.
+#
+# Cost (v0.2.97, review R6 F51): ONE resolver child for whichever settings the
+# environment does not set (`resolve-many`) -- it was one full PowerShell
+# start-up per key -- with its hub time bounded by VCT_RESOLVE_MAX_TIME=1, so
+# a hub port that accepts and then hangs costs at most ~1 s (it was up to
+# 2 x 5 s); after that the file store / .env / defaults answer, silently.
+$ResolvedSettings = @{}
+$UnsetSettings = @(@('CONTEXT_STATE_MAX_LINES', 'MEMORY_MAX_LINES') |
+    Where-Object { -not [Environment]::GetEnvironmentVariable($_) })
+if ($UnsetSettings.Count -gt 0) {
+    $resolver = Join-Path $PSScriptRoot "../scripts/vct_secrets_resolve.ps1"
+    if (Test-Path $resolver) {
+        # A child process: the resolver writes its answer with
+        # [Console]::Out.Write, which an in-process `&` call cannot capture.
+        $pwshExe = (Get-Process -Id $PID).Path
+        $priorBudget = $env:VCT_RESOLVE_MAX_TIME
+        $env:VCT_RESOLVE_MAX_TIME = "1"
+        try {
+            $resolvedLines = & $pwshExe -NoProfile -File $resolver resolve-many $ProjectDir $UnsetSettings 2>$null
+        } catch {
+            $resolvedLines = @()
+        } finally {
+            if ($null -eq $priorBudget) { Remove-Item Env:VCT_RESOLVE_MAX_TIME -ErrorAction SilentlyContinue }
+            else { $env:VCT_RESOLVE_MAX_TIME = $priorBudget }
+        }
+        foreach ($line in @($resolvedLines)) {
+            if ("$line" -match '^([A-Za-z_][A-Za-z0-9_]*)=(.*)$') { $ResolvedSettings[$Matches[1]] = $Matches[2] }
+        }
+    }
+}
+
 function Resolve-Threshold {
     param([string]$Key, [int]$Default)
     $value = [Environment]::GetEnvironmentVariable($Key)
-    if (-not $value) {
-        $resolver = Join-Path $PSScriptRoot "../scripts/vct_secrets_resolve.ps1"
-        if (Test-Path $resolver) {
-            # A child process: the resolver writes its answer with
-            # [Console]::Out.Write, which an in-process `&` call cannot capture.
-            $pwshExe = (Get-Process -Id $PID).Path
-            try { $value = (& $pwshExe -NoProfile -File $resolver $ProjectDir $Key 2>$null | Select-Object -First 1) } catch { $value = $null }
-        }
-    }
+    if (-not $value) { $value = $ResolvedSettings[$Key] }
     $n = 0
     if (-not ("$value" -match '^[0-9]+$') -or -not [int]::TryParse("$value", [ref]$n)) { return $Default }
     if ($n -lt 50 -or $n -gt 2000) { return $Default }

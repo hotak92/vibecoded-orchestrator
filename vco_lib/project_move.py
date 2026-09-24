@@ -1794,16 +1794,18 @@ def _dismiss_command(folder: Path, cid: str) -> str:
 def _codegraph_wrapper(folder: Path) -> str:
     """The code-graph analyzer command for ``folder``, as a real path.
 
-    There is no ``vco codegraph`` verb — the `vco` CLI ships
+    No CLI verb analyzes a code graph — the Python `vco` CLI ships
     ``verify-pins``, ``verify-env-projection``, ``verify-diagrams``,
-    ``rebuild-diagram-index``, ``codegraph-diagram``, ``doctor`` and
-    ``project``. The analyzer ships as the BUNDLED wrapper in the project's
-    own ``.claude/scripts/``, so that is what the remediation names.
+    ``rebuild-diagram-index``, ``codegraph-diagram``, ``doctor``,
+    ``project`` and ``fix-transcript``, and the launcher's `vct-cli`
+    ``codegraph`` only lists and searches. The analyzer ships as the BUNDLED
+    wrapper in the project's own ``.claude/scripts/``, so that is what the
+    remediation names.
 
     A printed command is shipped code. An earlier draft of this module
-    emitted ``vco codegraph analyze <path>``, which parses as an unknown
-    subcommand and exits 2 — a remediation that cannot work is worse than
-    none, because the user spends their attention discovering that.
+    emitted a `vco` "codegraph analyze <path>" command, which parses as an
+    unknown subcommand and exits 2 — a remediation that cannot work is worse
+    than none, because the user spends their attention discovering that.
     """
     name = "code-graph-analyze.ps1" if os.name == "nt" else "code-graph-analyze"
     return str(folder / ".claude" / "scripts" / name)

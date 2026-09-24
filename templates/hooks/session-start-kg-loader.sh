@@ -35,6 +35,10 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # Optional RL retrieval server (Pro tier). Auto-launches if installed,
 # otherwise silently no-ops — free tier ships with KG + code graph only.
+# The launcher script (`~/.claude/scripts/start-rl-server.sh`, or
+# $RL_SERVER_LAUNCHER) is NOT part of the OSS bundle: it is provided by
+# the paid RL module when that module is installed. Nothing in this repo
+# creates it, and the guard below keeps its absence a silent no-op.
 # Resolve $HOME via Python if the env var is unset (cmd.exe on Windows
 # doesn't expose $HOME — see audit finding F5).
 USER_HOME="${HOME:-}"

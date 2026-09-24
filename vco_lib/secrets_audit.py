@@ -287,7 +287,9 @@ def rewrite_env_with_sentinels(
     through ``python -m vco_lib.env_template sentinel`` instead of a Rust
     mirror). Only lines whose key is in ``migrated_keys`` change; the value
     bytes become the sentinel, ``export`` and an unquoted value's trailing
-    comment are kept, the file keeps its mode.
+    comment are kept, and the file keeps its permission bits (the writer goes
+    through :func:`vco_lib.atomic.atomic_rewrite_text`, which reads the mode
+    before the atomic swap and re-applies it after the rename).
     """
     from vco_lib.env_template import replace_values_with_sentinel
 

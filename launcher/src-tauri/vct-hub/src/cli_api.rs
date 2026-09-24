@@ -595,11 +595,11 @@ struct HookEnabledReq {
     enabled: bool,
 }
 
-/// Toggle a hook's enforcement from the `vco hooks enable/disable` CLI
+/// Toggle a hook's enforcement from the `vct-cli hooks enable/disable` CLI
 /// (v0.2.91 wave 5 residual close).
 ///
 /// Pre-fix this called `Db::set_project_hook_enabled(hook_id, enabled)` — a
-/// bare mirror-table `UPDATE` that nothing downstream reads, so `vco hooks
+/// bare mirror-table `UPDATE` that nothing downstream reads, so `vct-cli hooks
 /// disable <id>` silently did not stop the hook firing. Real enforcement
 /// (`hooks_enforcement::enforce_hook_toggle`) edits the owning project's
 /// `.claude/settings.json`, which means the owning project must be known:
@@ -621,7 +621,7 @@ async fn set_hook_enabled(
                 StatusCode::BAD_REQUEST,
                 "project_id_required",
                 "toggling a hook edits .claude/settings.json, which needs the owning \
-                 project. Pass `--project <id-or-slug>` (`vco hooks list <project>` to \
+                 project. Pass `--project <id-or-slug>` (`vct-cli hooks list <project>` to \
                  find it).",
             );
         }
@@ -1845,6 +1845,9 @@ mod cli_kg_integration_tests {
         // avoid races with siblings that read the var, we serialise
         // through a parking_lot mutex via the TEST_ENV_LOCK below.
         let _g = TEST_ENV_LOCK.write().unwrap();
+        // Then THE env lock (review R6): TEST_ENV_LOCK orders this module's
+        // readers; WEAVIATE_URL is read by every test in the binary.
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1913,6 +1916,9 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     async fn kg_collections_returns_empty_list_when_no_orchestrator_classes() {
         let _g = TEST_ENV_LOCK.write().unwrap();
+        // Then THE env lock (review R6): TEST_ENV_LOCK orders this module's
+        // readers; WEAVIATE_URL is read by every test in the binary.
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1965,6 +1971,9 @@ mod cli_kg_integration_tests {
         // override the WEAVIATE_URL for the duration of this test so
         // detection fails cleanly.
         let _g = TEST_ENV_LOCK.write().unwrap();
+        // Then THE env lock (review R6): TEST_ENV_LOCK orders this module's
+        // readers; WEAVIATE_URL is read by every test in the binary.
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let saved = std::env::var_os("WEAVIATE_URL");
         // Pick an almost-certainly-closed local port. 1 = privileged on
         // Linux and unreachable for our process.
@@ -2961,10 +2970,10 @@ mod hub_access_matrix_wiring_tests {
     // ─── PATCH /cli/hooks/{hook_id}/enabled — real enforcement ──────────
     //
     // v0.2.91 wave 5 residual close. This is the route the shipped
-    // `vco hooks enable/disable <id> --project <p>` CLI hits
+    // `vct-cli hooks enable/disable <id> --project <p>` CLI hits
     // (`launcher/tools/vct-cli/src/main.rs::hooks`). Pre-fix it called
     // `Db::set_project_hook_enabled(hook_id, enabled)` — a bare mirror
-    // `UPDATE` — so `vco hooks disable <id>` silently did not stop the
+    // `UPDATE` — so `vct-cli hooks disable <id>` silently did not stop the
     // hook firing. These tests exercise the real HTTP surface.
 
     const CLI_HOOK_SETTINGS_JSON: &str = r#"{
@@ -3052,7 +3061,7 @@ mod hub_access_matrix_wiring_tests {
 
     #[tokio::test]
     async fn cli_hooks_disable_accepts_a_project_slug_not_only_the_id() {
-        // `vco hooks disable <id> --project <slug>` is the documented
+        // `vct-cli hooks disable <id> --project <slug>` is the documented
         // shape (`HooksCmd::List` already accepts "id or slug"; the
         // enforcement path must match, not silently require the UUID).
         let (base, handle) = spawn_test_hub_with_state_api().await;

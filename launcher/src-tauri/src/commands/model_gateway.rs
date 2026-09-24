@@ -1921,11 +1921,12 @@ mod tests {
         // spawns and its allowlist does not carry `VCT_MODEL_GATEWAY_*`.
         // Without the re-injection loop, a user who set a documented knob and
         // pressed Start would get a daemon that silently ignored it.
-        let _g = scratch_root();
-        let saved = std::env::var_os("VCT_MODEL_GATEWAY_SECRET_PROJECT");
-        // SAFETY: `scratch_root()` holds the workspace-wide env mutex, so no
-        // other env-mutating test can observe or race this write.
-        unsafe { std::env::set_var("VCT_MODEL_GATEWAY_SECRET_PROJECT", "acme") };
+        // The scratch root plus the knob, set and restored by the one guard
+        // (it holds the workspace-wide env mutex).
+        let _g = state_dir_guard_with(&[
+            (PORT_ENV, None),
+            ("VCT_MODEL_GATEWAY_SECRET_PROJECT", Some("acme")),
+        ]);
 
         let cmd = gateway_command(Path::new("/usr/bin/python3"), None);
         let forwarded = cmd.get_envs().any(|(k, v)| {
@@ -1933,12 +1934,6 @@ mod tests {
                 && v.map(|vv| vv.to_string_lossy() == "acme").unwrap_or(false)
         });
 
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("VCT_MODEL_GATEWAY_SECRET_PROJECT", v),
-                None => std::env::remove_var("VCT_MODEL_GATEWAY_SECRET_PROJECT"),
-            }
-        }
         assert!(
             forwarded,
             "a documented gateway knob was dropped by the env sandbox; the \
@@ -1950,22 +1945,13 @@ mod tests {
     fn unrelated_env_still_does_not_leak_into_the_daemon() {
         // LEAVE-ALONE half: the sandbox's whole purpose is that the launcher's
         // own `.claude/env` inheritance does not reach a child.
-        let _g = scratch_root();
-        let saved = std::env::var_os("KG_COLLECTION");
-        // SAFETY: as above — the guard holds the global env mutex.
-        unsafe { std::env::set_var("KG_COLLECTION", "SENTINEL") };
+        let _g = state_dir_guard_with(&[(PORT_ENV, None), ("KG_COLLECTION", Some("SENTINEL"))]);
 
         let cmd = gateway_command(Path::new("/usr/bin/python3"), None);
         let leaked = cmd
             .get_envs()
             .any(|(k, _)| k.to_string_lossy() == "KG_COLLECTION");
 
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("KG_COLLECTION", v),
-                None => std::env::remove_var("KG_COLLECTION"),
-            }
-        }
         assert!(!leaked, "KG_COLLECTION leaked into the gateway daemon's env");
     }
 
@@ -2460,10 +2446,7 @@ mod tests {
     fn both_python_spawns_carry_the_gateway_knobs() {
         // Review R2-6: the writer resolves the gateway's port, and the pin is
         // the first step of that resolution — it must see it.
-        let _g = scratch_root();
-        let saved = std::env::var_os(PORT_ENV);
-        // SAFETY: `scratch_root()` holds the workspace-wide env mutex.
-        unsafe { std::env::set_var(PORT_ENV, "11437") };
+        let _g = state_dir_guard_with(&[(PORT_ENV, Some("11437"))]);
 
         let carried: Vec<bool> = [
             gateway_command(Path::new("/usr/bin/python3"), None),
@@ -2478,12 +2461,6 @@ mod tests {
         })
         .collect();
 
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var(PORT_ENV, v),
-                None => std::env::remove_var(PORT_ENV),
-            }
-        }
         assert_eq!(carried, vec![true, true], "both spawns must see the pin");
     }
 

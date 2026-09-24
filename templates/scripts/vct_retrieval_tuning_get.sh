@@ -247,7 +247,7 @@ if isinstance(data, dict) and key in data:
             exit "$rc"
             ;;
         5)
-            err "hub refused the request (403 forbidden) — present a scoped hub.token.<project_id> or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window; NOT falling back to the local TOML"
+            err "hub refused the request (403 forbidden) — present the scoped hub.token.<project_id> (the resolver this script delegates to already prefers it; the hub mints one on first request); the legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97; NOT falling back to the local TOML"
             exit 5
             ;;
     esac

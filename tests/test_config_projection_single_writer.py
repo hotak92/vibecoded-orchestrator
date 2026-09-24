@@ -1015,8 +1015,10 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
 def test_project_dotenv_writers_are_migrated_v0297() -> None:
     """v0.2.97: the project ``.env`` migration is complete — the legacy
     allowlist is EMPTY, so the scan above treats any direct ``.env`` write
-    in the two retired writers' files as a violation; they carry no
-    migration marker and no longer define the retired writer functions."""
+    in the two retired writers' files as a violation, and they carry no
+    migration marker. (Whether a retired writer came back is decided BY
+    SHAPE — ``test_the_guard_sees_the_retired_writers_by_shape`` — never by
+    looking for its function name.)"""
     assert _LEGACY_ENV_TEMPLATE_WRITERS == set()
     for path in _MIGRATED_DOTENV_WRITERS:
         assert path not in _LEGACY_ENV_TEMPLATE_WRITERS, path

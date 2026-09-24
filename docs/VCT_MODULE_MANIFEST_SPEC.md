@@ -154,6 +154,17 @@ obtain the image at all.
 
 All fields default; the whole block is optional.
 
+`depends_on` is enforced (v0.2.97). The launcher refuses to **install**,
+**update** or **enable** a module while any id it lists is missing for that
+project. The error message names each missing module, and nothing is
+installed on the user's behalf. A dependency counts as present when it is a
+bundled core module (`launcher/bundled_manifests/`, always installed) or has
+an install row — per-project or global — whose status is `installed`,
+`running` or `stopped`. One home: `vct_launcher_core::module_deps`.
+`validate-manifest` requires every listed id to be a **known** module: a
+bundled one, another manifest validated in the same run, or one named with
+`--known-module <id>` (a module published only in the catalog).
+
 ---
 
 ## 5. `install`
@@ -344,6 +355,13 @@ defaults plus per-project overrides (per-project rows always win, absent rows
 fall through to `default_enabled`). On update, added tools are inserted with
 their declared default, removed tools are dropped, and per-project overrides are
 left in place. `default_enabled` defaults to `true`.
+
+Declare it only for an MCP the module itself serves (an `mcp_*` runtime):
+`uninstall.deregister_mcp` removes the MCP it names. A module whose tools are
+served by ANOTHER module's MCP has no `mcp_registration` — it names that MCP
+in `provides[].tool_prefix` instead (the bundled `vct-codegraph`, whose tools
+belong to `vct-kg`'s `weaviate-kg`). Pinned for the bundled set by
+`tests/test_v0297_manifest_mcp_truth.py` and its Rust twin.
 
 ---
 

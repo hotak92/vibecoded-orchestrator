@@ -88,7 +88,7 @@ Each paid module has a `vct-module.json` manifest that the launcher consumes to 
    - A digest pin (`ghcr.io/<owner>/<id>@sha256:<digest>`), OR
    - A version-pinned tag matching a released semver (`ghcr.io/<owner>/<id>:v0.3.2`).
    - **Never `:latest`**. Mutable tags break reproducibility and make leak-time-of-check unreliable.
-4. **GPU variants are enumerated, not auto-derived**. If the module ships `cpu`, `cuda`, `rocm` variants, each variant is its own digest/version pin in `manifest.runtime.gpu_image_variants` — see `knowledge/concepts/gpu-mode-decision-policy.md`.
+4. **GPU variants are enumerated, not auto-derived**. If the module ships `cpu`, `cuda`, `rocm` variants, each variant is its own digest/version pin in `manifest.runtime.gpu_image_variants` — PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at pip-install time, so one container cannot serve two wheel families and the launcher never derives one variant's ref from another's.
 
 ---
 

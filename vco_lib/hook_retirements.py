@@ -501,7 +501,7 @@ def emit_removal_audit_rows(
 #
 # The refusal half of that is already closed Python-side
 # (``hooks_settings.insert_hook`` raises ``hook_retired``, so every restore
-# path — the Hooks tab, the hub's two PATCH routes, the ``vco hooks enable``
+# path — the Hooks tab, the hub's two PATCH routes, the ``vct-cli hooks enable``
 # CLI — refuses through ONE decision). This CLI closes the EAGER half: the
 # launcher asks, at Hooks-tab load, which of its parked rows are dead, and
 # releases those bytes before the user clicks anything.

@@ -1321,6 +1321,7 @@ mod tests {
 
     #[test]
     fn resolved_endpoint_url_defaults_to_production() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Don't set the env var; default branch must serve the prod URL.
         // Use a unique env-var name to avoid collisions if other tests set
         // it — but the constant is well-known, so just temporarily clear it
@@ -1336,6 +1337,7 @@ mod tests {
 
     #[test]
     fn resolved_endpoint_url_honors_env_override() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let saved = std::env::var("VCT_MODULE_CATALOG_URL").ok();
         std::env::set_var(
             "VCT_MODULE_CATALOG_URL",

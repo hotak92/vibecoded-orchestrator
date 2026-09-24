@@ -145,8 +145,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   appends `PROJECT_NAME` / `KG_COLLECTION` lines that overrode your real
   values, and the root's `PROJECT_NAME` comes from its launcher registration,
   never from the shell `install.py` runs in. An existing `.env` keeps its
-  file permissions. Unregistering a project removes VCO's block whole; the
-  stale-`KG_COLLECTION` repair, the launcher's "Migrate from .env" and the
+  file permissions. Unregistering a project removes only what VCO wrote
+  (see "unregistering a project" below). The stale-`KG_COLLECTION` repair, the launcher's "Migrate from .env" and the
   volumes page's `infrastructure/.env` key now go through the same writers
   instead of their own rewrites. Safe-add projects still get only
   `.env.vco.reference`, never a live `.env`.
@@ -166,7 +166,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unchanged) and warns when Claude Code's `MEMORY.md` for the project reaches
   `MEMORY_MAX_LINES` (default 200 — Claude Code loads only its first 200
   lines). Each is read from the environment, else the launcher setting, else
-  the project's `.env`.
+  the project's `.env` — both in one resolver run (the resolver's new
+  `resolve-many` form) that gives the vct-hub at most one second
+  (`VCT_RESOLVE_MAX_TIME`), so an unresponsive hub delays a session start by
+  about a second rather than up to ten. A manifest that cannot be written
+  does not stop the others from being refreshed.
+- A module's `requirements.depends_on` is now enforced. The launcher refuses
+  to install, update or enable a module while a module it depends on is not
+  installed for the project. The message names each missing module, and
+  nothing is installed on your behalf. `validate-manifest` fails a manifest
+  whose `depends_on` names an unknown module. `vct-kg` no longer depends on
+  `vct-ollama`, a module retired in v0.2.11: Ollama is the `ollama` service
+  in `infrastructure/docker-compose.yml`, not a module.
+- Texts that told you to install that retired module from the launcher's
+  Modules tab (two bundled agents, a knowledge node, and the deprecated-MCP
+  notice's "Opt-in" line) now say what exists instead. For images, use
+  Claude's native vision (`Read` on the image path). For local-only
+  inference, call the `ollama` service's REST API directly. Paths in the
+  bundled manifests now point at files that exist, and `vct-session-state`
+  no longer names a `health-check.sh` that never shipped.
 
 ### Changed — unregistering a project stops rather than lose track of a secret (v0.2.97)
 
@@ -180,8 +198,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.claude/VCO-UNREGISTER-LEFTOVERS.md` in the project, or under the
   launcher's own state folder when the project cannot be written — listing
   each key and file to clean by hand (names only, never a value). The
-  project list's quick unregister now shows a failure instead of dropping it
-  silently.
+  project list's quick unregister is now the same unregister as the settings
+  page's defaults: it removes the files VCO put in the folder (it used to
+  skip that step, although its defaults said otherwise), stops the same way,
+  offers the same escape, and its dialog says what it removes. It no longer
+  drops a failure silently.
+- Unregister removes only what VCO wrote to your env files. VCO's marked
+  block goes whole from `.env` and from `.claude/env`; from `.env` also the
+  lines older versions appended under their own headers, the comment above
+  any `<KEY>_old` values, and the header at the top of a `.env` VCO created,
+  while that header is unedited — the current one, or the one every earlier
+  version wrote ("Edit values to override defaults… Created by vco
+  <date>"). Anywhere else — outside those blocks, and in
+  the `env` blocks of `.claude/settings.json` and `.vscode/settings.json` — a
+  routing key such as `KG_COLLECTION` is removed only when it holds the value
+  VCO writes for that project. A different value is yours: it stays, and the
+  unregister result names it, as it names your `<KEY>_old` values. When VCO
+  cannot work out its own values for the project, only the marked blocks go,
+  and the result says so. A `# KEY=` comment line is never removed.
 
 ### Added — the model gateway tells you when it needs a restart (v0.2.97)
 
@@ -214,6 +248,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed — smaller issues (v0.2.97)
 
+- The bundled `vct-hub-api` module's port setting now sets the hub's port.
+  It was declared as `HUB_PORT`, which nothing read; it is now
+  `VCT_HUB_PORT`, the hub reads it (the module's machine-wide setting) when
+  it starts, and a `VCT_HUB_PORT` in the hub's own environment still wins.
+  Clients keep finding the hub through `hub.port`.
+- The bundled `vct-codegraph` module no longer declares an MCP server of its
+  own (`codegraph`), which nothing provided. Its tools, `search_code_graph`
+  and `query_code_structure`, belong to the `weaviate-kg` MCP that `vct-kg`
+  registers, and uninstalling `vct-codegraph` no longer tries to deregister
+  an MCP.
+- The launcher finds `podman`/`docker`, and the Linux package manager used to
+  install Podman, through its one `PATH` lookup — a copy of that lookup
+  missed `podman.exe` on Windows.
+- Rust tests no longer change the shared process environment behind the back
+  of other tests: none sets `PATH` (hub discovery and the update check take
+  their `PATH`, home directory and `git` as inputs), and every other change
+  holds one workspace lock. A test that unset `VCT_STATE_DIR` without it
+  could send concurrent tests to the real `~/.vct`.
+
 - The Projects page kept showing "N stale project bundles" after **Update all**
   finished; it now re-checks when the update ends and on **Refresh**.
 - The root `CLAUDE.md` no longer gets a `CLAUDE.md.from-upstream-<sha>` copy
@@ -239,12 +292,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matching `…_VOLUME_NAME` knobs — so services that already store their data
   somewhere can adopt it without copying. See `docs/CONFIGURATION.md`.
 
+### Changed — the launcher's command-line tool is now `vct-cli` (v0.2.97)
+
+- VCO shipped two different programs named `vco`: the launcher's Rust
+  command-line tool (`launcher/tools/vct-cli`: `project list/create/rename/
+  delete/show`, `module`, `audit`, `license`, `hooks`, `telemetry`, `hub`,
+  `kg`, `codegraph`) and the orchestrator's Python CLI (`vco doctor`,
+  `vco verify-pins`, `vco project move`, `vco fix-transcript`, …). Both
+  answered `vco project`, with different subcommands, so whichever came
+  first on `PATH` hid the other and half of the documented commands failed
+  as "invalid choice". The two never implemented the same operation, so
+  nothing is merged: the Rust tool is renamed to `vct-cli`, the name of its
+  crate, like `vct-hub` and `vct-launcher`. Every command keeps its
+  subcommands and flags — `vco hub health` is now `vct-cli hub health`.
+  The Python `vco` is unchanged. The release archives ship `vct-cli`
+  (`vct-cli.exe` on Windows) instead of `vco`.
+- If you installed the launcher tool with `launcher/tools/vct-cli/install.sh`,
+  run it again: it installs `~/.local/bin/vct-cli` and removes the old
+  `~/.local/bin/vco` — only when that file identifies itself as the launcher
+  tool. A Python `vco` there, or anything else, is left alone, and an old
+  copy elsewhere on `PATH` is reported with the command to remove it. The
+  same check now guards the pre-v0.1.0 `~/.local/bin/vct`: the script used to
+  delete any regular file there, including a copied secrets `vct`.
+- If you never re-run that script, the update tells you: `vco doctor` (which
+  every install and update runs) reports an old copy of the tool still on
+  `PATH` under a former name as `former_launcher_cli_on_path`, with the exact
+  command to remove it. It never deletes the file, and the notice clears
+  itself once the copy is gone. The Python `vco` and the secrets `vct` are
+  never reported.
+- New: `vct-cli telemetry pending` prints the events waiting in
+  `~/.vibecoded/telemetry_pending.jsonl`, and works with the launcher closed.
+  `docs/TELEMETRY.md` pointed at the CLI for this, but the command it named
+  (`telemetry status`) only shows consent.
+- Error messages from the tool start with `vct-cli:` (they said `vct:`, the
+  secrets tool's name). A test now fails if two shipped programs share a
+  command name, or if shipped text runs a verb through the wrong one.
+
 ### Changed (v0.2.97)
 
 - Hook commands in `.claude/settings.json` no longer start with
   `[ -n "$VCT_DISABLE_HOOKS" ] ||`; every hook script already checks that
   variable itself. Existing projects are rewritten in place on their next
   update. `VCT_DISABLE_HOOKS=1` works exactly as before.
+
+### Removed — `VCT_HUB_LEGACY_GLOBAL_ENV`, the global-token escape hatch (v0.2.97)
+
+- The `VCT_HUB_LEGACY_GLOBAL_ENV=1` opt-in — which re-opened the legacy
+  path where the coarse global `hub.token` authorized the per-project
+  `/api/v1/projects/{id}/env` + `/config` routes — is gone, and so is the
+  global-token path it unlocked. Every bundled resolver
+  (`vct_project_config.sh`/`.ps1`, `vct_secrets_resolve.sh`/`.ps1`,
+  `vco_lib`) has preferred the project-scoped `hub.token.<project_id>`
+  since v0.2.76, and the hub mints one for any project it meets mid-session,
+  so nothing VCO ships needed the hatch; it had also outlived its promised
+  one-release window by twenty releases. If a bespoke caller of your own
+  still presents the global `hub.token` there, present the scoped token
+  instead (`<vct_root_dir>/hub.token.<project_id>`); a hub started with the
+  variable still set logs one line saying it was removed and what to use,
+  and refuses the global token exactly as if it were unset.
 
 ## [0.2.96] - 2026-09-22
 

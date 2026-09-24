@@ -4,6 +4,7 @@
   import { toast } from '$lib/stores/toast';
   import { parseTaggedErrorPayload } from '$lib/tauri-error-payload';
   import { projects } from '$lib/stores/projects';
+  import { DEFAULT_UNREGISTER_OPTIONS } from '$lib/unregister-escape';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime } from '$lib/tauri';
   import { isOnboardingComplete, markOnboardingComplete } from '$lib/onboarding';
@@ -724,16 +725,16 @@
     recreatingProject = true;
     try {
       // Find the existing project_id, delete it, then create fresh.
-      // 2026-05-06: delete_project_v2 now takes `{ id, options }` —
-      // pass null to get the backend defaults (purgeLauncherFiles=true,
-      // purgeCollections=false). Pre-fix this call passed `projectId`
+      // 2026-05-06: delete_project_v2 now takes `{ id, options }` — the
+      // default unregister, sent explicitly (review R6 F46; the same
+      // options as the settings page's untouched checkboxes). Pre-fix this call passed `projectId`
       // (wrong key, silently ignored) which left the previous DB row
       // orphaned. Routing via the projects store keeps the tauri shape
       // consistent with the rest of the codebase.
       const all = await invoke<Array<{ id: string; folder_path: string }>>('list_projects_v2');
       const existing = all.find((p) => p.folder_path === path);
       if (existing) {
-        await projects.delete(existing.id, null);
+        await projects.delete(existing.id, { ...DEFAULT_UNREGISTER_OPTIONS });
       }
       await projects.create(name, path, 'base');
       toast.success(`Project "${name}" recreated`);

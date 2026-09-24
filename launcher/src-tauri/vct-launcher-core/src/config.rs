@@ -219,7 +219,6 @@ fn replace_or_push(
 mod tests {
     use super::*;
     use std::io::Write;
-    use std::sync::Mutex;
 
     // Env vars are process-wide; serialise tests that mutate them so
     // parallel runs don't observe each other. Each `#[test]` calls
@@ -229,18 +228,22 @@ mod tests {
     // attempt on a Mutex the same thread already holds, which blocks
     // forever). Mirrors the pattern in `paths.rs` tests but with the
     // single-lock discipline made explicit.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
+    //
+    // v0.2.97 review R6: the lock is THE workspace env lock
+    // (`test_env::env_lock`), not a module-private one — these variables are
+    // read by every test in the binary, not just this module's.
 
     /// Acquire the env-mutation lock for the duration of the test.
     /// Hold the returned guard until the test ends (let-binding it as
     /// `_g` is enough). Lock-poisoning from a panicking peer test is
-    /// recovered via `into_inner` so a single failed test doesn't make
-    /// every subsequent run hang on the poisoned lock.
-    fn serialize() -> std::sync::MutexGuard<'static, ()> {
-        SERIALIZE.lock().unwrap_or_else(|p| p.into_inner())
+    /// recovered so a single failed test doesn't make every subsequent run
+    /// hang on the poisoned lock.
+    fn serialize() -> crate::test_env::EnvLock {
+        crate::test_env::env_lock()
     }
 
-    fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
+    /// Set (or unset) `key` around `f`; the caller proves it holds the lock.
+    fn with_env<F: FnOnce()>(_held: &crate::test_env::EnvLock, key: &str, val: Option<&str>, f: F) {
         let prev = std::env::var(key).ok();
         match val {
             Some(v) => std::env::set_var(key, v),
@@ -264,8 +267,8 @@ mod tests {
     fn missing_file_falls_back_to_compiled_default() {
         let _g = serialize();
         // Both env vars cleared; non-existent path must yield default.
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg =
                     LocalConfig::load_from_path(Some(std::path::Path::new("/no/such/file.toml")));
                 assert_eq!(cfg.weaviate_url, DEFAULT_WEAVIATE_URL);
@@ -276,8 +279,8 @@ mod tests {
     #[test]
     fn no_path_no_env_yields_compiled_default() {
         let _g = serialize();
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(None);
                 assert_eq!(cfg.weaviate_url, DEFAULT_WEAVIATE_URL);
             });
@@ -292,8 +295,8 @@ mod tests {
             dir.path(),
             r#"weaviate_url = "http://example.test:9999""#,
         );
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, "http://example.test:9999");
             });
@@ -308,8 +311,8 @@ mod tests {
             dir.path(),
             r#"weaviate_url = "http://from-file:1111""#,
         );
-        with_env("VCT_WEAVIATE_URL", Some("http://from-env:2222"), || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", Some("http://from-env:2222"), || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, "http://from-env:2222");
             });
@@ -322,8 +325,8 @@ mod tests {
         // `WEAVIATE_URL` (no `VCT_` prefix) is the historical name. We
         // keep honoring it so existing developer shells / compose env
         // files don't break.
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", Some("http://legacy:3333"), || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", Some("http://legacy:3333"), || {
                 let cfg = LocalConfig::load_from_path(None);
                 assert_eq!(cfg.weaviate_url, "http://legacy:3333");
             });
@@ -335,8 +338,8 @@ mod tests {
         let _g = serialize();
         // If both env vars are set, the explicit `VCT_` name wins. This
         // matches the precedence documented in the file header.
-        with_env("VCT_WEAVIATE_URL", Some("http://vct:4444"), || {
-            with_env("WEAVIATE_URL", Some("http://legacy:5555"), || {
+        with_env(&_g, "VCT_WEAVIATE_URL", Some("http://vct:4444"), || {
+            with_env(&_g, "WEAVIATE_URL", Some("http://legacy:5555"), || {
                 let cfg = LocalConfig::load_from_path(None);
                 assert_eq!(cfg.weaviate_url, "http://vct:4444");
             });
@@ -354,8 +357,8 @@ mod tests {
             dir.path(),
             r#"weaviate_url = "http://from-file:6666""#,
         );
-        with_env("VCT_WEAVIATE_URL", Some(""), || {
-            with_env("WEAVIATE_URL", Some(""), || {
+        with_env(&_g, "VCT_WEAVIATE_URL", Some(""), || {
+            with_env(&_g, "WEAVIATE_URL", Some(""), || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, "http://from-file:6666");
             });
@@ -369,8 +372,8 @@ mod tests {
         // load function logs and falls through to compiled defaults.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), "this is not = valid = toml [[[");
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, DEFAULT_WEAVIATE_URL);
             });
@@ -384,8 +387,8 @@ mod tests {
         // "not set". Same reason as the empty-env-var case.
         let dir = tempfile::tempdir().unwrap();
         let path = write_config(dir.path(), r#"weaviate_url = """#);
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, DEFAULT_WEAVIATE_URL);
             });
@@ -406,8 +409,8 @@ mod tests {
             future_field_we_dont_understand = "ignored"
             "#,
         );
-        with_env("VCT_WEAVIATE_URL", None, || {
-            with_env("WEAVIATE_URL", None, || {
+        with_env(&_g, "VCT_WEAVIATE_URL", None, || {
+            with_env(&_g, "WEAVIATE_URL", None, || {
                 let cfg = LocalConfig::load_from_path(Some(&path));
                 assert_eq!(cfg.weaviate_url, "http://known:7777");
             });

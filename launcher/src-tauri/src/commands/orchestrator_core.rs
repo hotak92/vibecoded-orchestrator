@@ -879,6 +879,7 @@ mod tests {
     /// scripts.
     #[test]
     fn build_script_command_falls_back_to_orchestrator_copy() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let bin = script_bin("kg-sync");
 
         // Project WITHOUT its own .claude/scripts/.
@@ -934,29 +935,29 @@ mod tests {
     /// errors with a clear message.
     #[test]
     fn build_script_command_errors_when_nothing_resolves() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let proj = std::env::temp_dir().join(format!(
             "vct-bsc-none-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&proj).unwrap();
 
-        // SAFETY: crate tests run single-threaded by default.
         let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
-        let saved_path = std::env::var_os("PATH");
         unsafe {
             std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", &proj); // empty dir
-            std::env::set_var("PATH", "");
         }
 
-        let built = build_script_command(&proj, "kg-duplicates");
+        // An empty PATH for THIS thread's lookups only — never the shared
+        // process PATH (review R6).
+        let built = vct_launcher_core::paths::with_lookup_path(
+            Some(std::ffi::OsStr::new("")),
+            || build_script_command(&proj, "kg-duplicates"),
+        );
 
         unsafe {
             match saved_override {
                 Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
                 None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
-            }
-            if let Some(p) = saved_path {
-                std::env::set_var("PATH", p);
             }
         }
 
@@ -1101,6 +1102,7 @@ mod tests {
     /// have to time out.
     #[tokio::test]
     async fn health_check_reports_failures_without_panicking() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Force probe URLs to an unused port to guarantee connect-refused.
         std::env::set_var("WEAVIATE_URL", "http://127.0.0.1:1");
         std::env::set_var("OLLAMA_URL", "http://127.0.0.1:1");

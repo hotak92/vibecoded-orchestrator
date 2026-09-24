@@ -486,21 +486,25 @@ def test_the_collectors_find_the_known_sites():
 
 def test_the_env_block_bridge_verbs_are_collected():
     """v0.2.97 review F5: every Rust env-block edit goes through
-    `vco_lib_bridge.rs`'s two literal argv chains — `write-env-block` and its
-    removal-only twin `strip-env-keys` (plus the surface-free unregister
-    evidence verb `strip-proven-secret-values`). Pin that the collector SEES all
-    three (so the parametrised parse below covers their verb, flags and
-    `--surface` choice), and that each carries the flags its verb requires."""
+    `vco_lib_bridge.rs`'s literal argv chains — `write-env-block`, the
+    unregister evidence verb `strip-proven-secret-values`, and (review R6) the
+    unregister's routing-key strip `unregister_env strip-routing`, which
+    superseded the by-name `strip-env-keys`. Pin that the collector SEES them
+    (so the parametrised parse below covers their verb and flags), and that
+    each carries the flags its verb requires."""
     bridge = [
         s for s in _rust_sites()
         if s.where.startswith("launcher/src-tauri/src/services/vco_lib_bridge.rs")
-        and s.module == "vco_lib.config_projection"
+        and s.module in ("vco_lib.config_projection", "vco_lib.unregister_env")
     ]
     verbs = {s.tokens[0] for s in bridge if s.tokens}
-    assert {"write-env-block", "strip-env-keys", "strip-proven-secret-values"} <= verbs, verbs
+    assert {"write-env-block", "strip-proven-secret-values", "strip-routing"} <= verbs, verbs
+    assert "strip-env-keys" not in verbs, "retired in review R6"
     for s in bridge:
+        if s.tokens[0] == "from-db":
+            continue  # the test-only projection read (`test_projected_env`)
         assert "--project-folder" in s.tokens, s
-        if s.tokens[0] in ("write-env-block", "strip-env-keys"):
+        if s.tokens[0] == "write-env-block":
             assert "--surface" in s.tokens, s
 
 

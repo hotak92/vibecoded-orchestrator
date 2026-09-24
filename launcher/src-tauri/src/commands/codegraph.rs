@@ -139,7 +139,8 @@ pub async fn codegraph_grant_access(
 
 /// Returns the acting project's access level on the target project's
 /// codegraph, so the UI can render badges (read / denied) and the
-/// codegraph MCP can enforce permissions before returning results.
+/// weaviate-kg MCP's code-graph tools can enforce permissions before
+/// returning results.
 ///
 /// Note: there used to be a planned launcher-side query-proxy command
 /// (`CodegraphQueryReq` + a forwarder) that would funnel codegraph
@@ -147,7 +148,8 @@ pub async fn codegraph_grant_access(
 /// lightweight UI stats. That was deleted in 2026-05 — UI-side stats
 /// come from `codegraph_summary` (below) which proxies to Weaviate
 /// directly with the same access check, and full queries go through
-/// the codegraph MCP. Access enforcement happens at the MCP layer +
+/// the weaviate-kg MCP's code-graph tools (`search_code_graph`,
+/// `query_code_structure`). Access enforcement happens at the MCP layer +
 /// at this command for UI-side decisions.
 #[command]
 pub async fn codegraph_check_access(
@@ -2823,11 +2825,11 @@ pub(crate) fn resolve_orchestrator_script(bin: &str) -> Option<std::path::PathBu
         }
     }
 
-    // 4. PATH lookup
-    if let Ok(path) = std::env::var("PATH") {
-        let sep = if cfg!(windows) { ';' } else { ':' };
-        for d in path.split(sep) {
-            let p4 = std::path::Path::new(d).join(bin);
+    // 4. PATH lookup (`lookup_path`: tests inject one per thread instead of
+    // setting the shared process PATH — review R6).
+    if let Some(path) = vct_launcher_core::paths::lookup_path() {
+        for d in std::env::split_paths(&path) {
+            let p4 = d.join(bin);
             if p4.is_file() {
                 return Some(p4);
             }
@@ -3516,6 +3518,7 @@ mod build_tests {
     /// 2) wins instead — and a per-project deferral is emitted.
     #[test]
     fn resolve_analyzer_skips_stale_project_local_and_falls_back() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let bin = if cfg!(windows) {
             "code-graph-analyze.ps1"
         } else {
@@ -3578,6 +3581,7 @@ mod build_tests {
 
     #[test]
     fn resolve_analyzer_returns_none_when_nothing_found() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Empty project + cleared env override + emptied PATH.
         let d = tmpdir("resolve-none");
 
@@ -3585,18 +3589,17 @@ mod build_tests {
         // (consistent with launch_returns_not_found_when_editor_missing
         // pattern in projects_v2). If parallelism is ever enabled we'd
         // need a Mutex around env vars.
-        let saved_path = std::env::var_os("PATH");
         let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
         unsafe {
-            std::env::set_var("PATH", "");
             std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR");
         }
 
-        let resolved = resolve_analyzer_script(&d);
+        // An empty PATH for THIS thread's lookups only (review R6).
+        let resolved = vct_launcher_core::paths::with_lookup_path(
+            Some(std::ffi::OsStr::new("")),
+            || resolve_analyzer_script(&d),
+        );
 
-        if let Some(p) = saved_path {
-            unsafe { std::env::set_var("PATH", p); }
-        }
         if let Some(p) = saved_override {
             unsafe { std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", p); }
         }
@@ -3642,6 +3645,7 @@ mod build_tests {
     /// project-local hit is impossible without a prior bundle install.
     #[test]
     fn resolve_analyzer_requires_bundle_install_before_project_local_hit() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let d = tmpdir("race-invariant");
         let scripts = d.join(".claude").join("scripts");
         let bin = if cfg!(windows) {
@@ -3659,12 +3663,13 @@ mod build_tests {
         // can't control; we explicitly tolerate a non-project-local hit
         // there and only assert the project-local lookup itself.)
         // SAFETY: cargo test runs this crate single-threaded by default.
-        let saved_path = std::env::var_os("PATH");
         let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
         unsafe {
-            std::env::set_var("PATH", "");
             std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR");
         }
+        // PATH is emptied for THIS thread's lookups only (review R6) — the
+        // whole body below runs inside `with_lookup_path`.
+        vct_launcher_core::paths::with_lookup_path(Some(std::ffi::OsStr::new("")), || {
 
         // STATE 1: pre-bundle (the buggy pre-fix order). The folder has
         // a `.claude/` from `populate_project_state_from_filesystem` but
@@ -3706,10 +3711,9 @@ mod build_tests {
             "post-bundle: must prefer project-local script over fallbacks"
         );
 
+        });
+
         // Restore env to avoid polluting later tests in the same process.
-        if let Some(p) = saved_path {
-            unsafe { std::env::set_var("PATH", p); }
-        }
         if let Some(p) = saved_override {
             unsafe { std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", p); }
         }

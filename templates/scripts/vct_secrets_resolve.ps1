@@ -49,6 +49,24 @@
 #   .\vct_secrets_resolve.ps1 resolve-project <folder>
 #       Print the project_id for <folder>. Same exit codes (0/1/2).
 #
+#   .\vct_secrets_resolve.ps1 resolve-many <project_id_or_folder> KEY [KEY...]
+#       (v0.2.97) Several keys in ONE process, each through the same chain.
+#       The project is looked up ONCE; once the hub is unreachable (or the
+#       time budget below is spent) it is not asked again for the remaining
+#       keys, while tiers 2 and 3 still run for every key. Prints one
+#       `KEY=VALUE` line per RESOLVED key, in argument order. Keys must be
+#       env-var shaped (else exit 64); a value holding a line break is
+#       reported on stderr and treated as unresolved (exit 4). Exit 0 when
+#       every key resolved, else the single-key code of the FIRST key that
+#       did not. MUST MATCH read_many in vct_secrets_resolve.sh.
+#
+# Time budget (v0.2.97): $Env:VCT_RESOLVE_MAX_TIME=<seconds> (up to three
+#   decimals) bounds the TOTAL time this invocation spends on the hub --
+#   connect + read, across every request. Each request is capped at what is
+#   left (and at the usual 5 s); once nothing is left the hub is treated as
+#   unreachable. Unset: each request keeps its own 5 s cap. A value that is
+#   not a number is ignored with one stderr line.
+#
 # Hub discovery:
 #   1. $Env:VCT_HUB_PORT
 #   2. ${VCT_STATE_DIR or $HOME\.vct}\hub.port
@@ -77,7 +95,11 @@ param(
     [string]$Arg1,
 
     [Parameter(Mandatory = $true, Position = 1)]
-    [string]$Arg2
+    [string]$Arg2,
+
+    # resolve-many's keys after the first (v0.2.97). Empty for the other forms.
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [string[]]$MoreArgs = @()
 )
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -102,6 +124,35 @@ param(
 function Write-Err {
     param([string]$Message)
     [Console]::Error.WriteLine("[vct-secrets-resolve] $Message")
+}
+
+# The HTTP client (v0.2.97): System.Net.Http.HttpClient, whose Timeout takes
+# MILLISECONDS -- Invoke-WebRequest's -TimeoutSec is whole seconds, which
+# cannot honour a sub-second budget. Windows PowerShell 5.1 does not load the
+# assembly by default; pwsh 7 already has it.
+try { Add-Type -AssemblyName System.Net.Http -ErrorAction Stop } catch { }
+
+# ── Time budget ($Env:VCT_RESOLVE_MAX_TIME) ────────────────────────────
+# MUST MATCH _hub_request_max_time in vct_secrets_resolve.sh.
+$script:BudgetClock = [System.Diagnostics.Stopwatch]::StartNew()
+$script:BudgetMs = $null
+if ($env:VCT_RESOLVE_MAX_TIME) {
+    if ($env:VCT_RESOLVE_MAX_TIME -match '^([0-9]+)(\.([0-9]{1,3}))?$') {
+        $fraction = ("$($Matches[3])" + "000").Substring(0, 3)
+        $script:BudgetMs = [long]$Matches[1] * 1000 + [long]$fraction
+    } else {
+        Write-Err "VCT_RESOLVE_MAX_TIME is not a number of seconds; ignored"
+    }
+}
+
+function Get-HubRequestTimeoutMs {
+    # 5000, or what is left of the budget when that is less; 0 when the
+    # budget is spent (the caller then treats the hub as unreachable).
+    if ($null -eq $script:BudgetMs) { return 5000 }
+    $left = $script:BudgetMs - $script:BudgetClock.ElapsedMilliseconds
+    if ($left -le 0) { return 0 }
+    if ($left -ge 5000) { return 5000 }
+    return [int]$left
 }
 
 function Get-HubPort {
@@ -294,54 +345,48 @@ function Invoke-Hub {
 
 function Invoke-HubWithToken {
     # ONE request with an explicit bearer. Returns @{Status;Body} or
-    # $null on a connection-level failure (refused / DNS / TLS).
+    # $null on a connection-level failure (refused / DNS / timeout) or when
+    # the time budget is spent.
+    #
+    # HttpClient answers every HTTP status as a response (no exception), so
+    # the 403 / 404 / 503 bodies reach their switch arms directly -- the
+    # pre-v0.2.97 Invoke-WebRequest path had to dig the body out of
+    # $_.ErrorDetails because pwsh 7 disposes the failed response. The hub
+    # is always 127.0.0.1, so no proxy is consulted.
     param([string]$PathAndQuery, [int]$Port, [string]$Token)
+    $timeoutMs = Get-HubRequestTimeoutMs
+    if ($timeoutMs -le 0) { return $null }
     $url = "http://127.0.0.1:$Port/api/v1/$PathAndQuery"
-    $headers = @{ "Authorization" = "Bearer $Token" }
+    $handler = $null
+    $client = $null
+    $request = $null
+    $response = $null
     try {
-        $response = Invoke-WebRequest -Uri $url -Method Get -UseBasicParsing `
-            -Headers $headers -TimeoutSec 5 -ErrorAction Stop
+        $handler = New-Object System.Net.Http.HttpClientHandler
+        $handler.UseProxy = $false
+        $client = New-Object System.Net.Http.HttpClient($handler)
+        $client.Timeout = [TimeSpan]::FromMilliseconds($timeoutMs)
+        $request = New-Object System.Net.Http.HttpRequestMessage([System.Net.Http.HttpMethod]::Get, $url)
+        [void]$request.Headers.TryAddWithoutValidation("Authorization", "Bearer $Token")
+        $response = $client.SendAsync($request).GetAwaiter().GetResult()
+        # .NET Framework (Windows PowerShell 5.1) may hand back a response
+        # with no Content object at all; treat that as an empty body.
+        $body = ""
+        if ($null -ne $response.Content) {
+            $body = $response.Content.ReadAsStringAsync().GetAwaiter().GetResult()
+            if ($null -eq $body) { $body = "" }
+        }
         return @{
             Status = [int]$response.StatusCode
-            Body   = $response.Content
+            Body   = $body
         }
-    } catch [System.Net.WebException] {
-        $resp = $_.Exception.Response
-        if ($resp -ne $null) {
-            $stream = $resp.GetResponseStream()
-            $reader = New-Object System.IO.StreamReader($stream)
-            $body = $reader.ReadToEnd()
-            return @{
-                Status = [int]$resp.StatusCode
-                Body   = $body
-            }
-        }
-        return $null  # connection refused / DNS / etc.
     } catch {
-        # Newer .NET (PowerShell 7 / .NET Core) wraps an HTTP error status in
-        # System.Net.Http.HttpRequestException. The response object is already
-        # DISPOSED by the time the exception propagates, so reading the body
-        # via `$resp.Content.ReadAsStringAsync().Result` throws "Cannot access
-        # a disposed object" — which, under `$ErrorActionPreference='Stop'`,
-        # aborts the resolver with a bare exit 1 and NO status classification
-        # (every error-status arm — 403 / 404 / 503 — was unreachable on
-        # pwsh 7). Instead read the body PowerShell already captured for us in
-        # `$_.ErrorDetails.Message` (verbatim response body on a failed
-        # Invoke-WebRequest) and the status from the still-readable
-        # `$_.Exception.Response.StatusCode`. This makes the 404/403/503 arms
-        # actually reach their switch on modern .NET. Verified 2026-07-15
-        # against pwsh 7 with a fake 503 hub.
-        $resp = $_.Exception.Response
-        if ($null -ne $resp) {
-            $status = [int]$resp.StatusCode
-            $body = $_.ErrorDetails.Message
-            if ($null -eq $body) { $body = "" }
-            return @{
-                Status = $status
-                Body   = $body
-            }
-        }
-        return $null
+        return $null  # refused / DNS / timeout
+    } finally {
+        if ($null -ne $response) { $response.Dispose() }
+        if ($null -ne $request) { $request.Dispose() }
+        if ($null -ne $client) { $client.Dispose() }
+        elseif ($null -ne $handler) { $handler.Dispose() }
     }
 }
 
@@ -421,7 +466,14 @@ function Read-KeyHub {
     if ($resolved.ExitCode -ne 0) {
         return @{ ExitCode = $resolved.ExitCode }
     }
-    $pid_ = $resolved.Value
+    return Read-KeyHubEnv -ProjectId $resolved.Value -Key $Key
+}
+
+function Read-KeyHubEnv {
+    # Tier 1 for an ALREADY-RESOLVED project id (resolve-many looks the
+    # project up once and calls this per key). Same codes as Read-KeyHub.
+    param([string]$ProjectId, [string]$Key)
+    $pid_ = $ProjectId
     $encodedPid = [System.Uri]::EscapeDataString($pid_)
     $encodedKey = [System.Uri]::EscapeDataString($Key)
     # Per-project route → pass the resolved project id so Get-HubToken
@@ -489,7 +541,7 @@ function Read-KeyHub {
             # "hub unreachable" the Default arm used to emit. The outer chain
             # still consults the file store + project .env (legitimate secrets
             # tiers), so exit 5 only surfaces if those also miss.
-            Write-Err "hub returned 403 forbidden for $Key (project $pid_): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid_, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window."
+            Write-Err "hub returned 403 forbidden for $Key (project $pid_): the global hub.token is refused on /env (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid_ (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97."
             return @{ ExitCode = 5 }
         }
         503 {
@@ -700,6 +752,26 @@ function Get-DotenvValue {
     return @{ Found = $false }
 }
 
+function Get-LocalValue {
+    # Tiers 2 + 3 for one key (shared by Read-Key and Read-Many). Returns
+    # @{ Found = $true/$false; Value = ... }.
+    param([string]$ProjectArg, [string]$Key)
+    $tier2 = Get-FileStoreValue -ProjectArg $ProjectArg -Key $Key
+    if ($tier2.Found) { return $tier2 }
+    # Tier 3: project .env — only when the first arg names a folder.
+    if (Test-LooksLikePath $ProjectArg) {
+        $envDir = $ProjectArg
+        if (Test-Path -LiteralPath $envDir -PathType Leaf) {
+            $envDir = Split-Path -Parent $envDir
+        }
+        $tier3 = Get-DotenvValue -Folder $envDir -Key $Key
+        if ($tier3.Found) { return $tier3 }
+    } else {
+        Write-Err "tier 3 (.env) skipped: first arg is a project id, not a folder — re-invoke with the project folder to consult its .env"
+    }
+    return @{ Found = $false }
+}
+
 function Read-Key {
     # Chain: hub (tier 1) -> file store (tier 2) -> project .env
     # (tier 3). The final exit code on all-miss is TIER 1's code,
@@ -711,32 +783,78 @@ function Read-Key {
         [Console]::Out.Write($tier1.Value)
         return 0
     }
-    # Tier 2: file store.
-    $tier2 = Get-FileStoreValue -ProjectArg $ProjectArg -Key $Key
-    if ($tier2.Found) {
-        [Console]::Out.Write($tier2.Value)
+    $local = Get-LocalValue -ProjectArg $ProjectArg -Key $Key
+    if ($local.Found) {
+        [Console]::Out.Write($local.Value)
         return 0
-    }
-    # Tier 3: project .env — only when the first arg names a folder.
-    if (Test-LooksLikePath $ProjectArg) {
-        $envDir = $ProjectArg
-        if (Test-Path -LiteralPath $envDir -PathType Leaf) {
-            $envDir = Split-Path -Parent $envDir
-        }
-        $tier3 = Get-DotenvValue -Folder $envDir -Key $Key
-        if ($tier3.Found) {
-            [Console]::Out.Write($tier3.Value)
-            return 0
-        }
-    } else {
-        Write-Err "tier 3 (.env) skipped: first arg is a project id, not a folder — re-invoke with the project folder to consult its .env"
     }
     Write-Err "key $Key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
     return $tier1.ExitCode
 }
 
+function Read-Many {
+    # resolve-many (see Usage). MUST MATCH read_many in vct_secrets_resolve.sh.
+    param([string]$ProjectArg, [string[]]$Keys)
+    foreach ($key in $Keys) {
+        if (-not ("$key" -cmatch '^[A-Za-z_][A-Za-z0-9_]*$')) {
+            Write-Err "resolve-many: not an env-var-shaped key name: $key"
+            return 64
+        }
+    }
+    # The project is looked up ONCE; its code stands for tier 1 of every key
+    # until a key's own tier-1 answer says otherwise.
+    $resolved = Resolve-ProjectId -ArgValue $ProjectArg
+    $hubRc = $resolved.ExitCode
+    $firstMiss = 0
+    foreach ($key in $Keys) {
+        $rc = $hubRc
+        $value = $null
+        if ($hubRc -eq 0) {
+            $tier1 = Read-KeyHubEnv -ProjectId $resolved.Value -Key $key
+            $rc = $tier1.ExitCode
+            $value = $tier1.Value
+            # The hub stopped answering (or the budget is spent): do not
+            # wait on it again for the remaining keys.
+            if ($rc -eq 1) { $hubRc = 1 }
+        }
+        if ($rc -ne 0) {
+            $local = Get-LocalValue -ProjectArg $ProjectArg -Key $key
+            if ($local.Found) {
+                $rc = 0
+                $value = $local.Value
+            } else {
+                Write-Err "key $key unresolved after hub (tier 1), file store (tier 2), and project .env (tier 3)"
+            }
+        }
+        if ($rc -eq 0 -and ("$value".Contains("`n") -or "$value".Contains("`r"))) {
+            Write-Err "resolve-many: the value of $key holds a line break and cannot be printed as one KEY=VALUE line — resolve it with the single-key form"
+            $rc = 4
+        }
+        if ($rc -eq 0) {
+            [Console]::Out.Write("$key=$value`n")
+        } elseif ($firstMiss -eq 0) {
+            $firstMiss = $rc
+        }
+    }
+    return $firstMiss
+}
+
 # ── Main ────────────────────────────────────────────────────────────────
 $ErrorActionPreference = "Stop"
+
+if ($Arg1 -eq "resolve-many") {
+    if ($MoreArgs.Count -eq 0) {
+        Write-Err "usage: vct_secrets_resolve.ps1 resolve-many <project_id_or_folder> KEY [KEY...]"
+        exit 64
+    }
+    $rcMany = Read-Many -ProjectArg $Arg2 -Keys @($MoreArgs)
+    exit $rcMany
+}
+
+if ($MoreArgs.Count -gt 0) {
+    Write-Err "usage: vct_secrets_resolve.ps1 <project_id_or_folder> <secret_key> | resolve-project <folder> | resolve-many <project_id_or_folder> KEY [KEY...]"
+    exit 64
+}
 
 if ($Arg1 -eq "resolve-project") {
     $resolved = Resolve-ProjectId -ArgValue $Arg2

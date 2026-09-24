@@ -846,6 +846,27 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     return None
 
 
+def former_launcher_cli_still_on_path(ctx: ProbeContext) -> Optional[bool]:
+    """``former_launcher_cli_on_path`` — is an old copy of the launcher CLI
+    still there?
+
+    The doctor's own reading (:mod:`vco_lib.launcher_cli_identity`). The paths
+    the entry named are re-checked BY PATH first, so a caller whose PATH
+    differs from the user's shell cannot clear an entry for a copy that is
+    still on disk; then the current PATH is scanned for any other copy.
+
+    Returns True while any copy remains, False when none does, None when the
+    reading could not run.
+    """
+    from vco_lib import launcher_cli_identity as identity
+
+    try:
+        recorded = identity.paths_in_remedy(getattr(ctx.entry, "command_to_apply", "") or "")
+        return identity.still_present(recorded)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+
+
 #: Socket timeout for the hub health read. Mirrors the timeout
 #: ``install.py::_probe_vct_hub_health`` uses — the two must stay in step
 #: because they read the SAME endpoint (see :func:`hub_answers_health`).
@@ -972,6 +993,7 @@ PROBES: dict[str, ProbeFn] = {
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
+    "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
 }
 
 

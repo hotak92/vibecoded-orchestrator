@@ -12,7 +12,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   own code-graph collections (auto-detected for sibling repos via
 #   detect-project.sh). Writes do NOT consult VCT_CODE_GRAPH_ACCESS_LIST
 #   — that env var is read-side only (fan-out across peer codegraphs).
-#   No centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+#   No centralization needed: writes always target the project's OWN
+#   collections; the access lists gate reads fanning out to peers only.
 
 # Code Graph Incremental Update Hook
 # Runs incremental code graph analysis on every code file edit.
@@ -53,8 +54,8 @@ REPO_PATH="${2:-${CLAUDE_PROJECT_DIR:-$(pwd)}}"
 # slug-alias `code_graph_project`. The slug routes writes to a derived
 # zombie prefix (slug → canonical_class_prefix → e.g. `Orchestrator_root`)
 # while consumers + the launcher binding row point at the canonical
-# prefix (e.g. `VibeCodedOrchestrator`). See knowledge/concepts/
-# multi-codebase-code-graph-detection.md for the full diagnosis.
+# prefix (e.g. `VibeCodedOrchestrator`) — the write target silently
+# diverged from every consumer until the field switch.
 #
 # v0.2.66 (Bug 3): factored into a function so the canonical-root
 # re-resolution below (worktree dedup) reuses the SAME resolver→basename

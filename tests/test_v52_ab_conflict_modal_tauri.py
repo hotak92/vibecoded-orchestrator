@@ -235,13 +235,28 @@ class RustTauriCommandsTests(unittest.TestCase):
         )
         # Half 2: the runner it delegates to is itself silent, which is the
         # property this test exists to protect (no Windows console window).
+        # v0.2.97 review R6: the runners build their command through ONE
+        # constructor, `git_command()`, which resolves the program (so a test
+        # can inject a fake `git` per thread) and applies `.silent()`.
         git_cmd = (INSTALLER_RS.parent / "git_cmd.rs").read_text(encoding="utf-8")
-        self.assertIn(
-            'TokioCommand::new("git").silent()',
-            git_cmd,
+        constructor = self._function_body(git_cmd, "pub(crate) fn git_command()")
+        self.assertRegex(
+            constructor,
+            r'TokioCommand::new\([^\n]*"git"[^\n]*\)\.silent\(\)',
             "the git_cmd runner must apply .silent() — every caller, including "
             "resolve_conflict_and_resume, inherits the Windows-console "
             "suppression from it",
+        )
+        for runner in ("pub(crate) async fn run_git(", "pub(crate) async fn run_git_raw_env<"):
+            self.assertIn(
+                "git_command()",
+                self._function_body(git_cmd, runner),
+                f"{runner} must build its command through git_command()",
+            )
+        self.assertNotIn(
+            'TokioCommand::new("git")',
+            git_cmd,
+            "no git_cmd runner may bypass git_command() with its own construction",
         )
 
     # -- helpers -----------------------------------------------------------

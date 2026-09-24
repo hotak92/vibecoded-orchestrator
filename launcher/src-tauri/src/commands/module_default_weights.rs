@@ -2139,6 +2139,7 @@ mod tests {
 
     #[test]
     fn rl_latest_weights_url_respects_env_override() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var("VCT_RL_LATEST_WEIGHTS_URL").ok();
         std::env::set_var("VCT_RL_LATEST_WEIGHTS_URL", "https://staging.example/x");
         assert_eq!(rl_latest_weights_url(), "https://staging.example/x");

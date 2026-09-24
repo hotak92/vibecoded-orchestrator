@@ -611,8 +611,12 @@ pub(crate) async fn serialized_fetch_upstream(
         if let Some(branch) = refspec {
             args.push(branch);
         }
-        let fetch = TokioCommand::new("git")
-            .silent()
+        // Through git_cmd's one program resolution, so a test's per-thread
+        // lookup PATH reaches the fetch (review R6). The `--version` probe
+        // above stays on the process `git`: its answer is cached for the
+        // whole process, and a test's injection must not decide it for every
+        // other test.
+        let fetch = crate::commands::git_cmd::git_command()
             .args(&args)
             .current_dir(repo)
             .output()
@@ -3475,12 +3479,11 @@ mod tests {
     // git) they run for real.
 
     use std::process::Command as StdCommand;
-    use std::sync::Mutex;
 
-    /// Tests that mutate `VCO_UPSTREAM_URL` must hold this mutex — `cargo
-    /// test` runs in-binary tests in parallel and the env var is process-
-    /// global. Without serialization the override tests race.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
+    // Tests that mutate (or depend on) `VCO_UPSTREAM_URL` hold THE env lock
+    // (`test_env::env_lock`) — `cargo test` runs in-binary tests in parallel
+    // and the variable is process-global. v0.2.97 review R6: this module's
+    // own `ENV_MUTEX` ordered only its own tests.
 
     /// Skip a test if `git --version` doesn't succeed.
     macro_rules! skip_if_no_git {
@@ -3804,7 +3807,7 @@ mod tests {
         // Hold the env mutex: these tests read `default_upstream_url()`
         // which inspects VCO_UPSTREAM_URL. Without serialization an
         // env-override test could mutate it mid-read.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = vct_launcher_core::test_env::env_lock();
 
         let (_tmp, repo) = init_repo();
         assert!(get_remote_url_sync(&repo, VCO_UPSTREAM_REMOTE).is_none());
@@ -3818,7 +3821,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_upstream_remote_updates_when_url_mismatched() {
         skip_if_no_git!();
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = vct_launcher_core::test_env::env_lock();
 
         let (_tmp, repo) = init_repo();
 
@@ -3848,7 +3851,7 @@ mod tests {
     #[tokio::test]
     async fn ensure_upstream_remote_noop_when_already_correct() {
         skip_if_no_git!();
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = vct_launcher_core::test_env::env_lock();
 
         let (_tmp, repo) = init_repo();
 
@@ -3886,7 +3889,7 @@ mod tests {
     fn env_override_url_is_honored_when_set() {
         // Hold the env mutex for the duration so sibling env-tests don't race.
         // .unwrap_or_else handles a poisoned mutex from a prior panicked test.
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = vct_launcher_core::test_env::env_lock();
 
         let prev = std::env::var(VCO_UPSTREAM_URL_ENV).ok();
         std::env::set_var(VCO_UPSTREAM_URL_ENV, "https://git.example.com/mirror.git");
@@ -3903,7 +3906,7 @@ mod tests {
 
     #[test]
     fn env_override_invalid_falls_back_to_default() {
-        let _guard = ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner());
+        let _guard = vct_launcher_core::test_env::env_lock();
 
         let prev = std::env::var(VCO_UPSTREAM_URL_ENV).ok();
         std::env::set_var(VCO_UPSTREAM_URL_ENV, "garbage");

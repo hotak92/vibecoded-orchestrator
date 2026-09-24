@@ -127,7 +127,11 @@ pub struct DeprecatedMcp {
     pub removed_in: String,
     /// Human-readable rationale, surfaced verbatim in the retirement badge.
     pub reason: String,
-    /// Bundled-module manifest that re-adds it, if any.
+    /// Repo-relative path of a bundled-module manifest that re-adds it, if
+    /// any. Read by the Python deferral (`install_mcp`'s "Opt-in:" line);
+    /// carried here so both loaders parse the same table. It must name an
+    /// embedded manifest
+    /// (`bundled_manifests::tests::every_referenced_module_id_is_an_embedded_manifest`).
     #[serde(default)]
     pub opt_in_manifest: Option<String>,
 }
@@ -332,10 +336,10 @@ mod tests {
             "reason is rendered verbatim into the retirement badge: {}",
             ollama.reason
         );
-        assert_eq!(
-            ollama.opt_in_manifest.as_deref(),
-            Some("launcher/bundled_manifests/vct-ollama.json"),
-        );
+        // No opt-in: the vct-ollama manifest and the ollama_mcp server it
+        // installed were deleted in v0.2.11 (review R6 F50 — the pointer named
+        // a file that never shipped alongside this key).
+        assert_eq!(ollama.opt_in_manifest, None);
         // Every deprecated name must be a name the orchestrator once shipped
         // — otherwise the retire pass would badge a row it does not own.
         for name in d.keys() {

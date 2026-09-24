@@ -49,7 +49,9 @@
 //! same line:
 //!
 //!   * `vco_lib.config_projection` — [`write_settings_env_block`],
-//!     [`strip_settings_env_keys`], [`strip_proven_secret_values`];
+//!     [`strip_proven_secret_values`];
+//!   * `vco_lib.unregister_env` — [`strip_routing_env_keys`] (the
+//!     unregister's `.claude/env` + JSON env-block routing-key strip);
 //!   * `vco_lib.env_projection_check` — [`read_settings_env_blocks`];
 //!   * `vco_lib.hooks_settings` — [`list_settings_hooks`];
 //!   * `vco_lib.env_template` — [`apply_project_env_template`],
@@ -159,8 +161,8 @@ pub fn build_write_env_block_request(pairs: &[(&str, String)], owned_keys: &[&st
     serde_json::json!({ "set": set, "owned_keys": owned_keys }).to_string()
 }
 
-/// The stdin request `python -m vco_lib.config_projection strip-env-keys`
-/// reads: the key NAMES to remove.
+/// The stdin request the unregister's strips read (`vco_lib.unregister_env
+/// strip-routing`, `vco_lib.env_template strip`): the key NAMES in scope.
 pub fn build_strip_env_keys_request(keys: &[&str]) -> String {
     serde_json::json!({ "keys": keys }).to_string()
 }
@@ -204,28 +206,38 @@ pub fn write_settings_env_block(
     run_env_block_command(cmd, &python, root, project_folder, &body, "written")
 }
 
-/// The removal-only twin of [`write_settings_env_block`]
-/// (`vco_lib.config_projection.strip_env_keys`): removes `keys` from one JSON
-/// surface's env block, never creates a file, drops an env block it empties,
-/// and refuses (and records) a file it cannot safely edit. Returns the keys
-/// actually removed. Used by the unregister strips in `projects_v2`.
-pub fn strip_settings_env_keys(
+/// v0.2.97 (review R6): the unregister's routing-key strip for
+/// `.claude/env` and both JSON env blocks — `python -m vco_lib.unregister_env
+/// strip-routing` (stdin `{"keys": [...]}`). VCO's `.claude/env` block goes
+/// whole; elsewhere a key goes only when its value equals what VCO projects
+/// for `project_id` (resolved from the launcher DB with `root` as the
+/// orchestrator root — the refresh's own resolution — so call it BEFORE the
+/// project's row is deleted). Returns the whole `ok: true` reply: `removed` /
+/// `left` `{file: [KEY]}`, `projection` `"resolved"|"unavailable"`,
+/// `projection_error`, `errors` — names only, never a value. Superseded the
+/// by-name `config_projection strip-env-keys` spawn and a Rust `.claude/env`
+/// rewrite.
+pub fn strip_routing_env_keys(
     root: Option<&Path>,
     project_folder: &Path,
-    surface: &str,
+    project_id: Option<&str>,
     keys: &[&str],
-) -> Result<Vec<String>, String> {
+) -> Result<serde_json::Value, String> {
     let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
-        .arg("vco_lib.config_projection")
-        .arg("strip-env-keys")
+        .arg("vco_lib.unregister_env")
+        .arg("strip-routing")
         .arg("--project-folder")
-        .arg(project_folder)
-        .arg("--surface")
-        .arg(surface);
+        .arg(project_folder);
+    if let Some(id) = project_id {
+        cmd.arg("--project-id").arg(id);
+    }
+    if let Some(r) = root {
+        cmd.arg("--orchestrator-root").arg(r);
+    }
     let body = build_strip_env_keys_request(keys);
-    run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
+    run_vco_lib_json(cmd, &python, root, project_folder, &body, parse_ok_reply)
 }
 
 /// v0.2.97: remove from `project_folder`'s env files the secret values VCO
@@ -505,16 +517,29 @@ pub fn repair_project_env_kg(
     Ok(reply.get("action").and_then(serde_json::Value::as_str).unwrap_or("unchanged").to_string())
 }
 
-/// v0.2.97 (review R5 F40): the unregister's `.env` strip through the ONE
-/// `.env` writer — `python -m vco_lib.env_template strip` (stdin
-/// `{"keys": [...]}`): VCO's managed block goes whole, and every line
-/// assigning one of `keys` (active or `#`-commented) outside it. Returns the
-/// removed key names. Replaces a Rust read-modify-write of the same file.
+/// What the unregister's `.env` strip did — key NAMES only.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EnvStripOutcome {
+    /// VCO's keys removed (its managed block, its retired writers' sections).
+    pub removed: Vec<String>,
+    /// The user's OWN assignments of a managed key — left in place.
+    pub left: Vec<String>,
+    /// `<KEY>_old` lines (the user's earlier values) still in the file.
+    pub preserved: Vec<String>,
+}
+
+/// v0.2.97 (review R5 F40, R6 F47): the unregister's `.env` strip through the
+/// ONE `.env` writer — `python -m vco_lib.env_template strip` (stdin
+/// `{"keys": [...]}`). It removes what VCO authored ONLY: the managed block
+/// whole, the retired writers' recognised sections, and the comment VCO put
+/// above kept `<KEY>_old` values. A user's own assignment of a managed key
+/// elsewhere is left and reported ([`EnvStripOutcome::left`]), as are the
+/// `_old` values. Replaces a Rust read-modify-write of the same file.
 pub fn strip_project_env_keys(
     root: Option<&Path>,
     project_folder: &Path,
     keys: &[&str],
-) -> Result<Vec<String>, String> {
+) -> Result<EnvStripOutcome, String> {
     let python = vco_lib_python()?;
     let mut cmd = Command::new(&python).silent();
     cmd.arg("-m")
@@ -523,7 +548,13 @@ pub fn strip_project_env_keys(
         .arg("--project-folder")
         .arg(project_folder);
     let body = build_strip_env_keys_request(keys);
-    run_env_block_command(cmd, &python, root, project_folder, &body, "removed")
+    run_vco_lib_json(cmd, &python, root, project_folder, &body, |out, err| {
+        parse_ok_reply(out, err).map(|reply| EnvStripOutcome {
+            removed: list_at(&reply, "removed"),
+            left: list_at(&reply, "left"),
+            preserved: list_at(&reply, "preserved"),
+        })
+    })
 }
 
 /// v0.2.97 (review R5 F40): set one launcher-owned key (e.g.
@@ -557,7 +588,28 @@ pub fn set_infrastructure_env_key(
 fn vco_lib_python() -> Result<std::path::PathBuf, String> {
     #[cfg(test)]
     {
-        Ok(vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3"))
+        // An ABSOLUTE interpreter, resolved once. The fallback is the bare
+        // name `python3`, which the spawn looks up on PATH at spawn time.
+        // Tests used to blank the process PATH for a moment, and a bridge
+        // test spawning concurrently intermittently failed with "spawn
+        // failed"; no test does that now (v0.2.97 review R6,
+        // `tests/test_rust_tests_never_mutate_process_path.py`). A test
+        // that injected an empty lookup PATH on its own thread
+        // (`paths::with_lookup_path`) gets the bare name, uncached.
+        static PYTHON: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        if let Some(found) = PYTHON.get() {
+            return Ok(found.clone());
+        }
+        let resolved = vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3");
+        if resolved.is_absolute() {
+            return Ok(PYTHON.get_or_init(|| resolved).clone());
+        }
+        // The launcher's one PATH lookup (v0.2.97 review R6).
+        let on_path = resolved.to_str().and_then(vct_launcher_core::paths::which_on_path);
+        Ok(match on_path {
+            Some(absolute) => PYTHON.get_or_init(|| absolute).clone(),
+            None => resolved,
+        })
     }
     #[cfg(not(test))]
     {
@@ -585,6 +637,30 @@ pub(crate) fn vco_lib_cwd(root: Option<&Path>, project_folder: &Path) -> std::pa
     {
         root.map(Path::to_path_buf).unwrap_or_else(|| project_folder.to_path_buf())
     }
+}
+
+/// Test helper: the canonical env `vco_lib.config_projection from-db`
+/// resolves for `project_id` from the test's launcher DB — the values the
+/// unregister strip compares against (review R6). `root` as in production.
+#[cfg(test)]
+pub(crate) fn test_projected_env(root: Option<&Path>, project_id: &str) -> serde_json::Value {
+    let python = vco_lib_python().expect("a python for vco_lib");
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.config_projection")
+        .arg("from-db")
+        .arg("--project-id")
+        .arg(project_id);
+    if let Some(r) = root {
+        cmd.arg("--orchestrator-root").arg(r);
+    }
+    let here = test_checkout_root();
+    run_vco_lib_json(cmd, &python, root, &here, "", |out, err| {
+        serde_json::from_slice::<serde_json::Value>(out)
+            .map(|v| v["canonical_env"].clone())
+            .map_err(|e| format!("from-db: {} ({})", e, String::from_utf8_lossy(err)))
+    })
+    .expect("from-db resolves the test project")
 }
 
 /// The `VCT_STATE_DIR` a test child runs with: the test's own (set through
@@ -782,6 +858,7 @@ mod tests {
     /// (which reflects `env_clear` + explicit `env`).
     #[test]
     fn drops_non_allowlisted_key() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Set a sentinel disallowed key; after the sandbox it must NOT
         // appear among the re-injected overrides.
         std::env::set_var("KG_COLLECTION", "SENTINEL_SHOULD_BE_DROPPED");
@@ -813,6 +890,7 @@ mod tests {
     /// An allowlisted key present in the parent env IS re-injected.
     #[test]
     fn keeps_allowlisted_key() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("VCT_INSTALL_ROOT", "/tmp/sentinel-install-root");
 
         let mut cmd = Command::new("python3");
@@ -1030,15 +1108,21 @@ mod env_template_tests {
 
     /// Review R5 F40: the unregister's `.env` strip removes VCO's managed
     /// block WHOLE (a by-name strip left its markers and comments behind) and
-    /// keeps the user's lines.
+    /// keeps the user's lines. Review R6 F47: a user's OWN assignment of a
+    /// managed key is left and reported, never removed.
     #[test]
     fn strip_removes_the_whole_block_and_keeps_user_lines() {
         let (_guard, id, folder) = fixture("Acme");
-        std::fs::write(folder.join(".env"), "USER_KEY=keep\n").unwrap();
+        std::fs::write(folder.join(".env"), "USER_KEY=keep\nPROJECT_NAME=Mine\n").unwrap();
         apply_project_env_template(None, &folder, &id, PORTS).unwrap();
-        let removed = strip_project_env_keys(None, &folder, &["KG_COLLECTION", "PROJECT_NAME"]).unwrap();
-        assert!(removed.iter().any(|k| k == "KG_COLLECTION"), "{removed:?}");
-        assert_eq!(std::fs::read_to_string(folder.join(".env")).unwrap(), "USER_KEY=keep\n");
+        let outcome = strip_project_env_keys(None, &folder, &["KG_COLLECTION", "PROJECT_NAME"]).unwrap();
+        assert!(outcome.removed.iter().any(|k| k == "KG_COLLECTION"), "{outcome:?}");
+        assert_eq!(outcome.left, vec!["PROJECT_NAME".to_string()]);
+        assert!(!outcome.removed.iter().any(|k| k == "PROJECT_NAME"), "{outcome:?}");
+        assert_eq!(
+            std::fs::read_to_string(folder.join(".env")).unwrap(),
+            "USER_KEY=keep\nPROJECT_NAME=Mine\n"
+        );
     }
 
     /// The "Migrate from .env" rewrite, through the one writer: only the

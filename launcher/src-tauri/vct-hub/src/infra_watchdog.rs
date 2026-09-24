@@ -1351,6 +1351,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn code_embed_excluded_when_backend_is_ollama() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
         // Explicit CPU fallback → code_embed not in stack.
         for v in ["ollama", "OLLAMA", " Ollama "] {
@@ -1370,6 +1371,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn code_embed_included_when_backend_unset_or_gpu() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os(ENV_CODE_EMBED_BACKEND);
         std::env::remove_var(ENV_CODE_EMBED_BACKEND);
         assert!(code_embed_in_stack(), "unset backend defaults to in-stack");

@@ -2538,31 +2538,22 @@ mod tests {
     /// resolve_hub_base_port: hub.port file takes priority over $VCT_HUB_PORT.
     #[test]
     fn v0261_resolve_hub_base_port_prefers_port_file() {
-        let guard = VctStateDirGuard::new();
-        std::fs::write(guard.vct_root().join("hub.port"), "7711\n").expect("write port file");
-        // Even with the env set to something else, the file wins.
-        let prev = std::env::var("VCT_HUB_PORT").ok();
-        std::env::set_var("VCT_HUB_PORT", "9999");
+        // Scratch state dir + the env set to something else, restored by the
+        // one guard (it holds GLOBAL_ENV_MUTEX).
+        let guard = vct_launcher_core::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("9999"))]);
+        std::fs::write(guard.path().join("hub.port"), "7711\n").expect("write port file");
         assert_eq!(resolve_hub_base_port(), 7711, "hub.port file is authoritative");
-        match prev {
-            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
-            None => std::env::remove_var("VCT_HUB_PORT"),
-        }
     }
 
     /// resolve_hub_base_port: falls back to $VCT_HUB_PORT when no port file.
     #[test]
     fn v0261_resolve_hub_base_port_falls_back_to_env_then_default() {
-        let _guard = VctStateDirGuard::new(); // empty state dir → no hub.port
-        let prev = std::env::var("VCT_HUB_PORT").ok();
-        std::env::set_var("VCT_HUB_PORT", "8800");
+        // Empty state dir → no hub.port.
+        let _guard = vct_launcher_core::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("8800"))]);
         assert_eq!(resolve_hub_base_port(), 8800, "env used when no port file");
-        std::env::remove_var("VCT_HUB_PORT");
+        // The guard holds the lock and restores the prior value on drop.
+        unsafe { std::env::remove_var("VCT_HUB_PORT") };
         assert_eq!(resolve_hub_base_port(), 7700, "hard default when neither present");
-        match prev {
-            Some(v) => std::env::set_var("VCT_HUB_PORT", v),
-            None => std::env::remove_var("VCT_HUB_PORT"),
-        }
     }
 
     /// module_spawn_lock: the SAME module_id returns the SAME Arc<Mutex>

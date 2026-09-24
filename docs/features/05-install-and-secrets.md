@@ -85,7 +85,7 @@ PowerShell 5.1+ script with the same interpreter probe (`python3.12`, …, `py -
 
 `install.ps1` supports the flags the Python installer accepts: `-NoContainers`, `-Gpu`, `-CpuOnly`, `-LowResource`, `-OpenaiKey`, `-Container`, `-Dev`, `-Update`, `-SkipModels`, `-Quiet`, `-NoAgents`, `-NoSkills`. The Windows `py` launcher with version pinning (`py -3.12`) is tried as a secondary probe to handle Windows Store Python stubs.
 
-> The `-WithMaoAgents` switch is also present in `install.ps1` and forwards `--with-mao-agents` to `install.py`, but `install.py` doesn't define that flag and `templates/agents/mao/` doesn't exist in the OSS bundle — the switch is effectively a no-op until those land. Tracked as a code-doc gap, not a documented flag.
+> `install.ps1` also carries a `-WithMaoAgents` switch that is **obsolete and ignored**: the MAO-tier specialist agents were folded into the standard agent set before v0.2.0 (commit 79c2635b) and install unconditionally unless `-NoAgents` is given. The switch prints a warning and is never forwarded to `install.py` (whose argparse would reject `--with-mao-agents`), so an old invocation keeps installing instead of aborting.
 >
 
 </details>

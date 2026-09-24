@@ -4508,6 +4508,7 @@ kg_tier_full = 0.8
     /// candidate. Reproduces the dev-collection case-mismatch (Symptom B) fix.
     #[tokio::test]
     async fn dev_collection_case_rebind_adopts_on_disk_casing() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         crate::weaviate_schema_probe::_reset_cache_for_test();
 
         // Fake Weaviate: lowercase-c on-disk class (the case-mismatch case).
@@ -4593,6 +4594,7 @@ kg_tier_full = 0.8
     /// This is the no-rebind path and must keep working.
     #[tokio::test]
     async fn dev_collection_no_rebind_when_no_sibling() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         crate::weaviate_schema_probe::_reset_cache_for_test();
 
         // Fake Weaviate: empty schema (fresh install).
@@ -4641,6 +4643,7 @@ kg_tier_full = 0.8
     /// breaks resolver responses.
     #[tokio::test]
     async fn dev_collection_unreachable_weaviate_fails_open() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         crate::weaviate_schema_probe::_reset_cache_for_test();
 
         // Bind+drop a TCP listener to claim a port that's now closed.
@@ -4937,6 +4940,7 @@ kg_tier_full = 0.8
     ///   3. unreachable Weaviate → field ABSENT (probe failure ≠ absence).
     #[tokio::test]
     async fn config_warnings_phantom_and_probe_failure_legs() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         use axum::{routing::get, Json};
         crate::weaviate_schema_probe::_reset_cache_for_test();
 

@@ -9,7 +9,7 @@ The components themselves ship with the orchestrator; these manifests carry thei
 | Manifest | Module ID | License | Role |
 |---|---|---|---|
 | `vct-kg.json` | vct-kg | AGPL-3.0 | Knowledge graph MCP (Weaviate-backed) |
-| `vct-codegraph.json` | vct-codegraph | AGPL-3.0 | Code graph MCP (AST entities) |
+| `vct-codegraph.json` | vct-codegraph | AGPL-3.0 | Code graph (AST entities); its tools are served by vct-kg's `weaviate-kg` MCP |
 | `vct-search.json` | vct-search | AGPL-3.0 | Web/code/paper search MCP |
 | `vct-code-embedding.json` | vct-code-embedding | AGPL-3.0 | GPU/CPU code embeddings service |
 | `vct-hub-api.json` | vct-hub-api | AGPL-3.0 | Inter-app hub (port 7700) |
@@ -17,4 +17,4 @@ The components themselves ship with the orchestrator; these manifests carry thei
 
 All are `category: "core"`, `license.required: false`, compatible with both base and MAO hosts.
 
-See `docs/VCT_MODULE_MANIFEST_SPEC.md` (in the Claude Orchestrator meta-project) for the full manifest schema reference.
+See `docs/VCT_MODULE_MANIFEST_SPEC.md` (in this repository) for the full manifest schema reference.

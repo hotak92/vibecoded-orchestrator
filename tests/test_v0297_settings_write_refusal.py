@@ -326,24 +326,27 @@ def test_strip_env_keys_refuses_and_records_an_unreadable_file(tmp_path):
     assert _entry(tmp_path) is not None
 
 
-def test_the_strip_cli_reports_removed_keys_and_refuses_with_exit_4(tmp_path):
-    def run(request: dict) -> subprocess.CompletedProcess:
+def test_the_unregister_strip_refuses_an_unreadable_file_and_says_so(tmp_path):
+    """The unregister's JSON strip (`unregister_env strip-routing`, which
+    superseded the by-name `strip-env-keys` verb in review R6) refuses a file
+    it cannot edit exactly like every writer: byte-identical, recorded in the
+    ledger, and named in the reply's `errors` (the other surfaces still run)."""
+    def run(request: object) -> subprocess.CompletedProcess:
         return subprocess.run(
-            [sys.executable, "-m", "vco_lib.config_projection", "strip-env-keys",
-             "--project-folder", str(tmp_path), "--surface", "claude_settings_json"],
+            [sys.executable, "-m", "vco_lib.unregister_env", "strip-routing",
+             "--project-folder", str(tmp_path)],
             input=json.dumps(request), capture_output=True, text=True, cwd=REPO_ROOT,
             env=child_env(), check=False, timeout=60,
         )
 
-    _settings(tmp_path, json.dumps({"env": {"A": "1", "B": "2"}}).encode())
-    proc = run({"keys": ["A"]})
-    assert proc.returncode == 0, proc.stderr
-    assert json.loads(proc.stdout) == {"ok": True, "surface": "claude_settings_json", "removed": ["A"]}
     assert run({"keys": "A"}).returncode == 2
     path = _settings(tmp_path, UNPARSEABLE["array_root"])
-    proc = run({"keys": ["A"]})
-    assert proc.returncode == 4 and json.loads(proc.stdout)["error"] == "settings_write_refused"
+    proc = run({"keys": ["KG_COLLECTION"]})
+    assert proc.returncode == 0, proc.stderr
+    reply = json.loads(proc.stdout)
+    assert any("left untouched" in e and "NOT updated" in e for e in reply["errors"]), reply
     assert path.read_bytes() == UNPARSEABLE["array_root"]
+    assert _entry(tmp_path) is not None
 
 
 def test_the_apply_cli_exits_4_with_the_refusal_on_stderr(tmp_path, monkeypatch, capsys):

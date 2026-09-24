@@ -24,6 +24,16 @@ export const UNREGISTER_STOPPED_PREFIX = 'Unregister stopped';
 /** The second action's label — the Rust stop message names it verbatim. */
 export const UNREGISTER_ANYWAY_LABEL = 'Unregister anyway — leave these values';
 
+/** The unregister every GUI surface starts from — the settings page's
+ *  untouched checkboxes, the project list's quick unregister, the wizard's
+ *  re-create. Sent EXPLICITLY (review R6 F46: `null` used to reach a
+ *  different Rust default than `{}`). MUST MATCH `impl Default for
+ *  UnregisterOptions` in `launcher/src-tauri/src/commands/projects_v2.rs`. */
+export const DEFAULT_UNREGISTER_OPTIONS: Readonly<{
+  purgeLauncherFiles: boolean;
+  purgeCollections: boolean;
+}> = Object.freeze({ purgeLauncherFiles: true, purgeCollections: false });
+
 /** The error text of a failed invoke (Tauri rejects with a string). */
 export function errorText(e: unknown): string {
   if (typeof e === 'string') return e;
@@ -44,22 +54,31 @@ export type UnregisterOutcome =
  * Run an unregister; on the STOP, ask `confirmLeave(message)` whether to
  * "Unregister anyway". `kept` = the user chose to keep the project (the stop
  * stands). Any other failure is re-thrown unchanged. The first call NEVER
- * carries `leaveUnremovable` — the escape is only ever the second action.
+ * carries `leaveUnremovable` — the escape is only ever the second action, and
+ * it re-sends the SAME options with only `leaveUnremovable` changed.
  */
 export async function runUnregister(
-  del: (options: UnregisterOptions | null) => Promise<UnregisterReport>,
-  options: UnregisterOptions | null,
+  del: (options: UnregisterOptions) => Promise<UnregisterReport>,
+  options: UnregisterOptions,
   confirmLeave: (message: string) => Promise<boolean>,
 ): Promise<UnregisterOutcome> {
-  const first: UnregisterOptions | null =
-    options === null ? null : { ...options, leaveUnremovable: false };
   try {
-    return { kind: 'done', report: await del(first), leftAnyway: false };
+    return { kind: 'done', report: await del({ ...options, leaveUnremovable: false }), leftAnyway: false };
   } catch (e) {
     if (!isUnregisterStopped(e)) throw e;
     const message = errorText(e);
     if (!(await confirmLeave(message))) return { kind: 'kept', message };
-    const report = await del({ ...(options ?? {}), leaveUnremovable: true });
+    const report = await del({ ...options, leaveUnremovable: true });
     return { kind: 'done', report, leftAnyway: true };
   }
+}
+
+/** The project list's quick unregister: the same unregister as the settings
+ *  page's defaults ({@link DEFAULT_UNREGISTER_OPTIONS}) — the stop can fire,
+ *  and its escape re-runs with the same options (review R6 F46). */
+export function quickUnregister(
+  del: (options: UnregisterOptions) => Promise<UnregisterReport>,
+  confirmLeave: (message: string) => Promise<boolean>,
+): Promise<UnregisterOutcome> {
+  return runUnregister(del, { ...DEFAULT_UNREGISTER_OPTIONS }, confirmLeave);
 }

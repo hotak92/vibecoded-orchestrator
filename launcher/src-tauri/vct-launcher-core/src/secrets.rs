@@ -30,7 +30,7 @@
 //! + active-flag gating + cross-launcher pause check, all in one
 //! place. Bundled wrappers consume that endpoint via the shared
 //! resolver helper at `templates/scripts/vct_secrets_resolve.sh`
-//! (Bash) / `.ps1` (PowerShell). See `docs/MIGRATION-0.2.0.md`.
+//! (Bash) / `.ps1` (PowerShell). See `docs/VCT_SECRETS_PRIMITIVE.md`.
 //!
 //! Reads in this module go through the keychain only. There is no
 //! file-side mirror anywhere in the launcher's set/delete paths.

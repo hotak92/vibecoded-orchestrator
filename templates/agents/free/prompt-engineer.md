@@ -349,9 +349,9 @@ You succeed when:
 3. **Use Code Graph for few-shot examples**: `search_code_graph` finds real-world code to include in prompts
 4. **Document findings**: Share relevant KG nodes and code examples with user
 5. **Default to hybrid_search for research**: Most comprehensive (keyword + semantic + graph)
-6. **For quick analysis / rewrites**: use Claude's own reasoning. (If you've
-   opted into the `vct-ollama` module, local inference is available;
-   otherwise reason in-context.)
+6. **For quick analysis / rewrites**: use Claude's own reasoning. VCO exposes
+   no local-inference tool (the Ollama MCP was retired in v0.2.11); if a task
+   must stay on-device, see "Local-only inference" below.
 ```
 
 **Tool-aware agent template**:
@@ -363,7 +363,7 @@ You succeed when:
 - **Code search**: Grep, Glob
 - **Command execution**: Bash (tests, git, build)
 - **Weaviate MCP**: Semantic search (KG, docs, code graph)
-- **Ollama MCP** *(opt-in module)*: Local LLM inference — install via launcher Modules → `vct-ollama`. The default install relies on Claude's native reasoning.
+- **Claude's native capabilities**: reasoning for analysis and rewrites, `Read` for large files and (on an image path) vision. There is no Ollama MCP — it was retired in v0.2.11; Ollama runs only as VCO's embedding service.
 
 ## Tool Usage Strategy
 
@@ -371,7 +371,7 @@ You succeed when:
 1. `hybrid_search("concept")` → Find patterns, architecture decisions, past solutions (Weaviate MCP)
 2. `search_code_graph("purpose", scope="code")` → Find similar code implementations (Weaviate MCP)
 3. `query_code_structure("dependencies", "target_module")` → Understand architecture (Weaviate MCP)
-4. Reason about the approach in-context (Claude's native capabilities; or if vct-ollama is installed, `chat("Analyze: ...", model="gemma4:e4b")` for local-only)
+4. Reason about the approach in-context (Claude's native capabilities)
 5. Grep → Find exact strings/names in current codebase (built-in)
 6. Read → Understand specific files in detail (built-in)
 
@@ -392,7 +392,7 @@ You succeed when:
 - Conceptual search → `hybrid_search`
 - Code by purpose → `search_code_graph`
 - Architecture/dependencies → `query_code_structure`
-- Simple analysis/rewrites → Claude's native reasoning (opt-in: `chat` via vct-ollama)
+- Simple analysis/rewrites → Claude's native reasoning
 - File reading → Read
 - File editing → Edit (small) or Write (large)
 - Commands → Bash
@@ -682,18 +682,23 @@ You succeed when your prompts:
 **Example**: `search_code_graph("error handling patterns", scope="code")`
 **Why use**: Find real-world code examples to include in prompts
 
-**chat / read_document** (local LLM inference + file extraction) — **OPT-IN**:
-The base install exposes no local-inference MCP tools — Claude's native
-reasoning handles analysis/rewrite tasks, and `Read` with `offset`/`limit`
-handles large-file extraction. If you specifically want local-only inference
-(cost reasons, air-gapped use cases), install the `vct-ollama` module via
-launcher Modules — it provides `chat`, `read_document`, and `read_image`.
+**Local-only inference** (no MCP tool): the Ollama MCP that provided `chat`,
+`read_document` and `read_image` was retired in v0.2.11, and no module
+re-adds it. Claude's native reasoning handles analysis/rewrite tasks, `Read`
+with `offset`/`limit` handles large-file extraction, and `Read` on an image
+path uses Claude's built-in vision. If a task genuinely must stay on-device
+(cost reasons, air-gapped use cases), the `ollama` service VCO already runs
+for embeddings (`infrastructure/docker-compose.yml`, host port 11435) answers
+Ollama's own REST API — call it from Bash. Only models already pulled into it
+answer: `curl -s http://localhost:11435/api/tags` lists them, and
+`curl -s http://localhost:11435/api/generate -d '{"model":"<a listed model>","prompt":"...","stream":false}'`
+runs one.
 
 **KG-First Search Policy**:
 1. Conceptual query → `hybrid_search`
 2. Relational query → `semantic_graph_search`
 3. Code examples → `search_code_graph`
-4. Quick analysis → Claude's native reasoning (opt-in: `chat` via vct-ollama)
+4. Quick analysis → Claude's native reasoning
 5. Known exact term → `kg-search`
 
 ## Output Format
@@ -794,7 +799,9 @@ Search tools:
 ❌ **NO Workflow Meta-Details**:
 - No "Token-Efficient Hooks" sections (implementation detail)
 - No "Background Maintenance" sections (except in installer/migrator/bootstrapper agents)
-- No setup instructions like "**Setup**: `.claude/scripts/setup_cron.sh`"
+- No invented setup instructions that point at helper scripts which do not
+  exist in the project (e.g. a fictitious "**Setup**: run the project's setup
+  helper")
 - No cron job scheduling details (except in setup agents)
 
 ❌ **NO Workflow Management Details**:

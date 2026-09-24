@@ -301,7 +301,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_TUNING_PATH": "hook-script -> embedded-python value channel",
     "VCT_TUNING_TARGET": "hook-script -> embedded-python value channel",
     "VCT_TUNING_VALUES": "hook-script -> embedded-python value channel",
-    "VCT_VENV": "venv-path handoff between bundled hooks and children",
     # --- shell variables ASSIGNED (unconditionally, before any read) by
     # --- templates/hooks/_lib/container-names.sh — a user-set env value is
     # --- clobbered by the assignment, so these are not env knobs at all.

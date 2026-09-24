@@ -19,8 +19,10 @@ set -euo pipefail
 # `${VAR:-}` defaults so the script can run on any event without aborting.
 # session_id is the canonical per-conversation key; falling back to
 # "default" only on malformed JSON keeps concurrent sessions from sharing
-# state files (PR #176 cross-OS sweep — see knowledge/concepts/
-# hook-session-id-stdin-pattern.md).
+# state files (PR #176 cross-OS sweep: hooks read session_id from the
+# stdin JSON payload, never the CLAUDE_SESSION_ID env var — the hook
+# runner does not populate it, so an env-var read silently collapses
+# every session onto "default").
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 if [ -n "${PY:-}" ]; then
     SESSION_ID=$(printf '%s' "$HOOK_STDIN" | "$PY" -c "
@@ -95,7 +97,8 @@ fi
 # The staleness marker file is keyed by both PROJECT_NAME and SESSION_ID
 # so concurrent Claude Code sessions on the same project don't stomp on
 # each other's counter (the same concurrency fix as PR #176 applied to
-# 11 other hooks — see knowledge/concepts/hook-session-id-stdin-pattern.md).
+# 11 other hooks: key per-session state by the session_id parsed from
+# the stdin JSON payload, not by project alone).
 STALENESS_MARKER="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/claude-ctx-staleness-${PROJECT_NAME}-${SESSION_ID}"
 LAST_FIRE_WORDS=0
 if [ -f "$STALENESS_MARKER" ]; then

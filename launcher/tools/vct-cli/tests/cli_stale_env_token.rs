@@ -1,11 +1,11 @@
-//! v0.2.91 (WP-D item 4) — stale-env hub-token fallback in the `vco` CLI.
+//! v0.2.91 (WP-D item 4) — stale-env hub-token fallback in the `vct-cli` CLI.
 //!
 //! THE SEAM
 //! --------
 //! `resolve_token()` prefers `$VCT_HUB_TOKEN` over `<vct_root>/hub.token`.
 //! The hub regenerates `hub.token` on every start, so a shell that
 //! exported the token BEFORE an update presents a value the hub refuses —
-//! and every `vco` invocation from that shell died with
+//! and every invocation of this CLI (then named `vco`) from that shell died with
 //! `hub error 401 Unauthorized`, pointing the user at the launcher rather
 //! than at their own environment.
 //!
@@ -32,8 +32,8 @@ const STALE_ENV_TOKEN: &str = "stale-env-token-v0291-not-a-real-secret";
 const FRESH_DISK_TOKEN: &str = "fresh-disk-token-v0291-not-a-real-secret";
 const DEFINITIVE_LINE: &str = "stale VCT_HUB_TOKEN in env overridden by on-disk hub.token";
 
-fn vco_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_vco")
+fn cli_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_vct-cli")
 }
 
 /// A stub hub that 401s every bearer except `expected`, and records the
@@ -116,14 +116,14 @@ impl AuthStubHub {
     }
 }
 
-/// Run `vco project list` against `port` with a fully-controlled env.
-fn run_vco(
+/// Run `vct-cli project list` against `port` with a fully-controlled env.
+fn run_cli(
     port: u16,
     state_dir: &std::path::Path,
     env_token: Option<&str>,
     strict: bool,
 ) -> (String, String, i32) {
-    let mut cmd = Command::new(vco_bin());
+    let mut cmd = Command::new(cli_bin());
     cmd.args(["--port", &port.to_string(), "project", "list"])
         .env_remove("VCT_HUB_PORT")
         .env_remove("VCT_HUB_TOKEN")
@@ -137,7 +137,7 @@ fn run_vco(
     if strict {
         cmd.env("VCT_HUB_TOKEN_STRICT", "1");
     }
-    let out = cmd.output().expect("spawn vco");
+    let out = cmd.output().expect("spawn vct-cli");
     (
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
@@ -189,7 +189,7 @@ fn stale_env_token_is_retried_once_with_the_on_disk_token() {
     let hub = AuthStubHub::start(FRESH_DISK_TOKEN);
     let state = state_dir_with_token(Some(FRESH_DISK_TOKEN));
 
-    let (out, err, code) = run_vco(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
+    let (out, err, code) = run_cli(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
 
     assert_eq!(code, 0, "stdout={out} stderr={err}");
     assert!(out.contains("count"), "expected the hub's JSON body: {out}");
@@ -213,7 +213,7 @@ fn strict_guard_keeps_the_401_path() {
     let hub = AuthStubHub::start(FRESH_DISK_TOKEN);
     let state = state_dir_with_token(Some(FRESH_DISK_TOKEN));
 
-    let (_out, err, code) = run_vco(hub.port, state.path(), Some(STALE_ENV_TOKEN), true);
+    let (_out, err, code) = run_cli(hub.port, state.path(), Some(STALE_ENV_TOKEN), true);
 
     assert_ne!(code, 0, "strict mode must keep the failure");
     assert!(err.contains("401"), "expected the 401 error text: {err}");
@@ -227,7 +227,7 @@ fn identical_tokens_make_exactly_one_request() {
     let hub = AuthStubHub::start(FRESH_DISK_TOKEN);
     let state = state_dir_with_token(Some(FRESH_DISK_TOKEN));
 
-    let (_out, err, code) = run_vco(hub.port, state.path(), Some(FRESH_DISK_TOKEN), false);
+    let (_out, err, code) = run_cli(hub.port, state.path(), Some(FRESH_DISK_TOKEN), false);
 
     assert_eq!(code, 0, "stderr={err}");
     assert_eq!(hub.bearers(), vec![FRESH_DISK_TOKEN.to_string()]);
@@ -248,7 +248,7 @@ fn a_5xx_on_the_retry_keeps_the_original_401_and_prints_no_definitive_line() {
     );
     let state = state_dir_with_token(Some(FRESH_DISK_TOKEN));
 
-    let (_out, err, code) = run_vco(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
+    let (_out, err, code) = run_cli(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
 
     assert_ne!(code, 0);
     assert!(
@@ -275,7 +275,7 @@ fn a_404_on_the_retry_is_adopted_because_it_is_a_post_auth_answer() {
     );
     let state = state_dir_with_token(Some(FRESH_DISK_TOKEN));
 
-    let (_out, err, code) = run_vco(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
+    let (_out, err, code) = run_cli(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
 
     assert_ne!(code, 0, "a 404 is still an error for this command");
     assert!(err.contains("404"), "the adopted answer must surface: {err}");
@@ -288,7 +288,7 @@ fn no_on_disk_token_keeps_the_401_path() {
     let hub = AuthStubHub::start(FRESH_DISK_TOKEN);
     let state = state_dir_with_token(None);
 
-    let (_out, err, code) = run_vco(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
+    let (_out, err, code) = run_cli(hub.port, state.path(), Some(STALE_ENV_TOKEN), false);
 
     assert_ne!(code, 0);
     assert!(err.contains("401"), "expected the 401 error text: {err}");

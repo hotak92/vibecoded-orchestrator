@@ -45,7 +45,11 @@
 .PARAMETER NoAgents
     Skip installing Claude agents.
 .PARAMETER WithMaoAgents
-    Install MAO-tier specialist agents.
+    Obsolete; accepted for backward compatibility and otherwise ignored.
+    The MAO-tier specialist agents were folded into the standard agent set
+    before v0.2.0 (commit 79c2635b) and install unconditionally unless
+    -NoAgents is given. The switch prints a warning and is never forwarded
+    to install.py, which rejects --with-mao-agents as unrecognized.
 .PARAMETER NoSkills
     Skip installing Claude skills.
 .PARAMETER NoCompile
@@ -142,7 +146,7 @@ if ($Help) {
     Write-Host "  -NoAutoLaunch    --no-auto-launch  Skip post-install launcher spawn."
     Write-Host "  -NoDesktopIcon   --no-desktop-icon Skip desktop shortcut creation."
     Write-Host "  -Gpu / -CpuOnly / -LowResource     Hardware mode selection."
-    Write-Host "  -Dev -Update -NoAgents -WithMaoAgents"
+    Write-Host "  -Dev -Update -NoAgents"
     Write-Host "  -NoSkills -NoCompile -Quiet        See .PARAMETER docs in this file."
     Write-Host "  -OpenaiKey <key>  -Container <docker|podman>"
     Write-Host ""
@@ -604,7 +608,13 @@ if ($Update)        { $installArgs += "--update" }
 if ($SkipModels)    { $installArgs += "--skip-models" }
 if ($Quiet)         { $installArgs += "--quiet" }
 if ($NoAgents)      { $installArgs += "--no-agents" }
-if ($WithMaoAgents) { $installArgs += "--with-mao-agents" }
+# -WithMaoAgents is obsolete: the MAO-tier specialist agents were folded
+# into the standard set before v0.2.0 (79c2635b) and install unless
+# -NoAgents is given. Accepted so old invocations keep working; warns and
+# is never forwarded — install.py's argparse rejects --with-mao-agents.
+if ($WithMaoAgents) {
+    Write-Warning "-WithMaoAgents is obsolete: the specialist agents now install by default (they are part of the standard agent set; use -NoAgents to skip agent installation). The flag is ignored."
+}
 if ($NoSkills)      { $installArgs += "--no-skills" }
 if ($NoCompile)     { $installArgs += "--no-compile" }
 # --yes propagation: critical for first-install.bat --yes flow on Windows.

@@ -346,8 +346,9 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             f"hub returned 403 forbidden for {key!r} (project={pid}): the "
             "global hub.token is refused on /env (per-project token required) "
             "or a token for another project was presented. Present the scoped "
-            f"hub.token.{pid}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub "
-            "to reopen the one-release compat window"
+            f"hub.token.{pid} (the resolver prefers it; the hub mints one "
+            "on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape "
+            "hatch was removed in v0.2.97"
         )
     if resp.status_code == 503:
         # v0.2.82 WP-4a: the hub reached its keychain but could not read it.

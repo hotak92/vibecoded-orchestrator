@@ -22,47 +22,43 @@
 //!     `/var/lib/flatpak/exports/bin`.
 //!   - Windows: no-op (Explorer-launched apps inherit user PATH via
 //!     registry).
+//!
+//! v0.2.97 review R6: the tests drive the PURE half, `augmented_path`,
+//! with an explicit PATH and HOME — a Rust test never sets the process
+//! `PATH` (`tests/test_rust_tests_never_mutate_process_path.py`). The
+//! mutating wrapper is one `set_var` over it, called from `lib.rs`.
 
-use serial_test::serial;
-use std::path::PathBuf;
-use vct_launcher_core::services::runtime::augment_path_for_graphical_launch;
+use std::ffi::{OsStr, OsString};
+use std::path::{Path, PathBuf};
+use vct_launcher_core::services::runtime::augmented_path;
+
+// The public wrapper `lib.rs::setup()` calls must stay public too.
+#[allow(dead_code)]
+const _WRAPPER_IS_PUBLIC: fn() = vct_launcher_core::services::runtime::augment_path_for_graphical_launch;
+
+/// The PATH after one augment of `current` with `home`.
+fn after_augment(current: &str, home: &str) -> OsString {
+    augmented_path(OsStr::new(current), Some(Path::new(home)))
+        .unwrap_or_else(|| OsString::from(current))
+}
 
 /// Calling augment twice does not duplicate entries — entries already
 /// present on PATH after the first call are skipped on the second.
 #[test]
-#[serial]
 fn augment_is_idempotent_via_public_api() {
-    let original = std::env::var_os("PATH");
-    std::env::set_var("PATH", "/usr/bin:/bin");
-
-    augment_path_for_graphical_launch();
-    let first = std::env::var_os("PATH").unwrap_or_default();
-
-    augment_path_for_graphical_launch();
-    let second = std::env::var_os("PATH").unwrap_or_default();
-
-    assert_eq!(
-        first, second,
+    let first = after_augment("/usr/bin:/bin", "/tmp/vct-augment-integration-home");
+    assert!(
+        augmented_path(&first, Some(Path::new("/tmp/vct-augment-integration-home"))).is_none(),
         "second augment call must not modify PATH again"
     );
-
-    match original {
-        Some(p) => std::env::set_var("PATH", p),
-        None => std::env::remove_var("PATH"),
-    }
 }
 
 /// Entries already in the original PATH must appear in the post-augment
 /// PATH AND in their original relative order. Augment-added entries
 /// must come before the original entries (PREPEND semantics).
 #[test]
-#[serial]
 fn augment_preserves_original_path_order() {
-    let original = std::env::var_os("PATH");
-    std::env::set_var("PATH", "/zzz_marker_a:/zzz_marker_b");
-
-    augment_path_for_graphical_launch();
-    let after = std::env::var_os("PATH").unwrap_or_default();
+    let after = after_augment("/zzz_marker_a:/zzz_marker_b", "/tmp/vct-augment-integration-home");
     let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
     let pos_a = parts
@@ -78,26 +74,13 @@ fn augment_preserves_original_path_order() {
         pos_a.unwrap() < pos_b.unwrap(),
         "marker_a must precede marker_b after augment (original order preserved)"
     );
-
-    match original {
-        Some(p) => std::env::set_var("PATH", p),
-        None => std::env::remove_var("PATH"),
-    }
 }
 
 /// OS-specific candidate set must be present after augment. Asserts the
 /// platform-specific contract documented in the helper's doc comment.
 #[test]
-#[serial]
 fn augment_includes_expected_os_specific_directories() {
-    let original_path = std::env::var_os("PATH");
-    let original_home = std::env::var_os("HOME");
-
-    std::env::set_var("HOME", "/tmp/vct-augment-integration-home");
-    std::env::set_var("PATH", "/usr/bin:/bin");
-
-    augment_path_for_graphical_launch();
-    let after = std::env::var_os("PATH").unwrap_or_default();
+    let after = after_augment("/usr/bin:/bin", "/tmp/vct-augment-integration-home");
     let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
     #[cfg(target_os = "macos")]
@@ -140,14 +123,5 @@ fn augment_includes_expected_os_specific_directories() {
             vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
             "non-{{macOS, Linux}} augment must be a no-op"
         );
-    }
-
-    match original_path {
-        Some(p) => std::env::set_var("PATH", p),
-        None => std::env::remove_var("PATH"),
-    }
-    match original_home {
-        Some(h) => std::env::set_var("HOME", h),
-        None => std::env::remove_var("HOME"),
     }
 }

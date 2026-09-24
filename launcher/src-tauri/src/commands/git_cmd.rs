@@ -80,6 +80,16 @@ use vct_launcher_core::process::CommandExt as _;
 /// bounded (an unbounded git hangs the daily check forever).
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// A silent `git` command — the one place the launcher's git runners name
+/// the program. `git` is resolved through
+/// `vct_launcher_core::paths::spawn_program`: on the process `PATH` in
+/// production, as before; over a test's per-thread injected lookup `PATH`
+/// otherwise, so a test puts a fake `git` first without setting the shared
+/// process `PATH` (v0.2.97 review R6).
+pub(crate) fn git_command() -> TokioCommand {
+    TokioCommand::new(vct_launcher_core::paths::spawn_program("git")).silent()
+}
+
 /// Run `git <args>` in `repo`, returning trimmed stdout.
 ///
 /// `Err` on: spawn failure, timeout, OR a non-zero exit (with trimmed stderr
@@ -89,8 +99,7 @@ pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Output is captured, never inherited — `.silent()` also suppresses the
 /// console window Windows would otherwise flash for every invocation.
 pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = TokioCommand::new("git")
-        .silent()
+    let fut = git_command()
         .args(args)
         .current_dir(repo)
         .output();
@@ -143,7 +152,7 @@ pub(crate) async fn run_git_raw_env<S: AsRef<OsStr>>(
     args: &[S],
     envs: &[(&str, &str)],
 ) -> Result<std::process::Output, String> {
-    let mut cmd = TokioCommand::new("git").silent();
+    let mut cmd = git_command();
     cmd.args(args).current_dir(repo);
     for (key, value) in envs {
         cmd.env(key, value);
@@ -366,8 +375,7 @@ pub(crate) async fn is_ancestor(
 ) -> Result<bool, String> {
     let output = tokio::time::timeout(
         GIT_TIMEOUT,
-        TokioCommand::new("git")
-            .silent()
+        git_command()
             .args(["merge-base", "--is-ancestor", commit, other])
             .current_dir(repo)
             .output(),

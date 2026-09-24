@@ -254,55 +254,218 @@ def test_effective_verb_answers_managed_keys_only_and_never_prints_a_secret(tmp_
     assert canary not in refused.stdout + refused.stderr
 
 
-# ─── the unregister's .env strip (review R5 F40: moved from Rust) ───────
+# ─── the unregister's .env strip: VCO's lines only (R5 F40, R6 F47) ─────
 
 _BY_NAME = {"KG_COLLECTION", "PROJECT_NAME", "DEVELOPMENT_COLLECTION",
             "ACTIVE_EMBEDDING", "OLLAMA_URL", "CODE_GRAPH_PROJECT"}
 
 
-def test_strip_removes_the_block_whole_and_by_name_keys_keeps_user_lines(tmp_path: Path) -> None:
-    """Act: VCO's managed block goes WHOLE (markers and forensic comments —
-    the old by-name strip left them), plus canonical keys outside it, active
-    or commented; user lines survive byte-for-byte."""
+def test_strip_removes_the_block_whole_and_leaves_the_users_own_lines(tmp_path: Path) -> None:
+    """Act: VCO's managed block goes WHOLE (markers and forensic comments).
+    Leave-alone (review R6 F47, the evidence rule): a user's OWN assignment
+    of a managed key outside it — the line `apply` treated as `user_set` and
+    never rendered over — stays, and is reported as left, not removed."""
+    folder = _folder(tmp_path)
+    db = _db(tmp_path, folder)
+    user_lines = (
+        "# my header\nUSER_API_KEY=secret123\nKG_COLLECTION=Old_KG\n"
+        "# OLLAMA_URL=http://localhost:11435\nexport PROJECT_NAME=Mine\n"
+    )
+    (folder / ".env").write_text(user_lines, encoding="utf-8")
+    assert _cli("apply", db, folder).returncode == 0
+
+    outcome = strip_project_env(folder, _BY_NAME)
+    text = (folder / ".env").read_text(encoding="utf-8")
+
+    assert text == user_lines
+    assert ENV_TEMPLATE_BEGIN not in text and ENV_TEMPLATE_END not in text
+    assert "WEAVIATE_URL" in outcome["removed"]
+    assert "KG_COLLECTION" not in outcome["removed"] and "PROJECT_NAME" not in outcome["removed"]
+    assert outcome["left"] == ["KG_COLLECTION", "PROJECT_NAME"]
+
+
+def test_strip_probe_p4_a_user_set_key_is_never_deleted(tmp_path: Path) -> None:
+    """The reviewer's probe P4: `.env` = `KG_COLLECTION=Mine_KG\\nUSER=1`,
+    apply, strip → the user's line is still there and reported as theirs."""
+    folder = _folder(tmp_path)
+    db = _db(tmp_path, folder)
+    (folder / ".env").write_text("KG_COLLECTION=Mine_KG\nUSER=1\n", encoding="utf-8")
+    assert _cli("apply", db, folder).returncode == 0
+    outcome = strip_project_env(folder, _BY_NAME)
+    assert (folder / ".env").read_text(encoding="utf-8") == "KG_COLLECTION=Mine_KG\nUSER=1\n"
+    assert "KG_COLLECTION" in outcome["left"] and "KG_COLLECTION" not in outcome["removed"]
+
+
+def test_strip_removes_the_retired_writers_sections(tmp_path: Path) -> None:
+    """Act: the lines VCO's retired writers authored under their recognised
+    headers are VCO's — removed with the header, CRLF kept for the rest."""
+    folder = _folder(tmp_path)
+    (folder / ".env").write_bytes(
+        b"USER=1\r\n\r\n"
+        b"# added by vco 2026-06-01: appended missing canonical keys\r\n"
+        b"# OLLAMA_URL=\r\nKG_COLLECTION=Acme_KnowledgeGraph\r\nPROJECT_NAME=<project>\r\n"
+    )
+    outcome = strip_project_env(folder, _BY_NAME)
+    assert (folder / ".env").read_bytes() == b"USER=1\r\n"
+    assert outcome == {"removed": ["KG_COLLECTION", "OLLAMA_URL", "PROJECT_NAME"],
+                       "left": [], "preserved": []}
+
+
+def test_strip_removes_vcos_old_comment_and_leaves_the_old_values(tmp_path: Path) -> None:
+    """Review R6 F47: the `_old` lines are the user's earlier values — left
+    and reported; the comment VCO wrote above them goes with the block."""
+    from vco_lib.env_template import PRESERVED_VALUES_COMMENT
+
     folder = _folder(tmp_path)
     db = _db(tmp_path, folder)
     (folder / ".env").write_text(
-        "# my header\nUSER_API_KEY=secret123\nKG_COLLECTION=Old_KG\n"
-        "# OLLAMA_URL=http://localhost:11435\nexport PROJECT_NAME=Mine\n",
+        "USER=1\n\n# === Per-project Weaviate collections ===\n"
+        'KG_COLLECTION=Acme_KnowledgeGraph\nPROJECT_NAME="Mine"\n',
         encoding="utf-8",
     )
     assert _cli("apply", db, folder).returncode == 0
+    applied = (folder / ".env").read_text(encoding="utf-8")
+    assert PRESERVED_VALUES_COMMENT in applied and 'PROJECT_NAME_old="Mine"' in applied
 
-    removed = strip_project_env(folder, _BY_NAME)
+    outcome = strip_project_env(folder, _BY_NAME)
     text = (folder / ".env").read_text(encoding="utf-8")
+    assert text == 'USER=1\nPROJECT_NAME_old="Mine"\n'
+    assert outcome["preserved"] == ["PROJECT_NAME_old"] and outcome["left"] == []
 
-    assert text == "# my header\nUSER_API_KEY=secret123\n"
-    assert ENV_TEMPLATE_BEGIN not in text and ENV_TEMPLATE_END not in text
-    assert "added by vco" not in text
-    assert {"KG_COLLECTION", "OLLAMA_URL", "PROJECT_NAME", "WEAVIATE_URL"} <= set(removed)
+
+def test_the_old_values_comment_is_written_once(tmp_path: Path) -> None:
+    """Review R6 F47 (probe P2's third run): a later preservation reuses the
+    comment — the new `_old` line joins the ones under it."""
+    from vco_lib.env_template import PRESERVED_VALUES_COMMENT, apply_env_template
+
+    folder = _folder(tmp_path)
+    section = "# === Per-project Weaviate collections ===\nPROJECT_NAME={}\n"
+    (folder / ".env").write_text("USER=1\n" + section.format("First"), encoding="utf-8")
+    apply_env_template({"PROJECT_NAME": "Acme"}, project_folder=folder)
+    text = (folder / ".env").read_text(encoding="utf-8")
+    (folder / ".env").write_text(text + section.format("Second"), encoding="utf-8")
+    apply_env_template({"PROJECT_NAME": "Acme"}, project_folder=folder)
+    text = (folder / ".env").read_text(encoding="utf-8")
+    assert text.count(PRESERVED_VALUES_COMMENT) == 1
+    assert text.startswith(
+        f"USER=1\n{PRESERVED_VALUES_COMMENT}\nPROJECT_NAME_old=First\nPROJECT_NAME_old2=Second\n"
+    )
+    assert "below" not in PRESERVED_VALUES_COMMENT
+
+
+def test_strip_removes_vcos_new_file_header_only_while_unedited(tmp_path: Path) -> None:
+    """Review R6: the header of a `.env` VCO created describes VCO's block,
+    so without the block it is false — the unregister removes it while it is
+    byte-identical to what VCO wrote. The commented placeholders below it set
+    nothing and stay. Leave-alone: an edited header is the user's text."""
+    folder = _folder(tmp_path)
+    db = _db(tmp_path, folder)
+    assert _cli("apply", db, folder).returncode == 0
+    text = (folder / ".env").read_text(encoding="utf-8")
+    assert text.startswith("# vibecoded-orchestrator per-project .env\n")
+
+    strip_project_env(folder, _BY_NAME)
+    after = (folder / ".env").read_text(encoding="utf-8")
+    assert "vibecoded-orchestrator per-project .env" not in after
+    assert "VCO-MANAGED markers below" not in after
+    assert after.startswith("# === LLM API keys (optional) ===\n# ANTHROPIC_API_KEY=\n")
+
+    edited = tmp_path / "edited"
+    edited.mkdir()
+    db2 = tmp_path / "launcher2.db"
+    from tests.common.launcher_db_fixture import make_launcher_db
+    make_launcher_db(db2, projects=[{
+        "project_id": "p-2", "name": "Acme", "folder_path": str(edited), "slug": "acme2",
+    }])
+    assert _cli("apply", db2, edited, "p-2").returncode == 0
+    header_edited = (edited / ".env").read_text(encoding="utf-8").replace(
+        "# vibecoded-orchestrator per-project .env", "# vibecoded-orchestrator per-project .env (mine)", 1,
+    )
+    (edited / ".env").write_text(header_edited, encoding="utf-8")
+    strip_project_env(edited, _BY_NAME)
+    assert (edited / ".env").read_text(encoding="utf-8").startswith(
+        "# vibecoded-orchestrator per-project .env (mine)\n# VCO keeps the block"
+    )
+
+
+_PRE_0297_HEADER = (
+    "# vibecoded-orchestrator per-project .env\n"
+    "# Edit values to override defaults. Empty / commented lines are\n"
+    "# treated as \"use default\". Created by vco 2026-05-06.\n"
+    "\n"
+)
+
+
+def test_strip_removes_the_pre_0297_new_file_header_while_unedited(tmp_path: Path) -> None:
+    """The header every pre-v0.2.97 writer (the launcher's Rust template AND
+    install.py's) put on a new `.env` is VCO's too: after the unregister strip
+    of a field file — header, retired sections, a legacy append — nothing of
+    VCO's is left, the user's placeholders under their own headers stay."""
+    folder = _folder(tmp_path)
+    assert _RUST_FRESH_TEMPLATE.startswith(_PRE_0297_HEADER), "the fixture is the field shape"
+    (folder / ".env").write_text(_RUST_FRESH_TEMPLATE + _RUST_APPEND, encoding="utf-8")
+
+    strip_project_env(folder, _BY_NAME | {"WEAVIATE_URL", "WEAVIATE_PORT", "OLLAMA_PORT",
+                                          "CODE_EMBED_URL", "SHARED_KG_COLLECTION"})
+
+    after = (folder / ".env").read_text(encoding="utf-8")
+    assert "vibecoded-orchestrator per-project .env" not in after
+    assert "Edit values to override defaults" not in after
+    assert after.startswith("# === LLM API keys (optional) ===\n"), after
+
+
+def test_the_pre_0297_header_goes_with_windows_line_endings_too(tmp_path: Path) -> None:
+    """install.py wrote it with `Path.write_text` — CRLF on Windows."""
+    folder = _folder(tmp_path)
+    crlf = _PRE_0297_HEADER.replace("\n", "\r\n") + "USER=1\r\n"
+    (folder / ".env").write_bytes(crlf.encode())
+    strip_project_env(folder, _BY_NAME)
+    assert (folder / ".env").read_bytes() == b"USER=1\r\n"
+
+
+def test_an_edited_pre_0297_header_is_the_users_and_stays(tmp_path: Path) -> None:
+    """Leave-alone: any byte changed (a word, the date's shape, a mixed line
+    ending, a line above it) makes the header the user's text."""
+    folder = _folder(tmp_path)
+    variants = (
+        _PRE_0297_HEADER.replace("override defaults", "override MY defaults"),
+        _PRE_0297_HEADER.replace("2026-05-06", "May 6"),
+        _PRE_0297_HEADER.replace(".env\n", ".env\r\n", 1),
+        "# mine\n" + _PRE_0297_HEADER,
+        _PRE_0297_HEADER.rstrip("\n") + "\nUSER=0\n",
+    )
+    for text in variants:
+        (folder / ".env").write_bytes((text + "USER=1\n").encode())
+        strip_project_env(folder, _BY_NAME)
+        assert (folder / ".env").read_bytes() == (text + "USER=1\n").encode(), text
 
 
 def test_strip_leaves_a_file_without_vco_lines_untouched(tmp_path: Path) -> None:
     folder = _folder(tmp_path)
     (folder / ".env").write_text("USER_KEY=value\r\n", encoding="utf-8", newline="")
     mtime = (folder / ".env").stat().st_mtime_ns
-    assert strip_project_env(folder, _BY_NAME) == []
+    assert strip_project_env(folder, _BY_NAME) == {"removed": [], "left": [], "preserved": []}
     assert (folder / ".env").read_bytes() == b"USER_KEY=value\r\n"
     assert (folder / ".env").stat().st_mtime_ns == mtime
-    assert strip_project_env(tmp_path / "nowhere", _BY_NAME) == []
+    assert strip_project_env(tmp_path / "nowhere", _BY_NAME)["removed"] == []
 
 
 def test_strip_cli_takes_keys_on_stdin(tmp_path: Path) -> None:
     folder = _folder(tmp_path)
-    (folder / ".env").write_text("KG_COLLECTION=X\nKEEP=1\n", encoding="utf-8")
+    (folder / ".env").write_text(
+        f"{ENV_TEMPLATE_BEGIN}\nKG_COLLECTION=X\n{ENV_TEMPLATE_END}\nKEEP=1\nPROJECT_NAME=Mine\n",
+        encoding="utf-8",
+    )
     done = subprocess.run(
         [sys.executable, "-m", "vco_lib.env_template", "strip", "--project-folder", str(folder)],
-        input=json.dumps({"keys": ["KG_COLLECTION"]}), capture_output=True, text=True,
-        env=child_env(),
+        input=json.dumps({"keys": ["KG_COLLECTION", "PROJECT_NAME"]}), capture_output=True,
+        text=True, env=child_env(),
     )
     assert done.returncode == 0, done.stderr
-    assert json.loads(done.stdout) == {"ok": True, "removed": ["KG_COLLECTION"]}
-    assert (folder / ".env").read_text() == "KEEP=1\n"
+    assert json.loads(done.stdout) == {
+        "ok": True, "removed": ["KG_COLLECTION"], "left": ["PROJECT_NAME"], "preserved": [],
+    }
+    assert (folder / ".env").read_text() == "KEEP=1\nPROJECT_NAME=Mine\n"
 
 
 # ─── infrastructure/.env has one writer too (review R5 F40) ─────────────
@@ -320,6 +483,41 @@ def test_the_launcher_sets_its_infra_key_through_compose_env(tmp_path: Path) -> 
     fresh = tmp_path / "fresh"
     assert set_infrastructure_env_key(fresh, "VCT_VOLUMES_PATH", "/v") == "set"
     assert (fresh / ".env").read_text() == "VCT_VOLUMES_PATH=/v\n"
+
+
+def test_the_infra_setter_keeps_line_endings_and_the_trailing_newline_state(tmp_path: Path) -> None:
+    """Review R6 F52: a CRLF `infrastructure/.env` (edited in Notepad) stays
+    CRLF, a file with no trailing newline still has none, and an `export`
+    line keeps its `export` — only the value changes."""
+    from vco_lib.compose_env import set_infrastructure_env_key
+
+    crlf = tmp_path / "crlf"
+    crlf.mkdir()
+    (crlf / ".env").write_bytes(b"CODE_EMBED_BACKEND=gpu\r\nVCT_VOLUMES_PATH=/old\r\nZ=1\r\n")
+    assert set_infrastructure_env_key(crlf, "VCT_VOLUMES_PATH", "/new") == "set"
+    assert (crlf / ".env").read_bytes() == b"CODE_EMBED_BACKEND=gpu\r\nVCT_VOLUMES_PATH=/new\r\nZ=1\r\n"
+    assert set_infrastructure_env_key(crlf, "VCT_VOLUMES_PATH", "/new") == "unchanged"
+
+    appended = tmp_path / "append"
+    appended.mkdir()
+    (appended / ".env").write_bytes(b"A=1\r\n")
+    set_infrastructure_env_key(appended, "VCT_VOLUMES_PATH", "/v")
+    assert (appended / ".env").read_bytes() == b"A=1\r\nVCT_VOLUMES_PATH=/v\r\n"
+
+    no_eol = tmp_path / "noeol"
+    no_eol.mkdir()
+    (no_eol / ".env").write_bytes(b"A=1\nVCT_VOLUMES_PATH=/old")
+    set_infrastructure_env_key(no_eol, "VCT_VOLUMES_PATH", "/v")
+    assert (no_eol / ".env").read_bytes() == b"A=1\nVCT_VOLUMES_PATH=/v"
+    (no_eol / ".env").write_bytes(b"A=1")
+    set_infrastructure_env_key(no_eol, "VCT_VOLUMES_PATH", "/v")
+    assert (no_eol / ".env").read_bytes() == b"A=1\nVCT_VOLUMES_PATH=/v"
+
+    exported = tmp_path / "export"
+    exported.mkdir()
+    (exported / ".env").write_bytes(b"export VCT_VOLUMES_PATH=/old\n")
+    set_infrastructure_env_key(exported, "VCT_VOLUMES_PATH", "/v")
+    assert (exported / ".env").read_bytes() == b"export VCT_VOLUMES_PATH=/v\n"
 
 
 def test_the_infra_setter_refuses_other_keys_and_line_breaks(tmp_path: Path) -> None:

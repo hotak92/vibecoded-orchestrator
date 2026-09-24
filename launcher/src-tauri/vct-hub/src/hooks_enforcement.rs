@@ -16,7 +16,7 @@
 //!
 //!   * `PATCH /api/v1/projects/{project_id}/hooks/{hook_id}` (`project_state_api`)
 //!   * `PATCH /api/v1/cli/hooks/{hook_id}/enabled` (`cli_api`), reachable
-//!     from the shipped `vco hooks enable/disable <id> --project <p>` CLI
+//!     from the shipped `vct-cli hooks enable/disable <id> --project <p>` CLI
 //!     (`launcher/tools/vct-cli`)
 //!
 //! Both silently did nothing to what actually runs — the review evidence
@@ -590,6 +590,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     async fn hooks_cli_spawns_the_ladders_resolved_interpreter_not_a_bare_path_lookup() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let venv_dir = tempfile::TempDir::new().unwrap();

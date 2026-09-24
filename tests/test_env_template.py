@@ -1003,7 +1003,31 @@ def test_placeholders_and_fill_only_keep_no_old_value(tmp_path: Path) -> None:
     report = apply_env_template(_acme_keys(), project_folder=other, keep_existing_values=True)
     text = (other / ".env").read_text()
     assert "_old" not in text and report["preserved"] == []
-    assert _assignments(text, "SHARED_KG_COLLECTION") == ["MyOwnShared_KG"]
+    assert _assignments(text, "SHARED_KG_COLLECTION") == ['"MyOwnShared_KG"']
+
+
+def test_fill_only_carries_a_legacy_value_with_its_quoting(tmp_path: Path) -> None:
+    """Review R6 F45: the block renders values verbatim, so the fill-only
+    path must carry the legacy line's RAW text — `PROJECT_NAME="My Proj"`
+    stripped of its quotes would make `source .env` run `Proj`; a `#` or `$`
+    would break the same way."""
+    env_path = tmp_path / ".env"
+    env_path.write_text(
+        "# --- Added by install.py --update on 2026-05-28 ---\n"
+        "# Added by install.py --update on 2026-05-28\n"
+        'PROJECT_NAME="My Proj"\n'
+        "# Added by install.py --update on 2026-05-28\n"
+        "ACTIVE_EMBEDDING='arc#tic $x'\n"
+    )
+    apply_env_template(_acme_keys(), project_folder=tmp_path, keep_existing_values=True)
+    text = env_path.read_text()
+    block = text[text.index(ENV_TEMPLATE_BEGIN):]
+    assert _assignments(block, "PROJECT_NAME") == ['"My Proj"']
+    assert _assignments(block, "ACTIVE_EMBEDDING") == ["'arc#tic $x'"]
+    assert "Added by install.py" not in text, "the legacy section was folded"
+    before = text
+    apply_env_template(_acme_keys(), project_folder=tmp_path, keep_existing_values=True)
+    assert env_path.read_text() == before, "and the block keeps it on re-run"
 
 
 def test_a_secret_shaped_key_is_never_folded(tmp_path: Path) -> None:

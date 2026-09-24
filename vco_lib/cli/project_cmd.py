@@ -750,7 +750,7 @@ def _add_rename_collections(verbs: argparse._SubParsersAction) -> None:
 
     Four modes on ONE verb rather than four verbs, because they are phases of
     one operation and the user who needs ``--status`` or ``--drop-retired`` got
-    there from ``rename-collections``. A separate ``vco project drop-retired``
+    there from ``rename-collections``. A separate ``drop-retired`` verb
     would also be a second place to keep the guard correct.
     """
     p = verbs.add_parser(

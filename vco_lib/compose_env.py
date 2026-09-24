@@ -125,33 +125,51 @@ LAUNCHER_INFRA_ENV_KEYS: frozenset[str] = frozenset({"VCT_VOLUMES_PATH"})
 
 
 def set_infrastructure_env_key(infra_dir: Path, key: str, value: str) -> str:
-    """Set ``key=value`` in ``<infra_dir>/.env``: the first ``key=`` line is
-    replaced in place, else the line is appended; every other line is kept
-    byte-for-byte, and an existing file keeps its mode. Returns ``"set"`` /
-    ``"unchanged"``. The launcher's volumes page used to do this with its own
-    Rust read-modify-write — a second writer of this file the single-writer
-    lint could not see until it learned the shape.
+    """Set ``key=value`` in ``<infra_dir>/.env``: the first line assigning
+    ``key`` (THE line grammar, :func:`vco_lib.envfile.parse_env_line` — so
+    ``export KEY=`` counts, and keeps its ``export``) is replaced in place,
+    else the line is appended. Every other byte is kept: each line keeps its
+    own ending (a CRLF file stays CRLF — review R6 F52), a file with no
+    trailing newline still has none, and an existing file keeps its mode
+    (:func:`vco_lib.atomic.atomic_rewrite_text`). A new file is ``KEY=V\\n``.
+    Returns ``"set"`` / ``"unchanged"``. The launcher's volumes page used to
+    do this with its own Rust read-modify-write — a second writer of this
+    file the single-writer lint could not see until it learned the shape.
 
     Raises ``ValueError`` for a key outside :data:`LAUNCHER_INFRA_ENV_KEYS`
     or a value with a line break, ``OSError`` on a failed write.
     """
     from vco_lib.atomic import atomic_rewrite_text
+    from vco_lib.envfile import parse_env_line
 
     if key not in LAUNCHER_INFRA_ENV_KEYS:
         raise ValueError(f"{key} is not a launcher-owned infrastructure/.env key")
     if "\n" in value or "\r" in value:
         raise ValueError(f"{key}: a value cannot contain a line break")
     infra_env = infra_dir / ".env"
-    prior = infra_env.read_text(encoding="utf-8") if infra_env.is_file() else ""
-    lines = prior.splitlines()
-    wanted = f"{key}={value}"
+    prior = ""
+    if infra_env.is_file():
+        with infra_env.open(encoding="utf-8", newline="") as handle:
+            prior = handle.read()
+    lines = prior.splitlines(keepends=True)
     for i, line in enumerate(lines):
-        if line.startswith(f"{key}="):
-            lines[i] = wanted
+        pair = parse_env_line(line)
+        if pair is not None and pair[0] == key:
+            body = line.rstrip("\r\n")
+            ending = line[len(body):]
+            indent = body[: len(body) - len(body.lstrip())]
+            export = "export " if body.lstrip().startswith("export ") else ""
+            lines[i] = f"{indent}{export}{key}={value}{ending}"
             break
     else:
-        lines.append(wanted)
-    text = "\n".join(lines) + "\n"
+        eol = "\r\n" if "\r\n" in prior else "\n"
+        if not prior:
+            lines.append(f"{key}={value}\n")
+        elif prior.endswith("\n"):
+            lines.append(f"{key}={value}{eol}")
+        else:
+            lines.append(f"{eol}{key}={value}")
+    text = "".join(lines)
     if text == prior:
         return "unchanged"
     infra_dir.mkdir(parents=True, exist_ok=True)

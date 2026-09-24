@@ -44,8 +44,7 @@ fi
 #   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
 #   This hook does NOT query Weaviate directly. Env propagation is by
 #   subprocess inheritance (no `env -i`, no `unset VCT_KG_ACCESS_LIST`).
-#   See knowledge/concepts/multi-source-kg-runtime.md and
-#   tests/test_kg_access_list.py for the consumer contract.
+#   See tests/test_kg_access_list.py for the consumer contract.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 # Source emit-context.sh ONLY if it exists. If the helper is missing

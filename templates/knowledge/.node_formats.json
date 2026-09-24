@@ -479,14 +479,6 @@
     "content_hash": "799ef4821d2dee54",
     "total_chunks": 1
   },
-  "knowledge/concepts/read-image-memory-aware-gating.md": {
-    "title": "read_image — Memory-Aware Vision-Model Gating",
-    "description": "This node implements memory-aware gating logic for the read_image MCP tool to select appropriate vision models based on available system resources.\nIt features per-model VRAM and RAM thresholds, a tiered resize budget clamped to hardware limits, and automatic fallback to smaller models when resources are constrained.\nThe use case involves invoking the opt-in read_image tool against a running Ollama instance to retrieve base64 image data with optional on-device descriptions.\nIt matters because it prevents out-of-memory crashes by conservatively probing system capabilities and ensuring functional image processing within existing hardware limits.",
-    "summary": "The `read_image` MCP tool provides memory-aware vision-model gating for Ollama, returning images as base64 data URLs while optionally running on-device vision models. It probes free VRAM and system RAM at module load to select a model, clamp image resolution, or skip description generation. Per-model thresholds define VRAM/RAM floors for qwen3.5 (4b–9b), llama3.2-vision (11b/90b), and gemma3/4 models. The system auto-fallbacks to smaller installed models if the preferred one exceeds memory limits, or skips the description if no model fits, always ensuring the base64 image is returned for Claude. Resolution is clamped based on free VRAM tiers (256² to 1024² pixels) to prevent context waste. This design prevents OOM errors and silent hangs by providing clear skip reasons and graceful degradation.",
-    "generated_at": "2026-07-20T18:53:47.660874+00:00",
-    "content_hash": "d631563a95721079",
-    "total_chunks": 1
-  },
   "knowledge/concepts/reinforcement-learning.md": {
     "title": "Reinforcement Learning",
     "description": "Reinforcement Learning is a machine learning paradigm where an agent learns optimal decision-making by interacting with an environment to maximize cumulative rewards.\nIt operates through a core loop of observing states, selecting actions, receiving feedback, and updating its policy to improve future outcomes.\nThe field balances exploration of new actions against exploitation of known high-reward strategies using techniques like epsilon-greedy or Upper Confidence Bound.\nMajor algorithm categories include value-based methods like Q-Learning, policy gradient approaches like PPO, and actor-critic hybrids that combine both strategies.\nReinforcement Learning from Human Feedback (RLHF) is a critical application that aligns large language models with human preferences through iterative reward modeling.",

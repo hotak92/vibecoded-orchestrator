@@ -17,9 +17,11 @@
 //! knows its own project id (they all do — it's the lookup key) can
 //! present a credential scoped to exactly that project. A token minted
 //! for project A must NOT resolve project B (`auth.rs` returns a hard
-//! 403 for that case). The hub-wide `hub.token` stays accepted on these
-//! two routes for a one-release compatibility window (see
-//! `VCT_HUB_LEGACY_GLOBAL_ENV` in `auth.rs`).
+//! 403 for that case). The hub-wide `hub.token` is REFUSED on these two
+//! routes (the v0.2.76-v0.2.77 compat window and its
+//! `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in were removed in v0.2.97); a caller
+//! that still presents it gets the auth middleware's lazy-mint rescue on
+//! the first request (see `auth.rs`).
 //!
 //! ─── Lifecycle (least-machinery, see the Part-4 brief) ──────────────
 //!
@@ -39,14 +41,15 @@
 //! The hub is a detached process with **no push signal** from the
 //! launcher on project add/remove (it reads `launcher.db` per request,
 //! but nothing tells it "a project appeared"). Rather than add a timer
-//! or lazily mint-on-401 (a write-on-read side effect), we mint at
+//! or mint on every request (a write-on-read side effect), we mint at
 //! startup only. A project added *while the hub is already running* has
-//! no per-project token file yet — its resolver simply falls back to the
-//! hub-wide `hub.token` (the compat window keeps that working) until the
-//! next hub restart re-reads the registry. This is the least machinery
-//! that satisfies the contract: no new plumbing, no background task, no
-//! write-on-read; it reuses the startup registry read the hub already
-//! performs for the bind decision.
+//! no per-project token file yet — its resolver falls back to the
+//! hub-wide `hub.token`, the auth middleware runs the lazy-mint rescue
+//! (`lazy_mint_for_project`, v0.2.77 Part 8 Task 4a) on that first
+//! request and PROCEEDS, and every later request rides the scoped token.
+//! This is the least machinery that satisfies the contract: no new
+//! plumbing, no background task, no write-on-read; it reuses the startup
+//! registry read the hub already performs for the bind decision.
 //!
 //! ─── Threat model (same as `hub.token`) ─────────────────────────────
 //!
@@ -56,9 +59,9 @@
 //! keychain; this module does not raise the bar against that adversary.
 //! What it DOES is shrink the blast radius of a token that leaks to a
 //! *different* local user or process that can read one project's file
-//! but not another's, and it gives resolvers a scoped credential so a
-//! future release can turn OFF the coarse global-token path entirely
-//! (the `VCT_HUB_LEGACY_GLOBAL_ENV=0` posture).
+//! but not another's, and it gives resolvers a scoped credential — which
+//! is what let v0.2.97 turn OFF the coarse global-token path on these
+//! routes entirely (removing the `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in).
 
 use std::collections::HashMap;
 use std::path::PathBuf;

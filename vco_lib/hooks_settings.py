@@ -871,7 +871,7 @@ def insert_hook(doc: SettingsDoc, parked: Dict[str, Any]) -> bool:
     #
     # The refusal lives HERE, in the restore itself, because this is the one
     # place every restorer passes through — the launcher's Hooks tab, the
-    # hub's `PATCH /hooks/{id}` routes, and the shipped `vco hooks enable`
+    # hub's `PATCH /hooks/{id}` routes, and the shipped `vct-cli hooks enable`
     # CLI. Putting it in any one caller would leave the other two able to
     # write the dead entry back.
     #

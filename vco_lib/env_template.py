@@ -180,9 +180,15 @@ review R5 F35) is not lost: on the launcher path VCO's value goes in the
 block and the old one stays OUTSIDE it as ``<KEY>_old=<value>`` (original
 quoting; ``_old2``, ``_old3``… when ``<KEY>_old`` already holds something
 else — never overwritten, never duplicated), recorded in the project's
-auto-resolution trail by key name only. Placeholders are not kept;
-fill-only (``install.py``) carries the old value into the block instead.
-Secret-shaped keys are never folded.
+auto-resolution trail by key name only, under ONE comment line
+(:data:`PRESERVED_VALUES_COMMENT`). Placeholders are not kept; fill-only
+(``install.py``) carries the old value into the block instead — its RAW text,
+quotes included (review R6 F45). Secret-shaped keys are never folded.
+
+The unregister (:func:`strip_project_env`) removes only what VCO authored —
+the block, these legacy sections, that comment — and leaves (and reports) a
+user's own assignment of a managed key and the ``<KEY>_old`` values
+(review R6 F47).
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -510,8 +516,11 @@ def apply_env_template(
     preserved: list[tuple[str, str]] = []
     if keep_existing_values:
         # Precedence: the old block's value > a migrated legacy line's value
-        # > the caller's. Nothing a previous run settled changes.
-        kept = {k: _parsed_value(v) for k, v in migrated.items() if v is not None}
+        # > the caller's. Nothing a previous run settled changes. A legacy
+        # value is carried as its RAW text (review R6 F45): the block renders
+        # values verbatim, so `PROJECT_NAME="My Proj"` must keep its quotes —
+        # parsing is for comparisons only.
+        kept = {k: v for k, v in migrated.items() if v is not None}
         if block is not None:
             kept.update(
                 (k, v) for k, v in _block_values(block).items()
@@ -543,8 +552,11 @@ def apply_env_template(
 
 
 #: The comment VCO puts above the `<KEY>_old` lines it keeps (owner ruling F35).
+#: Written ONCE per file (a later preservation reuses it) and worded to stay
+#: true wherever the block is — or after an unregister removed it, which also
+#: removes this comment and leaves the `_old` lines (review R6 F47).
 PRESERVED_VALUES_COMMENT = (
-    "# vco: your earlier value(s) of keys VCO now sets in its block below — "
+    "# vco: your earlier value(s) of keys VCO sets in its VCO-MANAGED block — "
     "kept for reference, not read by VCO"
 )
 
@@ -571,7 +583,9 @@ def _preserve_replaced_values(
     :data:`PRESERVED_VALUES_COMMENT`. An existing ``<KEY>_old`` holding a
     different value is never overwritten: the next free ``<KEY>_old2``,
     ``_old3``… is used; one already holding this value is reused (so a
-    re-run adds nothing). Returns ``(before, [(KEY, name), ...])``."""
+    re-run adds nothing). The comment is written once: when ``before``
+    already carries it, the new lines join the ones under it. Returns
+    ``(before, [(KEY, name), ...])``."""
     from vco_lib.envfile import parse_env_line
 
     assigned: dict[str, set[str]] = {}
@@ -599,8 +613,29 @@ def _preserve_replaced_values(
             n += 1
     if not lines:
         return before, []
+    existing = before.split("\n")
+    for i, line in enumerate(existing):
+        if line.rstrip("\r") != PRESERVED_VALUES_COMMENT:
+            continue
+        eol = "\r" if line.endswith("\r") else ""
+        j = i + 1
+        while j < len(existing) and _is_old_value_line(existing[j]):
+            j += 1
+        existing[j:j] = [f"{new}{eol}" for new in lines]
+        return "\n".join(existing), preserved
     sep = "" if not before or before.endswith("\n") else "\n"
     return before + sep + PRESERVED_VALUES_COMMENT + "\n" + "\n".join(lines) + "\n", preserved
+
+
+_OLD_VALUE_NAME = re.compile(r"^([A-Za-z_][A-Za-z0-9_]*?)_old\d*$")
+
+
+def _is_old_value_line(line: str) -> bool:
+    """An active ``<KEY>_old`` / ``<KEY>_oldN`` assignment (a kept value)."""
+    from vco_lib.envfile import parse_env_line
+
+    pair = parse_env_line(line)
+    return pair is not None and _OLD_VALUE_NAME.match(pair[0]) is not None
 
 
 def _record_preserved(project_folder: Path, preserved: list[tuple[str, str]]) -> None:
@@ -750,10 +785,13 @@ def replace_values_with_sentinel(
     caller usually trusts the audit step's output, but if the user edited
     the .env between audit and rewrite a key may have moved).
 
-    Atomic-write semantics: a temp file is written in the same directory
-    then ``os.replace()``'d into place. File mode is preserved across the
-    swap (the temp file inherits ``env_path``'s mode pre-replace via an
-    explicit ``shutil.copystat``).
+    Atomic-write semantics: through :func:`_atomic_write_text`, i.e.
+    :func:`vco_lib.atomic.atomic_rewrite_text` — a ``mkstemp`` sibling (0600)
+    is written, fsync'd and ``os.replace()``'d into place, and the mode
+    ``env_path`` had BEFORE the rewrite (read with ``stat`` first) is
+    re-applied to the final path after the rename. The file is therefore
+    never briefly more permissive than before, and a 0640 ``.env`` stays
+    0640 (pinned by ``tests/test_v0297_r6_stale_texts.py``).
 
     Each replaced line keeps its original key + ``export`` prefix (if
     any) + trailing comment (if any). Only the value bytes change:
@@ -834,12 +872,11 @@ def replace_values_with_sentinel(
     if text.endswith("\n"):
         new_text += "\n"
 
-    # Atomic write: sibling tempfile, replace, then restore the mode.
-    # Preserve the existing mode (especially important on Unix where the
-    # env file may already be 0o600). v0.2.92 (duplication-merge): through
-    # the ONE atomic writer — its mkstemp tempfile is 0600, so the swapped
-    # file is never briefly MORE permissive than before; `mode=` then
-    # restores the original bits after the rename.
+    # Atomic write through the ONE rewrite home (`_atomic_write_text` →
+    # `vco_lib.atomic.atomic_rewrite_text`): it reads the existing mode, writes
+    # a 0600 mkstemp sibling, renames it into place and re-applies that mode —
+    # so the file is never briefly MORE permissive than before and a 0600 /
+    # 0640 `.env` keeps its bits.
     _atomic_write_text(env_path, new_text)
 
     return replaced_count, missed
@@ -887,40 +924,85 @@ def repair_stale_kg_collection(
     return True
 
 
-def strip_project_env(project_folder: Path, keys: "set[str] | frozenset[str]") -> list[str]:
-    """The unregister's ``.env`` strip (v0.2.97 review R5 F40 — it was a Rust
-    read-modify-write the single-writer lint could not see).
+def strip_project_env(
+    project_folder: Path, keys: "set[str] | frozenset[str]"
+) -> dict[str, list[str]]:
+    """The unregister's ``.env`` strip — VCO's lines only (the evidence rule,
+    review R6 F47; it was a Rust read-modify-write until review R5 F40).
 
-    Removes VCO's managed block WHOLE (markers and forensic comments too — a
-    by-name strip left them behind), then, outside it, every line assigning
-    one of ``keys`` — active (``KEY=`` / ``export KEY=``, THE line grammar,
-    :func:`vco_lib.envfile.parse_env_line`) or commented (``# KEY=…``, launcher
-    residue). Every other line is kept byte-for-byte (CRLF included), and the
-    file keeps its mode. Returns the removed key names, sorted; nothing is
-    written when nothing matched. A missing file is ``[]``; an unreadable one
-    raises (never a rewrite from a guess).
+    Removes what VCO authored and nothing else:
+
+      * the managed block WHOLE — markers, forensic comments, every key;
+      * inside a recognised legacy section (the retired writers' headers,
+        :func:`_migrate_legacy_sections`), the lines for the block's keys and
+        ``keys``, active or commented — and the header when nothing is left;
+      * the :data:`PRESERVED_VALUES_COMMENT` line VCO wrote above kept values;
+      * the new-file header (:data:`_PROJECT_ENV_SCAFFOLD_HEADER`) when the
+        file still starts with it byte-for-byte — it describes the block, so
+        it would be false without it. An edited header is the user's text.
+        The header the pre-v0.2.97 writers put on a new file
+        (:data:`_LEGACY_SCAFFOLD_HEADER`) is recognised the same way.
+
+    A user's OWN assignment of one of those keys anywhere else — the line
+    :func:`apply_env_template` classifies ``user_set`` and never renders over —
+    is LEFT and reported, never deleted and never called VCO's. The
+    ``<KEY>_old`` lines are the user's earlier values: left and reported.
+    A ``# KEY=`` comment outside those sections is the user's text and stays
+    (it sets nothing). Every kept line is byte-for-byte (CRLF included) and
+    the file keeps its mode. Nothing is written when nothing was VCO's. A missing file reports
+    nothing; an unreadable one raises (never a rewrite from a guess).
+
+    Returns ``{"removed": [...], "left": [...], "preserved": [...]}`` — key
+    names only, sorted: removed (VCO's), left (the user's own assignments of
+    a managed key), preserved (``<KEY>_old`` names still in the file).
     """
     from vco_lib.envfile import parse_env_line
 
     env_path = project_folder / ".env"
     if not env_path.is_file():
-        return []
+        return {"removed": [], "left": [], "preserved": []}
     with env_path.open(encoding="utf-8", newline="") as handle:
         prior = handle.read()
     before, block, after = _split_managed(prior)
     removed: set[str] = set(_block_values(block)) if block is not None else set()
-    kept: list[str] = []
-    for line in (before + after).splitlines(keepends=True):
-        body = line.strip()
-        pair = parse_env_line(body[1:] if body.startswith("#") else body)
-        if pair is not None and pair[0] in keys:
-            removed.add(pair[0])
-            continue
-        kept.append(line)
+    managed = set(keys) | removed
+    before, migrated_before = _migrate_legacy_sections(before, managed)
+    after, migrated_after = _migrate_legacy_sections(after, managed)
+    removed |= set(migrated_before) | set(migrated_after)
+    kept = [
+        line for line in (before + after).splitlines(keepends=True)
+        if line.rstrip("\r\n") != PRESERVED_VALUES_COMMENT
+    ]
     new_text = "".join(kept)
+    new_text = _without_scaffold_header(new_text)
+    left: set[str] = set()
+    preserved: set[str] = set()
+    for line in kept:
+        pair = parse_env_line(line)
+        if pair is None:
+            continue
+        if pair[0] in managed:
+            left.add(pair[0])
+            continue
+        old_of = _OLD_VALUE_NAME.match(pair[0])
+        if old_of is not None and old_of.group(1) in managed:
+            preserved.add(pair[0])
     if new_text != prior:
         _atomic_write_text(env_path, new_text)
-    return sorted(removed)
+    return {"removed": sorted(removed), "left": sorted(left), "preserved": sorted(preserved)}
+
+
+def _without_scaffold_header(text: str) -> str:
+    """``text`` minus the new-file header VCO wrote at its start — the
+    current one or the pre-v0.2.97 one — when it is still exactly VCO's
+    bytes. Anything else (an edited header, a line above it) is the user's
+    and ``text`` comes back unchanged."""
+    if text.startswith(_PROJECT_ENV_SCAFFOLD_HEADER):
+        return text[len(_PROJECT_ENV_SCAFFOLD_HEADER):]
+    legacy = _LEGACY_SCAFFOLD_HEADER.match(text)
+    if legacy is not None:
+        return text[legacy.end():]
+    return text
 
 
 # ─── Legacy VCO-authored lines (pre-v0.2.97 writers) ────────────────────
@@ -928,6 +1010,20 @@ def strip_project_env(project_folder: Path, keys: "set[str] | frozenset[str]") -
 # The headers the retired append-only writers put above their lines. Byte
 # strings of shipped files — see the module docstring, "Legacy lines".
 
+#: The new-file header BOTH retired writers put on a fresh ``.env`` — the
+#: launcher's Rust ``build_canonical_env_text`` and ``install.py``'s
+#: ``_env_canonical_template`` (every release from its introduction in
+#: 61f33bc4 until v0.2.97; ``git log -S "Edit values to override defaults"``
+#: finds no other wording). The date is the one variable. Rust wrote LF;
+#: ``install.py`` used ``Path.write_text``, so on Windows the same bytes
+#: landed with CRLF — the backreference accepts either, but not a mix
+#: (a mix means someone edited it). Like the current header it describes a
+#: VCO-owned file, so the unregister removes it while it is exactly VCO's.
+_LEGACY_SCAFFOLD_HEADER = re.compile(
+    r"# vibecoded-orchestrator per-project \.env(\r?\n)"
+    r"# Edit values to override defaults\. Empty / commented lines are\1"
+    r'# treated as "use default"\. Created by vco [0-9]{4}-[0-9]{2}-[0-9]{2}\.\1\1'
+)
 _LEGACY_APPEND_HEADER = re.compile(
     r"^# added by vco \d{4}-\d{2}-\d{2}: appended missing canonical keys$"
 )
@@ -1218,13 +1314,18 @@ def _atomic_write_text(path: Path, content: str) -> None:
 # The header + commented placeholders a NEW project ``.env`` starts with
 # (user-owned lines outside the managed block: the launcher never fills
 # them — they are secrets or paid-module settings). Written once, at
-# creation; after that the file's non-block content is the user's.
-_PROJECT_ENV_SCAFFOLD = """\
+# creation; after that the file's non-block content is the user's — except
+# the header, which describes VCO's block: the unregister removes it when it
+# is still byte-identical to this text (review R6), because without the block
+# it would be false. An edited header is the user's text and stays.
+_PROJECT_ENV_SCAFFOLD_HEADER = """\
 # vibecoded-orchestrator per-project .env
 # VCO keeps the block between the VCO-MANAGED markers below up to date.
 # To override one of its keys, set it anywhere OUTSIDE the block — VCO
 # then stops writing that key. A commented line sets nothing.
 
+"""
+_PROJECT_ENV_SCAFFOLD = _PROJECT_ENV_SCAFFOLD_HEADER + """\
 # === LLM API keys (optional) ===
 # ANTHROPIC_API_KEY=
 # OPENAI_API_KEY=
@@ -1422,11 +1523,11 @@ def _cli_strip(args: argparse.Namespace) -> int:
         _cli_error("bad_request", f"stdin is not a {{\"keys\": [...]}} object: {exc}")
         return 2
     try:
-        removed = strip_project_env(Path(args.project_folder), keys)
+        outcome = strip_project_env(Path(args.project_folder), keys)
     except (OSError, UnicodeDecodeError) as exc:
         _cli_error("strip_failed", str(exc))
         return 4
-    print(json.dumps({"ok": True, "removed": removed}))
+    print(json.dumps({"ok": True, **outcome}))
     return 0
 
 

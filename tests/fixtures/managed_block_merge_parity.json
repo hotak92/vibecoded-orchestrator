@@ -1,5 +1,5 @@
 {
-  "_comment": "Cross-language parity fixture for the .claude/env managed-block splice. Consumed by BOTH tests/test_v0297_managed_block_merge_parity.py (Python vco_lib.config_projection._merge_managed_block — the writer apply uses) AND the Rust #[test] managed_block_merge_matches_the_shared_parity_fixture in launcher/src-tauri/src/commands/projects_v2.rs (merge_claude_env_managed_block — the one deliberate Rust mirror, used by the launcher's unregister strip). `expected` is what BOTH must return. MUST MATCH between Python + Rust.",
+  "_comment": "Cases for the .claude/env managed-block splice, consumed by tests/test_v0297_managed_block_merge_parity.py (Python vco_lib.config_projection._merge_managed_block — the writer apply uses). `expected` is what it must return. Its Rust mirror (projects_v2::merge_claude_env_managed_block) was retired in v0.2.97 review R6 with its only caller, the unregister strip (now vco_lib.unregister_env).",
   "_format_version": 1,
   "begin_marker": "# vco-managed-begin",
   "end_marker": "# vco-managed-end",

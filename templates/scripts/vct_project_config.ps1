@@ -30,12 +30,12 @@
 #   3  service misconfigured (primary KG binding missing)
 #   4  field not found
 #   5  forbidden (403 — scoped-credential boundary refusal; NOT transient,
-#      so callers must NOT env-fallback. Post-flip the hub returns 403 when
-#      the coarse global hub.token is presented on a per-project /env|/config
-#      route with the compat window closed, or a token minted for a DIFFERENT
+#      so callers must NOT env-fallback. The hub returns 403 when the
+#      coarse global hub.token is presented on a per-project /env|/config
+#      route (refused unconditionally since v0.2.97 removed
+#      VCT_HUB_LEGACY_GLOBAL_ENV), or a token minted for a DIFFERENT
 #      project is presented. Fix: present the scoped hub.token.<id> (this
-#      resolver already prefers it) or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the
-#      hub to reopen the one-release compat window.)
+#      resolver already prefers it; the hub mints one on first request).
 #  64  usage error
 
 [CmdletBinding(DefaultParameterSetName = 'Config')]
@@ -711,7 +711,7 @@ function Get-Config {
             # hub.token on a per-project route with the compat window closed,
             # or a per-project token minted for a DIFFERENT project. HARD
             # refusal, NOT transient — do NOT env-fallback.
-            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden for project ${ProjectId}: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.${ProjectId}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$($result.Body)"
+            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden for project ${ProjectId}: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.${ProjectId} (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97. body=$($result.Body)"
             return 5
         }
         200 {

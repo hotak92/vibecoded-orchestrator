@@ -1753,16 +1753,17 @@ mod tests {
     /// the lifetime of the returned guard, restoring the prior value (set
     /// or unset) on drop — including on panic.
     ///
-    /// Deliberately does NOT take a lock of its own. Every caller already
-    /// holds [`keychain_test_lock`] (the store probe goes through
-    /// `secrets::get`), and that guard is what serialises this env
-    /// mutation against the other `VCT_SECRETS_DIR`-mutating tests in this
-    /// crate — `installer::tests::setup_temp_env` uses the identical
-    /// keychain-lock-then-set-env order. Acquiring a SECOND global mutex
-    /// here would introduce a lock-ordering hazard for no added safety.
+    /// Every caller already holds [`keychain_test_lock`] (the store probe
+    /// goes through `secrets::get`); this guard then takes THE env lock
+    /// (`test_env::env_lock`) — keychain first, env second, the one order
+    /// every test taking both uses (`installer::tests::setup_temp_env`,
+    /// `dashboard::tests`). v0.2.97 review R6: the keychain lock alone
+    /// ordered only the keychain tests, while `VCT_SECRETS_DIR` is read by
+    /// every test in the binary.
     struct FileStoreScratch {
         root: std::path::PathBuf,
         prev: Option<std::ffi::OsString>,
+        _env: vct_launcher_core::test_env::EnvLock,
     }
 
     impl FileStoreScratch {
@@ -1799,11 +1800,12 @@ mod tests {
         ));
         std::fs::create_dir_all(root.join("shared")).unwrap();
         std::fs::create_dir_all(root.join("projects")).unwrap();
+        let env = vct_launcher_core::test_env::env_lock();
         let prev = std::env::var_os("VCT_SECRETS_DIR");
         unsafe {
             std::env::set_var("VCT_SECRETS_DIR", &root);
         }
-        FileStoreScratch { root, prev }
+        FileStoreScratch { root, prev, _env: env }
     }
 
     /// A scratch store with no files in it — for tests that assert a pure

@@ -1696,8 +1696,11 @@ pub struct RuntimeBlock {
     // pure-Python MCPs) simply omit them and fall through to the legacy
     // "no GPU detection" path.
     //
-    // See knowledge/concepts/gpu-mode-decision-policy.md for the full
-    // design rationale.
+    // Rationale: PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive
+    // at pip-install time, so each GPU mode needs its own prebuilt
+    // image — the launcher never derives one variant's ref from
+    // another's; module authors enumerate and pin every variant they
+    // ship (see `gpu_image_variants` below).
 
     /// Per-module VRAM threshold (GB). When set, the launcher passes
     /// this value to `decide_gpu_mode` for this module's install/start
@@ -1839,9 +1842,9 @@ impl RuntimeBlock {
 /// Per-GPU-mode image tag variants. Each variant ships as a separate
 /// OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`)
 /// because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at
-/// pip-install time. See `knowledge/concepts/gpu-mode-decision-policy.md`
-/// > "Why CUDA wheels vs ROCm wheels need different containers" for
-/// the full rationale.
+/// pip-install time — one container cannot serve two wheel families,
+/// so there is nothing to derive: every variant a module ships is
+/// built and pinned independently.
 ///
 /// All three variants are REQUIRED when the block is present — the
 /// launcher would have no fallback if one were missing. Modules that

@@ -4648,6 +4648,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn install_path_pull_routes_through_shared_chokepoint_and_times_out() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
 

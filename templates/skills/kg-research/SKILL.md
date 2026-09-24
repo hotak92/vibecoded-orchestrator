@@ -154,7 +154,7 @@ Always structure research findings as:
 - **WikiLinks**: [[uses::Weaviate]], [[implements::Self-Retrieval]]
 
 ### [Concept 2]
-- **Source**: knowledge/concepts/blackboard-architecture-coordination.md
+- **Source**: knowledge/concepts/blackboard-coordination.md
 - **Key insight**: 13-57% improvement over hierarchical
 - **Relevance**: Should implement for multi-agent workflows
 - **WikiLinks**: [[uses::CONTEXT_STATE.md]], [[relatedTo::Agent Teams]]
@@ -235,7 +235,7 @@ Skill response:
 
 ## Code Examples
 1. `agent_planner.mcts_search` - Implementation of MCTS
-   - Location: .claude/scripts/mcts_planner.py:45
+   - Location: planning/mcts_planner.py:45
    - Uses: UCB1 selection, confidence-based pruning
 
 ## Gaps

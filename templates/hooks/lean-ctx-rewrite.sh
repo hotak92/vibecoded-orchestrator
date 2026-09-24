@@ -48,8 +48,7 @@
 # WHY NOT THE OLD BASH_ENV SHIM
 # -----------------------------
 # Compresses Claude Code Bash tool output ~90-97% without the fork-bomb
-# risk of the legacy BASH_ENV shim (disabled 0.2.11 — see
-# knowledge/concepts/lean-ctx-shim-disabled.md):
+# risk of the legacy BASH_ENV shim (disabled in v0.2.11):
 #   - The old shim wired BASH_ENV in .claude/settings.json. That env var
 #     propagated to EVERY child subprocess Claude Code's Bash tool spawned
 #     and re-sourced the shim recursively. lean-ctx 3.x changed `-c`

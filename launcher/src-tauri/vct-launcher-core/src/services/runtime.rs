@@ -228,14 +228,36 @@ impl RuntimeInfo {
 ///   - Resolves `~` expansion: `$HOME/.cargo/bin` is materialised, not
 ///     literal.
 pub fn augment_path_for_graphical_launch() {
-    let candidates = augment_candidates();
-    if candidates.is_empty() {
-        return;
-    }
-
     let current = std::env::var_os("PATH").unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(joined) = augmented_path(&current, home.as_deref()) {
+        // Safety: setting PATH process-wide is sound because we are
+        // single-threaded at this call site (lib.rs `setup()` runs before
+        // any subprocess spawn or Tauri-managed thread is unparked).
+        // `set_var` itself is `unsafe` on edition 2024+, but stable Rust
+        // allows the safe form on the current crate edition (2021).
+        std::env::set_var("PATH", &joined);
+    }
+}
+
+/// The PATH [`augment_path_for_graphical_launch`] sets, from `current` and
+/// `home` — `None` when there is nothing to add (every candidate is already
+/// on it, or the OS has none) or the result cannot be joined (logged).
+///
+/// Pure, so it is tested without touching the process `PATH`: tests share
+/// that variable with every concurrently running test and every child a test
+/// spawns by bare name (v0.2.97 review R6 — a Rust test never sets it;
+/// `tests/test_rust_tests_never_mutate_process_path.py`).
+pub fn augmented_path(
+    current: &std::ffi::OsStr,
+    home: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    let candidates = augment_candidates(home);
+    if candidates.is_empty() {
+        return None;
+    }
     let mut seen: std::collections::HashSet<PathBuf> =
-        std::env::split_paths(&current).collect();
+        std::env::split_paths(current).collect();
 
     // Prepend candidates that are not already on PATH, preserving the
     // order declared in `augment_candidates()`. Existing PATH entries
@@ -247,28 +269,21 @@ pub fn augment_path_for_graphical_launch() {
         }
     }
     if new_entries.is_empty() {
-        return; // All candidates already on PATH — nothing to do.
+        return None; // All candidates already on PATH — nothing to do.
     }
 
     // Append existing PATH entries after the new prepended candidates.
-    new_entries.extend(std::env::split_paths(&current));
+    new_entries.extend(std::env::split_paths(current));
 
     match std::env::join_paths(new_entries.iter()) {
-        Ok(joined) => {
-            // Safety: setting PATH process-wide is sound because we
-            // are single-threaded at this call site (lib.rs `setup()`
-            // runs before any subprocess spawn or Tauri-managed thread
-            // is unparked). `set_var` itself is `unsafe` on edition
-            // 2024+, but stable Rust allows the safe form via
-            // std::env::set_var on current crate edition (2021).
-            std::env::set_var("PATH", &joined);
-        }
+        Ok(joined) => Some(joined),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "[vct] augment_path_for_graphical_launch: join_paths failed — \
                  PATH left unchanged"
             );
+            None
         }
     }
 }
@@ -278,8 +293,7 @@ pub fn augment_path_for_graphical_launch() {
 /// exist on disk are still added — the user may install the tooling
 /// later and re-launch. Only `$HOME`-relative candidates are dropped
 /// when `HOME` is unset.
-fn augment_candidates() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+fn augment_candidates(home: Option<&std::path::Path>) -> Vec<PathBuf> {
 
     #[cfg(target_os = "macos")]
     {
@@ -1032,17 +1046,9 @@ mod tests {
     #[serial]
     fn pinned_runtime_reads_the_pin_and_ignores_non_pins() {
         // Mirrors `vco_lib.containers.runtime_preference_from_env`: only the
-        // two known names pin; `auto` / empty / garbage do not.
-        struct Guard(Option<String>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("VCT_CONTAINER_RUNTIME", v),
-                    None => std::env::remove_var("VCT_CONTAINER_RUNTIME"),
-                }
-            }
-        }
-        let _g = Guard(std::env::var("VCT_CONTAINER_RUNTIME").ok());
+        // two known names pin; `auto` / empty / garbage do not. The guard
+        // holds GLOBAL_ENV_MUTEX and restores the prior value on drop.
+        let _env = crate::test_env::env_guard(&[("VCT_CONTAINER_RUNTIME", None)]);
         for (value, want) in [
             ("podman", Some(ContainerRuntime::Podman)),
             (" Docker ", Some(ContainerRuntime::Docker)),
@@ -1078,59 +1084,33 @@ mod tests {
 
     // ----- v0.2.53 M-P0-7: launcher PATH augmentation tests -----
 
-    /// Augmentation is idempotent — calling twice does not duplicate
-    /// entries. On Windows this is a no-op and the PATH is unchanged.
+    /// The augmented PATH for `current`, or `current` itself when nothing
+    /// is added — what the process PATH would be after one call.
+    fn after_augment(current: &str, home: Option<&str>) -> std::ffi::OsString {
+        augmented_path(std::ffi::OsStr::new(current), home.map(std::path::Path::new))
+            .unwrap_or_else(|| std::ffi::OsString::from(current))
+    }
+
+    /// Augmentation is idempotent — a second call adds nothing. On Windows
+    /// it is a no-op and the PATH is unchanged.
     #[test]
-    #[serial]
     fn augment_path_is_idempotent() {
-        // Snapshot the existing PATH so we can restore it at the end.
-        let original = std::env::var_os("PATH");
-
-        // Use a minimal known PATH so the test does not depend on the
-        // host environment.
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        augment_path_for_graphical_launch();
-        let first = std::env::var_os("PATH").unwrap_or_default();
-
-        augment_path_for_graphical_launch();
-        let second = std::env::var_os("PATH").unwrap_or_default();
-
-        assert_eq!(
-            first, second,
+        let first = after_augment("/usr/bin:/bin", Some("/tmp/vct-augment-test-home"));
+        assert!(
+            augmented_path(&first, Some(std::path::Path::new("/tmp/vct-augment-test-home"))).is_none(),
             "second augment_path call must NOT modify PATH again"
         );
-
-        // Restore.
-        match original {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
     }
 
     /// Augmentation prepends candidates but preserves the existing PATH
-    /// after them — order is not destroyed. We assert this by checking
-    /// that the original entries appear AFTER any newly-prepended ones.
+    /// after them — order is not destroyed.
     #[test]
-    #[serial]
     fn augment_path_preserves_user_path_order() {
-        let original = std::env::var_os("PATH");
-
-        // Use a marker directory the augment_candidates() list will NOT
-        // emit — so we can verify it survives the prepend.
-        std::env::set_var("PATH", "/zzz_marker_a:/zzz_marker_b");
-
-        augment_path_for_graphical_launch();
-        let after = std::env::var_os("PATH").unwrap_or_default();
+        let after = after_augment("/zzz_marker_a:/zzz_marker_b", Some("/tmp/vct-augment-test-home"));
         let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
-        let pos_a = parts
-            .iter()
-            .position(|p| p == &PathBuf::from("/zzz_marker_a"));
-        let pos_b = parts
-            .iter()
-            .position(|p| p == &PathBuf::from("/zzz_marker_b"));
-
+        let pos_a = parts.iter().position(|p| p == &PathBuf::from("/zzz_marker_a"));
+        let pos_b = parts.iter().position(|p| p == &PathBuf::from("/zzz_marker_b"));
         // Both markers must still be present (augment does not delete).
         assert!(pos_a.is_some(), "marker_a must still be on PATH");
         assert!(pos_b.is_some(), "marker_b must still be on PATH");
@@ -1142,28 +1122,14 @@ mod tests {
             pos_a,
             pos_b
         );
-
-        match original {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
     }
 
     /// On macOS, the homebrew prefix must appear on PATH after augment.
     /// On Linux, `$HOME/.local/bin` must appear (when HOME is set).
     /// On Windows, augment is a no-op so PATH is unchanged.
     #[test]
-    #[serial]
     fn augment_path_adds_expected_os_specific_dirs() {
-        let original_path = std::env::var_os("PATH");
-        let original_home = std::env::var_os("HOME");
-
-        // Set a deterministic HOME so candidate construction is stable.
-        std::env::set_var("HOME", "/tmp/vct-augment-test-home");
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        augment_path_for_graphical_launch();
-        let after = std::env::var_os("PATH").unwrap_or_default();
+        let after = after_augment("/usr/bin:/bin", Some("/tmp/vct-augment-test-home"));
         let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
         #[cfg(target_os = "macos")]
@@ -1215,15 +1181,17 @@ mod tests {
                 parts
             );
         }
+    }
 
-        match original_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
-        match original_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
-        }
+    /// Without a HOME, the HOME-relative candidates are dropped (soft-fail).
+    #[test]
+    fn augment_path_without_home_drops_home_relative_candidates() {
+        let after = after_augment("/usr/bin:/bin", None);
+        assert!(
+            !std::env::split_paths(&after).any(|p| p.ends_with(".local/bin") || p.ends_with(".cargo/bin")),
+            "{:?}",
+            after
+        );
     }
 
     // ----- PR-15 G1: daemon_usable_probe tests -----

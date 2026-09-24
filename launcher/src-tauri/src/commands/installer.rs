@@ -3802,7 +3802,18 @@ pub(crate) fn ensure_hub_started_after_update(
         return Ok(());
     }
 
-    let Some(hub_bin) = crate::hub_launcher::find_hub_binary() else {
+    start_found_hub_after_update(install_path, ctx, crate::hub_launcher::find_hub_binary())
+}
+
+/// The rest of [`ensure_hub_started_after_update`], over the discovery's
+/// answer — a test hands it `None` instead of emptying the process
+/// `VCT_HUB_BIN` / `HOME` / `PATH` (v0.2.97 review R6).
+fn start_found_hub_after_update(
+    install_path: &Path,
+    ctx: HubRestartContext,
+    hub_bin: Option<PathBuf>,
+) -> Result<(), String> {
+    let Some(hub_bin) = hub_bin else {
         tracing::warn!(
             "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
              leaving hub stopped. Launcher restart will retry the discovery."
@@ -14528,6 +14539,10 @@ MemAvailable:   23456789 kB
             // binary holds its own copy of the in-process mutex, so
             // pre-v0.2.14 nothing serialised between binaries.
             _lock: crate::secrets::test_serialize::KeychainGuard,
+            // v0.2.97 review R6: and THE env lock, taken after the keychain
+            // one (the one order every test taking both uses). The restore
+            // in `drop` runs before either field is released.
+            _env: vct_launcher_core::test_env::EnvLock,
         }
 
         impl Drop for EnvGuard {
@@ -14541,6 +14556,7 @@ MemAvailable:   23456789 kB
 
         fn setup_temp_env() -> (PathBuf, EnvGuard) {
             let lock = crate::secrets::test_serialize::keychain_serialize_lock();
+            let env = vct_launcher_core::test_env::env_lock();
             let tmp = std::env::temp_dir().join(format!(
                 "vct-installer-pat-test-{}",
                 uuid::Uuid::new_v4().simple()
@@ -14548,7 +14564,7 @@ MemAvailable:   23456789 kB
             std::fs::create_dir_all(&tmp).unwrap();
             let prev_secrets_dir = std::env::var_os("VCT_SECRETS_DIR");
             std::env::set_var("VCT_SECRETS_DIR", &tmp);
-            let guard = EnvGuard { prev_secrets_dir, _lock: lock };
+            let guard = EnvGuard { prev_secrets_dir, _lock: lock, _env: env };
             (tmp, guard)
         }
 
@@ -16404,49 +16420,29 @@ MemAvailable:   23456789 kB
         fn ensure_hub_started_after_update_is_soft_fail_when_no_binary() {
             // No vct-hub binary anywhere → returns Ok(()), prints a
             // warning. The launcher's own boot path will retry.
-            with_vct_state_dir(|_root| {
-                let prev_bin = std::env::var_os("VCT_HUB_BIN");
-                let prev_path = std::env::var_os("PATH");
-                let prev_home = std::env::var_os("HOME");
-                let prev_profile = std::env::var_os("USERPROFILE");
-                unsafe {
-                    std::env::set_var("VCT_HUB_BIN", "/nonexistent/vct-hub");
-                    std::env::set_var("PATH", "/nonexistent-dir");
-                    std::env::set_var("HOME", "/nonexistent-home");
-                    std::env::set_var("USERPROFILE", "/nonexistent-profile");
-                }
-                let install_path = std::env::temp_dir();
-                // v0.2.89: signature now takes a HubRestartContext. PostInstall
-                // exercises the same missing-binary early-return the pre-v0.2.89
-                // test covered (the binary lookup fails BEFORE the ctx branch, so
-                // either context returns Ok(()) here — PostInstall keeps this a
-                // fully synchronous, deterministic soft-fail).
-                let result = ensure_hub_started_after_update(
-                    &install_path,
-                    HubRestartContext::PostInstall,
-                );
-                assert!(result.is_ok(),
-                    "missing binary should soft-fail to Ok(()), got {:?}",
-                    result);
-                unsafe {
-                    match prev_bin {
-                        Some(v) => std::env::set_var("VCT_HUB_BIN", v),
-                        None => std::env::remove_var("VCT_HUB_BIN"),
-                    }
-                    match prev_path {
-                        Some(v) => std::env::set_var("PATH", v),
-                        None => std::env::remove_var("PATH"),
-                    }
-                    match prev_home {
-                        Some(v) => std::env::set_var("HOME", v),
-                        None => std::env::remove_var("HOME"),
-                    }
-                    match prev_profile {
-                        Some(v) => std::env::set_var("USERPROFILE", v),
-                        None => std::env::remove_var("USERPROFILE"),
-                    }
-                }
-            });
+            //
+            // v0.2.97 review R6: the discovery's answer is handed in, so the
+            // test sets no process env (it used to empty VCT_HUB_BIN / HOME /
+            // USERPROFILE — which the harness refusal below made moot anyway).
+            // PostInstall: the missing-binary early return comes BEFORE the
+            // ctx branch, and keeps this synchronous and deterministic.
+            let install_path = std::env::temp_dir();
+            let result =
+                start_found_hub_after_update(&install_path, HubRestartContext::PostInstall, None);
+            assert!(result.is_ok(),
+                "missing binary should soft-fail to Ok(()), got {:?}",
+                result);
+        }
+
+        /// Under the cargo test harness the public entry refuses before any
+        /// discovery or spawn (hub discovery ignores `VCT_STATE_DIR`, so a
+        /// spawn would be a REAL hub) — and says so with `Ok(())`.
+        #[test]
+        fn ensure_hub_started_after_update_refuses_under_the_test_harness() {
+            assert!(crate::hub_launcher::running_under_test_harness());
+            for ctx in [HubRestartContext::PostInstall, HubRestartContext::AbortRecovery] {
+                assert!(ensure_hub_started_after_update(&std::env::temp_dir(), ctx).is_ok());
+            }
         }
     }
 
@@ -19799,9 +19795,12 @@ severity_max: critical\n\
         /// remote/fetch/rev-parse and fails ONLY rev-list.
         ///
         /// Plain `#[test]` (not `#[tokio::test]`): we build our OWN
-        /// single-thread runtime INSIDE `with_env_vars` so the PATH override
-        /// covers the whole async invocation. `#[tokio::test]` would already
-        /// hold a runtime and forbid the nested `block_on`.
+        /// single-thread runtime INSIDE `with_lookup_path`, so the whole
+        /// async invocation runs on THIS thread and sees the injected lookup
+        /// PATH (the launcher's git runners resolve `git` through it —
+        /// `git_cmd::git_command`). v0.2.97 review R6: the test used to put
+        /// the shim first on the PROCESS `PATH`, which every concurrently
+        /// running test and every child they spawn by bare name shares.
         #[cfg(unix)]
         #[test]
         fn rev_list_failure_populates_health_fields_not_silent() {
@@ -19843,30 +19842,17 @@ exit 0
             perms.set_mode(0o755);
             std::fs::set_permissions(&git_shim, perms).unwrap();
 
-            // Prepend the shim dir to PATH so our fake `git` wins. Guarded by
-            // GLOBAL_ENV_MUTEX so concurrent env-mutating tests don't race.
-            let orig_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", shim_dir.display(), orig_path);
+            // The shim dir is the WHOLE lookup PATH: only our fake `git` can
+            // be resolved, on this thread only.
             let repo_str = repo.to_str().unwrap().to_string();
-
-            // `with_env_vars` holds the mutex and runs the closure; we drive
-            // the async command on a fresh single-thread runtime INSIDE it so
-            // PATH stays overridden for the whole invocation.
-            let status = std::cell::RefCell::new(None);
-            vct_launcher_core::test_env::with_env_vars(
-                &[("PATH", Some(new_path.as_str()))],
-                || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    let s = rt.block_on(check_for_updates(repo_str.clone())).expect(
-                        "check_for_updates must NOT hard-fail on a rev-list failure",
-                    );
-                    *status.borrow_mut() = Some(s);
-                },
-            );
-            let status = status.into_inner().expect("status captured");
+            let status = vct_launcher_core::paths::with_lookup_path(Some(shim_dir.as_os_str()), || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(check_for_updates(repo_str.clone()))
+                    .expect("check_for_updates must NOT hard-fail on a rev-list failure")
+            });
 
             assert!(
                 status.remote_check.is_unknown(),

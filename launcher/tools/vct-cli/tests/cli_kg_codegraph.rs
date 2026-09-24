@@ -2,10 +2,10 @@
 //!
 //! Strategy
 //! --------
-//! - Build the `vco` binary via `env!("CARGO_BIN_EXE_vco")` (Cargo
+//! - Build the `vct-cli` binary via `env!("CARGO_BIN_EXE_vct-cli")` (Cargo
 //!   provides this for `[[bin]]` crates so we don't have to shell out
 //!   to `cargo run`).
-//! - For arg-parsing checks: invoke `vco <subcommand> --help` and grep
+//! - For arg-parsing checks: invoke `vct-cli <subcommand> --help` and grep
 //!   the output. Cheap, deterministic, no network.
 //! - For end-to-end behaviour: spawn a tiny axum stub on a random port
 //!   that records the incoming request and returns a canned JSON body,
@@ -21,19 +21,19 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-fn vco_bin() -> &'static str {
-    env!("CARGO_BIN_EXE_vco")
+fn cli_bin() -> &'static str {
+    env!("CARGO_BIN_EXE_vct-cli")
 }
 
-/// Run `vco <args>` and return (stdout, stderr, exit_code).
-fn run_vco(args: &[&str]) -> (String, String, i32) {
-    let output = Command::new(vco_bin())
+/// Run `vct-cli <args>` and return (stdout, stderr, exit_code).
+fn run_cli(args: &[&str]) -> (String, String, i32) {
+    let output = Command::new(cli_bin())
         .args(args)
         .env_remove("VCT_HUB_PORT")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("spawn vco");
+        .expect("spawn vct-cli");
     (
         String::from_utf8_lossy(&output.stdout).to_string(),
         String::from_utf8_lossy(&output.stderr).to_string(),
@@ -43,7 +43,7 @@ fn run_vco(args: &[&str]) -> (String, String, i32) {
 
 #[test]
 fn kg_subcommand_listed_in_top_help() {
-    let (out, _err, code) = run_vco(&["--help"]);
+    let (out, _err, code) = run_cli(&["--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("kg"), "top help missing 'kg'\n{}", out);
     assert!(out.contains("codegraph"), "top help missing 'codegraph'");
@@ -51,7 +51,7 @@ fn kg_subcommand_listed_in_top_help() {
 
 #[test]
 fn kg_search_help_advertises_required_flags() {
-    let (out, _err, code) = run_vco(&["kg", "search", "--help"]);
+    let (out, _err, code) = run_cli(&["kg", "search", "--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("--project"));
     assert!(out.contains("--collections"));
@@ -61,7 +61,7 @@ fn kg_search_help_advertises_required_flags() {
 
 #[test]
 fn codegraph_search_help_lists_scope_choices() {
-    let (out, _err, code) = run_vco(&["codegraph", "search", "--help"]);
+    let (out, _err, code) = run_cli(&["codegraph", "search", "--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("--scope"));
     assert!(out.contains("CodeModule") || out.contains("code"));
@@ -72,7 +72,7 @@ fn codegraph_search_help_lists_scope_choices() {
 fn kg_search_requires_project_flag() {
     // Clap should reject the call with a non-zero exit and an error
     // mentioning the missing flag.
-    let (_out, err, code) = run_vco(&["kg", "search", "test query"]);
+    let (_out, err, code) = run_cli(&["kg", "search", "test query"]);
     assert_ne!(code, 0);
     assert!(
         err.contains("--project") || err.contains("project"),
@@ -83,7 +83,7 @@ fn kg_search_requires_project_flag() {
 
 #[test]
 fn codegraph_search_rejects_unknown_subcommand() {
-    let (_out, err, code) = run_vco(&["codegraph", "blarg"]);
+    let (_out, err, code) = run_cli(&["codegraph", "blarg"]);
     assert_ne!(code, 0);
     assert!(err.contains("error") || err.contains("Unknown") || err.contains("unrecognized"));
 }
@@ -100,7 +100,7 @@ fn codegraph_search_rejects_unknown_subcommand() {
 
 #[test]
 fn hooks_enable_requires_project_flag() {
-    let (_out, err, code) = run_vco(&["hooks", "enable", "5"]);
+    let (_out, err, code) = run_cli(&["hooks", "enable", "5"]);
     assert_ne!(code, 0);
     assert!(
         err.contains("--project") || err.contains("project"),
@@ -111,7 +111,7 @@ fn hooks_enable_requires_project_flag() {
 
 #[test]
 fn hooks_disable_requires_project_flag() {
-    let (_out, err, code) = run_vco(&["hooks", "disable", "5"]);
+    let (_out, err, code) = run_cli(&["hooks", "disable", "5"]);
     assert_ne!(code, 0);
     assert!(
         err.contains("--project") || err.contains("project"),
@@ -122,7 +122,7 @@ fn hooks_disable_requires_project_flag() {
 
 #[test]
 fn hooks_enable_help_advertises_required_project_flag() {
-    let (out, _err, code) = run_vco(&["hooks", "enable", "--help"]);
+    let (out, _err, code) = run_cli(&["hooks", "enable", "--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("--project"), "help missing --project\n{}", out);
     assert!(out.contains("REQUIRED"), "help should say REQUIRED, not leave it implicit\n{}", out);
@@ -130,7 +130,7 @@ fn hooks_enable_help_advertises_required_project_flag() {
 
 #[test]
 fn hooks_disable_help_advertises_required_project_flag() {
-    let (out, _err, code) = run_vco(&["hooks", "disable", "--help"]);
+    let (out, _err, code) = run_cli(&["hooks", "disable", "--help"]);
     assert_eq!(code, 0);
     assert!(out.contains("--project"), "help missing --project\n{}", out);
     assert!(out.contains("REQUIRED"), "help should say REQUIRED, not leave it implicit\n{}", out);
@@ -232,7 +232,7 @@ fn kg_collections_calls_correct_endpoint_and_emits_valid_json() {
     let hub = StubHub::start_returning(canned.clone());
     let port = hub.port.to_string();
 
-    let (out, err, code) = run_vco(&["--port", &port, "kg", "collections"]);
+    let (out, err, code) = run_cli(&["--port", &port, "kg", "collections"]);
     assert_eq!(code, 0, "stderr: {}", err);
 
     // Path must be the cli endpoint under /api/v1.
@@ -260,7 +260,7 @@ fn kg_search_serialises_collections_and_query_to_post_body() {
     let port = hub.port.to_string();
 
     let project_uuid = "12345678-1234-1234-1234-123456789012";
-    let (out, err, code) = run_vco(&[
+    let (out, err, code) = run_cli(&[
         "--port",
         &port,
         "kg",
@@ -307,7 +307,7 @@ fn codegraph_search_passes_scope_in_body() {
     let port = hub.port.to_string();
 
     let project_uuid = "abcdef12-3456-7890-abcd-ef1234567890";
-    let (_out, err, code) = run_vco(&[
+    let (_out, err, code) = run_cli(&[
         "--port",
         &port,
         "codegraph",
@@ -342,7 +342,7 @@ fn kg_search_without_collections_omits_field_so_hub_auto_detects() {
     let port = hub.port.to_string();
 
     let project_uuid = "11111111-2222-3333-4444-555555555555";
-    let (out, err, code) = run_vco(&[
+    let (out, err, code) = run_cli(&[
         "--port",
         &port,
         "kg",

@@ -42,9 +42,9 @@ You are a specialized agent that maintains knowledge graph quality by extracting
    - Don't auto-merge (requires human review)
 
 4. **Infer missing relationships**:
-   - Use Claude's reasoning directly. If you've opted into the `vct-ollama`
-     module, you can route to local inference for cost reasons; otherwise,
-     reason in-context.
+   - Use Claude's reasoning directly, in-context. (VCO exposes no
+     local-inference tool — the Ollama MCP was retired in v0.2.11; see
+     "Ollama (local, optional)" below for the REST route.)
    - Example: "Node A uses Redis for caching" → Create `[[uses::Redis]]` link
    - Only suggest, don't auto-add (preserve manual control)
 
@@ -77,9 +77,12 @@ You will receive:
   - Create cross-references via `data.reference_add()`
   - Use GraphQL for relationship traversal
 
-- **Ollama (opt-in)**: local LLM for relationship inference, available via
-  the opt-in `vct-ollama` module if you want local inference instead of Claude.
-  - Model: `granite4:7b` (fast, good for extraction)
+- **Ollama (local, optional)**: the `ollama` service VCO runs for embeddings
+  (`infrastructure/docker-compose.yml`, `http://localhost:11435`) also answers
+  Ollama's REST API (`/api/generate`) if you want local inference instead of
+  Claude. It is not an MCP tool — call it from Bash — and only models already
+  pulled into it answer (`curl -s http://localhost:11435/api/tags` lists them).
+  - Model: a small extraction model you have pulled, e.g. `granite4:7b`
   - Use for: Extracting implicit relationships from text
 
 ### Critical Rules

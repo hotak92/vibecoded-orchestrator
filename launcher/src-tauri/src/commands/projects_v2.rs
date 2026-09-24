@@ -3747,60 +3747,12 @@ pub(crate) fn vco_lib_python_or(fallback: &str) -> PathBuf {
     vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or(fallback)
 }
 
-/// Marker pair delimiting the launcher-managed block in `.claude/env`.
-/// Lines BETWEEN the markers are owned by the launcher and replaced on
-/// every write; lines OUTSIDE are preserved verbatim. The markers must
-/// be exact; do not translate or reformat.
-pub(crate) const CLAUDE_ENV_MANAGED_BEGIN: &str = "# vco-managed-begin";
-pub(crate) const CLAUDE_ENV_MANAGED_END: &str = "# vco-managed-end";
-
-/// Splice a launcher-managed block into an existing `.claude/env`,
-/// preserving any lines outside the BEGIN/END markers.
-///
-/// Behaviour:
-///   * `prior == None` (file doesn't exist): emit just the managed block.
-///   * `prior` contains the BEGIN marker: replace the segment from
-///     BEGIN to END (inclusive) with the new managed block. Whitespace
-///     and content OUTSIDE the markers are preserved byte-for-byte.
-///   * `prior` doesn't contain BEGIN: append the managed block at the
-///     end. The user's pre-existing content is preserved (it's either
-///     a hand-edited file from before PR-3, or the legacy launcher
-///     wholesale-write — neither contained user-added exports we'd
-///     want to keep, since the launcher overwrote on every call). On
-///     the next round-trip the markers exist and in-place replace
-///     activates.
-pub(crate) fn merge_claude_env_managed_block(prior: Option<&str>, managed: &str) -> String {
-    let Some(prior) = prior else {
-        return managed.to_string();
-    };
-    if !prior.contains(CLAUDE_ENV_MANAGED_BEGIN) {
-        let mut out = String::with_capacity(prior.len() + managed.len() + 1);
-        out.push_str(prior);
-        if !prior.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(managed);
-        return out;
-    }
-    let begin_idx = prior.find(CLAUDE_ENV_MANAGED_BEGIN).unwrap();
-    let after_end = match prior[begin_idx..].find(CLAUDE_ENV_MANAGED_END) {
-        Some(off) => begin_idx + off + CLAUDE_ENV_MANAGED_END.len(),
-        // Marker pair not closed — treat as "managed block missing END",
-        // truncate from BEGIN to EOF and re-emit.
-        None => prior.len(),
-    };
-    // Trim trailing newline after END so we don't accumulate blank lines.
-    let after_end = if prior.as_bytes().get(after_end).copied() == Some(b'\n') {
-        after_end + 1
-    } else {
-        after_end
-    };
-    let mut out = String::with_capacity(prior.len() + managed.len());
-    out.push_str(&prior[..begin_idx]);
-    out.push_str(managed);
-    out.push_str(&prior[after_end..]);
-    out
-}
+// v0.2.97 (review R6): the Rust `.claude/env` splice
+// (`merge_claude_env_managed_block`) and by-name export strip
+// (`strip_canonical_keys_from_claude_env_text`) are retired — SUPERSEDED by
+// `vco_lib.unregister_env strip-routing`, the unregister's one strip of
+// `.claude/env` and the JSON env blocks (their only caller). The block's
+// writer and markers live in `vco_lib.config_projection`.
 
 // v0.2.97: the Rust `.env` writer (`ensure_project_env_template`,
 // `build_canonical_env_text`, `write_env_reference_sidecar` and the
@@ -4589,13 +4541,19 @@ pub async fn switch_project_host_v2(
 ///     installed — users edit them and treat them as user content.
 ///   * (ii) `.claude/scripts/` IS purged — these are launcher-managed
 ///     and re-shipped on every bundle install.
-#[derive(Debug, Clone, Deserialize, Default)]
-#[serde(rename_all = "camelCase")]
+///
+/// ONE set of defaults (review R6 F46): the struct-level `#[serde(default)]`
+/// fills a missing field from [`Default`], so `options: null` (`None` →
+/// `unwrap_or_default()`), `{}`, and the settings page's untouched checkboxes
+/// are the SAME unregister. The derived `Default` had `purge_launcher_files:
+/// false` while serde's per-field default said `true`, so `null` skipped the
+/// strip and the stop could never fire from the project list.
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", default)]
 pub struct UnregisterOptions {
     /// Surgically remove launcher-managed files from the project
     /// folder. Leaves user content (agents, skills, CONTEXT_STATE,
     /// CLAUDE.md, source code, user-added .env keys). Default: true.
-    #[serde(default = "default_true")]
     pub purge_launcher_files: bool,
 
     /// Drop the project's own Weaviate collections
@@ -4603,7 +4561,6 @@ pub struct UnregisterOptions {
     /// collections are NEVER touched. Default: false (opt-in).
     /// Collections can always be rebuilt from /knowledge + source
     /// code, so this is a user choice rather than a default.
-    #[serde(default)]
     pub purge_collections: bool,
 
     /// Owner ruling (review R5 F39): the explicit escape from the unregister
@@ -4612,11 +4569,17 @@ pub struct UnregisterOptions {
     /// each key and file (names only). Default false: the stop stays the
     /// default, and the GUI offers this only as the second action of that
     /// stop.
-    #[serde(default)]
     pub leave_unremovable: bool,
 }
 
-fn default_true() -> bool { true }
+impl Default for UnregisterOptions {
+    /// The defaults — MUST MATCH `DEFAULT_UNREGISTER_OPTIONS` in
+    /// `launcher/src/lib/unregister-escape.ts` (what every GUI unregister
+    /// sends explicitly).
+    fn default() -> Self {
+        Self { purge_launcher_files: true, purge_collections: false, leave_unremovable: false }
+    }
+}
 
 /// Per-call report from `delete_project_v2`. Consumed by the launcher
 /// UI's "Unregister project" toast for a one-line summary plus a
@@ -4797,9 +4760,10 @@ pub(crate) const CANONICAL_INSTALL_ENV_KEYS: &[&str] = &[
     "KG_BASE_DIR",
 ];
 
-/// Canonical env keys the launcher OWNS across every surface. These are
-/// the keys `purge_launcher_files_from_project` removes during unregister
-/// while preserving every other key (user-added secrets, custom config).
+/// Canonical env keys the launcher OWNS across every surface — the keys an
+/// unregister's env strip considers. Since v0.2.97 review R6 a key is removed
+/// only where the value is VCO's (its marked block, or a value equal to what
+/// VCO projects for the project); every other key is never touched.
 ///
 /// Install-flow audit (2026-05-08, P1 #2): now identical to
 /// `CANONICAL_INSTALL_ENV_KEYS` after the portability keys merged in
@@ -4859,8 +4823,10 @@ pub(crate) const UNREGISTER_PURGE_PATHS: &[&str] = &[
 /// (pinned by `tests/test_v0297_unregister_evidence.py`).
 pub(crate) const EVIDENCE_GATED_ENV_KEYS: &[&str] = &["GITHUB_TOKEN"];
 
-/// The canonical keys unregister removes BY NAME: every launcher-owned key
-/// except the [`EVIDENCE_GATED_ENV_KEYS`].
+/// The routing keys the unregister's env strips consider (every
+/// launcher-owned key except the secret-valued [`EVIDENCE_GATED_ENV_KEYS`]).
+/// The name alone removes nothing (review R6): the `.env` strip needs VCO's
+/// block or sections, the `.claude/env` / JSON strip VCO's block or VCO's value.
 fn unregister_by_name_keys() -> std::collections::HashSet<&'static str> {
     UNREGISTER_CANONICAL_ENV_KEYS
         .iter()
@@ -4869,118 +4835,51 @@ fn unregister_by_name_keys() -> std::collections::HashSet<&'static str> {
         .collect()
 }
 
-/// Pure helper: strip launcher-canonical keys from the `.claude/env`
-/// POSIX-export file (the project `.env` strip is `vco_lib.env_template
-/// strip`, through the bridge, since v0.2.97). Recognizes the
-/// `export KEY="value"` shape the env projection writes inside the managed
-/// block.
-///
-/// Recognized line shapes (after trim):
-///   * `export KEY="value"`
-///   * `export KEY=value`
-///   * `# export KEY="value"` (commented; rare but possible)
-///   * `KEY=value` / `# KEY=value` (env-style fallback)
-///
-/// MUST MATCH the line grammar of `vco_lib/envfile.py::parse_env_line`
-/// (a documented Rust mirror, review R4 F27): an optional `export `, a
-/// `KEY=` split on the first `=`, the key trimmed. This by-name strip also
-/// accepts a `#`-commented line, which the Python reader skips — deliberate:
-/// a commented canonical key is launcher residue too.
-///
-/// All lines OUTSIDE the matched-key set are preserved verbatim, INCLUDING
-/// the `# vco-managed-begin` / `# vco-managed-end` marker lines (a tidy
-/// sweep would remove them too, but leaving them is harmless and
-/// idempotent on re-run).
-pub(crate) fn strip_canonical_keys_from_claude_env_text(
-    text: &str,
-) -> (String, Vec<String>) {
-    let canonical = unregister_by_name_keys();
-    let mut removed = std::collections::BTreeSet::new();
-    let mut out = String::with_capacity(text.len());
-
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        // Strip optional leading '#' + whitespace (commented exports).
-        let after_hash = if let Some(rest) = trimmed.strip_prefix('#') {
-            rest.trim_start()
-        } else {
-            trimmed
-        };
-        // Strip optional leading 'export ' to expose KEY=value.
-        let body = after_hash.strip_prefix("export ").unwrap_or(after_hash);
-
-        let key_to_check = body
-            .find('=')
-            .filter(|&i| i > 0)
-            .map(|i| body[..i].trim());
-
-        if let Some(k) = key_to_check {
-            if canonical.contains(k) {
-                removed.insert(k.to_string());
-                continue; // drop the line
-            }
+/// The routing keys a `strip-routing` reply says were removed (any file).
+pub(crate) fn routing_strip_removed(reply: &serde_json::Value) -> Vec<String> {
+    let mut out = Vec::new();
+    for names in reply.get("removed").and_then(serde_json::Value::as_object).into_iter().flatten() {
+        for name in names.1.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str) {
+            out.push(name.to_string());
         }
-
-        out.push_str(line);
-        out.push('\n');
     }
-
-    // Preserve the input's trailing-newline shape.
-    if !text.ends_with('\n') && out.ends_with('\n') {
-        out.pop();
-    }
-    if text.ends_with('\n') && out.is_empty() {
-        out.push('\n');
-    }
-
-    (out, removed.into_iter().collect())
+    out
 }
 
-/// Strip `keys` from both JSON env surfaces of `folder` —
-/// `.claude/settings.json` `env` and `.vscode/settings.json`
-/// `claude-code.env` — through the ONE Python implementation
-/// (`vco_lib.config_projection strip-env-keys`, via
-/// [`crate::services::vco_lib_bridge::strip_settings_env_keys`]).
-///
-/// v0.2.97 review F5: both unregister strips carried a Rust read-merge-write
-/// here that parsed with strict `serde_json` and rewrote with
-/// `to_string_pretty` — a JSONC `.vscode/settings.json` (VS Code's own
-/// format) was refused with a warning, so the key NAMES it held survived the
-/// unregister, and a comment-free file was reformatted wholesale. The Python
-/// strip edits JSONC in place, drops an env block it empties, never creates a
-/// file, and refuses + records an unreadable one exactly like every other
-/// env writer. A surface whose file does not exist is not spawned for.
-///
-/// Removed keys are added to `purged`; a refusal or spawn failure becomes one
-/// `warnings` line naming the file (`what` says which strip it was).
-pub(crate) fn strip_json_env_surfaces(
-    root: Option<&Path>,
-    folder: &Path,
-    keys: &[&str],
-    what: &str,
-    purged: &mut std::collections::BTreeSet<String>,
-    warnings: &mut Vec<String>,
-) {
-    if keys.is_empty() {
-        return;
-    }
-    for (surface, file) in [
-        ("claude_settings_json", folder.join(".claude").join("settings.json")),
-        ("vscode_settings_json", folder.join(".vscode").join("settings.json")),
-    ] {
-        if !file.exists() {
-            continue;
-        }
-        match crate::services::vco_lib_bridge::strip_settings_env_keys(root, folder, surface, keys) {
-            Ok(removed) => purged.extend(removed),
-            Err(e) => warnings.push(format!(
-                "{} left untouched ({}): {}",
-                file.display(),
-                what,
-                e
-            )),
+/// The unregister report's lines for a `strip-routing` reply (review R6):
+/// per file, the routing keys LEFT because their value is not VCO's; why
+/// nothing outside VCO's block could be proven when the projection was not
+/// available; and each refused file. Key names only.
+pub(crate) fn routing_strip_report_lines(reply: &serde_json::Value) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut any_left = false;
+    for (rel, names) in reply.get("left").and_then(serde_json::Value::as_object).into_iter().flatten() {
+        let names: Vec<&str> =
+            names.as_array().into_iter().flatten().filter_map(serde_json::Value::as_str).collect();
+        if !names.is_empty() {
+            any_left = true;
+            lines.push(format!(
+                "left in {} — values VCO does not write for this project (yours), so the \
+                 unregister kept them: {}",
+                rel,
+                names.join(", ")
+            ));
         }
     }
+    // Only when it explains something: a key was left for want of evidence.
+    if any_left && reply.get("projection").and_then(serde_json::Value::as_str) == Some("unavailable") {
+        lines.push(format!(
+            "could not work out the values VCO writes for this project ({}), so no \
+             routing key outside VCO's .claude/env block was removed",
+            reply.get("projection_error").and_then(serde_json::Value::as_str).unwrap_or("unknown")
+        ));
+    }
+    for e in reply.get("errors").and_then(serde_json::Value::as_array).into_iter().flatten() {
+        if let Some(msg) = e.as_str() {
+            lines.push(msg.to_string());
+        }
+    }
+    lines
 }
 
 /// Drive the surgical purge across all four env surfaces in one folder.
@@ -5002,8 +4901,10 @@ pub(crate) fn strip_json_env_surfaces(
 pub(crate) fn surgically_strip_env_surfaces(
     root: Option<&Path>,
     folder: &Path,
+    project_id: Option<&str>,
 ) -> (Vec<String>, Vec<String>) {
-    let (keys, warnings, _not_removed) = surgically_strip_env_surfaces_checked(root, folder);
+    let (keys, warnings, _not_removed) =
+        surgically_strip_env_surfaces_checked(root, folder, project_id);
     (keys, warnings)
 }
 
@@ -5014,21 +4915,24 @@ pub(crate) fn surgically_strip_env_surfaces(
 pub(crate) fn surgically_strip_env_surfaces_checked(
     root: Option<&Path>,
     folder: &Path,
+    project_id: Option<&str>,
 ) -> (Vec<String>, Vec<String>, Vec<String>) {
     let mut keys = std::collections::BTreeSet::new();
     let mut warnings: Vec<String> = Vec::new();
 
     // 1. .env (root) — v0.2.97 (review R5 F40): through the ONE `.env`
-    // writer (`vco_lib.env_template strip`): VCO's managed block goes whole,
-    // plus the by-name keys outside it. This was a Rust read-modify-write the
-    // single-writer lint could not see, and it left the block's markers and
-    // comments behind.
+    // writer (`vco_lib.env_template strip`). It removes only what VCO
+    // authored (review R6 F47, the evidence rule): the managed block whole
+    // and the retired writers' sections. A user's own assignment of a managed
+    // key, and the `<KEY>_old` values VCO set aside, stay — named in the
+    // unregister report, never counted as VCO's.
     if folder.join(".env").exists() {
         let mut by_name: Vec<&str> = unregister_by_name_keys().into_iter().collect();
         by_name.sort_unstable();
         match crate::services::vco_lib_bridge::strip_project_env_keys(root, folder, &by_name) {
-            Ok(removed) => {
-                for k in removed { keys.insert(k); }
+            Ok(outcome) => {
+                warnings.extend(env_strip_report_lines(&folder.join(".env"), &outcome));
+                for k in outcome.removed { keys.insert(k); }
             }
             Err(e) => warnings.push(format!(
                 "could not strip VCO's keys from {}: {}",
@@ -5038,53 +4942,57 @@ pub(crate) fn surgically_strip_env_surfaces_checked(
         }
     }
 
-    // 2. .claude/env (POSIX exports). Two-step strip:
-    //    a) excise the launcher-managed BEGIN/END block in place
-    //    b) strip any orphaned canonical keys outside the block
-    //       (e.g. legacy entries from pre-managed-block layouts)
-    //
-    // The file is preserved (NOT in UNREGISTER_PURGE_PATHS as of
-    // 2026-05-09): users who hand-add exports outside the managed
-    // block keep them across unregister/re-register. Empty files
-    // are harmless residue the user can clean up at their discretion.
-    let claude_env = folder.join(".claude").join("env");
-    if claude_env.exists() {
-        match std::fs::read_to_string(&claude_env) {
-            Ok(text) => {
-                // Step (a): replace the managed block with an empty
-                // string. `merge_claude_env_managed_block` handles
-                // the BEGIN/END splice idempotently and is a no-op
-                // if no markers are present.
-                let after_block = merge_claude_env_managed_block(Some(&text), "");
-                // Step (b): strip orphaned canonical keys outside the
-                // (now-empty) managed segment.
-                let (new_text, removed) =
-                    strip_canonical_keys_from_claude_env_text(&after_block);
-                if new_text != text {
-                    if let Err(e) = std::fs::write(&claude_env, new_text) {
-                        warnings.push(format!(
-                            "could not rewrite {}: {}", claude_env.display(), e
-                        ));
-                    } else {
-                        for k in removed { keys.insert(k); }
-                    }
-                }
-            }
-            Err(e) => warnings.push(format!(
-                "could not read {} for env-key strip: {}", claude_env.display(), e
-            )),
-        }
-    }
-
-    // 3 + 4. `.claude/settings.json` `env` and `.vscode/settings.json`
-    //        `claude-code.env` — the ONE Python strip (v0.2.97 review F5).
+    // 2-4. `.claude/env`, `.claude/settings.json` `env` and
+    //      `.vscode/settings.json` `claude-code.env` — the ONE Python strip,
+    //      `vco_lib.unregister_env strip-routing` (review R6, the evidence
+    //      rule): VCO's `.claude/env` block goes whole (its markers are the
+    //      evidence); anywhere else a routing key goes only when its value
+    //      EQUALS what VCO projects for this project — computed from the
+    //      project's DB row, which is why this runs before the row is
+    //      deleted. A different value is the user's: left, and named here.
+    //      This replaced a Rust `.claude/env` rewrite and a by-name JSON strip.
     let canonical: Vec<&str> = unregister_by_name_keys().into_iter().collect();
-    strip_json_env_surfaces(root, folder, &canonical, "env-key strip", &mut keys, &mut warnings);
+    match crate::services::vco_lib_bridge::strip_routing_env_keys(root, folder, project_id, &canonical) {
+        Ok(reply) => {
+            keys.extend(routing_strip_removed(&reply));
+            warnings.extend(routing_strip_report_lines(&reply));
+        }
+        Err(e) => warnings.push(format!(
+            "could not strip VCO's routing keys from .claude/env / settings.json in {}: {}",
+            folder.display(),
+            e
+        )),
+    }
 
     // 5. Secret VALUES (user secrets + `GITHUB_TOKEN`) — only on evidence.
     let not_removed = strip_proven_secret_values(root, folder, &mut keys, &mut warnings);
 
     (keys.into_iter().collect(), warnings, not_removed)
+}
+
+/// The unregister report's lines for what the `.env` strip LEFT (review R6
+/// F47): the user's own assignments of managed keys, and the `<KEY>_old`
+/// earlier values VCO set aside. Key names only; empty when there is neither.
+pub(crate) fn env_strip_report_lines(
+    env_path: &Path,
+    outcome: &crate::services::vco_lib_bridge::EnvStripOutcome,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    if !outcome.left.is_empty() {
+        lines.push(format!(
+            "left in {} — your own lines, not VCO's, so the unregister kept them: {}",
+            env_path.display(),
+            outcome.left.join(", ")
+        ));
+    }
+    if !outcome.preserved.is_empty() {
+        lines.push(format!(
+            "kept in {} — your earlier values VCO set aside when it took over those keys: {}",
+            env_path.display(),
+            outcome.preserved.join(", ")
+        ));
+    }
+    lines
 }
 
 /// v0.2.97: remove the secret VALUES VCO can PROVE it wrote from every env
@@ -5100,8 +5008,7 @@ pub(crate) fn surgically_strip_env_surfaces_checked(
 /// `.claude/env` (a file can hold a key twice; only the proven line goes,
 /// review R3 F23), per key in the JSON env blocks (JSONC in place, refusal
 /// recorded). No Rust copy of the line grammar is used for this EVIDENCE
-/// strip (review R3 F24; the by-name canonical strippers above are a
-/// separate, documented mirror — see their "must match" notes). Must
+/// strip (review R3 F24). Must
 /// run BEFORE the unregister forgets the project's secret rows and deletes its
 /// DB row: the hub resolves the stored value only while the project is
 /// registered.
@@ -5397,8 +5304,8 @@ pub async fn delete_project_v2(
         let folder = Path::new(&row.folder_path);
         if folder.is_dir() {
             // 1a. Strip the launcher's env keys from all four env
-            //     surfaces: canonical routing keys by name, VCO's own
-            //     `.claude/env` managed block whole, and secret VALUES
+            //     surfaces: VCO's marked blocks whole, routing keys
+            //     elsewhere only where they hold VCO's value, and secret VALUES
             //     (user secrets of every bucket + GITHUB_TOKEN) ONLY where
             //     the value equals the launcher's stored one — anything
             //     else is left and listed in `report.warnings` (v0.2.97).
@@ -5413,7 +5320,7 @@ pub async fn delete_project_v2(
             //     here (review R4 F25, see `unregister_purge_folder`).
             unregister_purge_folder(
                 folder,
-                |f| surgically_strip_env_surfaces_checked(vco_root.as_deref(), f),
+                |f| surgically_strip_env_surfaces_checked(vco_root.as_deref(), f, Some(&id)),
                 &mut report,
                 opts.leave_unremovable,
                 &crate::paths::vct_root_dir(),
@@ -6616,17 +6523,10 @@ mod tests {
         // the spawn-failure branch is the one we want to assert on. A
         // direct std::process::Command spawn with an empty PATH gives us
         // the same NotFound error our command translates.
-        let saved = std::env::var_os("PATH");
-        // SAFETY: tests are single-threaded by default in this crate; if
-        // that ever changes, gate this with a Mutex or use std::process
-        // env directly per-call.
-        unsafe { std::env::set_var("PATH", ""); }
-        let res = std::process::Command::new("code").silent().arg(".").spawn();
-        if let Some(p) = saved {
-            unsafe { std::env::set_var("PATH", p); }
-        } else {
-            unsafe { std::env::remove_var("PATH"); }
-        }
+        // The child's OWN empty PATH — the lookup uses it — so the process
+        // PATH is never blanked (tests in this crate run in parallel; a
+        // process-wide blank PATH made concurrent spawns of `python3` fail).
+        let res = std::process::Command::new("code").silent().env("PATH", "").arg(".").spawn();
         let err = res.expect_err("expected NotFound when PATH is empty");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
@@ -7877,6 +7777,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn v0294_bundle_python_is_the_venv_not_a_bare_path_probe() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let root = std::env::temp_dir().join(format!(
@@ -8610,128 +8511,6 @@ mod tests {
         std::fs::remove_dir_all(&tmp).ok();
     }
 
-    // ─── PR-3 Commit 8: .claude/env BEGIN/END marker tests ─────────────
-    //
-    // `merge_claude_env_managed_block` stays live (the unregister strip
-    // splices the managed block out with it). The block it splices is now
-    // written by the Python projection, so these tests build one by hand in
-    // the same marker shape instead of calling the retired Rust builder.
-
-    fn managed_block(kg_collection: &str) -> String {
-        format!(
-            "{}\nexport KG_COLLECTION=\"{}\"\n{}\n",
-            CLAUDE_ENV_MANAGED_BEGIN, kg_collection, CLAUDE_ENV_MANAGED_END
-        )
-    }
-
-    #[test]
-    fn merge_claude_env_managed_block_no_prior_returns_managed_only() {
-        let managed = managed_block("Acme_KG");
-        let out = merge_claude_env_managed_block(None, &managed);
-        assert_eq!(out, managed);
-    }
-
-    #[test]
-    fn merge_claude_env_managed_block_replaces_in_place_preserving_user_lines() {
-        let user_pre = "# user-added note\nexport MY_TOKEN=\"abc\"\n\n";
-        let user_post = "\n# trailer\nexport ANOTHER=\"xyz\"\n";
-        let old_managed = format!(
-            "{}\nexport KG_COLLECTION=\"Old_KG\"\n{}\n",
-            CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END
-        );
-        let prior = format!("{}{}{}", user_pre, old_managed, user_post);
-
-        let new_managed = managed_block("New_KG");
-        let out = merge_claude_env_managed_block(Some(&prior), &new_managed);
-
-        // User content before + after the managed block must survive.
-        assert!(out.starts_with(user_pre), "user pre-block content lost");
-        assert!(out.ends_with(user_post), "user post-block content lost");
-        // Old managed value gone.
-        assert!(!out.contains("Old_KG"));
-        // New managed value present.
-        assert!(out.contains("New_KG"));
-        // Markers present (in-place replace, not duplicated).
-        assert_eq!(
-            out.matches(CLAUDE_ENV_MANAGED_BEGIN).count(),
-            1,
-            "managed BEGIN marker must appear exactly once"
-        );
-        assert_eq!(
-            out.matches(CLAUDE_ENV_MANAGED_END).count(),
-            1,
-            "managed END marker must appear exactly once"
-        );
-    }
-
-    #[test]
-    fn merge_claude_env_managed_block_legacy_file_appends_block() {
-        // Pre-PR-3 file (no markers). The full prior content is
-        // preserved and the managed block appends. On the next round-
-        // trip the markers exist and in-place replace activates.
-        let prior = "# legacy file written by old launcher\nexport KG_COLLECTION=\"Legacy_KG\"\n";
-        let new_managed = managed_block("New_KG");
-        let out = merge_claude_env_managed_block(Some(prior), &new_managed);
-        // Legacy content preserved verbatim.
-        assert!(out.starts_with(prior));
-        // Managed block appended.
-        assert!(out.contains(CLAUDE_ENV_MANAGED_BEGIN));
-        assert!(out.contains("New_KG"));
-    }
-
-    #[test]
-    fn merge_claude_env_managed_block_round_trip_idempotent() {
-        // Apply the merge twice with the same managed block — the file
-        // must converge (not grow on each call).
-        let new_managed = managed_block("Acme_KG");
-        let after_first = merge_claude_env_managed_block(None, &new_managed);
-        let after_second =
-            merge_claude_env_managed_block(Some(&after_first), &new_managed);
-        assert_eq!(
-            after_first, after_second,
-            "second merge with same managed block must be a no-op"
-        );
-    }
-
-    /// v0.2.97 — the Rust side of `tests/fixtures/managed_block_merge_parity.json`.
-    /// `merge_claude_env_managed_block` is the one deliberate mirror of the
-    /// Python writer's `config_projection._merge_managed_block` (the unregister
-    /// strip splices with it). The Python test
-    /// `tests/test_v0297_managed_block_merge_parity.py` pins the SAME cases to
-    /// the SAME expected bytes, so a change on either side fails one of them.
-    #[test]
-    fn managed_block_merge_matches_the_shared_parity_fixture() {
-        let repo_root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .and_then(|p| p.parent())
-            .expect("CARGO_MANIFEST_DIR must have two parents (repo layout)")
-            .to_path_buf();
-        let path = repo_root
-            .join("tests")
-            .join("fixtures")
-            .join("managed_block_merge_parity.json");
-        let raw = std::fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
-        let fixture: serde_json::Value = serde_json::from_str(&raw).expect("fixture parses");
-        assert_eq!(fixture["_format_version"], 1);
-        assert_eq!(fixture["begin_marker"], CLAUDE_ENV_MANAGED_BEGIN);
-        assert_eq!(fixture["end_marker"], CLAUDE_ENV_MANAGED_END);
-        let cases = fixture["cases"].as_array().expect("cases array");
-        assert!(cases.len() >= 10, "fixture has too few cases");
-        for case in cases {
-            let name = case["name"].as_str().unwrap_or("?");
-            let prior = case["prior"].as_str();
-            let managed = case["managed"].as_str().expect("managed is a string");
-            let expected = case["expected"].as_str().expect("expected is a string");
-            assert_eq!(
-                merge_claude_env_managed_block(prior, managed),
-                expected,
-                "case `{}` diverges from the Python writer",
-                name
-            );
-        }
-    }
-
     // ─── 2026-05-06 unregister keys / surgical purge ───────────────────
 
     /// Pin the canonical-key relationship: every key in the install
@@ -8807,37 +8586,171 @@ mod tests {
     // (The `.env` by-name strip tests moved with the strip to Python:
     // `tests/test_v0297_project_env_single_writer.py` — v0.2.97 review R5 F40.)
 
+    /// A project `.env` managed block as VCO writes it — the markers MUST
+    /// match `vco_lib/env_template.py` `ENV_TEMPLATE_BEGIN` / `_END`. Since
+    /// review R6 F47 the unregister removes only what VCO authored, so a
+    /// fixture that wants a key removed puts it where VCO puts it.
+    fn vco_env_block(body: &str) -> String {
+        format!(
+            "# >>> VCO-MANAGED ENV (do not edit between markers) >>>\n{body}# <<< VCO-MANAGED ENV <<<\n"
+        )
+    }
+
+    /// Review R6 F47 (leave-alone + report): a user's OWN assignment of a
+    /// managed key and the `<KEY>_old` values stay in `.env`, are named in the
+    /// unregister report, and are never counted among VCO's removed keys.
     #[test]
-    fn strip_canonical_keys_from_claude_env_text_handles_export_form() {
-        let input = "\
-# vco-managed-begin
-export KG_COLLECTION=\"SomeProject_KnowledgeGraph\"
-export PROJECT_NAME=\"SomeProject\"
-export VCT_ORCHESTRATOR_ROOT=\"/some/path\"
-export VCT_INFRASTRUCTURE_DIR=\"/some/path/infrastructure\"
-# vco-managed-end
-export USER_PROJECT_VAR=\"keep me\"
-# user comment
-";
-        let (out, removed) = strip_canonical_keys_from_claude_env_text(input);
+    fn unregister_leaves_and_reports_a_users_own_managed_key() {
+        let tmp = strip_test_folder("users-own");
+        std::fs::write(
+            tmp.join(".env"),
+            format!(
+                "{}PROJECT_NAME=Mine\nACTIVE_EMBEDDING_old=arctic\nUSER=1\n",
+                vco_env_block("KG_COLLECTION=X_KnowledgeGraph\nPROJECT_NAME=X\n")
+            ),
+        )
+        .unwrap();
 
-        assert!(!out.contains("export KG_COLLECTION="));
-        assert!(!out.contains("export PROJECT_NAME="));
-        assert!(!out.contains("VCT_ORCHESTRATOR_ROOT"));
-        assert!(!out.contains("VCT_INFRASTRUCTURE_DIR"));
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
 
-        // User exports + markers preserved.
-        assert!(out.contains("export USER_PROJECT_VAR=\"keep me\""));
-        assert!(out.contains("# vco-managed-begin"));
-        assert!(out.contains("# vco-managed-end"));
-        assert!(out.contains("# user comment"));
+        assert_eq!(
+            std::fs::read_to_string(tmp.join(".env")).unwrap(),
+            "PROJECT_NAME=Mine\nACTIVE_EMBEDDING_old=arctic\nUSER=1\n"
+        );
+        assert!(keys.contains(&"KG_COLLECTION".to_string()), "{:?} {:?}", keys, warnings);
+        assert!(
+            warnings.iter().any(|w| w.contains("your own lines, not VCO's") && w.ends_with(": PROJECT_NAME")),
+            "{:?}",
+            warnings
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("your earlier values") && w.ends_with(": ACTIVE_EMBEDDING_old")),
+            "{:?}",
+            warnings
+        );
+        std::fs::remove_dir_all(&tmp).ok();
+    }
 
-        let removed_set: std::collections::HashSet<String> =
-            removed.iter().cloned().collect();
-        assert!(removed_set.contains("KG_COLLECTION"));
-        assert!(removed_set.contains("PROJECT_NAME"));
-        assert!(removed_set.contains("VCT_ORCHESTRATOR_ROOT"));
-        assert!(removed_set.contains("VCT_INFRASTRUCTURE_DIR"));
+    /// Review R6 F46: `null`, `{}` and the settings page's default are the
+    /// SAME unregister (the strip runs, so the stop can fire from the project
+    /// list), and the escape re-run differs from them ONLY by
+    /// `leave_unremovable`.
+    #[test]
+    fn none_and_empty_object_are_the_same_options() {
+        let from_none: UnregisterOptions = None.unwrap_or_default();
+        let from_empty: UnregisterOptions = serde_json::from_str("{}").unwrap();
+        let settings_default: UnregisterOptions =
+            serde_json::from_str(r#"{"purgeLauncherFiles":true,"purgeCollections":false}"#).unwrap();
+        assert_eq!(from_none, from_empty);
+        assert_eq!(from_none, settings_default);
+        assert!(from_none.purge_launcher_files, "the default unregister runs the strip");
+        assert!(!from_none.purge_collections && !from_none.leave_unremovable);
+
+        let escape: UnregisterOptions = serde_json::from_str(
+            r#"{"purgeLauncherFiles":true,"purgeCollections":false,"leaveUnremovable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(UnregisterOptions { leave_unremovable: false, ..escape.clone() }, from_none);
+        assert!(escape.leave_unremovable);
+        let bare_escape: UnregisterOptions = serde_json::from_str(r#"{"leaveUnremovable":true}"#).unwrap();
+        assert_eq!(bare_escape, escape, "a missing field is the same default on every path");
+    }
+
+    /// A project registered in a scratch launcher DB (held by the guard) and
+    /// the routing values VCO projects for it — what the unregister strip
+    /// compares each surface's value with (review R6, the evidence rule).
+    fn registered_for_strip(
+        tag: &str,
+    ) -> (vct_launcher_core::test_env::StateDirGuard, String, std::path::PathBuf, serde_json::Value) {
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let folder = guard.path().join(tag);
+        std::fs::create_dir_all(folder.join(".claude")).unwrap();
+        std::fs::create_dir_all(folder.join(".vscode")).unwrap();
+        let db = Db::open().unwrap();
+        let id = uuid::Uuid::new_v4().to_string();
+        let slug = db.generate_unique_slug("Acme").unwrap();
+        db.insert_project(&id, "Acme", &folder.display().to_string(), ProjectHost::Base, &slug)
+            .unwrap();
+        drop(db);
+        let projected = crate::services::vco_lib_bridge::test_projected_env(None, &id);
+        (guard, id, folder, projected)
+    }
+
+    /// Review R6 (the evidence rule), per surface: a routing key holding the
+    /// value VCO projects goes; one holding anything else is the user's —
+    /// left, and named in the unregister result. VCO's `.claude/env` block
+    /// goes whole; a `# KEY=` comment outside it stays.
+    #[test]
+    fn unregister_strip_takes_only_vcos_routing_values() {
+        let (_guard, id, folder, projected) = registered_for_strip("evidence");
+        let kg = projected["KG_COLLECTION"].as_str().unwrap().to_string();
+        std::fs::write(
+            folder.join(".claude/env"),
+            format!(
+                "export KG_COLLECTION=\"{kg}\"\nexport PROJECT_NAME=\"Mine\"\n# DEVELOPMENT_COLLECTION=x\n\
+                 # vco-managed-begin\nexport KG_COLLECTION=\"{kg}\"\n# vco-managed-end\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join(".claude/settings.json"),
+            serde_json::json!({"env": {"KG_COLLECTION": "Mine_KG", "USER": "1"}}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            folder.join(".vscode/settings.json"),
+            serde_json::json!({"claude-code.env": {"KG_COLLECTION": kg}}).to_string(),
+        )
+        .unwrap();
+
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &folder, Some(&id));
+
+        assert_eq!(
+            std::fs::read_to_string(folder.join(".claude/env")).unwrap(),
+            "export PROJECT_NAME=\"Mine\"\n# DEVELOPMENT_COLLECTION=x\n"
+        );
+        let settings: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join(".claude/settings.json")).unwrap()).unwrap();
+        assert_eq!(settings["env"]["KG_COLLECTION"], "Mine_KG", "the user's value stays");
+        let vscode = std::fs::read_to_string(folder.join(".vscode/settings.json")).unwrap();
+        assert!(!vscode.contains("KG_COLLECTION"), "VCO's value goes: {}", vscode);
+        assert!(keys.contains(&"KG_COLLECTION".to_string()), "{:?}", keys);
+        assert!(
+            warnings.iter().any(|w| w.starts_with("left in .claude/env") && w.ends_with(": PROJECT_NAME")),
+            "{:?}",
+            warnings
+        );
+        assert!(
+            warnings.iter().any(|w| w.starts_with("left in .claude/settings.json") && w.ends_with(": KG_COLLECTION")),
+            "{:?}",
+            warnings
+        );
+    }
+
+    /// Leave-alone without evidence: with no project to compute VCO's values
+    /// for, only VCO's `.claude/env` block (proven by its markers) goes; every
+    /// routing key elsewhere stays and the result says why.
+    #[test]
+    fn unregister_strip_without_a_projection_removes_only_the_marked_block() {
+        let tmp = strip_test_folder("noproj");
+        std::fs::write(
+            tmp.join(".claude/env"),
+            "# vco-managed-begin\nexport KG_COLLECTION=\"X\"\n# vco-managed-end\nexport PROJECT_NAME=\"X\"\n",
+        )
+        .unwrap();
+        let settings = r#"{"env":{"KG_COLLECTION":"X"}}"#;
+        std::fs::write(tmp.join(".claude/settings.json"), settings).unwrap();
+
+        let (_keys, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
+
+        assert_eq!(std::fs::read_to_string(tmp.join(".claude/env")).unwrap(), "export PROJECT_NAME=\"X\"\n");
+        assert_eq!(std::fs::read_to_string(tmp.join(".claude/settings.json")).unwrap(), settings);
+        assert!(
+            warnings.iter().any(|w| w.contains("could not work out the values VCO writes")),
+            "{:?}",
+            warnings
+        );
+        std::fs::remove_dir_all(&tmp).ok();
     }
 
     fn strip_test_folder(tag: &str) -> std::path::PathBuf {
@@ -8858,15 +8771,16 @@ export USER_PROJECT_VAR=\"keep me\"
     /// key names survived the unregister.
     #[test]
     fn unregister_strip_edits_a_jsonc_vscode_settings_in_place() {
-        let tmp = strip_test_folder("jsonc");
+        let (_guard, id, tmp, projected) = registered_for_strip("jsonc");
+        let kg = projected["KG_COLLECTION"].as_str().unwrap();
         let vscode = tmp.join(".vscode/settings.json");
         std::fs::write(
             &vscode,
-            "{\n    // the team's settings\n    \"editor.formatOnSave\": true,\n    \"claude-code.env\": {\n        \"KG_COLLECTION\": \"P_KnowledgeGraph\",\n        \"USER_KEY\": \"mine\", // keep\n    },\n}\n",
+            format!("{{\n    // the team's settings\n    \"editor.formatOnSave\": true,\n    \"claude-code.env\": {{\n        \"KG_COLLECTION\": \"{kg}\",\n        \"USER_KEY\": \"mine\", // keep\n    }},\n}}\n"),
         )
         .unwrap();
 
-        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp, Some(&id));
 
         assert!(warnings.is_empty(), "warnings: {:?}", warnings);
         assert_eq!(keys, vec!["KG_COLLECTION".to_string()]);
@@ -8885,7 +8799,7 @@ export USER_PROJECT_VAR=\"keep me\"
         let original = "{\"hooks\":{\"Stop\":[]},\"permissions\":{\"allow\":[]}}";
         std::fs::write(&settings, original).unwrap();
 
-        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
 
         assert!(keys.is_empty() && warnings.is_empty(), "{:?} {:?}", keys, warnings);
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
@@ -8903,7 +8817,7 @@ export USER_PROJECT_VAR=\"keep me\"
         let original = "{\"env\": {\"KG_COLLECTION\": \"x\"},, }";
         std::fs::write(&settings, original).unwrap();
 
-        let (_keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (_keys, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
 
         assert_eq!(std::fs::read_to_string(&settings).unwrap(), original);
         assert!(
@@ -8923,10 +8837,8 @@ export USER_PROJECT_VAR=\"keep me\"
     /// `UNREGISTER_PURGE_PATHS` and preserves the user-content allowlist.
     #[test]
     fn unregister_default_purges_hooks_scripts_compose_keeps_agents_skills() {
-        let tmp = std::env::temp_dir().join(format!(
-            "vct-unreg-default-{}", uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&tmp).unwrap();
+        let (_guard, id, tmp, projected) = registered_for_strip("default");
+        let kg = projected["KG_COLLECTION"].as_str().unwrap().to_string();
 
         // Populate launcher-managed paths (must be removed).
         std::fs::create_dir_all(tmp.join(".claude/hooks/_lib")).unwrap();
@@ -8958,15 +8870,16 @@ export USER_PROJECT_VAR=\"keep me\"
         std::fs::write(tmp.join("main.py"), "print('hi')").unwrap();
         // .claude/settings.json with mixed canonical + user env keys.
         std::fs::write(tmp.join(".claude/settings.json"),
-            r#"{"env":{"KG_COLLECTION":"X_KnowledgeGraph","USER_VAR":"keep"},"hooks":{}}"#
+            serde_json::json!({"env": {"KG_COLLECTION": kg, "USER_VAR": "keep"}, "hooks": {}}).to_string()
         ).unwrap();
-        // .env with mixed canonical + user keys.
-        std::fs::write(tmp.join(".env"),
-            "KG_COLLECTION=X_KnowledgeGraph\nUSER_API_KEY=secret\nPROJECT_NAME=X\n"
-        ).unwrap();
+        // .env with VCO's block + a user key.
+        std::fs::write(tmp.join(".env"), format!(
+            "{}USER_API_KEY=secret\n",
+            vco_env_block("KG_COLLECTION=X_KnowledgeGraph\nPROJECT_NAME=X\n")
+        )).unwrap();
 
         // Run both purges (separately — drives identical to delete_project_v2).
-        let (keys_purged, env_warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys_purged, env_warnings) = surgically_strip_env_surfaces(None, &tmp, Some(&id));
         let (files_purged, file_warnings) = purge_launcher_files_from_project(&tmp);
 
         // No warnings on a clean folder.
@@ -9068,7 +8981,7 @@ export MY_HELPER_TOKEN=\"keep-me\"
         std::fs::write(tmp.join(".claude/env"), original).unwrap();
 
         // Run the unregister env-strip path.
-        let (keys_purged, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys_purged, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
         assert!(warnings.is_empty(), "warnings: {:?}", warnings);
         // Canonical keys reported as removed (they were inside the block,
         // and the block excision is what carries them off — strip_canonical
@@ -9158,32 +9071,35 @@ export MY_HELPER_TOKEN=\"keep-me\"
         // like every other canonical key. Tests that pin the survives
         // byte-for-byte semantics use MY_GITHUB_TOKEN (NOT in
         // CANONICAL_INSTALL_ENV_KEYS) for a clean separation.
-        let env_text = "\
-# vibecoded-orchestrator per-project .env
-KG_COLLECTION=MyProj_KnowledgeGraph
-DEVELOPMENT_COLLECTION=MyProj_Development
-SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph
-PROJECT_NAME=MyProj
-ACTIVE_EMBEDDING=qwen3
-WEAVIATE_URL=http://localhost:8081
-WEAVIATE_PORT=8081
-OLLAMA_URL=http://localhost:11435
-OLLAMA_PORT=11435
-CODE_EMBED_URL=http://localhost:11440
-CODE_EMBED_PORT=11440
-SHARED_KG_WRITE_DISABLED=false
-SHARED_KG_OPT_OUT=false
-
-# === user secrets ===
-ANTHROPIC_API_KEY=sk-ant-real-token-here
-OPENAI_API_KEY=sk-real-openai-token
-MY_GITHUB_TOKEN=ghp_real_pat
-USER_INTERNAL_HOST=internal.example.com
-USER_DB_URL=postgres://user:pass@db/app
-";
+        // The canonical keys sit in VCO's managed block (review R6 F47: the
+        // unregister removes what VCO authored, never a user's own line).
+        let env_text = format!("# vibecoded-orchestrator per-project .env\n{}\
+\n\
+# === user secrets ===\n\
+ANTHROPIC_API_KEY=sk-ant-real-token-here\n\
+OPENAI_API_KEY=sk-real-openai-token\n\
+MY_GITHUB_TOKEN=ghp_real_pat\n\
+USER_INTERNAL_HOST=internal.example.com\n\
+USER_DB_URL=postgres://user:pass@db/app\n",
+            vco_env_block("\
+KG_COLLECTION=MyProj_KnowledgeGraph\n\
+DEVELOPMENT_COLLECTION=MyProj_Development\n\
+SHARED_KG_COLLECTION=VibeCodedOrchestrator_KnowledgeGraph\n\
+PROJECT_NAME=MyProj\n\
+ACTIVE_EMBEDDING=qwen3\n\
+WEAVIATE_URL=http://localhost:8081\n\
+WEAVIATE_PORT=8081\n\
+OLLAMA_URL=http://localhost:11435\n\
+OLLAMA_PORT=11435\n\
+CODE_EMBED_URL=http://localhost:11440\n\
+CODE_EMBED_PORT=11440\n\
+SHARED_KG_WRITE_DISABLED=false\n\
+SHARED_KG_OPT_OUT=false\n"),
+        );
+        let env_text = env_text.as_str();
         std::fs::write(tmp.join(".env"), env_text).unwrap();
 
-        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp, None);
         assert!(warnings.is_empty());
 
         let after = std::fs::read_to_string(tmp.join(".env")).unwrap();
@@ -9243,17 +9159,17 @@ USER_DB_URL=postgres://user:pass@db/app
         std::fs::create_dir_all(tmp.join(".claude/hooks")).unwrap();
         std::fs::write(tmp.join(".claude/hooks/x.sh"), "echo").unwrap();
         std::fs::write(tmp.join(".env"),
-            "KG_COLLECTION=X_KnowledgeGraph\nUSER_KEY=keep\n").unwrap();
+            format!("{}USER_KEY=keep\n", vco_env_block("KG_COLLECTION=X_KnowledgeGraph\n"))).unwrap();
 
         // First run: should remove.
-        let (keys1, w1a) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys1, w1a) = surgically_strip_env_surfaces(None, &tmp, None);
         let (files1, w1b) = purge_launcher_files_from_project(&tmp);
         assert!(w1a.is_empty() && w1b.is_empty());
         assert!(!keys1.is_empty());
         assert!(!files1.is_empty());
 
         // Second run: nothing left to remove.
-        let (keys2, w2a) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys2, w2a) = surgically_strip_env_surfaces(None, &tmp, None);
         let (files2, w2b) = purge_launcher_files_from_project(&tmp);
         assert!(w2a.is_empty(), "second-run env warnings: {:?}", w2a);
         assert!(w2b.is_empty(), "second-run file warnings: {:?}", w2b);
@@ -9323,7 +9239,7 @@ USER_DB_URL=postgres://user:pass@db/app
             "vct-unreg-missing-{}", uuid::Uuid::new_v4().simple()
         ));
         // Don't create it.
-        let (keys, w_env) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys, w_env) = surgically_strip_env_surfaces(None, &tmp, None);
         let (files, w_file) = purge_launcher_files_from_project(&tmp);
         assert!(keys.is_empty());
         assert!(files.is_empty());
@@ -9589,18 +9505,21 @@ USER_DB_URL=postgres://user:pass@db/app
 
     /// Fill every env surface with the same three kinds of key: a canonical
     /// routing key, a secret (`secret_key` = `canary`), and a by-hand key.
-    fn seed_all_surfaces(tmp: &std::path::Path, secret_key: &str, canary: &str) {
+    fn seed_all_surfaces(tmp: &std::path::Path, secret_key: &str, canary: &str, kg: &str) {
         std::fs::create_dir_all(tmp.join(".claude")).unwrap();
         std::fs::create_dir_all(tmp.join(".vscode")).unwrap();
         std::fs::write(
             tmp.join(".env"),
-            format!("KG_COLLECTION=Some_KnowledgeGraph\n{secret_key}={canary}\nBY_HAND_KEY=user_typed\n"),
+            format!(
+                "{}{secret_key}={canary}\nBY_HAND_KEY=user_typed\n",
+                vco_env_block(&format!("KG_COLLECTION={kg}\n"))
+            ),
         )
         .unwrap();
         std::fs::write(
             tmp.join(".claude/env"),
             format!(
-                "# vco-managed-begin\nexport KG_COLLECTION=\"Some_KnowledgeGraph\"\n# vco-managed-end\n\
+                "# vco-managed-begin\nexport KG_COLLECTION=\"{kg}\"\n# vco-managed-end\n\
                  export {secret_key}=\"{canary}\"\nexport BY_HAND_KEY=\"user_typed\"\n"
             ),
         )
@@ -9609,7 +9528,7 @@ USER_DB_URL=postgres://user:pass@db/app
             std::fs::write(
                 tmp.join(rel),
                 serde_json::to_string_pretty(&serde_json::json!({
-                    block: {"KG_COLLECTION": "Some_KnowledgeGraph", secret_key: canary, "BY_HAND_KEY": "user_typed"}
+                    block: {"KG_COLLECTION": kg, secret_key: canary, "BY_HAND_KEY": "user_typed"}
                 }))
                 .unwrap(),
             )
@@ -9647,17 +9566,18 @@ USER_DB_URL=postgres://user:pass@db/app
     /// (discard port), so there is no evidence at all.
     #[test]
     fn unregister_never_removes_a_user_typed_github_token_by_name() {
-        let tmp = strip_test_folder("ghtoken");
-        seed_all_surfaces(&tmp, "GITHUB_TOKEN", "ghp_the_user_typed_this");
+        let (_guard, id, tmp, projected) = registered_for_strip("ghtoken");
+        let kg = projected["KG_COLLECTION"].as_str().unwrap().to_string();
+        seed_all_surfaces(&tmp, "GITHUB_TOKEN", "ghp_the_user_typed_this", &kg);
 
-        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp);
+        let (keys, warnings) = surgically_strip_env_surfaces(None, &tmp, Some(&id));
 
         assert!(!keys.contains(&"GITHUB_TOKEN".to_string()), "{:?}", keys);
-        assert!(keys.contains(&"KG_COLLECTION".to_string()), "routing keys still go by name");
+        assert!(keys.contains(&"KG_COLLECTION".to_string()), "VCO's routing values still go");
         for rel in ALL_SURFACES {
             let text = std::fs::read_to_string(tmp.join(rel)).unwrap();
             assert!(text.contains("ghp_the_user_typed_this"), "{} lost the user's token: {}", rel, text);
-            assert!(!text.contains("Some_KnowledgeGraph"), "{} kept a routing key", rel);
+            assert!(!text.contains(&kg), "{} kept a routing key", rel);
         }
         assert!(
             warnings.iter().any(|w| w.contains("left in place") && w.contains("GITHUB_TOKEN")),

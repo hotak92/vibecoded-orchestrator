@@ -18,6 +18,12 @@
 # `.claude/scripts/vct_secrets_resolve.sh` (hub → file store → the
 # project's .env) → the default. A value outside 50..2000 or not a number
 # falls back to the default.
+#
+# Cost (v0.2.97, review R6 F51): ONE resolver process for whichever of the
+# two settings the environment does not set (`resolve-many`), with its hub
+# time bounded by VCT_RESOLVE_MAX_TIME=1 — a hub port that accepts and then
+# hangs costs this session start at most ~1 s (it was up to 2 × 5 s), after
+# which the file store / .env / defaults answer, silently.
 
 set -euo pipefail
 
@@ -42,17 +48,33 @@ CONTEXT_FILE=".claude/CONTEXT_STATE.md"
 
 PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 
+# The settings the environment does not set, resolved in ONE resolver
+# spawn (see "Cost" above). Output: one KEY=VALUE line per resolved key.
+SETTING_KEYS="CONTEXT_STATE_MAX_LINES MEMORY_MAX_LINES"
+RESOLVED_SETTINGS=""
+unset_settings=""
+for setting_key in $SETTING_KEYS; do
+    [ -z "${!setting_key:-}" ] && unset_settings="$unset_settings $setting_key"
+done
+if [ -n "$unset_settings" ]; then
+    resolver="$(dirname "${BASH_SOURCE[0]}")/../scripts/vct_secrets_resolve.sh"
+    if [ -f "$resolver" ]; then
+        # shellcheck disable=SC2086  # the key list splits on purpose
+        RESOLVED_SETTINGS=$(VCT_RESOLVE_MAX_TIME=1 bash "$resolver" resolve-many "$PROJECT_DIR" $unset_settings 2>/dev/null || true)
+    fi
+fi
+
 # resolve_threshold KEY DEFAULT — see "Configuration" above. MUST MATCH
 # Resolve-Threshold in context-size-check.ps1.
 resolve_threshold() {
-    local key="$1" default="$2" value=""
+    local key="$1" default="$2" value="" line
     value="${!key:-}"
     if [ -z "$value" ]; then
-        local resolver
-        resolver="$(dirname "${BASH_SOURCE[0]}")/../scripts/vct_secrets_resolve.sh"
-        if [ -f "$resolver" ]; then
-            value=$(bash "$resolver" "$PROJECT_DIR" "$key" 2>/dev/null || true)
-        fi
+        while IFS= read -r line; do
+            case "$line" in
+                "$key="*) value="${line#*=}"; break ;;
+            esac
+        done <<< "$RESOLVED_SETTINGS"
     fi
     case "$value" in
         ''|*[!0-9]*) value="$default" ;;

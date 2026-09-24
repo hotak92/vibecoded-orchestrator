@@ -22,7 +22,7 @@
 //! OS CSPRNG, persists it to `<vct_root_dir>/hub.token` (mode 0o600 on
 //! Unix), and requires `Authorization: Bearer <token>` on every
 //! request that touches state. Same-user processes that legitimately
-//! talk to the hub (the launcher GUI, the `vco` CLI, the resolver
+//! talk to the hub (the launcher GUI, the `vct-cli` CLI, the resolver
 //! helper used by bundled MCP wrappers) read the token file fresh and
 //! authenticate transparently. Processes that DON'T have read access
 //! to `hub.token` (different user — different home dir, different
@@ -89,9 +89,8 @@
 //!   boundary. (A LAN attacker who can ALSO read `<vct_root_dir>/hub.token`
 //!   off this host is already the same-user-RCE case above.)
 
-use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use axum::{
     body::Body,
@@ -319,65 +318,43 @@ pub(crate) fn per_project_token_route(path: &str) -> Option<&str> {
     }
 }
 
-/// Whether the (now opt-IN) compat window accepts the global `hub.token`
-/// on the per-project `/env` + `/config` routes.
+/// v0.2.97 (owner ruling 2026-09-24): the `VCT_HUB_LEGACY_GLOBAL_ENV`
+/// opt-in escape hatch was REMOVED. From v0.2.77 to v0.2.96 it re-opened
+/// the legacy global-token path on the per-project `/env` + `/config`
+/// routes for bespoke callers; every bundled resolver has preferred the
+/// project-scoped `hub.token.<project_id>` since v0.2.76 (Part 4 Task 3)
+/// and the hub lazy-mints a scoped token for a project added mid-session
+/// (Part 8 Task 4a), so no bundled consumer needed it. A global
+/// `hub.token` on these routes is now ALWAYS refused.
 ///
-/// ─── DEFAULT FLIPPED (v0.2.77 Part 8) ───────────────────────────────
-/// Introduced in v0.2.76 Part 4 as DEFAULT-allow (a one-release compat
-/// window). As of v0.2.77 the default is FLIPPED to DENY: an UNSET or
-/// unrecognised `VCT_HUB_LEGACY_GLOBAL_ENV` now REFUSES the global token
-/// on these two routes. The per-project scoped token
-/// (`hub.token.<project_id>`) is required — the bundled resolver triplet
-/// already prefers it (v0.2.76 Part 4 Task 3), the hub lazy-mints a
-/// scoped token for projects added mid-session (Part 8 Task 4a), and the
-/// auth layer canonicalizes id-or-slug before comparing (Part 8 Task 4d).
-///
-/// Operator escape hatch: set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true` /
-/// `TRUE` / `yes`) on the HUB process to REOPEN the compat window for one
-/// more release while migrating a bespoke caller. Scoped tokens are
-/// automatic on the next hub restart, so most installs need nothing.
-///
-/// Recognised ALLOW values: exactly `"1"`, `"true"`, `"TRUE"`, `"yes"`
-/// (same terse set + case convention as the bind env `VCT_HUB_BIND_ALL`).
-/// EVERY other value — including unset, `"0"`, `"false"`, `"no"`, or any
-/// typo — DENIES (fail-closed: an unrecognised value must not silently
-/// re-open a security boundary).
-fn legacy_global_env_allowed() -> bool {
-    matches!(
-        std::env::var("VCT_HUB_LEGACY_GLOBAL_ENV").ok().as_deref(),
-        Some("1") | Some("true") | Some("TRUE") | Some("yes")
-    )
+/// A hub started with the variable still set must never silently accept
+/// or silently ignore it: [`warn_removed_legacy_global_env`] logs ONE
+/// clear line at startup saying it was removed in v0.2.97 and what to
+/// use instead.
+fn legacy_global_env_is_set() -> bool {
+    std::env::var("VCT_HUB_LEGACY_GLOBAL_ENV")
+        .ok()
+        .is_some_and(|v| !v.trim().is_empty())
 }
 
-/// Process-lifetime dedup set for the "global token used on a per-project
-/// route" deprecation log. Keyed by project_id so a resolver hammering
-/// ONE project's `/env` in a loop logs once, not per request — but a
-/// genuinely different project still surfaces its own line. Granularity
-/// is "caller-ish" (per project) rather than per-request, per the brief.
-static LEGACY_GLOBAL_ENV_WARNED: Mutex<Option<HashSet<String>>> = Mutex::new(None);
+/// The ONE startup line a hub prints when `VCT_HUB_LEGACY_GLOBAL_ENV` is
+/// still set (removed v0.2.97). Kept as a const so the removal-notice
+/// test can pin the text without capturing `tracing`.
+fn removed_legacy_global_env_notice() -> &'static str {
+    "[vct-hub] VCT_HUB_LEGACY_GLOBAL_ENV is set but was REMOVED in v0.2.97: \
+         the global hub.token is now ALWAYS refused on the per-project \
+         /env + /config routes and nothing reads this variable. Present the \
+         project-scoped token (<vct_root_dir>/hub.token.<project_id>) \
+         instead — the bundled resolvers already do, and the hub mints a \
+         scoped token for a project added while it is running. Unset the \
+         variable."
+}
 
-/// Emit the deprecation line for `project_id` at most once per process.
-fn warn_legacy_global_env_once(project_id: &str) {
-    let mut guard = match LEGACY_GLOBAL_ENV_WARNED.lock() {
-        Ok(g) => g,
-        Err(p) => p.into_inner(),
-    };
-    let seen = guard.get_or_insert_with(HashSet::new);
-    if !seen.insert(project_id.to_string()) {
-        return; // already warned for this project this process.
+/// Log the removal notice exactly once per process, at hub startup.
+pub(crate) fn warn_removed_legacy_global_env() {
+    if legacy_global_env_is_set() {
+        tracing::warn!("{}", removed_legacy_global_env_notice());
     }
-    tracing::warn!(
-        project_id,
-        "[vct-hub] DEPRECATION: the global hub.token was used to read \
-         /projects/{}/env or /config, accepted ONLY because you set \
-         VCT_HUB_LEGACY_GLOBAL_ENV=1 to re-open the compat window (the \
-         default is now DENY as of v0.2.77). This coarse credential grants \
-         every project's env + config; migrate to the per-project token \
-         (hub.token.{}) — the bundled resolvers already prefer it and the \
-         hub mints one per project — then UNSET the flag. This escape \
-         hatch will be removed in a future release.",
-        project_id, project_id
-    );
 }
 
 /// Outcome of evaluating a bearer against the per-project + global
@@ -386,9 +363,6 @@ fn warn_legacy_global_env_once(project_id: &str) {
 enum ProjectRouteAuth {
     /// Bearer matched THIS project's per-project token — allow, no log.
     ProjectToken,
-    /// Bearer matched the global token — allow (compat window) unless
-    /// the legacy flag is off; caller logs the deprecation line once.
-    GlobalTokenCompat,
     /// Bearer matched a DIFFERENT project's per-project token than the URL
     /// segment names — a candidate hard 403. Carries the owner id so the
     /// caller can, as a fallback, canonicalize the URL segment (which may
@@ -398,8 +372,9 @@ enum ProjectRouteAuth {
     WrongProject { owner: String },
     /// Bearer matched nothing — 401.
     NoMatch,
-    /// Legacy global-token path disabled by `VCT_HUB_LEGACY_GLOBAL_ENV=0`
-    /// AND the bearer is the global token — 403 with a migration message.
+    /// Bearer is the global token — ALWAYS 403 on these routes since
+    /// v0.2.97 removed the opt-in compat window (the middleware still
+    /// runs the lazy-mint rescue before answering).
     GlobalTokenRefused,
 }
 
@@ -409,8 +384,9 @@ enum ProjectRouteAuth {
 ///   1. per-project token for THIS project → allow;
 ///   2. per-project token for ANOTHER project → hard 403 (wrong project
 ///      — a scoped credential must never cross the project boundary);
-///   3. global token → allow this release (compat) unless the legacy
-///      flag is off, in which case 403 with a migration message;
+///   3. global token → ALWAYS 403 since v0.2.97 removed the opt-in
+///      compat window (`VCT_HUB_LEGACY_GLOBAL_ENV`); the middleware
+///      still runs the lazy-mint rescue before answering;
 ///   4. anything else → 401.
 ///
 /// Constant-time comparisons throughout (the registry reverse-lookup and
@@ -436,11 +412,11 @@ fn evaluate_project_route_auth(
         // hot path with no DB round-trip.
         return ProjectRouteAuth::WrongProject { owner };
     }
-    // 3: global token?
+    // 3: global token? Refused, ALWAYS — v0.2.97 removed the opt-in
+    // compat window. `require_auth` still runs the lazy-mint rescue on
+    // this arm, so a first-ever request from a resolver that rode the
+    // global token mints the scoped token and proceeds.
     if constant_time_eq(bearer.as_bytes(), global_token.as_bytes()) {
-        if legacy_global_env_allowed() {
-            return ProjectRouteAuth::GlobalTokenCompat;
-        }
         return ProjectRouteAuth::GlobalTokenRefused;
     }
     // 4: matches nothing.
@@ -554,10 +530,11 @@ fn forbidden_response(message: &str) -> Response {
 /// the preflight DO get gated.
 ///
 /// v0.2.76 Part 4 — the per-project `/env` + `/config` routes accept
-/// EITHER the matching per-project token (`hub.token.<id>`) OR the global
-/// `hub.token` (one-release compat window). A token minted for a
-/// different project is a hard 403. All OTHER `/api/v1/*` routes stay on
-/// the global token exactly as before.
+/// ONLY the matching per-project token (`hub.token.<id>`); the global
+/// `hub.token` is refused there (the v0.2.76-v0.2.77 one-release compat
+/// window and its `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in were removed in
+/// v0.2.97). A token minted for a different project is a hard 403. All
+/// OTHER `/api/v1/*` routes stay on the global token exactly as before.
 pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
     // OPTIONS = CORS preflight. Always allow; the CORS layer above
     // will produce the right response with no body.
@@ -589,9 +566,9 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
         }
     };
 
-    // v0.2.76 Part 4 — per-project `/env` + `/config` routes accept the
-    // matching per-project token OR the global token (compat window). A
-    // token minted for a DIFFERENT project is a hard 403.
+    // v0.2.76 Part 4 (v0.2.97: compat window removed) — per-project
+    // `/env` + `/config` routes accept ONLY the matching per-project
+    // token. A token minted for a DIFFERENT project is a hard 403.
     if let Some(url_project_id) = per_project_token_route(path) {
         // The registry is injected by server.rs. If it's missing (a
         // wiring bug, or a test harness that only installs AuthState),
@@ -612,10 +589,6 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
             &registry,
         ) {
             ProjectRouteAuth::ProjectToken => return next.run(req).await,
-            ProjectRouteAuth::GlobalTokenCompat => {
-                warn_legacy_global_env_once(url_project_id);
-                return next.run(req).await;
-            }
             ProjectRouteAuth::WrongProject { owner } => {
                 // v0.2.77 Part 8 Task 4d — slug canonicalization. The
                 // direct id compare in evaluate_project_route_auth failed,
@@ -648,12 +621,11 @@ pub async fn require_auth(req: Request<Body>, next: Next) -> Response {
                     return next.run(req).await;
                 }
                 return forbidden_response(
-                    "the global hub.token is refused by default as of v0.2.77 on \
-                     /env + /config; present the per-project token \
-                     (hub.token.<project_id>) — the bundled resolvers already \
-                     prefer it, and the hub lazy-mints one for a mid-session \
-                     project — or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to \
-                     reopen the one-release compat window",
+                    "the global hub.token is refused on /env + /config \
+                     (unconditionally since v0.2.97); present the per-project \
+                     token (hub.token.<project_id>) — the bundled resolvers \
+                     already prefer it, and the hub lazy-mints one for a \
+                     mid-session project",
                 );
             }
             ProjectRouteAuth::NoMatch => return unauthorized_response(),
@@ -707,7 +679,7 @@ mod tests {
     // now the shared workspace helpers — the local copy unset
     // `VCT_STATE_DIR` on exit instead of restoring it, and its mutex
     // only excluded other tests in THIS file.
-    use vct_launcher_core::test_env::{state_dir_guard, with_state_dir};
+    use vct_launcher_core::test_env::{state_dir_guard_with, with_state_dir};
 
     // ─── Token generation ────────────────────────────────────────────
 
@@ -1172,8 +1144,9 @@ mod tests {
             evaluate_project_route_auth("proj-a", "token-b", global, &reg),
             ProjectRouteAuth::WrongProject { owner: "proj-b".to_string() }
         );
-        // (Global-token posture is flag-driven — asserted explicitly at
-        // the end of this test under a held flag guard, both directions.)
+        // (Global-token posture: ALWAYS refused since v0.2.97 removed the
+        // opt-in — asserted explicitly at the end of this test under a
+        // held flag guard.)
         // Garbage → 401.
         assert!(matches!(
             evaluate_project_route_auth("proj-a", "nonsense", global, &reg),
@@ -1188,19 +1161,18 @@ mod tests {
             ProjectRouteAuth::WrongProject { owner: "proj-a".to_string() }
         );
 
-        // Global-token posture is flag-driven — assert BOTH explicitly
-        // (v0.2.77 flip: default is now DENY, so we pin each side under a
-        // held flag guard rather than riding an implicit default).
+        // Global-token posture — ALWAYS refused; even the OLD opt-in
+        // value must not resurrect the compat path (v0.2.97 removal).
         {
-            let g = LegacyFlagGuard::cleared(); // unset → default DENY.
+            let g = LegacyFlagGuard::cleared(); // unset → refused.
             assert!(matches!(
                 evaluate_project_route_auth("proj-a", global, global, &reg),
                 ProjectRouteAuth::GlobalTokenRefused
             ));
-            g.reset("1"); // explicit opt-in → compat allow.
+            g.reset("1"); // the old opt-in value — dead since v0.2.97.
             assert!(matches!(
                 evaluate_project_route_auth("proj-a", global, global, &reg),
-                ProjectRouteAuth::GlobalTokenCompat
+                ProjectRouteAuth::GlobalTokenRefused
             ));
         }
     }
@@ -1262,10 +1234,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn env_route_accepts_global_token_compat_window() {
-        // v0.2.77 flip: the compat window is now OPT-IN — the operator
-        // must set VCT_HUB_LEGACY_GLOBAL_ENV=1 explicitly. This test pins
-        // that the escape hatch still WORKS when re-opened.
+    async fn env_route_refuses_global_token_even_with_legacy_flag_set() {
+        // v0.2.97: VCT_HUB_LEGACY_GLOBAL_ENV was REMOVED. Setting it must
+        // change NOTHING — the global token stays refused on /env, and
+        // the 403 body must point at the scoped-token remediation (it no
+        // longer names the dead variable). This is the removal's pin.
         let _g = LegacyFlagGuard::set("1");
         let base = spawn_router(router_with_project_tokens(
             "global-tok",
@@ -1273,22 +1246,38 @@ mod tests {
         ))
         .await;
         let client = reqwest::Client::new();
-        // With the flag opted back in, the global token works on /env.
         let resp = client
             .get(format!("{}/api/v1/projects/proj-a/env", base))
             .header("Authorization", "Bearer global-tok")
             .send()
             .await
             .expect("hub reachable");
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "flag set → global token STILL refused (v0.2.97 removal)"
+        );
+        let body = resp.text().await.unwrap();
+        assert!(
+            !body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"),
+            "403 body must not advertise the removed variable; got: {}",
+            body
+        );
+        // The scoped token still authorizes with the variable set.
+        let resp2 = client
+            .get(format!("{}/api/v1/projects/proj-a/env", base))
+            .header("Authorization", "Bearer tok-a")
+            .send()
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp2.status(), StatusCode::OK);
     }
 
-    /// v0.2.77 flip: the DEFAULT-path test. With NO flag set (the new
-    /// default), the global token is REFUSED on /env with a 403 — this is
-    /// now the out-of-the-box posture, not an opt-in. Formerly
-    /// `env_route_refuses_global_token_when_flag_off` covered this only
-    /// under an explicit VCT_HUB_LEGACY_GLOBAL_ENV=0; that test remains
-    /// (belt + suspenders), but THIS one pins the unset-default behaviour.
+    /// v0.2.77 flip → v0.2.97 removal: with NO flag set (the out-of-the-box
+    /// posture), the global token is REFUSED on /env with a 403.
+    /// `env_route_refuses_global_token_when_legacy_flag_set` pins the same
+    /// refusal under the dead variable's old opt-in value (belt +
+    /// suspenders); THIS one pins the unset-variable behaviour.
     #[tokio::test]
     async fn env_route_refuses_global_token_by_default_post_flip() {
         let _g = LegacyFlagGuard::cleared(); // unset → default DENY.
@@ -1310,7 +1299,11 @@ mod tests {
             "unset flag → global token refused (v0.2.77 flipped default)"
         );
         let body = resp.text().await.unwrap();
-        assert!(body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"), "body: {}", body);
+        assert!(
+            body.contains("hub.token.<project_id>"),
+            "403 body should name the scoped-token remediation; got: {}",
+            body
+        );
         // The scoped token STILL authorizes under the default.
         let resp2 = client
             .get(format!("{}/api/v1/projects/proj-a/env", base))
@@ -1365,116 +1358,113 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
     }
 
-    // ─── VCT_HUB_LEGACY_GLOBAL_ENV flag (DEFAULT FLIPPED v0.2.77) ─────
+    // ─── VCT_HUB_LEGACY_GLOBAL_ENV (REMOVED v0.2.97) ──────────────────
     //
-    // Introduced v0.2.76 Part 4 as DEFAULT-allow (one-release compat).
-    // As of v0.2.77 Part 8 the DEFAULT is DENY: unset/unrecognised
-    // refuses the global token on /env + /config; only "1"/"true"/
-    // "TRUE"/"yes" re-open the window. These tests pin the flipped
-    // semantics — compat tests now set "1" EXPLICITLY (they no longer
-    // ride an implicit default-allow). The env var is process-global;
+    // Introduced v0.2.76 Part 4 as DEFAULT-allow (one-release compat),
+    // flipped to opt-in DENY in v0.2.77 Part 8, REMOVED in v0.2.97
+    // (owner ruling 2026-09-24): every bundled resolver prefers the
+    // project-scoped token and the hub lazy-mints one for mid-session
+    // projects, so nothing needed the hatch. The tests below pin the
+    // removal: the variable changes NOTHING, and a hub started with it
+    // still set logs ONE removal notice. The env var is process-global;
     // cargo runs vct-hub tests with RUST_TEST_THREADS=1 (serialised — see
     // .cargo/config.toml), so each test sets + restores it without racing
     // siblings.
 
-    /// Serialise the env-mutating flag tests among themselves (belt +
-    /// suspenders on top of the workspace-wide single-thread setting).
-    static LEGACY_FLAG_SERIALIZE: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// RAII guard: acquires the serialise lock ONCE for its lifetime and
-    /// ALWAYS removes `VCT_HUB_LEGACY_GLOBAL_ENV` on drop (even on a
-    /// panicking assert), so a failed flag test never leaks a "deny"
+    /// RAII guard: holds THE env lock (`test_env::env_lock`) ONCE for its
+    /// lifetime and ALWAYS removes `VCT_HUB_LEGACY_GLOBAL_ENV` on drop (even
+    /// on a panicking assert), so a failed flag test never leaks a "deny"
     /// value into a later compat test. The mutex is NOT reentrant, so the
     /// guard holds it for the whole test and mutations go through
-    /// `set` / `clear` WITHOUT re-locking. Mirrors the `with_state_dir`
-    /// discipline in this module.
+    /// `reset` / `reclear` WITHOUT re-locking — and a test that also needs a
+    /// scratch state dir takes `state_dir_guard_with` with the flag instead
+    /// of this guard. v0.2.97 review R6: this used to be a module-private
+    /// mutex, which ordered only this module's tests.
     struct LegacyFlagGuard {
-        _lock: std::sync::MutexGuard<'static, ()>,
+        lock: vct_launcher_core::test_env::EnvLock,
     }
     impl LegacyFlagGuard {
         /// Acquire the lock and set the flag to `value`.
         fn set(value: &str) -> Self {
-            let lock = LEGACY_FLAG_SERIALIZE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            // Safety: serialised by the held lock + RUST_TEST_THREADS=1.
-            unsafe {
-                std::env::set_var("VCT_HUB_LEGACY_GLOBAL_ENV", value);
-            }
-            Self { _lock: lock }
+            let guard = Self { lock: vct_launcher_core::test_env::env_lock() };
+            guard.reset(value);
+            guard
         }
         /// Acquire the lock with the flag cleared.
         fn cleared() -> Self {
-            let lock = LEGACY_FLAG_SERIALIZE
-                .lock()
-                .unwrap_or_else(|p| p.into_inner());
-            unsafe {
-                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
-            }
-            Self { _lock: lock }
+            let guard = Self { lock: vct_launcher_core::test_env::env_lock() };
+            guard.reclear();
+            guard
         }
         /// Mutate the flag WITHOUT re-acquiring the lock (this guard
-        /// already holds it — the mutex is not reentrant). Used to sweep
-        /// multiple values inside one test body.
+        /// already holds it). Used to sweep multiple values inside one test.
         fn reset(&self, value: &str) {
-            unsafe {
-                std::env::set_var("VCT_HUB_LEGACY_GLOBAL_ENV", value);
-            }
+            flag_set(&self.lock, Some(value));
         }
         fn reclear(&self) {
-            unsafe {
-                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
+            flag_set(&self.lock, None);
+        }
+    }
+
+    /// The one write of the flag — its caller proves it holds the env lock.
+    fn flag_set(_held: &vct_launcher_core::test_env::EnvLock, value: Option<&str>) {
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("VCT_HUB_LEGACY_GLOBAL_ENV", v),
+                None => std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV"),
             }
         }
     }
     impl Drop for LegacyFlagGuard {
         fn drop(&mut self) {
-            unsafe {
-                std::env::remove_var("VCT_HUB_LEGACY_GLOBAL_ENV");
-            }
+            flag_set(&self.lock, None);
         }
     }
 
     #[test]
-    fn legacy_global_env_allowed_default_and_allow_values() {
-        // v0.2.77 Part 8 (flip): the DEFAULT is now DENY. Unset → deny;
-        // only the recognised truthy set allows; every other value —
-        // including "0"/"false"/"no" AND an unrecognised typo — denies
-        // (fail-closed). ONE guard holds the lock for the whole test.
+    fn legacy_global_env_is_set_predicate() {
+        // v0.2.97: the variable no longer GATES anything — the predicate
+        // only decides whether the one-line removal notice fires at
+        // startup. Any non-blank value (the old allow AND deny values
+        // alike) counts as "set"; unset is the only silent case.
         let g = LegacyFlagGuard::cleared();
-        assert!(
-            !legacy_global_env_allowed(),
-            "unset → DENY (v0.2.77 flipped default)"
-        );
-        // The ONLY values that re-open the compat window.
-        for allow in ["1", "true", "TRUE", "yes"] {
-            g.reset(allow);
-            assert!(legacy_global_env_allowed(), "{:?} → allow", allow);
-        }
-        // Explicit deny values AND anything unrecognised → deny.
-        for deny in ["0", "false", "no", "anything-else", "", "True", "YES"] {
-            g.reset(deny);
-            assert!(!legacy_global_env_allowed(), "{:?} → deny (fail-closed)", deny);
+        assert!(!legacy_global_env_is_set(), "unset → no notice");
+        for set_val in ["1", "true", "TRUE", "yes", "0", "false", "no", "anything"] {
+            g.reset(set_val);
+            assert!(legacy_global_env_is_set(), "{set_val:?} → notice fires");
         }
         g.reclear();
-        assert!(!legacy_global_env_allowed(), "recleared (unset) → DENY");
+        assert!(!legacy_global_env_is_set(), "recleared → no notice");
     }
 
     #[test]
-    fn evaluate_global_token_refused_when_flag_off() {
-        let _g = LegacyFlagGuard::set("0");
+    fn removed_notice_names_remediation() {
+        // The startup notice must say it was removed, when, and what to
+        // use instead — a set-but-dead variable may never be silently
+        // accepted or silently ignored.
+        let notice = removed_legacy_global_env_notice();
+        assert!(notice.contains("REMOVED in v0.2.97"), "notice: {notice}");
+        assert!(notice.contains("hub.token.<project_id>"), "notice: {notice}");
+        assert!(notice.contains("Unset"), "notice: {notice}");
+    }
+
+    #[test]
+    fn evaluate_global_token_refused_even_with_flag_set() {
+        // v0.2.97 removal pin at the pure-fn level: the OLD opt-in value
+        // ("1") must not resurrect the compat path.
+        let _g = LegacyFlagGuard::set("1");
         let mut map = std::collections::HashMap::new();
         map.insert("proj-a".to_string(), "token-a".to_string());
         let reg = ProjectTokenRegistry::from_map(map);
         let global = "global-token";
 
-        // Global token → refused (403) when the flag is off.
+        // Global token → refused (403) even with the variable set.
         assert!(matches!(
             evaluate_project_route_auth("proj-a", global, global, &reg),
             ProjectRouteAuth::GlobalTokenRefused
         ));
-        // The per-project token STILL works even with the flag off — the
-        // flag only gates the GLOBAL-token path.
+        // The per-project token STILL works — the removal only kills the
+        // GLOBAL-token path.
         assert!(matches!(
             evaluate_project_route_auth("proj-a", "token-a", global, &reg),
             ProjectRouteAuth::ProjectToken
@@ -1482,8 +1472,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn env_route_refuses_global_token_when_flag_off() {
-        let _g = LegacyFlagGuard::set("0");
+    async fn env_route_refuses_global_token_when_legacy_flag_set() {
+        let _g = LegacyFlagGuard::set("1");
         let base = spawn_router(router_with_project_tokens(
             "global-tok",
             &[("proj-a", "tok-a")],
@@ -1491,7 +1481,7 @@ mod tests {
         .await;
         let client = reqwest::Client::new();
 
-        // Global token on /env → 403 (compat window closed by the flag).
+        // Global token on /env → 403 (the variable is dead; removal pin).
         let resp = client
             .get(format!("{}/api/v1/projects/proj-a/env", base))
             .header("Authorization", "Bearer global-tok")
@@ -1501,12 +1491,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let body = resp.text().await.unwrap();
         assert!(
-            body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"),
-            "403 body should name the flag; got: {}",
+            !body.contains("VCT_HUB_LEGACY_GLOBAL_ENV"),
+            "403 body must not advertise the removed variable; got: {}",
             body
         );
 
-        // The per-project token STILL authorizes with the flag off.
+        // The per-project token STILL authorizes with the variable set.
         let resp2 = client
             .get(format!("{}/api/v1/projects/proj-a/env", base))
             .header("Authorization", "Bearer tok-a")
@@ -1517,8 +1507,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn config_route_refuses_global_token_when_flag_off() {
-        let _g = LegacyFlagGuard::set("0");
+    async fn config_route_refuses_global_token_when_legacy_flag_set() {
+        // v0.2.97 removal pin on /config: the old opt-in value must not
+        // resurrect the compat path here either.
+        let _g = LegacyFlagGuard::set("1");
         let base = spawn_router(router_with_project_tokens(
             "global-tok",
             &[("proj-a", "tok-a")],
@@ -1584,21 +1576,18 @@ mod tests {
             .unwrap();
     }
 
-    /// Flag OFF + global token + a project that exists in the DB but has
-    /// NO registry entry (added mid-session) → lazy-mint rescues it: the
-    /// request PROCEEDS (200) and the scoped token is now registered +
-    /// written to disk, so the next request rides the per-project token.
+    /// Global token + a project that exists in the DB but has NO registry
+    /// entry (added mid-session) → lazy-mint rescues it: the request
+    /// PROCEEDS (200) and the scoped token is now registered + written to
+    /// disk, so the next request rides the per-project token. (The
+    /// v0.2.77 flag that once gated this path is gone; the rescue is the
+    /// default and only route for a global-token bearer now.)
     #[tokio::test]
-    async fn lazy_mint_rescues_db_known_project_when_flag_off() {
-        // Hold the flag lock for the whole test AND isolate VCT_STATE_DIR
-        // (lazy-mint writes hub.token.<id> there). The LegacyFlagGuard
-        // serialises against the other flag tests; the state-dir set is
-        // safe under that same held lock.
-        let _g = LegacyFlagGuard::set("0");
-        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
-        // of these tests, and no test in this file takes them the other way
-        // round, so the two locks have a consistent order.
-        let tmp = state_dir_guard();
+    async fn lazy_mint_rescues_db_known_project_presenting_global_token() {
+        // Isolate VCT_STATE_DIR (lazy-mint writes hub.token.<id> there),
+        // under the ONE env lock: `LegacyFlagGuard` holds the same
+        // non-reentrant mutex, so it is not taken here too.
+        let tmp = state_dir_guard_with(&[]);
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         seed_project_row(&db, "mid-pid", "MidSession", "/tmp/mid");
@@ -1643,16 +1632,13 @@ mod tests {
         assert_eq!(resp2.status(), StatusCode::OK);
     }
 
-    /// Flag OFF + global token + an UNKNOWN id (no DB row) → NO lazy-mint;
-    /// the 403 stands and no token file is written. Guards against an
-    /// attacker forcing a token file for an arbitrary id.
+    /// Global token + an UNKNOWN id (no DB row) → NO lazy-mint; the 403
+    /// stands and no token file is written. Guards against an attacker
+    /// forcing a token file for an arbitrary id.
     #[tokio::test]
-    async fn lazy_mint_does_not_rescue_unknown_id_when_flag_off() {
-        let _g = LegacyFlagGuard::set("0");
-        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
-        // of these tests, and no test in this file takes them the other way
-        // round, so the two locks have a consistent order.
-        let tmp = state_dir_guard();
+    async fn lazy_mint_does_not_rescue_unknown_id() {
+        // Scratch state dir, under the one env lock (see above).
+        let tmp = state_dir_guard_with(&[]);
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         // No projects seeded.
@@ -1818,11 +1804,8 @@ mod tests {
     /// This test cannot be masked because it goes through the prod SSOT.
     #[tokio::test]
     async fn f1_lazy_mint_reachable_through_production_layer_stack() {
-        let _g = LegacyFlagGuard::set("0");
-        // `state_dir_guard()` is taken AFTER `LegacyFlagGuard` in all three
-        // of these tests, and no test in this file takes them the other way
-        // round, so the two locks have a consistent order.
-        let _tmp = state_dir_guard();
+        // Scratch state dir, under the one env lock (see above).
+        let _tmp = state_dir_guard_with(&[]);
 
         let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
         seed_project_row(&db, "f1-pid", "F1Session", "/tmp/f1");

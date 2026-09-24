@@ -30,12 +30,12 @@
 #   4  field not found (--field NAME, NAME not in config)
 #   5  forbidden (403 — a scoped-credential boundary refusal; NOT a
 #      transient/unreachable condition, so callers must NOT env-fallback.
-#      Post-flip the hub returns 403 when a resolver presents the coarse
-#      global hub.token on a per-project /env|/config route while the
-#      compat window is closed, or presents a per-project token minted
-#      for a DIFFERENT project. Fix: present the scoped hub.token.<id>
-#      (this resolver already prefers it) or set
-#      VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window.)
+#      The hub returns 403 when a resolver presents the coarse global
+#      hub.token on a per-project /env|/config route (refused
+#      unconditionally since v0.2.97 removed VCT_HUB_LEGACY_GLOBAL_ENV),
+#      or presents a per-project token minted for a DIFFERENT project.
+#      Fix: present the scoped hub.token.<id> (this resolver already
+#      prefers it; the hub mints one on first request).
 #   64 usage error
 #
 # Hub discovery:
@@ -857,7 +857,7 @@ fetch_config() {
             # hub.token.<id> is already preferred by hub_token; a 403
             # therefore means that file was absent/unreadable so we rode the
             # global token, OR the wrong project's token was presented.
-            _emit_warning "forbidden" "403 forbidden for project $pid: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$body"
+            _emit_warning "forbidden" "403 forbidden for project $pid: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97. body=$body"
             return 5
             ;;
         404)

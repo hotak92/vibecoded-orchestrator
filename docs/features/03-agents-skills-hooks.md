@@ -47,7 +47,7 @@ Migrate code between languages, frameworks, or versions. Injects `architecture-c
 Create hooks, scripts, agents, and skills. Self-improves the automation system.
 
 ### `doc-extractor` (Sonnet)
-Pulls knowledge out of scattered docs and into KG nodes. Frontmatter declares an agent-scoped `PreToolUse Write|Edit` hook pointing at `.claude/scripts/validate-readonly.sh`; the script doesn't ship in v0.1.0, so the read-only enforcement is convention-only at the moment. Tracked as a code-doc gap.
+Pulls knowledge out of scattered docs and into KG nodes. Read-only on its sources by instruction, not enforcement: the agent's frontmatter declares no hook, and its tool list includes `Write`/`Edit` for the extraction reports it produces.
 
 ### `doc-maintainer` (Sonnet)
 Keeps documentation current and prunes stale material — but always extracts to the KG before archival, so context isn't lost when files are removed.
@@ -134,7 +134,7 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. The implementation is not present in the OSS bundle (paid module). Free-tier agents use `weaviate-kg` and `search` MCPs directly.
 
 ### Graceful degradation behaviour
-Seven agents reference `orchestrator-tools` in their frontmatter as of v0.1.0: `coder`, `tester`, `planner`, `expert-coder`, `project-architect`, `project-coordinator`, `ai-agentic-architect`. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools fail at runtime, not at install time.
+Seven free agents reference `orchestrator-tools` in their frontmatter: `coder`, `tester`, `planner`, `expert-coder`, `project-architect`, `consulting-cto-portfolio-coordinator`, `ai-agentic-architect`. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools fail at runtime, not at install time.
 
 ---
 
@@ -447,7 +447,7 @@ A hook's `.claude/settings.json` entry is merged by `_merge_hooks_for_bundle`, w
 The `skills:` list in agent frontmatter injects skill `SKILL.md` files into the agent's context window before it runs. This provides the agent with specialist knowledge and decision frameworks without changing its tool permissions. Example: `planner` injects `task-breakdown` (Sonnet) and `architect` (Opus) — Opus-level reasoning is available as a reference even though the planner itself runs on Sonnet.
 
 ### Blackboard coordination
-The `project-coordinator` agent implements a blackboard pattern: agents volunteer for tasks from a shared `CONTEXT_STATE.md` rather than receiving delegated assignments. This pattern (documented in `knowledge/concepts/blackboard-architecture-coordination.md`) reduces inter-agent communication overhead and supports parallelism without a central scheduler.
+The `project-coordinator` agent implements a blackboard pattern: agents volunteer for tasks from a shared `CONTEXT_STATE.md` rather than receiving delegated assignments. This pattern reduces inter-agent communication overhead and supports parallelism without a central scheduler: the shared file is the only coordination point, so no agent needs to know which others exist or wait on them.
 
 ### Hook → Agent delegation
 Several hooks spawn background Claude Code agents for heavyweight tasks: `kg-summary-generator.sh` → Haiku agent to update KG summaries; `post-git-commit-kg-sync.sh` → Haiku agent to sync KG after commits. All delegating hooks guard with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside subprocesses.

@@ -54,16 +54,19 @@
 //! `node`, `npm`, `cargo`, `joern`, `lean-ctx` are findable from a
 //! .desktop-launched process state. Two angles, same root fix.
 
+//! v0.2.97 review R6: every test computes the augmented PATH with the
+//! PURE `augmented_path(minimal PATH, fixture HOME)` and resolves tools
+//! against THAT value — a Rust test never sets the process `PATH` or
+//! `HOME` (`tests/test_rust_tests_never_mutate_process_path.py`).
+
 #![cfg(target_os = "linux")]
 
+use std::ffi::{OsStr, OsString};
 use std::fs;
-use std::path::PathBuf;
-use std::sync::Mutex;
+use std::path::{Path, PathBuf};
 
-use vct_launcher_core::services::runtime::augment_path_for_graphical_launch;
+use vct_launcher_core::services::runtime::augmented_path;
 
-/// Manual temp dir helper — avoids pulling `tempfile` as a dev-dep
-/// just for this one test. Auto-cleans on Drop.
 struct TempDir {
     path: PathBuf,
 }
@@ -80,7 +83,7 @@ impl TempDir {
         Self { path: p }
     }
 
-    fn path(&self) -> &std::path::Path {
+    fn path(&self) -> &Path {
         &self.path
     }
 }
@@ -91,221 +94,102 @@ impl Drop for TempDir {
     }
 }
 
-/// Tests that mutate the process's PATH/HOME env vars must run serially
-/// (the std::env is process-wide). Lock around them.
-static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-/// Tools the launcher subsystem must be able to resolve under
-/// .desktop-launch — taken directly from L-P0-4's "extend to Node,
-/// Joern, lean-ctx, cargo, npm" wording in the v0.2.53 design doc.
 const L_P0_4_TOOLS: &[&str] = &["node", "npm", "cargo", "joern", "lean-ctx"];
 
-/// Locations where user-installed copies of the L-P0-4 tools commonly
-/// live. Mirrors `augment_candidates()`'s Linux branch in runtime.rs.
-fn home_relative_tool_dirs(home: &PathBuf) -> Vec<PathBuf> {
-    vec![
-        home.join(".local/bin"),
-        home.join(".cargo/bin"),
-    ]
+/// `systemd --user`'s minimal PATH, precisely.
+const SYSTEMD_USER_PATH: &str = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+
+fn home_relative_tool_dirs(home: &Path) -> Vec<PathBuf> {
+    vec![home.join(".local/bin"), home.join(".cargo/bin")]
 }
 
-/// Emulate which(name) using the process's CURRENT PATH (no augment
-/// applied implicitly). This mirrors what the launcher's runtime
-/// probes do at subprocess spawn time.
-fn which_using_process_path(name: &str) -> Option<PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+/// `which` against an explicit PATH value (never the process's).
+fn which_in(path: &OsStr, name: &str) -> Option<PathBuf> {
+    std::env::split_paths(path).map(|dir| dir.join(name)).find(|p| p.is_file())
 }
 
-/// Create an executable stub at `dir/name` so `is_file()` returns true.
-fn lay_down_stub(dir: &PathBuf, name: &str) -> PathBuf {
+fn lay_down_stub(dir: &Path, name: &str) -> PathBuf {
     fs::create_dir_all(dir).expect("mkdir -p");
-    let target = dir.join(name);
-    fs::write(&target, b"#!/bin/sh\nexit 0\n").expect("write stub");
-    // Mark executable for completeness — `is_file()` succeeds either
-    // way, but a real .desktop launch would only resolve to executable
-    // files. Use Unix-specific permissions API.
-    use std::os::unix::fs::PermissionsExt;
-    let mut perms = fs::metadata(&target).unwrap().permissions();
-    perms.set_mode(0o755);
-    fs::set_permissions(&target, perms).expect("chmod");
-    target
+    let p = dir.join(name);
+    fs::write(&p, b"#!/bin/sh\nexit 0\n").expect("write stub");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perm = fs::metadata(&p).expect("stat").permissions();
+        perm.set_mode(0o755);
+        fs::set_permissions(&p, perm).expect("chmod");
+    }
+    p
 }
 
-/// Synthetic-state fixture: minimal PATH (mimicking `systemd --user`),
-/// fresh HOME with .local/bin + .cargo/bin populated by stubs for the
-/// L-P0-4 tools.
-struct DesktopLaunchFixture {
-    home: TempDir,
-    saved_path: Option<std::ffi::OsString>,
-    saved_home: Option<std::ffi::OsString>,
-}
-
-impl DesktopLaunchFixture {
-    fn new_with_minimal_path() -> Self {
-        let home = TempDir::new();
-        let saved_path = std::env::var_os("PATH");
-        let saved_home = std::env::var_os("HOME");
-
-        // Mimic systemd --user's minimal PATH precisely.
-        std::env::set_var(
-            "PATH",
-            "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
-        );
-        std::env::set_var("HOME", home.path());
-
-        Self {
-            home,
-            saved_path,
-            saved_home,
-        }
-    }
-
-    fn home_path(&self) -> PathBuf {
-        self.home.path().to_path_buf()
-    }
-}
-
-impl Drop for DesktopLaunchFixture {
-    fn drop(&mut self) {
-        if let Some(p) = self.saved_path.take() {
-            std::env::set_var("PATH", p);
-        } else {
-            std::env::remove_var("PATH");
-        }
-        if let Some(h) = self.saved_home.take() {
-            std::env::set_var("HOME", h);
-        } else {
-            std::env::remove_var("HOME");
-        }
-    }
+/// The PATH the launcher has after its startup augment under a
+/// `.desktop` launch with `home` as `$HOME`.
+fn desktop_launch_path(home: &Path) -> OsString {
+    augmented_path(OsStr::new(SYSTEMD_USER_PATH), Some(home))
+        .unwrap_or_else(|| OsString::from(SYSTEMD_USER_PATH))
 }
 
 #[test]
 fn baseline_without_augment_does_not_see_home_local_bin_tools() {
     // Sanity check: confirm the BUG actually exists before augment runs.
-    // If this fails, either the test fixture is broken or the underlying
-    // gap has already been silently fixed elsewhere — in which case the
-    // assertion below would give a false-positive "augment worked"
-    // signal. We hold the line.
-    //
-    // CI-portability note: use a unique, host-absent stub name (NOT
-    // `node`/`npm`/`cargo`, which are pre-installed at /usr/local/bin
-    // on GitHub `ubuntu-latest` runners). The minimal PATH sets
-    // /usr/local/bin first, so a pre-installed system copy would
-    // satisfy `which` and break the baseline assertion despite a
-    // correct fixture. `vct_l_p0_4_stub_marker` is reserved-namespace.
-    let _guard = ENV_MUTEX.lock().expect("lock env");
-    let fx = DesktopLaunchFixture::new_with_minimal_path();
-    let local_bin = fx.home_path().join(".local/bin");
-    lay_down_stub(&local_bin, "vct_l_p0_4_stub_marker");
-
-    // PRE-augment: minimal PATH does NOT include $HOME/.local/bin, so
-    // `which vct_l_p0_4_stub_marker` returns None even though the
-    // stub exists at $HOME/.local/bin.
+    // A unique, host-absent stub name: `node`/`npm`/`cargo` are
+    // pre-installed at /usr/local/bin on GitHub `ubuntu-latest` runners.
+    let home = TempDir::new();
+    lay_down_stub(&home.path().join(".local/bin"), "vct_l_p0_4_stub_marker");
     assert!(
-        which_using_process_path("vct_l_p0_4_stub_marker").is_none(),
+        which_in(OsStr::new(SYSTEMD_USER_PATH), "vct_l_p0_4_stub_marker").is_none(),
         "baseline broken: PATH already includes $HOME/.local/bin somehow"
     );
 }
 
 #[test]
 fn augment_path_makes_node_npm_cargo_joern_leanctx_findable() {
-    let _guard = ENV_MUTEX.lock().expect("lock env");
-    let fx = DesktopLaunchFixture::new_with_minimal_path();
-
-    // Lay down the L-P0-4 tool stubs across the two HOME-relative
-    // candidate dirs that Track C's augment adds.
-    let dirs = home_relative_tool_dirs(&fx.home_path());
+    let home = TempDir::new();
+    let dirs = home_relative_tool_dirs(home.path());
     let local_bin = &dirs[0]; // ~/.local/bin
     let cargo_bin = &dirs[1]; // ~/.cargo/bin
-
-    // Place each tool in a plausible default location:
-    //   node, npm → typically symlinked into ~/.local/bin by user
-    //                installs (`npm config set prefix ~/.local`),
-    //                fnm/nvm proxy shims, etc.
-    //   cargo, lean-ctx → ~/.cargo/bin (rustup-managed)
-    //   joern → ~/.local/bin (sdkman or manual extract)
     lay_down_stub(local_bin, "node");
     lay_down_stub(local_bin, "npm");
     lay_down_stub(cargo_bin, "cargo");
     lay_down_stub(cargo_bin, "lean-ctx");
     lay_down_stub(local_bin, "joern");
 
-    // Call Track C's M-P0-7 helper. This is the line of code the
-    // launcher's `lib.rs::setup()` runs at startup.
-    augment_path_for_graphical_launch();
-
-    // After augment, every L-P0-4 tool must be resolvable via PATH.
+    let path = desktop_launch_path(home.path());
     for tool in L_P0_4_TOOLS {
-        let resolved = which_using_process_path(tool);
         assert!(
-            resolved.is_some(),
-            "L-P0-4 regression: tool {tool:?} unresolvable after \
-             augment_path_for_graphical_launch() under simulated \
-             .desktop-launch state — Track C's augment did not pick up \
-             $HOME/.local/bin or $HOME/.cargo/bin"
+            which_in(&path, tool).is_some(),
+            "L-P0-4 regression: tool {tool:?} unresolvable after the startup \
+             augment under simulated .desktop-launch state — it did not pick \
+             up $HOME/.local/bin or $HOME/.cargo/bin"
         );
     }
 }
 
 #[test]
 fn augment_is_idempotent_under_repeated_desktop_launch_state() {
-    let _guard = ENV_MUTEX.lock().expect("lock env");
-    let fx = DesktopLaunchFixture::new_with_minimal_path();
-    let local_bin = fx.home_path().join(".local/bin");
-    lay_down_stub(&local_bin, "node");
+    let home = TempDir::new();
+    lay_down_stub(&home.path().join(".local/bin"), "node");
 
-    augment_path_for_graphical_launch();
-    let after_first = std::env::var("PATH").unwrap();
-    augment_path_for_graphical_launch();
-    augment_path_for_graphical_launch();
-    let after_third = std::env::var("PATH").unwrap();
-
-    assert_eq!(
-        after_first, after_third,
+    let after_first = desktop_launch_path(home.path());
+    assert!(
+        augmented_path(&after_first, Some(home.path())).is_none(),
         "augment must be idempotent: repeated calls (e.g. resume-after-\
          sleep, lib.rs::setup() re-entry on Tauri 2 hot-reload) must \
          not duplicate entries or change order"
     );
-
-    // And the tool must still resolve.
-    assert!(
-        which_using_process_path("node").is_some(),
-        "node lookup broke after repeated augment calls"
-    );
+    assert!(which_in(&after_first, "node").is_some(), "node lookup broke");
 }
 
 #[test]
 fn augment_preserves_pre_existing_path_entries_after_candidates() {
-    let _guard = ENV_MUTEX.lock().expect("lock env");
-    let fx = DesktopLaunchFixture::new_with_minimal_path();
-    let local_bin = fx.home_path().join(".local/bin");
-    lay_down_stub(&local_bin, "node");
-
-    augment_path_for_graphical_launch();
-    let new_path = std::env::var("PATH").unwrap();
-
-    // The systemd --user PATH entries must still be present (not
-    // replaced wholesale). Order-relative: augment candidates are
-    // PREPENDED, system entries follow.
-    for systemd_entry in [
-        "/usr/local/bin",
-        "/usr/bin",
-        "/bin",
-    ] {
+    let home = TempDir::new();
+    let new_path = desktop_launch_path(home.path()).to_string_lossy().to_string();
+    // The systemd --user PATH entries must still be present (not replaced
+    // wholesale); augment candidates are PREPENDED, system entries follow.
+    for systemd_entry in ["/usr/local/bin", "/usr/bin", "/bin"] {
         assert!(
             new_path.contains(systemd_entry),
-            "augment dropped systemd --user PATH entry {systemd_entry:?} \
-             from the augmented PATH. Original was preserved-after-\
-             candidates per Track C M-P0-7 contract."
+            "augment dropped systemd --user PATH entry {systemd_entry:?}"
         );
     }
-    let _ = fx;
 }

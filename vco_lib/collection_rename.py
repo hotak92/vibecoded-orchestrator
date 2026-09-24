@@ -1105,7 +1105,8 @@ def drop_retired_command(folder: "str | Path", *,
 def _analyze_wrapper(folder: Path, *, platform: Optional[str] = None) -> str:
     """The bundled analyzer wrapper for ``folder``, as a real path.
 
-    There is no ``vco codegraph`` verb. The analyzer ships as the BUNDLED
+    No CLI verb analyzes a code graph (the launcher's ``vct-cli codegraph``
+    only lists and searches). The analyzer ships as the BUNDLED
     wrapper in the project's own ``.claude/scripts/``, so that is what any
     remediation names — a printed command is shipped code.
     """

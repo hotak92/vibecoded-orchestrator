@@ -24,7 +24,7 @@
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import AdoptProjectModal from '$lib/components/AdoptProjectModal.svelte';
   import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
-  import { runUnregister } from '$lib/unregister-escape';
+  import { quickUnregister } from '$lib/unregister-escape';
   import { toast } from '$lib/stores/toast';
   // v0.2.91 (#32): Name↔Path coupling extracted to pure, unit-tested
   // logic (project-selector-path-logic.test.ts). The browse handler's
@@ -566,14 +566,13 @@
     if (deleteConfirmText !== deletingProject.name) return;
     deleting = true;
     try {
-      // Pass null → backend defaults apply: purgeLauncherFiles=true,
-      // purgeCollections=false. The selector's quick-trash flow keeps
-      // the original UX: "remove project from launcher" with sensible
-      // defaults. The settings-tab Danger zone exposes the full options.
+      // The settings page's default unregister, sent explicitly (review R6
+      // F46): launcher files purged, collections kept — so the stop can fire
+      // here too and its escape re-runs with the same options. The settings
+      // tab's Danger zone exposes the other choices.
       const target = deletingProject;
-      const outcome = await runUnregister(
+      const outcome = await quickUnregister(
         (options) => projects.delete(target.id, options),
-        null,
         askLeaveAnyway,
       );
       if (outcome.kind === 'kept') {
@@ -944,13 +943,19 @@
 >
   {#snippet header()}
     <div class="modal-header-row">
-      <h2>Delete Project</h2>
+      <h2>Unregister project</h2>
     </div>
   {/snippet}
   {#snippet body()}
         <p class="modal-desc">
           This removes the project from the launcher and uninstalls its modules.
-          Your project folder on disk is <strong>not</strong> deleted.
+          It also removes what VCO put in the folder — <code>.claude/hooks/</code>,
+          <code>.claude/scripts/</code>, the infra compose files, and what VCO
+          wrote to your env files. Your own content (agents, skills,
+          <code>CONTEXT_STATE.md</code>, <code>CLAUDE.md</code>, source code, your
+          own <code>.env</code> lines) stays, and the project's Weaviate
+          collections are kept. The folder itself is <strong>not</strong> deleted.
+          For other choices, use the project's Settings → Danger zone.
         </p>
         <p class="modal-desc">
           Type <strong class="mono">{proj.name}</strong> to confirm.
@@ -973,7 +978,7 @@
             {#if deleting}
               <span class="spinner-sm"></span>
             {:else}
-              Delete
+              Unregister
             {/if}
           </button>
         </div>

@@ -563,6 +563,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn default_export_path_is_the_gateway_state_dir_under_vct_root() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Guard: another test in this binary may have set the override.
         std::env::remove_var(EXPORT_PATH_ENV);
         let p = export_path();
@@ -577,6 +578,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn export_path_honours_the_gateways_env_override() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("envpath");
         let custom = dir.join("elsewhere.json");
         std::env::set_var(EXPORT_PATH_ENV, &custom);
@@ -614,6 +616,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn export_writes_the_contract_shape_and_reports_where() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("export");
         let target = dir.join("model-gateway").join("chat_model_context.json");
         std::env::set_var(EXPORT_PATH_ENV, &target);
@@ -650,6 +653,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn export_overwrites_a_damaged_file_and_keeps_the_pre_vco_bytes_once() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("damaged");
         let target = dir.join("chat_model_context.json");
         std::fs::write(&target, "{ not json at all").unwrap();
@@ -682,6 +686,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_first_export_on_a_clean_machine_writes_no_sidecar() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("clean");
         let target = dir.join("chat_model_context.json");
         std::env::set_var(EXPORT_PATH_ENV, &target);
@@ -707,6 +712,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn a_failing_export_is_reported_rather_than_logged_and_forgotten() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("failwrite");
         // Point the export at a path whose "parent" is a FILE, so
         // create_dir_all cannot succeed on any OS.
@@ -739,6 +745,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn every_mutation_re_exports_and_says_so() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("mutations");
         let clone = dir.join("clone");
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
@@ -814,6 +821,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn reseed_with_no_shipped_seed_file_fails_loudly() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("noseed");
         let clone = clone_without_seed(&dir);
         std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
@@ -837,6 +845,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn status_reports_a_missing_export_without_inventing_a_problem() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("statusmissing");
         std::env::set_var(EXPORT_PATH_ENV, dir.join("chat_model_context.json"));
         let (exists, gen, models, problem) = inspect_export(&export_path());
@@ -999,6 +1008,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn unstated_rows_flow_from_the_shipped_seed_into_the_export_as_zero() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..");
@@ -1070,6 +1080,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn boot_seeds_from_the_clone_and_exports_in_one_pass() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("boot");
         let clone = dir.join("some-odd-place").join("orchestrator");
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
@@ -1146,6 +1157,7 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn boot_with_no_shipped_seed_is_quiet_and_still_exports() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let dir = tmp_dir("noseedboot");
         let clone = clone_without_seed(&dir);
         let target = dir.join("chat_model_context.json");

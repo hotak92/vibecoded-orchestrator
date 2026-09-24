@@ -227,6 +227,15 @@ CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
 #: this probe never writes a manifest and never touches an update path.
 CID_INSTALL_MARKER_UNBACKED = "install_manifest_attests_uninstalled_source"
 
+#: v0.2.97. A copy of the launcher's Rust CLI under a FORMER name (``vco``
+#: until v0.2.96, ``vct`` before v0.1.0) is on PATH, where it hides or is
+#: hidden by the Python ``vco`` / the secrets ``vct``. Registered
+#: ``action_required`` with the clear probe ``former_launcher_cli_still_on_path``
+#: (the same :mod:`vco_lib.launcher_cli_identity` reading). The doctor only
+#: REPORTS it: deleting a binary is the user's call, or ``install.sh``'s for
+#: the copy it installed itself.
+CID_FORMER_LAUNCHER_CLI = "former_launcher_cli_on_path"
+
 #: condition_ids the DOCTOR owns END-TO-END: it detects them AND emits them.
 #: A cid another component owns (``launcher_binary_stale``) is REPORTED by the
 #: doctor but emitted by its owner — re-emitting it here would fork its
@@ -235,7 +244,7 @@ DOCTOR_OWNED_CIDS: tuple[str, ...] = (
     CID_NPX_MISSING, CID_DISK_SPACE_LOW, CID_VCO_LIB_SHADOWED,
     CID_KG_BINDING_EVIDENCE_MISMATCH, CID_KG_UNCLAIMED,
     CID_CODE_EMBED_IMAGE_STALE, CID_GATEWAY_UNRUNNABLE,
-    CID_INSTALL_MARKER_UNBACKED,
+    CID_INSTALL_MARKER_UNBACKED, CID_FORMER_LAUNCHER_CLI,
 )
 
 #: Doctor-owned cids the doctor also RESOLVES when its own probe reports OK.
@@ -409,6 +418,32 @@ class DoctorResolvers:
     #: injected so the summary-pending probe's tests describe a machine's
     #: sidecars with dataclasses, no filesystem.
     summary_pending: Optional[Callable[[Path], Optional[Any]]] = None
+    #: () -> list of :class:`vco_lib.launcher_cli_identity.FormerCopy`.
+    #: Injected so the former-name probe is driven from a described machine
+    #: without running any ``vco`` / ``vct`` it finds.
+    former_launcher_cli: Optional[Callable[[], list]] = None
+
+    def resolve_former_launcher_cli(self) -> list:
+        """Copies of the launcher CLI under a former name reachable on PATH.
+
+        Composes :mod:`vco_lib.launcher_cli_identity` (the rule ``install.sh``
+        uses). When a test describes the machine's PATH through
+        ``path_command`` instead, only what that names is judged — the
+        injected PATH is the whole PATH, and a real scan would run whatever
+        the developer's own PATH holds.
+        """
+        from vco_lib import launcher_cli_identity as identity
+
+        if self.former_launcher_cli is not None:
+            return self.former_launcher_cli()
+        if self.path_command is not None:
+            found = []
+            for name in identity.FORMER_NAMES:
+                path = self.path_command(name)
+                if path and identity.is_launcher_cli_named(path, name):
+                    found.append(identity.FormerCopy(path, name))
+            return found
+        return identity.find_on_path()
 
     def resolve_gateway_state(self):
         """The model gateway's registration verdict, from its ONE home.
@@ -3752,6 +3787,42 @@ def probe_stale_vct_deploy(folder: Path, res: DoctorResolvers, ctx: dict) -> lis
     ]
 
 
+def probe_former_launcher_cli(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Is a copy of the launcher CLI on PATH under a name it no longer has?
+
+    Read-only: identifies each ``vco`` / ``vct`` on PATH by what it prints
+    (:mod:`vco_lib.launcher_cli_identity`, the rule ``install.sh`` uses) and
+    never deletes one. Runs for the orchestrator install root only — PATH is
+    the machine's, so one ledger entry is enough, and every registered project
+    repeating it would be noise.
+    """
+    from vco_lib import launcher_cli_identity as identity
+
+    if not (Path(folder) / "vco_lib" / "__init__.py").is_file():
+        return []
+    copies = res.resolve_former_launcher_cli()
+    if not copies:
+        return [Finding(
+            probe="former_launcher_cli",
+            status=STATUS_OK,
+            summary="no copy of the launcher CLI under a former name (vco, vct) on PATH",
+        )]
+    listed = ", ".join(f"{c.path} (`{c.name}`)" for c in copies)
+    return [Finding(
+        probe="former_launcher_cli",
+        status=STATUS_PROBLEM,
+        summary=(
+            f"an old copy of the launcher CLI is on PATH under a former name: {listed}. "
+            f"It is `{identity.CURRENT_NAME}` now; the old copy hides or is hidden by "
+            "the real program of that name"
+        ),
+        fix=FIX_DEFER,
+        condition_id=CID_FORMER_LAUNCHER_CLI,
+        command=identity.remedy(copies),
+        detail={"copies": [{"path": c.path, "name": c.name} for c in copies]},
+    )]
+
+
 #: v0.2.92 WP-D — bundle-staleness census condition. Emitted and resolved by
 #: ``vco_lib.bundle_staleness`` (the census owns the lifecycle end-to-end:
 #: a full census emits when ``stale > 0`` and resolves when ``stale == 0``);
@@ -4075,6 +4146,9 @@ PROBES: dict = {
     # end-of-update report names the count, not just the cid.
     "summary_pending": (probe_summary_pending, (SCOPE_FULL,)),
     "claude_code_trust": (probe_claude_code_trust, (SCOPE_FULL,)),
+    # v0.2.97: full-only — it RUNS each `vco` / `vct` on PATH (`--version`,
+    # `-h`), which is more than the boot subset's file-read budget.
+    "former_launcher_cli": (probe_former_launcher_cli, (SCOPE_FULL,)),
 }
 
 
@@ -4515,6 +4589,38 @@ def _install_marker_unbacked_entry(finding: Finding):
     )
 
 
+def _former_launcher_cli_entry(finding: Finding):
+    from vco_lib.deferral_report import DeferralEntry
+
+    posix = not sys.platform.startswith("win")
+    return DeferralEntry(
+        condition_id=CID_FORMER_LAUNCHER_CLI,
+        title="An old copy of the launcher CLI is on PATH under a former name",
+        detected=finding.summary,
+        why_deferred=(
+            "The launcher's Rust command-line tool was called `vco` until "
+            "v0.2.96 — the same name as the orchestrator's Python CLI "
+            "(`vco doctor`, `vco project move`, ...) — and `vct` before "
+            "v0.1.0, which is now the secrets tool. It is `vct-cli` since "
+            "v0.2.97. The copy named here identifies itself as the old tool, "
+            "so whichever of the two programs comes first on PATH hides the "
+            "other. VCO never deletes a binary from a health check: remove the "
+            "copy with the command below"
+            + (
+                ", or re-run `launcher/tools/vct-cli/install.sh`, which removes "
+                "the copy it installed itself in `~/.local/bin` and installs "
+                "`vct-cli`"
+                if posix else ""
+            )
+            + ". The entry clears itself once no such copy is left."
+        ),
+        command_to_apply=finding.command,
+        severity="warning",
+        disposition="action_required",
+        kg_node_refs=["launcher/docs/CLI.md"],
+    )
+
+
 _ENTRY_BUILDERS: dict = {
     CID_NPX_MISSING: _npx_entry,
     CID_DISK_SPACE_LOW: _disk_space_entry,
@@ -4524,6 +4630,7 @@ _ENTRY_BUILDERS: dict = {
     CID_CODE_EMBED_IMAGE_STALE: _code_embed_image_entry,
     CID_GATEWAY_UNRUNNABLE: _gateway_unrunnable_entry,
     CID_INSTALL_MARKER_UNBACKED: _install_marker_unbacked_entry,
+    CID_FORMER_LAUNCHER_CLI: _former_launcher_cli_entry,
 }
 
 

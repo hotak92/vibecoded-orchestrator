@@ -149,7 +149,8 @@ def _write_pending_jsonl(events: List[dict]) -> int:
     stub endpoint — instead of HTTP-posting (and silently failing or
     spamming an unhealthy endpoint), we persist events to disk so users
     who opted in can inspect exactly what telemetry the orchestrator
-    WOULD have shipped. Surfaced via `vct-cli telemetry pending` (TODO).
+    WOULD have shipped. Surfaced via `vct-cli telemetry pending`, which
+    reads this same file (its path constants must match this one).
     """
     from pathlib import Path
     pending_dir = Path.home() / ".vibecoded"

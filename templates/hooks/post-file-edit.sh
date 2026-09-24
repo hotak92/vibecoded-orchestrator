@@ -14,7 +14,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   analyze_code_graph.py). Writes do NOT consult VCT_KG_ACCESS_LIST or
 #   VCT_CODE_GRAPH_ACCESS_LIST — those env vars are read-side only
 #   (fan-out search across peer KGs). This hook is correct as-is; no
-#   centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+#   centralization needed: writes always target the project's OWN
+#   collections; the access lists gate reads fanning out to peers only.
 
 # post-file-edit.sh — PostToolUse hook
 #

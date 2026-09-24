@@ -37,7 +37,7 @@ The OS keychain backends:
 - **macOS**: Keychain
 - **Windows**: Credential Manager
 
-This is implemented in `launcher/src-tauri/src/secrets.rs`. Every keychain entry uses `service_name = vct.{scope}.{module_id}` and `username = {key}`, which makes secrets discoverable in the OS credential manager UI (e.g. `seahorse` on GNOME).
+This is implemented in `launcher/src-tauri/vct-launcher-core/src/secrets.rs`. Every keychain entry uses `service_name = vct.{scope}.{module_id}` and `username = {key}`, which makes secrets discoverable in the OS credential manager UI (e.g. `seahorse` on GNOME).
 
 #### Why secrets are referenced by `secret_ref`, not value
 
@@ -227,7 +227,7 @@ These five tabs share a common contract:
 - All mutations are written to the audit log (`db.audit(...)`) without
   recording values.
 
-Schema source of truth: `launcher/src-tauri/src/db/project_state.rs`
+Schema source of truth: `launcher/src-tauri/vct-launcher-core/src/db/project_state.rs`
 (tables `project_agents`, `project_skills`, `project_hooks`,
 `project_kg_bindings`, `project_codegraph_bindings`).
 

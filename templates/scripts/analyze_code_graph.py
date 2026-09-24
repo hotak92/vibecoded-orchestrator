@@ -6663,8 +6663,7 @@ def main():
             # the analyzer's `_sanitize_collection_prefix` re-canonicalised
             # it and produced a prefix that diverged from the binding row,
             # silently writing to zombie collections. Always prefer the
-            # explicit prefix field here. See knowledge/concepts/
-            # multi-codebase-code-graph-detection.md for the diagnosis.
+            # explicit prefix field here.
             project_name = cfg.code_graph_collection_prefix
             if not project_name:
                 # Resolver returned an empty prefix; fall back.

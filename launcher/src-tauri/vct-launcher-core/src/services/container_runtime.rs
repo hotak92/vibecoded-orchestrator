@@ -4499,6 +4499,7 @@ mod tests {
     /// v0.2.67 extraction — the installer-engine copy now delegates here.
     #[test]
     fn module_pull_timeout_honours_env_override_and_rejects_garbage() {
+        let _env_lock = crate::test_env::env_lock();
         use std::time::Duration;
         let prev = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS").ok();
 
@@ -4548,6 +4549,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bounded_authed_pull_times_out_and_does_not_hang() {
+        let _env_lock = crate::test_env::env_lock();
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::Duration;

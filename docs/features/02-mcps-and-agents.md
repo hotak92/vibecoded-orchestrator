@@ -10,7 +10,7 @@ Five MCP servers ship with VCO by default:
 
 Authoritative writer for the four Python MCPs: `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Pure-Python fallback for installs that bypass the launcher: `install.py:20654-20661`. Playwright is invoked separately via `_install_playwright_browsers` (`install.py:24784-24858`) so users without npx still get the other four MCPs.
 
-The Python MCPs run from `claude_mcp_servers/.venv`. Pro-tier MCPs are excluded from the default install — see `mcp_registration.rs:16` for the rationale. The `mermaid` + `excalidraw` default-disabled list in `project_mcp_servers.rs` keeps the per-project tool surface narrow for users who don't author diagrams; the GUI toggle flips them on without re-running install.py.
+The Python MCPs run from the orchestrator install's shared venv — canonical `<install>/.venv`, with the legacy `claude_mcp_servers/.venv` accepted as a fallback (`mcp_registration.rs::resolve_venv_python`). Pro-tier MCPs are excluded from the default install — see `mcp_registration.rs:16` for the rationale. The `mermaid` + `excalidraw` default-disabled list in `project_mcp_servers.rs` keeps the per-project tool surface narrow for users who don't author diagrams; the GUI toggle flips them on without re-running install.py.
 
 ### Wrapper-MCP spawn shape and `PYTHONPATH` (v0.2.91)
 
@@ -196,7 +196,7 @@ Failure modes: `npx` not on PATH → the install step skips with WARN **and the 
 
 ## Infrastructure Scripts
 
-Shell wrappers under `.claude/scripts/` that auto-activate `claude_mcp_servers/.venv` before calling their Python backends. Most have a PowerShell `.ps1` sibling for Windows users.
+Shell wrappers under `.claude/scripts/` that resolve a dependency-gated venv via the shared ladder (`templates/scripts/vct_venv_ladder.sh` / `vct_venv_ladder.ps1`: `$VCT_VENV` → the `.claude/env` tier → the orchestrator install's `.venv` → a VCO-clone fallback, refusing loudly when no candidate imports the wrapper's required modules) before calling their Python backends. Most have a PowerShell `.ps1` sibling for Windows users.
 
 ### `kg-search` CLI
 Fast keyword/metadata search over the KG without going through Weaviate MCP.

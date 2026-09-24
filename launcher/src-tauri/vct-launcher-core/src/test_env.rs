@@ -74,6 +74,30 @@ use std::sync::{Mutex, MutexGuard};
 #[cfg(any(test, debug_assertions))]
 pub static GLOBAL_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
+/// A held [`GLOBAL_ENV_MUTEX`]. Also the proof a helper asks for when it
+/// mutates the environment on its caller's behalf: `fn set(_held: &EnvLock,
+/// …)` can only be called by code that holds the lock.
+///
+/// v0.2.97 review R6: every Rust test that mutates the process environment
+/// holds THIS lock — a per-module `static SERIALIZE` (or `#[serial]`) only
+/// orders the tests of one module, while the environment is shared by every
+/// test in the binary and every child they spawn. Pinned by
+/// `tests/test_rust_tests_never_mutate_process_path.py`.
+#[cfg(any(test, debug_assertions))]
+pub type EnvLock = MutexGuard<'static, ()>;
+
+/// Take [`GLOBAL_ENV_MUTEX`] (recovering from poison) for a test that
+/// mutates the process environment directly because a process-env read is
+/// the production contract it pins. Prefer [`env_guard`] /
+/// [`state_dir_guard_with`], which also restore the prior values.
+///
+/// NOT reentrant: never call [`env_guard`], [`with_env_vars`],
+/// [`state_dir_guard`] or [`with_state_dir`] while holding it.
+#[cfg(any(test, debug_assertions))]
+pub fn env_lock() -> EnvLock {
+    GLOBAL_ENV_MUTEX.lock().unwrap_or_else(|p| p.into_inner())
+}
+
 /// Run `f` with `VCT_STATE_DIR` set to a fresh tempdir. After `f`
 /// returns (or panics), restore the prior env-var state and drop the
 /// tempdir. Acquires `GLOBAL_ENV_MUTEX` for the duration.
@@ -173,9 +197,7 @@ pub fn state_dir_guard() -> StateDirGuard {
 /// value is still restored on drop).
 #[cfg(any(test, debug_assertions))]
 pub fn state_dir_guard_with(extra: &[(&str, Option<&str>)]) -> StateDirGuard {
-    let lock = GLOBAL_ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let lock = env_lock();
     let tmp = tempfile::tempdir().expect("tempdir for state_dir_guard");
     let path = tmp.path().to_path_buf();
 
@@ -218,9 +240,7 @@ pub struct EnvGuard {
 /// state-dir guard; use [`state_dir_guard_with`] instead.
 #[cfg(any(test, debug_assertions))]
 pub fn env_guard(vars: &[(&str, Option<&str>)]) -> EnvGuard {
-    let lock = GLOBAL_ENV_MUTEX
-        .lock()
-        .unwrap_or_else(|p| p.into_inner());
+    let lock = env_lock();
     let names: Vec<&str> = vars.iter().map(|(k, _)| *k).collect();
     let restore = EnvRestore::capture(&names);
     unsafe {
@@ -316,43 +336,47 @@ pub fn has_launcher_db() -> bool {
 mod tests {
     use super::*;
 
+    // v0.2.97 review R6: these tests used to plant a bogus `VCT_STATE_DIR`
+    // (or remove it) OUTSIDE the lock, so every concurrent test in this
+    // binary that read `vct_root_dir()` saw the plant — or, after a
+    // `remove_var`, the developer's REAL `~/.vct`. Now:
+    //
+    //   * the prior-value mechanics (set → restored, unset → unset, panic)
+    //     are pinned on PRIVATE variable names, planted under `env_lock()`;
+    //   * the guards' `VCT_STATE_DIR` handling is pinned against the
+    //     BASELINE the harness runs with, read and re-read under the lock
+    //     (every mutator restores before it releases, so the baseline is the
+    //     value whenever nobody holds the lock).
+
+    fn read_locked(name: &str) -> Option<OsString> {
+        let _held = env_lock();
+        std::env::var_os(name)
+    }
+
+    fn plant(name: &str, value: Option<&str>) {
+        let _held = env_lock();
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var(name, v),
+                None => std::env::remove_var(name),
+            }
+        }
+    }
+
     #[test]
     fn with_state_dir_sets_and_restores_var() {
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", "/prior-value");
-        }
+        let baseline = read_locked("VCT_STATE_DIR");
         with_state_dir(|root| {
             let now = std::env::var("VCT_STATE_DIR").unwrap();
             assert_eq!(now, root.to_string_lossy());
         });
-        // Restored.
-        assert_eq!(
-            std::env::var("VCT_STATE_DIR").unwrap(),
-            "/prior-value"
-        );
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-    }
-
-    #[test]
-    fn with_state_dir_restores_unset_var() {
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
-        with_state_dir(|_| {
-            assert!(std::env::var_os("VCT_STATE_DIR").is_some());
-        });
-        // Restored to unset.
-        assert!(std::env::var_os("VCT_STATE_DIR").is_none());
+        assert_eq!(read_locked("VCT_STATE_DIR"), baseline, "restored to the baseline");
     }
 
     #[test]
     fn with_env_vars_handles_set_and_unset_pairs() {
-        unsafe {
-            std::env::set_var("VCT_TEST_FOO", "before");
-            std::env::remove_var("VCT_TEST_BAR");
-        }
+        plant("VCT_TEST_FOO", Some("before"));
+        plant("VCT_TEST_BAR", None);
         with_env_vars(
             &[
                 ("VCT_TEST_FOO", Some("during")),
@@ -363,19 +387,14 @@ mod tests {
                 assert_eq!(std::env::var("VCT_TEST_BAR").unwrap(), "only-set-here");
             },
         );
-        // Restored.
-        assert_eq!(std::env::var("VCT_TEST_FOO").unwrap(), "before");
-        assert!(std::env::var_os("VCT_TEST_BAR").is_none());
-        unsafe {
-            std::env::remove_var("VCT_TEST_FOO");
-        }
+        assert_eq!(read_locked("VCT_TEST_FOO").as_deref(), Some(std::ffi::OsStr::new("before")));
+        assert!(read_locked("VCT_TEST_BAR").is_none());
+        plant("VCT_TEST_FOO", None);
     }
 
     #[test]
-    fn state_dir_guard_sets_and_restores_a_prior_value() {
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", "/prior-guard-value");
-        }
+    fn state_dir_guard_points_at_its_scratch_dir_and_restores_the_baseline() {
+        let baseline = read_locked("VCT_STATE_DIR");
         {
             let g = state_dir_guard();
             assert_eq!(
@@ -385,62 +404,54 @@ mod tests {
             );
             assert!(g.path().is_dir(), "scratch dir must exist while held");
         }
-        assert_eq!(
-            std::env::var("VCT_STATE_DIR").unwrap(),
-            "/prior-guard-value",
-            "the PRIOR value must come back — not an unset"
-        );
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
+        assert_eq!(read_locked("VCT_STATE_DIR"), baseline, "the PRIOR value must come back");
     }
 
-    /// The regression this whole module exists for: when the var was
-    /// UNSET before, restoring means unsetting — and when it was SET
-    /// before (an outer redirect), restoring means putting THAT back.
-    /// The 49 hand-rolled sites only ever did the first.
+    /// The regression this whole module exists for: when a var was UNSET
+    /// before, restoring means unsetting — and when it was SET before (an
+    /// outer redirect), restoring means putting THAT back. The 49
+    /// hand-rolled sites only ever did the first. Pinned on the shared
+    /// restore (`EnvRestore`, which every guard uses) with private names.
     #[test]
-    fn state_dir_guard_restores_an_unset_var_to_unset() {
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
+    fn a_guard_restores_a_prior_value_and_an_unset_var_to_unset() {
+        plant("VCT_TEST_RESTORE_SET", Some("outer"));
+        plant("VCT_TEST_RESTORE_UNSET", None);
         {
-            let g = state_dir_guard();
-            assert!(g.path().is_dir());
-            assert!(std::env::var_os("VCT_STATE_DIR").is_some());
+            let _g = state_dir_guard_with(&[
+                ("VCT_TEST_RESTORE_SET", Some("inner")),
+                ("VCT_TEST_RESTORE_UNSET", Some("inner")),
+            ]);
         }
-        assert!(
-            std::env::var_os("VCT_STATE_DIR").is_none(),
-            "an unset var must be restored to unset"
+        assert_eq!(
+            read_locked("VCT_TEST_RESTORE_SET").as_deref(),
+            Some(std::ffi::OsStr::new("outer")),
+            "the PRIOR value must come back — not an unset"
         );
+        assert!(read_locked("VCT_TEST_RESTORE_UNSET").is_none(), "an unset var is restored to unset");
+        plant("VCT_TEST_RESTORE_SET", None);
     }
 
     #[test]
     fn state_dir_guard_restores_on_panic() {
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", "/before-guard-panic");
-        }
+        let baseline = read_locked("VCT_STATE_DIR");
+        plant("VCT_TEST_PANIC_EXTRA", Some("before-guard-panic"));
         let caught = std::panic::catch_unwind(|| {
-            let _g = state_dir_guard();
+            let _g = state_dir_guard_with(&[("VCT_TEST_PANIC_EXTRA", Some("during"))]);
             panic!("intentional");
         });
         assert!(caught.is_err(), "panic must propagate");
+        assert_eq!(read_locked("VCT_STATE_DIR"), baseline, "Drop restores during unwind");
         assert_eq!(
-            std::env::var("VCT_STATE_DIR").unwrap(),
-            "/before-guard-panic",
-            "Drop restores during unwind — no catch_unwind needed"
+            read_locked("VCT_TEST_PANIC_EXTRA").as_deref(),
+            Some(std::ffi::OsStr::new("before-guard-panic"))
         );
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
+        plant("VCT_TEST_PANIC_EXTRA", None);
     }
 
     #[test]
     fn state_dir_guard_with_applies_and_restores_extra_vars() {
-        unsafe {
-            std::env::set_var("VCT_TEST_EXTRA_KEEP", "outer");
-            std::env::remove_var("VCT_TEST_EXTRA_NEW");
-        }
+        plant("VCT_TEST_EXTRA_KEEP", Some("outer"));
+        plant("VCT_TEST_EXTRA_NEW", None);
         {
             let g = state_dir_guard_with(&[
                 ("VCT_TEST_EXTRA_KEEP", Some("inner")),
@@ -450,40 +461,31 @@ mod tests {
             assert_eq!(std::env::var("VCT_TEST_EXTRA_KEEP").unwrap(), "inner");
             assert_eq!(std::env::var("VCT_TEST_EXTRA_NEW").unwrap(), "only-here");
         }
-        assert_eq!(std::env::var("VCT_TEST_EXTRA_KEEP").unwrap(), "outer");
-        assert!(std::env::var_os("VCT_TEST_EXTRA_NEW").is_none());
-        unsafe {
-            std::env::remove_var("VCT_TEST_EXTRA_KEEP");
-        }
+        assert_eq!(read_locked("VCT_TEST_EXTRA_KEEP").as_deref(), Some(std::ffi::OsStr::new("outer")));
+        assert!(read_locked("VCT_TEST_EXTRA_NEW").is_none());
+        plant("VCT_TEST_EXTRA_KEEP", None);
     }
 
-    /// `extra` may carry `None` to UNSET a var for the duration — the
-    /// shape `hub_launcher`'s "nothing resolves" tests need.
+    /// `extra` may carry `None` to UNSET a var for the duration.
     #[test]
     fn state_dir_guard_with_can_unset_a_var_for_the_duration() {
-        unsafe {
-            std::env::set_var("VCT_TEST_EXTRA_UNSET_ME", "present");
-        }
+        plant("VCT_TEST_EXTRA_UNSET_ME", Some("present"));
         {
             let _g = state_dir_guard_with(&[("VCT_TEST_EXTRA_UNSET_ME", None)]);
             assert!(std::env::var_os("VCT_TEST_EXTRA_UNSET_ME").is_none());
         }
         assert_eq!(
-            std::env::var("VCT_TEST_EXTRA_UNSET_ME").unwrap(),
-            "present",
+            read_locked("VCT_TEST_EXTRA_UNSET_ME").as_deref(),
+            Some(std::ffi::OsStr::new("present")),
             "an unset-for-the-duration var must come back"
         );
-        unsafe {
-            std::env::remove_var("VCT_TEST_EXTRA_UNSET_ME");
-        }
+        plant("VCT_TEST_EXTRA_UNSET_ME", None);
     }
 
     #[test]
     fn env_guard_restores_set_and_unset_pairs() {
-        unsafe {
-            std::env::set_var("VCT_TEST_GUARD_FOO", "before");
-            std::env::remove_var("VCT_TEST_GUARD_BAR");
-        }
+        plant("VCT_TEST_GUARD_FOO", Some("before"));
+        plant("VCT_TEST_GUARD_BAR", None);
         {
             let _g = env_guard(&[
                 ("VCT_TEST_GUARD_FOO", Some("during")),
@@ -492,33 +494,44 @@ mod tests {
             assert_eq!(std::env::var("VCT_TEST_GUARD_FOO").unwrap(), "during");
             assert_eq!(std::env::var("VCT_TEST_GUARD_BAR").unwrap(), "only-set-here");
         }
-        assert_eq!(std::env::var("VCT_TEST_GUARD_FOO").unwrap(), "before");
-        assert!(std::env::var_os("VCT_TEST_GUARD_BAR").is_none());
-        unsafe {
-            std::env::remove_var("VCT_TEST_GUARD_FOO");
-        }
+        assert_eq!(read_locked("VCT_TEST_GUARD_FOO").as_deref(), Some(std::ffi::OsStr::new("before")));
+        assert!(read_locked("VCT_TEST_GUARD_BAR").is_none());
+        plant("VCT_TEST_GUARD_FOO", None);
     }
 
     #[test]
     fn with_state_dir_restores_env_after_panic() {
-        // The fix here is the `catch_unwind` + `resume_unwind` pattern:
-        // if `f` panics, we still restore the prior env state before
-        // re-raising. Without that, a panicking test would leak state
-        // into the next test that ran on the same thread.
-        unsafe {
-            std::env::set_var("VCT_STATE_DIR", "/before-panic");
-        }
+        // If `f` panics, the guard's Drop still restores the prior env state
+        // during the unwind. Without that, a panicking test would leak state
+        // into the next test.
+        let baseline = read_locked("VCT_STATE_DIR");
         let caught = std::panic::catch_unwind(|| {
             with_state_dir(|_| panic!("intentional"));
         });
         assert!(caught.is_err(), "panic should propagate");
-        assert_eq!(
-            std::env::var("VCT_STATE_DIR").unwrap(),
-            "/before-panic",
-            "env restored even after panic"
+        assert_eq!(read_locked("VCT_STATE_DIR"), baseline, "env restored even after panic");
+    }
+
+    /// `env_lock` is the lock the guards take: while a test holds it, a
+    /// guard on another thread waits.
+    fn take_a_guard_then_signal(tx: std::sync::mpsc::Sender<()>) {
+        let _g = env_guard(&[("VCT_TEST_LOCK_PROBE", Some("x"))]);
+        tx.send(()).unwrap();
+    }
+
+    #[test]
+    fn env_lock_is_the_lock_the_guards_take() {
+        let held = env_lock();
+        let (tx, rx) = std::sync::mpsc::channel();
+        // On ANOTHER thread — taking a guard on this one would deadlock.
+        let waiter = std::thread::spawn(move || take_a_guard_then_signal(tx));
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_millis(200)).is_err(),
+            "a guard must not proceed while env_lock() is held"
         );
-        unsafe {
-            std::env::remove_var("VCT_STATE_DIR");
-        }
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("the guard proceeds once released");
+        waiter.join().unwrap();
+        assert!(read_locked("VCT_TEST_LOCK_PROBE").is_none());
     }
 }

@@ -2665,6 +2665,7 @@ mod tests {
 
     #[test]
     fn resolve_stall_timeout_uses_default_when_unset() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
         unsafe {
@@ -2681,6 +2682,7 @@ mod tests {
 
     #[test]
     fn resolve_stall_timeout_honours_env_override() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
         unsafe {
@@ -2696,6 +2698,7 @@ mod tests {
 
     #[test]
     fn resolve_stall_timeout_zero_disables_watchdog() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
         unsafe {
@@ -2711,6 +2714,7 @@ mod tests {
 
     #[test]
     fn resolve_stall_timeout_falls_back_on_garbage() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
         unsafe {
@@ -2782,6 +2786,7 @@ mod tests {
 
     #[test]
     fn heartbeat_stale_secs_has_floor_and_scales_with_stall_timeout() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let _g = env_test_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var_os("KG_SYNC_STALL_TIMEOUT_SECS");
 

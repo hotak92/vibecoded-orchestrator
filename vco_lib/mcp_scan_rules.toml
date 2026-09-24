@@ -236,8 +236,26 @@ uninstall_scrub_shape_gated = [
 # One [deprecated.<name>] table per deprecated MCP. Fields:
 #   removed_in      — release the MCP left the default set
 #   reason          — human-readable why (shown in the deferral)
-#   opt_in_manifest — bundled-module manifest to re-add it, if any
+#   opt_in_manifest — OPTIONAL: the repo-relative path of a bundled-module
+#                     manifest that re-adds the MCP
+#                     (`launcher/bundled_manifests/<id>.json`). Its reader is
+#                     `install_mcp._detect_deprecated_mcp_entries`, which adds
+#                     an "Opt-in: … inspect <path>" line to the deferral; the
+#                     Rust side carries it for table parity. It must name a
+#                     manifest the launcher embeds —
+#                     `every_referenced_module_id_is_an_embedded_manifest`
+#                     (vct-launcher-core) and
+#                     tests/test_v0297_r6_manifest_references.py fail otherwise.
+#
+# [deprecated.ollama] has NO opt_in_manifest, by evidence: the manifest it
+# used to name (`vct-ollama.json`) was deleted in v0.2.11 together with the
+# `claude_mcp_servers/ollama_mcp/` server it installed (PR-14b — "no MCP
+# server to install for it anymore"), two releases BEFORE this key existed
+# (PR-34, v0.2.13), so the deferral had been telling users to inspect a file
+# that never shipped with the key. The capability is superseded by Claude's
+# native Read / vision / reasoning (the reason below). Ollama itself is
+# infrastructure — the `ollama` service of infrastructure/docker-compose.yml,
+# started by the ensure-containers hook — not a module.
 [deprecated.ollama]
 removed_in = "v0.2.11"
 reason = "Ollama MCP server dropped from default install (PR-14a). The tools it exposed (chat / read_document / read_image) are redundant with Claude's native capabilities. Ollama remains as embedding infrastructure (Weaviate vectorizers); only the MCP tool-surface was removed."
-opt_in_manifest = "launcher/bundled_manifests/vct-ollama.json"

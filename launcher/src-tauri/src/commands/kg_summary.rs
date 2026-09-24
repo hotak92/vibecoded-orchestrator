@@ -1753,6 +1753,7 @@ mod tests {
 
     #[test]
     fn resolve_summary_returns_none_when_missing() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let d = tmpdir("resolve-miss");
         // No .claude/scripts/ at all.
         // Clear any env override so step 2 of the resolver doesn't pick

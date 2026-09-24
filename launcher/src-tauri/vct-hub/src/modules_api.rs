@@ -1681,7 +1681,9 @@ mod tests {
     async fn project_env_delivers_the_bundled_session_state_settings() {
         let _kc_lock = h1_lock();
         let guard = vct_launcher_core::test_env::state_dir_guard();
-        let written = vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path()).unwrap();
+        let report = vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let written = report.written;
         assert!(written.contains(&"vct-session-state.json".to_string()));
         let (base, h) = spawn_modules_api_hub().await;
         seed_project(&h.0, "p-bundled-1", "Bundled Project", "/tmp/bundled-project-1");

@@ -519,28 +519,19 @@ pub fn is_launcher_managed_override(body: &str) -> bool {
 // Legacy-volume detection
 // ---------------------------------------------------------------------------
 
-/// Find `podman` or `docker` on PATH. Returns the absolute path-as-string
-/// of the runtime, or `None` if neither is present.
-fn which_runtime() -> Option<String> {
-    for runtime in &["podman", "docker"] {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                #[cfg(windows)]
-                let candidates: Vec<PathBuf> = vec![
-                    dir.join(format!("{runtime}.exe")),
-                    dir.join(runtime),
-                ];
-                #[cfg(not(windows))]
-                let candidates: Vec<PathBuf> = vec![dir.join(runtime)];
-                for c in candidates {
-                    if c.is_file() {
-                        return Some(c.to_string_lossy().to_string());
-                    }
-                }
-            }
-        }
-    }
-    None
+/// Find `podman` (first) or `docker` on PATH. Returns the absolute
+/// path-as-string of the runtime, or `None` if neither is present.
+///
+/// The one home for this probe — `volumes` calls it too (v0.2.97 review
+/// R6: both, and `runtime_install`, walked `$PATH` by hand). The walk itself
+/// is `vct_launcher_core::paths::which_on_path`, the launcher's one PATH
+/// lookup (`.exe`/`.cmd`/`.bat` on Windows; a test injects its PATH per
+/// thread instead of setting the process one).
+pub(crate) fn which_runtime() -> Option<String> {
+    ["podman", "docker"]
+        .iter()
+        .find_map(|runtime| vct_launcher_core::paths::which_on_path(runtime))
+        .map(|p| p.to_string_lossy().to_string())
 }
 
 /// Parse one line of `podman volume ls --format '{{.Name}}'` output and
@@ -1325,6 +1316,34 @@ pub async fn migrate_to_bind_path(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- Runtime probe (v0.2.97 review R6: the one PATH lookup) ----------
+
+    /// podman outranks docker even when docker's directory comes first; the
+    /// answer is the absolute binary path; the PATH is injected per thread.
+    #[cfg(unix)]
+    #[test]
+    fn which_runtime_prefers_podman_through_the_injected_lookup_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let docker_dir = tempfile::tempdir().unwrap();
+        let podman_dir = tempfile::tempdir().unwrap();
+        let docker = docker_dir.path().join("docker");
+        let podman = podman_dir.path().join("podman");
+        for bin in [&docker, &podman] {
+            std::fs::write(bin, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let both = std::env::join_paths([docker_dir.path(), podman_dir.path()]).unwrap();
+        use vct_launcher_core::paths::with_lookup_path as lookup;
+        assert_eq!(lookup(Some(&both), which_runtime), Some(podman.to_string_lossy().to_string()));
+        assert_eq!(
+            lookup(Some(docker_dir.path().as_os_str()), which_runtime),
+            Some(docker.to_string_lossy().to_string())
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert_eq!(lookup(Some(empty.path().as_os_str()), which_runtime), None);
+        assert_eq!(lookup(None, which_runtime), None, "no PATH at all finds nothing");
+    }
 
     // ----- Allowlist filtering ---------------------------------------------
 
