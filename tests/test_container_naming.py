@@ -208,7 +208,7 @@ class FindExistingContainerTests(unittest.TestCase):
         """Runtime is present but every probe returns non-zero (no
         container by that name exists) → return None."""
         # Fake runtime is on PATH.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
         # Every subprocess.run returns the "no such container" failure
@@ -231,7 +231,7 @@ class FindExistingContainerTests(unittest.TestCase):
 
     def test_returns_canonical_when_canonical_exists(self):
         """When the canonical container exists, it wins over aliases."""
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
         class FakeCompleted:
@@ -269,7 +269,7 @@ class FindExistingContainerTests(unittest.TestCase):
 
     def test_falls_through_to_legacy_alias(self):
         """When only a legacy alias exists, return that alias."""
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
         class FakeCompleted:
@@ -331,7 +331,7 @@ class ContainerInspectProbeTests(unittest.TestCase):
         Returns (result, [argv of every probe])."""
         argvs: list[list[str]] = []
 
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name in ("podman", "docker") else None
 
         def fake_run(cmd, **kwargs):
@@ -479,7 +479,7 @@ class RuntimeSelectionTests(unittest.TestCase):
     def test_env_var_podman_overrides_docker_default(self):
         # When the env says podman and shutil reports podman present,
         # the probe should go through podman.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name in ("podman", "docker") else None
 
         seen_bins: list[str] = []
@@ -517,7 +517,7 @@ class RuntimeSelectionTests(unittest.TestCase):
 
     def test_env_var_auto_uses_caller_default(self):
         # auto = no preference = caller's `runtime` argument wins.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name in ("podman", "docker") else None
 
         seen_bins: list[str] = []
@@ -589,7 +589,7 @@ class PinnedRuntimeLookupTests(unittest.TestCase):
                 txt.parent.mkdir(parents=True)
                 txt.write_text(recorded + "\n", encoding="utf-8")
             with patch("vco_lib.containers.shutil.which",
-                       side_effect=lambda n: f"/fake/{n}" if n in on_path else None), \
+                       side_effect=lambda n, path=None: f"/fake/{n}" if n in on_path else None), \
                     patch("vco_lib.containers.subprocess.run", side_effect=fake_run), \
                     patch.dict(os.environ, env, clear=True):
                 result = find_existing_container("weaviate", install_root=Path(root))

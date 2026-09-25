@@ -364,13 +364,17 @@ The chosen executable is returned as a string (`podman` or `docker`) and used un
 "Is podman (or docker) installed?" is answered on the calling process's `PATH`
 **and** in the usual install locations — one list, `vco_lib/tool_search_dirs.toml`,
 read by the Python side (`vco_lib.tool_search_dirs`), by the launcher and the
-hub (both prepend it to their `PATH` at startup) and by the boot wrapper
-`scripts/launch-claude-mcp-stack.{sh,ps1}` (it appends the directory of a runtime
-found only there). Linux: `~/.local/bin`, `~/.cargo/bin`, Linuxbrew, `/snap/bin`,
-flatpak, `~/bin` (rootless Docker), `/usr/local/bin`, `/usr/bin`. macOS:
-`/opt/homebrew/bin` and `/sbin`, `~/.cargo/bin`, `~/.local/bin`, `~/bin`,
-`/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle, `~/.docker/bin`,
-MacPorts, `/usr/bin`. Windows: the Docker Desktop and Podman installer directories.
+hub (both add the directories their `PATH` lacks at startup) and by the boot
+wrapper `scripts/launch-claude-mcp-stack.{sh,ps1}` (it adds the directory of a
+runtime found outside its `PATH`). Each entry has a **placement**, and every
+surface applies the same order, so a name resolves to the same binary everywhere:
+
+| Placement | Entries | Where a missing one goes |
+|---|---|---|
+| `prepend-when-missing` | the graphical-launch list (v0.2.53). Linux: `~/.local/bin`, `~/.cargo/bin`, Linuxbrew, `/snap/bin`, flatpak. macOS: `/opt/homebrew/bin` and `/sbin`, `~/.cargo/bin`, `~/.local/bin` | **ahead** of your `PATH` — the order your login shell builds, so a Finder launch runs Homebrew's `git`/`python3` rather than the `/usr/bin` Xcode Command Line Tools stubs |
+| `append` | the container-runtime locations (v0.2.97). Linux: `~/bin` (rootless Docker), `/usr/local/bin`, `/usr/bin`. macOS: `~/bin`, `/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle, `~/.docker/bin`, MacPorts, `/usr/bin`. Windows: the Docker Desktop and Podman installer directories | **after** your `PATH` — they only reach a tool nothing on it provides, and never shadow one |
+
+A directory already on your `PATH` is never moved, whatever its placement.
 A boot unit, a Finder/`.desktop`-launched launcher and the hub start with a short
 `PATH`; without this list they read a runtime in `~/bin` or `/opt/homebrew/bin` as
 **not installed** — and a runtime that is not installed is the one case in which
@@ -383,7 +387,7 @@ to change it — both files are rewritten).
 
 | Var | Effect |
 |---|---|
-| `VCT_TOOL_SEARCH_DIRS` | When **set** (even to an empty string), replaces the list above for this OS: entries separated by the OS path separator (`:` / `;`), each `~/…` or `${NAME}…` expanded. Empty means "look on `PATH` only" — the test suite runs that way so it never finds the host's own runtimes. |
+| `VCT_TOOL_SEARCH_DIRS` | When **set** (even to an empty string), replaces the list above for this OS: entries separated by the OS path separator (`:` / `;`), each `~/…` or `${NAME}…` expanded, every one placed `append` (after your `PATH`). Empty means "look on `PATH` only" — the test suite runs that way so it never finds the host's own runtimes. |
 
 ### Forcing Docker when both runtimes are installed
 

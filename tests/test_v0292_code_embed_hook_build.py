@@ -357,6 +357,83 @@ class PowerShellUnreadablePlanTests(unittest.TestCase):
             self.assertEqual(fx.compose_invocations(), [])
 
 
+def _refused_runtime_fixture(tmp: Path) -> "_Fixture":
+    """_Fixture's readable plan plus a PINNED runtime the resolver must
+    REFUSE: the fake podman answers ``version`` but its daemon is down
+    (``info`` fails) while ``VCT_CONTAINER_RUNTIME`` pins podman, so
+    ``vco_lib.containers resolve --shell`` exits 3 (state=absent,
+    requested=podman) — the exact NON-ZERO resolver answer R10 J1 is about:
+    under the hook's ``set -euo pipefail`` a bare ``out="$(cmd)" ; rc=$?``
+    aborted the shell at the assignment, so the hook died with the
+    resolver's exit code, empty stdout and a leaked
+    ``$TMPDIR/vco-containers-resolve.<pid>`` instead of reporting the
+    refusal on STDOUT (the R9 H3 contract this hook's plan branch rests
+    on). Same refusal shape as ``_refusal_fixture`` below, but with the
+    launcher.db the plan read needs."""
+    fx = _Fixture(tmp)
+    (fx.bin / "podman").write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        case "$1" in
+          version) exit 0 ;;
+          info) exit 1 ;;
+        esac
+        exit 0
+        """))
+    (fx.bin / "podman").chmod(0o755)
+    return fx
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class BashRefusedRuntimeTests(unittest.TestCase):
+    """R10 J1 — a refused runtime pin (resolver exit 3) is an EXPECTED
+    answer, not a hook failure: exit 0, the refusal line on STDOUT, no
+    leaked resolver temp file."""
+
+    def test_a_refused_pin_is_reported_not_fatal_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _refused_runtime_fixture(Path(tmp))
+            env = fx.env(free_port())
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("skipping", proc.stdout,
+                          "the refusal must be reported on STDOUT "
+                          f"(R9 H3 contract):\n{proc.stdout}\n{proc.stderr}")
+            leftovers = list(Path(tmp).glob("vco-containers-resolve.*"))
+            self.assertEqual(leftovers, [], f"resolver temp files leaked: {leftovers}")
+            # A refused runtime is a skip: compose is never reached.
+            self.assertEqual(fx.compose_invocations(), [])
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class PowerShellRefusedRuntimeTests(unittest.TestCase):
+    """R10 J1, .ps1 parity pin — the sibling already handled rc 3/4
+    (``-in 0, 3, 4``); this proves it stays that way."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def test_a_refused_pin_is_reported_not_fatal_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _refused_runtime_fixture(Path(tmp))
+            env = fx.env(free_port())
+            env["TEMP"] = str(fx.tmp)
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("skipping", proc.stdout, proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [])
+
+
 @unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling mirrors it")
 class EnsureContainersBuildGateTests(unittest.TestCase):
     """`ensure-containers` rebuilds ONLY when code_embed is among the missing.

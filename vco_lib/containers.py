@@ -736,9 +736,10 @@ def installed_runtime(
     *, env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
     install_root: object = _DEFAULT_ROOT,
 ) -> str:
-    """The FIRST candidate binary on PATH regardless of whether its daemon
-    runs (the pinned runtime — :func:`runtime_pin` — wins when installed).
-    ``""`` when none is."""
+    """The FIRST candidate binary installed — on PATH or in the usual install
+    locations (:mod:`vco_lib.tool_search_dirs`) — regardless of whether its
+    daemon runs (the pinned runtime — :func:`runtime_pin` — wins when
+    installed). ``""`` when none is."""
     _which = which or _tsd.which
     pin = runtime_pin(env, install_root=install_root, warn=lambda _m: None)
     pref = pin[0] if pin is not None else None
@@ -773,7 +774,8 @@ def daemon_responsive(
     """``<runtime> info`` — round-trips to the daemon / socket / machine,
     the same code path compose-up needs. Catches a stopped Docker Desktop
     on macOS, a stopped ``podman.socket`` on Linux, an unstarted podman
-    machine on Windows. ``False`` when the binary is not on PATH."""
+    machine on Windows. ``False`` when the binary is not installed — neither
+    on PATH nor in the usual install locations (:mod:`vco_lib.tool_search_dirs`)."""
     if not runtime or not (which or _tsd.which)(runtime):
         return False
     return _probe([runtime, "info"], DAEMON_PROBE_TIMEOUT_S, run or _tsd.run)
@@ -1188,7 +1190,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         # R9 H5: a runtime (or its compose front-end) found only in the usual
         # install locations must also be DRIVABLE by the caller, which runs it
         # by name. `search_path` is the caller's PATH with those directories
-        # appended — `None` when nothing needs adding.
+        # added per the table's placement (`tool_search_dirs.reachable_path`)
+        # — `None` when nothing needs adding.
         search_path = _tsd.reachable_path() if res.state is RuntimeState.RESOLVED else None
         if args.json:
             d = res.to_dict()

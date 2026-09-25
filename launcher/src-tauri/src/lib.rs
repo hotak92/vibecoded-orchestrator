@@ -899,8 +899,12 @@ pub fn run() {
             // `.desktop`-launched apps under systemd-user inherit a
             // similarly minimal PATH (missing `$HOME/.local/bin`,
             // `$HOME/.cargo/bin`, linuxbrew, snap, flatpak). Windows
-            // Explorer-launched apps inherit the user PATH via registry,
-            // so the call is a no-op there.
+            // Explorer-launched apps inherit the user PATH via registry;
+            // there it only appends the container runtimes' installer dirs
+            // the PATH lacks (v0.2.97). Order rule (R10): the graphical-
+            // launch dirs go AHEAD of the inherited PATH (a login shell's
+            // order), the runtime locations BEHIND it — per entry in
+            // `vco_lib/tool_search_dirs.toml`.
             //
             // Idempotent: candidates already on PATH are skipped, so
             // running again from a terminal that already sourced .zshrc

@@ -709,12 +709,11 @@ Inline button on the gate spawns `first-install.{sh,command,bat}` in a terminal 
 
 **Why**: `.app` double-click on macOS Finder, and `.desktop` activation on GNOME/KDE, both inherit a minimal LaunchServices / systemd-user PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Tooling installed via Homebrew, cargo, pipx, linuxbrew, snap, flatpak is missing, so every subsequent `python3`, `cargo`, `podman`, `git` spawn failed with "command not found" until the user re-launched from a terminal. Cross-OS triage finding `cross-os-triage-2026-06-10.md` §P0-7 confirms macOS + Linux are the same root cause.
 
-**Candidates** (prepended; first wins):
-- macOS: `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`.
-- Linux: `$HOME/.local/bin`, `$HOME/.cargo/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/snap/bin`, `/var/lib/flatpak/exports/bin`.
-- Windows: no-op — Explorer-launched apps inherit user PATH from registry (`HKCU\Environment`).
+**Candidates** — since v0.2.97 one table, `vco_lib/tool_search_dirs.toml`, shared with the Python side and also applied by the hub at startup; each entry is added only when `PATH` lacks it, per its `placement` (see [CONFIGURATION.md](../CONFIGURATION.md#where-vco-looks-for-the-runtime-v0297)):
+- `prepend-when-missing` (the v0.2.53 list above, a login shell's order; first wins): macOS `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`; Linux `$HOME/.local/bin`, `$HOME/.cargo/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/snap/bin`, `/var/lib/flatpak/exports/bin`.
+- `append` (the v0.2.97 container-runtime locations — reach only, never shadow): `~/bin`, `/usr/local/bin`, `/usr/bin`, and on macOS `/opt/podman/bin`, Docker Desktop, `~/.docker/bin`, MacPorts; on Windows (where Explorer-launched apps otherwise inherit the registry PATH) the Docker Desktop / Podman installer directories.
 
-Properties: idempotent (`HashSet` dedup), order-preserving (existing PATH stays in original order after the prepend), soft-fail (`HOME` unset → `$HOME`-relative candidates silently dropped), `~` expanded to a real path. Tests at `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs:829–910`.
+Properties: idempotent (`HashSet` dedup), order-preserving (the inherited PATH stays contiguous and in its original order; an entry already on it is never moved), soft-fail (`HOME` unset → `$HOME`-relative candidates silently dropped), `~` expanded to a real path. Tests: the `augment_path_*` / `a_graphical_launch_still_prefers_homebrew_over_the_system_stub` / `tool_search_order_matches_the_shared_fixture` tests in `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs`, and `tests/fixtures/tool_search_dirs_cases.json` (run by both languages).
 
 ---
 

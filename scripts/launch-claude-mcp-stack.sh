@@ -219,7 +219,8 @@ _log_foreign_record() {
 # of where the data is — its runtime is not installed (not on PATH nor in the
 # usual install locations) and the other one holds VCO's containers/volumes,
 # or it holds none of them while the other does — and nothing otherwise (then
-# the pin is refused as before). "No VCO data anywhere" is never switched
+# the pin is refused as before). A bind-mounted data folder (R10 J2) is data
+# under the recorded runtime: never switched away from here. "No VCO data anywhere" is never switched
 # here (R9 H1: install.py decides that one), nor is a runtime the user
 # confirmed with `install.py --container` (R9 H2). The next install/update
 # re-records it.
@@ -289,9 +290,12 @@ _bounded() {
 # `command -v` called an installed runtime "not installed" — and a runtime
 # judged not installed is one the record reconcile may switch away from.
 # Asks the ONE table (vco_lib/tool_search_dirs.toml, through
-# `python -m vco_lib.tool_search_dirs search-path`) and appends the directory
-# of every such tool found only there. Whatever PATH already reached keeps
-# winning. Soft: no Python or no answer leaves PATH as it is.
+# `python -m vco_lib.tool_search_dirs search-path`) and adds the directory of
+# every such tool found outside PATH, per the table's placement (a
+# graphical-launch dir such as Homebrew ahead of PATH, as a login shell has it;
+# a runtime location such as ~/bin after it) — the order the launcher, the hub
+# and every Python surface use. PATH itself is kept as it is. Soft: no Python
+# or no answer leaves PATH as it is.
 # ---------------------------------------------------------------------------
 augment_tool_path() {
     local p

@@ -32,6 +32,9 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/compose-invocation.ps1"
+# R10 J5: the detached record-boot-refusal spawn below goes through the ONE
+# guarded spawn home (argument quoting, hidden window, soft-fail).
+. "$PSScriptRoot/_lib/resolve-powershell.ps1"
 
 if ($env:VCT_SKIP_PORT_WATCHDOG -eq "1") { return }
 
@@ -149,11 +152,19 @@ if ($VcoRt.state -ne "resolved") {
     # already said it), but a REFUSED PIN is a user action, so it is reported.
     if ($VcoRt.requested) {
         Write-Output "verify-container-ports: $($VcoRt.reason); skipping"
-        # R9 H4/H7 (parity with the .sh sibling): also in the ledger. Soft-fail;
-        # the CLI bounds itself and writes only an installed clone's ledger.
-        try {
-            [void](& $RunPy -m vco_lib.runtime_reconcile record-boot-refusal --source session --reason ($VcoRt.reason) 2>$null)
-        } catch { }
+        # R9 H4/H7 (parity with the .sh sibling): also in the ledger. R10 J5:
+        # FIRED DETACHED, never waited for - the record can sit on the ledger
+        # lock a 10 s-bound update holds after a resolve that already spent
+        # up to ~30 s probing, and the sum passes this hook's 30 s budget
+        # (Claude Code would discard the refusal line above with the rest of
+        # the output). Start-VcoDetachedProcess = the ONE guarded spawn home
+        # (argument quoting, hidden window, soft-fail); the CLI bounds itself
+        # and writes only an installed clone's ledger.
+        $RecOut = Join-Path ([System.IO.Path]::GetTempPath()) "vco-record-refusal.$PID.out"
+        [void](Start-VcoDetachedProcess -FilePath $RunPy `
+            -ArgumentList @('-m', 'vco_lib.runtime_reconcile', 'record-boot-refusal',
+                            '--source', 'session', '--reason', [string]$VcoRt.reason) `
+            -RedirectStandardOutput $RecOut -RedirectStandardError "$RecOut.err")
     }
     Write-VcoPortCheckLog -Action "skipped" -Reason $(if ($VcoRt.reason) { [string]$VcoRt.reason } else { "no usable container runtime" })
     return

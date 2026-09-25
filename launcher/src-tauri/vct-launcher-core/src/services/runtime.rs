@@ -188,8 +188,9 @@ impl RuntimeInfo {
 
 /// Augment the process-wide `PATH` with the OS-appropriate locations where
 /// user-installed CLI tooling (homebrew, cargo, pipx, linuxbrew, snap, flatpak)
-/// typically lives but which graphical launchers (Finder on macOS,
-/// `.desktop` files under GNOME/KDE on Linux) do NOT inherit.
+/// and the container runtimes typically live but which graphical launchers
+/// (Finder on macOS, `.desktop` files under GNOME/KDE on Linux) and boot units
+/// do NOT inherit.
 ///
 /// Why this exists (v0.2.53 M-P0-7 / L-P0-4):
 ///   - macOS: when the launcher is started by double-clicking
@@ -198,15 +199,14 @@ impl RuntimeInfo {
 ///     default PATH: `/usr/bin:/bin:/usr/sbin:/sbin` — `/opt/homebrew/bin/`
 ///     and `$HOME/.cargo/bin/` are NOT on it. Every subsequent `python3`,
 ///     `cargo`, `joern`, `podman`, `git` spawn fails with "command not
-///     found" until the user manually re-launches the launcher from a
-///     terminal session that DID source `.zshrc` /
-///     `eval "$(brew shellenv)"`.
+///     found" — or runs `/usr/bin/git` / `/usr/bin/python3`, the Xcode
+///     Command Line Tools stubs — until the user re-launches from a terminal
+///     session that DID source `.zshrc` / `eval "$(brew shellenv)"`.
 ///   - Linux: same shape via `.desktop` launchers. Under systemd-user,
 ///     the PATH is
 ///     `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` —
 ///     `$HOME/.cargo/bin`, `$HOME/.local/bin`, Linuxbrew, snap, flatpak
-///     are missing. Frequency is lower than macOS (Linux dev users tend
-///     to launch from terminal) but the bug shape is identical.
+///     are missing.
 ///   - Windows: Explorer-launched apps inherit the user PATH via
 ///     registry (`HKCU\Environment`); since v0.2.97 R9 the Docker Desktop /
 ///     Podman installer directories are still added when missing (a
@@ -218,19 +218,19 @@ impl RuntimeInfo {
 ///     and a short inherited PATH must not answer "no" for a runtime in
 ///     `~/bin` or `/opt/homebrew/bin`.
 ///
-/// Cross-OS triage finding (`cross-os-triage-2026-06-10.md` §P0-7)
-/// confirms the macOS + Linux PATH inheritance class is the same root
-/// cause: launcher processes spawned from graphical contexts do NOT
-/// see the user's interactive-shell PATH. Single helper, OS-cfg'd
-/// candidates.
-///
 /// Properties:
 ///   - Idempotent: calling twice does not duplicate entries.
-///   - Order-preserving: existing user PATH stays in its original
-///     order; augment candidates are PREPENDED so they take precedence
-///     over the system PATH (but only when missing). This matters when
-///     the user has both a system `python3` and a homebrew `python3` —
-///     homebrew should win for parity with their interactive shell.
+///   - The order rule (v0.2.97 R10 J3, split by the table's per-entry
+///     `placement`; see [`augmented_entries`]): the v0.2.53 graphical-launch
+///     candidates (`prepend-when-missing`) the inherited PATH lacks go AHEAD
+///     of it — a login shell's order, so Homebrew's `git` beats the
+///     `/usr/bin` stub in a Finder launch, exactly as before v0.2.97 — and
+///     the v0.2.97 runtime locations (`append`) it lacks go AFTER it, so they
+///     never shadow an inherited entry. An entry already on the inherited
+///     PATH is never moved, so the inherited PATH keeps its own order.
+///     `vco_lib.tool_search_dirs` (`which`, `run`, `reachable_path`) follows
+///     the same rule, so a name resolves to the SAME binary in the launcher,
+///     the hub and every Python/shell surface.
 ///   - Soft-fail: if `HOME` is unset (CI / sandboxed contexts) the
 ///     candidates that reference `$HOME` are silently dropped.
 ///   - Resolves `~` expansion: `$HOME/.cargo/bin` is materialised, not
@@ -261,30 +261,18 @@ pub fn augmented_path(
     current: &std::ffi::OsStr,
     home: Option<&std::path::Path>,
 ) -> Option<std::ffi::OsString> {
-    let candidates = augment_candidates(home);
-    if candidates.is_empty() {
-        return None;
-    }
-    let mut seen: std::collections::HashSet<PathBuf> =
-        std::env::split_paths(current).collect();
-
-    // Prepend candidates that are not already on PATH, preserving the
-    // order declared in `augment_candidates()`. Existing PATH entries
-    // follow.
-    let mut new_entries: Vec<PathBuf> = Vec::with_capacity(candidates.len());
-    for cand in candidates {
-        if seen.insert(cand.clone()) {
-            new_entries.push(cand);
-        }
-    }
-    if new_entries.is_empty() {
+    // An empty PATH has no entries (split_paths would yield one empty entry,
+    // i.e. the current directory, in the middle of the result).
+    let inherited: Vec<PathBuf> = if current.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(current).collect()
+    };
+    let entries = augmented_entries(&inherited, &augment_candidates(home));
+    if entries.len() == inherited.len() {
         return None; // All candidates already on PATH — nothing to do.
     }
-
-    // Append existing PATH entries after the new prepended candidates.
-    new_entries.extend(std::env::split_paths(current));
-
-    match std::env::join_paths(new_entries.iter()) {
+    match std::env::join_paths(entries.iter()) {
         Ok(joined) => Some(joined),
         Err(e) => {
             tracing::warn!(
@@ -297,25 +285,48 @@ pub fn augmented_path(
     }
 }
 
-/// OS-specific list of directories to prepend to PATH, in priority
-/// order (first entry wins for collisions). Candidates that do not
-/// exist on disk are still added — the user may install the tooling
-/// later and re-launch. Only `$HOME`-relative candidates are dropped
-/// when `HOME` is unset (and `${VAR}` ones when the variable is unset).
+/// THE ORDER RULE, pure: the `prepend-when-missing` candidates `current`
+/// lacks (candidate order), then `current` unchanged, then the `append`
+/// candidates it lacks (candidate order). A candidate already in `current`
+/// is never moved nor duplicated. MUST MATCH
+/// `vco_lib.tool_search_dirs.lookup_entries`
+/// (`tests/fixtures/tool_search_dirs_cases.json` `order_cases` run both).
+pub fn augmented_entries(current: &[PathBuf], candidates: &[(PathBuf, Placement)]) -> Vec<PathBuf> {
+    let mut seen: std::collections::HashSet<&PathBuf> = current.iter().collect();
+    let mut before: Vec<PathBuf> = Vec::new();
+    let mut after: Vec<PathBuf> = Vec::new();
+    for (dir, placement) in candidates {
+        if !seen.insert(dir) {
+            continue;
+        }
+        match placement {
+            Placement::PrependWhenMissing => before.push(dir.clone()),
+            Placement::Append => after.push(dir.clone()),
+        }
+    }
+    before.extend(current.iter().cloned());
+    before.extend(after);
+    before
+}
+
+/// This OS's table entries (see [`tool_search_entries_for`]) with `home`
+/// and the process environment — what the launcher and the hub augment
+/// with. Candidates that do not exist on disk are still added — the user may
+/// install the tooling later and re-launch. Only `$HOME`-relative candidates
+/// are dropped when `HOME` is unset (and `${VAR}` ones when the variable is
+/// unset).
 ///
 /// v0.2.97 R9 H1(b)/H5: the list is no longer hard-coded here — it is the
 /// ONE committed table `vco_lib/tool_search_dirs.toml` that the Python side
-/// (`vco_lib.tool_search_dirs`) also reads, extended with the places the
-/// container runtimes live (`~/bin` for rootless Docker, `/usr/local/bin`,
-/// `/opt/podman/bin`, Docker Desktop's app bundle, the Windows installers).
-/// The launcher (`lib.rs::setup`) AND the hub (`vct-hub/src/main.rs`) apply
-/// it at startup, so a runtime installed outside their short inherited PATH
-/// is found — and driven — instead of read as "not installed".
-fn augment_candidates(home: Option<&std::path::Path>) -> Vec<PathBuf> {
+/// (`vco_lib.tool_search_dirs`) also reads: the v0.2.53 graphical-launch
+/// list plus the places the container runtimes live (`~/bin` for rootless
+/// Docker, `/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle,
+/// the Windows installers), each with its `placement` (R10).
+fn augment_candidates(home: Option<&std::path::Path>) -> Vec<(PathBuf, Placement)> {
     let home = home.map(|h| h.to_string_lossy().into_owned());
-    tool_search_dirs_for(current_os_key(), home.as_deref(), &|k| std::env::var(k).ok())
+    tool_search_entries_for(current_os_key(), home.as_deref(), &|k| std::env::var(k).ok())
         .into_iter()
-        .map(PathBuf::from)
+        .map(|(d, p)| (PathBuf::from(d), p))
         .collect()
 }
 
@@ -325,26 +336,61 @@ fn augment_candidates(home: Option<&std::path::Path>) -> Vec<PathBuf> {
 const TOOL_SEARCH_DIRS_TOML: &str = include_str!("../../../../../vco_lib/tool_search_dirs.toml");
 
 /// When SET (even to ""), replaces the table's list for this OS: entries
-/// separated by the OS path separator, same syntax. MUST MATCH
-/// `vco_lib.tool_search_dirs.ENV_OVERRIDE`.
+/// separated by the OS path separator, same syntax, every one placed
+/// [`Placement::Append`]. MUST MATCH `vco_lib.tool_search_dirs.ENV_OVERRIDE`.
 pub const TOOL_SEARCH_DIRS_ENV: &str = "VCT_TOOL_SEARCH_DIRS";
+
+/// Where a table directory the PATH lacks goes (v0.2.97 R10): the table's
+/// per-entry `placement`. MUST MATCH `vco_lib.tool_search_dirs.PLACEMENT_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Placement {
+    /// `prepend-when-missing` — ahead of the inherited PATH (the v0.2.53
+    /// graphical-launch list: a login shell's order).
+    PrependWhenMissing,
+    /// `append` — after the inherited PATH (the v0.2.97 runtime locations:
+    /// reach only, never shadow).
+    Append,
+}
+
+impl Placement {
+    /// The table's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::PrependWhenMissing => "prepend-when-missing",
+            Placement::Append => "append",
+        }
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolSearchDirEntry {
+    dir: String,
+    placement: Placement,
+}
 
 #[derive(serde::Deserialize)]
 struct ToolSearchDirsFile {
     format_version: u32,
-    dirs: std::collections::HashMap<String, Vec<String>>,
+    dirs: std::collections::HashMap<String, Vec<ToolSearchDirEntry>>,
 }
 
-static TOOL_SEARCH_DIRS: std::sync::LazyLock<std::collections::HashMap<String, Vec<String>>> =
-    std::sync::LazyLock::new(|| {
-        let parsed: ToolSearchDirsFile = toml::from_str(TOOL_SEARCH_DIRS_TOML)
-            .expect("vco_lib/tool_search_dirs.toml is embedded at compile time and must parse");
-        assert_eq!(
-            parsed.format_version, 1,
-            "vco_lib/tool_search_dirs.toml format_version this reader supports is 1"
-        );
-        parsed.dirs
-    });
+static TOOL_SEARCH_DIRS: std::sync::LazyLock<
+    std::collections::HashMap<String, Vec<(String, Placement)>>,
+> = std::sync::LazyLock::new(|| {
+    let parsed: ToolSearchDirsFile = toml::from_str(TOOL_SEARCH_DIRS_TOML)
+        .expect("vco_lib/tool_search_dirs.toml is embedded at compile time and must parse");
+    assert_eq!(
+        parsed.format_version, 2,
+        "vco_lib/tool_search_dirs.toml format_version this reader supports is 2"
+    );
+    parsed
+        .dirs
+        .into_iter()
+        .map(|(os, entries)| (os, entries.into_iter().map(|e| (e.dir, e.placement)).collect()))
+        .collect()
+});
 
 /// The table's key for the OS this binary runs on (`linux` / `macos` /
 /// `windows`; `other` has no entries). MUST MATCH
@@ -389,34 +435,46 @@ pub fn expand_search_dir(
     Some(entry.to_string())
 }
 
-/// The expanded search directories for `os` (table order, duplicates
-/// dropped), or the `VCT_TOOL_SEARCH_DIRS` override when `env` has it.
-/// Pure (home and env injected) so the shared fixture can drive every OS
-/// from any host. MUST MATCH `vco_lib.tool_search_dirs.candidate_dirs`.
+/// The expanded `(directory, placement)` entries for `os` (table order,
+/// duplicate directories dropped — the first keeps its placement), or the
+/// `VCT_TOOL_SEARCH_DIRS` override when `env` has it (every entry
+/// [`Placement::Append`]). Pure (home and env injected) so the shared
+/// fixture can drive every OS from any host. MUST MATCH
+/// `vco_lib.tool_search_dirs.search_entries`.
+pub fn tool_search_entries_for(
+    os: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, Placement)> {
+    let raw: Vec<(String, Placement)> = match env(TOOL_SEARCH_DIRS_ENV) {
+        Some(over) => {
+            let sep = if os == "windows" { ';' } else { ':' };
+            over.split(sep)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| (p.to_string(), Placement::Append))
+                .collect()
+        }
+        None => TOOL_SEARCH_DIRS.get(os).cloned().unwrap_or_default(),
+    };
+    let mut out: Vec<(String, Placement)> = Vec::new();
+    for (entry, placement) in raw {
+        if let Some(d) = expand_search_dir(entry.trim(), home, env) {
+            if !d.is_empty() && !out.iter().any(|(seen, _)| seen == &d) {
+                out.push((d, placement));
+            }
+        }
+    }
+    out
+}
+
+/// The directories of [`tool_search_entries_for`], in table order. MUST
+/// MATCH `vco_lib.tool_search_dirs.candidate_dirs`.
 pub fn tool_search_dirs_for(
     os: &str,
     home: Option<&str>,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Vec<String> {
-    let raw: Vec<String> = match env(TOOL_SEARCH_DIRS_ENV) {
-        Some(over) => {
-            let sep = if os == "windows" { ';' } else { ':' };
-            over.split(sep)
-                .filter(|p| !p.trim().is_empty())
-                .map(|p| p.to_string())
-                .collect()
-        }
-        None => TOOL_SEARCH_DIRS.get(os).cloned().unwrap_or_default(),
-    };
-    let mut out: Vec<String> = Vec::new();
-    for entry in raw {
-        if let Some(d) = expand_search_dir(entry.trim(), home, env) {
-            if !d.is_empty() && !out.contains(&d) {
-                out.push(d);
-            }
-        }
-    }
-    out
+    tool_search_entries_for(os, home, env).into_iter().map(|(d, _)| d).collect()
 }
 
 // v0.2.53 L-P0-4 (Track G3) — coverage note:
@@ -446,7 +504,9 @@ pub fn tool_search_dirs_for(
 //   This is fixed by Track C's M-P0-7 process-wide PATH augment:
 //   `augment_path_for_graphical_launch()` in this same module is called
 //   from `lib.rs::setup()` BEFORE any subprocess spawn or thread spawn,
-//   prepending the OS-specific candidate directories to PATH. After that
+//   adding the OS-specific candidate directories the PATH lacks (the
+//   graphical-launch ones ahead of it, the runtime locations after it —
+//   R10 J3). After that
 //   runs, this `which_on_path()` resolves Node, Joern, lean-ctx, cargo,
 //   npm correctly under both interactive-shell AND .desktop launch
 //   contexts.
@@ -961,54 +1021,34 @@ async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<Ru
     let mut order = candidate_order(override_pref.as_deref(), recorded.as_deref());
 
     // v0.2.97 R8 follow-up: a STALE RECORD pin is the one sanctioned
-    // substitution (the mirror of the reconcile arm in
-    // `container_runtime::detect_container_runtime_with_pin` and
-    // `vco_lib.containers.resolve`). runtime.txt names a runtime that is
-    // not installed (not on the startup-augmented PATH — R9 H1(b)), the
-    // other runtime answers AND holds VCO's data (R9 H1: positive evidence
-    // only), and the record is not the user's confirmed choice (R9 H2) →
-    // drive the other runtime, read-only — the next update re-records it.
-    // The ENV pin is never reconciled; an installed-but-down recorded
-    // runtime keeps the strict refusal (nothing runs).
+    // substitution — the ONE arm `container_runtime::reconcile_stale_record`
+    // shares with the module plane and the hub supervisor (and mirrors the
+    // reconcile arm of `vco_lib.containers.resolve`): runtime.txt names a
+    // runtime that is not installed (not on the startup-augmented PATH — R9
+    // H1(b)), the other runtime answers AND holds VCO's data (R9 H1:
+    // positive evidence only), the record is not the user's confirmed choice
+    // (R9 H2) and no bind-mounted folder holds the data (R10 J2) → drive the
+    // other runtime, read-only — the next update re-records it. The ENV pin
+    // is never reconciled; an installed-but-down recorded runtime keeps the
+    // strict refusal (nothing runs).
     {
-        use super::container_runtime::{
-            other_runtime, pinned_runtime, read_runtime_confirmed, record_reconcile_decides,
-            RuntimePinSource,
-        };
+        use super::container_runtime::{pinned_runtime, reconcile_stale_record, StaleRecord};
         let env_pin = match override_pref.as_deref() {
             Some(p @ ("podman" | "docker")) => Some(p),
             _ => None,
         };
         let pinned = pinned_runtime(env_pin, recorded.as_deref());
-        if let Some((pin, RuntimePinSource::RuntimeTxt)) = pinned {
-            if which_on_path(pin).is_none() {
-                let confirmed =
-                    install_root.and_then(read_runtime_confirmed).as_deref() == Some(pin);
-                let other = other_runtime(pin);
-                let other_responsive = !confirmed
-                    && super::container_runtime::runtime_daemon_responsive(other).await;
-                let other_data_listed = if other_responsive {
-                    super::container_runtime::vco_data_under(other, install_root).await
-                } else {
-                    None
-                };
-                if let Some(sub) = record_reconcile_decides(
-                    pinned,
-                    true,
-                    other_responsive,
-                    other_data_listed,
-                    confirmed,
-                ) {
-                    tracing::info!(
-                        recorded = pin,
-                        runtime = sub,
-                        "stale runtime record: {} is not installed; driving {}                          (the next update re-records it)",
-                        pin,
-                        sub
-                    );
-                    order = vec![runtime_named(sub)];
-                }
-            }
+        match reconcile_stale_record(install_root, pinned).await {
+            StaleRecord::Switch(sub) => order = vec![runtime_named(sub)],
+            // This surface answers "no runtime" (the install preflight
+            // modal words the refusal from `runtime_pin`); the reason the
+            // record was not switched goes to the log in the words every
+            // other surface uses (R10 J6).
+            StaleRecord::Declined(note) => tracing::warn!(
+                "[vct] runtime: the recorded container runtime is refused (not switched: {})",
+                note
+            ),
+            StaleRecord::NotApplicable => {}
         }
     }
 
@@ -1210,6 +1250,7 @@ mod tests {
                         daemon_ok.iter().any(|c| c == other),
                         other_data_listed(sc, other),
                         sc.get("runtime_confirmed").and_then(|v| v.as_str()) == Some(pin),
+                        sc.get("bind_data").and_then(|v| v.as_bool()) == Some(true),
                     ) {
                         order = vec![runtime_from(sub)];
                     }
@@ -1396,8 +1437,8 @@ mod tests {
         );
     }
 
-    /// Augmentation prepends candidates but preserves the existing PATH
-    /// after them — order is not destroyed.
+    /// Augmentation keeps the existing PATH in its order (candidates go
+    /// ahead of or behind it, per placement — R10) — order is not destroyed.
     #[test]
     fn augment_path_preserves_user_path_order() {
         let after = after_augment("/zzz_marker_a:/zzz_marker_b", Some("/tmp/vct-augment-test-home"));
@@ -1416,6 +1457,117 @@ mod tests {
             pos_a,
             pos_b
         );
+    }
+
+    /// The table's entries for `os` as the augment consumes them.
+    fn entries_for(os: &str, home: &str) -> Vec<(PathBuf, Placement)> {
+        tool_search_entries_for(os, Some(home), &|_k| None)
+            .into_iter()
+            .map(|(d, p)| (PathBuf::from(d), p))
+            .collect()
+    }
+
+    /// R10 J3 (split by placement): an inherited entry is never displaced.
+    /// The inherited PATH appears in the result contiguous and unchanged —
+    /// including a table directory it already holds, of EITHER placement
+    /// (`/usr/bin` is `append`, `~/.local/bin` is `prepend-when-missing`),
+    /// which is neither moved nor duplicated. Ahead of it: exactly the
+    /// `prepend-when-missing` entries it lacked; behind it: exactly the
+    /// `append` entries it lacked, each in table order.
+    #[test]
+    fn augment_path_never_displaces_an_inherited_entry() {
+        let home = "/tmp/vct-augment-test-home";
+        for os in ["linux", "macos"] {
+            let cands = entries_for(os, home);
+            let late_graphical = PathBuf::from(format!("{home}/.local/bin"));
+            assert!(cands.contains(&(late_graphical.clone(), Placement::PrependWhenMissing)), "{os}");
+            let inherited = vec![
+                PathBuf::from("/zzz_first"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/zzz_second"),
+                late_graphical.clone(),
+            ];
+            let after = augmented_entries(&inherited, &cands);
+            let lacked = |want: Placement| -> Vec<PathBuf> {
+                cands
+                    .iter()
+                    .filter(|(d, p)| *p == want && !inherited.contains(d))
+                    .map(|(d, _)| d.clone())
+                    .collect()
+            };
+            let before = lacked(Placement::PrependWhenMissing);
+            let behind = lacked(Placement::Append);
+            assert_eq!(&after[..before.len()], before.as_slice(), "{os}: {after:?}");
+            assert_eq!(
+                &after[before.len()..before.len() + inherited.len()],
+                inherited.as_slice(),
+                "{os}: the inherited PATH must stay contiguous and in order: {after:?}"
+            );
+            assert_eq!(&after[before.len() + inherited.len()..], behind.as_slice(), "{os}: {after:?}");
+            for kept in [PathBuf::from("/usr/bin"), late_graphical] {
+                assert_eq!(after.iter().filter(|p| **p == kept).count(), 1, "{os}: {kept:?} duplicated");
+            }
+        }
+    }
+
+    /// R10 J3, by name resolution: a binary the inherited PATH reaches is the
+    /// one found after augment — even when a table directory holds a
+    /// same-named binary: an `append` one (`~/bin`, the rootless-Docker
+    /// location) because it goes behind the PATH, a `prepend-when-missing`
+    /// one (`~/.local/bin`) that the PATH already holds, later, because it is
+    /// never moved. Such a table dir only reaches what the PATH does not. Pure over
+    /// the returned PATH (never the process PATH, `with_lookup_path`).
+    #[cfg(unix)]
+    #[test]
+    fn a_same_named_binary_earlier_on_path_still_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let inherited = dir.path().join("inherited");
+        let appended = home.join("bin");
+        let graphical = home.join(".local").join("bin");
+        for d in [&inherited, &appended, &graphical] {
+            std::fs::create_dir_all(d).unwrap();
+            write_fake_runtime(d, "vct-r10-tool", "", 0);
+        }
+        write_fake_runtime(&appended, "vct-r10-only-in-table", "", 0);
+        let current = std::env::join_paths([&inherited, &graphical]).unwrap();
+        let after = augmented_path(&current, Some(&home)).expect("the table adds ~/bin");
+        crate::paths::with_lookup_path(Some(after.as_os_str()), || {
+            assert_eq!(
+                crate::paths::which_on_path("vct-r10-tool"),
+                Some(inherited.join("vct-r10-tool")),
+                "the inherited PATH's binary must win"
+            );
+            assert_eq!(
+                crate::paths::which_on_path("vct-r10-only-in-table"),
+                Some(appended.join("vct-r10-only-in-table")),
+                "a tool only the table reaches still resolves"
+            );
+        });
+    }
+
+    /// v0.2.53 M-P0-7 restored (R10 split): a Finder launch's PATH
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`, LaunchServices) lacks Homebrew, and
+    /// `/usr/bin/git` / `/usr/bin/python3` are the Xcode Command Line Tools
+    /// stubs. Homebrew is `prepend-when-missing`, so after the augment it is
+    /// AHEAD of `/usr/bin` — as in the user's login shell — and `git`
+    /// resolves to Homebrew's. (With every candidate appended, R10 J3's first
+    /// cut, the stub won.)
+    #[test]
+    fn a_graphical_launch_still_prefers_homebrew_over_the_system_stub() {
+        let finder: Vec<PathBuf> = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let after = augmented_entries(&finder, &entries_for("macos", "/Users/u"));
+        let pos = |d: &str| after.iter().position(|p| p == &PathBuf::from(d));
+        assert!(
+            pos("/opt/homebrew/bin").unwrap() < pos("/usr/bin").unwrap(),
+            "Homebrew must precede the system dir: {after:?}"
+        );
+        let installed = [PathBuf::from("/usr/bin/git"), PathBuf::from("/opt/homebrew/bin/git")];
+        let git = after.iter().map(|d| d.join("git")).find(|p| installed.contains(p));
+        assert_eq!(git, Some(PathBuf::from("/opt/homebrew/bin/git")));
     }
 
     /// On macOS, the homebrew prefix must appear on PATH after augment.
@@ -1467,19 +1619,20 @@ mod tests {
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            // Windows + other: exactly the shared table's entries for this
-            // OS (R9: the container runtimes' install dirs), then the
-            // original PATH.
-            let mut want: Vec<PathBuf> = tool_search_dirs_for(
+            // Windows + other: the original PATH, then the shared table's
+            // entries for this OS (R9: the container runtimes' install dirs,
+            // all `append` — R10).
+            // The baseline split the way THIS OS splits a PATH (";" on Windows).
+            let mut want: Vec<PathBuf> =
+                std::env::split_paths(std::ffi::OsStr::new("/usr/bin:/bin")).collect();
+            for (d, placement) in tool_search_entries_for(
                 current_os_key(),
                 Some("/tmp/vct-augment-test-home"),
                 &|k| std::env::var(k).ok(),
-            )
-            .into_iter()
-            .map(PathBuf::from)
-            .collect();
-            // The baseline split the way THIS OS splits a PATH (";" on Windows).
-            want.extend(std::env::split_paths(std::ffi::OsStr::new("/usr/bin:/bin")));
+            ) {
+                assert_eq!(placement, Placement::Append, "{d}");
+                want.push(PathBuf::from(d));
+            }
             assert_eq!(parts, want, "PATH={:?}", parts);
         }
     }
@@ -1511,18 +1664,74 @@ mod tests {
         for case in cases {
             let name = case["name"].as_str().unwrap();
             let env = fixture_env(case);
-            let got = tool_search_dirs_for(
-                case["os"].as_str().unwrap(),
-                case["home"].as_str(),
-                &|k| env.get(k).cloned(),
-            );
-            let want: Vec<String> = case["expect"]
+            let os = case["os"].as_str().unwrap();
+            let got: Vec<(String, String)> =
+                tool_search_entries_for(os, case["home"].as_str(), &|k| env.get(k).cloned())
+                    .into_iter()
+                    .map(|(d, p)| (d, p.as_str().to_string()))
+                    .collect();
+            let want: Vec<(String, String)> = case["expect"]
                 .as_array()
                 .unwrap()
                 .iter()
-                .map(|v| v.as_str().unwrap().to_string())
+                .map(|pair| {
+                    (
+                        pair[0].as_str().unwrap().to_string(),
+                        pair[1].as_str().unwrap().to_string(),
+                    )
+                })
                 .collect();
             assert_eq!(got, want, "case {}", name);
+            let dirs: Vec<String> = want.into_iter().map(|(d, _)| d).collect();
+            assert_eq!(
+                tool_search_dirs_for(os, case["home"].as_str(), &|k| env.get(k).cloned()),
+                dirs,
+                "case {}",
+                name
+            );
+        }
+    }
+
+    /// R10 J3 split — THE ORDER RULE and the resolution it implies, driven by
+    /// the SAME `order_cases` the Python suite runs
+    /// (`test_the_order_rule_matches_the_shared_fixture`): graphical-launch
+    /// dirs the PATH lacks ahead of it, runtime locations it lacks behind it,
+    /// a dir already on it never moved.
+    #[test]
+    fn tool_search_order_matches_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/tool_search_dirs_cases.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fx: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+        let cases = fx["order_cases"].as_array().expect("order_cases");
+        assert!(cases.len() >= 3, "fixture shrank");
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+        };
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let os = case["os"].as_str().unwrap();
+            let env = fixture_env(case);
+            let cands: Vec<(PathBuf, Placement)> =
+                tool_search_entries_for(os, case["home"].as_str(), &|k| env.get(k).cloned())
+                    .into_iter()
+                    .map(|(d, p)| (PathBuf::from(d), p))
+                    .collect();
+            let current: Vec<PathBuf> = strings(&case["path"]).into_iter().map(PathBuf::from).collect();
+            let got: Vec<String> = augmented_entries(&current, &cands)
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, strings(&case["expect_path"]), "case {}", name);
+            let sep = if os == "windows" { "\\" } else { "/" };
+            let binaries = strings(&case["binaries"]);
+            let tool = case["resolve"].as_str().unwrap();
+            let hit = got
+                .iter()
+                .map(|d| format!("{d}{sep}{tool}"))
+                .find(|p| binaries.contains(p));
+            assert_eq!(hit.as_deref(), case["expect"].as_str(), "case {}", name);
         }
     }
 
@@ -1556,10 +1765,13 @@ mod tests {
                 std::env::var(k).ok()
             }
         };
-        let dirs = tool_search_dirs_for("linux", home.path().to_str(), &env);
-        let mut entries: Vec<PathBuf> = dirs.into_iter().map(PathBuf::from).collect();
-        entries.extend(std::env::split_paths(&systemd_user));
-        let augmented = std::env::join_paths(entries).unwrap();
+        let cands: Vec<(PathBuf, Placement)> =
+            tool_search_entries_for("linux", home.path().to_str(), &env)
+                .into_iter()
+                .map(|(d, p)| (PathBuf::from(d), p))
+                .collect();
+        let inherited: Vec<PathBuf> = std::env::split_paths(&systemd_user).collect();
+        let augmented = std::env::join_paths(augmented_entries(&inherited, &cands)).unwrap();
         crate::paths::with_lookup_path(Some(&augmented), || {
             assert_eq!(which_on_path("docker"), Some(docker.clone()));
         });

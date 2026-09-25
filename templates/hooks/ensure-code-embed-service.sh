@@ -95,7 +95,20 @@ else
     exit 0
 fi
 __vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
-__vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?
+# R10 J1: the resolver's NON-ZERO answers (3 = absent — a refused pin, a
+# down daemon; 4 = unknown) are EXPECTED branches in the case below, but
+# this hook runs `set -euo pipefail`: a bare `out="$(cmd)" ; rc=$?` ABORTS
+# the shell at the assignment, before `rc` is ever read — so every session
+# with a refused pin died as a failed hook (exit 3, empty stdout, this
+# stderr capture file leaked) and the `case 0|3|4)` report never ran. The
+# `rc=0; … || rc=$?` shape makes every exit code a VALUE, not a trap. The
+# siblings without `set -e` (ensure-containers, verify-container-ports)
+# keep the plain shape — there it is harmless.
+# The trap removes the capture file on EVERY exit path from here on
+# (including a later `set -e` abort), so nothing leaks per session.
+trap 'rm -f "$__vco_rt_err" 2>/dev/null' EXIT
+__vco_rt_rc=0
+__vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" || __vco_rt_rc=$?
 case "$__vco_rt_rc" in
     0|3|4) eval "$__vco_rt_out" ;;
     *)

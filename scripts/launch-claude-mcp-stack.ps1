@@ -423,8 +423,9 @@ function Get-StackPython {
 # task's PATH may lack the directory podman/docker (or a compose front-end)
 # is installed in; the ONE table (vco_lib/tool_search_dirs.toml, through
 # `python -m vco_lib.tool_search_dirs search-path`) names where to look, and
-# the directory of every tool found only there is appended. Whatever PATH
-# already reached keeps winning. Soft: no answer leaves PATH as it is.
+# the directory of every tool found outside PATH is added per the table's
+# placement (Windows' entries are all appended after PATH). PATH itself is kept
+# as it is. Soft: no answer leaves PATH as it is.
 # ---------------------------------------------------------------------------
 function Update-ToolPath {
     $py = Get-StackPython

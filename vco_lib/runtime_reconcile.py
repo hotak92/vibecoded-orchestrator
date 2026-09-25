@@ -52,7 +52,18 @@ unusable, read-only callers refuse with the reason and install records an
 (:func:`vco_volume_names`, R9 H6): the compose defaults plus every
 ``VCT_*_VOLUME_NAME`` override in ``infrastructure/.env`` (the launcher writes
 them from the ``service_endpoints`` rows) and in the environment — an install
-that adopted a pre-existing volume by name must not read as "no data".
+that adopted a pre-existing volume by name must not read as "no data". An
+override name is a name the USER picked, so under the runtime VCO would switch
+TO it is evidence only when corroborated there (R10 J8): a VCO container under
+that runtime, or the volume's compose project label naming VCO's own project;
+the ``vco_*`` defaults count on their own.
+
+A bind-mounted data folder (``VCT_*_DATA_SOURCE=<dir>``, the launcher's
+"relocate to a folder") is VCO's data on the HOST, under no runtime (R10 J2).
+While one exists and is not empty, the runtime choice cannot be read off the
+runtimes' volumes: the record is treated as holding the data — (c) keeps it,
+(a) refuses read-only and records ``action_required`` at install — and a
+leftover named volume under the other runtime never switches it.
 
 The runtime is never switched silently while VCO's data lives under the recorded
 one — every switch is a positive-evidence decision with a ledger record.
@@ -63,11 +74,15 @@ phase (``_detect_system``).
 from __future__ import annotations
 
 import argparse
+import functools
 import json
+import os
 import platform
+import re
 import shlex
 import subprocess
 import sys
+import tomllib
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -90,8 +105,16 @@ __all__ = [
     "Reconciliation",
     "reconcile",
     "vco_data_under",
+    "data_evidence",
+    "vco_compose_project",
     "vco_volume_names",
     "volume_names_from",
+    "DATA_SOURCE_KEYS",
+    "bind_sources_from",
+    "bind_data_source",
+    "unusable_detail",
+    "not_switched_text",
+    "MESSAGES_PATH",
     "apply_at_install",
     "record_explicit_choice",
     "read_confirmed",
@@ -119,9 +142,20 @@ VCO_VOLUME_NAMES: tuple[str, ...] = ("vco_weaviate_data", "vco_ollama_data", "vc
 #: MUST MATCH ``container_runtime.rs::VCO_VOLUME_NAME_KEYS``.
 VOLUME_NAME_KEYS: tuple[str, ...] = tuple(pair[1] for pair in DATA_KNOBS.values())
 
+#: The compose knobs that turn a service's data mount into a BIND mount of a
+#: host folder (``${KEY:-<volume key>}:/data``) — the DATA_SOURCE half of
+#: :data:`vco_lib.compose_env.DATA_KNOBS`, in its order. MUST MATCH
+#: ``container_runtime.rs::VCO_DATA_SOURCE_KEYS``.
+DATA_SOURCE_KEYS: tuple[str, ...] = tuple(pair[0] for pair in DATA_KNOBS.values())
+
+#: The refusal wording shared with Rust (``container_runtime.rs``
+#: ``include_str!``s the same file) — R10 J6.
+MESSAGES_PATH = Path(__file__).with_name("runtime_reconcile_messages.toml")
+
 #: The compose project dir whose ``.env`` compose reads (install.py's
 #: ``infrastructure/``; ``compose_env.write_service_keys`` writes the knobs there).
 INFRA_ENV_REL = Path("infrastructure") / ".env"
+INFRA_COMPOSE_REL = Path("infrastructure") / "docker-compose.yml"
 
 #: How long the boot wrapper's ledger write waits for the deferral lock (R9 H7):
 #: an update holding it must never stall boot. Past it the entry is skipped
@@ -202,15 +236,7 @@ def vco_volume_names(install_root: Optional[Path], *,
     earlier layout is still VCO's. MUST MATCH
     ``container_runtime.rs::vco_volume_names`` —
     ``tests/fixtures/vco_volume_names_cases.json`` runs both."""
-    import os  # noqa: PLC0415
-
-    text = ""
-    if install_root is not None:
-        try:
-            text = (Path(install_root) / INFRA_ENV_REL).read_text(encoding="utf-8")
-        except (OSError, ValueError):
-            text = ""
-    return volume_names_from(text, os.environ if env is None else env)
+    return volume_names_from(_infra_env_text(install_root), os.environ if env is None else env)
 
 
 def volume_names_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, ...]:
@@ -231,17 +257,97 @@ def volume_names_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, 
     return tuple(names)
 
 
+def _infra_env_text(install_root: Optional[Path]) -> str:
+    if install_root is None:
+        return ""
+    try:
+        return (Path(install_root) / INFRA_ENV_REL).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return ""
+
+
+def _our_container_names() -> frozenset[str]:
+    """VCO's own container names under a runtime: the ``vco_*`` / ``vct_*``
+    subset of every canonical service's known names (an unprefixed ``ollama``
+    may be the user's own). MUST MATCH
+    ``container_runtime.rs::VCO_OUR_CONTAINER_NAMES``."""
+    return frozenset(
+        n for s in _c.CANONICAL_CONTAINERS for n in _c.all_known_names(s)
+        if n.startswith(("vco_", "vct_"))
+    )
+
+
+def vco_compose_project(install_root: Optional[Path]) -> str:
+    """The compose project VCO's own stack runs under — what the compose
+    identity guard already derives (:func:`vco_lib.containers.compose_project_name`
+    of ``infrastructure/``), so a volume compose created for VCO carries it in
+    its ``com.docker.compose.project`` label. ``""`` without an install root."""
+    if install_root is None:
+        return ""
+    infra = Path(install_root) / INFRA_COMPOSE_REL.parent
+    try:
+        text = (Path(install_root) / INFRA_COMPOSE_REL).read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        text = ""
+    return _c.compose_project_name(infra, text)
+
+
+def data_evidence(containers: set[str], volumes: set[str], names: Sequence[str], *,
+                  own_project: str, label_of: Callable[[str], Optional[str]],
+                  corroborate_overrides: bool) -> bool:
+    """Pure: do these listings show VCO's data under ONE runtime?
+
+    A VCO container, or a ``vco_*`` default volume, is evidence on its own. A
+    volume named by a ``VCT_*_VOLUME_NAME`` override (``names`` beyond the
+    defaults) is a name the USER picked — an unrelated ``ollama`` volume can
+    carry it — so with ``corroborate_overrides`` it counts only when its compose
+    project label (``label_of``) is ``own_project`` (R10 J8; a VCO container
+    under the same runtime has already answered ``True``). MUST MATCH
+    ``container_runtime.rs::data_evidence`` —
+    ``tests/fixtures/runtime_data_evidence_cases.json`` runs both."""
+    if containers & _our_container_names():
+        return True
+    for name in names:
+        if name not in volumes:
+            continue
+        if name in VCO_VOLUME_NAMES or not corroborate_overrides:
+            return True
+        if own_project and label_of(name) == own_project:
+            return True
+    return False
+
+
+def _volume_project_label(runtime: str, volume: str, run: RunFn) -> Optional[str]:
+    fmt = '{{index .Labels "' + _c.COMPOSE_PROJECT_LABEL + '"}}'
+    try:
+        res = run([runtime, "volume", "inspect", "--format", fmt, volume],
+                  capture_output=True, text=True, timeout=_LIST_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    return (res.stdout or "").strip() or None
+
+
 def vco_data_under(runtime: str, *, run: Optional[RunFn] = None,
                    install_root: Optional[Path] = None,
-                   env: Optional[Mapping[str, str]] = None) -> Optional[bool]:
+                   env: Optional[Mapping[str, str]] = None,
+                   corroborate_overrides: bool = False) -> Optional[bool]:
     """Does ``runtime`` hold VCO's containers or named volumes?
 
     ``True``/``False`` only when BOTH listings answered; ``None`` when either
     could not (daemon down, CLI error) — "could not look" is never "empty".
     Only VCO-prefixed containers count (``vco_*`` / ``vct_*``: an unprefixed
     ``ollama`` may be the user's own) and the install's ACTUAL volume names
-    (:func:`vco_volume_names` of ``install_root``). Read-only: ``ps -a`` and
-    ``volume ls``.
+    (:func:`vco_volume_names` of ``install_root``). Read-only: ``ps -a``,
+    ``volume ls`` and — only for an override-named volume that needs it —
+    ``volume inspect``.
+
+    ``corroborate_overrides``: set it when asking about the runtime VCO would
+    SWITCH TO — an override-named volume then counts only when corroborated
+    there (:func:`data_evidence`, R10 J8). The recorded runtime is asked
+    without it: counting the user's adopted volume as data there only ever
+    keeps the record.
     """
     _run = run or _tsd.run
     containers = _list_names([runtime, "ps", "-a", "--format", "{{.Names}}"], _run)
@@ -250,11 +356,102 @@ def vco_data_under(runtime: str, *, run: Optional[RunFn] = None,
     volumes = _list_names([runtime, "volume", "ls", "--format", "{{.Name}}"], _run)
     if volumes is None:
         return None
-    ours = {
-        n for s in _c.CANONICAL_CONTAINERS for n in _c.all_known_names(s)
-        if n.startswith(("vco_", "vct_"))
-    }
-    return bool(containers & ours) or bool(volumes & set(vco_volume_names(install_root, env=env)))
+    return data_evidence(
+        containers, volumes, vco_volume_names(install_root, env=env),
+        own_project=vco_compose_project(install_root) if corroborate_overrides else "",
+        label_of=lambda vol: _volume_project_label(runtime, vol, _run),
+        corroborate_overrides=corroborate_overrides,
+    )
+
+
+_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
+
+
+def _is_bind_source(value: str) -> bool:
+    """Compose's rule for a volume SOURCE: a path (``/``, ``.``, ``~``, ``\\``
+    or a drive letter) is a bind mount; anything else names a volume."""
+    return value.startswith(("/", ".", "~", "\\")) or bool(_DRIVE_PATH_RE.match(value))
+
+
+def bind_sources_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, ...]:
+    """Pure: every non-empty :data:`DATA_SOURCE_KEYS` value that is a PATH
+    (a bind mount), in ``infrastructure/.env`` (file order) then in ``env``
+    (key order), each once. A value that is not a path names a volume and is
+    left to :func:`vco_volume_names`. MUST MATCH
+    ``container_runtime.rs::bind_sources_from`` (the shared fixture)."""
+    found: list[str] = []
+
+    def _add(value: str) -> None:
+        v = (value or "").strip()
+        if v and _is_bind_source(v) and v not in found:
+            found.append(v)
+
+    for key, value in parse_env_lines(env_file_text or ""):
+        if key in DATA_SOURCE_KEYS:
+            _add(value)
+    for key in DATA_SOURCE_KEYS:
+        _add(env.get(key) or "")
+    return tuple(found)
+
+
+def bind_data_source(install_root: Optional[Path], *,
+                     env: Optional[Mapping[str, str]] = None) -> Optional[str]:
+    """The first bind-mounted data folder of this install that EXISTS and is
+    not empty (or cannot be listed — not provably empty), or ``None``.
+
+    Relative sources resolve against ``infrastructure/`` (compose's project
+    dir), ``~`` against the home directory. Such a folder is VCO's data on the
+    host — no runtime's volume listing can say where it belongs (R10 J2).
+    MUST MATCH ``container_runtime.rs::bind_data_source``."""
+    if install_root is None:
+        return None
+    infra = Path(install_root) / INFRA_ENV_REL.parent
+    for src in bind_sources_from(_infra_env_text(install_root),
+                                 os.environ if env is None else env):
+        path = Path(os.path.expanduser(src))
+        if not path.is_absolute():
+            path = infra / path
+        if not path.is_dir():
+            continue
+        try:
+            if next(path.iterdir(), None) is None:
+                continue
+        except OSError:
+            pass  # a data folder this user cannot list is not provably empty
+        return str(path)
+    return None
+
+
+@functools.lru_cache(maxsize=1)
+def _messages() -> dict[str, dict[str, str]]:
+    data = tomllib.loads(MESSAGES_PATH.read_text(encoding="utf-8"))
+    return {"unusable": dict(data["unusable"]), "not_switched": dict(data["not_switched"])}
+
+
+def _fill(template: str, **values: str) -> str:
+    """``{name}`` → value, literally (the Rust side does the same)."""
+    for key, value in values.items():
+        template = template.replace("{" + key + "}", value)
+    return template
+
+
+def not_switched_text(decline: str, *, pinned: str, bind: str = "") -> str:
+    """The ``not_switched`` suffix for ``decline`` (a key of the shared table)."""
+    return _fill(_messages()["not_switched"][decline], pinned=pinned,
+                 other=_other(pinned), bind=bind)
+
+
+def unusable_detail(pinned: str, source: str, status: str,
+                    decline: Optional[str] = None, *, bind: str = "") -> str:
+    """Why ``pinned`` is not driven, from the shared table
+    (``runtime_reconcile_messages.toml``): its state (``missing``, else
+    ``down``) plus the ``decline`` suffix. MUST MATCH
+    ``container_runtime.rs::record_reconcile_note``."""
+    msgs = _messages()["unusable"]
+    what = _fill(msgs["missing" if status == "missing" else "down"], pinned=pinned)
+    if decline is not None:
+        what += not_switched_text(decline, pinned=pinned, bind=bind)
+    return _fill(msgs["head"], pinned=pinned, source=source, what=what)
 
 
 def _status(runtime: str, which: WhichFn, run: RunFn) -> str:
@@ -326,20 +523,27 @@ def reconcile(
         # R9 H2: the user chose it with `--container`; only the user switches
         # (and the other runtime is not even started for a switch that will
         # not happen).
-        return _unusable(root, pinned, via, status, (other, "confirmed"), started, rewrite)
+        return _unusable(root, pinned, via, status, "confirmed", started, rewrite)
+    bind = bind_data_source(root, env=env)
+    if bind is not None:
+        # R10 J2: the data is a folder on the host, under neither runtime —
+        # the record is the only statement of which runtime serves it. Install
+        # keeps it (action_required names the explicit switch); read-only
+        # refuses. Nothing is started for a switch that will not happen.
+        return _unusable(root, pinned, via, status, "bind_data", started, rewrite, bind=bind)
     ostatus, ostarted = _start_if_down(other, _status(other, _which, _run), starter, _which, _run)
     started = "; ".join(x for x in (started, ostarted) if x)
     if ostatus != "usable":
-        return _unusable(root, pinned, via, status, (other, ostatus), started, rewrite)
-    data = vco_data_under(other, run=_run, install_root=root, env=env)
+        return _unusable(root, pinned, via, status, "other_not_usable", started, rewrite)
+    data = vco_data_under(other, run=_run, install_root=root, env=env, corroborate_overrides=True)
     if data is None:
-        return _unusable(root, pinned, via, status, (other, "unlistable"), started, rewrite)
+        return _unusable(root, pinned, via, status, "unlistable", started, rewrite)
     if not data and not rewrite:
         # R9 H1: a read-only caller switches on POSITIVE evidence only. "Not
         # found by me" is not "gone" (a PATH the table does not cover), and
         # starting the stack on the other runtime's EMPTY volumes is the
         # outcome this module exists to prevent. install.py decides this one.
-        return _unusable(root, pinned, via, status, (other, "empty"), started, rewrite)
+        return _unusable(root, pinned, via, status, "no_data", started, rewrite)
     why = (f"{pinned} is not installed; {other} answers and holds VCO's containers/volumes"
            if data else f"{pinned} is not installed; {other} answers and no VCO data exists under it")
     return _rewritten(root, pinned, other, why, rewrite, started)
@@ -352,8 +556,15 @@ def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: 
                           f"{pinned} answers", started=started)
     if read_confirmed(root) == pinned or _status(other, which, run) != "usable":
         return kept
+    bind = bind_data_source(root, env=env)
+    if bind is not None:
+        # R10 J2: VCO's data is a host folder (a bind mount): whatever the
+        # other runtime lists, it is not "the data" — the record stands.
+        return Reconciliation(Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
+                              f"{pinned} answers; VCO's data is in the bind-mounted folder "
+                              f"{bind}, so the recorded {pinned} is kept", started=started)
     here = vco_data_under(pinned, run=run, install_root=root, env=env)
-    there = vco_data_under(other, run=run, install_root=root, env=env)
+    there = vco_data_under(other, run=run, install_root=root, env=env, corroborate_overrides=True)
     if here is None or there is None or not there:
         return kept
     if here:
@@ -404,26 +615,25 @@ def _start_command(runtime: str) -> str:
 
 
 def _unusable(root: Optional[Path], pinned: str, via: Optional[str], status: str,
-              other: Optional[tuple[str, str]], started: str, rewrite: bool) -> Reconciliation:
+              decline: Optional[str], started: str, rewrite: bool, *,
+              bind: str = "") -> Reconciliation:
+    """``decline``: why a stale record was NOT switched — a ``not_switched``
+    key of the shared table (``None`` when no switch was considered)."""
     source = via if via == _c.PIN_VIA_ENV else str(_c.runtime_txt_path(root)) if root else str(via)
-    if status == "missing":
-        what = f"{pinned} is not installed (not on PATH nor in the usual install locations)"
-    else:
-        what = f"{pinned} is installed but does not answer `{pinned} info`"
-    if other is not None:
-        what += {
-            "unlistable": f"; {other[0]} answers but its containers/volumes could not be listed",
-            "confirmed": (f"; {pinned} is your confirmed choice (`install.py --container "
-                          f"{pinned}`), so VCO does not switch to {other[0]}"),
-            "empty": (f"; {other[0]} answers but holds none of VCO's containers or volumes — "
-                      f"not switching to it here (run `python install.py --update` to "
-                      f"re-record the runtime)"),
-        }.get(other[1], f", and {other[0]} is not usable either")
-    detail = f"the container runtime is pinned to {pinned} by {source}: {what}"
+    detail = unusable_detail(pinned, source, status, decline, bind=bind)
     if started:
         detail += f" ({started})"
     entries = (_unusable_entry(root, pinned, via or "", status, detail),) if rewrite else ()
     return Reconciliation(Outcome.UNUSABLE, None, pinned, via, detail, entries, started)
+
+
+def _unusable_title(pinned: str) -> str:
+    """The ONE title of ``container_runtime_unusable`` (R10 J4) — install, the
+    boot wrapper and the session hooks all write this condition; a title per
+    writer made the entry flip on every re-emission."""
+    if pinned:
+        return f"Container runtime {pinned} is not usable — containers were not started"
+    return "No usable container runtime — containers were not started"
 
 
 def _unusable_entry(root: Optional[Path], pinned: str, via: str, status: str,
@@ -440,7 +650,7 @@ def _unusable_entry(root: Optional[Path], pinned: str, via: str, status: str,
         remedy += f"\n# Or stop pinning it: unset VCT_CONTAINER_RUNTIME (or set it to {other})"
     return DeferralEntry(
         condition_id=CID_UNUSABLE,
-        title=f"Container runtime {pinned} is not usable — containers were not started",
+        title=_unusable_title(pinned),
         detected=detail + ".",
         why_deferred=(
             f"VCO will not start the stack under {other} on its own: podman and docker keep "
@@ -512,10 +722,8 @@ def apply_at_install(
         return None
     # R9 H1(b)/H5: a runtime found only in the usual install locations is
     # "installed" to the reconcile below; the rest of this run spawns it BY
-    # NAME, so its directory joins this process's PATH (appended — whatever
-    # PATH already reached keeps winning).
-    import os  # noqa: PLC0415
-
+    # NAME, so its directory joins this process's PATH, placed per the table
+    # (`tool_search_dirs.reachable_path` — the order every surface uses).
     reach = _tsd.reachable_path()
     if reach:
         os.environ["PATH"] = reach
@@ -635,11 +843,14 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
         return None
     if read_confirmed(root) == recorded:
         return False
+    if bind_data_source(root) is not None:
+        return False  # R10 J2: the reconcile keeps the record — nothing to ask
     _which, _run = which or _tsd.which, run or _tsd.run
     if any(_status(rt, _which, _run) != "usable" for rt in _c.RUNTIME_CANDIDATES):
         return None
     here = vco_data_under(recorded, run=_run, install_root=root)
-    there = vco_data_under(_other(recorded), run=_run, install_root=root)
+    there = vco_data_under(_other(recorded), run=_run, install_root=root,
+                           corroborate_overrides=True)
     if here is None or there is None:
         return None
     return bool(here and there)
@@ -650,13 +861,12 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
 # ---------------------------------------------------------------------------
 
 
-#: Who is recording a refusal — the wording of the entry says which surface
-#: started nothing (``--source`` of the CLI).
-_REFUSAL_SOURCES: dict[str, tuple[str, str]] = {
-    "boot": ("Containers did not start at boot",
-             "The boot service (launch-claude-mcp-stack) started nothing"),
-    "session": ("Containers were not started for this session",
-                "A session-start hook started nothing"),
+#: Who is recording a refusal — the entry's ``detected`` text says which
+#: surface started nothing (``--source`` of the CLI). The TITLE is the
+#: condition's one title (:func:`_unusable_title`, R10 J4).
+_REFUSAL_SOURCES: dict[str, str] = {
+    "boot": "The boot service (launch-claude-mcp-stack) started nothing",
+    "session": "A session-start hook started nothing",
 }
 
 #: The hard ceiling on ``python -m vco_lib.runtime_reconcile record-boot-refusal``
@@ -685,11 +895,10 @@ def record_boot_refusal(install_root: Path, reason: str, *,
         return False
     pin = _c.runtime_pin(env, install_root=install_root, warn=lambda _m: None)
     pinned, via = (pin[0], pin[1]) if pin is not None else ("", "")
-    title_head, detected_head = _REFUSAL_SOURCES.get(source, _REFUSAL_SOURCES["boot"])
+    detected_head = _REFUSAL_SOURCES.get(source, _REFUSAL_SOURCES["boot"])
     entry = DeferralEntry(
         condition_id=CID_UNUSABLE,
-        title=(f"{title_head}: "
-               + (f"{pinned} is not usable" if pinned else "no usable container runtime")),
+        title=_unusable_title(pinned),
         detected=f"{detected_head}: {reason.strip()}",
         why_deferred=(
             "VCO never starts the stack under the runtime the data is NOT on "
@@ -705,7 +914,11 @@ def record_boot_refusal(install_root: Path, reason: str, *,
     # R9 H7: bounded — an update holding the ledger lock must never stall boot
     # (the wrapper's own `timeout` is absent on macOS). Past the bound the
     # emitter logs and returns False; the next boot or session writes it.
-    return emit(Path(install_root), entry, lock_timeout_s=BOOT_LEDGER_LOCK_TIMEOUT_S)
+    # R10 J4: every session start (twice) and every boot re-emit this while it
+    # holds — the entry keeps the `detected_at` it was first recorded with,
+    # and an unchanged entry is not rewritten.
+    return emit(Path(install_root), entry, lock_timeout_s=BOOT_LEDGER_LOCK_TIMEOUT_S,
+                keep_first_detected=True)
 
 
 def _cli(argv: Optional[Sequence[str]] = None) -> int:
@@ -748,8 +961,6 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
         # nothing, but interpreter shutdown can still stall on I/O).
         sys.stdout.flush()
         sys.stderr.flush()
-        import os  # noqa: PLC0415
-
         os._exit(0)
     return 0
 

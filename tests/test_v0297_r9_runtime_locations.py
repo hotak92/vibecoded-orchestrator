@@ -61,14 +61,34 @@ posix_only = pytest.mark.skipif(not POSIX or BASH is None, reason="POSIX shell r
 # Shared fixtures (the Rust suite runs the same JSON)
 # ---------------------------------------------------------------------------
 
-_DIR_CASES = json.loads((FIXTURES / "tool_search_dirs_cases.json").read_text(encoding="utf-8"))["cases"]
+_TSD_FIXTURE = json.loads((FIXTURES / "tool_search_dirs_cases.json").read_text(encoding="utf-8"))
+_DIR_CASES = _TSD_FIXTURE["cases"]
+_ORDER_CASES = _TSD_FIXTURE["order_cases"]
 _VOL_CASES = json.loads((FIXTURES / "vco_volume_names_cases.json").read_text(encoding="utf-8"))["cases"]
 
 
 @pytest.mark.parametrize("case", _DIR_CASES, ids=[c["name"] for c in _DIR_CASES])
 def test_tool_search_dirs_match_the_shared_fixture(case: dict):
-    got = tsd.candidate_dirs(os_name=case["os"], home=case["home"], env=case["env"])
-    assert got == case["expect"]
+    got = tsd.search_entries(os_name=case["os"], home=case["home"], env=case["env"])
+    assert [list(e) for e in got] == case["expect"]
+    assert tsd.candidate_dirs(os_name=case["os"], home=case["home"], env=case["env"]) == [
+        d for d, _p in case["expect"]]
+
+
+@pytest.mark.parametrize("case", _ORDER_CASES, ids=[c["name"] for c in _ORDER_CASES])
+def test_the_order_rule_matches_the_shared_fixture(case: dict):
+    """R10 J3 split: graphical-launch dirs the PATH lacks go AHEAD of it, the
+    runtime locations it lacks go AFTER it, a dir already on it never moves —
+    and a name resolves along that order. The Rust suite runs the same cases
+    (`runtime.rs::tool_search_order_matches_the_shared_fixture`)."""
+    entries = tsd.search_entries(os_name=case["os"], home=case["home"], env=case["env"])
+    order = tsd.lookup_entries(case["path"], entries)
+    assert order == case["expect_path"]
+    sep = "\\" if case["os"] == "windows" else "/"
+    binaries = set(case["binaries"])
+    hit = next((d + sep + case["resolve"] for d in order
+                if d + sep + case["resolve"] in binaries), None)
+    assert hit == case["expect"]
 
 
 @pytest.mark.parametrize("case", _VOL_CASES, ids=[c["name"] for c in _VOL_CASES])
@@ -370,6 +390,70 @@ def test_run_spawns_a_tool_found_only_in_the_table(tmp_path, monkeypatch):
     assert str(home / "bin") in res.stdout
 
 
+def _real_table(monkeypatch, *, path: Path, home: Path) -> None:
+    """This process sees the REAL table (not the suite's empty override),
+    with a tmp HOME and a one-directory PATH."""
+    monkeypatch.setenv("PATH", str(path))
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv(tsd.ENV_OVERRIDE, raising=False)
+
+
+@posix_only
+def test_a_graphical_launch_prefers_the_login_shells_dir_on_every_python_surface(
+        tmp_path, monkeypatch):
+    """R10 J3 split, on a real filesystem: ``~/.local/bin`` is a v0.2.53
+    graphical-launch dir (``prepend-when-missing`` on Linux and macOS). A
+    short PATH that lacks it resolves the name THERE — ahead of the PATH's own
+    same-named binary, as the user's login shell and the launcher's augment
+    do — and ``which``, ``run`` and ``reachable_path`` agree on it."""
+    home = tmp_path / "home"
+    system = tmp_path / "system-bin"
+    _stub(system / "vct-r10-tool", "#!/bin/sh\necho system\n")
+    user = _stub(home / ".local" / "bin" / "vct-r10-tool", "#!/bin/sh\necho user:$PATH\n")
+    _real_table(monkeypatch, path=system, home=home)
+    assert tsd.which("vct-r10-tool") == str(user)
+    res = tsd.run(["vct-r10-tool"], capture_output=True, text=True, timeout=10)
+    assert res.stdout.startswith(f"user:{home / '.local' / 'bin'}:{system}"), res.stdout
+    reach = tsd.reachable_path(("vct-r10-tool",))
+    assert reach == f"{home / '.local' / 'bin'}:{system}"
+    assert shutil.which("vct-r10-tool", path=reach) == str(user)
+
+
+@posix_only
+def test_an_appended_runtime_location_never_shadows_the_path(tmp_path, monkeypatch):
+    """R10 J3 split: ``~/bin`` is a v0.2.97 runtime location (``append``). A
+    same-named binary on the PATH keeps winning on every Python surface; a
+    name only ``~/bin`` holds is still found, and the PATH that drives it
+    APPENDS ``~/bin``."""
+    home = tmp_path / "home"
+    inherited = tmp_path / "inherited"
+    mine = _stub(inherited / "vct-r10-docker", "#!/bin/sh\necho inherited\n")
+    _stub(home / "bin" / "vct-r10-docker", "#!/bin/sh\necho table\n")
+    only = _stub(home / "bin" / "vct-r10-only", "#!/bin/sh\necho only\n")
+    _real_table(monkeypatch, path=inherited, home=home)
+    assert tsd.which("vct-r10-docker") == str(mine)
+    assert tsd.run(["vct-r10-docker"], capture_output=True, text=True,
+                   timeout=10).stdout.strip() == "inherited"
+    assert tsd.reachable_path(("vct-r10-docker",)) is None
+    assert tsd.which("vct-r10-only") == str(only)
+    assert tsd.reachable_path(("vct-r10-docker", "vct-r10-only")) == f"{inherited}:{home / 'bin'}"
+
+
+@posix_only
+def test_a_graphical_launch_dir_already_on_path_is_not_moved(tmp_path, monkeypatch):
+    """``prepend-when-missing`` applies only to a MISSING dir: an inherited
+    ``~/.local/bin`` late on the PATH stays late, so the PATH's earlier binary
+    wins."""
+    home = tmp_path / "home"
+    first = tmp_path / "first"
+    earlier = _stub(first / "vct-r10-tool")
+    _stub(home / ".local" / "bin" / "vct-r10-tool")
+    _real_table(monkeypatch, path=first, home=home)
+    monkeypatch.setenv("PATH", f"{first}:{home / '.local' / 'bin'}")
+    assert tsd.which("vct-r10-tool") == str(earlier)
+    assert tsd.reachable_path(("vct-r10-tool",)) is None
+
+
 # ---------------------------------------------------------------------------
 # The boot wrappers (bash + pwsh) — main() end to end on stub runtimes
 # ---------------------------------------------------------------------------
@@ -633,7 +717,9 @@ def test_a_session_refusal_says_a_session_hook_started_nothing(tmp_path):
     root = _root(tmp_path, "docker")
     assert rr.record_boot_refusal(root, "pinned to docker", env={}, source="session") is True
     [entry] = DeferralReport.read(root).entries
-    assert entry.title.startswith("Containers were not started for this session")
+    # R10 J4: the condition's ONE title (it used to name the surface and flip
+    # with whoever wrote last); the surface is in `detected`.
+    assert entry.title == "Container runtime docker is not usable — containers were not started"
     assert entry.detected.startswith("A session-start hook started nothing")
 
 
@@ -684,6 +770,71 @@ def test_a_session_hook_records_a_refused_pin_in_the_installs_ledger(tmp_path, h
         time.sleep(0.2)
     assert [e.condition_id for e in entries] == [rr.CID_UNUSABLE], proc.stdout + proc.stderr
     assert entries[0].detected.startswith("A session-start hook started nothing")
+
+
+SLOW_RECORD_S = 20.0  # a record slower than any foreground hook budget
+
+
+@pytest.mark.parametrize("shell", [
+    pytest.param("bash", marks=pytest.mark.skipif(not POSIX or BASH is None, reason="bash hook")),
+    pytest.param("pwsh", marks=pytest.mark.skipif(not POSIX or BASH is None or PWSH is None,
+                                                  reason="pwsh + bash stubs")),
+])
+def test_a_slow_refusal_record_never_blocks_the_watchdogs_foreground(tmp_path, shell):
+    """R10 J5 — verify-container-ports FIRES the refused-pin record
+    detached; its foreground returns (with the refusal line on stdout) even
+    when the record is slower than the hook's whole 30 s budget. Before J5
+    the record ran in the FOREGROUND after a resolve that can spend ~30 s
+    probing: a slow ledger lock plus the record could push the hook past its
+    timeout, and Claude Code discarded the output — the refusal line
+    included.
+
+    The slow record is injected through the VCT_VENV tier-1 interpreter
+    seam (same shape as ``_plan_failing_python``): the wrapper stalls ONLY
+    ``record-boot-refusal`` by 20 s, then delegates to the real CLI — so the
+    ledger entry this test finally reads is written by the REAL emitter,
+    proving the detached call completes after the hook has returned."""
+    from tests.test_v0297_lifecycle_hooks import SENTINEL_MANAGED, _Machine
+
+    m = _Machine(tmp_path, SENTINEL_MANAGED, {})
+    _stub(m.bin / "docker", "#!/usr/bin/env bash\nexit 1\n")
+    root = _installed_clone(tmp_path)
+    project = tmp_path / "project"
+    project.mkdir()
+    wrapper = m.bin / "vco-slow-record-python"
+    wrapper.write_text(
+        "#!/usr/bin/env bash\n"
+        'if [ "$1" = "-m" ] && [ "$2" = "vco_lib.runtime_reconcile" ] '
+        '&& [ "$3" = "record-boot-refusal" ]; then\n'
+        f"    sleep {int(SLOW_RECORD_S)}\n"
+        "fi\n"
+        f'exec "{sys.executable}" "$@"\n')
+    wrapper.chmod(0o755)
+    script = REPO_ROOT / "templates" / "hooks" / f"verify-container-ports.{('sh' if shell == 'bash' else 'ps1')}"
+    argv = ([BASH or "bash", str(script)] if shell == "bash" else
+            [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+    env = m.env(VCT_CONTAINER_RUNTIME="docker", VCT_INSTALL_ROOT=str(root),
+                CLAUDE_PROJECT_DIR=str(project), VCT_VENV=str(wrapper))
+    env[tsd.ENV_OVERRIDE] = ""
+    t0 = time.monotonic()
+    proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=180,
+                          cwd=str(REPO_ROOT))
+    elapsed = time.monotonic() - t0
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert "VCT_CONTAINER_RUNTIME=docker" in proc.stdout, proc.stdout + proc.stderr
+    assert elapsed < SLOW_RECORD_S, (
+        f"the foreground waited {elapsed:.1f}s for a {SLOW_RECORD_S:.0f}s record — "
+        "the record is not detached (R10 J5)")
+    # The detached record still lands (it sleeps SLOW_RECORD_S first, then
+    # the real CLI writes the installed clone's ledger).
+    deadline = time.monotonic() + SLOW_RECORD_S + 30
+    entries: list = []
+    while time.monotonic() < deadline:
+        entries = DeferralReport.read(root).entries
+        if entries:
+            break
+        time.sleep(0.2)
+    assert [e.condition_id for e in entries] == [rr.CID_UNUSABLE], proc.stdout + proc.stderr
 
 
 # Tools a session hook may call by name. The hermetic PATH below holds ONLY

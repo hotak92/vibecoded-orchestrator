@@ -1,0 +1,49 @@
+{
+  "_comment": [
+    "v0.2.97 R10 J2/J6/J8 — ONE fixture for \"where is VCO's data, and why was a stale runtime record not switched\",",
+    "read by tests/test_v0297_r10_runtime_evidence.py (Python: vco_lib.runtime_reconcile / vco_lib.containers) AND by",
+    "launcher/src-tauri/vct-launcher-core/src/services/container_runtime.rs (Rust mirrors of the same names).",
+    "`compose_project`: the compose project VCO's stack runs under — containers.compose_project_name of the compose",
+    "dir + file text (a top-level `name:` wins, else the dir basename normalised); a volume compose made for VCO",
+    "carries it in its com.docker.compose.project label.",
+    "`bind_sources`: the VCT_*_DATA_SOURCE values that are PATHS (a bind mount of a host folder) — infrastructure/.env",
+    "first (file order), then the environment (key order), each once; a non-path value names a volume and is ignored.",
+    "`evidence`: VCO's data under the runtime a stale record would be SWITCHED TO (R10 J8 — both surfaces judge only",
+    "that runtime this way): a vco_/vct_ container or a vco_* default volume counts on its own; a VCT_*_VOLUME_NAME",
+    "override name (a name the user picked) counts only with its compose project label naming `own_project`.",
+    "`not_switched`: the refusal detail when the stale-record reconcile declines, rendered from",
+    "vco_lib/runtime_reconcile_messages.toml by both languages; `source` is passed in as-is."
+  ],
+  "compose_project": [
+    {"name": "the_infrastructure_dir", "compose_dir": "infrastructure", "compose_text": "services: {}\n", "expect": "infrastructure"},
+    {"name": "a_top_level_name_key_wins", "compose_dir": "infrastructure", "compose_text": "name: vco\nservices: {}\n", "expect": "vco"},
+    {"name": "a_quoted_name_with_a_comment", "compose_dir": "infrastructure", "compose_text": "# stack\nname: 'my-stack' # ours\n", "expect": "my-stack"},
+    {"name": "an_indented_name_is_not_the_project", "compose_dir": "infrastructure", "compose_text": "services:\n  weaviate:\n    name: nope\n", "expect": "infrastructure"},
+    {"name": "the_basename_is_normalised", "compose_dir": "_-My Stack.Dir", "compose_text": "", "expect": "mystackdir"}
+  ],
+  "bind_sources": [
+    {"name": "a_relocated_service_in_the_managed_block", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/weaviate\nVCT_WEAVIATE_VOLUME_NAME=\n", "env": {}, "expect": ["/srv/weaviate"]},
+    {"name": "a_volume_key_source_is_not_a_bind", "env_file": "VCT_OLLAMA_DATA_SOURCE=ollama_data\n", "env": {}, "expect": []},
+    {"name": "relative_home_and_drive_paths", "env_file": "export VCT_OLLAMA_DATA_SOURCE=\"./data/ollama\"\nVCT_CODE_EMBED_CACHE_SOURCE=~/embed\n", "env": {"VCT_WEAVIATE_DATA_SOURCE": "D:\\vco\\weaviate"}, "expect": ["./data/ollama", "~/embed", "D:\\vco\\weaviate"]},
+    {"name": "empty_values_and_other_keys_are_ignored", "env_file": "VCT_WEAVIATE_DATA_SOURCE=\nVCT_WEAVIATE_VOLUME_NAME=/not/a/source\n# VCT_OLLAMA_DATA_SOURCE=/commented\n", "env": {"VCT_VOLUMES_PATH": "/srv"}, "expect": []},
+    {"name": "file_then_environment_each_once", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\r\n", "env": {"VCT_WEAVIATE_DATA_SOURCE": "/srv/w", "VCT_OLLAMA_DATA_SOURCE": "/srv/o"}, "expect": ["/srv/w", "/srv/o"]}
+  ],
+  "evidence": [
+    {"name": "a_vco_container_is_evidence", "env_file": "", "env": {}, "own_project": "infrastructure", "containers": ["vco_weaviate"], "volumes": [], "labels": {}, "expect": true},
+    {"name": "a_default_volume_is_evidence", "env_file": "", "env": {}, "own_project": "infrastructure", "containers": [], "volumes": ["vco_ollama_data"], "labels": {}, "expect": true},
+    {"name": "an_unprefixed_container_is_not", "env_file": "", "env": {}, "own_project": "infrastructure", "containers": ["ollama", "weaviate"], "volumes": ["ollama"], "labels": {}, "expect": false},
+    {"name": "an_override_name_alone_is_not_evidence", "_why": "R10 J8: the user adopted a podman volume named `ollama`; docker has an unrelated `ollama` of its own. The name alone must not make docker the place VCO's data is.", "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "containers": ["someone_elses_ollama"], "volumes": ["ollama"], "labels": {}, "expect": false},
+    {"name": "an_environment_override_alone_is_not_evidence", "env_file": "", "env": {"VCT_WEAVIATE_VOLUME_NAME": "weaviate"}, "own_project": "infrastructure", "containers": [], "volumes": ["weaviate"], "labels": {}, "expect": false},
+    {"name": "an_override_labelled_by_another_project_is_not", "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "containers": [], "volumes": ["ollama"], "labels": {"ollama": "someone_else"}, "expect": false},
+    {"name": "an_override_labelled_with_vcos_project_is_evidence", "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "containers": [], "volumes": ["ollama"], "labels": {"ollama": "infrastructure"}, "expect": true},
+    {"name": "an_override_next_to_a_vco_container_is_evidence", "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "containers": ["vco_ollama"], "volumes": ["ollama"], "labels": {}, "expect": true},
+    {"name": "without_an_own_project_a_label_corroborates_nothing", "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "", "containers": [], "volumes": ["ollama"], "labels": {"ollama": ""}, "expect": false}
+  ],
+  "not_switched": [
+    {"name": "confirmed", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "confirmed", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); docker is your confirmed choice (`install.py --container docker`), so VCO does not switch to podman"},
+    {"name": "bind_data", "pinned": "podman", "source": "/i/state/install/runtime.txt", "decline": "bind_data", "bind": "/srv/weaviate", "expect": "the container runtime is pinned to podman by /i/state/install/runtime.txt: podman is not installed (not on PATH nor in the usual install locations); VCO's data is in the bind-mounted folder /srv/weaviate on this host, so VCO does not switch to docker on the strength of docker's volumes"},
+    {"name": "other_not_usable", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "other_not_usable", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations), and podman is not usable either"},
+    {"name": "unlistable", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "unlistable", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); podman answers but its containers/volumes could not be listed"},
+    {"name": "no_data", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "no_data", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); podman answers but holds none of VCO's containers or volumes — not switching to it here (run `python install.py --update` to re-record the runtime)"}
+  ]
+}

@@ -50,7 +50,13 @@
     "`runtime_confirmed` names the runtime in state/install/runtime.confirmed (the user's `install.py --container`",
     "choice): a record that matches it is NEVER substituted, on any surface",
     "(`runtime_txt_confirmed_record_is_never_switched`). \"Installed\" itself is judged on PATH AND in the usual",
-    "install locations (vco_lib/tool_search_dirs.toml) — `on_path` here stands for that combined answer."
+    "install locations (vco_lib/tool_search_dirs.toml) — `on_path` here stands for that combined answer.",
+    "v0.2.97 R10 J6: `expect_not_switched` names WHY a stale record was not switched on a refused reconcile row — a",
+    "key of vco_lib/runtime_reconcile_messages.toml `[not_switched]`. Python's refusal carries",
+    "\"(not switched: <that detail>)\" and so does the Rust refusal (module plane + hub supervisor), rendered from the",
+    "same table. R10 J2: `bind_data: true` = the install's infrastructure/.env relocates a service's data to a",
+    "non-empty host folder (VCT_*_DATA_SOURCE=<dir>): the data is under neither runtime, so no surface switches the",
+    "record away — even when the other runtime lists VCO's volumes."
   ],
   "scenarios": [
     {
@@ -799,7 +805,8 @@
           "via": "state/install/runtime.txt",
           "alternative_usable": true
         }
-      }
+      },
+      "expect_not_switched": "no_data"
     },
     {
       "name": "runtime_txt_confirmed_record_is_never_switched",
@@ -841,7 +848,8 @@
           "via": "state/install/runtime.txt",
           "alternative_usable": true
         }
-      }
+      },
+      "expect_not_switched": "confirmed"
     },
     {
       "name": "runtime_txt_confirmed_other_runtime_does_not_protect_the_record",
@@ -885,6 +893,49 @@
       }
     },
     {
+      "name": "runtime_txt_stale_record_bind_data_is_never_switched",
+      "_why": "R10 J2: the launcher relocated Weaviate's data to a host folder (VCT_WEAVIATE_DATA_SOURCE=<dir>, non-empty); runtime.txt records docker, which this process cannot find; podman answers and even lists VCO's volumes (a leftover of an earlier trial). The data is on the HOST, not in either runtime's volumes, so nothing here says it belongs to podman: refused everywhere, the refusal says why; install keeps the record (action_required).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "bind_data"
+    },
+    {
       "name": "runtime_txt_stale_record_other_unlistable",
       "_why": "runtime.txt records docker (gone); podman answers but its containers/volumes could not be listed. The reconcile cannot establish where the data is, so the strict pin stands: refused.",
       "env": null,
@@ -924,7 +975,8 @@
           "via": "state/install/runtime.txt",
           "alternative_usable": true
         }
-      }
+      },
+      "expect_not_switched": "unlistable"
     },
     {
       "name": "runtime_txt_record_missing_other_down_is_refused",
@@ -960,7 +1012,8 @@
           "via": "state/install/runtime.txt",
           "alternative_usable": false
         }
-      }
+      },
+      "expect_not_switched": "other_not_usable"
     },
     {
       "name": "env_pin_is_never_reconciled",

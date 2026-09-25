@@ -62,6 +62,9 @@ pub mod compose_args;
 // the supervisor-image-resolution-variant-gap bug fixed in this release.
 // See knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md.
 pub mod container_runtime;
+// v0.2.97 R10 J2/J6/J8: where VCO's data is + why a stale record was not
+// switched (the pure halves of container_runtime's reconcile arm).
+pub mod runtime_evidence;
 pub mod gpu_mode;
 
 // v0.2.95: the model gateway's port/file/service constants and the resolution

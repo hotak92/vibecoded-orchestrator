@@ -159,11 +159,31 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     if [ -n "${VCO_RUNTIME_REQUESTED:-}" ]; then
         echo "verify-container-ports: $VCO_RUNTIME_REASON; skipping"
         # R9 H4/H7 (parity with ensure-containers): also in the ledger, where
-        # the launcher and the next session look. Soft-fail; the CLI bounds
-        # itself (no `timeout` — macOS has none) and writes only an installed
-        # clone's ledger (the one whose runtime.txt the resolver read).
-        "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
-            --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 || true
+        # the launcher and the next session look. R10 J5: the record is
+        # FIRED DETACHED, never waited for. Unlike ensure-containers (whose
+        # whole body runs in its `run-detached` child, so its foreground
+        # record is relay-budgeted), THIS hook has no detached half on the
+        # refused-pin path — its `run-detached` re-exec exists only for
+        # zombie recovery — and the record can sit on the ledger lock a
+        # 10 s-bound update holds (20 s on a stalled write) after a resolve
+        # that already spent up to ~30 s probing: the sum passes this hook's
+        # 30 s budget, Claude Code kills the hook and the refusal line above
+        # is discarded with the rest of the output. Same detach ladder as
+        # _lib/kg-sync-debounce.sh's _kg_debounce_detach (setsid →
+        # nohup+disown → subshell); the CLI bounds ITSELF (no `timeout` —
+        # macOS has none) and writes only an installed clone's ledger (the
+        # one whose runtime.txt the resolver read).
+        if command -v setsid >/dev/null 2>&1; then
+            setsid "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
+                --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 </dev/null &
+        elif command -v nohup >/dev/null 2>&1; then
+            nohup "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
+                --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 </dev/null &
+            disown 2>/dev/null || true
+        else
+            ( "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
+                --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 </dev/null ) &
+        fi
     fi
     log_run skipped "${VCO_RUNTIME_REASON:-no usable container runtime}"
     exit 0

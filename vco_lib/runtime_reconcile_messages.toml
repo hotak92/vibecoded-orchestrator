@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# Why the runtime-record reconcile did NOT switch a stale record — ONE table
+# both languages render (tier B of the A>B>C rule), so every surface that
+# refuses a pinned runtime says the same thing (v0.2.97 R10 J6).
+#
+# Readers:
+#   * Python — `vco_lib/runtime_reconcile.py` (`unusable_detail`): the detail of
+#     an UNUSABLE reconciliation, which `vco_lib.containers.resolve` appends to
+#     its refusal as "(not switched: <detail>)" and install.py prints.
+#   * Rust — `launcher/src-tauri/vct-launcher-core/src/services/container_runtime.rs`
+#     (`include_str!`, `record_reconcile_note`): the same text, appended to the
+#     launcher's and the hub's refusal as "(not switched: <detail>)".
+#   * `tests/fixtures/runtime_data_evidence_cases.json` (`not_switched`) pins
+#     that both render every key identically.
+#
+# Placeholders are `{name}`, replaced literally (no format mini-language):
+#   {pinned} the recorded runtime, {other} the other one, {source} where the
+#   pin came from (the runtime.txt path, or VCT_CONTAINER_RUNTIME), {bind} the
+#   bind-mounted data folder, {what} = the `unusable` state + a `not_switched`
+#   suffix.
+
+format_version = 1
+
+[unusable]
+head = "the container runtime is pinned to {pinned} by {source}: {what}"
+missing = "{pinned} is not installed (not on PATH nor in the usual install locations)"
+down = "{pinned} is installed but does not answer `{pinned} info`"
+
+# Appended to the `unusable` state, keyed by WHY the record was not switched.
+[not_switched]
+confirmed = "; {pinned} is your confirmed choice (`install.py --container {pinned}`), so VCO does not switch to {other}"
+bind_data = "; VCO's data is in the bind-mounted folder {bind} on this host, so VCO does not switch to {other} on the strength of {other}'s volumes"
+other_not_usable = ", and {other} is not usable either"
+unlistable = "; {other} answers but its containers/volumes could not be listed"
+no_data = "; {other} answers but holds none of VCO's containers or volumes — not switching to it here (run `python install.py --update` to re-record the runtime)"

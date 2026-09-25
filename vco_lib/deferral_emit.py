@@ -54,6 +54,7 @@ from __future__ import annotations
 import json
 import logging
 from contextlib import contextmanager
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Optional, Sequence
@@ -114,7 +115,8 @@ def _log(log: Any, level: str, msg: str) -> None:
 
 
 @contextmanager
-def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None) -> Iterator[DeferralReport]:
+def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None,
+                  gate: Optional["WriteGate"] = None) -> Iterator[DeferralReport]:
     """Read → yield → write the deferral report under the shared file lock.
 
     The whole cycle runs inside the exclusive lock on
@@ -145,6 +147,9 @@ def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None) -> It
         lock_timeout_s: ``None`` waits for the lock; a number bounds the wait
             (:class:`vco_lib.atomic.LockTimeout` past it, nothing read or
             written) — R9 H7, for callers that must never stall.
+        gate: a caller that may change nothing passes a :class:`WriteGate`
+            and clears ``gate.write`` — the report is then not rewritten
+            (its render carries a fresh ``generated_at``, R10 J4).
 
     Yields:
         A :class:`DeferralReport` seeded from the on-disk state, ready to
@@ -154,7 +159,30 @@ def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None) -> It
     with exclusive_file_lock(folder / LOCK_REL, timeout_s=lock_timeout_s):
         report = DeferralReport.read(folder)
         yield report
-        report.write(folder)
+        if gate is None or gate.write:
+            report.write(folder)
+
+
+class WriteGate:
+    """:func:`locked_report`'s ``gate``: clear ``write`` inside the block when
+    nothing changed, and the report is not rewritten."""
+
+    __slots__ = ("write",)
+
+    def __init__(self) -> None:
+        self.write = True
+
+
+def _first_detected(prior: Optional[DeferralEntry], entry: DeferralEntry) -> DeferralEntry:
+    """``entry`` carrying ``prior``'s ``detected_at`` when ``prior`` is the SAME
+    condition (same ``condition_id`` and the same ``dismiss_fields`` — the
+    registry's "what makes it the same state" values). A re-emission then
+    says since when the condition holds, not when it was last noticed."""
+    if prior is None or prior.condition_id != entry.condition_id:
+        return entry
+    if dict(prior.dismiss_fields or {}) != dict(entry.dismiss_fields or {}):
+        return entry
+    return replace(entry, detected_at=prior.detected_at)
 
 
 def emit_entries(
@@ -163,6 +191,7 @@ def emit_entries(
     *,
     log: Any = None,
     lock_timeout_s: Optional[float] = None,
+    keep_first_detected: bool = False,
 ) -> bool:
     """Add ``entries`` to the on-disk report under the shared lock.
 
@@ -179,6 +208,12 @@ def emit_entries(
         log: Optional logger for the soft-fail path.
         lock_timeout_s: bound on the lock wait (see :func:`locked_report`);
             past it nothing is written and ``False`` is returned (logged).
+        keep_first_detected: for a condition RE-EMITTED on every run (a
+            session hook's refusal): an entry already in the ledger for the
+            same condition (same ``dismiss_fields``) keeps its ``detected_at``,
+            and when nothing else changed either the ledger is not rewritten
+            at all (v0.2.97 R10 J4 — it would otherwise say "detected a minute
+            ago" forever and change on every session).
 
     Returns:
         ``True`` when the report holds at least one entry after the write
@@ -186,14 +221,24 @@ def emit_entries(
         deleted). Mirrors :meth:`DeferralReport.write`'s return.
     """
     try:
-        with locked_report(folder, lock_timeout_s=lock_timeout_s) as report:
+        written: list[DeferralEntry] = []
+        gate = WriteGate()
+        with locked_report(folder, lock_timeout_s=lock_timeout_s, gate=gate) as report:
             for entry in entries:
+                if keep_first_detected:
+                    prior = report.entry_for(entry.condition_id)
+                    entry = _first_detected(prior, entry)
+                    if prior == entry:
+                        continue
                 report.add_entry(entry)
+                written.append(entry)
+            if keep_first_detected and not written:
+                gate.write = False
             wrote = bool(report)
         # v0.2.91 WP-B: mirror record-class entries into the auto-resolutions
         # trail. Runs AFTER the locked cycle (different file, no lock needed)
         # so a jsonl hiccup can never hold the deferral lock.
-        _mirror_record_entries_to_trail(folder, entries, log=log)
+        _mirror_record_entries_to_trail(folder, written, log=log)
         return wrote
     except Exception as exc:  # noqa: BLE001 — deferral I/O is best-effort
         cids = ", ".join(e.condition_id for e in entries) or "(none)"
@@ -244,9 +289,10 @@ def _mirror_record_entries_to_trail(
 
 
 def emit(folder: Path, entry: DeferralEntry, *, log: Any = None,
-         lock_timeout_s: Optional[float] = None) -> bool:
+         lock_timeout_s: Optional[float] = None, keep_first_detected: bool = False) -> bool:
     """Single-entry sugar over :func:`emit_entries`."""
-    return emit_entries(folder, (entry,), log=log, lock_timeout_s=lock_timeout_s)
+    return emit_entries(folder, (entry,), log=log, lock_timeout_s=lock_timeout_s,
+                        keep_first_detected=keep_first_detected)
 
 
 def resolve_conditions(

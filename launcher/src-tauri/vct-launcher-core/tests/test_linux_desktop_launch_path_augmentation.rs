@@ -185,7 +185,8 @@ fn augment_preserves_pre_existing_path_entries_after_candidates() {
     let home = TempDir::new();
     let new_path = desktop_launch_path(home.path()).to_string_lossy().to_string();
     // The systemd --user PATH entries must still be present (not replaced
-    // wholesale); augment candidates are PREPENDED, system entries follow.
+    // wholesale); the graphical-launch candidates are PREPENDED, the
+    // runtime locations APPENDED (v0.2.97 R10), system entries in between.
     for systemd_entry in ["/usr/local/bin", "/usr/bin", "/bin"] {
         assert!(
             new_path.contains(systemd_entry),

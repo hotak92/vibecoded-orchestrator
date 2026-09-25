@@ -91,13 +91,21 @@ def _probes(sc: dict):
 
 
 def _install_root(tmp_path: Path, runtime_txt: Optional[str],
-                  confirmed: Optional[str] = None) -> Path:
+                  confirmed: Optional[str] = None, bind_data: bool = False) -> Path:
     """An install root holding the scenario's ``state/install/runtime.txt``
     (or none) and, when the scenario declares ``runtime_confirmed``, its
     ``state/install/runtime.confirmed`` — never the machine's own clone, whose
-    record would leak in."""
+    record would leak in. ``bind_data`` (R10 J2): its ``infrastructure/.env``
+    relocates Weaviate's data to a non-empty folder (``_bind_dir``)."""
     root = tmp_path / "install-root"
     root.mkdir()
+    if bind_data:
+        folder = _bind_dir(root)
+        folder.mkdir(parents=True)
+        (folder / "classifications.db").write_text("x", encoding="utf-8")
+        (root / "infrastructure").mkdir()
+        (root / "infrastructure" / ".env").write_text(
+            f"VCT_WEAVIATE_DATA_SOURCE={folder}\nVCT_WEAVIATE_VOLUME_NAME=\n", encoding="utf-8")
     if runtime_txt is not None:
         containers.runtime_txt_path(root).parent.mkdir(parents=True)
         containers.runtime_txt_path(root).write_text(runtime_txt + "\n", encoding="utf-8")
@@ -107,12 +115,17 @@ def _install_root(tmp_path: Path, runtime_txt: Optional[str],
     return root
 
 
+def _bind_dir(root: Path) -> Path:
+    return root / "weaviate-folder"
+
+
 @pytest.mark.parametrize("sc", SCENARIOS, ids=[s["name"] for s in SCENARIOS])
 def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
     which, run = _probes(sc)
     env = {} if sc["env"] is None else {"VCT_CONTAINER_RUNTIME": sc["env"]}
     warnings: list[str] = []
-    root = _install_root(tmp_path, sc.get("runtime_txt"), sc.get("runtime_confirmed"))
+    root = _install_root(tmp_path, sc.get("runtime_txt"), sc.get("runtime_confirmed"),
+                         bool(sc.get("bind_data")))
     res = containers.resolve(
         env=env, which=which, run=run, warn=warnings.append, home=tmp_path,
         install_root=root,
@@ -152,6 +165,18 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
             f"{res.requested!r} — that forks the data plane (separate named volumes)"
         )
     assert res.to_dict()["substituted"] is exp["substituted"]  # what --json carries
+    # R10 J6: WHY the stale record was not switched, in the shared wording the
+    # Rust refusal renders too (runtime_reconcile_messages.toml).
+    decline = sc.get("expect_not_switched")
+    if decline is not None:
+        from vco_lib.runtime_reconcile import unusable_detail
+
+        detail = unusable_detail(exp["requested"], str(containers.runtime_txt_path(root)),
+                                 "missing", decline,
+                                 bind=str(_bind_dir(root)) if sc.get("bind_data") else "")
+        assert f"(not switched: {detail})" in res.reason, f"{sc['name']}: {res.reason}"
+    else:
+        assert "(not switched:" not in res.reason, f"{sc['name']}: {res.reason}"
     if exp["requested"] and exp["state"] != "resolved":
         # A refused pin is USELESS unless it says what to do next.
         assert res.runtime is None and res.compose is None

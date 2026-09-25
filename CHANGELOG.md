@@ -455,20 +455,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pinned with `VCT_CONTAINER_RUNTIME` is never changed.
 - When the recorded runtime cannot be found, a session, the boot service, the
   launcher or the hub switches to the other runtime only if that one already
-  holds VCO's containers or volumes — including volumes you named with
-  `VCT_*_VOLUME_NAME` — and otherwise refuses and says why; it never starts
-  the stack on empty volumes. A runtime installed outside the calling
+  holds VCO's containers or volumes, and otherwise refuses and says why; it
+  never starts the stack on empty volumes. A volume name you picked with
+  `VCT_*_VOLUME_NAME` counts as VCO's data there only next to a VCO container
+  or with VCO's compose label, so an unrelated volume of the same name cannot
+  move the record; a service whose data lives in a folder
+  (`VCT_*_DATA_SOURCE`) keeps its recorded runtime while the folder holds
+  data. A runtime installed outside the calling
   program's `PATH` (`~/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
   `/usr/local/bin`, Docker Desktop's folders, the Windows installer folders)
   is now found instead of being treated as not installed;
-  `VCT_TOOL_SEARCH_DIRS` replaces the list of places searched. On macOS, the
+  `VCT_TOOL_SEARCH_DIRS` replaces the list of places searched. These extra
+  places come after your `PATH`, so they never replace a program your `PATH`
+  already finds; a launcher started from Finder or a desktop icon still puts
+  Homebrew, cargo and `~/.local/bin` first, as it has since v0.2.53. On macOS, the
   boot service no longer reports every runtime as unusable.
 - The boot service reads its own install's runtime record, never another
   copy's, and falls back to its own compose folder when the configured one is
   gone. When no usable container runtime is found at boot — or a session
   hook refuses a pinned runtime — the reason appears in
-  `UPDATE_DEFERRED.md`, not only in a log, and recording it can never hold up
-  boot or a session while an update is running.
+  `UPDATE_DEFERRED.md`, not only in a log, under one title that keeps the
+  time it was first seen. Recording it gives up after a few seconds if an
+  update is holding the ledger, and the port check records it in the
+  background, so neither boot nor a session is held up.
 - Every VCO client (Python, shell, PowerShell, `vct-cli`, the launcher, and
   `vco verify-diagrams`) now finds the hub the same way, and agrees on what a
   valid port is: 1–65535 in plain digits (a sign, `_`, other numerals or
@@ -483,6 +492,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of always 7700, and the hub module's catalog entry names the running hub's
   port too. The code-embedding module's entry named port 11438; the service
   runs on 11440.
+- The bash code-embed session hook no longer exits silently when the
+  container runtime is refused: it says why, and leaves no temporary file
+  behind (a problem since v0.2.92).
 - The code-embed session hook takes the service's port from the recorded
   endpoint; an exported `CODE_EMBED_PORT` no longer steers it. When it cannot
   read the record, it changes nothing that session instead of guessing a
@@ -555,8 +567,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Code passes in — `"${CLAUDE_PROJECT_DIR:-.}"` on Linux and macOS (it falls
   back to the old relative form if Claude Code provides neither the value
   nor the variable, so it is never worse than before), and the exact
-  `${CLAUDE_PROJECT_DIR}` placeholder on Windows, which Claude Code fills in
-  whichever shell runs the hook. See `docs/CLAUDE_CODE_COMPATIBILITY.md`.
+  `${CLAUDE_PROJECT_DIR}` placeholder on Windows, which Claude Code's
+  documentation says it substitutes into the command before running it (not
+  yet verified on a Windows machine). See `docs/CLAUDE_CODE_COMPATIBILITY.md`.
   Before, they named `.claude/hooks/…` relative to the current directory, so
   after a `cd` or inside a worktree every VCO hook failed. Your next bundle
   update rewrites existing projects' VCO hooks in place and leaves your own
