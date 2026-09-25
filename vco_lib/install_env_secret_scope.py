@@ -140,15 +140,18 @@ def post_secrets_to_hub(
     """
     import json
 
+    # v0.2.97: the project_config import rides INSIDE the same guard — its
+    # module scope imports `requests` unguarded, so an interpreter without
+    # the package (install.py on the system python, post-venv) must fail
+    # into the RuntimeError below, never into a ModuleNotFoundError.
     try:
         import requests
+        from vco_lib.project_config import _discover_hub, HubUnreachable
     except ImportError as exc:
         raise RuntimeError(
             "V47-C: cannot migrate secrets — `requests` not importable; "
             "is the MCP venv active?"
         ) from exc
-
-    from vco_lib.project_config import _discover_hub, HubUnreachable
 
     try:
         port, token = _discover_hub()

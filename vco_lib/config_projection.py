@@ -2794,7 +2794,7 @@ def apply_project_env(
     # stay in the keychain; only proven copies in committable files go.
     known_secret_keys = list(bundle.get("user_secret_known_keys") or [])
     verdicts = classify_json_env_secrets(project_root, known_keys=known_secret_keys)
-    residue_before = retained_user_secret_values(project_root, verdicts=verdicts)
+    residue_before = retained_launcher_value_names(project_root, verdicts=verdicts)
     us_strip_keys: list[str] = residue_before.get(".claude/settings.json", [])
     vscode_strip_keys: list[str] = residue_before.get(".vscode/settings.json", [])
 
@@ -3187,7 +3187,7 @@ def known_user_secret_keys_for_folder(folder: Path) -> list[str]:
         return []
 
 
-def retained_user_secret_values(
+def retained_launcher_value_names(
     folder: Path,
     *,
     known_keys: Optional[Iterable[str]] = None,
@@ -3220,7 +3220,7 @@ def retained_user_secret_state(folder: Path) -> Optional[bool]:
     remains; ``None`` — none proven, but a launcher-known key's value could not
     be checked (keep the entry: no evidence it is over); ``False`` — clean."""
     verdicts = classify_json_env_secrets(Path(folder))
-    if retained_user_secret_values(folder, verdicts=verdicts):
+    if retained_launcher_value_names(folder, verdicts=verdicts):
         return True
     if any(
         v in (EVIDENCE_UNKNOWN, EVIDENCE_PAUSED) for per in verdicts.values() for v in per.values()
@@ -3239,7 +3239,7 @@ def _record_secret_value_scrubs(
         from vco_lib.deferral_emit import record_auto_resolution, resolve_conditions
         from vco_lib.deferral_report import DeferralReport
 
-        after = retained_user_secret_values(project_root, known_keys=known_keys)
+        after = retained_launcher_value_names(project_root, known_keys=known_keys)
         for rel, names in before.items():
             for name in sorted(set(names) - set(after.get(rel, []))):
                 record_auto_resolution(
@@ -4460,7 +4460,7 @@ __all__ = [
     "strip_proven_secret_values",
     "retained_secret_keys_in",
     "retained_user_secret_state",
-    "retained_user_secret_values",
+    "retained_launcher_value_names",
     "strip_env_keys",
     "user_secret_known_keys_from_db",
     "write_env_block",

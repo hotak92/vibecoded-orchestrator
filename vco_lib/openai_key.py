@@ -27,17 +27,20 @@ it went unread by the Python consumers. This module closes both halves:
   after copying it into the file store when nothing is stored yet. A line
   the user wrote anywhere else is theirs and is not touched.
 
-No function here logs, prints or returns a value.
+No function here logs, prints or returns a VALUE. (The ``__main__`` CLI
+prints the migration's JSON verdict — status and detail, which carry no
+value by the contract above.)
 """
 
 from __future__ import annotations
 
 import hmac
+import json
 import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 #: The one name of the slot (``vct-module.json`` ``bundled_secrets``).
 OPENAI_SECRET_NAME = "openai_api_key"
@@ -53,6 +56,11 @@ _resolved: dict[str, str] = {}
 class StoreFailed(RuntimeError):
     """Neither store accepted the key. The message names the stores and the
     reason, never the value."""
+
+
+class MigrationUnavailable(RuntimeError):
+    """The venv-side migration subprocess could not run, failed, or did not
+    answer. The message names the interpreter and the reason, never a value."""
 
 
 def resolve_openai_api_key(project: Optional[str] = None) -> str:
@@ -220,6 +228,125 @@ def migrate_dotenv_openai_key(root: Path) -> dict[str, str]:
     return outcome
 
 
+def migrate_dotenv_openai_key_via(
+    python_exe: Optional[Path],
+    root: Path,
+    *,
+    say: Callable[..., None],
+    note: Callable[..., None],
+) -> None:
+    """install.py's step-9 / ``--update`` migration entry: run
+    :func:`migrate_dotenv_openai_key` as a child of ``python_exe`` and report.
+
+    v0.2.97 install-smoke fix: install.py runs on the SYSTEM interpreter for
+    its whole run (the venv is created mid-run but the process never re-execs
+    into it), so migrating in-process imported ``vco_lib.agent_secrets`` →
+    ``vco_lib.project_config`` → ``requests`` and every fresh install crashed
+    at step 9 with ``ModuleNotFoundError``. The venv HAS the packages, so the
+    step runs there — tier A, ``python -m vco_lib.openai_key
+    migrate-dotenv``. The value never crosses argv, env or exception text:
+    the CHILD reads ``<root>/.env``, argv carries only the root path, and the
+    child's JSON verdict is status+detail by :func:`migrate_dotenv_openai_key`'s
+    contract. A subprocess that cannot run is REPORTED (a left-in-place
+    warning through ``note``), never a silent skip, never a crash."""
+    if python_exe is None:
+        result = {
+            "status": "left_unverified",
+            "detail": (
+                f"the install venv has no python under {root} — re-run "
+                "install.py to recreate it, then move the key by hand"
+            ),
+        }
+    else:
+        try:
+            result = run_dotenv_migration_under(python_exe, root)
+        except MigrationUnavailable as exc:
+            result = {"status": "left_unverified", "detail": str(exc)}
+    if result["status"] == "absent":
+        return
+    if result["status"] == "migrated":
+        say(f"  .env: moved the OpenAI key VCO wrote there into {result['detail']}.")
+        note("ok", "openai key moved out of .env", {"status": result["status"]})
+        return
+    say(
+        f"  .env: the OpenAI key VCO wrote there was LEFT in place — "
+        f"{result['detail']}. Remove the `OPENAI_API_KEY=` line under "
+        "`# OpenAI (for embeddings)` once the key is stored (launcher "
+        "Preferences → Special Secrets)."
+    )
+    note("warn", f".env openai key left: {result['detail']}", {"status": result["status"]})
+
+
+def run_dotenv_migration_under(
+    python_exe: Path, root: Path, *, timeout: float = 120.0,
+) -> "dict[str, str]":
+    """Run the migration as ``python -m vco_lib.openai_key migrate-dotenv``
+    and return the child's ``{"status", "detail"}``.
+
+    Raises :class:`MigrationUnavailable` when the child could not start,
+    failed, or did not print one JSON verdict — the caller reports, the
+    install never crashes. The key value never appears in argv (only the
+    root path rides it), in the captured output that failure messages quote,
+    or in the exception text."""
+    argv = [
+        str(python_exe), "-m", "vco_lib.openai_key",
+        "migrate-dotenv", "--root", str(root),
+    ]
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        raise MigrationUnavailable(
+            f"the venv migration timed out after {timeout:.0f}s"
+        ) from exc
+    except OSError as exc:
+        raise MigrationUnavailable(f"could not run {python_exe}: {exc}") from exc
+    if done.returncode != 0:
+        tail = (done.stderr or "").strip().splitlines()
+        reason = tail[-1][:300] if tail else f"exit code {done.returncode}"
+        raise MigrationUnavailable(f"the venv migration failed: {reason}")
+    stdout = (done.stdout or "").strip()
+    line = stdout.splitlines()[-1] if stdout else ""
+    try:
+        verdict = json.loads(line)
+    except ValueError as exc:
+        raise MigrationUnavailable(
+            "the venv migration printed no JSON verdict"
+        ) from exc
+    if not isinstance(verdict, dict) or not verdict.get("status"):
+        raise MigrationUnavailable("the venv migration's verdict has no status")
+    return {
+        "status": str(verdict.get("status", "")),
+        "detail": str(verdict.get("detail", "")),
+    }
+
+
+def _main(argv: Optional[list[str]] = None) -> int:
+    """``python -m vco_lib.openai_key`` — the venv-side CLI install.py
+    subprocesses to. Prints the migration's value-free JSON verdict as the
+    LAST stdout line (what :func:`run_dotenv_migration_under` parses)."""
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.openai_key",
+        description="The OpenAI key's one-store tooling (install.py's venv side).",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+    mig = sub.add_parser(
+        "migrate-dotenv",
+        help="move a legacy VCO-written OPENAI_API_KEY .env line into the store",
+    )
+    mig.add_argument("--root", required=True, help="the install root holding the .env")
+    parsed = parser.parse_args(argv)
+    print(json.dumps(migrate_dotenv_openai_key(Path(parsed.root))))
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover — exercised as a real child below
+    import sys
+
+    sys.exit(_main())
+
+
 # The ONE argv redactor lives with the install companions (stdlib only, so
 # install.py can use it before its venv exists); re-exported here.
 from vco_lib.install_companions import (  # noqa: E402
@@ -232,11 +359,14 @@ __all__ = [
     "LEGACY_DOTENV_HEADER",
     "OPENAI_ENV_VAR",
     "OPENAI_SECRET_NAME",
+    "MigrationUnavailable",
     "StoreFailed",
     "SECRET_ARGV_FLAGS",
     "describe_store",
     "migrate_dotenv_openai_key",
+    "migrate_dotenv_openai_key_via",
     "redact_secret_argv",
     "resolve_openai_api_key",
+    "run_dotenv_migration_under",
     "store_openai_api_key",
 ]

@@ -500,8 +500,14 @@ def _substitute_tree(node: Any, env: dict) -> Any:
 
 def load_compose_doc(path: Path, env: dict) -> Optional[dict]:
     """Parse one compose file with ``${VAR}`` / ``${VAR:-default}``
-    substitution.  ``None`` when unreadable/unparseable."""
-    import yaml  # local: see the module header — not available at bootstrap
+    substitution.  ``None`` when unreadable/unparseable — or when PyYAML is
+    not importable in this interpreter (v0.2.97: install.py reaches this on
+    the SYSTEM python, post-venv; the degradation is the caller's existing
+    "compose chain unusable" refusal, never a crash)."""
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError:
+        return None
 
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -931,7 +937,10 @@ def existing_managed_override(infra_dir: Path) -> Optional[dict]:
     """The parsed managed override already in *infra_dir* (the first of the
     two auto-load names that exists and carries the managed marker), or
     ``None``. A user-authored file is never read as ours."""
-    import yaml  # local: see the module header — not available at bootstrap
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError:
+        return None  # same degradation as "no managed override readable"
 
     for name in _OVERRIDE_FILES:
         target = infra_dir / name
@@ -1012,7 +1021,17 @@ def render_adoption_override(plans: Sequence[ServicePlan], *,
     body = {"services": services_block or {}}
     body["networks"] = networks_block or {}
     body["volumes"] = volumes_block or {}
-    import yaml  # local: see the module header — not available at bootstrap
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError as exc:
+        # Loud, never silent: the override cannot be rendered without PyYAML.
+        # The install path never gets here (load_compose_doc's guard already
+        # refused the chain); a direct caller learns the reason, not a
+        # ModuleNotFoundError from an unrelated frame.
+        raise RuntimeError(
+            "PyYAML is not importable in this interpreter — the adoption "
+            "override cannot be rendered (re-run install.py)"
+        ) from exc
 
     text = yaml.safe_dump(body, default_flow_style=False, sort_keys=True)
     return _OVERRIDE_HEADER + "\n" + text
@@ -1642,17 +1661,21 @@ def adopt_services(
         if doc is None:
             continue
         cfg = doc if cfg is None else merge_compose(cfg, doc)
-    # ABOVE the try, not inside it: the `except` clause names `yaml`, so an
-    # import that failed in the try would leave the handler referencing an
-    # unbound name and raise NameError instead of the error it exists to
-    # catch. (pyright: reportPossiblyUnbound — the same shape this cycle
-    # already fixed twice in install.py.)
-    import yaml  # local: see the module header
-
+    # v0.2.97: PyYAML is a venv-time package (module header) — an
+    # interpreter without it (install.py on the SYSTEM python, post-venv)
+    # degrades to "override unreadable" (rendered=None), never a crash.
+    # The try/except-ImportError sits AROUND the import only: the YAMLError
+    # handler below must not reference a name the failed import left
+    # unbound (pyright reportPossiblyUnbound).
     try:
-        rendered = yaml.safe_load(override_body)
-    except yaml.YAMLError:
+        import yaml  # local: see the module header
+    except ImportError:
         rendered = None
+    else:
+        try:
+            rendered = yaml.safe_load(override_body)
+        except yaml.YAMLError:
+            rendered = None
     cfg = merge_compose(cfg or {}, rendered if isinstance(rendered, dict) else {})
     rendered_top = cfg.get("volumes") or {}
     for plan in list(adoptable):

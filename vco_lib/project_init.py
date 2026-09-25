@@ -9704,11 +9704,11 @@ def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
     refresh that leaves nothing behind. FOREIGN to install.py (v0.2.73 S-8):
     bundle-update-only, so it is deliberately NOT install-owned.
     """
-    from vco_lib.config_projection import retained_user_secret_values
+    from vco_lib.config_projection import retained_launcher_value_names
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
-    found = retained_user_secret_values(Path(folder))
+    found = retained_launcher_value_names(Path(folder))
     if not found:
         return
     where = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in found.items())

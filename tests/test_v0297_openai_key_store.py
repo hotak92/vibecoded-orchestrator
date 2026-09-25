@@ -28,6 +28,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
 
 from vco_lib import openai_key  # noqa: E402
+from tests.common.fake_venv import install_fake_venv_python  # noqa: E402
 
 CANARY = "sk-canary-not-a-real-key-7d2c"
 OTHER = "sk-other-not-a-real-key-a91e"
@@ -199,6 +200,10 @@ def test_install_migrates_a_legacy_root_env_line_on_rerun(stores, tmp_path) -> N
     root = tmp_path / "orch"
     root.mkdir()
     (root / ".env").write_text("KG_COLLECTION=Gamma_KG\n" + _LEGACY.format(value=CANARY))
+    # v0.2.97: the migration runs as a SUBPROCESS of the install venv's
+    # python (in-process it would import `requests` on the launching
+    # interpreter) — the fake venv answers the resolver for it.
+    install_fake_venv_python(root)
     _run_write_env(root)
     text = (root / ".env").read_text()
     assert CANARY not in text and text.startswith("KG_COLLECTION=Gamma_KG\n")
@@ -207,9 +212,17 @@ def test_install_migrates_a_legacy_root_env_line_on_rerun(stores, tmp_path) -> N
 
 def test_update_reconcile_moves_a_legacy_line_out_of_the_reconciled_env(stores, tmp_path) -> None:
     """``install.py --update`` (``_reconcile_env_keys``) runs the same
-    migration on the folder it reconciles — never on another tree."""
+    migration on the folder it reconciles — never on another tree. The venv
+    interpreter is resolved from the INSTALL root (the reconciled folder may
+    be a project without one), so the fake venv goes there."""
     (tmp_path / ".env").write_text("KG_COLLECTION=Gamma_KG\n" + _LEGACY.format(value=CANARY))
-    install._reconcile_env_keys(tmp_path / ".env")
+    install_fake_venv_python(tmp_path)
+    orig = install.PROJECT_ROOT
+    install.PROJECT_ROOT = tmp_path
+    try:
+        install._reconcile_env_keys(tmp_path / ".env")
+    finally:
+        install.PROJECT_ROOT = orig
     assert CANARY not in (tmp_path / ".env").read_text()
     assert _stored(stores).read_text().strip() == CANARY
 

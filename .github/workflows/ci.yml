@@ -169,15 +169,23 @@ jobs:
       # install always has `<root>/.venv` with `pip install -e .`; the hosted
       # runner does not, so give it the same shape here (the Python job
       # already does the editable install for the same reason, eb1a74a4).
-      # `--no-deps`: `vco_lib.hooks_settings` is stdlib + vco_lib only, and
-      # the bare `python3` these tests ran under before had no deps either.
+      # v0.2.97: WITH requirements.txt. The earlier `--no-deps` rested on
+      # "vco_lib.hooks_settings is stdlib + vco_lib only" — true of that one
+      # module, not of every vco_lib CLI the Rust tests spawn: the secret
+      # scrub (`config_projection`) resolves launcher-stored values through
+      # the hub client, which imports `requests`, and four launcher tests went
+      # red with ModuleNotFoundError on a venv no real install ever has. A
+      # real install's venv carries requirements.txt; so does this one (the
+      # Python jobs above install the same file).
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+          cache: pip
       - name: Install vco_lib into a checkout venv (what every real install has)
         run: |
           python -m venv .venv
           .venv/bin/python -m pip install --quiet --upgrade pip
+          .venv/bin/pip install --quiet -r requirements.txt
           .venv/bin/pip install --quiet --no-deps -e .
           .venv/bin/python -c 'import vco_lib, vco_lib.hooks_settings; print(vco_lib.__file__)'
       - name: cargo test --workspace --tests (keychain-safe wrapper)

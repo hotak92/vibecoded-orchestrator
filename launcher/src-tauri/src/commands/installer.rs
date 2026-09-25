@@ -14894,6 +14894,16 @@ MemAvailable:   23456789 kB
                     if is_keychain_unavailable_err(&e) {
                         return KeychainPrep::Unavailable(e);
                     }
+                    // A host with NO Secret Service backend (headless CI:
+                    // "org.freedesktop.secrets was not provided by any .service
+                    // files") errs on every op by construction and can hold no
+                    // residue — the keychain is empty, so the file-fallback
+                    // tests are exactly what should run there. Consulted only
+                    // AFTER a non-timeout failure: a loaded desktop whose probe
+                    // times out still takes the timeout skip above.
+                    if !crate::secrets::keychain_backend_available() {
+                        return KeychainPrep::Ready;
+                    }
                     panic!(
                         "delete_keychain_checked: keychain delete of shared.{}/{} \
                          failed (residue would be misread as already-migrated): {}",

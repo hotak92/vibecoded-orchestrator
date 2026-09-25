@@ -112,7 +112,7 @@ def test_a_value_equal_to_the_stored_one_is_removed_and_the_users_keys_survive(p
         "hooks": {"Stop": []},
         "env": {KNOWN: VALUE, "MY_HAND_ADDED_TOKEN": "mine", "EDITOR_THEME": "dark"},
     }))
-    assert cp.retained_user_secret_values(project) == {".claude/settings.json": [KNOWN]}
+    assert cp.retained_launcher_value_names(project) == {".claude/settings.json": [KNOWN]}
 
     _refresh()
 
@@ -120,7 +120,7 @@ def test_a_value_equal_to_the_stored_one_is_removed_and_the_users_keys_survive(p
     assert KNOWN not in env
     assert env["MY_HAND_ADDED_TOKEN"] == "mine" and env["EDITOR_THEME"] == "dark"
     assert VALUE not in path.read_text()
-    assert cp.retained_user_secret_values(project) == {}
+    assert cp.retained_launcher_value_names(project) == {}
 
 
 def test_github_token_follows_the_same_rule_against_github_pat(project, stored):

@@ -72,6 +72,12 @@
         // weaviate-client v4 stubs. Gate it after that cleanup.
         "claude_mcp_servers/weaviate_mcp/server.py"
     ],
+    // v0.2.97: `claude_mcp_servers` is on sys.path at runtime (install.py's
+    // editable weaviate_mcp install adds it), so `from model_router import
+    // config` in vco_lib resolves there. Name the CHECKOUT's copy here: without
+    // it a local run resolved through whatever venv .pth happened to exist
+    // (another install's older tree) and CI, with no such .pth, failed.
+    "extraPaths": ["claude_mcp_servers"],
     "pythonVersion": "3.12",
     // v0.2.92: unused-import ratchet ON. The 21-violation backlog this
     // surfaced was cleared (11 dead imports deleted; 10 deliberate

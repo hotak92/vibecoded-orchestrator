@@ -110,7 +110,7 @@ def test_provably_vco_written_values_belong_to_the_sibling_condition(project, st
     stored["LAUNCHER_KNOWN_TOKEN"] = "the-launchers-own-value"
     _write(project, {"GITHUB_TOKEN": VALUE, "LAUNCHER_KNOWN_TOKEN": VALUE})
     assert user_owned_secrets.found(project) == {".claude/settings.json": ["LAUNCHER_KNOWN_TOKEN"]}
-    assert cp.retained_user_secret_values(project) == {".claude/settings.json": ["GITHUB_TOKEN"]}
+    assert cp.retained_launcher_value_names(project) == {".claude/settings.json": ["GITHUB_TOKEN"]}
 
 
 def test_leave_alone_the_env_refresh_never_removes_a_user_owned_secret(project):

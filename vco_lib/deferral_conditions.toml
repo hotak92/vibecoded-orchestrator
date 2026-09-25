@@ -949,7 +949,7 @@ owner = "vco_lib.project_init"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 notes = """Probed clear (B-F8 re-scan) on every bundle update. v0.2.97: the \
-detection is `config_projection.retained_user_secret_values` — the SAME set \
+detection is `config_projection.retained_launcher_value_names` — the SAME set \
 every `apply_project_env` removes: a JSON env-block value that EQUALS the \
 launcher's stored value for that key (resolved through the hub, active-gated, \
 compared in constant time; GITHUB_TOKEN against github_pat), and secret-shaped \

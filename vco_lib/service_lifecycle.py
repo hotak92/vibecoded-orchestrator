@@ -395,8 +395,13 @@ def _provider_mount(argv: list[str], infra: Path, service: str, destination: str
     if res.returncode != 0:
         tail = (res.stderr or "").strip().splitlines()
         return None, "`compose config` failed: " + (tail[-1] if tail else f"exit {res.returncode}")
-    import yaml  # noqa: PLC0415 — venv-time only (see service_adoption's header)
-
+    try:
+        import yaml  # noqa: PLC0415 — venv-time only (see service_adoption's header)
+    except ImportError:
+        # v0.2.97: same degradation as every other unreadable render — the
+        # caller refuses the migration (install.py may be on the SYSTEM
+        # python here, post-venv, where PyYAML is absent).
+        return None, "PyYAML is not importable in this interpreter (venv not active?)"
     try:
         doc = yaml.safe_load(res.stdout or "")
     except yaml.YAMLError as exc:

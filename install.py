@@ -6609,11 +6609,8 @@ def main() -> int:
             data=_backfill_result,
         )
 
-        # v0.2.80 GAP-CG-1: re-project ALL projects (name-form lists); the
-        # deferral_report threading is LOAD-BEARING (review B2, None-guarded).
-        from vco_lib.config_projection import run_update_reprojection_step
-        run_update_reprojection_step(print_fn=print, log_event=_log_install_event,
-                                     deferral_report=_deferral_report)
+        # v0.2.80 GAP-CG-1: re-project ALL projects (LOAD-BEARING, review B2).
+        _reproject_all_projects_guarded(_deferral_report)
 
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so
@@ -13362,19 +13359,18 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
         result["action"] = "orchestrator_not_registered"
         return result
 
-    # Imported ABOVE the try, not inside it (v0.2.96: install.py joined the
-    # pyright gate, which flagged the two exception names as possibly
-    # unbound). That is a real hazard, not a typing nit: with the import
-    # inside, a broken `vco_lib` makes the `except DbUnreachable:` clause
-    # itself raise NameError, replacing the ImportError that says what is
-    # actually wrong. A missing shipped dependency must fail loudly AND
-    # legibly ("loud-fail, never silent-fallback").
-    from vco_lib.config_projection import (
-        apply_project_env,
-        project_env_from_db,
-        DbUnreachable,
-        ProjectNotFound,
-    )
+    # v0.2.97: guarded — this process may still be the SYSTEM interpreter
+    # (no re-exec after ``_create_venv``) and the projection chain reaches
+    # ``requests``. The guard wraps ONLY the import, so the except clauses
+    # below keep their names bound (v0.2.96 NameError hazard).
+    try:
+        from vco_lib.config_projection import (
+            apply_project_env, project_env_from_db, DbUnreachable, ProjectNotFound,
+        )
+    except ImportError as exc:
+        # Degrade through the existing failure channel; never crash the update.
+        result["action"] = f"apply_failed:ImportError:{exc}"
+        return result
     try:
         bundle = project_env_from_db(project_id)
         report = apply_project_env(bundle)
@@ -13399,6 +13395,20 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
     result["action"] = "applied"
     result["added_keys"] = sorted(keys_written)
     return result
+
+
+def _reproject_all_projects_guarded(deferral_report) -> None:
+    """v0.2.80 GAP-CG-1: re-project ALL projects (the deferral_report
+    threading is LOAD-BEARING, review B2). v0.2.97: guarded — this process
+    may still reach ``requests`` on the system python; a skip is reported."""
+    try:
+        from vco_lib.config_projection import run_update_reprojection_step
+    except ImportError as exc:
+        print(f"  [skip] Env reprojection ({exc})")
+        _log_install_event("9/10", "warn", f"env reprojection skipped: {exc}")
+        return
+    run_update_reprojection_step(print_fn=print, log_event=_log_install_event,
+                                 deferral_report=deferral_report)
 
 
 def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
@@ -21678,27 +21688,17 @@ def _store_install_openai_key(value: str) -> None:
 
 def _migrate_install_dotenv_openai_key(root: Optional[Path] = None) -> None:
     """Move a pre-v0.2.97 VCO-written ``OPENAI_API_KEY`` line out of
-    ``<root>/.env`` (default: the install root) on value evidence
-    (:func:`vco_lib.openai_key.migrate_dotenv_openai_key`); report a line left
-    in place. Never prints the value."""
-    from vco_lib.openai_key import migrate_dotenv_openai_key
+    ``<root>/.env`` on value evidence; never the value. v0.2.97 fix: it runs
+    as a SUBPROCESS of the install venv's python — in-process, the system
+    interpreter reached ``requests`` (see migrate_dotenv_openai_key_via)."""
+    from vco_lib.openai_key import migrate_dotenv_openai_key_via
 
-    try:
-        result = migrate_dotenv_openai_key(root or PROJECT_ROOT)
-    except (OSError, UnicodeDecodeError) as exc:
-        result = {"status": "left_unverified", "detail": str(exc)}
-    if result["status"] == "absent":
-        return
-    if result["status"] == "migrated":
-        print(f"  .env: moved the OpenAI key VCO wrote there into {result['detail']}.")
-        _log_install_event("9/10", "ok", "openai key moved out of .env",
-                           data={"status": result["status"]})
-        return
-    print(f"  .env: the OpenAI key VCO wrote there was LEFT in place — {result['detail']}. "
-          "Remove the `OPENAI_API_KEY=` line under `# OpenAI (for embeddings)` once the "
-          "key is stored (launcher Preferences → Special Secrets).")
-    _log_install_event("9/10", "warn", f".env openai key left: {result['detail']}",
-                       data={"status": result["status"]})
+    migrate_dotenv_openai_key_via(
+        _resolve_venv_python_for_install(PROJECT_ROOT),
+        root or PROJECT_ROOT,
+        say=print,
+        note=lambda lvl, msg, data=None: _log_install_event("9/10", lvl, msg, data=data),
+    )
 
 
 def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
