@@ -110,7 +110,7 @@ Switches the entire embedding stack to OpenAI `text-embedding-3-small` (1536-dim
 Skips all Docker/Podman service setup. Useful for CI or when services are managed externally. `.env` is still written; agents/skills are still installed.
 
 ### `--container docker|podman`
-Forces a specific container runtime instead of auto-detecting (Linux prefers Podman; macOS/Windows prefers Docker).
+Forces a specific container runtime instead of auto-detecting, and records it as your choice (`state/install/runtime.confirmed` — VCO never switches away from a runtime chosen this way). Without it, auto-detection prefers Podman on every OS; Docker is the fallback.
 
 ### `--skip-models`
 Skips pulling Ollama models after containers start. Models can be pulled manually later via `ollama pull`.

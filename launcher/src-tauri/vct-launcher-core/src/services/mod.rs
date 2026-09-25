@@ -29,6 +29,13 @@ pub mod runtime_verdict;
 // Python constant by `tests/test_deferral_lock_parity.py`.
 pub mod deferral_lock;
 
+// v0.2.97 R12-bis P2-1: the ONE allowlist of env keys a scrubbed child
+// receives after `env_clear()` — the shared home/temp/system family.
+// Three hand-rolled shapes (runtime_verdict's decide child,
+// vco_lib_bridge's sandbox, container_runtime's reserved-name table) read
+// THIS table now; none may hand-roll a fourth.
+pub mod child_env;
+
 // v0.2.97: `adoption` (the `<vct_root_dir>/services.toml` reader/writer) is
 // RETIRED. What a service is — VCO-managed, an adopted container, an adopted
 // URL — is its launcher.db `service_endpoints` row (`crate::db::service_endpoints`,

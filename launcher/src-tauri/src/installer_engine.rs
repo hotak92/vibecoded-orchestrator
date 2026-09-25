@@ -1684,13 +1684,14 @@ pub(crate) use vct_launcher_core::services::container_runtime::format_pull_token
 /// `docker cp` runs against the runtime that did the `docker pull`,
 /// so the image reference resolves to a known-good local copy.
 ///
-/// v0.2.54 (C-RT-1/C-RT-2): thin wrapper over the promoted
-/// daemon-aware detector in
-/// `vct-launcher-core::services::container_runtime` — honors
-/// `VCT_CONTAINER_RUNTIME` -> `state/install/runtime.txt` ->
-/// podman-first `<cmd> info` probing. The pre-v0.2.54 local copy
-/// probed `--version` only (client binary, never the daemon) and
-/// ignored the user's runtime choice.
+/// v0.2.54 (C-RT-1/C-RT-2) → v0.2.97 R12: thin wrapper over
+/// `vct-launcher-core::services::container_runtime::detect_container_runtime`,
+/// which ASKS the ONE Python verdict (`runtime_verdict::decide`) — the
+/// pin (`VCT_CONTAINER_RUNTIME` → `state/install/runtime.txt`) and the
+/// podman-first daemon-aware choice live in `vco_lib.runtime_reconcile`,
+/// not in Rust. The pre-v0.2.54 local copy probed `--version` only
+/// (client binary, never the daemon) and ignored the user's runtime
+/// choice.
 pub(crate) async fn detect_container_runtime() -> Result<String, String> {
     let install_root = crate::commands::installer::find_local_repo_root().ok();
     vct_launcher_core::services::container_runtime::detect_container_runtime(
@@ -1867,19 +1868,11 @@ async fn run_post_install_command(
     let mut cmd = Command::new(program).silent();
     cmd.args(args);
     cmd.current_dir(&cwd);
-    // Scrubbed env: only pass through PATH, HOME, USER, and platform essentials.
+    // Scrubbed env: only the ONE shared child-env table
+    // (`vct-launcher-core services::child_env`, R12-bis P2-1) — PATH +
+    // temp/locale keys + the per-OS home/system family.
     cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
 
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());

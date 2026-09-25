@@ -354,8 +354,9 @@ Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a
 `vco_lib/containers.py` resolves the runtime via:
 
 1. `VCT_CONTAINER_RUNTIME` env var — explicit `podman` or `docker`. It is a **pin**, not a preference: when set, it is the *only* candidate. If the pinned runtime is unusable (not installed, client binary refuses, daemon/machine/socket down), VCO **refuses** with an actionable message naming what you pinned, why it is unusable, and whether the other runtime is usable — it does **not** fall back to the other one. See [Why a refused pin is not a fallback](#why-a-refused-pin-is-not-a-fallback) below.
-2. Caller-passed `runtime` arg.
-3. `auto` (or unset) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
+2. The runtime the install recorded in `state/install/runtime.txt` — VCO's own note of where it put your data. Same pin semantics (probed alone; unusable → refusal), except that a READ-ONLY surface (a session, the boot service, the launcher, the hub) may answer the other runtime when the recorded one is no longer installed AND that one already holds VCO's containers or volumes — and never when the record is a `--container` choice of yours (`state/install/runtime.confirmed`). The next `install.py --update` re-records the runtime your data is on.
+3. Caller-passed `runtime` arg.
+4. `auto` (or unset, the last fallback of the one rule) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
 
 The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` — the one home every VCO path composes from (wrapper, hook, launcher, install.py), always naming the `vco_managed` services explicitly with `--no-deps`. The legacy `claude_mcp_servers/compose.yaml` home is no longer composed from; containers created there are adopted as `adopted_container` rows.
 
@@ -391,7 +392,7 @@ to change it — both files are rewritten).
 
 ### Forcing Docker when both runtimes are installed
 
-Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:8920`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
+Hosts with both Podman AND Docker installed default to Podman (step 4 above; see `_detect_container_runtime` in `install.py`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
 
 ```bash
 export VCT_CONTAINER_RUNTIME=docker

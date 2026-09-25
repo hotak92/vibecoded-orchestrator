@@ -422,10 +422,10 @@ def own_compose_project(install_root: Optional[Path]) -> str:
     ``<install_root>/infrastructure/docker-compose.yml``, which is what the
     compose identity guard compares a container's label against and what a
     volume compose created for VCO carries in ``com.docker.compose.project``.
-    ``""`` without an install root. MUST MATCH
-    ``runtime_evidence.rs::vco_compose_project`` (the declared Rust mirror,
-    pinned by ``tests/fixtures/runtime_data_evidence_cases.json``
-    ``compose_project``)."""
+    ``""`` without an install root. Pinned by the ``compose_project`` rows of
+    ``tests/fixtures/runtime_data_evidence_cases.json`` — Python-only since
+    v0.2.97 R12 (the Rust mirror retired; the Rust surfaces ask the decide
+    client)."""
     if install_root is None:
         return ""
     return compose_project_of(Path(install_root) / "infrastructure" / "docker-compose.yml")
@@ -516,11 +516,14 @@ def foreign_compose_identity(
 # below, and the hook pairs run `python -m vco_lib.containers resolve --json`
 # (class A of the A>B>C rule — a user-action / session-start path where a
 # ~50 ms subprocess is fine) instead of mirroring the logic in bash and
-# PowerShell. `runtime.rs` stays as a DECLARED CLASS-C MIRROR (a compiled
-# binary cannot shell out to Python for every services-watcher tick); its
-# decision function and `resolve()` below are pinned to ONE fixture,
+# PowerShell. From v0.2.97 R12 the launcher's Rust surfaces are CLIENTS of
+# this rule, not mirrors: `services/runtime.rs` renders the ONE Python
+# verdict (`python -m vco_lib.runtime_reconcile decide --json`, through
+# `runtime_verdict::decide` — the class-C `candidate_order`/`select_runtime`
+# mirror is retired), and `resolve()` below is pinned to ONE fixture,
 # `tests/fixtures/container_runtime_parity.json`, read by both
-# `tests/test_container_runtime_ssot.py` and `runtime.rs`'s tests.
+# `tests/test_container_runtime_ssot.py` and `runtime.rs`'s tests THROUGH
+# THE CLIENT.
 #
 # Tri-state, per PLAN-EXTENSION §4: RESOLVED (a usable runtime), ABSENT (no
 # runtime binary on PATH, or every binary present refuses — a TRUE fact with
@@ -538,8 +541,8 @@ class RuntimeState(str, Enum):
 
 #: Canonical candidate order when the user expressed no preference.
 #: Podman first — no commercial licence, increasingly native on
-#: macOS/Windows — then Docker. `runtime.rs` and `container_runtime.rs`
-#: hold the same order.
+#: macOS/Windows — then Docker. The ONE order: the Rust surfaces ask the
+#: decide client (no second copy has existed since v0.2.97 R12).
 RUNTIME_CANDIDATES: tuple[str, ...] = ("podman", "docker")
 
 #: Exit codes of `python -m vco_lib.containers resolve`, one per state.
@@ -643,8 +646,9 @@ def runtime_preference_from_env(
     warns once on stderr — a misconfigured env var must not strand the
     user with no runtime; auto-detect finds whatever IS working).
 
-    Same contract as ``container_runtime.rs::runtime_preference_from_env``
-    and the ``runtime.rs`` override branch (v0.2.14 Bug #3 / PR-43).
+    The contract the Rust surfaces honour through the decide verdict (the
+    ``runtime.rs`` override branch since v0.2.14 Bug #3 / PR-43; the Rust
+    twin of this function was retired in v0.2.97 R12).
     """
     source = os.environ if env is None else env
     raw = (source.get("VCT_CONTAINER_RUNTIME") or "").strip().lower()
@@ -659,8 +663,9 @@ def runtime_preference_from_env(
     return None
 
 
-#: The two pin channels, named the way the Rust mirror names them
-#: (``container_runtime.rs::RuntimePinSource::label``).
+#: The two pin channels, named the way the Rust pin-source enum names them
+#: (``container_runtime.rs::RuntimePinSource::label`` — the one Rust symbol
+#: of the pin rule that survives v0.2.97 R12).
 PIN_VIA_ENV = "VCT_CONTAINER_RUNTIME"
 PIN_VIA_RUNTIME_TXT = "state/install/runtime.txt"
 
@@ -677,8 +682,10 @@ def runtime_txt_path(install_root: Path) -> Path:
 
 def read_runtime_txt(install_root: Optional[Path]) -> Optional[str]:
     """The recorded runtime (``podman`` / ``docker``), or ``None`` when there
-    is no install root, no file, an unreadable file or an unknown token.
-    MUST MATCH ``container_runtime.rs::read_runtime_txt``."""
+    is no install root, no file, an unreadable file or an unknown token —
+    the ONE reader of the record (the Rust surfaces receive it through the
+    decide verdict's ``requested_via: "record"``; the Rust twin was retired
+    in v0.2.97 R12)."""
     if install_root is None:
         return None
     try:
@@ -725,7 +732,7 @@ def runtime_pin(
     Every surface applies this same precedence: this module (the session-start
     hooks, install.py, the doctor), ``services/runtime.rs`` (the launcher's
     infra stack), ``container_runtime.rs`` (module containers, storage and
-    volumes — ``runtime_candidate_order`` / ``pinned_runtime``) and the hub
+    volumes — through the decide verdict since v0.2.97 R12) and the hub
     supervisor. Before v0.2.97 only the last two read runtime.txt, so a machine
     whose install recorded docker had its stack brought up under podman by the
     hooks while the storage page migrated the docker copies.
@@ -754,8 +761,8 @@ def runtime_candidate_order(preference: Optional[str]) -> list[str]:
     v0.2.92 (BLOCKER-4): this used to return ``[preference, *RUNTIME_CANDIDATES]``
     — the pinned runtime first, then BOTH, so a pinned-but-unusable runtime
     fell through to the other one. That is now a refusal (:func:`resolve`),
-    and the order is byte-for-byte what ``runtime.rs::candidate_order``
-    returns for every arm.
+    and this is the ONE order every surface uses (the Rust surfaces ask the
+    decide client; the retired Rust mirror used to return it too).
     """
     if preference in RUNTIME_CANDIDATES:
         return [preference]
@@ -820,7 +827,9 @@ def compose_command(
 ) -> Optional[tuple[list[str], str]]:
     """The compose invocation for ``runtime``: ``(argv_prefix, form)``.
 
-    ONE order, the launcher's (``runtime.rs::detect_compose_form``):
+    ONE order (this is the only home — the Rust surfaces get the form from
+    the decide verdict's ``compose_form``; the Rust probe was retired in
+    v0.2.97 R12):
       1. subcommand — ``<runtime> compose version`` exits 0
          (Podman 4.x+ / Docker 20.10+; Podman delegates to an external
          provider, which is fine — it is what the user has).
@@ -930,8 +939,9 @@ def _pin_refusal_reason(
 ) -> str:
     """The actionable hint a refused pin carries — names what was pinned and
     through WHICH channel, why it is unusable, whether the other runtime IS
-    usable, and the two things the user can do about it. Shaped like
-    ``container_runtime.rs::module_runtime_pin_refusal``.
+    usable, and the two things the user can do about it (the module plane's
+    refusal renders this same text through the decide verdict — the Rust
+    twin was retired in v0.2.97 R12).
 
     ``bind_decline`` (R12 M3): the pin was refused over a BIND-layout
     decline — VCO's data is a host folder, not the other runtime's named
@@ -1011,9 +1021,9 @@ def resolve(
     conflated *misconfigured* (pinned runtime not installed) with
     *temporarily down* (installed, machine stopped after a reboot) — and the
     second is the common case, where a fall-through forks the data plane.
-    ``runtime.rs::candidate_order`` has always been strict; both surfaces now
-    agree, which is what ``env_pref_unusable_is_refused_not_substituted`` in
-    the parity fixture pins.
+    The Rust side was always strict and now asks this verdict directly; both
+    surfaces agree, which is what ``env_pref_unusable_is_refused_not_substituted``
+    in the parity fixture pins.
 
     Probes are injectable (``which`` / ``run``) so the decision is unit-
     testable against ``tests/fixtures/container_runtime_parity.json``

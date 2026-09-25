@@ -45,7 +45,7 @@ FIXTURE = json.loads((REPO_ROOT / "tests" / "fixtures" / "runtime_data_evidence_
 
 
 # ---------------------------------------------------------------------------
-# The shared fixture (the Rust suite runs the same rows)
+# The fixture (Python-only since v0.2.97 R12 retired the Rust mirrors)
 # ---------------------------------------------------------------------------
 
 

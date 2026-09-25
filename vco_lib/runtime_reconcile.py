@@ -27,8 +27,8 @@ as it is now. :func:`reconcile` runs early in ``install.py`` (install and
     VCO's containers/volumes → the record is rewritten to the other runtime and
     an ``informational_record`` says what changed and why. "No VCO data exists
     anywhere" is rewritten ONLY by install.py (``rewrite=True``): a READ-ONLY
-    caller (``rewrite=False`` — the resolver, the boot wrapper, the Rust
-    mirrors) switches on POSITIVE evidence alone and otherwise refuses (R9 H1),
+    caller (``rewrite=False`` — the resolver, the boot wrapper, the Rust decide
+    client) switches on POSITIVE evidence alone and otherwise refuses (R9 H1),
     because a runtime it merely failed to find may still hold the data;
 (b) the recorded runtime is installed but its daemon does not answer → the
     documented start is tried (install.py's ``_try_start_*_daemon``); if it still
@@ -257,18 +257,21 @@ CID_DATA_UNDER_BOTH = "container_runtime_data_under_both"
 VCO_VOLUME_NAMES: tuple[str, ...] = ("vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache")
 
 #: The compose knobs that rename those volumes (``name: ${KEY:-<default>}``) —
-#: the VOLUME_NAME half of :data:`vco_lib.compose_env.DATA_KNOBS`, in its order.
-#: MUST MATCH ``container_runtime.rs::VCO_VOLUME_NAME_KEYS``.
+#: the VOLUME_NAME half of :data:`vco_lib.compose_env.DATA_KNOBS`, in its
+#: order: extracted from the ONE knob table, never re-listed (the Rust copy
+#: of this list was retired in v0.2.97 R12 — the Rust surfaces ask
+#: ``runtime_verdict::decide``).
 VOLUME_NAME_KEYS: tuple[str, ...] = tuple(pair[1] for pair in DATA_KNOBS.values())
 
 #: The compose knobs that turn a service's data mount into a BIND mount of a
 #: host folder (``${KEY:-<volume key>}:/data``) — the DATA_SOURCE half of
-#: :data:`vco_lib.compose_env.DATA_KNOBS`, in its order. MUST MATCH
-#: ``container_runtime.rs::VCO_DATA_SOURCE_KEYS``.
+#: :data:`vco_lib.compose_env.DATA_KNOBS`, in its order: extracted from the
+#: ONE knob table, never re-listed (the Rust copy retired in v0.2.97 R12).
 DATA_SOURCE_KEYS: tuple[str, ...] = tuple(pair[0] for pair in DATA_KNOBS.values())
 
-#: The refusal wording shared with Rust (``container_runtime.rs``
-#: ``include_str!``s the same file) — R10 J6.
+#: The refusal wording of the reconcile — ONE table, rendered only here; the
+#: Rust surfaces show Python's rendered text verbatim through the decide
+#: verdict (the ``include_str!`` Rust reader was retired in v0.2.97 R12).
 MESSAGES_PATH = Path(__file__).with_name("runtime_reconcile_messages.toml")
 
 #: The compose project dir whose ``.env`` compose reads (install.py's
@@ -376,15 +379,16 @@ def vco_volume_names(install_root: Optional[Path], *,
     (whole file, file order — compose reads all of it) and then in ``env``
     (default :data:`os.environ`; compose's shell env wins over ``.env``).
     A union, never a replacement: a default-named volume left behind by an
-    earlier layout is still VCO's. MUST MATCH
-    ``container_runtime.rs::vco_volume_names`` —
-    ``tests/fixtures/vco_volume_names_cases.json`` runs both."""
+    earlier layout is still VCO's. Pinned by
+    ``tests/fixtures/vco_volume_names_cases.json`` — Python-only since
+    v0.2.97 R12 (the Rust mirror retired; the Rust surfaces receive the
+    names through the decide verdict / resolve, never a copy)."""
     return volume_names_from(_infra_env_text(install_root), os.environ if env is None else env)
 
 
 def volume_names_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, ...]:
-    """Pure half of :func:`vco_volume_names` (what the parity fixture drives).
-    MUST MATCH ``container_runtime.rs::volume_names_from``."""
+    """Pure half of :func:`vco_volume_names` (what the fixture drives —
+    Python-only since v0.2.97 R12; the Rust mirror retired)."""
     names = list(VCO_VOLUME_NAMES)
 
     def _add(value: str) -> None:
@@ -412,8 +416,8 @@ def _infra_env_text(install_root: Optional[Path]) -> str:
 def _our_container_names() -> frozenset[str]:
     """VCO's own container names under a runtime: the ``vco_*`` / ``vct_*``
     subset of every canonical service's known names (an unprefixed ``ollama``
-    may be the user's own). MUST MATCH
-    ``container_runtime.rs::VCO_OUR_CONTAINER_NAMES``."""
+    may be the user's own) — the ONE list (the Rust copy was retired in
+    v0.2.97 R12; the Rust surfaces get the answer through the decide verdict)."""
     return frozenset(
         n for s in _c.CANONICAL_CONTAINERS for n in _c.all_known_names(s)
         if n.startswith(("vco_", "vct_"))
@@ -437,9 +441,10 @@ def data_evidence(containers: set[str], volumes: set[str], names: Sequence[str],
     defaults) is a name the USER picked — an unrelated ``ollama`` volume can
     carry it — so with ``corroborate_overrides`` it counts only when its compose
     project label (``label_of``) is ``own_project`` (R10 J8; a VCO container
-    under the same runtime has already answered ``True``). MUST MATCH
-    ``container_runtime.rs::data_evidence`` —
-    ``tests/fixtures/runtime_data_evidence_cases.json`` runs both."""
+    under the same runtime has already answered ``True``). Pinned by the
+    ``evidence`` rows of ``tests/fixtures/runtime_data_evidence_cases.json``
+    — Python-only since v0.2.97 R12 (the Rust mirrors retired; the Rust
+    surfaces ask the decide client)."""
     if containers & _our_container_names():
         return True
     for name in names:
@@ -452,9 +457,10 @@ def data_evidence(containers: set[str], volumes: set[str], names: Sequence[str],
     return False
 
 
-#: What a runtime's listings show of VCO's data (R11 L2) — MUST MATCH
-#: ``runtime_evidence.rs::DataKind`` (``tests/fixtures/runtime_data_evidence_cases.json``
-#: ``kind`` runs both). A VCO container outranks a volume, a RUNNING one a
+#: What a runtime's listings show of VCO's data (R11 L2) — pinned by the
+#: ``kind`` rows of ``tests/fixtures/runtime_data_evidence_cases.json``
+#: (Python-only since v0.2.97 R12; the Rust mirror retired). A VCO container
+#: outranks a volume, a RUNNING one a
 #: stopped one: a container mounts the data wherever it lives, a volume is only
 #: a copy that may be a leftover.
 KIND_RUNNING = "running"
@@ -468,8 +474,8 @@ def data_kind(containers: set[str], running: set[str], volumes: set[str], names:
               corroborate_overrides: bool) -> str:
     """Pure: WHAT these listings show of VCO's data under one runtime — a VCO
     container that is running (``ps``), one that is not (``ps -a`` only),
-    only volumes (:func:`data_evidence`'s volume rule), or nothing. MUST MATCH
-    ``runtime_evidence.rs::data_kind``."""
+    only volumes (:func:`data_evidence`'s volume rule), or nothing — pinned
+    by the fixture's ``kind`` rows (Python-only since v0.2.97 R12)."""
     ours = containers & _our_container_names()
     if ours:
         return KIND_RUNNING if running & ours else KIND_STOPPED
@@ -509,9 +515,10 @@ def bind_verdict(other_kind: str, *, pinned_missing: bool, all_bind: bool,
     4. Only a leftover named volume there, or nothing: ``keep`` (R10 J2 — the
        folder is the data and a volume is not evidence about it).
 
-    MUST MATCH ``runtime_evidence.rs::bind_verdict`` (the fixture's
-    ``bind_verdict`` rows run both; the ``bind_verdict_positive_only`` rows
-    are the read-only half, Python-side until the Rust mirrors retire)."""
+    Pinned by the fixture's ``bind_verdict`` + ``bind_verdict_positive_only``
+    rows (``tests/fixtures/runtime_data_evidence_cases.json``) — Python-only
+    since v0.2.97 R12: the Rust mirror retired, so BOTH halves run here, and
+    the Rust surfaces get the verdict through the decide client."""
     if other_kind == KIND_RUNNING:
         return VERDICT_BOTH if here_running else VERDICT_SWITCH
     if pinned_missing and all_bind and not (positive_only and other_kind == KIND_NONE):
@@ -565,7 +572,8 @@ def vco_data_kind(runtime: str, *, run: Optional[RunFn] = None,
     """:func:`vco_data_under`, saying WHAT holds the data (:func:`data_kind`)
     — a ``KIND_*`` value, or ``None`` when a listing could not run. Lists the
     RUNNING containers (``ps``) only when a VCO container exists at all.
-    Read-only. MUST MATCH ``container_runtime.rs::vco_data_kind``."""
+    Read-only — the ONE listing reader (the Rust mirror retired in v0.2.97
+    R12; the Rust surfaces ask the decide client)."""
     return _data_listing(runtime, run=run, install_root=install_root, env=env,
                          corroborate_overrides=corroborate_overrides, want_running=True)
 
@@ -600,7 +608,11 @@ def runtimes_are_one_engine(a: str, b: str, *, run: Optional[RunFn] = None) -> O
     one engine's listing read twice, and a "switch" would switch nothing.
     ``True`` when that is PROVEN, ``None`` when it cannot be told — never
     ``False``, because two genuinely distinct engines are indistinguishable
-    from two probes that could not prove anything.
+    from two probes that could not prove anything. Every consumer reads
+    ``None`` as TWO engines — the conservative direction (ask the user,
+    never switch), because a failed probe and a genuine two-engine machine
+    look identical; the ``data_under_both`` entries say so when that is the
+    case (R12bis F2).
 
     TWO bounded legs (each within :data:`_LIST_TIMEOUT_S`):
 
@@ -686,8 +698,9 @@ def bind_sources_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, 
     file mentions, in file order (so the fixture's ``bind_sources`` rows keep
     byte-stable output), then the keys only ``env`` sets, in
     :data:`DATA_SOURCE_KEYS` order — both read through the ONE resolver
-    :func:`effective_data_sources`. MUST MATCH
-    ``container_runtime.rs::bind_sources_from`` (the shared fixture)."""
+    :func:`effective_data_sources`. Pinned by the shared fixture's
+    ``bind_sources`` / ``bind_sources_effective`` rows (Python-only since
+    v0.2.97 R12; the Rust mirror retired)."""
     effective = effective_data_sources(env_file_text, env)
     mentioned = [key for key, _ in parse_env_lines(env_file_text or "") if key in DATA_SOURCE_KEYS]
     found: list[str] = []
@@ -711,9 +724,9 @@ def all_services_bind(env_file_text: str, env: Mapping[str, str]) -> bool:
     :func:`effective_data_sources` — the ONE precedence resolver) and its
     value a path (:func:`_is_bind_source`); an unset or empty key, or one
     that names a volume, means a named volume is in play. Then no named
-    volume is in play anywhere, so a runtime switch strands none. MUST MATCH
-    ``runtime_evidence.rs::all_services_bind`` (the fixture's ``all_bind``
-    rows run both)."""
+    volume is in play anywhere, so a runtime switch strands none. Pinned by
+    the fixture's ``all_bind`` rows (Python-only since v0.2.97 R12; the Rust
+    mirror retired)."""
     effective = effective_data_sources(env_file_text, env)
     if len(effective) != len(DATA_SOURCE_KEYS):
         return False
@@ -731,8 +744,9 @@ def install_all_bind(install_root: Optional[Path], *,
 
 def _absent(exc: OSError) -> bool:
     """A probe error that means "no folder there" — everything else (EACCES on
-    an unsearchable parent, a symlink loop, an I/O error) means "cannot tell".
-    MUST MATCH ``runtime_evidence.rs::bind_probe`` (NotFound / NotADirectory)."""
+    an unsearchable parent, a symlink loop, an I/O error) means "cannot tell"
+    (NotFound / NotADirectory only — the ONE rule, the Rust mirror retired
+    in v0.2.97 R12)."""
     return isinstance(exc, (FileNotFoundError, NotADirectoryError))
 
 
@@ -743,9 +757,9 @@ def bind_folder_holds_data(path: Path) -> bool:
     ANY other error while probing — ``stat`` raising ``PermissionError``
     because a parent is not searchable (``Path.is_dir()`` re-raises that), or
     a directory this user cannot list — means VCO cannot tell, and a folder it
-    cannot prove empty counts as data. Never raises. MUST MATCH
-    ``runtime_evidence.rs::bind_folder_holds_data`` (the fixture's
-    ``bind_probe`` rows run both)."""
+    cannot prove empty counts as data. Never raises. Pinned by the fixture's
+    ``bind_probe`` rows (Python-only since v0.2.97 R12; the Rust mirror
+    retired)."""
     try:
         st = os.stat(path)
     except OSError as exc:
@@ -770,7 +784,8 @@ def bind_data_source(install_root: Optional[Path], *,
     Relative sources resolve against ``infrastructure/`` (compose's project
     dir), ``~`` against the home directory. Such a folder is VCO's data on the
     host — no runtime's volume listing can say where it belongs (R10 J2).
-    MUST MATCH ``container_runtime.rs::bind_data_source``."""
+    The ONE reader (the Rust mirror retired in v0.2.97 R12; the Rust
+    surfaces get the folder's effect through the decide verdict)."""
     if install_root is None:
         return None
     infra = Path(install_root) / INFRA_ENV_REL.parent
@@ -807,8 +822,9 @@ def unusable_detail(pinned: str, source: str, status: str,
                     decline: Optional[str] = None, *, bind: str = "") -> str:
     """Why ``pinned`` is not driven, from the shared table
     (``runtime_reconcile_messages.toml``): its state (``missing``, else
-    ``down``) plus the ``decline`` suffix. MUST MATCH
-    ``container_runtime.rs::record_reconcile_note``."""
+    ``down``) plus the ``decline`` suffix — rendered from the ONE table; the
+    Rust surfaces show this text verbatim through the decide verdict (pinned
+    by the fixture's ``not_switched`` rows)."""
     msgs = _messages()["unusable"]
     what = _fill(msgs["missing" if status == "missing" else "down"], pinned=pinned)
     if decline is not None:
@@ -927,14 +943,20 @@ def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: 
         if verdict == VERDICT_BOTH:
             # R12 M7: a podman-docker shim is ONE engine — its "containers
             # under both" is one listing read twice; no both, no switch.
-            if runtimes_are_one_engine(pinned, other, run=run):
+            # None (the identity probe could not tell) is read as TWO
+            # engines — the conservative direction: a genuine two-engine
+            # machine and a failed probe are indistinguishable, and asking
+            # the user is safe where switching is not (R12bis F2).
+            one = runtimes_are_one_engine(pinned, other, run=run)
+            if one:
                 return Reconciliation(
                     Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                     f"{pinned} and {other} are one engine on this machine; the "
                     f"recorded {pinned} is kept", started=started, same_engine=True)
             # R11 L2 (ii): VCO containers under the other runtime next to the
             # folder — only the user knows which runtime serves it.
-            entries = (_both_entry(root, pinned, other, bind=bind, kept=True, there=there),) \
+            entries = (_both_entry(root, pinned, other, bind=bind, kept=True, there=there,
+                                   engine_unknown=one is None),) \
                 if rewrite else ()
             return Reconciliation(Outcome.DATA_UNDER_BOTH, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                                   f"VCO's data is in the bind-mounted folder {bind} and {other} "
@@ -950,13 +972,17 @@ def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: 
     if here is None or there is None or there == KIND_NONE:
         return kept
     if here != KIND_NONE:
-        if runtimes_are_one_engine(pinned, other, run=run):
+        # None (the identity probe could not tell) is read as TWO engines —
+        # the conservative direction; see the bind arm above (R12bis F2).
+        one = runtimes_are_one_engine(pinned, other, run=run)
+        if one:
             return Reconciliation(
                 Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                 f"{pinned} and {other} are one engine on this machine; the "
                 f"recorded {pinned} is kept", started=started, same_engine=True)
         entries = (_both_entry(root, pinned, other, there=there,
-                               here_running=here == KIND_RUNNING),) if rewrite else ()
+                               here_running=here == KIND_RUNNING,
+                               engine_unknown=one is None),) if rewrite else ()
         return Reconciliation(Outcome.DATA_UNDER_BOTH, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                               f"VCO containers/volumes exist under both {pinned} and {other}; "
                               f"keeping the recorded {pinned}", entries, started)
@@ -1155,14 +1181,24 @@ def _reconciled_entry(root: Path, old: str, new: str, why: str) -> DeferralEntry
 
 def _both_entry(root: Path, recorded: str, other: str, *, bind: str = "",
                 kept: bool = True, there: str = KIND_STOPPED,
-                here_running: bool = False) -> DeferralEntry:
+                here_running: bool = False,
+                engine_unknown: bool = False) -> DeferralEntry:
     """``bind``: VCO's data is that host folder (R11 L2 (ii)) and ``other``
     holds VCO containers beside it; ``kept``: whether VCO went on using
     ``recorded`` (it answers) or started nothing (it is not installed).
     ``there`` / ``here_running`` say what the probes actually FOUND under
     ``other`` (R12 M2: the text never claims more than was probed — not
     "containers or volumes" when the listing said which, and "running" only
-    when a running container was seen)."""
+    when a running container was seen). ``engine_unknown`` (R12bis F2): the
+    one-engine identity probe could not tell — the entry says THAT instead
+    of claiming a plain "data under both" a failed probe never proved."""
+    if there == KIND_RUNNING:
+        holds = (f"{other} is running VCO containers as well" if here_running else
+                 f"{other} is running VCO containers")
+    elif there == KIND_VOLUMES:
+        holds = f"{other} holds VCO volumes (no containers)"
+    else:
+        holds = f"{other} holds VCO containers that are not running there"
     if there == KIND_RUNNING:
         holds = (f"{other} is running VCO containers as well" if here_running else
                  f"{other} is running VCO containers")
@@ -1182,6 +1218,12 @@ def _both_entry(root: Path, recorded: str, other: str, *, bind: str = "",
         detected = (f"{recorded} is recorded in {_c.runtime_txt_path(root)} and answers, and "
                     f"{holds}. {outcome}")
         why = "Only you know which copy is current; VCO will not merge them or pick for you."
+    if engine_unknown:
+        detected += (f" (whether {recorded} and {other} are one engine on this machine "
+                     f"could not be determined — the identity probe failed; if they are "
+                     f"one engine, there is only one copy and this entry is moot)")
+        why += (" If the two runtimes turn out to be one engine (a podman-docker shim), "
+                "there is only one copy — either command below clears this entry.")
     if kept:
         command_to_apply = (f"# Keep {recorded} (confirms the record; silences this entry):\n"
                             f"python install.py --update --container {recorded}\n"
@@ -1372,6 +1414,8 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
             if decision[0] != VERDICT_BOTH:
                 return False
             # R12 M7: one engine under two names is not "data under both".
+            # None (the probe could not tell) counts as "still under both" —
+            # the entry persists until the probe can answer (R12bis F2).
             return runtimes_are_one_engine(recorded, other, run=_run) is not True
     if any(_status(rt, _which, _run) != "usable" for rt in _c.RUNTIME_CANDIDATES):
         return None

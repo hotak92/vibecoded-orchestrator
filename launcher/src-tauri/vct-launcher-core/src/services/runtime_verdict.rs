@@ -381,10 +381,16 @@ pub async fn decide_uncached(opts: VerdictOpts<'_>) -> Result<RuntimeVerdict, St
         cmd.current_dir(root);
     }
 
-    // Env: the child probes runtime binaries and reads the pin, so it needs
-    // PATH, HOME (tool_search_dirs expands `~`), the temp family and
-    // VCT_CONTAINER_RUNTIME / VCT_TOOL_SEARCH_DIRS. Nothing else is a
-    // decision input; per-launcher quirks must not leak in.
+    // Env: the child probes runtime binaries and reads the pin, so it
+    // needs PATH, the home/temp/system family and VCT_CONTAINER_RUNTIME /
+    // VCT_TOOL_SEARCH_DIRS. The home family comes from the ONE shared
+    // child-env table (`services::child_env`, R12-bis P2-1) — per-OS, so
+    // a Windows child gets USERPROFILE/APPDATA/LOCALAPPDATA/
+    // HOMEDRIVE/HOMEPATH plus SYSTEMROOT/COMSPEC (it normally has no
+    // HOME; `Path.home()` and the runtime CLIs' config lookups read the
+    // Windows family, and without SYSTEMROOT a spawned python.exe fails
+    // to initialize). Nothing else is a decision input; per-launcher
+    // quirks must not leak in.
     cmd.env_clear();
     if let Some(path) = opts.path_env {
         cmd.env("PATH", path);
@@ -393,7 +399,18 @@ pub async fn decide_uncached(opts: VerdictOpts<'_>) -> Result<RuntimeVerdict, St
         // `paths::with_lookup_path`) — not a hand-rolled var_os walk.
         cmd.env("PATH", p);
     }
-    for key in ["HOME", "TEMP", "TMP", "TMPDIR", "VCT_CONTAINER_RUNTIME", "VCT_TOOL_SEARCH_DIRS"] {
+    for (key, value) in super::child_env::present_pairs() {
+        if key == "PATH" {
+            // Set above from the injectable lookup path — never re-read
+            // from the raw process env.
+            continue;
+        }
+        if opts.unset_keys.iter().any(|k| k == key) {
+            continue;
+        }
+        cmd.env(key, value);
+    }
+    for key in ["VCT_CONTAINER_RUNTIME", "VCT_TOOL_SEARCH_DIRS"] {
         if opts.unset_keys.iter().any(|k| k == key) {
             continue;
         }

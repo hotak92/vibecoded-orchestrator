@@ -26,8 +26,9 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #     centrally). Live `<runtime> ps` is trustworthy. Recovery is just
 #     `docker restart <name>` for the silent-crash case.
 #
-# Engine detection: prefer podman per project convention, fall back to
-# docker. VCT_CONTAINER_RUNTIME env var explicitly overrides.
+# Engine detection: ONE home — `python -m vco_lib.containers resolve`
+# (pin → install record → auto-detect; a refused pin is reported, never
+# swapped).
 #
 # Bypass: VCT_SKIP_PORT_WATCHDOG=1
 # Verbose:  VCT_PORT_WATCHDOG_VERBOSE=1 (default: only prints when it

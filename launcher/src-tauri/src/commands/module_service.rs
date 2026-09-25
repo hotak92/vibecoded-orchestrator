@@ -17,9 +17,10 @@
 //!
 //! Cross-OS: spawns podman OR docker via the local `detect_container_runtime`
 //! helper. Paths via PathBuf throughout; never assumes Unix separators.
-//! Subprocess invocations use `env_clear()` + selective env pass-through
-//! (PATH/HOME/USER/TMPDIR/LANG/LC_ALL, plus SYSTEMROOT/APPDATA/
-//! LOCALAPPDATA/USERPROFILE/TEMP/TMP on Windows).
+//! Subprocess invocations use `env_clear()` + the ONE shared child-env
+//! table (`vct-launcher-core services::child_env`: PATH + temp/locale
+//! keys + HOME on POSIX / the USERPROFILE family with SYSTEMROOT/
+//! COMSPEC on Windows).
 //!
 //! Cross-embedding: reads `ACTIVE_EMBEDDING` from the project's
 //! `.claude/env` (qwen3 / arctic / openai / future). Never hardcodes the
@@ -450,17 +451,10 @@ async fn launch_prepared_start(
     let mut cmd = Command::new(&podman).silent();
     cmd.args(&spawn.args);
     cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
+    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
+    // family, per-OS — the same keys the decide child and the vco_lib
+    // sandbox receive.
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
     // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
     // in this child's environment, never in its argv.
     spawn.apply_secret_env(&mut cmd);

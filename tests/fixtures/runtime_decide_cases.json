@@ -264,6 +264,55 @@
       "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
                  "refused": false, "outcome": "data_under_both", "same_engine": false,
                  "not_switched_key": null}
+    },
+    {
+      "name": "stale_other_unusable_refuses",
+      "_why": "R12bis F3(a): the recorded docker is gone AND podman is unusable (installed, daemon down) — the other_not_usable decline; nothing is driven, the refusal names both runtimes.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": false, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "record", "requested_installed": false,
+                 "alternative_usable": null, "refused": true, "outcome": "unusable",
+                 "not_switched_key": "other_not_usable",
+                 "refusal_contains": ["podman is not usable either"]}
+    },
+    {
+      "name": "confirmed_disagrees_record_switch_lands_on_confirmed",
+      "_why": "R12bis F3(b): runtime.confirmed (podman) disagrees with the record (docker) — a switch target is always _other(record), so a switch can only ever land ON the confirmed runtime, never away from one; the data being under podman, the stale-record switch proceeds.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": "podman", "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"],
+                   "volume_ls": ["vco_weaviate_data"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "compose_form": "subcommand",
+                 "requested": "docker", "requested_via": "record",
+                 "record_reconciled": true, "refused": false,
+                 "outcome": "rewritten", "same_engine": false}
+    },
+    {
+      "name": "bind_running_both_one_engine_kept",
+      "_why": "R12bis F3(c): the BIND arm's VERDICT_BOTH shape (~the running_both + here_running reconcile arm): the folder holds VCO's data, both runtimes RUN VCO containers — a podman-docker shim collapses it to KEPT, same_engine, no data_under_both.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_WEAVIATE_VOLUME_NAME=\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_ollama"], "ps": ["vco_ollama"]},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"],
+                   "version_out": "docker version 24.0 (emulates the docker CLI using podman)\n"}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "same_engine": true,
+                 "not_switched_key": null}
     }
   ]
 }

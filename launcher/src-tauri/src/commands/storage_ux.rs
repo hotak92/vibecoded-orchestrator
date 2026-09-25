@@ -533,12 +533,13 @@ pub(crate) struct StorageRuntime {
 /// v0.2.97 owner ruling "Honour the pin": this was `which_runtime`, a
 /// podman-first PATH probe that ignored `VCT_CONTAINER_RUNTIME` and the
 /// install's `state/install/runtime.txt`, so a docker-pinned machine had
-/// its volumes inspected and migrated under podman. It is now the ONE
-/// shared pin-first detector
-/// (`container_runtime::detect_container_runtime_with_pin`): a pin is the
-/// only candidate and a pinned runtime that is down is refused, never
-/// substituted; unpinned, podman is still preferred, now among runtimes
-/// whose daemon answers `info`.
+/// its volumes inspected and migrated under podman. It now ASKS the ONE
+/// Python verdict through
+/// `container_runtime::detect_container_runtime_with_pin`
+/// (`runtime_verdict::decide`): a pin is the only candidate and a pinned
+/// runtime that is down is refused, never substituted; the podman-first
+/// auto-detect preference itself lives in `vco_lib.runtime_reconcile`,
+/// not here.
 pub(crate) async fn storage_runtime() -> Result<StorageRuntime, String> {
     let install_root = super::installer::find_local_repo_root().ok();
     storage_runtime_at(install_root.as_deref()).await

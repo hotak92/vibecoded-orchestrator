@@ -1151,6 +1151,7 @@ mod tests {
             not_switched: Some("podman holds none of VCO's data".into()),
             refusal: Some("pinned to docker (not switched: podman holds none of VCO's data)".into()),
             installed: None,
+            verdict_failed: false,
         };
         let (news, line) = super::no_runtime_line(&refused, &last);
         assert!(news);

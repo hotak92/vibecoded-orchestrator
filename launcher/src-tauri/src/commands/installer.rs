@@ -14897,6 +14897,34 @@ MemAvailable:   23456789 kB
             };
         }
 
+        /// Seed macro for tests in this module (R12-bis keychain-tests
+        /// residual): the SEED `crate::secrets::set` gets the same
+        /// positive-timeout skip `clean_keychain!` gives the cleanup
+        /// deletes — a wedged Secret Service under load used to abort the
+        /// test at the seed's `.unwrap()` before it asserted anything.
+        /// Any NON-timeout error still panics with the error.
+        macro_rules! seed_keychain {
+            ($home:expr, $scope:expr, $module_id:expr, $key:expr, $value:expr) => {
+                if let Err(e) = crate::secrets::set($scope, $module_id, $key, $value) {
+                    if is_keychain_unavailable_err(&e) {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as keyring_available() == \
+                             false — not a product regression",
+                            e
+                        );
+                        std::fs::remove_dir_all(&$home).ok();
+                        return;
+                    }
+                    panic!(
+                        "seeding shared.{}/{} failed (cannot seed the \
+                         migration fixture): {}",
+                        $module_id, $key, e
+                    );
+                }
+            };
+        }
+
         /// True when the migration report's warnings positively identify a
         /// keychain timeout / worker failure as the reason `migrated` is
         /// false. Used ONLY to distinguish "Secret Service too slow under
@@ -15658,8 +15686,7 @@ MemAvailable:   23456789 kB
                 project_id: SENTINEL_SHARED,
             };
             // Seed the LEGACY slot only.
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
             // Pre-condition: new slot empty, old slot full.
             assert!(keychain_value().is_none(), "new slot must start empty");
             assert_eq!(
@@ -15723,9 +15750,8 @@ MemAvailable:   23456789 kB
             // Seed BOTH slots — simulates user who used the wizard
             // (writes to old slot in 0.2.0) THEN the SecretsPanel
             // Shared tab (writes to new slot).
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &old_canary)
-                .unwrap();
-            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary).unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &old_canary);
+            seed_keychain!(home, scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
             assert!(report.had_old_value, "old slot must have held its seed: {:?}", report);
@@ -15807,8 +15833,7 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
             assert_eq!(report.winner, "old");
@@ -15862,8 +15887,7 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
 
             // The fallback surfaces it.
             assert_eq!(
@@ -15906,8 +15930,7 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
             // Pause the legacy slot.
             db.mark_secret_inactive("shared", SENTINEL_SHARED, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY)
                 .unwrap();

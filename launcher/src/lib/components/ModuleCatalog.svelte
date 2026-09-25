@@ -475,11 +475,12 @@
     // v0.2.35 Agent M (2026-05-26): container-runtime preflight. Runs on
     // EVERY install click (not gated behind a "first-time" flag) so that
     // a user who uninstalls their runtime mid-session gets an actionable
-    // modal instead of the cryptic "no container runtime found" error
-    // from `installer_engine::detect_container_runtime` deep inside
-    // `run_install`. The preflight command never returns Err — failures
-    // surface as `available: false` so the modal renders rather than
-    // a generic error toast.
+    // modal instead of a cryptic error deep inside `run_install`.
+    // v0.2.97 R12: every runtime-STATE answer (refused pin, nothing
+    // installed, no compose) comes back as `available: false` so the
+    // modal renders; the command returns Err in exactly ONE case — the
+    // ONE verdict could not run (missing/broken Python = broken install,
+    // loud-fail). That Err is surfaced below, never swallowed.
     try {
       const availability = await invoke<PreflightRuntimeAvailability>(
         'check_container_runtime_available',
@@ -495,12 +496,16 @@
         return;
       }
     } catch (e) {
-      // The Rust command's contract is "never Err", but the IPC
-      // transport itself could fail (Tauri unavailable in dev browser
-      // mode). Fall through to the install attempt — `install_module_
-      // for_project` will surface its own error if the runtime really
-      // is missing.
-      console.warn('[ModuleCatalog] preflight runtime check failed, proceeding without gate:', e);
+      // R12-bis P3-1: Err means broken install — the message carries its
+      // own remedy. Surface it and STOP: falling through to `runInstall`
+      // would attempt the install on the same broken Python and bury
+      // this error inside a generic install failure. (A dev-browser IPC
+      // transport failure shares this path, and stopping is right there
+      // too — there is no runtime gate to bypass.)
+      toast.error(`Install blocked — runtime preflight failed: ${e}`, {
+        key: `module:${m.id}:install`,
+      });
+      return;
     }
 
     await runInstall(m);

@@ -637,14 +637,26 @@ pub struct RuntimeDetection {
     /// else `None`.
     pub not_switched: Option<String>,
     /// The full refusal when `info` is `None`: Python's `refusal` text
-    /// verbatim (a refused pin, carrying `not_switched`), or the loud
+    /// verbatim (a refused pin, carrying `not_switched`), the verdict's
+    /// `reason` when it RESOLVED without compose (R12-bis P3-2: an
+    /// installed, answering runtime without compose is not "no container
+    /// runtime found" — the reason explains the compose gap), or the loud
     /// broken-install error when the verdict itself could not run. `None`
     /// otherwise.
     pub refusal: Option<String>,
     /// The first candidate binary INSTALLED, usable or not (the verdict's
-    /// `installed`; `None` = no container runtime is installed at all).
-    /// M4: the boot path offers the install dialog on this, pin or not.
+    /// `installed`; `None` = no container runtime is installed at all —
+    /// EXCEPT under [`verdict_failed`], where nothing was learned and
+    /// `None` means UNKNOWN, not "none"). M4: the boot path offers the
+    /// install dialog on this, pin or not.
     pub installed: Option<String>,
+    /// True when the ONE verdict could not be obtained at all (missing or
+    /// broken Python, spawn failure, timeout, unparseable output). The
+    /// `refusal` then carries the loud broken-install error WITH its
+    /// remedy, and `installed` is unknown — a surface must answer with
+    /// that error, never with the "install a container runtime" download
+    /// dialog (R12-bis P3-3).
+    pub verdict_failed: bool,
 }
 
 impl RuntimeDetection {
@@ -728,6 +740,9 @@ pub async fn require_runtime() -> Result<RuntimeInfo, String> {
 // still maps to `info: None` here (Python says `resolved` + `compose: null`
 // so install.py can print compose's own error; this module has nothing to
 // drive) — the deliberate divergence the fixture's `expect_rust` records.
+// R12-bis P3-2: on that branch the verdict's `reason` rides as the
+// detection's refusal, so the surfaces say "installed but no compose"
+// (Python's explanation) instead of "No container runtime found".
 
 async fn resolve_runtime() -> RuntimeDetection {
     resolve_runtime_in(crate::orchestrator_manifest::orchestrator_install_root().as_deref()).await
@@ -762,7 +777,11 @@ async fn resolve_runtime_in_with(
                 info: None,
                 not_switched: None,
                 refusal: Some(e),
+                // UNKNOWN, not "none" — `verdict_failed` tells the boot
+                // path to show the error above and NOT open the runtime
+                // download dialog (R12-bis P3-3).
                 installed: None,
+                verdict_failed: true,
             };
         }
     };
@@ -781,6 +800,10 @@ async fn resolve_runtime_in_with(
 /// `binary_path` become [`RuntimeInfo`]; a refusal keeps Python's text
 /// VERBATIM (M3); `not_switched` travels for the surfaces that show it
 /// separately; `installed` drives the boot path's install dialog (M4).
+/// When the verdict RESOLVED but compose is missing/unknown (`info` is
+/// `None` with no refusal), the verdict's `reason` rides as the refusal
+/// (R12-bis P3-2): it explains the compose gap, and no surface may call
+/// an installed, answering runtime "No container runtime found".
 pub(crate) fn detection_from_verdict(
     verdict: &super::runtime_verdict::RuntimeVerdict,
     needs_machine_start: bool,
@@ -802,11 +825,24 @@ pub(crate) fn detection_from_verdict(
                 .or_else(|| which_on_path(runtime.binary()))?;
             Some(RuntimeInfo { runtime, compose_form, needs_machine_start, binary_path })
         });
+    let nothing_to_drive = info.is_none();
     RuntimeDetection {
         info,
         not_switched: verdict.not_switched.clone(),
-        refusal: verdict.refusal.clone(),
+        refusal: verdict.refusal.clone().or_else(|| {
+            // R12-bis P3-2: resolved WITHOUT compose (or any no-refusal
+            // shape with nothing to drive) — Python's `reason` explains
+            // the gap; Python sets `refusal` only when NOT resolved
+            // (`vco_lib/runtime_reconcile.py`), so without this the
+            // surfaces would fall back to "No container runtime found".
+            if nothing_to_drive {
+                Some(verdict.reason.clone())
+            } else {
+                None
+            }
+        }),
         installed: verdict.installed.clone(),
+        verdict_failed: false,
     }
 }
 
@@ -1088,6 +1124,61 @@ mod tests {
         assert_eq!(detection.installed.as_deref(), Some("docker"), "M4: installed travels");
         let none = RuntimeDetection::default();
         assert!(none.no_runtime_message().starts_with("No container runtime found"));
+    }
+
+    /// R12-bis P3-2, pure over the parsed verdict: RESOLVED without
+    /// compose (Python sets `refusal` only when NOT resolved) — the
+    /// mapping carries the verdict's `reason` as the refusal so every
+    /// surface explains the compose gap instead of falling back to "No
+    /// container runtime found" about an installed, answering runtime.
+    /// Leave-alone: a resolved verdict WITH compose keeps `refusal: None`.
+    #[test]
+    fn detection_from_verdict_carries_the_reason_when_resolved_without_compose() {
+        let base = super::super::runtime_verdict::RuntimeVerdict {
+            runtime: Some("podman".to_string()),
+            state: "resolved".to_string(),
+            resolved: true,
+            compose: None,
+            compose_form: None,
+            binary_path: None,
+            search_path: None,
+            installed: Some("podman".to_string()),
+            requested: None,
+            requested_via: "auto".to_string(),
+            requested_installed: false,
+            alternative_usable: None,
+            record_reconciled: false,
+            outcome: "usable_runtime_but_no_compose_anywhere".to_string(),
+            not_switched_key: None,
+            not_switched: None,
+            same_engine: false,
+            refused: false,
+            refusal: None,
+            reason: "podman is installed and answering, but no compose is available \
+                     (neither `podman compose` nor podman-compose)."
+                .to_string(),
+        };
+        let detection = detection_from_verdict(&base, false);
+        assert!(detection.info.is_none(), "nothing to drive without compose");
+        assert_eq!(detection.refusal.as_deref(), Some(base.reason.as_str()));
+        assert!(
+            !detection.no_runtime_message().contains("No container runtime found"),
+            "an installed runtime without compose is not 'no container runtime found': {}",
+            detection.no_runtime_message()
+        );
+        assert_eq!(detection.installed.as_deref(), Some("podman"));
+        assert!(!detection.verdict_failed);
+        // Leave-alone: with compose the refusal stays None (nothing to
+        // complain about) and the runtime drives.
+        let with_compose = super::super::runtime_verdict::RuntimeVerdict {
+            compose: Some(vec!["podman".to_string(), "compose".to_string()]),
+            compose_form: Some("subcommand".to_string()),
+            binary_path: Some("/usr/bin/podman".into()),
+            ..base
+        };
+        let detection = detection_from_verdict(&with_compose, false);
+        assert!(detection.info.is_some(), "a compose-bearing verdict drives");
+        assert!(detection.refusal.is_none(), "no refusal when resolved with compose");
     }
 
     #[test]

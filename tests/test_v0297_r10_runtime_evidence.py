@@ -13,8 +13,10 @@ runtime record says about it.
   volume. (c) keeps it; (a) refuses read-only and records ``action_required``
   at install.
 * J6 — WHY a stale record was not switched comes from ONE table
-  (``vco_lib/runtime_reconcile_messages.toml``) that the Rust refusal renders
-  too; ``tests/fixtures/runtime_data_evidence_cases.json`` runs both.
+  (``vco_lib/runtime_reconcile_messages.toml``) rendered only by Python since
+  v0.2.97 R12 (every other surface shows the same text through the decide
+  verdict); ``tests/fixtures/runtime_data_evidence_cases.json`` runs the
+  Python side alone.
 * J4 — the refusal re-emitted every session keeps its first ``detected_at``,
   has one title, and an unchanged entry does not rewrite the ledger.
 
@@ -48,7 +50,7 @@ FIXTURE = json.loads((REPO_ROOT / "tests" / "fixtures" / "runtime_data_evidence_
 
 
 # ---------------------------------------------------------------------------
-# The shared fixture (the Rust suite runs the same JSON)
+# The fixture (Python-only since v0.2.97 R12 retired the Rust mirrors)
 # ---------------------------------------------------------------------------
 
 

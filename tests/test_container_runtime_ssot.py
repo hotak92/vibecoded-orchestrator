@@ -2,7 +2,8 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.92 duplication-merge (PLAN-EXTENSION §3.5 / R13) — ONE Python home
 for container-runtime + compose resolution, pinned to the shared parity
-fixture the Rust mirror also reads.
+fixture the Rust parity test still reads (through the decide client — the Rust
+mirror itself was retired in v0.2.97 R12).
 
 Before the merge FIVE detectors answered "which runtime, which compose?"
 (install.py ×4 helpers, ``vco_lib.containers._resolve_runtime``, three hook
@@ -185,8 +186,9 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
             f"{res.requested!r} — that forks the data plane (separate named volumes)"
         )
     assert res.to_dict()["substituted"] is exp["substituted"]  # what --json carries
-    # R10 J6: WHY the stale record was not switched, in the shared wording the
-    # Rust refusal renders too (runtime_reconcile_messages.toml).
+    # R10 J6: WHY the stale record was not switched, in the shared wording of
+    # runtime_reconcile_messages.toml (rendered only by Python; every other
+    # surface shows this same text through the decide verdict).
     decline = sc.get("expect_not_switched")
     if decline is not None:
         from vco_lib.runtime_reconcile import unusable_detail
@@ -624,6 +626,34 @@ def test_rust_mirror_reads_the_same_fixture():
     assert "fn select_runtime" not in rs and "fn candidate_order" not in rs, (
         "the retired Rust mirror must not come back"
     )
+
+
+def test_no_vco_lib_marker_points_at_the_retired_rust_mirrors():
+    """R12bis F1: v0.2.97 R12 retired the Rust runtime mirrors
+    (``runtime_evidence.rs`` outright; the reconcile fns of
+    ``container_runtime.rs`` / ``runtime.rs``). Every Rust surface now asks
+    ``runtime_verdict::decide``. A ``MUST MATCH <deleted fn>`` marker in
+    vco_lib directs a reader at code that no longer exists — nothing
+    satisfies the parity it promises, so the markers were retired with the
+    mirrors; this keeps them retired."""
+    retired = (
+        "runtime_evidence.rs",
+        "::candidate_order", "::select_runtime", "::detect_compose_form",
+        "::module_runtime_pin_refusal", "::runtime_preference_from_env",
+        "::read_runtime_txt", "::record_reconcile_note",
+        "::vco_compose_project", "::bind_data_source", "::vco_data_kind",
+        "::data_evidence", "::bind_verdict", "::all_services_bind",
+        "::bind_probe", "::bind_folder_holds_data", "::vco_volume_names",
+        "::volume_names_from", "::VCO_VOLUME_NAME_KEYS",
+        "::VCO_DATA_SOURCE_KEYS", "::VCO_OUR_CONTAINER_NAMES",
+        "::DataKind", "::data_kind",
+    )
+    for rel in ("vco_lib/runtime_reconcile.py", "vco_lib/containers.py"):
+        body = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        for needle in retired:
+            assert needle not in body, (
+                f"{rel} still points at retired Rust code: {needle!r}"
+            )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim scripts")

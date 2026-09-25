@@ -84,17 +84,21 @@ use vct_launcher_core::process::CommandExt as _;
 ///
 /// The allowlist (kept in ONE place so it can't drift across call-sites):
 ///   * `PATH` — the child needs it to find `python`'s own helpers.
+///   * the shared home/temp/system family from the ONE child-env table
+///     (`vct-launcher-core services::child_env`, R12-bis P2-1) —
+///     `TEMP`/`TMP`/`TMPDIR` so the child's atomic-write tempfiles land
+///     somewhere writable (Windows + macOS especially), plus `HOME`
+///     (POSIX) or the Windows `USERPROFILE` family with
+///     `SYSTEMROOT`/`COMSPEC` — so the `~/.vct/launcher.db` fallback
+///     resolves AND a Windows `python.exe` child initializes at all.
+///     The same table serves `runtime_verdict`'s decide child and the
+///     module-plane reserved-name check.
 ///   * `VCT_STATE_DIR` — launcher-state root override (else the resolver
 ///     falls back to `~/.vct/`).
 ///   * `VCT_HUB_PORT` / `VCT_HUB_TOKEN` — hub-aware resolver hints.
 ///   * `VCT_INSTALL_ROOT` — so `python -m vco_lib...` resolves `vco_lib`
 ///     as an implicit-namespace package from the orchestrator clone
 ///     (`vco_lib` is NOT pip-installed).
-///   * `TEMP` / `TMP` / `TMPDIR` — so the child's atomic-write tempfiles
-///     land somewhere writable (Windows + macOS especially).
-///   * home-dir keys — `HOME` (POSIX) or
-///     `USERPROFILE`/`APPDATA`/`LOCALAPPDATA`/`HOMEDRIVE`/`HOMEPATH`
-///     (Windows) — so the `~/.vct/launcher.db` fallback resolves.
 ///
 /// Anything NOT on this list (e.g. an inherited `KG_COLLECTION`) is
 /// dropped by the preceding `env_clear`, which is the whole point.
@@ -109,39 +113,17 @@ use vct_launcher_core::process::CommandExt as _;
 pub fn reinject_minimal_env(cmd: &mut Command) {
     cmd.env_clear();
 
-    // A key is re-injected only when present in the parent env; a missing
-    // key stays missing (never re-injected as empty), preserving the
+    // The shared home/temp/system family — ONE table, same keys the
+    // decide child and the module-plane spawn sites receive. A key is
+    // re-injected only when present in the parent env; a missing key
+    // stays missing (never re-injected as empty), preserving the
     // "absent means absent" contract the Python resolver relies on.
-    for key in [
-        "PATH",
-        "VCT_STATE_DIR",
-        "VCT_HUB_PORT",
-        "VCT_HUB_TOKEN",
-        "VCT_INSTALL_ROOT",
-        "TEMP",
-        "TMP",
-        "TMPDIR",
-    ] {
+    vct_launcher_core::services::child_env::reinject_std(cmd);
+
+    // This sandbox's per-caller extras: the vco_lib resolver hints.
+    for key in ["VCT_STATE_DIR", "VCT_HUB_PORT", "VCT_HUB_TOKEN", "VCT_INSTALL_ROOT"] {
         if let Ok(v) = std::env::var(key) {
             cmd.env(key, v);
-        }
-    }
-
-    // Home-dir keys so `~/.vct/launcher.db` (and the atomic-write temp
-    // fallback) resolve. Split per-OS: Windows needs the USERPROFILE
-    // family; POSIX needs HOME.
-    #[cfg(target_os = "windows")]
-    {
-        for key in ["USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH"] {
-            if let Ok(v) = std::env::var(key) {
-                cmd.env(key, v);
-            }
-        }
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        if let Ok(v) = std::env::var("HOME") {
-            cmd.env("HOME", v);
         }
     }
 }

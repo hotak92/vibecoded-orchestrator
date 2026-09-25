@@ -146,44 +146,34 @@ pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime
 //     host with podman installed-but-machine-stopped and Docker
 //     Desktop running picked the dead podman every time (C-RT-2).
 //
-// This promoted detector applies the canonical v0.2.14 contract
-// (install.py `_runtime_preference_from_env` + `_detect_container_runtime`
-// + `_container_runtime_reachable`), with the v0.2.92 pin discipline
-// (delivery-audit M1 / R35 — the same ruling BLOCKER-4 already applied to
-// the other two surfaces, `vco_lib.containers.resolve` and
-// `services/runtime.rs::candidate_order`):
+// v0.2.97 R12 (owner ruling "Consolidate now"): the precedence contract
+// this block used to present as THIS module's — env pin
+// (`VCT_CONTAINER_RUNTIME`) → the install's `state/install/runtime.txt`
+// → daemon-aware podman-first auto-detect, each refused-never-substituted
+// — is NOT decided here any more (nor anywhere else in Rust). The ONE
+// decision lives in Python (`vco_lib.runtime_reconcile.decide`);
+// `detect_container_runtime` below ASKS it through
+// `runtime_verdict::decide(install_root, ReadOnly, Module)` and renders
+// the answer (runtime + pin source, or Python's refusal text verbatim —
+// M3). The Rust precedence ladder this block documented, and the
+// `runtime_candidate_order` / `pinned_runtime` homes it named, were
+// RETIRED with the rest of the reconcile mirrors
+// (`services/runtime.rs::candidate_order` included); the parity fixture
+// (`tests/fixtures/container_runtime_parity.json`) drives this surface
+// through the client. History the pin discipline still deserves: a
+// pinned runtime whose daemon does not respond is refused, never
+// substituted — pre-v0.2.92 this surface fell through to the other
+// runtime with only a warn, and a pinned-podman user whose machine was
+// stopped got the module image pulled into docker and started against
+// docker's EMPTY copy of every named volume, while the supervisor's
+// next pass re-selected podman — split brain over user data (podman and
+// docker keep separate named volumes). That refusal rule is Python's
+// now too.
 //
-//   1. `VCT_CONTAINER_RUNTIME=podman|docker` — a PIN. When it names a
-//      runtime, that runtime is the ONLY candidate; a pinned runtime
-//      whose daemon does not respond is REFUSED with an error naming
-//      the pin, why it is unusable, and whether the other runtime is
-//      usable — never substituted. Pre-v0.2.92 this surface fell
-//      through to the other runtime with only a warn: a pinned-podman
-//      user whose machine was stopped got the module image pulled into
-//      docker and started against docker's EMPTY copy of every named
-//      volume, while the supervisor's next pass re-selected podman —
-//      split brain over user data (podman and docker keep separate
-//      named volumes).
-//   2. `<install_root>/state/install/runtime.txt` — the runtime
-//      install.py detected and recorded (`_persist_runtime_txt`).
-//      Same pin semantics: the recorded runtime is where the install
-//      put the data, so it is probed ALONE; unusable → refusal that
-//      names the file and the env override that can supersede it.
-//      (Only consulted when the env override is absent — the explicit
-//      env choice wins.) R7b F5 (owner ruling): this is a pin on EVERY
-//      surface with this same precedence — `runtime_candidate_order` /
-//      `pinned_runtime` below are the Rust home (services/runtime.rs's
-//      `candidate_order` delegates here; the hub supervisor passes the
-//      clone root), `vco_lib.containers.runtime_pin` the Python one (the
-//      session-start hooks, install.py), and
-//      `tests/fixtures/container_runtime_parity.json` pins all three.
-//   3. No pin: daemon-aware probe of `["podman", "docker"]`
-//      (podman-first, matching install.py + services/runtime.rs
-//      policy) via `<cmd> info` — the round-trip that exercises the
-//      same code path `run`/`pull` need. `--version` is NOT used as a
-//      selection signal anymore (only to distinguish
-//      "binary present, daemon dead" from "not installed" in the
-//      error message).
+// What REMAINS execution-plane here: `runtime_daemon_responsive`
+// (below — the ownership guard `check_runtime_owns` asks it about a
+// runtime the verdict already chose) and the container spawn/argv
+// builders this module is named for.
 
 /// Daemon-aware liveness probe: `<cmd> info` with a 10s timeout.
 /// Returns true iff the daemon/socket/machine actually responds —
@@ -801,12 +791,12 @@ pub fn build_podman_run_args(
 }
 
 /// Env names the spawn sites pass through to the `podman`/`docker` process
-/// itself (after `env_clear`). A secret with one of these names would replace
-/// the runtime's own value, so [`SpawnArgs::new`] refuses to carry it.
-pub const RESERVED_SPAWN_ENV: &[&str] = &[
-    "PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "SYSTEMROOT",
-    "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP",
-];
+/// itself (after `env_clear`) — the ONE shared child-env table
+/// (`services::child_env::ALL_CHILD_ENV_KEYS`, R12-bis P2-1), so the
+/// reserved-name check and the actual sandbox cannot drift apart. A secret
+/// with one of these names would replace the runtime's own value, so
+/// [`SpawnArgs::new`] refuses to carry it.
+pub const RESERVED_SPAWN_ENV: &[&str] = super::child_env::ALL_CHILD_ENV_KEYS;
 
 /// Env names VCO itself gives a global module container: its per-spawn
 /// identity token and where the hub is (`vct_hub::module_supervisor`). A
@@ -3712,10 +3702,12 @@ mod tests {
 
     // -----------------------------------------------------------------
     // Parity fixture (v0.2.92 delivery-audit M1) — the SAME JSON drives
-    // tests/test_container_runtime_ssot.py (Python resolve) and
-    // runtime.rs's tests (candidate_order + select_runtime). The
+    // tests/test_container_runtime_ssot.py (Python resolve) and this
+    // surface's + runtime.rs's tests, through the ONE client
+    // (`runtime_verdict::decide`, v0.2.97 R12 — the Rust decision half
+    // these tests used to call directly is retired). The
     // `expect_module_plane` key is THIS surface's answer: what
-    // detect_container_runtime's decision half picks for the MODULE
+    // detect_container_runtime's verdict says for the MODULE
     // CONTAINER plane (no compose gating — module containers don't need
     // compose; a runtime the infra plane rejects for lacking compose is
     // still fine here).

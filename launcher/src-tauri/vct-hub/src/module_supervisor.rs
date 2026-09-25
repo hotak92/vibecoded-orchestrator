@@ -92,13 +92,15 @@ pub const RL_PORT_RANGE_HI: u16 = 11900;
 // SAME implementation — closing the drift gap that produced the
 // supervisor-image-resolution-variant bug.
 
-/// Detect which container runtime to use. v0.2.54 (C-RT-1/C-RT-2):
-/// thin wrapper over the promoted daemon-aware detector in
-/// `vct-launcher-core::services::container_runtime`. Honors the pin —
-/// `VCT_CONTAINER_RUNTIME`, else the install's `state/install/runtime.txt`
-/// — and probes daemon liveness via `<cmd> info` (the pre-v0.2.54 local
-/// copy probed `--version` only and could pick a dead podman over a live
-/// docker). R7b F5: this passed `install_root = None`, so the hub
+/// Detect which container runtime to use. v0.2.54 (C-RT-1/C-RT-2) →
+/// v0.2.97 R12: thin wrapper over
+/// `vct-launcher-core::services::container_runtime::detect_container_runtime`,
+/// which ASKS the ONE Python verdict (`runtime_verdict::decide`) — the
+/// pin (`VCT_CONTAINER_RUNTIME`, else the install's
+/// `state/install/runtime.txt`) and the podman-first daemon-aware choice
+/// live in `vco_lib.runtime_reconcile`, not in Rust (the pre-v0.2.54
+/// local copy probed `--version` only and could pick a dead podman over
+/// a live docker). R7b F5: this passed `install_root = None`, so the hub
 /// supervisor ignored runtime.txt and could restart a module container
 /// under podman that the launcher had installed under the recorded docker;
 /// it now reads the clone root through the core resolver
@@ -240,17 +242,10 @@ pub async fn start_container_for_module_with_gpu_mode(
     let mut cmd = Command::new(&podman).silent();
     cmd.args(&spawn.args);
     cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
+    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
+    // family, per-OS — the same keys the decide child and the vco_lib
+    // sandbox receive.
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
     // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
     // in this child's environment, never in its argv.
     spawn.apply_secret_env(&mut cmd);
@@ -1306,17 +1301,10 @@ pub async fn start_global_container_supervisor(
     let mut cmd = Command::new(&podman).silent();
     cmd.args(&spawn.args);
     cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
+    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
+    // family, per-OS — the same keys the decide child and the vco_lib
+    // sandbox receive.
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
     // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
     // in this child's environment, never in its argv.
     spawn.apply_secret_env(&mut cmd);

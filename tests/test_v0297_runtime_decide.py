@@ -200,7 +200,8 @@ def test_m7_names_are_not_container_ids():
 
 
 def _both_runtimes_hold_vco(*, docker_version_out: Optional[str] = None,
-                            docker_running: bool = False):
+                            docker_running: bool = False,
+                            ids_probe_ok: bool = True):
     specs = {
         "podman": {"ps_a": ["vco_ollama"], "ps": ["vco_ollama"]},
         "docker": {"ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"] if docker_running else []},
@@ -216,7 +217,9 @@ def _both_runtimes_hold_vco(*, docker_version_out: Optional[str] = None,
             out = docker_version_out if rt == "docker" and docker_version_out else f"{rt} version 5.0\n"
             return _cp(argv, 0, out)
         if sub[:3] == ["ps", "-a", "--no-trunc"]:
-            return _cp(argv, 0, "")
+            # rc 1 makes the ID-intersection leg of the one-engine probe
+            # unanswerable — `runtimes_are_one_engine` returns None.
+            return _cp(argv, 0 if ids_probe_ok else 1, "")
         if sub[:2] == ["ps", "-a"]:
             return _cp(argv, 0, "".join(n + "\n" for n in spec["ps_a"]))
         if sub[:2] == ["ps", "--format"]:
@@ -253,6 +256,49 @@ def test_m7_one_engine_collapses_data_under_both(tmp_path, shim):
     else:
         assert res.outcome is rr.Outcome.DATA_UNDER_BOTH and res.same_engine is False, res.detail
         assert [e.condition_id for e in res.entries] == [rr.CID_DATA_UNDER_BOTH]
+
+
+def test_m7_unknown_identity_is_treated_as_two_engines_and_says_so(tmp_path):
+    """R12bis F2, non-bind arm: when the one-engine probe cannot tell
+    (``None`` — clean versions, the ID listing failed), the pair is read as
+    TWO engines (the conservative direction — a failed probe and a genuine
+    two-engine machine are indistinguishable), the record is kept, nothing
+    is switched — and the ``data_under_both`` entry SAYS the identity could
+    not be determined instead of claiming plain "data under both"."""
+    which, run = _both_runtimes_hold_vco(ids_probe_ok=False)
+    root = _bare_root(tmp_path, "podman")
+    res = rr.reconcile(root, env={}, which=which, run=run, rewrite=True)
+    assert res.outcome is rr.Outcome.DATA_UNDER_BOTH and res.same_engine is False, res.detail
+    [entry] = res.entries
+    assert entry.condition_id == rr.CID_DATA_UNDER_BOTH
+    assert "could not be determined" in entry.detected, entry.detected
+    assert "one engine" in entry.detected, entry.detected
+
+
+def test_m7_unknown_identity_bind_arm_says_so_too(tmp_path):
+    """R12bis F2, bind arm (~the reconcile's VERDICT_BOTH shape): the folder
+    holds VCO's data, both runtimes RUN VCO containers, and the identity
+    probe fails — data under both with the unknown identity named, never a
+    plain "either runtime could serve that folder" claim that hides it."""
+    which, run = _both_runtimes_hold_vco(docker_running=True, ids_probe_ok=False)
+    root = _bare_root(tmp_path, "podman")
+    folder = tmp_path / "srv-w"
+    folder.mkdir()
+    (folder / "classifications.db").write_text("x", encoding="utf-8")
+    (root / "infrastructure").mkdir()
+    (root / "infrastructure" / ".env").write_text(
+        f"VCT_WEAVIATE_DATA_SOURCE={folder}\nVCT_WEAVIATE_VOLUME_NAME=\n", encoding="utf-8")
+    res = rr.reconcile(root, env={}, which=which, run=run, rewrite=True)
+    assert res.outcome is rr.Outcome.DATA_UNDER_BOTH, res.detail
+    assert res.decline == "data_under_both" and res.bind == str(folder)
+    [entry] = res.entries
+    assert entry.condition_id == rr.CID_DATA_UNDER_BOTH
+    assert "could not be determined" in entry.detected, entry.detected
+    # The clear probe keeps the entry while the identity stays unknown.
+    # (The REAL entry object — a plain dict has no `dismiss_fields`
+    # attribute, so `_entry_root` would fall back to this process's
+    # install root and answer for the wrong tree.)
+    assert rr.data_still_under_both(entry, which=which, run=run) is True
 
 
 def test_m2_both_entry_wording_matches_what_was_probed(tmp_path):
@@ -451,6 +497,35 @@ def test_m5_foreign_owned_services_takes_no_infra_dir(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# R12bis F3 — the fields the Rust client reads and spawns by
+# ---------------------------------------------------------------------------
+
+
+def test_decide_reports_the_binary_and_search_path_the_client_reads(
+        tmp_path: Path, monkeypatch):
+    """``binary_path`` / ``search_path`` come from the shared search table
+    (:mod:`vco_lib.tool_search_dirs`) — the SAME table the infra plane
+    spawns the runtime by after the Rust client renders the verdict —
+    resolvable and asserted, not just present in the schema."""
+    machine = FakeMachine({
+        "podman": {"on_path": True, "version_ok": True, "daemon_ok": True,
+                   "compose_subcommand": True},
+    })
+
+    def fake_which(name, *, env=None, **_kw):
+        return f"/opt/podman/bin/{name}" if name == "podman" else None
+
+    monkeypatch.setattr(rr._tsd, "which", fake_which)
+    monkeypatch.setattr(rr._tsd, "reachable_path", lambda *a, **_k: "/opt/podman/bin")
+    root = _root(tmp_path, {"runtimes": machine.runtimes}, tmp_path / "data")
+    verdict = rr.decide(root, mode="read-only", purpose="infra", env={},
+                        which=machine.which, run=machine.run, home=tmp_path)
+    assert verdict["state"] == "resolved" and verdict["runtime"] == "podman", verdict
+    assert verdict["binary_path"] == "/opt/podman/bin/podman", verdict
+    assert verdict["search_path"] == "/opt/podman/bin", verdict
+
+
+# ---------------------------------------------------------------------------
 # The CLI contract — exit codes and the JSON form, through a real child
 # ---------------------------------------------------------------------------
 
@@ -486,12 +561,21 @@ def _run_cli(tmp_path: Path, bin_dir: Path, *extra: str):
 def test_cli_decide_exit_0_and_schema_json_when_resolved(tmp_path):
     root = tmp_path / "install-root"
     (root / "state" / "install").mkdir(parents=True)  # no record: auto-detect
-    proc = _run_cli(tmp_path, _stub_bin(tmp_path), "--root", str(root))
+    bin_dir = _stub_bin(tmp_path)
+    proc = _run_cli(tmp_path, bin_dir, "--root", str(root))
     assert proc.returncode == 0, (proc.returncode, proc.stdout, proc.stderr)
     verdict = json.loads(proc.stdout)
     assert verdict["schema"] == 1 and verdict["state"] == "resolved"
     assert verdict["runtime"] == "podman" and verdict["refused"] is False
     assert set(SCHEMA_KEYS) <= set(verdict)
+    # R12bis F3: the fields the Rust client reads and the infra plane spawns
+    # by — a real child resolving real stubs on its PATH. `binary_path` is
+    # the stub the child found (the search table's prepend entries precede
+    # PATH, so only the NAME is guaranteed); `search_path` is None (nothing
+    # to add) or the augmented PATH carrying this bin_dir.
+    assert Path(verdict["binary_path"]).name == "podman", verdict
+    assert (verdict["search_path"] is None
+            or str(bin_dir) in verdict["search_path"]), verdict
 
 
 def test_cli_decide_exit_3_when_refused(tmp_path):

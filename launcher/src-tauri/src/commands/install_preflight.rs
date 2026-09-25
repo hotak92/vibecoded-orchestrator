@@ -349,64 +349,224 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn check_returns_sensible_shape_on_host() {
-        // The function's contract: never Err, always returns a
-        // RuntimeAvailability. On dev machines podman is usually on
-        // PATH (Linux user) → `available: true`. On CI with no
-        // runtime → `available: false` + `install_url: Some(...)`.
-        // We can't assert which branch we're in, but we CAN assert
-        // the shape is internally consistent.
-        let r = check_container_runtime_available()
-            .await
-            .expect("preflight never returns Err");
+    // ───────────────────────────────────────────────────────────────
+    // The command's REAL contract, pinned hermetically (R12-bis): Ok —
+    // with the shape the modal renders — on a healthy install, Err (the
+    // loud broken-install fail) when vco_lib cannot import. The test
+    // this replaces asserted "never Err", which stopped being the
+    // contract in v0.2.97 R12.
+    //
+    // Hermeticity: the command takes no install root — it walks
+    // `orchestrator_install_root()`, which under `cargo test` resolves
+    // to THIS checkout, whose `vco_lib` is what the decide child
+    // imports (child cwd == root; `python -m` puts cwd first on
+    // sys.path). So `storage_ux::fake_runtime_support::
+    // use_checkout_vco_lib` has nothing to add here — what the HOST
+    // could leak in is pinned instead: `$VCT_VENV` names the
+    // interpreter (the ladder's first tier, so the install-root tiers
+    // never run), the lookup PATH is a stub dir, the pin is cleared and
+    // the tool-search table emptied (the child can never probe the
+    // host's real podman/docker). The runtime caches are invalidated by
+    // the command itself.
+    // ───────────────────────────────────────────────────────────────
+    #[cfg(all(test, unix))]
+    mod hermetic {
+        use super::*;
+        use crate::commands::storage_ux::fake_runtime_support::fake_runtime;
+        use std::path::{Path, PathBuf};
 
-        if r.available {
-            assert!(
-                r.detected.is_some(),
-                "available=true must come with a detected runtime name"
-            );
-            let name = r.detected.as_deref().unwrap();
-            assert!(
-                matches!(name, "podman" | "docker"),
-                "detected runtime must be podman or docker, got: {}",
-                name
-            );
-            assert!(
-                r.install_url.is_none(),
-                "install_url should be None when runtime is already available"
-            );
-        } else {
-            assert!(
-                r.detected.is_none(),
-                "available=false must have detected=None"
-            );
-            // install_url is Some on the three known platforms, None on
-            // 'unknown'. Either is fine — the frontend handles both.
+        /// A vco_lib-capable interpreter for the Ok legs: the resolver's
+        /// own ladder answer, else `/usr/bin/python3`, else any python3
+        /// on the real PATH. `None` means this host cannot run the Ok
+        /// contract at all — skip rather than fail (the same discipline
+        /// as `services::runtime`'s on-host probes).
+        fn vco_lib_python() -> Option<PathBuf> {
+            if let Some(p) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() {
+                return Some(p);
+            }
+            let system = PathBuf::from("/usr/bin/python3");
+            if system.is_file() {
+                return Some(system);
+            }
+            vct_launcher_core::paths::which_on_path("python3")
         }
 
-        // Platform is always one of the four known strings regardless
-        // of branch.
-        assert!(
-            matches!(r.platform.as_str(), "linux" | "macos" | "windows" | "unknown"),
-            "platform must be a known value, got: {}",
-            r.platform
-        );
+        /// True when `py` can import `vco_lib.runtime_reconcile` with the
+        /// CHECKOUT as cwd — exactly what the decide child does.
+        fn imports_vco_lib(py: &Path) -> bool {
+            let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("CARGO_MANIFEST_DIR reaches the checkout root");
+            std::process::Command::new(py)
+                .arg("-c")
+                .arg("import vco_lib.runtime_reconcile")
+                .current_dir(checkout)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
 
-        // v0.2.92 BLOCKER-4 invariants, whichever branch the host is in.
-        if r.available {
-            // A resolved runtime is never reported as a refused pin.
-            assert!(r.pinned.is_none() && !r.pinned_unusable);
+        /// A `$VCT_VENV` that IS a broken interpreter: every invocation
+        /// prints vco_lib's can't-import error and exits 1 — the shape of
+        /// an install whose venv lost its vco_lib (loud-fail territory).
+        fn broken_python(dir: &Path) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let script = dir.join("python");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\necho \"ModuleNotFoundError: No module named 'vco_lib'\" >&2\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+
+        /// Run the command under the pinned environment: `venv` as
+        /// `$VCT_VENV` (absolute interpreter path — the ladder's
+        /// interpreter-binary shape), `bin` as the only lookup PATH, pin
+        /// cleared, tool-search table emptied — on a current-thread
+        /// runtime, under the workspace env lock.
+        fn with_pinned_env<T>(
+            venv: &Path,
+            bin: &Path,
+            fut: impl std::future::Future<Output = T>,
+        ) -> T {
+            let venv = venv.display().to_string();
+            let mut out = None;
+            vct_launcher_core::test_env::with_env_vars(
+                &[
+                    ("VCT_VENV", Some(venv.as_str())),
+                    // The ladder must stop at $VCT_VENV — the host's
+                    // install-root vars never reach it.
+                    ("VCT_INSTALL_ROOT", None),
+                    ("VCT_ORCHESTRATOR_ROOT", None),
+                    ("VCT_CONTAINER_RUNTIME", None),
+                    // An empty value REPLACES the table.
+                    ("VCT_TOOL_SEARCH_DIRS", Some("")),
+                ],
+                || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    out = Some(vct_launcher_core::paths::with_lookup_path(
+                        Some(bin.as_os_str()),
+                        || rt.block_on(fut),
+                    ));
+                },
+            );
+            out.unwrap()
+        }
+
+        #[test]
+        fn check_is_ok_and_available_on_a_healthy_install() {
+            let Some(py) = vco_lib_python() else {
+                eprintln!("skip: no vco_lib-capable python on this host");
+                return;
+            };
+            if !imports_vco_lib(&py) {
+                eprintln!(
+                    "skip: {} cannot import vco_lib.runtime_reconcile from the checkout",
+                    py.display()
+                );
+                return;
+            }
+            // A fake podman answering the resolver's probes (version /
+            // info / compose version) on the stub PATH — nothing real.
+            let dir = tempfile::tempdir().unwrap();
+            fake_runtime(dir.path(), "podman", &[]);
+
+            let r = with_pinned_env(&py, dir.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect("healthy install: the verdict runs, so Ok");
+
+            // Deterministic branch: podman + compose answered on the
+            // stub PATH, so the modal gets "available" with the detected
+            // name — never an install URL.
+            assert!(r.available);
+            assert_eq!(r.detected.as_deref(), Some("podman"));
+            assert!(r.install_url.is_none());
+            assert!(
+                matches!(r.platform.as_str(), "linux" | "macos" | "windows" | "unknown"),
+                "platform must be a known value, got: {}",
+                r.platform
+            );
+            // v0.2.92 BLOCKER-4 invariants: an available runtime is
+            // never also a refused pin.
+            assert!(r.pinned.is_none() && !r.pinned_unusable && !r.pinned_installed);
             assert!(r.alternative_usable.is_none());
         }
-        assert_eq!(r.pinned.is_some(), r.pinned_unusable);
-        if let Some(p) = r.pinned.as_deref() {
-            assert!(matches!(p, "podman" | "docker"));
-            // The alternative is never the pinned runtime itself — that is
-            // the swap the whole refusal exists to prevent.
-            assert_ne!(r.alternative_usable.as_deref(), Some(p));
-        } else {
-            assert!(!r.pinned_installed && r.alternative_usable.is_none());
+
+        #[test]
+        fn check_is_ok_but_not_available_when_no_runtime_exists() {
+            let Some(py) = vco_lib_python() else {
+                eprintln!("skip: no vco_lib-capable python on this host");
+                return;
+            };
+            if !imports_vco_lib(&py) {
+                eprintln!(
+                    "skip: {} cannot import vco_lib.runtime_reconcile from the checkout",
+                    py.display()
+                );
+                return;
+            }
+            // A stub PATH with NO runtime binaries at all: the verdict
+            // resolves "nothing installed" — a runtime STATE, so still
+            // Ok, rendered by the modal's not-installed branch.
+            let dir = tempfile::tempdir().unwrap();
+
+            let r = with_pinned_env(&py, dir.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect("no runtime installed is a state, not a failure: Ok");
+
+            assert!(!r.available);
+            assert!(r.detected.is_none());
+            if r.platform == "unknown" {
+                assert!(r.install_url.is_none());
+            } else {
+                assert!(
+                    r.install_url.is_some(),
+                    "not-available on a known platform offers the install URL"
+                );
+            }
+            // No pin was set, so no pin is rendered.
+            assert!(r.pinned.is_none() && !r.pinned_unusable && !r.pinned_installed);
+            assert!(r.alternative_usable.is_none());
+        }
+
+        #[test]
+        fn check_errs_loudly_when_vco_lib_cannot_import() {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let py = broken_python(stub_dir.path());
+            let empty_bin = tempfile::tempdir().unwrap();
+
+            let err = with_pinned_env(&py, empty_bin.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect_err(
+                "a venv that cannot import vco_lib is a broken install: Err, \
+                 never a silent available:false",
+            );
+
+            // The loud-fail message names the failed verdict child and
+            // carries Python's own diagnosis — it must NOT be the
+            // not-installed shape the runtime download dialog renders.
+            // (The child died before printing JSON, so the arm that
+            // fires is the unreadable-output one; either way the name
+            // and the stderr diagnosis are the contract.)
+            assert!(
+                err.contains("runtime_reconcile decide"),
+                "Err must name the failed decide child, got: {err}"
+            );
+            assert!(
+                err.contains("No module named 'vco_lib'"),
+                "Err must carry Python's can't-import diagnosis, got: {err}"
+            );
         }
     }
 }

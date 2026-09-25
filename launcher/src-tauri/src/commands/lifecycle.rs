@@ -920,11 +920,16 @@ pub(crate) fn choice_event_payload(
 /// for. A refused pin with a runtime installed (down, or the data sits
 /// under the pinned one) still suppresses the dialog: the refusal names
 /// the pin, why the stale record was not switched and what to do, and an
-/// "install a runtime" dialog would contradict it. Pure.
+/// "install a runtime" dialog would contradict it. R12-bis P3-2/P3-3:
+/// a runtime installed WITHOUT compose suppresses it too (the refusal
+/// carries the verdict's `reason` explaining the compose gap), and so
+/// does a BROKEN INSTALL (`verdict_failed`: the error carries its own
+/// remedy; `installed` is unknown there, not "none"). Pure.
 pub(crate) fn boot_without_runtime(detection: &RuntimeDetection) -> (String, bool) {
     (
         detection.no_runtime_message(),
-        detection.refusal.is_none() || detection.installed.is_none(),
+        !detection.verdict_failed
+            && (detection.refusal.is_none() || detection.installed.is_none()),
     )
 }
 
@@ -961,7 +966,10 @@ pub async fn auto_start_on_boot(app: AppHandle) {
             if !offer_install {
                 // R11 L6: a REFUSED pin is not "no runtime": the message above
                 // names the pin, why the stale record was not switched and
-                // what to do — the "install a runtime" dialog would contradict it.
+                // what to do — the "install a runtime" dialog would contradict
+                // it. R12-bis P3-2/P3-3: the same holds for a runtime without
+                // compose (the message explains the compose gap) and for a
+                // broken install (the message IS the loud error + remedy).
                 return;
             }
             let os = if cfg!(target_os = "linux") {
@@ -1057,6 +1065,7 @@ mod services_lifecycle_tests {
             // repin target the refusal names), so the install dialog must
             // NOT open.
             installed: Some("podman".into()),
+            verdict_failed: false,
         };
         let (message, offer_install) = boot_without_runtime(&refused);
         assert!(message.contains("pinned to docker"), "{message}");
@@ -1084,6 +1093,7 @@ mod services_lifecycle_tests {
                     .into(),
             ),
             installed: None,
+            verdict_failed: false,
         };
         let (message, offer_install) = boot_without_runtime(&refused_nothing_installed);
         assert!(message.contains("pinned to docker"), "{message}");
@@ -1091,6 +1101,65 @@ mod services_lifecycle_tests {
             offer_install,
             "no runtime installed at all: the install dialog must open, pin or not"
         );
+    }
+
+    /// R12-bis P3-2 (act + leave-alone): a runtime that is installed and
+    /// answers but has NO compose anywhere — the detection carries the
+    /// verdict's `reason` as the refusal (it explains the compose gap)
+    /// and `installed` names the runtime, so the boot path says the
+    /// reason, never "No container runtime found", and does NOT open the
+    /// install dialog (a runtime IS installed).
+    #[test]
+    fn a_runtime_without_compose_names_the_reason_and_keeps_the_dialog_closed() {
+        let resolved_no_compose = RuntimeDetection {
+            info: None,
+            not_switched: None,
+            refusal: Some(
+                "podman is installed and answering, but no compose is available \
+                 (neither `podman compose` nor podman-compose)."
+                    .into(),
+            ),
+            installed: Some("podman".into()),
+            verdict_failed: false,
+        };
+        let (message, offer_install) = boot_without_runtime(&resolved_no_compose);
+        assert!(message.contains("no compose is available"), "{message}");
+        assert!(
+            !message.contains("No container runtime found"),
+            "an installed, answering runtime is not 'no container runtime found': {message}"
+        );
+        assert!(!offer_install, "compose missing ≠ runtime missing");
+    }
+
+    /// R12-bis P3-3 (act + leave-alone): a broken install (the ONE verdict
+    /// could not run — missing/broken Python) shows its loud error, with
+    /// its remedy, and NEVER the "install a container runtime" download
+    /// dialog (`installed` is UNKNOWN there, not "none"); a machine with
+    /// genuinely nothing installed still gets the dialog.
+    #[test]
+    fn a_broken_install_shows_its_error_not_the_runtime_download_dialog() {
+        let broken = RuntimeDetection {
+            info: None,
+            not_switched: None,
+            refusal: Some(
+                "broken install: no Python environment with VCO's dependencies \
+                 found — reinstall VCO to repair it."
+                    .into(),
+            ),
+            installed: None,
+            verdict_failed: true,
+        };
+        let (message, offer_install) = boot_without_runtime(&broken);
+        assert!(message.contains("broken install"), "{message}");
+        assert!(
+            !offer_install,
+            "a broken install must show its own remedy, never the runtime download dialog"
+        );
+        // Leave-alone: the SAME shape with the verdict intact (nothing
+        // installed, no pin) still opens the dialog.
+        let (message, offer_install) = boot_without_runtime(&RuntimeDetection::default());
+        assert!(message.starts_with("No container runtime found"), "{message}");
+        assert!(offer_install, "genuinely nothing installed must still offer the dialog");
     }
 
     fn row(service: &str, mode: EndpointMode, port: u16) -> ServiceEndpointRow {

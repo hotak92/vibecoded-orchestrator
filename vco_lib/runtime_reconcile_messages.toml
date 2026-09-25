@@ -1,19 +1,20 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 #
-# Why the runtime-record reconcile did NOT switch a stale record — ONE table
-# both languages render (tier B of the A>B>C rule), so every surface that
-# refuses a pinned runtime says the same thing (v0.2.97 R10 J6).
+# Why the runtime-record reconcile did NOT switch a stale record — ONE table,
+# rendered ONLY by Python (v0.2.97 R10 J6; the Rust `include_str!` reader was
+# retired in v0.2.97 R12 when the Rust mirrors were deleted).
 #
 # Readers:
 #   * Python — `vco_lib/runtime_reconcile.py` (`unusable_detail`): the detail of
 #     an UNUSABLE reconciliation, which `vco_lib.containers.resolve` appends to
 #     its refusal as "(not switched: <detail>)" and install.py prints.
-#   * Rust — `launcher/src-tauri/vct-launcher-core/src/services/container_runtime.rs`
-#     (`include_str!`, `record_reconcile_note`): the same text, appended to the
-#     launcher's and the hub's refusal as "(not switched: <detail>)".
+#   * Every other surface (launcher, hub) shows this SAME text verbatim through
+#     the decide verdict's `refusal`/`reason` fields
+#     (`python -m vco_lib.runtime_reconcile decide --json`); the Rust client no
+#     longer renders the table itself.
 #   * `tests/fixtures/runtime_data_evidence_cases.json` (`not_switched`) pins
-#     that both render every key identically.
+#     the full key set this table must carry.
 #
 # Placeholders are `{name}`, replaced literally (no format mini-language):
 #   {pinned} the recorded runtime, {other} the other one, {source} where the
