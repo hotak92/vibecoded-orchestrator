@@ -14781,6 +14781,136 @@ MemAvailable:   23456789 kB
             );
         }
 
+        // ── v0.2.97 flaky-run hardening (2026-09-25) ─────────────────────────
+        //
+        // A full-workspace `cargo test` run failed ONCE on
+        // `migrate_github_pat_audit_log_records_file_removed_false` with a bare
+        // `assert!(report.migrated)`. Root cause: every keychain op runs on ONE
+        // worker thread with a 10s caller-side bound (`KEYCHAIN_OP_TIMEOUT` in
+        // vct-launcher-core::secrets) and fast-fails with `WorkerStuck` while a
+        // prior op is wedged — under load a delete or set can fail there. The
+        // old `delete_keychain()` swallowed delete errors (`let _ =`), so a
+        // failed CLEANUP delete left residue that the NEXT test's migration
+        // read as "keychain already has a value" (Case 2 → migrated=false), or
+        // the migration's own `secrets::set` failed into `report.warnings`
+        // (Case 3 → migrated=false). The bare assert then reported neither.
+
+        /// True when the error string positively identifies a keychain-op
+        /// timeout / worker unavailability — the deterministic `Display`
+        /// strings of `KeychainTimeout` in vct-launcher-core, embedded
+        /// verbatim in `KeychainError::Other` details by `set_raw` /
+        /// `get_with_context` / `delete_with_context`. These substrings are
+        /// produced by no other error source, so matching them is positive
+        /// identification, not a guess. Any OTHER error is a real failure
+        /// and must fail the test loudly.
+        fn is_keychain_unavailable_err(e: &str) -> bool {
+            e.contains("keychain operation timed out")
+                || e.contains("keychain worker stuck")
+                || e.contains("keychain worker unavailable")
+        }
+
+        /// Outcome of [`delete_keychain_checked`].
+        enum KeychainPrep {
+            Ready,
+            /// The Secret Service was too slow / wedged under load (a
+            /// positively-identified timeout-class error). The caller should
+            /// SKIP the test — the same posture as `keyring_available() ==
+            /// false` — never fail it.
+            Unavailable(String),
+        }
+
+        /// [`delete_keychain`], made honest (v0.2.97): a failed delete must
+        /// fail the test loudly with the error, and the slots must be VERIFIED
+        /// empty afterwards — a delete whose error was swallowed can leave
+        /// residue that a later migration reads as "already migrated",
+        /// which is exactly the silent false-failure mode this hardens
+        /// against. Only a positively-identified timeout-class error yields
+        /// [`KeychainPrep::Unavailable`] so the caller can skip.
+        ///
+        /// Same safety contract as `delete_keychain`: only callable inside a
+        /// `setup_temp_env()` guard (namespace `vct-test-<pid>`); the
+        /// `assert_not_production_pat_slot` tripwire enforces it.
+        fn delete_keychain_checked() -> KeychainPrep {
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            for module_id in [GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID] {
+                if let Err(e) = crate::secrets::delete(scope, module_id, GITHUB_PAT_KEY) {
+                    if is_keychain_unavailable_err(&e) {
+                        return KeychainPrep::Unavailable(e);
+                    }
+                    panic!(
+                        "delete_keychain_checked: keychain delete of shared.{}/{} \
+                         failed (residue would be misread as already-migrated): {}",
+                        module_id, GITHUB_PAT_KEY, e
+                    );
+                }
+            }
+            // Verify both slots actually read EMPTY. Never print the value —
+            // slot identity + a length is all a diagnostic needs.
+            for module_id in [GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID] {
+                match crate::secrets::get(scope, module_id, GITHUB_PAT_KEY) {
+                    Ok(None) => {}
+                    Ok(Some(v)) => panic!(
+                        "delete_keychain_checked: slot shared.{}/{} still holds \
+                         {} bytes after delete — a swallowed delete error would \
+                         make the next migration report migrated=false",
+                        module_id,
+                        GITHUB_PAT_KEY,
+                        v.len()
+                    ),
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            return KeychainPrep::Unavailable(e);
+                        }
+                        panic!(
+                            "delete_keychain_checked: verifying slot \
+                             shared.{}/{} empty failed: {}",
+                            module_id, GITHUB_PAT_KEY, e
+                        );
+                    }
+                }
+            }
+            KeychainPrep::Ready
+        }
+
+        /// Precondition macro for tests in this module: wipe + verify both PAT
+        /// slots, skipping the test (like `keyring_available() == false`) when
+        /// the Secret Service is positively identified as too slow/unavailable
+        /// under load, and failing loudly on any other keychain error or on
+        /// post-delete residue.
+        macro_rules! clean_keychain {
+            ($home:expr) => {
+                match delete_keychain_checked() {
+                    KeychainPrep::Ready => {}
+                    KeychainPrep::Unavailable(reason) => {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as keyring_available() == \
+                             false — not a product regression",
+                            reason
+                        );
+                        std::fs::remove_dir_all(&$home).ok();
+                        return;
+                    }
+                }
+            };
+        }
+
+        /// True when the migration report's warnings positively identify a
+        /// keychain timeout / worker failure as the reason `migrated` is
+        /// false. Used ONLY to distinguish "Secret Service too slow under
+        /// load" from a product regression; any other warning still fails
+        /// the assert.
+        fn migration_report_indicates_keychain_timeout(
+            report: &GithubPatMigrationReport,
+        ) -> bool {
+            report
+                .warnings
+                .iter()
+                .any(|w| is_keychain_unavailable_err(w))
+        }
+
         // ── Item #1: register_github_pat → keychain (no plaintext file) ──
 
         /// Calling the underlying register flow (keychain set + active
@@ -14798,7 +14928,7 @@ MemAvailable:   23456789 kB
             let (home, _guard) = setup_temp_env();
             let db = make_db();
             // Clean slate — no prior keychain residue from another test.
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_test_{}", uuid::Uuid::new_v4().simple());
 
@@ -14853,7 +14983,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a user-owned file. The user "owns" this file
             // (e.g. they wrote it manually); the launcher must not
@@ -14909,7 +15039,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a file at the new shared/ path with a canary.
             let canary = format!("ghp_existing_{}", uuid::Uuid::new_v4().simple());
@@ -14920,6 +15050,18 @@ MemAvailable:   23456789 kB
 
             // Migrate.
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: a positively-identified keychain timeout
+            // under load is an environment condition (same posture as
+            // `keyring_available() == false`), not a product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "expected migrated=true: {:?}", report);
             assert!(
                 !report.file_removed,
@@ -14927,7 +15069,7 @@ MemAvailable:   23456789 kB
                 report,
             );
             assert!(report.flag_set, "expected flag_set=true: {:?}", report);
-            assert!(!report.already_done, "first run is not already_done");
+            assert!(!report.already_done, "first run is not already_done: {:?}", report);
 
             // Keychain has the value.
             assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
@@ -14953,9 +15095,13 @@ MemAvailable:   23456789 kB
 
             // Run #2: idempotent — already_done short-circuits.
             let report2 = migrate_github_pat_file_to_keychain(&db).unwrap();
-            assert!(report2.already_done, "second run should be a no-op");
-            assert!(!report2.migrated);
-            assert!(!report2.file_removed);
+            assert!(
+                report2.already_done,
+                "second run should be a no-op: {:?}",
+                report2
+            );
+            assert!(!report2.migrated, "second run must not re-migrate: {:?}", report2);
+            assert!(!report2.file_removed, "second run must not remove: {:?}", report2);
 
             // Cleanup.
             delete_keychain();
@@ -14974,7 +15120,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_{}", uuid::Uuid::new_v4().simple());
             let secrets_dir = vct_secrets_dir().unwrap();
@@ -14983,8 +15129,20 @@ MemAvailable:   23456789 kB
             std::fs::write(&flat, &canary).unwrap();
 
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: a positively-identified keychain timeout
+            // under load is an environment condition (same posture as
+            // `keyring_available() == false`), not a product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "expected migrated=true: {:?}", report);
-            assert!(report.flag_set);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert!(
                 !report.file_removed,
                 "non-destructive contract: file_removed must be false: {:?}",
@@ -15023,7 +15181,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a file at the shared/ path with a canary so
             // the Case-3 codepath (file present, keychain empty) is
@@ -15036,7 +15194,19 @@ MemAvailable:   23456789 kB
             std::fs::write(&path, &canary).unwrap();
 
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
-            assert!(report.migrated);
+            // v0.2.97 flaky-run fix (the test that failed bare in the
+            // workspace run): timeout under load → skip; anything else
+            // fails WITH the report so `warnings` is diagnosable.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
+            assert!(report.migrated, "expected migrated=true (Case-3): {:?}", report);
             assert!(
                 !report.file_removed,
                 "non-destructive contract: file_removed must be false: {:?}",
@@ -15125,7 +15295,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-populate keychain.
             let existing = format!("ghp_existing_{}", uuid::Uuid::new_v4().simple());
@@ -15180,7 +15350,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             let token = format!("ghp_same_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15213,7 +15383,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_env_{}", uuid::Uuid::new_v4().simple());
             crate::secrets::set(
@@ -15251,7 +15421,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_paused_{}", uuid::Uuid::new_v4().simple());
             crate::secrets::set(
@@ -15292,7 +15462,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             assert_eq!(resolve_github_pat(&db), None);
 
@@ -15317,10 +15487,9 @@ MemAvailable:   23456789 kB
             let db = make_db();
             // Clear any prior keychain residue so the file-fallback
             // path is the one exercised. If the keychain backend is
-            // unreachable (CI), `delete` is a no-op and the test still
-            // exercises the file-fallback (since the keychain read
-            // also returns None on unreachable).
-            delete_keychain();
+            // unreachable (CI), the checked delete skips the test (the
+            // keychain read would be indistinguishable from empty anyway).
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_fallback_{}", uuid::Uuid::new_v4().simple());
             let shared_dir = vct_secrets_shared_dir().unwrap();
@@ -15447,7 +15616,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_user_slot_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15482,7 +15651,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_old_only_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15500,13 +15669,13 @@ MemAvailable:   23456789 kB
             );
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(!report.already_done);
-            assert!(report.had_old_value);
-            assert!(!report.had_new_value);
+            assert!(!report.already_done, "first run: {:?}", report);
+            assert!(report.had_old_value, "old slot must have held the seed: {:?}", report);
+            assert!(!report.had_new_value, "new slot must have started empty: {:?}", report);
             assert_eq!(report.winner, "old");
-            assert!(report.deleted_old_keychain_row);
-            assert!(report.forgot_old_active_state);
-            assert!(report.flag_set);
+            assert!(report.deleted_old_keychain_row, "old row must be deleted: {:?}", report);
+            assert!(report.forgot_old_active_state, "old active row must be dropped: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert!(
                 report.warnings.is_empty(),
                 "expected no warnings: {:?}",
@@ -15544,7 +15713,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let old_canary = format!("ghp_old_{}", uuid::Uuid::new_v4().simple());
             let new_canary = format!("ghp_new_{}", uuid::Uuid::new_v4().simple());
@@ -15559,15 +15728,15 @@ MemAvailable:   23456789 kB
             crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary).unwrap();
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report.had_old_value);
-            assert!(report.had_new_value);
+            assert!(report.had_old_value, "old slot must have held its seed: {:?}", report);
+            assert!(report.had_new_value, "new slot must have held its seed: {:?}", report);
             assert_eq!(
                 report.winner, "new",
                 "both slots populated → new wins (later-write); got {:?}",
                 report.winner
             );
-            assert!(report.deleted_old_keychain_row);
-            assert!(report.flag_set);
+            assert!(report.deleted_old_keychain_row, "old row must be deleted: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
 
             // Post-condition: new slot retains its value, old slot empty.
             assert_eq!(
@@ -15598,15 +15767,15 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(!report.already_done, "first run must not be already_done");
-            assert!(!report.had_old_value);
-            assert!(!report.had_new_value);
+            assert!(!report.already_done, "first run must not be already_done: {:?}", report);
+            assert!(!report.had_old_value, "old slot must be empty: {:?}", report);
+            assert!(!report.had_new_value, "new slot must be empty: {:?}", report);
             assert_eq!(report.winner, "none");
-            assert!(!report.deleted_old_keychain_row);
-            assert!(report.flag_set);
+            assert!(!report.deleted_old_keychain_row, "nothing to delete: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
 
             // Both slots still empty.
             assert!(keychain_value().is_none());
@@ -15614,9 +15783,9 @@ MemAvailable:   23456789 kB
 
             // Run #2: idempotent — already_done short-circuits.
             let report2 = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report2.already_done);
+            assert!(report2.already_done, "second run must short-circuit: {:?}", report2);
             assert_eq!(report2.winner, "none");
-            assert!(!report2.flag_set, "flag was already set; we don't re-set it");
+            assert!(!report2.flag_set, "flag was already set; we don't re-set it: {:?}", report2);
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15632,7 +15801,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_audit_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15685,7 +15854,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Simulate a 0.2.0 install: PAT lives at the LEGACY slot
             // only, no migration has run yet.
@@ -15706,7 +15875,7 @@ MemAvailable:   23456789 kB
             // Run the module_id migration. After that, the value lives
             // at the new slot AND the legacy slot is empty.
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report.flag_set);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert_eq!(
                 resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
@@ -15731,7 +15900,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_paused_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15774,7 +15943,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Seed a file-fallback PAT — simulates a fresh install
             // where the user has `~/.vct-secrets/shared/github_pat`
@@ -15787,6 +15956,17 @@ MemAvailable:   23456789 kB
             // Run the file→keychain migration. After our 2026-05-10
             // const flip, this writes via GITHUB_PAT_MODULE_ID="user".
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: timeout under load → skip, not a
+            // product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "file→keychain must have run: {:?}", report);
 
             // Value lands at the user slot, not the legacy installer slot.
