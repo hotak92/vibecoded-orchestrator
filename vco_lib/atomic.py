@@ -602,9 +602,57 @@ def atomic_write_json(
     atomic_write_text(path, body, fsync=fsync, mode=mode)
 
 
+class LockTimeout(TimeoutError):
+    """:func:`exclusive_file_lock` could not take the lock within ``timeout_s``."""
+
+
+#: How often a bounded :func:`exclusive_file_lock` retries its non-blocking take.
+_LOCK_RETRY_INTERVAL_S = 0.1
+
+
+def _take_flock(fh: Any, timeout_s: Optional[float], lock_path: Path) -> bool:
+    """Take ``LOCK_EX`` on ``fh`` (bounded by ``timeout_s`` when given). ``True``
+    when held; ``False`` where flock does not exist (Windows / a filesystem
+    without it — the block runs without mutual exclusion, as before). Raises
+    :class:`LockTimeout` when the bound expires."""
+    try:
+        import fcntl  # noqa: PLC0415 — POSIX-only, deferred import
+    except ImportError:
+        return False
+    if timeout_s is None:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            return True
+        except (AttributeError, OSError):
+            return False
+    import time  # noqa: PLC0415
+
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return True
+        except AttributeError:
+            return False
+        except OSError as exc:
+            if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EACCES):
+                return False  # no flock on this filesystem — best effort, as before
+        if time.monotonic() >= deadline:
+            raise LockTimeout(f"{lock_path} is held by another process (waited {timeout_s:g}s)")
+        time.sleep(_LOCK_RETRY_INTERVAL_S)
+
+
 @contextlib.contextmanager
-def exclusive_file_lock(lock_path: Path) -> Iterator[None]:
+def exclusive_file_lock(lock_path: Path, *, timeout_s: Optional[float] = None) -> Iterator[None]:
     """Hold an exclusive advisory lock on ``lock_path`` for the block.
+
+    ``timeout_s`` (v0.2.97 R9 H7): ``None`` (the default) waits as long as the
+    holder keeps the lock — the historical blocking ``LOCK_EX``. A number
+    bounds the wait: the lock is taken NON-blocking (``LOCK_EX | LOCK_NB``)
+    and retried every 0.1 s until the deadline, then :class:`LockTimeout` is
+    raised BEFORE the block runs (nothing done unlocked). A caller that must
+    never stall — the boot wrapper's ledger write while an update holds the
+    lock — passes one.
 
     Cross-platform, best-effort: on POSIX the lock is a real
     ``fcntl.flock(LOCK_EX)`` on a sidecar lockfile, so concurrent
@@ -636,15 +684,7 @@ def exclusive_file_lock(lock_path: Path) -> Iterator[None]:
     fh = open(lock_path, "a+")  # noqa: SIM115 — handle closed in finally
     locked = False
     try:
-        try:
-            import fcntl  # noqa: PLC0415 — POSIX-only, deferred import
-
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-            locked = True
-        except (ImportError, AttributeError, OSError):
-            # Windows or a filesystem without flock — best-effort
-            # fall-through: the block still runs without mutual exclusion.
-            locked = False
+        locked = _take_flock(fh, timeout_s, lock_path)
         yield
     finally:
         if locked:

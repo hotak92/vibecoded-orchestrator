@@ -507,6 +507,19 @@ if not _ALLOW_REAL_STATE:
 if not _ALLOW_REAL_STATE:
     os.environ["VCT_INSTALL_ROOT"] = str(_REPO_ROOT)
 
+# ─── W-TOOL-DIRS (v0.2.97 R9 H1(b)): the suite never discovers this machine's
+# container runtimes OUTSIDE PATH. `vco_lib.tool_search_dirs` makes "is podman
+# installed?" look in the usual install locations too (`/usr/bin`, `~/bin`,
+# `/opt/homebrew/bin`, ... — `vco_lib/tool_search_dirs.toml`), and a test that
+# runs with `PATH=<fake bin>` to hide the host's runtimes would otherwise find
+# the REAL `/usr/bin/podman` there and talk to it. Empty = no extra directories
+# (the knob REPLACES the table's list). A test exercising the table sets its own
+# value (`monkeypatch.setenv` / `delenv` run after this fixture's setup), and a
+# child started with an explicit env must carry it (see the boot-wrapper tests).
+# Set at import and RE-ESTABLISHED per test below, like the other W-* pins.
+TOOL_SEARCH_DIRS_ENV = "VCT_TOOL_SEARCH_DIRS"
+os.environ[TOOL_SEARCH_DIRS_ENV] = ""
+
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
 # `weaviate_mcp.server._resolution_context()` answers "whose project is this?"
@@ -621,6 +634,8 @@ def _redirect_user_state_dir(request):
     # that sets its own `VCT_INSTALL_ROOT` still wins: it runs after this
     # setup, and the `finally` below only restores what was there at setup.
     install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
+    # W-TOOL-DIRS: unconditional, like W-INSTALL-ROOT (see the block above).
+    install_root_keys[TOOL_SEARCH_DIRS_ENV] = ""
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
     )

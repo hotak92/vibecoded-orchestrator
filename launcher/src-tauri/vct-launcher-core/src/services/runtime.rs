@@ -208,7 +208,15 @@ impl RuntimeInfo {
 ///     are missing. Frequency is lower than macOS (Linux dev users tend
 ///     to launch from terminal) but the bug shape is identical.
 ///   - Windows: Explorer-launched apps inherit the user PATH via
-///     registry (`HKCU\Environment`), so no augmentation is needed.
+///     registry (`HKCU\Environment`); since v0.2.97 R9 the Docker Desktop /
+///     Podman installer directories are still added when missing (a
+///     Scheduled Task or a service may run with a different PATH).
+///   - v0.2.97 R9 H1(b)/H5: the candidate list is the shared table
+///     `vco_lib/tool_search_dirs.toml` (see [`augment_candidates`]), and the
+///     HUB calls this too (`vct-hub/src/main.rs`, before its tokio runtime
+///     exists): both processes decide "is the container runtime installed?"
+///     and a short inherited PATH must not answer "no" for a runtime in
+///     `~/bin` or `/opt/homebrew/bin`.
 ///
 /// Cross-OS triage finding (`cross-os-triage-2026-06-10.md` §P0-7)
 /// confirms the macOS + Linux PATH inheritance class is the same root
@@ -233,7 +241,8 @@ pub fn augment_path_for_graphical_launch() {
     if let Some(joined) = augmented_path(&current, home.as_deref()) {
         // Safety: setting PATH process-wide is sound because we are
         // single-threaded at this call site (lib.rs `setup()` runs before
-        // any subprocess spawn or Tauri-managed thread is unparked).
+        // any subprocess spawn or Tauri-managed thread is unparked; the
+        // hub's `main` calls it before building its tokio runtime).
         // `set_var` itself is `unsafe` on edition 2024+, but stable Rust
         // allows the safe form on the current crate edition (2021).
         std::env::set_var("PATH", &joined);
@@ -292,43 +301,122 @@ pub fn augmented_path(
 /// order (first entry wins for collisions). Candidates that do not
 /// exist on disk are still added — the user may install the tooling
 /// later and re-launch. Only `$HOME`-relative candidates are dropped
-/// when `HOME` is unset.
+/// when `HOME` is unset (and `${VAR}` ones when the variable is unset).
+///
+/// v0.2.97 R9 H1(b)/H5: the list is no longer hard-coded here — it is the
+/// ONE committed table `vco_lib/tool_search_dirs.toml` that the Python side
+/// (`vco_lib.tool_search_dirs`) also reads, extended with the places the
+/// container runtimes live (`~/bin` for rootless Docker, `/usr/local/bin`,
+/// `/opt/podman/bin`, Docker Desktop's app bundle, the Windows installers).
+/// The launcher (`lib.rs::setup`) AND the hub (`vct-hub/src/main.rs`) apply
+/// it at startup, so a runtime installed outside their short inherited PATH
+/// is found — and driven — instead of read as "not installed".
 fn augment_candidates(home: Option<&std::path::Path>) -> Vec<PathBuf> {
+    let home = home.map(|h| h.to_string_lossy().into_owned());
+    tool_search_dirs_for(current_os_key(), home.as_deref(), &|k| std::env::var(k).ok())
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let mut out: Vec<PathBuf> = vec![
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/opt/homebrew/sbin"),
-        ];
-        if let Some(h) = home.as_ref() {
-            out.push(h.join(".cargo/bin"));
-            out.push(h.join(".local/bin"));
+/// The shared table of usual tool install locations (see
+/// [`augment_candidates`]). Embedded at compile time — the SAME file the
+/// Python reader parses.
+const TOOL_SEARCH_DIRS_TOML: &str = include_str!("../../../../../vco_lib/tool_search_dirs.toml");
+
+/// When SET (even to ""), replaces the table's list for this OS: entries
+/// separated by the OS path separator, same syntax. MUST MATCH
+/// `vco_lib.tool_search_dirs.ENV_OVERRIDE`.
+pub const TOOL_SEARCH_DIRS_ENV: &str = "VCT_TOOL_SEARCH_DIRS";
+
+#[derive(serde::Deserialize)]
+struct ToolSearchDirsFile {
+    format_version: u32,
+    dirs: std::collections::HashMap<String, Vec<String>>,
+}
+
+static TOOL_SEARCH_DIRS: std::sync::LazyLock<std::collections::HashMap<String, Vec<String>>> =
+    std::sync::LazyLock::new(|| {
+        let parsed: ToolSearchDirsFile = toml::from_str(TOOL_SEARCH_DIRS_TOML)
+            .expect("vco_lib/tool_search_dirs.toml is embedded at compile time and must parse");
+        assert_eq!(
+            parsed.format_version, 1,
+            "vco_lib/tool_search_dirs.toml format_version this reader supports is 1"
+        );
+        parsed.dirs
+    });
+
+/// The table's key for the OS this binary runs on (`linux` / `macos` /
+/// `windows`; `other` has no entries). MUST MATCH
+/// `vco_lib.tool_search_dirs.os_key`.
+pub fn current_os_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "other"
+    }
+}
+
+/// One table entry → a directory, or `None` when it cannot be expanded:
+/// `~/rest` needs a home, `${NAME}rest` a set, non-empty `NAME`; anything
+/// else is literal. MUST MATCH `vco_lib.tool_search_dirs.expand_entry`
+/// (`tests/fixtures/tool_search_dirs_cases.json` runs both).
+pub fn expand_search_dir(
+    entry: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if entry == "~" || entry.starts_with("~/") {
+        let h = home.filter(|h| !h.is_empty())?;
+        return Some(format!("{}{}", h.trim_end_matches(['/', '\\']), &entry[1..]));
+    }
+    if let Some(rest) = entry.strip_prefix("${") {
+        if let Some(end) = rest.find('}') {
+            let name = &rest[..end];
+            let valid = !name.is_empty()
+                && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if valid {
+                let value = env(name).filter(|v| !v.is_empty())?;
+                return Some(format!("{}{}", value, &rest[end + 1..]));
+            }
         }
-        out
     }
+    Some(entry.to_string())
+}
 
-    #[cfg(target_os = "linux")]
-    {
-        let mut out: Vec<PathBuf> = Vec::new();
-        if let Some(h) = home.as_ref() {
-            out.push(h.join(".local/bin"));
-            out.push(h.join(".cargo/bin"));
+/// The expanded search directories for `os` (table order, duplicates
+/// dropped), or the `VCT_TOOL_SEARCH_DIRS` override when `env` has it.
+/// Pure (home and env injected) so the shared fixture can drive every OS
+/// from any host. MUST MATCH `vco_lib.tool_search_dirs.candidate_dirs`.
+pub fn tool_search_dirs_for(
+    os: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    let raw: Vec<String> = match env(TOOL_SEARCH_DIRS_ENV) {
+        Some(over) => {
+            let sep = if os == "windows" { ';' } else { ':' };
+            over.split(sep)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| p.to_string())
+                .collect()
         }
-        out.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
-        out.push(PathBuf::from("/snap/bin"));
-        out.push(PathBuf::from("/var/lib/flatpak/exports/bin"));
-        out
+        None => TOOL_SEARCH_DIRS.get(os).cloned().unwrap_or_default(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for entry in raw {
+        if let Some(d) = expand_search_dir(entry.trim(), home, env) {
+            if !d.is_empty() && !out.contains(&d) {
+                out.push(d);
+            }
+        }
     }
-
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        // Windows + other targets: no-op. Explorer-launched apps
-        // inherit the user PATH via the registry, so augmentation is
-        // unnecessary.
-        let _ = home;
-        Vec::new()
-    }
+    out
 }
 
 // v0.2.53 L-P0-4 (Track G3) — coverage note:
@@ -876,14 +964,16 @@ async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<Ru
     // substitution (the mirror of the reconcile arm in
     // `container_runtime::detect_container_runtime_with_pin` and
     // `vco_lib.containers.resolve`). runtime.txt names a runtime that is
-    // not installed, the other runtime answers, and its data could be
-    // listed (VCO's data under it, or provably none anywhere) → drive
-    // the other runtime, read-only — the next update re-records it. The
-    // ENV pin is never reconciled; an installed-but-down recorded
+    // not installed (not on the startup-augmented PATH — R9 H1(b)), the
+    // other runtime answers AND holds VCO's data (R9 H1: positive evidence
+    // only), and the record is not the user's confirmed choice (R9 H2) →
+    // drive the other runtime, read-only — the next update re-records it.
+    // The ENV pin is never reconciled; an installed-but-down recorded
     // runtime keeps the strict refusal (nothing runs).
     {
         use super::container_runtime::{
-            other_runtime, pinned_runtime, record_reconcile_decides, RuntimePinSource,
+            other_runtime, pinned_runtime, read_runtime_confirmed, record_reconcile_decides,
+            RuntimePinSource,
         };
         let env_pin = match override_pref.as_deref() {
             Some(p @ ("podman" | "docker")) => Some(p),
@@ -892,11 +982,13 @@ async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<Ru
         let pinned = pinned_runtime(env_pin, recorded.as_deref());
         if let Some((pin, RuntimePinSource::RuntimeTxt)) = pinned {
             if which_on_path(pin).is_none() {
+                let confirmed =
+                    install_root.and_then(read_runtime_confirmed).as_deref() == Some(pin);
                 let other = other_runtime(pin);
-                let other_responsive =
-                    super::container_runtime::runtime_daemon_responsive(other).await;
+                let other_responsive = !confirmed
+                    && super::container_runtime::runtime_daemon_responsive(other).await;
                 let other_data_listed = if other_responsive {
-                    super::container_runtime::vco_data_under(other).await
+                    super::container_runtime::vco_data_under(other, install_root).await
                 } else {
                     None
                 };
@@ -905,6 +997,7 @@ async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<Ru
                     true,
                     other_responsive,
                     other_data_listed,
+                    confirmed,
                 ) {
                     tracing::info!(
                         recorded = pin,
@@ -1116,6 +1209,7 @@ mod tests {
                         !on.iter().any(|c| c == pin),
                         daemon_ok.iter().any(|c| c == other),
                         other_data_listed(sc, other),
+                        sc.get("runtime_confirmed").and_then(|v| v.as_str()) == Some(pin),
                     ) {
                         order = vec![runtime_from(sub)];
                     }
@@ -1373,13 +1467,118 @@ mod tests {
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            // Windows + other: no-op.
-            assert_eq!(
-                parts,
-                vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-                "Windows augment must be a no-op; PATH={:?}",
-                parts
+            // Windows + other: exactly the shared table's entries for this
+            // OS (R9: the container runtimes' install dirs), then the
+            // original PATH.
+            let mut want: Vec<PathBuf> = tool_search_dirs_for(
+                current_os_key(),
+                Some("/tmp/vct-augment-test-home"),
+                &|k| std::env::var(k).ok(),
+            )
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+            // The baseline split the way THIS OS splits a PATH (";" on Windows).
+            want.extend(std::env::split_paths(std::ffi::OsStr::new("/usr/bin:/bin")));
+            assert_eq!(parts, want, "PATH={:?}", parts);
+        }
+    }
+
+    // ----- v0.2.97 R9 H1(b)/H5: the shared tool-search table -----
+
+    fn fixture_env(case: &serde_json::Value) -> std::collections::HashMap<String, String> {
+        case["env"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The expansion rule and every OS's list, driven by the SAME fixture
+    /// the Python suite runs (`tests/fixtures/tool_search_dirs_cases.json`).
+    #[test]
+    fn tool_search_dirs_match_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/tool_search_dirs_cases.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fx: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+        let cases = fx["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 6, "fixture shrank");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let env = fixture_env(case);
+            let got = tool_search_dirs_for(
+                case["os"].as_str().unwrap(),
+                case["home"].as_str(),
+                &|k| env.get(k).cloned(),
             );
+            let want: Vec<String> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(got, want, "case {}", name);
+        }
+    }
+
+    /// R9 H5: a runtime installed ONLY in a user-local directory (rootless
+    /// Docker's `~/bin`) is found by a process started with the minimal
+    /// boot-unit PATH once the startup augment ran — the lookup every
+    /// runtime decision in this crate goes through (`which_on_path`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_only_in_a_user_local_dir_is_found_under_a_short_path() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(&docker, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let systemd_user = std::ffi::OsString::from(
+            "/usr/local/sbin:/nonexistent-vct-r9-sbin:/nonexistent-vct-r9-bin",
+        );
+        // Baseline: the boot unit's PATH alone does not reach it.
+        crate::paths::with_lookup_path(Some(&systemd_user), || {
+            assert_ne!(which_on_path("docker"), Some(docker.clone()));
+        });
+        let env = |k: &str| -> Option<String> {
+            if k == TOOL_SEARCH_DIRS_ENV {
+                None // the real table
+            } else {
+                std::env::var(k).ok()
+            }
+        };
+        let dirs = tool_search_dirs_for("linux", home.path().to_str(), &env);
+        let mut entries: Vec<PathBuf> = dirs.into_iter().map(PathBuf::from).collect();
+        entries.extend(std::env::split_paths(&systemd_user));
+        let augmented = std::env::join_paths(entries).unwrap();
+        crate::paths::with_lookup_path(Some(&augmented), || {
+            assert_eq!(which_on_path("docker"), Some(docker.clone()));
+        });
+    }
+
+    /// R9 H5 (macOS): the Homebrew prefixes and Docker Desktop's bundle are
+    /// on the list a launchd-started process augments with.
+    #[test]
+    fn the_macos_list_covers_homebrew_and_docker_desktop() {
+        let dirs = tool_search_dirs_for("macos", Some("/Users/u"), &|_k| None);
+        for want in [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/podman/bin",
+            "/Applications/Docker.app/Contents/Resources/bin",
+            "/Users/u/bin",
+            "/Users/u/.local/bin",
+        ] {
+            assert!(dirs.iter().any(|d| d == want), "{want} missing from {dirs:?}");
         }
     }
 

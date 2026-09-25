@@ -77,6 +77,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+# "Is the runtime installed?" is judged on PATH AND in the usual install
+# locations (v0.2.97 R9 H1(b)): a short-PATH caller must never read a runtime in
+# ~/bin or /opt/homebrew/bin as absent. Every default ``which`` / ``run`` below
+# goes through it; an injected probe is the whole world, as before.
+from vco_lib import tool_search_dirs as _tsd
+
 __all__ = [
     "CANONICAL_CONTAINERS",
     "HISTORICAL_ALIASES",
@@ -203,7 +209,8 @@ def _resolve_runtime(runtime: str, install_root: object = None) -> Optional[str]
     """The runtime a container LOOKUP uses — THE pin rule (:func:`runtime_pin`:
     ``VCT_CONTAINER_RUNTIME`` → ``state/install/runtime.txt`` → auto).
 
-    * Pinned: the pinned runtime when its binary is on PATH, else ``None`` —
+    * Pinned: the pinned runtime when its binary is installed (on PATH, or
+      in the usual install locations — :func:`vco_lib.tool_search_dirs.which`), else ``None`` —
       never the other runtime. Podman and Docker keep separate containers and
       volumes; answering "found" from the runtime the user did NOT pin names a
       container next to empty volumes (plan invariants I1/I2), so a pinned
@@ -220,22 +227,22 @@ def _resolve_runtime(runtime: str, install_root: object = None) -> Optional[str]
                       warn=lambda _m: None)
     if pin is not None:
         pinned = pin[0]
-        return pinned if shutil.which(pinned) else None
+        return pinned if _tsd.which(pinned) else None
 
     effective = (runtime or "podman").strip().lower()
     if effective not in ("podman", "docker"):
         # Caller passed something weird. Probe both in podman-first order.
         for candidate in ("podman", "docker"):
-            if shutil.which(candidate):
+            if _tsd.which(candidate):
                 return candidate
         return None
 
-    if shutil.which(effective):
+    if _tsd.which(effective):
         return effective
 
     # Unpinned and the caller's choice is missing — auto-detect the other.
     other = "docker" if effective == "podman" else "podman"
-    if shutil.which(other):
+    if _tsd.which(other):
         return other
     return None
 
@@ -289,7 +296,7 @@ def find_existing_container(
 
     for name in all_known_names(service):
         try:
-            res = subprocess.run(
+            res = _tsd.run(
                 [bin_name, "container", "inspect",
                  "--format", "{{.Name}}", name],
                 capture_output=True, text=True, timeout=10,
@@ -420,7 +427,7 @@ def compose_identity_of(
     )
     argv = [bin_name, "inspect", "--type", "container", "--format", fmt, container]
     try:
-        res = (run or subprocess.run)(
+        res = (run or _tsd.run)(
             argv, capture_output=True, text=True, timeout=10,
         )
     except (subprocess.TimeoutExpired, OSError):
@@ -581,9 +588,12 @@ class RuntimeResolution:
     #: ``tests/fixtures/container_runtime_parity.json`` fails on every row.
     substituted: bool = False
     #: True only when the RECORD pin was answered with the other runtime
-    #: because the recorded one is not installed and the read-only record
-    #: reconcile decided case (a) (the other runtime answers, holding VCO's
-    #: data, or no VCO data exists anywhere) — see :func:`resolve`. What
+    #: because the recorded one is not installed (not on PATH nor in the usual
+    #: install locations) and the read-only record reconcile decided case (a)
+    #: on POSITIVE evidence — the other runtime answers and holds VCO's
+    #: containers/volumes (v0.2.97 R9 H1: "no VCO data anywhere" is install's
+    #: decision alone, never a read-only one), and the record is not a
+    #: user-confirmed choice (H2) — see :func:`resolve`. What
     #: lets a caller say what happened: the record stays stale on disk (the
     #: next update re-records it), so the user gets ONE explanatory line,
     #: not a refusal. An ENV pin is never reconciled.
@@ -729,7 +739,7 @@ def installed_runtime(
     """The FIRST candidate binary on PATH regardless of whether its daemon
     runs (the pinned runtime — :func:`runtime_pin` — wins when installed).
     ``""`` when none is."""
-    _which = which or shutil.which
+    _which = which or _tsd.which
     pin = runtime_pin(env, install_root=install_root, warn=lambda _m: None)
     pref = pin[0] if pin is not None else None
     if pref is not None and _which(pref):
@@ -754,7 +764,7 @@ def _probe(
 
 def binary_works(runtime: str, *, run: Optional[RunFn] = None) -> Optional[bool]:
     """``<runtime> version`` — the client binary runs at all."""
-    return _probe([runtime, "version"], VERSION_PROBE_TIMEOUT_S, run or subprocess.run)
+    return _probe([runtime, "version"], VERSION_PROBE_TIMEOUT_S, run or _tsd.run)
 
 
 def daemon_responsive(
@@ -764,9 +774,9 @@ def daemon_responsive(
     the same code path compose-up needs. Catches a stopped Docker Desktop
     on macOS, a stopped ``podman.socket`` on Linux, an unstarted podman
     machine on Windows. ``False`` when the binary is not on PATH."""
-    if not runtime or not (which or shutil.which)(runtime):
+    if not runtime or not (which or _tsd.which)(runtime):
         return False
-    return _probe([runtime, "info"], DAEMON_PROBE_TIMEOUT_S, run or subprocess.run)
+    return _probe([runtime, "info"], DAEMON_PROBE_TIMEOUT_S, run or _tsd.run)
 
 
 def compose_command(
@@ -788,8 +798,8 @@ def compose_command(
     ``None`` when neither exists — the caller decides whether that is
     fatal (the stack cannot come up) or a skip (a probe-only hook).
     """
-    _which = which or shutil.which
-    _run = run or subprocess.run
+    _which = which or _tsd.which
+    _run = run or _tsd.run
     if _probe([runtime, "compose", "version"], COMPOSE_PROBE_TIMEOUT_S, _run):
         return [runtime, "compose"], "subcommand"
     standalone = f"{runtime}-compose"
@@ -807,7 +817,7 @@ class _CandidateProbe:
 
     ``status`` is the ladder's verdict:
 
-    * ``missing``    — not on PATH.
+    * ``missing``    — not on PATH nor in the usual install locations.
     * ``unknown``    — a probe could not RUN (timeout / OSError); nothing
       is known about this candidate.
     * ``refused``    — the client binary or its daemon answered NO.
@@ -835,8 +845,12 @@ def _evaluate_candidate(
     candidates :func:`resolve` walks and for the "is the runtime you did
     NOT pin usable?" question the refusal hint has to answer."""
     if not which(candidate):
+        # "not installed" as far as this process can tell: the default probe
+        # (vco_lib.tool_search_dirs.which) looks on PATH AND in the usual
+        # install locations (R9 H1(b)), and the message says what was looked at.
         return _CandidateProbe(
-            "missing", None, None, None, f"{candidate} is not on PATH",
+            "missing", None, None, None,
+            f"{candidate} is not on PATH nor in the usual install locations",
         )
     works = binary_works(candidate, run=run)
     if works is None:
@@ -963,10 +977,12 @@ def resolve(
 
     v0.2.97 (R8 follow-up, owner rule "users never need a manual step"): the
     RECORD pin — and ONLY the record pin — is reconciled read-only. When
-    ``state/install/runtime.txt`` names a runtime that is NOT installed and
-    the read-only record reconcile (:func:`vco_lib.runtime_reconcile.reconcile`
-    with ``rewrite=False``) decides case (a) (the other runtime answers,
-    holding VCO's containers/volumes, or no VCO data exists anywhere), the
+    ``state/install/runtime.txt`` names a runtime that is NOT installed (on
+    PATH nor in the usual install locations, :mod:`vco_lib.tool_search_dirs`)
+    and the read-only record reconcile (:func:`vco_lib.runtime_reconcile.reconcile`
+    with ``rewrite=False``) decides case (a) on positive evidence (the other
+    runtime answers AND holds VCO's containers/volumes; the record is not a
+    user-confirmed ``--container`` choice), the
     resolver ANSWERS the other runtime — writing nothing (the next update
     re-records it) — with :attr:`record_reconciled` /
     :attr:`RuntimeResolution.substituted` set and a ``reason`` that says what
@@ -977,8 +993,8 @@ def resolve(
     data under both runtimes stays refused, and the ENV pin is NEVER
     reconciled.
     """
-    _which = which or shutil.which
-    _run = run or subprocess.run
+    _which = which or _tsd.which
+    _run = run or _tsd.run
     _warn = warn or _default_warn
     pin = runtime_pin(env, install_root=install_root, warn=warn)
     pref = pin[0] if pin is not None else None
@@ -1017,17 +1033,19 @@ def resolve(
 
     order = runtime_candidate_order(pref)
     record_note: Optional[str] = None
+    record_refusal_note: Optional[str] = None
     if (via == PIN_VIA_RUNTIME_TXT and root is not None and pref is not None
             and not _which(pref)):
         # The record names a runtime that is NOT installed. Ask the ONE
         # record reconciler, READ-ONLY (no runtime.txt write, no daemon
-        # start, no ledger entry): its case (a) — the other runtime answers,
-        # holding VCO's containers/volumes, or no VCO data exists anywhere —
-        # is the only way the strict pin is lifted here. Installed-but-down,
-        # data under both, an unlistable other runtime and every reconcile
-        # failure keep the refusal below (the reconcile says UNUSABLE, the
-        # resolver's own ladder then refuses exactly as before). The env
-        # pin never reaches this arm.
+        # start, no ledger entry): its case (a) on POSITIVE evidence — the
+        # other runtime answers AND holds VCO's containers/volumes, and the
+        # record is not a user-confirmed choice — is the only way the strict
+        # pin is lifted here (R9 H1/H2). "No VCO data anywhere", a confirmed
+        # record, installed-but-down, data under both, an unlistable other
+        # runtime and every reconcile failure keep the refusal below (the
+        # reconcile says UNUSABLE and its reason joins the refusal's). The
+        # env pin never reaches this arm.
         from vco_lib.runtime_reconcile import Outcome as _Outcome  # noqa: PLC0415 — lazy: runtime_reconcile imports this module
         from vco_lib.runtime_reconcile import reconcile as _record_reconcile
 
@@ -1036,6 +1054,8 @@ def resolve(
         if (rec.outcome is _Outcome.REWRITTEN and rec.runtime in RUNTIME_CANDIDATES):
             order = [rec.runtime]
             record_note = rec.detail
+        elif rec.outcome is _Outcome.UNUSABLE and rec.detail:
+            record_refusal_note = rec.detail
 
     for candidate in order:
         p = probes[candidate] = _probe_one(candidate)
@@ -1070,6 +1090,9 @@ def resolve(
             pref, probes[pref], alternative,
             via=via or PIN_VIA_ENV, recorded_file=pin[2] if pin is not None else None,
         )
+        if record_refusal_note:
+            # Why the stale-record reconcile did NOT switch (R9 H1/H2).
+            reason += f" (not switched: {record_refusal_note})"
         _warn(reason)
         return RuntimeResolution(
             RuntimeState.ABSENT, None, installed, None, None,
@@ -1162,11 +1185,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     args = _build_arg_parser().parse_args(argv)
     if args.cmd == "resolve":
         res = resolve(probe_daemon=not args.no_daemon, probe_compose=not args.no_compose)
+        # R9 H5: a runtime (or its compose front-end) found only in the usual
+        # install locations must also be DRIVABLE by the caller, which runs it
+        # by name. `search_path` is the caller's PATH with those directories
+        # appended — `None` when nothing needs adding.
+        search_path = _tsd.reachable_path() if res.state is RuntimeState.RESOLVED else None
         if args.json:
-            print(json.dumps(res.to_dict(), sort_keys=True))
+            d = res.to_dict()
+            d["search_path"] = search_path
+            print(json.dumps(d, sort_keys=True))
         elif args.shell:
             import shlex
 
+            if search_path:
+                # The .sh hooks `eval` this output, so their later bare-name
+                # `$RUNTIME` / compose calls resolve (one line, only when
+                # needed; whatever PATH already reached keeps winning).
+                print(f"PATH={shlex.quote(search_path)}; export PATH")
             argv = res.compose or []
             print(f"VCO_RUNTIME_STATE={shlex.quote(res.state.value)}")
             print(f"VCO_RUNTIME={shlex.quote(res.runtime or '')}")

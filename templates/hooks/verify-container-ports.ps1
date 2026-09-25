@@ -147,12 +147,23 @@ Remove-Item $VcoRtErr -ErrorAction SilentlyContinue
 if ($VcoRt.state -ne "resolved") {
     # Probe-only watchdog: quiet on a plain "no runtime" host (ensure-containers
     # already said it), but a REFUSED PIN is a user action, so it is reported.
-    if ($VcoRt.requested) { Write-Output "verify-container-ports: $($VcoRt.reason); skipping" }
+    if ($VcoRt.requested) {
+        Write-Output "verify-container-ports: $($VcoRt.reason); skipping"
+        # R9 H4/H7 (parity with the .sh sibling): also in the ledger. Soft-fail;
+        # the CLI bounds itself and writes only an installed clone's ledger.
+        try {
+            [void](& $RunPy -m vco_lib.runtime_reconcile record-boot-refusal --source session --reason ($VcoRt.reason) 2>$null)
+        } catch { }
+    }
     Write-VcoPortCheckLog -Action "skipped" -Reason $(if ($VcoRt.reason) { [string]$VcoRt.reason } else { "no usable container runtime" })
     return
 }
 $runtime = $VcoRt.runtime
 $script:LogRuntime = $runtime
+# R9 H5 (parity with the .sh sibling, whose `eval` of `resolve --shell` applies
+# it): a runtime found only in the usual install locations
+# (vco_lib/tool_search_dirs.toml) comes with the PATH that reaches it by name.
+if ($VcoRt.search_path) { $env:PATH = [string]$VcoRt.search_path }
 # Compose driver as an argv array.
 $composeArgs = if ($VcoRt.compose) { @($VcoRt.compose) } else { @($runtime, "compose") }
 

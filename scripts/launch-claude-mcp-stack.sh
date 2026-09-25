@@ -215,11 +215,14 @@ _log_foreign_record() {
 # reconcile_record :: the READ-ONLY form of install.py's runtime-record
 # reconcile (python -m vco_lib.runtime_reconcile boot — the one home of the
 # decision; this wrapper never rewrites state). Prints the runtime to use
-# for THIS boot when VCO's own record is stale — its runtime is not
-# installed and the other one holds VCO's data (or there is none anywhere),
-# or it holds none of VCO's containers/volumes while the other does — and
-# nothing otherwise (then the pin is refused as before). The next
-# install/update re-records it.
+# for THIS boot when VCO's own record is stale AND there is positive evidence
+# of where the data is — its runtime is not installed (not on PATH nor in the
+# usual install locations) and the other one holds VCO's containers/volumes,
+# or it holds none of them while the other does — and nothing otherwise (then
+# the pin is refused as before). "No VCO data anywhere" is never switched
+# here (R9 H1: install.py decides that one), nor is a runtime the user
+# confirmed with `install.py --container` (R9 H2). The next install/update
+# re-records it.
 # ---------------------------------------------------------------------------
 reconcile_record() {
     local py="${STACK_PY:-}" out
@@ -240,14 +243,66 @@ reconcile_record() {
 # Python emitter (python -m vco_lib.runtime_reconcile record-boot-refusal),
 # which session start and the launcher show; it clears once the runtime
 # answers. Best effort, bounded, never blocks boot. $1 = the reason.
+#
+# R9 H7: the CLI bounds ITSELF — no coreutils `timeout` (absent on macOS):
+# it waits at most BOOT_LEDGER_LOCK_TIMEOUT_S for the ledger lock an in-flight
+# update may hold (non-blocking retries, then it skips with a log line), and
+# exits by RECORD_REFUSAL_DEADLINE_S whatever else is in flight.
 # ---------------------------------------------------------------------------
 record_boot_refusal() {
-    local py="${STACK_PY:-}" to=()
+    local py="${STACK_PY:-}"
     [ -n "$py" ] || py="$(resolve_stack_python)"
     [ -n "$py" ] && [ -n "$_VCT_OWN_ROOT" ] || return 0
-    command -v timeout >/dev/null 2>&1 && to=(timeout 30)
-    PYTHONPATH="${_VCT_OWN_ROOT}${PYTHONPATH:+:$PYTHONPATH}" ${to[@]+"${to[@]}"} "$py" -m vco_lib.runtime_reconcile \
+    PYTHONPATH="${_VCT_OWN_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m vco_lib.runtime_reconcile \
         record-boot-refusal --root "$_VCT_OWN_ROOT" --reason "$1" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# _bounded :: run "$@" for at most $1 seconds — coreutils `timeout` when it
+# exists, else a portable background watchdog (macOS ships no `timeout`, and
+# before R9 H7 every bounded probe here simply FAILED there: `timeout 5 docker
+# info` is "command not found", so every runtime read as unusable at boot).
+# Returns the command's exit code (non-zero when it was cut off).
+# ---------------------------------------------------------------------------
+_bounded() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    "$@" &
+    local pid=$! watcher rc
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    watcher=$!
+    wait "$pid"
+    rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# augment_tool_path :: R9 H1(b)/H5 — a boot unit's PATH (systemd --user,
+# launchd) lacks ~/bin, ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, ...
+# where podman/docker (or their compose front-ends) are often installed, so
+# `command -v` called an installed runtime "not installed" — and a runtime
+# judged not installed is one the record reconcile may switch away from.
+# Asks the ONE table (vco_lib/tool_search_dirs.toml, through
+# `python -m vco_lib.tool_search_dirs search-path`) and appends the directory
+# of every such tool found only there. Whatever PATH already reached keeps
+# winning. Soft: no Python or no answer leaves PATH as it is.
+# ---------------------------------------------------------------------------
+augment_tool_path() {
+    local p
+    [ -n "${STACK_PY:-}" ] || return 0
+    p="$(stack_py vco_lib.tool_search_dirs search-path 2>/dev/null)" || return 0
+    [ -n "$p" ] || return 0
+    if [ "$p" != "$PATH" ]; then
+        PATH="$p"
+        export PATH
+        log "container runtime tools found outside this service's PATH; PATH is now: $PATH"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -269,8 +324,8 @@ record_boot_refusal() {
 #            backend isn't initialized).
 #   anything else → not usable.
 #
-# Both probes carry a 5s timeout — a hung daemon socket must NOT block
-# boot indefinitely.
+# Both probes carry a 5s bound (_bounded — portable, R9 H7) — a hung
+# daemon socket must NOT block boot indefinitely.
 # ---------------------------------------------------------------------------
 _runtime_usable() {
     local token="$1"
@@ -278,7 +333,7 @@ _runtime_usable() {
         docker)
             command -v docker >/dev/null 2>&1 || return 1
             local info_out
-            if ! info_out="$(timeout 5 docker info 2>&1)"; then
+            if ! info_out="$(_bounded 5 docker info 2>&1)"; then
                 return 1
             fi
             # Server: section presence is the daemon-access proxy.
@@ -287,7 +342,7 @@ _runtime_usable() {
             ;;
         podman)
             command -v podman >/dev/null 2>&1 || return 1
-            timeout 5 podman info >/dev/null 2>&1 || return 1
+            _bounded 5 podman info >/dev/null 2>&1 || return 1
             return 0
             ;;
         *)
@@ -773,6 +828,9 @@ main() {
         log "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) — nothing composed"
         exit 5
     fi
+    # Before any runtime probe: a runtime installed outside this service's
+    # PATH is found (and driven) instead of read as absent (R9 H1(b)/H5).
+    augment_tool_path
     local plan_out plan_err
     plan_err="${TMPDIR:-/tmp}/vco-stack-plan.$$"
     if ! plan_out="$(stack_py vco_lib.service_lifecycle plan --shell 2>"$plan_err")"; then

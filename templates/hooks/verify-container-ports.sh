@@ -158,6 +158,12 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     # (start the pinned runtime, or repin), so it is reported.
     if [ -n "${VCO_RUNTIME_REQUESTED:-}" ]; then
         echo "verify-container-ports: $VCO_RUNTIME_REASON; skipping"
+        # R9 H4/H7 (parity with ensure-containers): also in the ledger, where
+        # the launcher and the next session look. Soft-fail; the CLI bounds
+        # itself (no `timeout` — macOS has none) and writes only an installed
+        # clone's ledger (the one whose runtime.txt the resolver read).
+        "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
+            --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 || true
     fi
     log_run skipped "${VCO_RUNTIME_REASON:-no usable container runtime}"
     exit 0

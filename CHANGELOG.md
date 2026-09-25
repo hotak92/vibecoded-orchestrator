@@ -357,7 +357,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own recorded port. A container hook stopped at its time limit no longer
   releases the shared lock while its `compose up` keeps running: the locked
   work runs in the background, holds the lock until it has really finished,
-  and the hook shows its output within its time limit. The two container hooks no
+  and the hook shows its output within its time limit (and names its log,
+  under `logs/session-hooks/` in VCO's state folder, when the work takes
+  longer). The two container hooks no
   longer act at the same moment, and the port check removes nothing it could
   not re-check; it now logs every run to
   `.claude/logs/container_port_check.jsonl`, as its documentation said it did.
@@ -447,13 +449,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   else and leaves an entry naming what to start, which clears once it
   answers. If podman and docker both hold VCO data, it keeps the recorded one
   and asks; `install.py --update --container <podman|docker>` records your
-  choice. Before, an update in any of these cases exited with an error behind
-  a message that named the wrong runtime. A runtime you pinned with
-  `VCT_CONTAINER_RUNTIME` is never changed.
+  choice, and a runtime you chose that way is never switched away from.
+  Before, an update whose recorded runtime was gone or not answering exited
+  with an error behind a message that named the wrong runtime. A runtime you
+  pinned with `VCT_CONTAINER_RUNTIME` is never changed.
+- When the recorded runtime cannot be found, a session, the boot service, the
+  launcher or the hub switches to the other runtime only if that one already
+  holds VCO's containers or volumes — including volumes you named with
+  `VCT_*_VOLUME_NAME` — and otherwise refuses and says why; it never starts
+  the stack on empty volumes. A runtime installed outside the calling
+  program's `PATH` (`~/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
+  `/usr/local/bin`, Docker Desktop's folders, the Windows installer folders)
+  is now found instead of being treated as not installed;
+  `VCT_TOOL_SEARCH_DIRS` replaces the list of places searched. On macOS, the
+  boot service no longer reports every runtime as unusable.
 - The boot service reads its own install's runtime record, never another
   copy's, and falls back to its own compose folder when the configured one is
-  gone. When it cannot start the stack, the reason appears in
-  `UPDATE_DEFERRED.md`, not only in a log under `/tmp`.
+  gone. When no usable container runtime is found at boot — or a session
+  hook refuses a pinned runtime — the reason appears in
+  `UPDATE_DEFERRED.md`, not only in a log, and recording it can never hold up
+  boot or a session while an update is running.
 - Every VCO client (Python, shell, PowerShell, `vct-cli`, the launcher, and
   `vco verify-diagrams`) now finds the hub the same way, and agrees on what a
   valid port is: 1–65535 in plain digits (a sign, `_`, other numerals or
@@ -468,6 +483,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of always 7700, and the hub module's catalog entry names the running hub's
   port too. The code-embedding module's entry named port 11438; the service
   runs on 11440.
+- The code-embed session hook takes the service's port from the recorded
+  endpoint; an exported `CODE_EMBED_PORT` no longer steers it. When it cannot
+  read the record, it changes nothing that session instead of guessing a
+  port (which could restart a healthy service that had moved).
+- The Hooks tab suggests the Windows form of a hook command on Windows.
 - The launcher finds its bundled scripts (code graph, KG sync, KG summary)
   through one shared lookup instead of two copies that could disagree.
 - On Docker, VCO never found an existing container by name: it asked with
@@ -531,7 +551,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variable itself. Existing projects are rewritten in place on their next
   update. `VCT_DISABLE_HOOKS=1` works exactly as before.
 - Every VCO hook now runs from the project root whatever directory the
-  session has moved to: hook commands start from `${CLAUDE_PROJECT_DIR}`.
+  session has moved to: hook commands start from the project folder Claude
+  Code passes in — `"${CLAUDE_PROJECT_DIR:-.}"` on Linux and macOS (it falls
+  back to the old relative form if Claude Code provides neither the value
+  nor the variable, so it is never worse than before), and the exact
+  `${CLAUDE_PROJECT_DIR}` placeholder on Windows, which Claude Code fills in
+  whichever shell runs the hook. See `docs/CLAUDE_CODE_COMPATIBILITY.md`.
   Before, they named `.claude/hooks/…` relative to the current directory, so
   after a `cd` or inside a worktree every VCO hook failed. Your next bundle
   update rewrites existing projects' VCO hooks in place and leaves your own

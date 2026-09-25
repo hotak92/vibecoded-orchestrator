@@ -477,7 +477,9 @@ def _py_env(tmp_path: Path) -> dict:
 
     return {"VCO_VENV_PYTHON": sys.executable, "PYTHONPATH": str(REPO_ROOT),
             "VCT_STATE_DIR": str(tmp_path / "vct-state"),
-            "VCT_LAUNCHER_DB_PATH": str(tmp_path / "no-launcher.db")}
+            "VCT_LAUNCHER_DB_PATH": str(tmp_path / "no-launcher.db"),
+            # W-TOOL-DIRS: never this machine's real runtimes (R9 H1(b)).
+            "VCT_TOOL_SEARCH_DIRS": ""}
 
 
 @pytest.mark.skipif(_BASH is None or os.name == "nt", reason="bash-script runtime stubs need a POSIX bash")

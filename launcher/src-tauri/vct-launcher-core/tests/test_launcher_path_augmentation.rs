@@ -116,12 +116,20 @@ fn augment_includes_expected_os_specific_directories() {
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     {
-        // Windows + other targets: augment must be a no-op so the
-        // baseline PATH is unchanged.
-        assert_eq!(
-            parts,
-            vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-            "non-{{macOS, Linux}} augment must be a no-op"
-        );
+        // Windows + other targets (v0.2.97 R9): exactly the shared table's
+        // entries for this OS (the container runtimes' installer dirs, when
+        // their variables are set), then the baseline PATH, unchanged.
+        use vct_launcher_core::services::runtime::{current_os_key, tool_search_dirs_for};
+        let mut want: Vec<PathBuf> = tool_search_dirs_for(
+            current_os_key(),
+            Some("/tmp/vct-augment-integration-home"),
+            &|k| std::env::var(k).ok(),
+        )
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+        // The baseline split the way THIS OS splits a PATH (";" on Windows).
+        want.extend(std::env::split_paths(std::ffi::OsStr::new("/usr/bin:/bin")));
+        assert_eq!(parts, want, "non-{{macOS, Linux}} augment: table entries, then the PATH");
     }
 }

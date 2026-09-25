@@ -4,8 +4,10 @@
   import Dropdown from '$lib/components/Dropdown.svelte';
   import {
     canToggle,
+    detectHintOs,
     gitVisibilityNote,
     isChecked,
+    newHookCommandPlaceholder,
     parseTimeoutSeconds,
     registerBlockedReason,
     settingsErrorBanner,
@@ -40,6 +42,12 @@
   const readable = $derived(view?.settings_readable ?? false);
   const rowKey = (h: EffectiveHook) => `${h.event}\x00${h.matcher}\x00${h.command}`;
   const registerBlocked = $derived(registerBlockedReason(nEvent, nCommand, nTimeout));
+  // R9 H8: the hint must be runnable on the OS reading it — the Linux bash
+  // form on Windows produces a hook the compatibility doc says breaks under
+  // the PowerShell fallback, and a user's own hook is never rewritten.
+  const newCommandPlaceholder = newHookCommandPlaceholder(
+    detectHintOs(typeof navigator !== 'undefined' ? navigator.userAgent : ''),
+  );
 
   const COMMON_EVENTS = [
     'SessionStart', 'SessionEnd', 'UserPromptSubmit',
@@ -274,7 +282,7 @@
         </label>
         <label><span>Matcher</span><input bind:value={nMatcher} placeholder="Edit(*) — blank matches everything" /></label>
         <label class="ps-span2"><span>Command</span>
-          <input bind:value={nCommand} placeholder={'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"'} />
+          <input bind:value={nCommand} placeholder={newCommandPlaceholder} />
         </label>
         <label><span>Timeout (seconds)</span><input bind:value={nTimeout} placeholder="optional" inputmode="numeric" /></label>
       </div>

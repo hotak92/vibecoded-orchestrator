@@ -495,7 +495,11 @@ def _py_env(tmp_path: Path) -> dict:
     return {"VCO_VENV_PYTHON": sys.executable, "PYTHONPATH": str(REPO_ROOT),
             "VCT_STATE_DIR": str(tmp_path / "vct-state"),
             "VCT_LAUNCHER_DB_PATH": str(tmp_path / "no-launcher.db"),
-            "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log")}
+            "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log"),
+            # W-TOOL-DIRS for a child built from scratch: without it the
+            # Python side would find this machine's REAL /usr/bin runtimes
+            # through the usual-install-locations table (R9 H1(b)).
+            "VCT_TOOL_SEARCH_DIRS": ""}
 
 
 def test_a_runtime_txt_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):

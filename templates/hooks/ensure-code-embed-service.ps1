@@ -71,13 +71,29 @@ if (-not $RunPy) {
 # from env `CODE_EMBED_PORT` - a retired input; env `*_PORT` values are
 # projected outputs only and `vco doctor` treats retired inputs as retired.
 # ONE plan read serves both the port and the compose gate in
-# Get-CodeEmbedUpArgs below. When the plan cannot be read, fall back to the
-# compiled default 11440 - never to env.
+# Get-CodeEmbedUpArgs below. R9 H3 (parity with the .sh sibling): when the
+# plan CANNOT be read, this hook takes NO state-changing action - a
+# guess-port probe that finds 11440 closed on a container that was
+# deliberately moved to another port used to RESTART a healthy service
+# every session the plan was unreadable. One line, exit 0. 11440 stays only
+# the default for a plan that READS but carries no code_embed row - never
+# to env.
 $Port = 11440
 $SePlan = $null
+$PlanRaw = ""
+$PlanRc = 1
 try {
-    $SePlan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json
-} catch { $SePlan = $null }
+    $PlanRaw = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String)
+    $PlanRc = $LASTEXITCODE
+} catch { $PlanRc = 1 }
+if ($PlanRc -ne 0 -or -not $PlanRaw.Trim()) {
+    Write-Output "[code_embed] service_endpoints plan unreadable; nothing probed, started or restarted this session"
+    exit 0
+}
+try { $SePlan = $PlanRaw | ConvertFrom-Json } catch {
+    Write-Output "[code_embed] service_endpoints plan unreadable; nothing probed, started or restarted this session"
+    exit 0
+}
 if ($SePlan -and $SePlan.services.code_embed.port) {
     $Port = [int]$SePlan.services.code_embed.port
 }
@@ -93,6 +109,8 @@ try {
     $VcoRtRc = $LASTEXITCODE
     if ($VcoRtRc -in 0, 3, 4) { $VcoRt = ($VcoRtJson | Out-String) | ConvertFrom-Json }
 } catch { $VcoRt = $null }
+# A runtime found in the usual install locations but not on this PATH: run it by name.
+if ($VcoRt -and $VcoRt.search_path) { $env:PATH = [string]$VcoRt.search_path }
 if (-not $VcoRt) {
     $VcoRtWhy = ""
     if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }

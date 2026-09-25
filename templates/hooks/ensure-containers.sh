@@ -190,6 +190,21 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     # `absent` is a true fact (nothing installed / daemon down / a refused
     # pin); `unknown` means a probe could not run. Both are skips, both said.
     echo "ensure-containers: $VCO_RUNTIME_REASON; skipping"
+    # R9 H4: a REFUSED PIN is the one skip a machine cannot clear by itself
+    # and that nothing else records on the session path (no boot service by
+    # default, no update run) — record `container_runtime_unusable` through
+    # the ONE Python emitter, the same entry point the boot wrapper uses
+    # (`python -m vco_lib.runtime_reconcile record-boot-refusal`, which
+    # dedupes per condition_id and writes NOTHING unless the root is an
+    # installed clone — `state/install/` present; a dev checkout or the test
+    # suite records nothing). Soft-fail, and the CLI bounds ITSELF (R9 H7: a
+    # held ledger lock or a stall ends it — no coreutils `timeout`, which
+    # macOS lacks). No --root: it writes the ledger of the clone whose
+    # runtime.txt the resolver just read (the same install-root ladder).
+    if [ -n "${VCO_RUNTIME_REQUESTED:-}" ]; then
+        "$RUN_PY" -m vco_lib.runtime_reconcile record-boot-refusal --source session \
+            --reason "$VCO_RUNTIME_REASON" >/dev/null 2>&1 || true
+    fi
     exit 0
 fi
 RUNTIME="$VCO_RUNTIME"

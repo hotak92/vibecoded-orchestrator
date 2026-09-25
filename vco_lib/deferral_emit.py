@@ -56,7 +56,7 @@ import logging
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Sequence
+from typing import Any, Iterator, Optional, Sequence
 
 from vco_lib.atomic import exclusive_file_lock
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
@@ -114,7 +114,7 @@ def _log(log: Any, level: str, msg: str) -> None:
 
 
 @contextmanager
-def locked_report(folder: Path) -> Iterator[DeferralReport]:
+def locked_report(folder: Path, *, lock_timeout_s: Optional[float] = None) -> Iterator[DeferralReport]:
     """Read → yield → write the deferral report under the shared file lock.
 
     The whole cycle runs inside the exclusive lock on
@@ -142,13 +142,16 @@ def locked_report(folder: Path) -> Iterator[DeferralReport]:
 
     Args:
         folder: The managed project folder (contains ``.claude/``).
+        lock_timeout_s: ``None`` waits for the lock; a number bounds the wait
+            (:class:`vco_lib.atomic.LockTimeout` past it, nothing read or
+            written) — R9 H7, for callers that must never stall.
 
     Yields:
         A :class:`DeferralReport` seeded from the on-disk state, ready to
         mutate. The write is performed on exit.
     """
     folder = Path(folder)
-    with exclusive_file_lock(folder / LOCK_REL):
+    with exclusive_file_lock(folder / LOCK_REL, timeout_s=lock_timeout_s):
         report = DeferralReport.read(folder)
         yield report
         report.write(folder)
@@ -159,6 +162,7 @@ def emit_entries(
     entries: Sequence[DeferralEntry],
     *,
     log: Any = None,
+    lock_timeout_s: Optional[float] = None,
 ) -> bool:
     """Add ``entries`` to the on-disk report under the shared lock.
 
@@ -173,6 +177,8 @@ def emit_entries(
         entries: The entries to add. Empty ⇒ a no-op read/write (the report is
             rewritten unchanged; still returns whether it holds any entries).
         log: Optional logger for the soft-fail path.
+        lock_timeout_s: bound on the lock wait (see :func:`locked_report`);
+            past it nothing is written and ``False`` is returned (logged).
 
     Returns:
         ``True`` when the report holds at least one entry after the write
@@ -180,7 +186,7 @@ def emit_entries(
         deleted). Mirrors :meth:`DeferralReport.write`'s return.
     """
     try:
-        with locked_report(folder) as report:
+        with locked_report(folder, lock_timeout_s=lock_timeout_s) as report:
             for entry in entries:
                 report.add_entry(entry)
             wrote = bool(report)
@@ -237,9 +243,10 @@ def _mirror_record_entries_to_trail(
             continue
 
 
-def emit(folder: Path, entry: DeferralEntry, *, log: Any = None) -> bool:
+def emit(folder: Path, entry: DeferralEntry, *, log: Any = None,
+         lock_timeout_s: Optional[float] = None) -> bool:
     """Single-entry sugar over :func:`emit_entries`."""
-    return emit_entries(folder, (entry,), log=log)
+    return emit_entries(folder, (entry,), log=log, lock_timeout_s=lock_timeout_s)
 
 
 def resolve_conditions(

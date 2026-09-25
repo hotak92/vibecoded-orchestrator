@@ -163,6 +163,8 @@ try {
     $VcoRtRc = $LASTEXITCODE
     if ($VcoRtRc -in 0, 3, 4) { $VcoRt = ($VcoRtJson | Out-String) | ConvertFrom-Json }
 } catch { $VcoRt = $null }
+# A runtime found in the usual install locations but not on this PATH: run it by name.
+if ($VcoRt -and $VcoRt.search_path) { $env:PATH = [string]$VcoRt.search_path }
 if (-not $VcoRt) {
     $VcoRtWhy = ""
     if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }
@@ -181,6 +183,22 @@ if ($VcoRt.state -ne "resolved") {
     # `absent` is a true fact (nothing installed / daemon down / a refused
     # pin); `unknown` means a probe could not run. Both are skips, both said.
     Write-Output "ensure-containers: $($VcoRt.reason); skipping"
+    # R9 H4 (parity with the .sh sibling): a REFUSED PIN is the one skip a
+    # machine cannot clear by itself and that nothing else records on the
+    # session path (no boot service by default, no update run) - record
+    # `container_runtime_unusable` through the ONE Python emitter, the same
+    # entry point the boot wrapper uses (`python -m vco_lib.runtime_reconcile
+    # record-boot-refusal`, which dedupes per condition_id and writes
+    # NOTHING unless the root is an installed clone - `state/install/`
+    # present; a dev checkout or the test suite records nothing).
+    # Best effort, never blocks the session.
+    # The CLI bounds ITSELF (R9 H7). No --root: it writes the ledger of the
+    # clone whose runtime.txt the resolver just read (same install-root ladder).
+    if ($VcoRt.requested) {
+        try {
+            [void](& $RunPy -m vco_lib.runtime_reconcile record-boot-refusal --source session --reason ($VcoRt.reason) 2>$null)
+        } catch { }
+    }
     exit 0
 }
 $Runtime = $VcoRt.runtime

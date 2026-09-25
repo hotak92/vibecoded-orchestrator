@@ -79,14 +79,20 @@ fi
 # (`VCO_CODE_EMBED_PORT`), never from env `CODE_EMBED_PORT` — a retired
 # input; env `*_PORT` values are projected outputs only and `vco doctor`
 # treats retired inputs as retired. ONE plan read serves both the port and
-# the compose gate in code_embed_up_args below. When the plan cannot be
-# read, fall back to the compiled default 11440 — never to env.
+# the compose gate in code_embed_up_args below. R9 H3: when the plan CANNOT
+# be read, this hook takes NO state-changing action — a guess-port probe that
+# finds 11440 closed on a container that was deliberately moved to another
+# port used to RESTART a healthy service every session the plan was
+# unreadable. One line, exit 0. 11440 stays only the default for a plan that
+# READS but carries no code_embed row — never to env.
 unset VCO_CODE_EMBED_PORT
-__vco_se_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || __vco_se_plan=""
 PORT=11440
-if [ -n "$__vco_se_plan" ]; then
+if __vco_se_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)"; then
     eval "$__vco_se_plan"
     [ -n "${VCO_CODE_EMBED_PORT:-}" ] && PORT="$VCO_CODE_EMBED_PORT"
+else
+    echo "[code_embed] service_endpoints plan unreadable; nothing probed, started or restarted this session"
+    exit 0
 fi
 __vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
 __vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?

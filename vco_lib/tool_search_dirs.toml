@@ -1,0 +1,79 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# Where user-installed command-line tools live when the CALLING PROCESS's PATH
+# does not include them — one committed list both languages parse (tier B of
+# the A>B>C rule).
+#
+# Why (v0.2.97 review R9 H1/H5): a boot unit (systemd --user, launchd), a
+# Finder/.desktop-launched launcher and the hub inherit a short PATH. Rootless
+# Docker puts `docker` in ~/bin, a user-local install in ~/.local/bin, Homebrew
+# on Apple Silicon in /opt/homebrew/bin, Intel Homebrew and Docker Desktop's
+# symlinks in /usr/local/bin, the podman.io installer in /opt/podman/bin. A
+# process that judged "installed" by its own PATH alone called such a runtime
+# "not installed" — and a runtime judged not installed is exactly the one the
+# record reconcile may switch away from, onto the OTHER runtime's empty
+# volumes. With this list, "installed" means "on PATH, or in one of these".
+#
+# Readers:
+#   * Python — `vco_lib/tool_search_dirs.py`: `which()` (PATH first, then
+#     these), `reachable_path()` (the PATH a shell needs to drive a runtime
+#     found only here) and the `search-path` CLI the boot wrappers
+#     (`scripts/launch-claude-mcp-stack.{sh,ps1}`) call before they probe.
+#     `vco_lib.containers` / `vco_lib.runtime_reconcile` judge "installed"
+#     through it.
+#   * Rust — `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs`
+#     (`include_str!`): `augment_candidates` — the launcher's startup PATH
+#     augment (`lib.rs::setup`) and the hub's (`vct-hub/src/main.rs`) prepend
+#     these, so every runtime lookup and bare-name spawn in either process sees
+#     them.
+#   * `tests/fixtures/tool_search_dirs_cases.json` pins the expansion rule on
+#     both sides.
+#
+# Entry syntax (the same in both readers):
+#   "~/rest"         -> $HOME + "/rest"; dropped when HOME is unknown
+#   "${NAME}rest"    -> the value of env NAME + "rest"; dropped when NAME is
+#                       unset or empty
+#   anything else    -> taken literally
+#
+# `VCT_TOOL_SEARCH_DIRS`, when SET (even to ""), REPLACES the list for this OS:
+# entries separated by the OS path separator (":" / ";"), same syntax. Empty =
+# no extra directories (the test suite's hermetic default).
+#
+# Order matters: the Rust augment prepends the entries that are not already on
+# PATH in this order. The first five Linux and first four macOS entries are
+# the launcher's pre-v0.2.97 augment list, unchanged; the rest were added for
+# the container runtimes (Windows had no augment before).
+
+format_version = 1
+
+[dirs]
+linux = [
+    "~/.local/bin",
+    "~/.cargo/bin",
+    "/home/linuxbrew/.linuxbrew/bin",
+    "/snap/bin",
+    "/var/lib/flatpak/exports/bin",
+    "~/bin",
+    "/usr/local/bin",
+    "/usr/bin",
+]
+macos = [
+    "/opt/homebrew/bin",
+    "/opt/homebrew/sbin",
+    "~/.cargo/bin",
+    "~/.local/bin",
+    "~/bin",
+    "/usr/local/bin",
+    "/opt/podman/bin",
+    "/Applications/Docker.app/Contents/Resources/bin",
+    "~/Applications/Docker.app/Contents/Resources/bin",
+    "~/.docker/bin",
+    "/opt/local/bin",
+    "/usr/bin",
+]
+windows = [
+    "${ProgramFiles}\\Docker\\Docker\\resources\\bin",
+    "${ProgramFiles}\\RedHat\\Podman",
+    "${LOCALAPPDATA}\\Programs\\Podman",
+]

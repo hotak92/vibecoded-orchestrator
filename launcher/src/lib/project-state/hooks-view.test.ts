@@ -11,8 +11,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   canToggle,
+  detectHintOs,
   gitVisibilityNote,
   isChecked,
+  newHookCommandPlaceholder,
   parseTimeoutSeconds,
   registerBlockedReason,
   settingsErrorBanner,
@@ -207,5 +209,32 @@ describe('registerBlockedReason', () => {
 
   it('surfaces the timeout error rather than letting it round-trip', () => {
     expect(registerBlockedReason('Stop', 'cmd', 'soon')).toMatch(/whole number/);
+  });
+});
+
+describe('newHookCommandPlaceholder — the hint must fit the OS that reads it', () => {
+  it('shows the bash form on Linux and macOS', () => {
+    for (const ua of [
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    ]) {
+      expect(detectHintOs(ua)).toBe('other');
+      expect(newHookCommandPlaceholder(detectHintOs(ua))).toBe(
+        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"',
+      );
+    }
+  });
+
+  it('shows the exact powershell -File form on Windows — the form the compatibility doc says survives the PowerShell fallback', () => {
+    expect(detectHintOs('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')).toBe(
+      'windows',
+    );
+    expect(newHookCommandPlaceholder('windows')).toBe(
+      'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.ps1"',
+    );
+  });
+
+  it('never shows the bash form on Windows (a copied bash hint is a broken hook)', () => {
+    expect(newHookCommandPlaceholder('windows')).not.toContain('bash');
   });
 });

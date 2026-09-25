@@ -20,9 +20,16 @@ as it is now. :func:`reconcile` runs early in ``install.py`` (install and
 ``--update``), before anything uses the pin, and read-only in the boot wrapper
 (``scripts/launch-claude-mcp-stack.{sh,ps1}``, which must never rewrite state):
 
-(a) the recorded runtime is NOT INSTALLED and the other runtime answers, holding
-    VCO's containers/volumes (or none exist anywhere) → the record is rewritten to
-    the other runtime and an ``informational_record`` says what changed and why;
+(a) the recorded runtime is NOT INSTALLED — not on this process's PATH nor in
+    the usual install locations (:mod:`vco_lib.tool_search_dirs`, R9 H1(b): a
+    short-PATH boot unit must never read a runtime in ``~/bin`` or
+    ``/opt/homebrew/bin`` as absent) — and the other runtime answers, holding
+    VCO's containers/volumes → the record is rewritten to the other runtime and
+    an ``informational_record`` says what changed and why. "No VCO data exists
+    anywhere" is rewritten ONLY by install.py (``rewrite=True``): a READ-ONLY
+    caller (``rewrite=False`` — the resolver, the boot wrapper, the Rust
+    mirrors) switches on POSITIVE evidence alone and otherwise refuses (R9 H1),
+    because a runtime it merely failed to find may still hold the data;
 (b) the recorded runtime is installed but its daemon does not answer → the
     documented start is tried (install.py's ``_try_start_*_daemon``); if it still
     does not answer, an ``action_required`` entry names exactly what to start, the
@@ -35,7 +42,17 @@ as it is now. :func:`reconcile` runs early in ``install.py`` (install and
     empty volumes.
 
 A runtime the user chose with ``install.py --container`` is CONFIRMED
-(``state/install/runtime.confirmed``): (c)'s heuristics never override it.
+(``state/install/runtime.confirmed``): NOTHING here overrides it — neither (a)
+nor (c), neither read-only nor at install (R9 H2). When a confirmed runtime is
+unusable, read-only callers refuse with the reason and install records an
+``action_required`` entry; only the user switches, by running
+``install.py --container <other>``, which rewrites BOTH files.
+
+"VCO's data" is looked for under the ACTUAL volume names
+(:func:`vco_volume_names`, R9 H6): the compose defaults plus every
+``VCT_*_VOLUME_NAME`` override in ``infrastructure/.env`` (the launcher writes
+them from the ``service_endpoints`` rows) and in the environment — an install
+that adopted a pre-existing volume by name must not read as "no data".
 
 The runtime is never switched silently while VCO's data lives under the recorded
 one — every switch is a positive-evidence decision with a ledger record.
@@ -57,21 +74,30 @@ from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import containers as _c
+from vco_lib import tool_search_dirs as _tsd
+from vco_lib.compose_env import DATA_KNOBS
 from vco_lib.deferral_report import DeferralEntry
+from vco_lib.envfile import parse_env_lines
 
 __all__ = [
     "CID_RECORD_RECONCILED",
     "CID_UNUSABLE",
     "CID_DATA_UNDER_BOTH",
     "VCO_VOLUME_NAMES",
+    "VOLUME_NAME_KEYS",
+    "BOOT_LEDGER_LOCK_TIMEOUT_S",
     "Outcome",
     "Reconciliation",
     "reconcile",
     "vco_data_under",
+    "vco_volume_names",
+    "volume_names_from",
     "apply_at_install",
     "record_explicit_choice",
     "read_confirmed",
     "record_boot_refusal",
+    "record_refusal_bounded",
+    "RECORD_REFUSAL_DEADLINE_S",
     "unusable_still_applies",
     "data_still_under_both",
     "runtime_down_message",
@@ -87,6 +113,20 @@ CID_DATA_UNDER_BOTH = "container_runtime_data_under_both"
 #: defaults in ``infrastructure/docker-compose.yml`` (pinned by
 #: ``tests/test_v0297_runtime_reconcile.py``).
 VCO_VOLUME_NAMES: tuple[str, ...] = ("vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache")
+
+#: The compose knobs that rename those volumes (``name: ${KEY:-<default>}``) —
+#: the VOLUME_NAME half of :data:`vco_lib.compose_env.DATA_KNOBS`, in its order.
+#: MUST MATCH ``container_runtime.rs::VCO_VOLUME_NAME_KEYS``.
+VOLUME_NAME_KEYS: tuple[str, ...] = tuple(pair[1] for pair in DATA_KNOBS.values())
+
+#: The compose project dir whose ``.env`` compose reads (install.py's
+#: ``infrastructure/``; ``compose_env.write_service_keys`` writes the knobs there).
+INFRA_ENV_REL = Path("infrastructure") / ".env"
+
+#: How long the boot wrapper's ledger write waits for the deferral lock (R9 H7):
+#: an update holding it must never stall boot. Past it the entry is skipped
+#: with a log line; the next boot or session writes it.
+BOOT_LEDGER_LOCK_TIMEOUT_S = 10.0
 
 #: The runtime the user chose explicitly (``install.py --container``).
 CONFIRMED_REL = Path("state") / "install" / "runtime.confirmed"
@@ -151,16 +191,59 @@ def _list_names(argv: Sequence[str], run: RunFn) -> Optional[set[str]]:
     return {ln.strip().lstrip("/") for ln in (res.stdout or "").splitlines() if ln.strip()}
 
 
-def vco_data_under(runtime: str, *, run: Optional[RunFn] = None) -> Optional[bool]:
+def vco_volume_names(install_root: Optional[Path], *,
+                     env: Optional[Mapping[str, str]] = None) -> tuple[str, ...]:
+    """The named volumes that hold VCO's data on this install (R9 H6): the
+    compose defaults (:data:`VCO_VOLUME_NAMES`), then every non-empty
+    :data:`VOLUME_NAME_KEYS` value in ``<install_root>/infrastructure/.env``
+    (whole file, file order — compose reads all of it) and then in ``env``
+    (default :data:`os.environ`; compose's shell env wins over ``.env``).
+    A union, never a replacement: a default-named volume left behind by an
+    earlier layout is still VCO's. MUST MATCH
+    ``container_runtime.rs::vco_volume_names`` —
+    ``tests/fixtures/vco_volume_names_cases.json`` runs both."""
+    import os  # noqa: PLC0415
+
+    text = ""
+    if install_root is not None:
+        try:
+            text = (Path(install_root) / INFRA_ENV_REL).read_text(encoding="utf-8")
+        except (OSError, ValueError):
+            text = ""
+    return volume_names_from(text, os.environ if env is None else env)
+
+
+def volume_names_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, ...]:
+    """Pure half of :func:`vco_volume_names` (what the parity fixture drives).
+    MUST MATCH ``container_runtime.rs::volume_names_from``."""
+    names = list(VCO_VOLUME_NAMES)
+
+    def _add(value: str) -> None:
+        v = (value or "").strip()
+        if v and v not in names:
+            names.append(v)
+
+    for key, value in parse_env_lines(env_file_text or ""):
+        if key in VOLUME_NAME_KEYS:
+            _add(value)
+    for key in VOLUME_NAME_KEYS:
+        _add(env.get(key) or "")
+    return tuple(names)
+
+
+def vco_data_under(runtime: str, *, run: Optional[RunFn] = None,
+                   install_root: Optional[Path] = None,
+                   env: Optional[Mapping[str, str]] = None) -> Optional[bool]:
     """Does ``runtime`` hold VCO's containers or named volumes?
 
     ``True``/``False`` only when BOTH listings answered; ``None`` when either
     could not (daemon down, CLI error) — "could not look" is never "empty".
-    Only VCO-prefixed names count (``vco_*`` / ``vct_*`` containers and
-    :data:`VCO_VOLUME_NAMES`): an unprefixed ``ollama`` may be the user's own.
-    Read-only: ``ps -a`` and ``volume ls``.
+    Only VCO-prefixed containers count (``vco_*`` / ``vct_*``: an unprefixed
+    ``ollama`` may be the user's own) and the install's ACTUAL volume names
+    (:func:`vco_volume_names` of ``install_root``). Read-only: ``ps -a`` and
+    ``volume ls``.
     """
-    _run = run or subprocess.run
+    _run = run or _tsd.run
     containers = _list_names([runtime, "ps", "-a", "--format", "{{.Names}}"], _run)
     if containers is None:
         return None
@@ -171,7 +254,7 @@ def vco_data_under(runtime: str, *, run: Optional[RunFn] = None) -> Optional[boo
         n for s in _c.CANONICAL_CONTAINERS for n in _c.all_known_names(s)
         if n.startswith(("vco_", "vct_"))
     }
-    return bool(containers & ours) or bool(volumes & set(VCO_VOLUME_NAMES))
+    return bool(containers & ours) or bool(volumes & set(vco_volume_names(install_root, env=env)))
 
 
 def _status(runtime: str, which: WhichFn, run: RunFn) -> str:
@@ -209,13 +292,13 @@ def reconcile(
 ) -> Reconciliation:
     """Decide what the pin means for this machine now (see the module doc).
 
-    ``rewrite=False`` is the boot wrapper's read-only form: the same decision,
-    no runtime.txt write, no daemon start, no ledger entries.
+    ``rewrite=False`` is the READ-ONLY form (the resolver, the boot wrapper):
+    no runtime.txt write, no daemon start, no ledger entries — and in case (a)
+    it switches only on positive evidence (the other runtime holds VCO's
+    data); "no data anywhere" stays install's decision (R9 H1).
     """
-    import shutil  # noqa: PLC0415 — stdlib, only for the default
-
-    _which = which or shutil.which
-    _run = run or subprocess.run
+    _which = which or _tsd.which
+    _run = run or _tsd.run
     root = Path(install_root) if install_root is not None else None
     pin = _c.runtime_pin(env, install_root=root, warn=lambda _m: None)
     if pin is None:
@@ -231,32 +314,46 @@ def reconcile(
         return _unusable(root, pinned, via, status, None, started, rewrite)
 
     if status == "usable":
-        return _reconcile_usable(root, pinned, other, _which, _run, rewrite, started)
+        return _reconcile_usable(root, pinned, other, _which, _run, rewrite, started, env)
     if status == "down":
         # (b) Its data may well be there; it cannot be looked at, so the record
         # stands and nothing is switched.
         return _unusable(root, pinned, via, status, None, started, rewrite)
 
-    # (a) The recorded runtime is not installed at all.
+    # (a) The recorded runtime is not installed (not on PATH, not in the usual
+    # install locations).
+    if read_confirmed(root) == pinned:
+        # R9 H2: the user chose it with `--container`; only the user switches
+        # (and the other runtime is not even started for a switch that will
+        # not happen).
+        return _unusable(root, pinned, via, status, (other, "confirmed"), started, rewrite)
     ostatus, ostarted = _start_if_down(other, _status(other, _which, _run), starter, _which, _run)
     started = "; ".join(x for x in (started, ostarted) if x)
     if ostatus != "usable":
         return _unusable(root, pinned, via, status, (other, ostatus), started, rewrite)
-    data = vco_data_under(other, run=_run)
+    data = vco_data_under(other, run=_run, install_root=root, env=env)
     if data is None:
         return _unusable(root, pinned, via, status, (other, "unlistable"), started, rewrite)
+    if not data and not rewrite:
+        # R9 H1: a read-only caller switches on POSITIVE evidence only. "Not
+        # found by me" is not "gone" (a PATH the table does not cover), and
+        # starting the stack on the other runtime's EMPTY volumes is the
+        # outcome this module exists to prevent. install.py decides this one.
+        return _unusable(root, pinned, via, status, (other, "empty"), started, rewrite)
     why = (f"{pinned} is not installed; {other} answers and holds VCO's containers/volumes"
            if data else f"{pinned} is not installed; {other} answers and no VCO data exists under it")
     return _rewritten(root, pinned, other, why, rewrite, started)
 
 
 def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: RunFn,
-                      rewrite: bool, started: str) -> Reconciliation:
+                      rewrite: bool, started: str,
+                      env: Optional[Mapping[str, str]] = None) -> Reconciliation:
     kept = Reconciliation(Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                           f"{pinned} answers", started=started)
     if read_confirmed(root) == pinned or _status(other, which, run) != "usable":
         return kept
-    here, there = vco_data_under(pinned, run=run), vco_data_under(other, run=run)
+    here = vco_data_under(pinned, run=run, install_root=root, env=env)
+    there = vco_data_under(other, run=run, install_root=root, env=env)
     if here is None or there is None or not there:
         return kept
     if here:
@@ -310,12 +407,18 @@ def _unusable(root: Optional[Path], pinned: str, via: Optional[str], status: str
               other: Optional[tuple[str, str]], started: str, rewrite: bool) -> Reconciliation:
     source = via if via == _c.PIN_VIA_ENV else str(_c.runtime_txt_path(root)) if root else str(via)
     if status == "missing":
-        what = f"{pinned} is not installed"
+        what = f"{pinned} is not installed (not on PATH nor in the usual install locations)"
     else:
         what = f"{pinned} is installed but does not answer `{pinned} info`"
     if other is not None:
-        what += f", and {other[0]} is not usable either" if other[1] != "unlistable" else (
-            f"; {other[0]} answers but its containers/volumes could not be listed")
+        what += {
+            "unlistable": f"; {other[0]} answers but its containers/volumes could not be listed",
+            "confirmed": (f"; {pinned} is your confirmed choice (`install.py --container "
+                          f"{pinned}`), so VCO does not switch to {other[0]}"),
+            "empty": (f"; {other[0]} answers but holds none of VCO's containers or volumes — "
+                      f"not switching to it here (run `python install.py --update` to "
+                      f"re-record the runtime)"),
+        }.get(other[1], f", and {other[0]} is not usable either")
     detail = f"the container runtime is pinned to {pinned} by {source}: {what}"
     if started:
         detail += f" ({started})"
@@ -407,6 +510,18 @@ def apply_at_install(
     """
     if getattr(args, "no_containers", False):
         return None
+    # R9 H1(b)/H5: a runtime found only in the usual install locations is
+    # "installed" to the reconcile below; the rest of this run spawns it BY
+    # NAME, so its directory joins this process's PATH (appended — whatever
+    # PATH already reached keeps winning).
+    import os  # noqa: PLC0415
+
+    reach = _tsd.reachable_path()
+    if reach:
+        os.environ["PATH"] = reach
+        log_event("runtime_reconcile", "ok",
+                  "container runtime found outside PATH; its directory was added to PATH",
+                  data={"path": reach})
     if getattr(args, "container", None):
         try:
             record_explicit_choice(install_root, args.container)
@@ -456,9 +571,7 @@ def runtime_down_message(os_name: str, installed: str, *,
     """The prompt's "installed but not responding" text — or ``""`` when no
     runtime binary is installed. Under a pin it names the PINNED runtime, never
     the other one as "installed but its daemon isn't responding" (R8 G1)."""
-    import shutil  # noqa: PLC0415
-
-    _which = which or shutil.which
+    _which = which or _tsd.which
     pin = _c.runtime_pin(env, install_root=install_root if install_root is not None
                          else _c._DEFAULT_ROOT, warn=lambda _m: None)  # noqa: SLF001
     if pin is not None and not _which(pin[0]):
@@ -516,18 +629,17 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
     """``container_runtime_data_under_both``: False once the user confirmed the
     record (``--container``) or VCO's data is no longer under both runtimes;
     None when either runtime cannot be looked at."""
-    import shutil  # noqa: PLC0415
-
     root = _entry_root(entry)
     recorded = _c.read_runtime_txt(root)
     if root is None or recorded is None:
         return None
     if read_confirmed(root) == recorded:
         return False
-    _which, _run = which or shutil.which, run or subprocess.run
+    _which, _run = which or _tsd.which, run or _tsd.run
     if any(_status(rt, _which, _run) != "usable" for rt in _c.RUNTIME_CANDIDATES):
         return None
-    here, there = vco_data_under(recorded, run=_run), vco_data_under(_other(recorded), run=_run)
+    here = vco_data_under(recorded, run=_run, install_root=root)
+    there = vco_data_under(_other(recorded), run=_run, install_root=root)
     if here is None or there is None:
         return None
     return bool(here and there)
@@ -538,11 +650,31 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
 # ---------------------------------------------------------------------------
 
 
+#: Who is recording a refusal — the wording of the entry says which surface
+#: started nothing (``--source`` of the CLI).
+_REFUSAL_SOURCES: dict[str, tuple[str, str]] = {
+    "boot": ("Containers did not start at boot",
+             "The boot service (launch-claude-mcp-stack) started nothing"),
+    "session": ("Containers were not started for this session",
+                "A session-start hook started nothing"),
+}
+
+#: The hard ceiling on ``python -m vco_lib.runtime_reconcile record-boot-refusal``
+#: (R9 H7): past it the CLI exits 0 whatever is still in flight. Above
+#: :data:`BOOT_LEDGER_LOCK_TIMEOUT_S`, so a held lock is normally what ends the
+#: wait; this bounds everything else (a stalled filesystem, a slow import).
+#: Callers need no `timeout` binary of their own (macOS has none).
+RECORD_REFUSAL_DEADLINE_S = 20.0
+
+
 def record_boot_refusal(install_root: Path, reason: str, *,
-                        env: Optional[Mapping[str, str]] = None) -> bool:
-    """The boot wrapper exited 3 (pinned runtime refused, or none found): put it
-    in ``install_root``'s ledger through the one emitter, so session start and
-    the launcher show it. Clears through :func:`unusable_still_applies`.
+                        env: Optional[Mapping[str, str]] = None,
+                        source: str = "boot") -> bool:
+    """A pinned runtime was refused (or none was found) and nothing was
+    started — by the boot wrapper's exit 3 (``source="boot"``) or a session
+    hook (``source="session"``): put it in ``install_root``'s ledger through
+    the one emitter, so session start and the launcher show it. Clears through
+    :func:`unusable_still_applies`.
 
     Only an INSTALLED clone has a ledger to write (``state/install/`` is what
     install.py creates): a development checkout running the wrapper — the test
@@ -553,13 +685,14 @@ def record_boot_refusal(install_root: Path, reason: str, *,
         return False
     pin = _c.runtime_pin(env, install_root=install_root, warn=lambda _m: None)
     pinned, via = (pin[0], pin[1]) if pin is not None else ("", "")
+    title_head, detected_head = _REFUSAL_SOURCES.get(source, _REFUSAL_SOURCES["boot"])
     entry = DeferralEntry(
         condition_id=CID_UNUSABLE,
-        title=("Containers did not start at boot: "
+        title=(f"{title_head}: "
                + (f"{pinned} is not usable" if pinned else "no usable container runtime")),
-        detected=f"The boot service (launch-claude-mcp-stack) started nothing: {reason.strip()}",
+        detected=f"{detected_head}: {reason.strip()}",
         why_deferred=(
-            "The boot wrapper never starts the stack under the runtime the data is NOT on "
+            "VCO never starts the stack under the runtime the data is NOT on "
             "(podman and docker keep separate volumes). This entry clears by itself once the "
             "runtime answers; the next session start then brings the stack up."
         ),
@@ -569,7 +702,10 @@ def record_boot_refusal(install_root: Path, reason: str, *,
         severity="warning",
         dismiss_fields={"runtime": pinned, "via": via, "root": str(install_root)},
     )
-    return emit(Path(install_root), entry)
+    # R9 H7: bounded — an update holding the ledger lock must never stall boot
+    # (the wrapper's own `timeout` is absent on macOS). Past the bound the
+    # emitter logs and returns False; the next boot or session writes it.
+    return emit(Path(install_root), entry, lock_timeout_s=BOOT_LEDGER_LOCK_TIMEOUT_S)
 
 
 def _cli(argv: Optional[Sequence[str]] = None) -> int:
@@ -578,9 +714,15 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     b = sub.add_parser("boot", help="Read-only reconcile of the install's runtime record.")
     b.add_argument("--root", required=True)
     b.add_argument("--json", action="store_true")
-    r = sub.add_parser("record-boot-refusal", help="Ledger entry for the wrapper's exit 3.")
-    r.add_argument("--root", required=True)
+    r = sub.add_parser(
+        "record-boot-refusal",
+        help="Ledger entry for a refused runtime (the boot wrapper's exit 3, a session hook's "
+             "skip). Bounded by itself: never needs an external `timeout`.")
+    r.add_argument("--root", default=None,
+                   help="Install root whose ledger to write (default: the clone this vco_lib "
+                        "belongs to — the same root whose runtime.txt the resolver read).")
     r.add_argument("--reason", default="")
+    r.add_argument("--source", choices=sorted(_REFUSAL_SOURCES), default="boot")
     a = p.parse_args(argv)
     if a.cmd == "boot":
         res = reconcile(Path(a.root), rewrite=False)
@@ -592,11 +734,50 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
             print(f"VCO_RECONCILE_RUNTIME={shlex.quote(res.runtime or '')}")
             print(f"VCO_RECONCILE_DETAIL={shlex.quote(res.detail)}")
         return 0
-    try:
-        record_boot_refusal(Path(a.root), a.reason)
-    except Exception as exc:  # noqa: BLE001 — best effort: never blocks boot
-        print(f"could not record the boot refusal: {exc}", file=sys.stderr)
+    if a.root:
+        root: Optional[Path] = Path(a.root)
+    else:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+        root = resolve_install_root()
+    if root is None:
+        return 0
+    if not record_refusal_bounded(root, a.reason, source=a.source):
+        # The worker is still in flight past the deadline: leave NOW, whatever
+        # it is blocked on (a daemon thread would otherwise be waited for by
+        # nothing, but interpreter shutdown can still stall on I/O).
+        sys.stdout.flush()
+        sys.stderr.flush()
+        import os  # noqa: PLC0415
+
+        os._exit(0)
     return 0
+
+
+def record_refusal_bounded(install_root: Path, reason: str, *, source: str = "boot",
+                           deadline_s: Optional[float] = None) -> bool:
+    """:func:`record_boot_refusal` under a hard deadline (R9 H7) — ``True``
+    when it finished (written or not), ``False`` when it was still running at
+    :data:`RECORD_REFUSAL_DEADLINE_S` (the ledger is then left as it was; the
+    next boot or session records it). Never raises."""
+    import threading  # noqa: PLC0415
+
+    limit = RECORD_REFUSAL_DEADLINE_S if deadline_s is None else deadline_s
+
+    def _work() -> None:
+        try:
+            record_boot_refusal(install_root, reason, source=source)
+        except Exception as exc:  # noqa: BLE001 — best effort: never blocks boot
+            print(f"could not record the runtime refusal: {exc}", file=sys.stderr)
+
+    worker = threading.Thread(target=_work, name="record-boot-refusal", daemon=True)
+    worker.start()
+    worker.join(limit)
+    if worker.is_alive():
+        print(f"record-boot-refusal: gave up after {limit:g}s; the ledger was left as it was",
+              file=sys.stderr)
+        return False
+    return True
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

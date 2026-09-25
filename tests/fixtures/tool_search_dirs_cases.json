@@ -1,0 +1,138 @@
+{
+  "_comment": [
+    "v0.2.97 R9 H1(b)/H5 — ONE fixture for the usual-tool-install-locations rule, read by",
+    "tests/test_v0297_r9_runtime_locations.py (Python: vco_lib.tool_search_dirs.candidate_dirs) AND by",
+    "launcher/src-tauri/vct-launcher-core/src/services/runtime.rs (Rust: tool_search_dirs_for, the launcher's and",
+    "the hub's startup PATH augment). Both read the table vco_lib/tool_search_dirs.toml; this pins the per-OS",
+    "lists and the expansion rule: `~/rest` needs a home, `${NAME}rest` a set non-empty NAME, anything else is",
+    "literal; duplicates are dropped; VCT_TOOL_SEARCH_DIRS (set, even empty) REPLACES the list, split on the OS",
+    "path separator. `home` null = no home; `env` is the whole environment the case sees."
+  ],
+  "cases": [
+    {
+      "name": "linux_table_with_a_home",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "expect": [
+        "/home/u/.local/bin",
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/home/u/bin",
+        "/usr/local/bin",
+        "/usr/bin"
+      ]
+    },
+    {
+      "name": "linux_without_a_home_drops_the_home_relative_entries",
+      "os": "linux",
+      "home": null,
+      "env": {},
+      "expect": [
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/local/bin",
+        "/usr/bin"
+      ]
+    },
+    {
+      "name": "macos_table_covers_homebrew_podman_and_docker_desktop",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "expect": [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/Users/u/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin",
+        "/usr/bin"
+      ]
+    },
+    {
+      "name": "windows_table_expands_the_installer_locations",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": "C:\\Program Files",
+        "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local"
+      },
+      "expect": [
+        "C:\\Program Files\\Docker\\Docker\\resources\\bin",
+        "C:\\Program Files\\RedHat\\Podman",
+        "C:\\Users\\u\\AppData\\Local\\Programs\\Podman"
+      ]
+    },
+    {
+      "name": "windows_entries_whose_variable_is_unset_or_empty_are_dropped",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": ""
+      },
+      "expect": []
+    },
+    {
+      "name": "an_os_without_a_list_has_none",
+      "os": "other",
+      "home": "/home/u",
+      "env": {},
+      "expect": []
+    },
+    {
+      "name": "the_override_set_empty_means_no_directories",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": ""
+      },
+      "expect": []
+    },
+    {
+      "name": "the_override_replaces_the_list_with_the_same_syntax",
+      "os": "linux",
+      "home": "/h/",
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "~/bin::/opt/x:~/bin"
+      },
+      "expect": [
+        "/h/bin",
+        "/opt/x"
+      ]
+    },
+    {
+      "name": "the_windows_override_splits_on_semicolons",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "${ProgramFiles}\\X;C:\\Y",
+        "ProgramFiles": "C:\\PF"
+      },
+      "expect": [
+        "C:\\PF\\X",
+        "C:\\Y"
+      ]
+    },
+    {
+      "name": "a_malformed_variable_reference_is_literal",
+      "os": "linux",
+      "home": null,
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "${1BAD}/x:${}/y"
+      },
+      "expect": [
+        "${1BAD}/x",
+        "${}/y"
+      ]
+    }
+  ]
+}

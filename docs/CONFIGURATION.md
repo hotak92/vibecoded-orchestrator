@@ -359,6 +359,32 @@ Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a
 
 The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` — the one home every VCO path composes from (wrapper, hook, launcher, install.py), always naming the `vco_managed` services explicitly with `--no-deps`. The legacy `claude_mcp_servers/compose.yaml` home is no longer composed from; containers created there are adopted as `adopted_container` rows.
 
+### Where VCO looks for the runtime (v0.2.97)
+
+"Is podman (or docker) installed?" is answered on the calling process's `PATH`
+**and** in the usual install locations — one list, `vco_lib/tool_search_dirs.toml`,
+read by the Python side (`vco_lib.tool_search_dirs`), by the launcher and the
+hub (both prepend it to their `PATH` at startup) and by the boot wrapper
+`scripts/launch-claude-mcp-stack.{sh,ps1}` (it appends the directory of a runtime
+found only there). Linux: `~/.local/bin`, `~/.cargo/bin`, Linuxbrew, `/snap/bin`,
+flatpak, `~/bin` (rootless Docker), `/usr/local/bin`, `/usr/bin`. macOS:
+`/opt/homebrew/bin` and `/sbin`, `~/.cargo/bin`, `~/.local/bin`, `~/bin`,
+`/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle, `~/.docker/bin`,
+MacPorts, `/usr/bin`. Windows: the Docker Desktop and Podman installer directories.
+A boot unit, a Finder/`.desktop`-launched launcher and the hub start with a short
+`PATH`; without this list they read a runtime in `~/bin` or `/opt/homebrew/bin` as
+**not installed** — and a runtime that is not installed is the one case in which
+VCO's own record (`state/install/runtime.txt`) may be switched to the other
+runtime. Even then, a read-only surface (a session, the boot service, the
+launcher, the hub) switches only when the other runtime **holds VCO's data**, and
+never away from a runtime you chose with `install.py --container` (that record is
+`state/install/runtime.confirmed`; run `install.py --update --container <other>`
+to change it — both files are rewritten).
+
+| Var | Effect |
+|---|---|
+| `VCT_TOOL_SEARCH_DIRS` | When **set** (even to an empty string), replaces the list above for this OS: entries separated by the OS path separator (`:` / `;`), each `~/…` or `${NAME}…` expanded. Empty means "look on `PATH` only" — the test suite runs that way so it never finds the host's own runtimes. |
+
 ### Forcing Docker when both runtimes are installed
 
 Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:8920`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:

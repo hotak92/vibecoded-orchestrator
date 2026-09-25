@@ -27,6 +27,7 @@
 #   log()                      | Write-StackLog
 #   resolve_runtime_file()     | Resolve-RuntimeFile
 #   _runtime_usable()          | Test-RuntimeUsable
+#   _bounded()                 | Invoke-WithTimeout
 #   detect_runtime()           | Find-Runtime
 #   has_nvidia()               | Test-HasNvidia
 #   wait_for_cdi()             | Wait-ForCdi (Windows: no-op; see note)
@@ -37,6 +38,7 @@
 #   resolve_working_dir()      | Resolve-WorkingDir
 #   reconcile_record()         | Invoke-RecordReconcile
 #   record_boot_refusal()      | Register-BootRefusal
+#   augment_tool_path()        | Update-ToolPath
 #   main()                     | Invoke-Main
 #
 # GPU on Windows: Docker Desktop and Podman both run via WSL2; GPU
@@ -416,6 +418,28 @@ function Get-StackPython {
     return (Resolve-StackPython)
 }
 
+# ---------------------------------------------------------------------------
+# Update-ToolPath :: R9 H1(b)/H5 — mirrors bash augment_tool_path. A boot
+# task's PATH may lack the directory podman/docker (or a compose front-end)
+# is installed in; the ONE table (vco_lib/tool_search_dirs.toml, through
+# `python -m vco_lib.tool_search_dirs search-path`) names where to look, and
+# the directory of every tool found only there is appended. Whatever PATH
+# already reached keeps winning. Soft: no answer leaves PATH as it is.
+# ---------------------------------------------------------------------------
+function Update-ToolPath {
+    $py = Get-StackPython
+    if (-not $py) { return }
+    try {
+        $run = Invoke-StackPy -Python $py -Arguments @('vco_lib.tool_search_dirs', 'search-path')
+    } catch { return }
+    if ($run.Rc -ne 0) { return }
+    $p = ([string]$run.Stdout).Trim()
+    if ($p -and $p -ne $env:PATH) {
+        $env:PATH = $p
+        Write-StackLog "container runtime tools found outside this task's PATH; PATH is now: $p"
+    }
+}
+
 function Invoke-RecordReconcile {
     $py = Get-StackPython
     if (-not $py -or -not $script:VctOwnRoot) { return '' }
@@ -431,6 +455,9 @@ function Invoke-RecordReconcile {
     return ''
 }
 
+# R9 H7: the Python emitter bounds its own wait for the ledger lock an
+# in-flight update may hold (BOOT_LEDGER_LOCK_TIMEOUT_S, non-blocking
+# retries, then it skips with a log line), so this never stalls boot.
 function Register-BootRefusal {
     param([string] $Reason)
     $py = Get-StackPython
@@ -902,6 +929,9 @@ function Invoke-Main {
             Write-StackLog "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) - nothing composed"
             return 5
         }
+        # Before any runtime probe: a runtime installed outside this task's
+        # PATH is found (and driven) instead of read as absent (R9 H1(b)/H5).
+        Update-ToolPath
         $planRun = Invoke-StackPy -Python $stackPy -Arguments @('vco_lib.service_lifecycle', 'plan', '--json')
         $plan = $null
         if ($planRun.Rc -eq 0) { try { $plan = $planRun.Stdout | ConvertFrom-Json } catch { $plan = $null } }

@@ -33,7 +33,24 @@
     "`state/install/runtime.txt`, the labels of RuntimePinSource). The module plane is",
     "two-state over its Err: a probe that times out collapses into the same refusal",
     "arm as a dead daemon (`probe_timeout_is_unknown_not_absent` stays unknown ONLY",
-    "v0.2.97 R8 follow-up (owner rule \"users never need a manual step\"): the RECORD pin — and only\nit — is reconciled read-only inside the resolver. When runtime.txt names a runtime that is NOT\ninstalled and the read-only record reconcile decides case (a) — the other runtime answers, holding\nVCO's containers/volumes (`vco_data_under`: {<rt>: true}), or no VCO data exists anywhere\n(`vco_data_under` absent/false for it) — every surface ANSWERS the other runtime: expect.runtime is\nthe other one, expect.substituted is TRUE and (Python) expect.record_reconciled is true, with\nrequested/requested_via still naming the stale record. A runtime listed in `vco_data_unlistable`\ncannot have its containers/volumes listed, so the reconcile refuses and the strict pin stands.\nThe env pin is NEVER reconciled (`env_pin_is_never_reconciled`), a recorded runtime that is\ninstalled but down stays refused (`runtime_txt_pin_unusable_is_refused_not_substituted`), and\n`expect.substituted` stays false on every other row."
+    "v0.2.97 R8 follow-up (owner rule \"users never need a manual step\"): the RECORD pin — and only",
+    "it — is reconciled read-only inside the resolver. When runtime.txt names a runtime that is NOT",
+    "installed and the read-only record reconcile decides case (a) — the other runtime answers AND holds",
+    "VCO's containers/volumes (`vco_data_under`: {<rt>: true}) — every surface ANSWERS the other runtime: expect.runtime is",
+    "the other one, expect.substituted is TRUE and (Python) expect.record_reconciled is true, with",
+    "requested/requested_via still naming the stale record. A runtime listed in `vco_data_unlistable`",
+    "cannot have its containers/volumes listed, so the reconcile refuses and the strict pin stands.",
+    "The env pin is NEVER reconciled (`env_pin_is_never_reconciled`), a recorded runtime that is",
+    "installed but down stays refused (`runtime_txt_pin_unusable_is_refused_not_substituted`), and",
+    "`expect.substituted` stays false on every other row.",
+    "v0.2.97 R9 H1/H2: a READ-ONLY surface substitutes on POSITIVE evidence only. \"No VCO data anywhere\"",
+    "(`vco_data_under` absent/false for the other runtime) is install.py's decision alone (rewrite=True, run",
+    "under the user's PATH, recorded in the ledger): every surface here REFUSES it",
+    "(`runtime_txt_stale_record_no_data_anywhere`) — \"not installed\" may only mean \"not on THIS process's PATH\".",
+    "`runtime_confirmed` names the runtime in state/install/runtime.confirmed (the user's `install.py --container`",
+    "choice): a record that matches it is NEVER substituted, on any surface",
+    "(`runtime_txt_confirmed_record_is_never_switched`). \"Installed\" itself is judged on PATH AND in the usual",
+    "install locations (vco_lib/tool_search_dirs.toml) — `on_path` here stands for that combined answer."
   ],
   "scenarios": [
     {
@@ -747,7 +764,7 @@
     },
     {
       "name": "runtime_txt_stale_record_no_data_anywhere",
-      "_why": "runtime.txt records docker but docker is gone; podman answers and NO VCO data exists under either runtime (a fresh machine whose record went stale). Still case (a): the reconcile answers podman rather than refusing — there is no data plane to fork.",
+      "_why": "runtime.txt records docker but docker is not found; podman answers and NO VCO data exists under it. R9 H1: a read-only surface switches on POSITIVE evidence only — docker may merely be off this process's PATH (a rootless ~/bin docker under a boot unit), and starting podman here would bring the stack up on EMPTY volumes. Refused everywhere; install.py (rewrite=True, the user's PATH) is the one that re-records it (tests/test_v0297_runtime_reconcile.py).",
       "env": null,
       "runtime_txt": "docker",
       "on_path": [
@@ -765,6 +782,90 @@
       ],
       "standalone_on_path": [],
       "vco_data_under": {},
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_confirmed_record_is_never_switched",
+      "_why": "R9 H2: the user moved to docker with `install.py --container docker` (runtime.txt AND runtime.confirmed say docker); the old podman volumes are still there. On a process that cannot find docker, podman answers holding VCO's data — positive evidence — yet the confirmed choice is never overridden: refused everywhere, the refusal says why. Only another `--container` switches.",
+      "env": null,
+      "runtime_txt": "docker",
+      "runtime_confirmed": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_confirmed_other_runtime_does_not_protect_the_record",
+      "_why": "runtime.confirmed says podman but runtime.txt says docker (the record was re-made without --container, or hand-edited): the confirmation is of a DIFFERENT runtime and protects nothing — the stale docker record reconciles to podman, which holds VCO's data, exactly as without it.",
+      "env": null,
+      "runtime_txt": "docker",
+      "runtime_confirmed": "podman",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
       "expect": {
         "state": "resolved",
         "runtime": "podman",

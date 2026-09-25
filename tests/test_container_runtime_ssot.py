@@ -90,14 +90,20 @@ def _probes(sc: dict):
     return which, cast(containers.RunFn, run)
 
 
-def _install_root(tmp_path: Path, runtime_txt: Optional[str]) -> Path:
+def _install_root(tmp_path: Path, runtime_txt: Optional[str],
+                  confirmed: Optional[str] = None) -> Path:
     """An install root holding the scenario's ``state/install/runtime.txt``
-    (or none) — never the machine's own clone, whose record would leak in."""
+    (or none) and, when the scenario declares ``runtime_confirmed``, its
+    ``state/install/runtime.confirmed`` — never the machine's own clone, whose
+    record would leak in."""
     root = tmp_path / "install-root"
     root.mkdir()
     if runtime_txt is not None:
         containers.runtime_txt_path(root).parent.mkdir(parents=True)
         containers.runtime_txt_path(root).write_text(runtime_txt + "\n", encoding="utf-8")
+    if confirmed is not None:
+        (root / "state" / "install").mkdir(parents=True, exist_ok=True)
+        (root / "state" / "install" / "runtime.confirmed").write_text(confirmed + "\n", encoding="utf-8")
     return root
 
 
@@ -106,7 +112,7 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
     which, run = _probes(sc)
     env = {} if sc["env"] is None else {"VCT_CONTAINER_RUNTIME": sc["env"]}
     warnings: list[str] = []
-    root = _install_root(tmp_path, sc.get("runtime_txt"))
+    root = _install_root(tmp_path, sc.get("runtime_txt"), sc.get("runtime_confirmed"))
     res = containers.resolve(
         env=env, which=which, run=run, warn=warnings.append, home=tmp_path,
         install_root=root,
