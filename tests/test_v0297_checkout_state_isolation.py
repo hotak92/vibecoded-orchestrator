@@ -103,7 +103,15 @@ def test_a_write_under_a_checkout_state_dir_is_refused_and_recorded(state_dir: P
     with pytest.raises(_suite.RealUserStateWriteBlocked):
         os.makedirs(probe)
     attempts = _suite.consume_state_write_attempts()
-    assert str(target) in attempts and str(probe) in attempts
+    assert str(target) in attempts
+    # `makedirs` creates missing parents first, so on a fresh checkout with no
+    # `state/` yet (CI) the refused write is `state/` itself, not the probe.
+    # Either is the right refusal: the first path under the state dir the
+    # call tried to create.
+    assert any(
+        (probe == Path(a) or probe.is_relative_to(a)) and Path(a).is_relative_to(state_dir)
+        for a in attempts
+    ), attempts
     assert target.exists() == existed
     assert not probe.exists()
 

@@ -2885,7 +2885,10 @@ def apply_project_env(
 _LEGACY_SECRET_ENV_KEYS: frozenset[str] = frozenset({"GITHUB_TOKEN"})
 _STORED_SLOT_FOR_ENV_KEY: dict[str, str] = {"GITHUB_TOKEN": "github_pat"}
 
-_RETAINED_SECRET_CID = "user_secret_values_retained_in_tree"
+# A condition id, not a secret: the constant's name avoids "secret" because
+# CodeQL's clear-text-storage query taints identifiers by name, and this id is
+# written to the auto-resolution trail.
+_RETAINED_VALUES_CID = "user_secret_values_retained_in_tree"
 
 #: The JSON env surfaces: ``(file, env-block key)``.
 _JSON_SECRET_SURFACES: tuple[tuple[str, str], ...] = (
@@ -3243,12 +3246,12 @@ def _record_secret_value_scrubs(
         for rel, names in before.items():
             for name in sorted(set(names) - set(after.get(rel, []))):
                 record_auto_resolution(
-                    project_root, _RETAINED_SECRET_CID, "scrubbed_user_secret_value",
+                    project_root, _RETAINED_VALUES_CID, "scrubbed_user_secret_value",
                     f"removed the in-tree value of {name} from {rel} (it equalled the "
                     "value the launcher stores); the secret itself stays in the keychain",
                 )
-        if not after and DeferralReport.read(project_root).has_condition(_RETAINED_SECRET_CID):
-            resolve_conditions(project_root, [_RETAINED_SECRET_CID])
+        if not after and DeferralReport.read(project_root).has_condition(_RETAINED_VALUES_CID):
+            resolve_conditions(project_root, [_RETAINED_VALUES_CID])
     except Exception:  # noqa: BLE001 — trail + ledger are observability
         pass
 

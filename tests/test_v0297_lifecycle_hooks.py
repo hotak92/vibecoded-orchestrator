@@ -382,6 +382,16 @@ class HookSessionReconcileTests(_TmpCase, _Shells):
                 # 8 s bound + interpreter start-up; well inside the hook's 15 s.
                 self.assertLess(elapsed, 14, proc.stdout)
                 self.assertIn("did not finish within 8 s", proc.stdout, proc.stderr)
+                # On a slow interpreter (CI's pwsh) the 8 s bound plus start-up
+                # can outlast the hook's foreground budget; the hook then says
+                # "still working in the background" and the lifecycle finishes
+                # detached. The promise is that the lifecycle RUNS, not that it
+                # finishes in the foreground, so wait for it in that case.
+                deadline = time.monotonic() + (
+                    60 if "still working in the background" in proc.stdout else 0
+                )
+                while not m.compose_calls() and time.monotonic() < deadline:
+                    time.sleep(0.2)
                 self.assertEqual(len(m.compose_calls()), 1, proc.stdout)
 
 
