@@ -766,11 +766,7 @@ def migrate_managed_service(
             f"the installer's effective config would mount {_describe_mount(effective, destination)} "
             f"at {destination}, not the live {_describe_mount(data, destination)}"
         )
-    try:
-        compose_text = (infra / "docker-compose.yml").read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own_project = _containers.compose_project_name(infra, compose_text)
+    own_project = _containers.own_compose_project(root)
     chain: list[str] = []
     for path in files:
         chain += ["-f", str(path)]

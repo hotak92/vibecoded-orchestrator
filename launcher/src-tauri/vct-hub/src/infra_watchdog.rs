@@ -127,7 +127,7 @@ use vct_launcher_core::db::Db;
 use vct_launcher_core::services::service_endpoints::{
     is_compose_managed, lifecycle_container, machine_row, zombie_action, CoreService, ZombieAction,
 };
-use vct_launcher_core::services::runtime::{detect_runtime, RuntimeInfo};
+use vct_launcher_core::services::runtime::{detect_runtime_detailed, RuntimeDetection, RuntimeInfo};
 use vct_launcher_core::services::watchdog_pause;
 
 use crate::modules_api::LauncherDbHandle;
@@ -929,11 +929,40 @@ async fn run_watchdog_loop(db: LauncherDbHandle, config: WatchdogConfig) {
         // / `lock_recover`) rather than `lock().expect("db mutex
         // poisoned")`, so a poisoned launcher.db mutex no longer kills this
         // detached task. The row reads go through `lock_recover` and
-        // `detect_runtime()` is already non-panicking. The result is that the watchdog upholds
+        // `detect_runtime_detailed()` is already non-panicking. The result is that the watchdog upholds
         // its "never crashes the hub" contract: a single bad tick logs and
         // the next tick tries again.
         run_one_tick(&db, base, &mut backoffs, &mut ticks_since_attempt).await;
     }
+}
+
+/// The last pin refusal the watchdog logged at `warn` — so a refusal that
+/// holds tick after tick is said once, and again only when it changes.
+static LAST_REFUSAL: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// The watchdog's line for a tick with no runtime to drive (v0.2.97 R11 L6),
+/// and whether it is news (`warn`): a refused pin names the pin and why the
+/// stale record was not switched ([`RuntimeDetection::refusal`]) — before, it
+/// was a `debug` line without either. `last` holds the refusal last said.
+pub(crate) fn no_runtime_line(
+    detection: &RuntimeDetection,
+    last: &std::sync::Mutex<Option<String>>,
+) -> (bool, String) {
+    let Some(refusal) = detection.refusal.as_deref() else {
+        return (
+            false,
+            "[vct-hub] infra watchdog: no container runtime reachable this tick; will retry \
+             next interval."
+                .to_string(),
+        );
+    };
+    let line = format!("[vct-hub] infra watchdog: supervising nothing — {refusal}");
+    let mut g = last.lock().unwrap_or_else(|p| p.into_inner());
+    let news = g.as_deref() != Some(refusal);
+    if news {
+        *g = Some(refusal.to_string());
+    }
+    (news, line)
 }
 
 /// Execute a single watchdog tick across all canonical infra services.
@@ -946,15 +975,18 @@ async fn run_one_tick(
     ticks_since_attempt: &mut HashMap<String, u64>,
 ) {
     // Resolve the runtime once per tick (cached after first detect).
-    let runtime = match detect_runtime().await {
+    let detection = detect_runtime_detailed().await;
+    let runtime = match detection.info.clone() {
         Some(r) => r,
         None => {
-            // No podman/docker reachable — nothing the watchdog can do.
-            // Quiet (one line) so logs don't fill on a runtime-less host.
-            tracing::debug!(
-                "[vct-hub] infra watchdog: no container runtime reachable this \
-                 tick; will retry next interval."
-            );
+            // Nothing the watchdog can drive. A REFUSED PIN is said once
+            // (warn) with WHY — the same refusal the launcher shows (R11 L6)
+            // — and again only when it changes; a runtime-less host stays
+            // quiet (debug) so logs don't fill.
+            match no_runtime_line(&detection, &LAST_REFUSAL) {
+                (true, line) => tracing::warn!("{}", line),
+                (false, line) => tracing::debug!("{}", line),
+            }
             return;
         }
     };
@@ -1107,6 +1139,28 @@ async fn run_one_tick(
 
 #[cfg(test)]
 mod tests {
+    /// R11 L6: a refused pin reaches the watchdog's log WITH why — once at
+    /// `warn`, then quietly until it changes; no pin at all stays the quiet
+    /// "no container runtime reachable".
+    #[test]
+    fn a_refused_pin_is_logged_with_why_once() {
+        use vct_launcher_core::services::runtime::RuntimeDetection;
+        let last = std::sync::Mutex::new(None);
+        let refused = RuntimeDetection {
+            info: None,
+            not_switched: Some("podman holds none of VCO's data".into()),
+            refusal: Some("pinned to docker (not switched: podman holds none of VCO's data)".into()),
+        };
+        let (news, line) = super::no_runtime_line(&refused, &last);
+        assert!(news);
+        assert!(line.contains("pinned to docker (not switched: podman holds none of VCO's data)"), "{line}");
+        assert!(!super::no_runtime_line(&refused, &last).0, "the same refusal is said once");
+        let other = RuntimeDetection { refusal: Some("pinned to podman".into()), ..RuntimeDetection::default() };
+        assert!(super::no_runtime_line(&other, &last).0, "a changed refusal is news");
+        let (news, line) = super::no_runtime_line(&RuntimeDetection::default(), &last);
+        assert!(!news && line.contains("no container runtime reachable"), "{line}");
+    }
+
     use super::*;
 
     // ----- opt-out parsing -----

@@ -58,8 +58,11 @@ pub fn compose_project_name(compose_dir: &Path, compose_text: &str) -> String {
 
 /// The compose project VCO's own stack runs under (`<root>/infrastructure`),
 /// so a volume compose created for VCO carries it in its
-/// `com.docker.compose.project` label. `""` without a root. MUST MATCH
-/// `vco_lib.runtime_reconcile.vco_compose_project`.
+/// `com.docker.compose.project` label. `""` without a root. The Rust side's
+/// ONE reader of it (a declared class-C mirror, pinned by the fixture's
+/// `compose_project` rows). MUST MATCH `vco_lib.containers.own_compose_project`
+/// (the one Python home since v0.2.97 R11 L7; `vco_lib.runtime_reconcile.vco_compose_project`
+/// is that function).
 pub fn vco_compose_project(install_root: Option<&Path>) -> String {
     let Some(root) = install_root else {
         return String::new();
@@ -100,6 +103,173 @@ pub fn override_volumes_present<'a>(volumes: &[String], names: &'a [String]) -> 
         .filter(|n| !VCO_VOLUME_NAMES.contains(&n.as_str()) && volumes.contains(n))
         .map(|n| n.as_str())
         .collect()
+}
+
+/// WHAT a runtime's listings show of VCO's data (v0.2.97 R11 L2). A VCO
+/// container outranks a volume, a RUNNING one a stopped one: a container
+/// mounts the data wherever it lives, a volume is only a copy that may be a
+/// leftover. MUST MATCH `vco_lib.runtime_reconcile.KIND_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DataKind {
+    /// A VCO container `ps` lists.
+    Running,
+    /// A VCO container only `ps -a` lists.
+    Stopped,
+    /// No VCO container; a VCO volume ([`data_evidence`]'s volume rule).
+    Volumes,
+    /// Nothing of VCO's.
+    Nothing,
+}
+
+impl DataKind {
+    pub fn key(self) -> &'static str {
+        match self {
+            DataKind::Running => "running",
+            DataKind::Stopped => "stopped",
+            DataKind::Volumes => "volumes",
+            DataKind::Nothing => "none",
+        }
+    }
+
+    /// The inverse of [`DataKind::key`] (the shared fixtures name kinds).
+    pub fn from_key(key: &str) -> Option<DataKind> {
+        [DataKind::Running, DataKind::Stopped, DataKind::Volumes, DataKind::Nothing]
+            .into_iter()
+            .find(|k| k.key() == key)
+    }
+}
+
+/// [`data_evidence`], saying WHAT holds the data — for the runtime a stale
+/// record would be switched TO (so an override-named volume needs VCO's
+/// label). `running` is what `ps` lists (consulted only when a VCO container
+/// exists). MUST MATCH `vco_lib.runtime_reconcile.data_kind` with
+/// `corroborate_overrides=True` (the fixture's `kind` rows run both).
+pub fn data_kind(
+    containers: &[String],
+    running: &[String],
+    volumes: &[String],
+    names: &[String],
+    own_project: &str,
+    label_of: &dyn Fn(&str) -> Option<String>,
+) -> DataKind {
+    let ours: Vec<&String> = containers
+        .iter()
+        .filter(|n| VCO_OUR_CONTAINER_NAMES.contains(&n.as_str()))
+        .collect();
+    if !ours.is_empty() {
+        return if ours.iter().any(|n| running.contains(n)) {
+            DataKind::Running
+        } else {
+            DataKind::Stopped
+        };
+    }
+    if data_evidence(&[], volumes, names, own_project, label_of) {
+        DataKind::Volumes
+    } else {
+        DataKind::Nothing
+    }
+}
+
+/// What a bind-mounted data layout makes of the OTHER runtime's listing
+/// (v0.2.97 R11 L2/L3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BindVerdict {
+    /// Drive (and, at install, re-record) the other runtime.
+    Switch,
+    /// VCO containers under both runtimes beside the folder: only the user
+    /// knows which one serves it.
+    Both,
+    /// The folder is the data; the record stands (R10 J2).
+    Keep,
+}
+
+impl BindVerdict {
+    pub fn key(self) -> &'static str {
+        match self {
+            BindVerdict::Switch => "switch",
+            BindVerdict::Both => "both",
+            BindVerdict::Keep => "keep",
+        }
+    }
+}
+
+/// The bind-layout precedence (v0.2.97 R11 L2/L3): (1) VCO containers
+/// RUNNING under the other runtime → the stack lives there: `Switch` (`Both`
+/// when VCO containers also run under the recorded runtime); (2) the recorded
+/// runtime is NOT installed and EVERY service's data is a folder
+/// ([`all_services_bind`]) → no named volume is stranded: `Switch`; (3)
+/// STOPPED VCO containers under the other runtime → `Both`; (4) a leftover
+/// volume or nothing → `Keep`. MUST MATCH
+/// `vco_lib.runtime_reconcile.bind_verdict` (the fixture's `bind_verdict`
+/// rows run both).
+pub fn bind_verdict(
+    other: DataKind,
+    pinned_missing: bool,
+    all_bind: bool,
+    here_running: bool,
+) -> BindVerdict {
+    if other == DataKind::Running {
+        return if here_running { BindVerdict::Both } else { BindVerdict::Switch };
+    }
+    if pinned_missing && all_bind {
+        return BindVerdict::Switch;
+    }
+    if other == DataKind::Stopped {
+        return BindVerdict::Both;
+    }
+    BindVerdict::Keep
+}
+
+/// Does EVERY service's data mount resolve to a host folder (v0.2.97 R11
+/// L3)? Per [`VCO_DATA_SOURCE_KEYS`] key, the value compose uses — `env`'s
+/// when the key is set there (even empty), else the LAST assignment in
+/// `env_file_text` — must be a path; an unset or empty key is the service's
+/// named volume. MUST MATCH `vco_lib.runtime_reconcile.all_services_bind`
+/// (the fixture's `all_bind` rows run both).
+pub fn all_services_bind(env_file_text: &str, env: &dyn Fn(&str) -> Option<String>) -> bool {
+    let mut from_file: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    for line in env_file_text.lines() {
+        if let Some((k, v)) = super::container_runtime::parse_env_line(line) {
+            if VCO_DATA_SOURCE_KEYS.contains(&k.as_str()) {
+                from_file.insert(k, v);
+            }
+        }
+    }
+    VCO_DATA_SOURCE_KEYS.iter().all(|key| {
+        let value = env(key).or_else(|| from_file.get(*key).cloned()).unwrap_or_default();
+        is_bind_source(value.trim())
+    })
+}
+
+/// [`all_services_bind`] for this install's `infrastructure/.env` and the
+/// process environment.
+pub fn install_all_bind(install_root: Option<&Path>) -> bool {
+    let Some(root) = install_root else {
+        return false;
+    };
+    let text = std::fs::read_to_string(root.join("infrastructure").join(".env")).unwrap_or_default();
+    all_services_bind(&text, &|k| std::env::var(k).ok())
+}
+
+/// Is `path` a data folder that is not provably empty (R10 J2, R11 L1)? A
+/// missing path or a non-directory → no; a directory with an entry → yes; ANY
+/// other error while probing (a parent this user cannot search, a folder it
+/// cannot list, a symlink loop) → VCO cannot tell, and a folder it cannot
+/// prove empty is data. Never panics, never errors. MUST MATCH
+/// `vco_lib.runtime_reconcile.bind_folder_holds_data` (the fixture's
+/// `bind_probe` rows run both).
+pub fn bind_folder_holds_data(path: &Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_dir() => false,
+        Ok(_) => match std::fs::read_dir(path) {
+            Ok(mut entries) => entries.next().is_some(),
+            Err(_) => true, // a data folder this user cannot list is not provably empty
+        },
+        Err(e) => !matches!(
+            e.kind(),
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+        ),
+    }
 }
 
 /// Compose's rule for a volume SOURCE: a path (`/`, `.`, `~`, `\` or a
@@ -145,8 +315,9 @@ fn home_dir() -> Option<PathBuf> {
     raw.filter(|h| !h.is_empty()).map(PathBuf::from)
 }
 
-/// The first bind-mounted data folder of this install that EXISTS and is not
-/// empty (or cannot be listed — not provably empty), else `None`. Relative
+/// The first bind-mounted data folder of this install that holds data
+/// ([`bind_folder_holds_data`]: not empty, or not provably empty), else
+/// `None`. Relative
 /// sources resolve against `infrastructure/` (compose's project dir), `~`
 /// against the home directory. Such a folder is VCO's data on the HOST, under
 /// neither runtime (R10 J2) — so no runtime's listing can justify switching
@@ -170,14 +341,7 @@ pub fn bind_data_source(install_root: Option<&Path>) -> Option<PathBuf> {
             .components()
             .filter(|c| !matches!(c, std::path::Component::CurDir))
             .collect();
-        if !path.is_dir() {
-            continue;
-        }
-        let empty = match std::fs::read_dir(&path) {
-            Ok(mut entries) => entries.next().is_none(),
-            Err(_) => false, // a data folder this user cannot list is not provably empty
-        };
-        if !empty {
+        if bind_folder_holds_data(&path) {
             return Some(path);
         }
     }
@@ -198,6 +362,9 @@ pub enum ReconcileDecline {
     Unlistable,
     /// The other runtime holds none of VCO's data (R9 H1: not evidence).
     NoData,
+    /// VCO's data is a bind-mounted folder AND the other runtime holds VCO
+    /// containers that are not running beside it (R11 L2 (ii)).
+    DataUnderBoth,
 }
 
 impl ReconcileDecline {
@@ -208,6 +375,7 @@ impl ReconcileDecline {
             ReconcileDecline::OtherNotUsable => "other_not_usable",
             ReconcileDecline::Unlistable => "unlistable",
             ReconcileDecline::NoData => "no_data",
+            ReconcileDecline::DataUnderBoth => "data_under_both",
         }
     }
 }
@@ -356,6 +524,7 @@ mod tests {
             ReconcileDecline::OtherNotUsable,
             ReconcileDecline::Unlistable,
             ReconcileDecline::NoData,
+            ReconcileDecline::DataUnderBoth,
         ];
         for decline in all {
             assert!(
@@ -376,6 +545,170 @@ mod tests {
             );
             assert_eq!(got, case["expect"].as_str().unwrap(), "case {}", case["name"]);
         }
+    }
+
+    /// R11 L2: WHAT the other runtime holds, row by row with Python.
+    #[test]
+    fn data_kind_matches_the_shared_fixture() {
+        let fx = fixture();
+        let cases = fx["kind"].as_array().unwrap();
+        assert!(cases.len() >= 5, "fixture shrank");
+        for case in cases {
+            let env = env_of(case);
+            let names = super::super::container_runtime::volume_names_from(
+                case["env_file"].as_str().unwrap(),
+                &|k| env.get(k).cloned(),
+            );
+            let labels = case["labels"].as_object().unwrap().clone();
+            let got = data_kind(
+                &strings(&case["containers"]),
+                &strings(&case["running"]),
+                &strings(&case["volumes"]),
+                &names,
+                case["own_project"].as_str().unwrap(),
+                &|v| labels.get(v).and_then(|l| l.as_str()).map(str::to_string),
+            );
+            assert_eq!(got.key(), case["expect"].as_str().unwrap(), "case {}", case["name"]);
+        }
+    }
+
+    /// R11 L2/L3: the bind-layout precedence, the whole truth table.
+    #[test]
+    fn bind_verdict_matches_the_shared_fixture() {
+        let fx = fixture();
+        let cases = fx["bind_verdict"].as_array().unwrap();
+        assert!(cases.len() >= 20, "fixture shrank");
+        for case in cases {
+            let other = DataKind::from_key(case["other"].as_str().unwrap()).expect("a kind");
+            let got = bind_verdict(
+                other,
+                case["pinned_missing"].as_bool().unwrap(),
+                case["all_bind"].as_bool().unwrap(),
+                case["here_running"].as_bool().unwrap(),
+            );
+            assert_eq!(got.key(), case["expect"].as_str().unwrap(), "case {}", case["name"]);
+        }
+    }
+
+    /// R11 L3: "every service's data is a folder", row by row with Python.
+    #[test]
+    fn all_services_bind_matches_the_shared_fixture() {
+        let fx = fixture();
+        let cases = fx["all_bind"].as_array().unwrap();
+        assert!(cases.len() >= 6, "fixture shrank");
+        for case in cases {
+            let env = env_of(case);
+            let got = all_services_bind(case["env_file"].as_str().unwrap(), &|k| env.get(k).cloned());
+            assert_eq!(got, case["expect"].as_bool().unwrap(), "case {}", case["name"]);
+        }
+    }
+
+    /// Restores the modes of every chmodded directory on drop, so a failing
+    /// assertion never leaves an undeletable temp dir behind.
+    #[cfg(unix)]
+    struct ModeGuard(Vec<PathBuf>);
+
+    #[cfg(unix)]
+    impl Drop for ModeGuard {
+        fn drop(&mut self) {
+            use std::os::unix::fs::PermissionsExt;
+            for p in &self.0 {
+                let _ = std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    }
+
+    /// The filesystem shape a `bind_probe` row names, or `None` when this
+    /// process cannot produce it (root bypasses permission bits).
+    #[cfg(unix)]
+    fn bind_probe_setup(dir: &Path, setup: &str, guard: &mut ModeGuard) -> Option<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = dir.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let folder = parent.join("data");
+        match setup {
+            "missing" => return Some(folder),
+            "file" => {
+                std::fs::write(&folder, "x").unwrap();
+                return Some(folder);
+            }
+            _ => std::fs::create_dir_all(&folder).unwrap(),
+        }
+        if setup == "empty" {
+            return Some(folder);
+        }
+        std::fs::write(folder.join("blob"), "x").unwrap();
+        if setup == "non_empty" {
+            return Some(folder);
+        }
+        let target = if setup == "unsearchable_parent" { parent.clone() } else { folder.clone() };
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0)).unwrap();
+        guard.0.push(target);
+        let denied = if setup == "unsearchable_parent" {
+            std::fs::metadata(&folder).is_err()
+        } else {
+            std::fs::read_dir(&folder).is_err()
+        };
+        denied.then_some(folder)
+    }
+
+    /// R11 L1: every probe shape answers — an unsearchable parent (EACCES
+    /// from `metadata`) and an unlistable folder are data, never an error.
+    #[cfg(unix)]
+    #[test]
+    fn bind_probe_matches_the_shared_fixture() {
+        let fx = fixture();
+        let cases = fx["bind_probe"].as_array().unwrap();
+        assert!(cases.len() >= 6, "fixture shrank");
+        for case in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let mut guard = ModeGuard(Vec::new());
+            let Some(folder) = bind_probe_setup(dir.path(), case["setup"].as_str().unwrap(), &mut guard)
+            else {
+                continue; // root: permission bits are not enforced
+            };
+            assert_eq!(
+                bind_folder_holds_data(&folder),
+                case["expect"].as_bool().unwrap(),
+                "case {}",
+                case["name"]
+            );
+            drop(guard);
+        }
+    }
+
+    /// R11 L1 through the install-level reader: a bind source under an
+    /// unsearchable parent is reported as the data folder (Python raised
+    /// `PermissionError` here; this side used to answer "not data").
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_bind_source_under_an_unsearchable_parent_is_data() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        let locked = dir.path().join("locked");
+        let folder = locked.join("weaviate");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("classifications.db"), "x").unwrap();
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("VCT_WEAVIATE_DATA_SOURCE={}\n", folder.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0)).unwrap();
+        let guard = ModeGuard(vec![locked.clone()]);
+        if std::fs::metadata(&folder).is_ok() {
+            return; // root: permission bits are not enforced
+        }
+        let _env = crate::test_env::env_guard(&[
+            ("VCT_WEAVIATE_DATA_SOURCE", None),
+            ("VCT_OLLAMA_DATA_SOURCE", None),
+            ("VCT_CODE_EMBED_CACHE_SOURCE", None),
+        ]);
+        assert_eq!(bind_data_source(Some(&root)), Some(folder));
+        drop(guard);
     }
 
     #[test]

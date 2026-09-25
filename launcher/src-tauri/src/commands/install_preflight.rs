@@ -36,8 +36,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::services::runtime::{
-    detect_runtime, invalidate_cache as invalidate_runtime_cache, probe_runtime, runtime_on_path,
-    runtime_pin,
+    detect_runtime_detailed, invalidate_cache as invalidate_runtime_cache, probe_runtime,
+    runtime_on_path, runtime_pin, RuntimeDetection,
 };
 use vct_launcher_core::services::container_runtime::RuntimePinSource;
 
@@ -88,6 +88,13 @@ pub struct RuntimeAvailability {
     /// not — the user's repin target. The launcher does NOT switch to it on
     /// its own, for the same volume reason.
     pub alternative_usable: Option<String>,
+    /// Why the install's STALE runtime record was not switched to the other
+    /// runtime (v0.2.97 R11 L6) — the shared table's wording
+    /// (`vco_lib/runtime_reconcile_messages.toml`), the same reason every
+    /// other surface gives. `None` unless the pin is refused AND the
+    /// stale-record reconcile declined.
+    #[serde(default)]
+    pub not_switched: Option<String>,
 }
 
 /// Resolve the canonical install URL for the current OS. Mirrors the
@@ -158,19 +165,13 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
     // over the ~50ms probe cost.
     invalidate_runtime_cache();
 
-    let info = detect_runtime().await;
-    let platform = current_platform();
-    let install_url = if info.is_none() {
-        install_url_for(&platform)
-    } else {
-        None
-    };
+    let detection = detect_runtime_detailed().await;
 
     // v0.2.92 BLOCKER-4: `detect_runtime` is strict about a pin, so `None`
     // under a pin means "the runtime you pinned is unusable" — NOT "no
     // container runtime is installed". Those are different sentences and
     // different user actions, and the modal could not tell them apart.
-    let pin = if info.is_none() { runtime_pin() } else { None };
+    let pin = if detection.info.is_none() { runtime_pin() } else { None };
     let pinned = pin.map(|(runtime, _)| runtime);
     let pinned_via = pin.map(|(_, source)| pin_source_label(source));
     let pinned_installed = pinned.map(runtime_on_path).unwrap_or(false);
@@ -184,17 +185,48 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
         None => None,
     };
 
-    Ok(RuntimeAvailability {
+    Ok(availability(
+        &detection,
+        current_platform(),
+        pinned.map(|p| p.binary().to_string()),
+        pinned_via,
+        pinned_installed,
+        alternative_usable,
+    ))
+}
+
+/// The modal's shape from what the probes established — pure, so the
+/// refused-pin fields (R11 L6: `not_switched`) are tested without a
+/// runtime on the machine.
+fn availability(
+    detection: &RuntimeDetection,
+    platform: String,
+    pinned: Option<String>,
+    pinned_via: Option<String>,
+    pinned_installed: bool,
+    alternative_usable: Option<String>,
+) -> RuntimeAvailability {
+    let info = detection.info.clone();
+    let install_url = if info.is_none() { install_url_for(&platform) } else { None };
+    // The stale record's reason, on the refused-pin path only (a resolved
+    // runtime is never reported as refused).
+    let not_switched = if info.is_none() && pinned.is_some() {
+        detection.not_switched.clone()
+    } else {
+        None
+    };
+    RuntimeAvailability {
         available: info.is_some(),
         detected: info.map(|i| i.runtime.binary().to_string()),
         platform,
         install_url,
-        pinned: pinned.map(|p| p.binary().to_string()),
-        pinned_via,
         pinned_unusable: pinned.is_some(),
+        pinned,
+        pinned_via,
         pinned_installed,
         alternative_usable,
-    })
+        not_switched,
+    }
 }
 
 /// What the modal shows as the pin's origin: the env var's name, or the
@@ -218,6 +250,43 @@ fn pin_source_label(source: RuntimePinSource) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R11 L6: the reason the stale record was not switched reaches the
+    /// modal on the refused-pin path — and only there.
+    #[test]
+    fn the_modal_carries_why_the_stale_record_was_not_switched() {
+        let why = "docker is not installed; podman holds none of VCO's data";
+        let refused = RuntimeDetection {
+            info: None,
+            not_switched: Some(why.into()),
+            refusal: Some("pinned to docker".into()),
+        };
+        let av = availability(
+            &refused,
+            "linux".into(),
+            Some("docker".into()),
+            Some("/i/state/install/runtime.txt".into()),
+            false,
+            Some("podman".into()),
+        );
+        assert!(!av.available && av.pinned_unusable);
+        assert_eq!(av.not_switched.as_deref(), Some(why));
+        // The field serialises under the name the frontend reads.
+        let json = serde_json::to_value(&av).unwrap();
+        assert_eq!(json["not_switched"], serde_json::json!(why));
+        // No pin → nothing to explain; nothing refused → nothing either.
+        let unpinned = availability(&refused, "linux".into(), None, None, false, None);
+        assert_eq!(unpinned.not_switched, None);
+        let quiet = availability(
+            &RuntimeDetection::default(),
+            "linux".into(),
+            Some("docker".into()),
+            None,
+            false,
+            None,
+        );
+        assert_eq!(quiet.not_switched, None);
+    }
 
     #[test]
     fn the_pin_source_names_the_env_var_or_the_record_file() {

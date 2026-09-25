@@ -82,7 +82,7 @@ def test_the_order_rule_matches_the_shared_fixture(case: dict):
     and a name resolves along that order. The Rust suite runs the same cases
     (`runtime.rs::tool_search_order_matches_the_shared_fixture`)."""
     entries = tsd.search_entries(os_name=case["os"], home=case["home"], env=case["env"])
-    order = tsd.lookup_entries(case["path"], entries)
+    order = tsd.lookup_entries(case["path"], entries, windows=case["os"] == "windows")
     assert order == case["expect_path"]
     sep = "\\" if case["os"] == "windows" else "/"
     binaries = set(case["binaries"])
@@ -112,13 +112,16 @@ def test_the_volume_name_keys_are_compose_envs_knobs():
 
 class Machine:
     """``installed`` / ``up`` per runtime; ``containers`` / ``volumes`` are
-    what ``ps -a`` / ``volume ls`` list under each. Records every argv."""
+    what ``ps -a`` / ``volume ls`` list under each, ``running`` what ``ps``
+    lists (default: none of them runs — R11 L2). Records every argv."""
 
-    def __init__(self, *, installed=(), up=(), containers_=None, volumes=None, start_ok=()):
+    def __init__(self, *, installed=(), up=(), containers_=None, volumes=None, start_ok=(),
+                 running=None):
         self.installed = set(installed)
         self.up = set(up)
         self.containers = {k: list(v) for k, v in (containers_ or {}).items()}
         self.volumes = {k: list(v) for k, v in (volumes or {}).items()}
+        self.running = {k: list(v) for k, v in (running or {}).items()}
         self.start_ok = set(start_ok)
         self.calls: list[list[str]] = []
         self.started: list[str] = []
@@ -136,6 +139,9 @@ class Machine:
         elif rest[:2] == ["ps", "-a"]:
             ok = ok and rt in self.up
             out = "".join(n + "\n" for n in self.containers.get(rt, ["someone_elses_ollama"]))
+        elif rest[:2] == ["ps", "--format"]:
+            ok = ok and rt in self.up
+            out = "".join(n + "\n" for n in self.running.get(rt, []))
         elif rest[:2] == ["volume", "ls"]:
             ok = ok and rt in self.up
             out = "".join(n + "\n" for n in self.volumes.get(rt, ["someone_elses_data"]))
@@ -835,6 +841,66 @@ def test_a_slow_refusal_record_never_blocks_the_watchdogs_foreground(tmp_path, s
             break
         time.sleep(0.2)
     assert [e.condition_id for e in entries] == [rr.CID_UNUSABLE], proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("shell", [
+    pytest.param("bash", marks=pytest.mark.skipif(not POSIX or BASH is None, reason="bash hook")),
+    pytest.param("pwsh", marks=pytest.mark.skipif(not POSIX or BASH is None or PWSH is None,
+                                                  reason="pwsh + bash stubs")),
+])
+def test_a_refused_pin_record_leaves_no_temp_files_behind(tmp_path, shell):
+    """R11 L4 — the detached refused-pin record leaves NOTHING per-run in the
+    fixture's TEMP. The .sh sibling sends both streams to /dev/null; the .ps1
+    used to redirect to ``vco-record-refusal.$PID.out`` + ``.err`` under
+    ``[IO.Path]::GetTempPath()`` and never remove them — two leaked files per
+    session on a refused pin (the J1 class, on the sibling J5 just touched).
+    The pwsh fix keeps ONE fixed per-user pair (``vco-record-refusal.log`` /
+    ``.log.err``, truncated each spawn), so the invariant pinned here is: after
+    TWO refused-pin sessions the TEMP listing of ``vco-record-refusal.*`` is
+    identical between runs and holds no PID-shaped name (the leak always
+    carried the spawning pwsh's numeric PID)."""
+    from tests.test_v0297_lifecycle_hooks import SENTINEL_MANAGED, _Machine
+
+    def _run_once() -> list[str]:
+        machine_dir = tmp_path / f"machine-{time.monotonic_ns()}"
+        machine_dir.mkdir()
+        m = _Machine(machine_dir, SENTINEL_MANAGED, {})
+        _stub(m.bin / "docker", "#!/usr/bin/env bash\nexit 1\n")
+        root = _installed_clone(tmp_path / f"installed-{time.monotonic_ns()}")
+        project = tmp_path / f"project-{time.monotonic_ns()}"
+        project.mkdir()
+        script = REPO_ROOT / "templates" / "hooks" / \
+            f"verify-container-ports.{('sh' if shell == 'bash' else 'ps1')}"
+        argv = ([BASH or "bash", str(script)] if shell == "bash" else
+                [PWSH or "pwsh", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(script)])
+        # _Machine.env points TMPDIR/TEMP at the machine's own tmp dir, so the
+        # hook's GetTempPath() (pwsh) resolves there — any leak lands in m.tmp.
+        env = m.env(VCT_CONTAINER_RUNTIME="docker", VCT_INSTALL_ROOT=str(root),
+                    CLAUDE_PROJECT_DIR=str(project))
+        env[tsd.ENV_OVERRIDE] = ""
+        proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=180,
+                              cwd=str(REPO_ROOT))
+        assert proc.returncode == 0, proc.stdout + proc.stderr
+        assert "VCT_CONTAINER_RUNTIME=docker" in proc.stdout, proc.stdout + proc.stderr
+        # The detached record must still land (the fix changes WHERE its
+        # output goes, not WHETHER it runs).
+        deadline = time.monotonic() + 30  # the hook may relay a detached child
+        entries: list = []
+        while time.monotonic() < deadline:
+            entries = DeferralReport.read(root).entries
+            if entries:
+                break
+            time.sleep(0.2)
+        assert [e.condition_id for e in entries] == [rr.CID_UNUSABLE], proc.stdout + proc.stderr
+        return sorted(p.name for p in m.tmp.iterdir()
+                      if p.name.startswith("vco-record-refusal."))
+
+    first = _run_once()
+    second = _run_once()
+    # One fixed truncated pair at most (.log / .log.err — names with no PID);
+    # nothing per-run, nothing growing between sessions.
+    assert first == second, (first, second)
+    assert not [n for n in first if any(c.isdigit() for c in n)], first
 
 
 # Tools a session hook may call by name. The hermetic PATH below holds ONLY

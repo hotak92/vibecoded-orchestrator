@@ -260,7 +260,7 @@ owner = "vco_lib.runtime_reconcile"
 clear_probe = "probe:py:container_runtime_data_still_under_both"
 emit_surfaces = ["ledger"]
 dismiss_key = ["recorded", "root"]
-notes = """v0.2.97 (R8 G1 case c): podman AND docker both hold VCO containers/volumes; the recorded runtime was kept. Clears once the user confirms a runtime (`install.py --update --container <x>` writes `state/install/runtime.confirmed`) or VCO's data is no longer under both."""
+notes = """v0.2.97 (R8 G1 case c): podman AND docker both hold VCO containers/volumes; the recorded runtime was kept. R11 L2: also written when VCO's data is a bind-mounted host folder and the OTHER runtime holds VCO containers that are not running beside it (either runtime could serve the folder) — the recorded runtime is kept when it answers; when it is not installed nothing is started. Clears once the user confirms a runtime (`install.py --update --container <x>` writes `state/install/runtime.confirmed`) or VCO's data is no longer under both (the probe asks the same bind-layout rule the reconcile applies)."""
 
 [conditions.adopted_service_config_drift]
 class = "environmental"

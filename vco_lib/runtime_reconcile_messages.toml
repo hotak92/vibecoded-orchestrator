@@ -32,6 +32,7 @@ down = "{pinned} is installed but does not answer `{pinned} info`"
 [not_switched]
 confirmed = "; {pinned} is your confirmed choice (`install.py --container {pinned}`), so VCO does not switch to {other}"
 bind_data = "; VCO's data is in the bind-mounted folder {bind} on this host, so VCO does not switch to {other} on the strength of {other}'s volumes"
+data_under_both = "; VCO's data is in the bind-mounted folder {bind} on this host and {other} holds VCO containers that are not running — either runtime could serve that folder, so VCO starts nothing until you choose (`python install.py --update --container {pinned}` or `--container {other}`)"
 other_not_usable = ", and {other} is not usable either"
 unlistable = "; {other} answers but its containers/volumes could not be listed"
 no_data = "; {other} answers but holds none of VCO's containers or volumes — not switching to it here (run `python install.py --update` to re-record the runtime)"

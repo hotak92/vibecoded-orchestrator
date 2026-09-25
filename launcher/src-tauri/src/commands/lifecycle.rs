@@ -3,7 +3,9 @@ use std::path::PathBuf;
 use tauri::{command, AppHandle, Emitter, State};
 
 use crate::db::Db;
-use crate::services::runtime::{detect_runtime, RuntimeInfo};
+use crate::services::runtime::{
+    detect_runtime, detect_runtime_detailed, require_runtime, RuntimeDetection, RuntimeInfo,
+};
 use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::services::service_endpoints::{
@@ -392,9 +394,9 @@ pub async fn services_get_endpoints() -> Result<Vec<(String, Option<ServiceEndpo
 pub async fn recover_zombie(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
     let service = CoreService::from_name(&name).ok_or("unknown service")?;
-    let info = detect_runtime()
+    let info = require_runtime()
         .await
-        .ok_or("No container runtime found; cannot recover a stuck container")?;
+        .map_err(|why| format!("{why} (cannot recover a stuck container without it)"))?;
     let row = machine_row_from_disk(service);
     match zombie_route(service, row.as_ref()) {
         LifecycleRoute::Compose { service: svc } => {
@@ -451,9 +453,7 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
 /// Idempotent.
 #[command]
 pub async fn services_start_all() -> Result<(), String> {
-    let info = detect_runtime()
-        .await
-        .ok_or("No container runtime found. Install Podman or Docker.")?;
+    let info = require_runtime().await?;
     let rows = machine_rows_from_disk();
     let managed = start_all_compose_services(&rows);
 
@@ -488,7 +488,7 @@ pub async fn services_start_all() -> Result<(), String> {
 /// stopped service so the hub's watchdog knows the stop was deliberate.
 #[command]
 pub async fn services_stop_all() -> Result<(), String> {
-    let info = detect_runtime().await.ok_or("No container runtime found.")?;
+    let info = require_runtime().await?;
     let managed = compose_managed_services(&machine_rows_from_disk());
     for name in &managed {
         let service = CoreService::from_name(name).ok_or("unknown service")?;
@@ -502,7 +502,7 @@ pub async fn services_stop_all() -> Result<(), String> {
 /// missing one is created through the `up` rule).
 #[command]
 pub async fn services_restart_all() -> Result<(), String> {
-    let info = detect_runtime().await.ok_or("No container runtime found.")?;
+    let info = require_runtime().await?;
     let managed = compose_managed_services(&machine_rows_from_disk());
     set_pause_markers(&managed, false);
     let mut errors: Vec<String> = Vec::new();
@@ -553,7 +553,7 @@ fn set_pause_marker_for_service(name: &str, pause: bool) {
 #[command]
 pub async fn service_start(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
-    let info = detect_runtime().await.ok_or("No container runtime found.")?;
+    let info = require_runtime().await?;
     route_service_action(&info, &name, "start").await?;
     set_pause_marker_for_service(&name, false);
     Ok(())
@@ -563,7 +563,7 @@ pub async fn service_start(name: String) -> Result<(), String> {
 #[command]
 pub async fn service_stop(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
-    let info = detect_runtime().await.ok_or("No container runtime found.")?;
+    let info = require_runtime().await?;
     route_service_action(&info, &name, "stop").await?;
     set_pause_marker_for_service(&name, true);
     Ok(())
@@ -573,7 +573,7 @@ pub async fn service_stop(name: String) -> Result<(), String> {
 #[command]
 pub async fn service_restart(name: String) -> Result<(), String> {
     validate_service_name(&name)?;
-    let info = detect_runtime().await.ok_or("No container runtime found.")?;
+    let info = require_runtime().await?;
     route_service_action(&info, &name, "restart").await?;
     set_pause_marker_for_service(&name, false);
     Ok(())
@@ -912,6 +912,16 @@ pub(crate) fn choice_event_payload(
     serde_json::json!({ "pending": pending, "rows": rows, "detection": detection })
 }
 
+/// What the boot path says when there is no runtime to drive (v0.2.97 R11
+/// L6), and whether it also offers the "install a container runtime"
+/// dialog: a refused PIN says the pin was refused and why (and offers no
+/// install — the runtime may well be installed, only down, or the user's
+/// data may be under the pinned one); only "nothing installed or usable"
+/// is "No container runtime found". Pure.
+pub(crate) fn boot_without_runtime(detection: &RuntimeDetection) -> (String, bool) {
+    (detection.no_runtime_message(), detection.refusal.is_none())
+}
+
 /// Auto-start the shared services on launcher boot (background task).
 ///
 ///   1. Detect the runtime. Missing → emit `runtime_missing` (unless
@@ -928,7 +938,8 @@ pub async fn auto_start_on_boot(app: AppHandle) {
     };
     emit("detecting_runtime", "Detecting container runtime…".into());
 
-    let info = match detect_runtime().await {
+    let detection = detect_runtime_detailed().await;
+    let info = match detection.info.clone() {
         Some(i) => i,
         None => {
             if services_already_running().await {
@@ -939,10 +950,14 @@ pub async fn auto_start_on_boot(app: AppHandle) {
                 emit("started", "Services already running.".into());
                 return;
             }
-            emit(
-                "runtime_missing",
-                "No container runtime found. Install Podman or Docker to run VCT services.".into(),
-            );
+            let (message, offer_install) = boot_without_runtime(&detection);
+            emit("runtime_missing", message);
+            if !offer_install {
+                // R11 L6: a REFUSED pin is not "no runtime": the message above
+                // names the pin, why the stale record was not switched and
+                // what to do — the "install a runtime" dialog would contradict it.
+                return;
+            }
             let os = if cfg!(target_os = "linux") {
                 "linux"
             } else if cfg!(target_os = "macos") {
@@ -1018,6 +1033,30 @@ pub async fn auto_start_on_boot(app: AppHandle) {
 #[cfg(test)]
 mod services_lifecycle_tests {
     use super::*;
+
+    /// R11 L6: the start path says a refused pin was refused and WHY —
+    /// never "No container runtime found" — and does not offer to install
+    /// a runtime; with no pin at all it still says "no runtime" and offers.
+    #[test]
+    fn the_start_path_says_a_pin_was_refused_and_why() {
+        let refused = RuntimeDetection {
+            info: None,
+            not_switched: Some("podman holds none of VCO's data".into()),
+            refusal: Some(
+                "The container runtime is pinned to docker by /i/state/install/runtime.txt, and \
+                 docker is not installed (not switched: podman holds none of VCO's data)."
+                    .into(),
+            ),
+        };
+        let (message, offer_install) = boot_without_runtime(&refused);
+        assert!(message.contains("pinned to docker"), "{message}");
+        assert!(message.contains("(not switched: podman holds none of VCO's data)"), "{message}");
+        assert!(!message.contains("No container runtime found"), "{message}");
+        assert!(!offer_install, "a refused pin is not an absent runtime");
+        let (message, offer_install) = boot_without_runtime(&RuntimeDetection::default());
+        assert!(message.starts_with("No container runtime found"), "{message}");
+        assert!(offer_install);
+    }
 
     fn row(service: &str, mode: EndpointMode, port: u16) -> ServiceEndpointRow {
         let mut r = ServiceEndpointRow::new(service, mode, "localhost", port);

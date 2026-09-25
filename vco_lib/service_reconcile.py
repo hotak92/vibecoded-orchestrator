@@ -1336,12 +1336,7 @@ def reconcile(
         return result
 
     if installer_project is None:
-        infra = root / "infrastructure"
-        try:
-            text = (infra / "docker-compose.yml").read_text(encoding="utf-8")
-        except OSError:
-            text = ""
-        installer_project = _containers.compose_project_name(infra, text)
+        installer_project = _containers.own_compose_project(root)
     extra: list[_det.Endpoint] = []
     for stmt in [*legacy.statements, *legacy.continuity.values()]:
         extra.append(_det.Endpoint(stmt.service, stmt.host, stmt.port, stmt.scheme,

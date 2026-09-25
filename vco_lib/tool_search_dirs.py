@@ -64,6 +64,7 @@ __all__ = [
     "candidate_dirs",
     "expand_entry",
     "lookup_entries",
+    "path_key",
     "os_key",
     "path_separator",
     "reachable_path",
@@ -199,18 +200,44 @@ def candidate_dirs(
     return [d for d, _p in search_entries(os_name=os_name, home=home, env=env)]
 
 
-def lookup_entries(current: Sequence[str], entries: Sequence[Entry]) -> list[str]:
+def path_key(entry: str, *, windows: bool) -> str:
+    """What two PATH entries are compared by (R11 L5): duplicate separators
+    collapsed and trailing ones dropped (a root stays a root), so
+    ``/opt/homebrew/bin/`` and ``//opt//homebrew/bin`` are ``/opt/homebrew/bin``;
+    on Windows also case-insensitive and ``/`` read as ``\\`` (a leading
+    ``\\\\`` UNC prefix and a drive root ``C:\\`` are kept). The entry itself is
+    never rewritten — only compared. MUST MATCH ``runtime.rs::path_key``
+    (``tests/fixtures/tool_search_dirs_cases.json`` ``order_cases`` run both)."""
+    sep = "\\" if windows else "/"
+    text = entry.replace("/", "\\").lower() if windows else entry
+    lead = ""
+    if windows and text.startswith("\\\\"):
+        lead, text = "\\\\", text[2:]
+    collapsed = re.sub(re.escape(sep) + "+", lambda _m: sep, text)
+    stripped = collapsed.rstrip(sep)
+    if not stripped and collapsed:
+        stripped = sep  # the root
+    elif windows and stripped != collapsed and re.fullmatch(r"[a-z]:", stripped):
+        stripped += sep  # a drive root, not the drive's current directory
+    return lead + stripped
+
+
+def lookup_entries(current: Sequence[str], entries: Sequence[Entry], *,
+                   windows: Optional[bool] = None) -> list[str]:
     """THE ORDER RULE, pure: the ``prepend-when-missing`` entries ``current``
     lacks (table order), then ``current`` unchanged, then the ``append``
-    entries it lacks (table order). An entry already in ``current`` is never
-    moved nor duplicated. MUST MATCH ``runtime.rs::augmented_entries``."""
-    present = set(current)
+    entries it lacks (table order). An entry already in ``current`` —
+    compared by :func:`path_key` (``windows`` defaults to this OS) — is never
+    moved nor duplicated. MUST MATCH ``runtime.rs::augmented_entries_for``."""
+    win = os_key() == "windows" if windows is None else windows
+    present = {path_key(c, windows=win) for c in current}
     before: list[str] = []
     after: list[str] = []
     for d, placement in entries:
-        if d in present:
+        key = path_key(d, windows=win)
+        if key in present:
             continue
-        present.add(d)
+        present.add(key)
         (before if placement == PLACEMENT_PREPEND else after).append(d)
     return before + list(current) + after
 

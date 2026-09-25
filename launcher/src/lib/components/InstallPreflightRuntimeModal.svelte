@@ -54,6 +54,7 @@
     preflightBusy,
     scheduleProceed,
   } from '$lib/components/install-preflight-gate';
+  import { notSwitchedReason } from '$lib/runtime-refusal';
 
   interface RuntimeAvailability {
     available: boolean;
@@ -72,6 +73,9 @@
     pinned_unusable?: boolean;
     pinned_installed?: boolean;
     alternative_usable?: string | null;
+    // R11 L6: why the install's stale runtime record was not switched to the
+    // other runtime — the wording every VCO surface shares.
+    not_switched?: string | null;
   }
 
   let {
@@ -123,6 +127,7 @@
   const pinnedVia = $derived(runtimeInfo?.pinned_via ?? 'VCT_CONTAINER_RUNTIME');
   const pinnedByRecord = $derived(pinnedVia !== 'VCT_CONTAINER_RUNTIME');
   const altUsable = $derived(runtimeInfo?.alternative_usable ?? null);
+  const notSwitched = $derived(notSwitchedReason(runtimeInfo));
   // A pinned runtime that IS installed needs starting, not installing. Offering
   // an install link there is the "could not distinguish" defect in the UI.
   const installUrl = $derived(
@@ -236,6 +241,11 @@
             rather than your knowledge graph.
           {/if}
         </p>
+        {#if notSwitched}
+          <p class="hint" data-testid="preflight-not-switched">
+            Why VCO kept the recorded runtime: {notSwitched}
+          </p>
+        {/if}
         <p class="hint">
           Start {pinnedName} and click "Detect again".
           {#if altUsable}

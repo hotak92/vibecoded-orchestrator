@@ -219,8 +219,10 @@ _log_foreign_record() {
 # of where the data is — its runtime is not installed (not on PATH nor in the
 # usual install locations) and the other one holds VCO's containers/volumes,
 # or it holds none of them while the other does — and nothing otherwise (then
-# the pin is refused as before). A bind-mounted data folder (R10 J2) is data
-# under the recorded runtime: never switched away from here. "No VCO data anywhere" is never switched
+# the pin is refused as before). Under a bind-mounted data folder (R10 J2,
+# R11 L2/L3) only VCO containers RUNNING under the other runtime — or every
+# service's data being a folder — switch; a leftover volume there never does.
+# "No VCO data anywhere" is never switched
 # here (R9 H1: install.py decides that one), nor is a runtime the user
 # confirmed with `install.py --container` (R9 H2). The next install/update
 # re-records it.

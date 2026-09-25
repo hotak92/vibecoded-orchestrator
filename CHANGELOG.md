@@ -459,16 +459,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   never starts the stack on empty volumes. A volume name you picked with
   `VCT_*_VOLUME_NAME` counts as VCO's data there only next to a VCO container
   or with VCO's compose label, so an unrelated volume of the same name cannot
-  move the record; a service whose data lives in a folder
-  (`VCT_*_DATA_SOURCE`) keeps its recorded runtime while the folder holds
-  data. A runtime installed outside the calling
+  move the record. A service whose data lives in a folder
+  (`VCT_*_DATA_SOURCE`) keeps its recorded runtime against a leftover volume
+  under the other runtime, but VCO follows its containers when they are
+  running under the other one; if the other runtime holds stopped VCO
+  containers beside the folder, nothing starts until you pick a runtime with
+  `install.py --update --container <podman|docker>`. When every service's
+  data is in a folder, a runtime that is gone is simply re-recorded, since no
+  volume is left behind. A data folder VCO cannot look into counts as data,
+  instead of stopping sessions, the boot service or an update with an
+  error. A runtime installed outside the calling
   program's `PATH` (`~/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
   `/usr/local/bin`, Docker Desktop's folders, the Windows installer folders)
   is now found instead of being treated as not installed;
   `VCT_TOOL_SEARCH_DIRS` replaces the list of places searched. These extra
   places come after your `PATH`, so they never replace a program your `PATH`
   already finds; a launcher started from Finder or a desktop icon still puts
-  Homebrew, cargo and `~/.local/bin` first, as it has since v0.2.53. On macOS, the
+  Homebrew, cargo and `~/.local/bin` first, as it has since v0.2.53, and the
+  hub, the session hooks, the boot service and the installer now look tools
+  up in that same order. A `PATH` entry written with a trailing or doubled
+  slash (or, on Windows, in another case or with `/`) is recognised as
+  already present instead of being added again ahead of your `PATH`. When the
+  launcher or the hub refuses the recorded runtime, the install check, the
+  Services page and the hub's log name the pinned runtime, say why VCO did
+  not switch and what to do, instead of "No container runtime found". On macOS, the
   boot service no longer reports every runtime as unusable.
 - The boot service reads its own install's runtime record, never another
   copy's, and falls back to its own compose folder when the configured one is

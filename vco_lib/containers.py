@@ -93,6 +93,8 @@ __all__ = [
     "UnknownServiceError",
     "ComposeIdentity",
     "compose_project_name",
+    "compose_project_of",
+    "own_compose_project",
     "compose_identity_of",
     "foreign_compose_identity",
     # v0.2.92 (§3.5 / R13): runtime + compose resolution, the ONE Python home.
@@ -399,6 +401,34 @@ def compose_project_name(compose_dir: Path, compose_text: str = "") -> str:
         return m.group(1)
     raw = Path(compose_dir).name.lower()
     return re.sub(r"[^a-z0-9_-]", "", raw).lstrip("-_")
+
+
+def compose_project_of(compose_file: Path) -> str:
+    """The compose project ``compose_file`` runs under:
+    :func:`compose_project_name` of its directory and its text (an unreadable
+    file derives from the directory alone). The ONE reader of "which project
+    does this compose file bring up" — every call-site used to inline the same
+    read-then-derive lines (v0.2.97 review R11 L7)."""
+    compose_file = Path(compose_file)
+    try:
+        text = compose_file.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        text = ""
+    return compose_project_name(compose_file.parent, text)
+
+
+def own_compose_project(install_root: Optional[Path]) -> str:
+    """The compose project VCO's OWN stack runs under — the installer's
+    ``<install_root>/infrastructure/docker-compose.yml``, which is what the
+    compose identity guard compares a container's label against and what a
+    volume compose created for VCO carries in ``com.docker.compose.project``.
+    ``""`` without an install root. MUST MATCH
+    ``runtime_evidence.rs::vco_compose_project`` (the declared Rust mirror,
+    pinned by ``tests/fixtures/runtime_data_evidence_cases.json``
+    ``compose_project``)."""
+    if install_root is None:
+        return ""
+    return compose_project_of(Path(install_root) / "infrastructure" / "docker-compose.yml")
 
 
 def compose_identity_of(
@@ -1052,11 +1082,17 @@ def resolve(
         from vco_lib.runtime_reconcile import reconcile as _record_reconcile
 
         probes[pref] = _probe_one(pref)  # "missing" — the ladder's own verdict
-        rec = _record_reconcile(root, env=env, which=_which, run=_run, rewrite=False)
-        if (rec.outcome is _Outcome.REWRITTEN and rec.runtime in RUNTIME_CANDIDATES):
+        try:
+            rec = _record_reconcile(root, env=env, which=_which, run=_run, rewrite=False)
+        except Exception as exc:  # noqa: BLE001 — a reconcile defect keeps the strict refusal
+            # R11 L1: the promise above — a failed reconcile never takes the
+            # resolver (and every session hook behind it) down with it.
+            rec = None
+            record_refusal_note = f"the runtime-record reconcile failed: {exc}"
+        if rec is not None and rec.outcome is _Outcome.REWRITTEN and rec.runtime in RUNTIME_CANDIDATES:
             order = [rec.runtime]
             record_note = rec.detail
-        elif rec.outcome is _Outcome.UNUSABLE and rec.detail:
+        elif rec is not None and rec.outcome is _Outcome.UNUSABLE and rec.detail:
             record_refusal_note = rec.detail
 
     for candidate in order:

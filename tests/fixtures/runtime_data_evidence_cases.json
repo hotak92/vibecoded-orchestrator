@@ -12,7 +12,15 @@
     "that runtime this way): a vco_/vct_ container or a vco_* default volume counts on its own; a VCT_*_VOLUME_NAME",
     "override name (a name the user picked) counts only with its compose project label naming `own_project`.",
     "`not_switched`: the refusal detail when the stale-record reconcile declines, rendered from",
-    "vco_lib/runtime_reconcile_messages.toml by both languages; `source` is passed in as-is."
+    "vco_lib/runtime_reconcile_messages.toml by both languages; `source` is passed in as-is.",
+    "R11 L1/L2/L3 — `kind`: WHAT a runtime's listings show of VCO's data (`running` = a VCO container `ps` lists,",
+    "`stopped` = one only `ps -a` lists, `volumes` = the `evidence` volume rule with corroboration, else `none`).",
+    "`bind_verdict`: what a bind layout makes of the OTHER runtime's kind — running VCO containers switch (`both` when",
+    "VCO containers run under the recorded runtime too); every service a folder with the recorded runtime NOT installed",
+    "switches; stopped VCO containers are `both`; otherwise `keep`. `all_bind`: does every VCT_*_DATA_SOURCE resolve to a",
+    "path (the environment's value when set, even empty, else the LAST .env assignment)? `bind_probe`: is a folder in",
+    "this `setup` VCO's data — missing / a file / empty are not; an entry, an unsearchable parent (EACCES) or an",
+    "unlistable folder are (not provably empty; never an error)."
   ],
   "compose_project": [
     {"name": "the_infrastructure_dir", "compose_dir": "infrastructure", "compose_text": "services: {}\n", "expect": "infrastructure"},
@@ -44,6 +52,60 @@
     {"name": "bind_data", "pinned": "podman", "source": "/i/state/install/runtime.txt", "decline": "bind_data", "bind": "/srv/weaviate", "expect": "the container runtime is pinned to podman by /i/state/install/runtime.txt: podman is not installed (not on PATH nor in the usual install locations); VCO's data is in the bind-mounted folder /srv/weaviate on this host, so VCO does not switch to docker on the strength of docker's volumes"},
     {"name": "other_not_usable", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "other_not_usable", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations), and podman is not usable either"},
     {"name": "unlistable", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "unlistable", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); podman answers but its containers/volumes could not be listed"},
-    {"name": "no_data", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "no_data", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); podman answers but holds none of VCO's containers or volumes — not switching to it here (run `python install.py --update` to re-record the runtime)"}
+    {"name": "no_data", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "no_data", "bind": "", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); podman answers but holds none of VCO's containers or volumes — not switching to it here (run `python install.py --update` to re-record the runtime)"},
+    {"name": "data_under_both", "pinned": "docker", "source": "/i/state/install/runtime.txt", "decline": "data_under_both", "bind": "/srv/weaviate", "expect": "the container runtime is pinned to docker by /i/state/install/runtime.txt: docker is not installed (not on PATH nor in the usual install locations); VCO's data is in the bind-mounted folder /srv/weaviate on this host and podman holds VCO containers that are not running — either runtime could serve that folder, so VCO starts nothing until you choose (`python install.py --update --container docker` or `--container podman`)"}
+  ],
+  "kind": [
+    {"name": "a_running_vco_container_is_running", "containers": ["vco_weaviate", "vco_ollama"], "running": ["vco_ollama"], "volumes": [], "env_file": "", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "running"},
+    {"name": "a_vco_container_ps_does_not_list_is_stopped", "containers": ["vco_weaviate"], "running": ["someone_elses_ollama"], "volumes": ["vco_weaviate_data"], "env_file": "", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "stopped"},
+    {"name": "a_legacy_vct_container_counts_as_a_vco_container", "containers": ["vct_code_embed"], "running": ["vct_code_embed"], "volumes": [], "env_file": "", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "running"},
+    {"name": "only_a_default_volume_is_volumes", "containers": ["someone_elses_ollama"], "running": ["someone_elses_ollama"], "volumes": ["vco_ollama_data"], "env_file": "", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "volumes"},
+    {"name": "an_unprefixed_container_is_not_vcos", "containers": ["ollama"], "running": ["ollama"], "volumes": [], "env_file": "", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "none"},
+    {"name": "an_uncorroborated_override_volume_is_none", "containers": [], "running": [], "volumes": ["ollama"], "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "labels": {}, "expect": "none"},
+    {"name": "a_labelled_override_volume_is_volumes", "containers": [], "running": [], "volumes": ["ollama"], "env_file": "VCT_OLLAMA_VOLUME_NAME=ollama\n", "env": {}, "own_project": "infrastructure", "labels": {"ollama": "infrastructure"}, "expect": "volumes"}
+  ],
+  "bind_verdict": [
+    {"name": "running_missing_all_bind", "other": "running", "pinned_missing": true, "all_bind": true, "here_running": false, "expect": "switch"},
+    {"name": "running_missing_some_bind", "other": "running", "pinned_missing": true, "all_bind": false, "here_running": false, "expect": "switch"},
+    {"name": "running_usable_all_bind", "other": "running", "pinned_missing": false, "all_bind": true, "here_running": false, "expect": "switch"},
+    {"name": "running_usable_all_bind_here_running", "other": "running", "pinned_missing": false, "all_bind": true, "here_running": true, "expect": "both"},
+    {"name": "running_usable_some_bind", "other": "running", "pinned_missing": false, "all_bind": false, "here_running": false, "expect": "switch"},
+    {"name": "running_usable_some_bind_here_running", "other": "running", "pinned_missing": false, "all_bind": false, "here_running": true, "expect": "both"},
+    {"name": "stopped_missing_all_bind", "other": "stopped", "pinned_missing": true, "all_bind": true, "here_running": false, "expect": "switch"},
+    {"name": "stopped_missing_some_bind", "other": "stopped", "pinned_missing": true, "all_bind": false, "here_running": false, "expect": "both"},
+    {"name": "stopped_usable_all_bind", "other": "stopped", "pinned_missing": false, "all_bind": true, "here_running": false, "expect": "both"},
+    {"name": "stopped_usable_all_bind_here_running", "other": "stopped", "pinned_missing": false, "all_bind": true, "here_running": true, "expect": "both"},
+    {"name": "stopped_usable_some_bind", "other": "stopped", "pinned_missing": false, "all_bind": false, "here_running": false, "expect": "both"},
+    {"name": "stopped_usable_some_bind_here_running", "other": "stopped", "pinned_missing": false, "all_bind": false, "here_running": true, "expect": "both"},
+    {"name": "volumes_missing_all_bind", "other": "volumes", "pinned_missing": true, "all_bind": true, "here_running": false, "expect": "switch"},
+    {"name": "volumes_missing_some_bind", "other": "volumes", "pinned_missing": true, "all_bind": false, "here_running": false, "expect": "keep"},
+    {"name": "volumes_usable_all_bind", "other": "volumes", "pinned_missing": false, "all_bind": true, "here_running": false, "expect": "keep"},
+    {"name": "volumes_usable_all_bind_here_running", "other": "volumes", "pinned_missing": false, "all_bind": true, "here_running": true, "expect": "keep"},
+    {"name": "volumes_usable_some_bind", "other": "volumes", "pinned_missing": false, "all_bind": false, "here_running": false, "expect": "keep"},
+    {"name": "volumes_usable_some_bind_here_running", "other": "volumes", "pinned_missing": false, "all_bind": false, "here_running": true, "expect": "keep"},
+    {"name": "none_missing_all_bind", "other": "none", "pinned_missing": true, "all_bind": true, "here_running": false, "expect": "switch"},
+    {"name": "none_missing_some_bind", "other": "none", "pinned_missing": true, "all_bind": false, "here_running": false, "expect": "keep"},
+    {"name": "none_usable_all_bind", "other": "none", "pinned_missing": false, "all_bind": true, "here_running": false, "expect": "keep"},
+    {"name": "none_usable_all_bind_here_running", "other": "none", "pinned_missing": false, "all_bind": true, "here_running": true, "expect": "keep"},
+    {"name": "none_usable_some_bind", "other": "none", "pinned_missing": false, "all_bind": false, "here_running": false, "expect": "keep"},
+    {"name": "none_usable_some_bind_here_running", "other": "none", "pinned_missing": false, "all_bind": false, "here_running": true, "expect": "keep"}
+  ],
+  "all_bind": [
+    {"name": "every_service_a_folder", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\n", "env": {}, "expect": true},
+    {"name": "the_code_embed_cache_is_a_service_too", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\n", "env": {}, "expect": false},
+    {"name": "a_volume_name_for_one_service_is_not_all", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=my_ollama\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\n", "env": {}, "expect": false},
+    {"name": "the_environment_completes_the_file", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\n", "env": {"VCT_CODE_EMBED_CACHE_SOURCE": "~/cache"}, "expect": true},
+    {"name": "the_environment_wins_even_empty", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\n", "env": {"VCT_OLLAMA_DATA_SOURCE": ""}, "expect": false},
+    {"name": "the_last_file_assignment_counts", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\nVCT_CODE_EMBED_CACHE_SOURCE=vco_code_embed_cache\n", "env": {}, "expect": false},
+    {"name": "relative_and_windows_paths_are_folders", "env_file": "VCT_WEAVIATE_DATA_SOURCE=./data/w\nVCT_OLLAMA_DATA_SOURCE=D:\\vco\\ollama\nVCT_CODE_EMBED_CACHE_SOURCE=\\\\nas\\cache\n", "env": {}, "expect": true},
+    {"name": "nothing_set_is_all_volumes", "env_file": "", "env": {}, "expect": false}
+  ],
+  "bind_probe": [
+    {"name": "a_missing_folder_is_not_data", "setup": "missing", "expect": false},
+    {"name": "a_file_is_not_a_data_folder", "setup": "file", "expect": false},
+    {"name": "an_empty_folder_is_not_data", "setup": "empty", "expect": false},
+    {"name": "a_folder_with_an_entry_is_data", "setup": "non_empty", "expect": true},
+    {"name": "a_folder_under_an_unsearchable_parent_is_not_provably_empty", "setup": "unsearchable_parent", "expect": true},
+    {"name": "a_folder_this_user_cannot_list_is_not_provably_empty", "setup": "unlistable", "expect": true}
   ]
 }

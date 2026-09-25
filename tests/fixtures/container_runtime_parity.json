@@ -56,7 +56,14 @@
     "\"(not switched: <that detail>)\" and so does the Rust refusal (module plane + hub supervisor), rendered from the",
     "same table. R10 J2: `bind_data: true` = the install's infrastructure/.env relocates a service's data to a",
     "non-empty host folder (VCT_*_DATA_SOURCE=<dir>): the data is under neither runtime, so no surface switches the",
-    "record away — even when the other runtime lists VCO's volumes."
+    "record away — even when the other runtime lists VCO's volumes.",
+    "v0.2.97 R11 L2/L3: `vco_data_kind` refines `vco_data_under` for a runtime - `running` (a VCO container `ps` lists),",
+    "`stopped` (only `ps -a` lists it) or `volumes` (no VCO container, a VCO volume); a `vco_data_under: true` without it",
+    "means `running`. `bind_data` may also be `all`: EVERY service's data (Weaviate, Ollama, the code_embed cache) is a",
+    "non-empty host folder. Under a bind layout the other runtime's listing is read in this order: RUNNING VCO containers",
+    "switch (the stack lives there); every service a folder with the recorded runtime NOT installed switches (no named",
+    "volume is stranded); STOPPED VCO containers are data under both (`expect_not_switched: data_under_both`); a leftover",
+    "volume alone never switches (`bind_data`)."
   ],
   "scenarios": [
     {
@@ -894,7 +901,7 @@
     },
     {
       "name": "runtime_txt_stale_record_bind_data_is_never_switched",
-      "_why": "R10 J2: the launcher relocated Weaviate's data to a host folder (VCT_WEAVIATE_DATA_SOURCE=<dir>, non-empty); runtime.txt records docker, which this process cannot find; podman answers and even lists VCO's volumes (a leftover of an earlier trial). The data is on the HOST, not in either runtime's volumes, so nothing here says it belongs to podman: refused everywhere, the refusal says why; install keeps the record (action_required).",
+      "_why": "R10 J2 / R11 L2 (iii): the launcher relocated Weaviate's data to a host folder (VCT_WEAVIATE_DATA_SOURCE=<dir>, non-empty); runtime.txt records docker, which this process cannot find; podman answers and lists only a LEFTOVER vco_weaviate_data volume (an earlier trial) - no VCO container. The data is on the HOST, and a volume is not evidence about it: refused everywhere, the refusal says why; install keeps the record (action_required).",
       "env": null,
       "runtime_txt": "docker",
       "on_path": [
@@ -915,6 +922,9 @@
         "podman": true
       },
       "bind_data": true,
+      "vco_data_kind": {
+        "podman": "volumes"
+      },
       "expect": {
         "state": "absent",
         "runtime": null,
@@ -934,6 +944,179 @@
         }
       },
       "expect_not_switched": "bind_data"
+    },
+    {
+      "name": "runtime_txt_stale_record_bind_data_running_containers_switch",
+      "_why": "R11 L2 (i): Weaviate's data is a host folder; runtime.txt records docker (not found); podman answers and is RUNNING VCO's containers. A running VCO container is positive evidence that the stack lives under podman - it outranks the folder rule, and no volume is created for containers that already run: every surface drives podman (read-only), install re-records it (informational).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "vco_data_kind": {
+        "podman": "running"
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_bind_data_stopped_containers_is_data_under_both",
+      "_why": "R11 L2 (ii): Weaviate's data is a host folder; runtime.txt records docker (not found); podman answers and holds VCO containers that are NOT running. Either runtime could serve that folder - data under both: refused everywhere with the reason; install records container_runtime_data_under_both (action_required).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "vco_data_kind": {
+        "podman": "stopped"
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "data_under_both"
+    },
+    {
+      "name": "runtime_txt_stale_record_all_bind_switches_without_data",
+      "_why": "R11 L3: EVERY service's data (Weaviate, Ollama, the code_embed cache) is a host folder, so no named volume is in play; runtime.txt records docker (not installed) and podman answers holding none of VCO's containers or volumes. Switching strands nothing: every surface drives podman (read-only too), install re-records it.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "bind_data": "all",
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_all_bind_switches_over_stopped_containers",
+      "_why": "R11 L3 over L2 (ii): every service's data is a host folder and the recorded docker is NOT installed, so it cannot serve that folder; podman holds stopped VCO containers. Nothing can run under both and no named volume is stranded: switched to podman.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": "all",
+      "vco_data_kind": {
+        "podman": "stopped"
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
     },
     {
       "name": "runtime_txt_stale_record_other_unlistable",

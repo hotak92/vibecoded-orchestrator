@@ -103,11 +103,7 @@ def foreign_owned_services(
     callers and mocks that pass nothing behave exactly as before."""
     if not services:
         return {}
-    try:
-        compose_text = compose_file.read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own = _containers.compose_project_name(infra_dir, compose_text)
+    own = _containers.compose_project_of(compose_file)
     out: dict[str, str] = {}
     for svc in dict.fromkeys(services):
         try:

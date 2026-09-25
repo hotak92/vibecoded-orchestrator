@@ -56,10 +56,16 @@ def _probes(sc: dict):
     (``vco_data_under`` / ``vco_data_unlistable``, v0.2.97 R8 follow-up): a
     runtime listed as holding VCO's data lists ``vco_*`` names, one that does
     not lists a foreign container, and an unlistable runtime's listing exits
-    non-zero."""
+    non-zero. ``vco_data_kind`` (R11 L2) says WHAT it holds: a ``running``
+    VCO container (``ps`` lists it — the default for ``vco_data_under``), a
+    ``stopped`` one (``ps -a`` only) or only ``volumes``."""
     on_path = set(sc["on_path"]) | set(sc["standalone_on_path"])
     data = sc.get("vco_data_under") or {}
+    kinds = sc.get("vco_data_kind") or {}
     unlistable = set(sc.get("vco_data_unlistable") or [])
+
+    def kind(rt: str) -> str:
+        return kinds.get(rt) or ("running" if data.get(rt) else "none")
 
     def which(name: str) -> Optional[str]:
         return f"/usr/bin/{name}" if name in on_path else None
@@ -77,11 +83,16 @@ def _probes(sc: dict):
         if sub[:2] == ["ps", "-a"]:
             if rt in unlistable:
                 return _Result(1)
-            return _Result(0, "vco_weaviate\n" if data.get(rt) else "someone_elses_ollama\n")
+            return _Result(0, "vco_weaviate\n" if kind(rt) in ("running", "stopped")
+                           else "someone_elses_ollama\n")
+        if sub[:2] == ["ps", "--format"]:
+            if rt in unlistable:
+                return _Result(1)
+            return _Result(0, "vco_weaviate\n" if kind(rt) == "running" else "")
         if sub[:2] == ["volume", "ls"]:
             if rt in unlistable:
                 return _Result(1)
-            return _Result(0, "vco_weaviate_data\n" if data.get(rt) else "someone_elses_data\n")
+            return _Result(0, "vco_weaviate_data\n" if kind(rt) != "none" else "someone_elses_data\n")
         raise AssertionError(f"unexpected probe {argv!r}")
 
     # The fake's _Result is not a CompletedProcess subclass (see the
@@ -91,12 +102,13 @@ def _probes(sc: dict):
 
 
 def _install_root(tmp_path: Path, runtime_txt: Optional[str],
-                  confirmed: Optional[str] = None, bind_data: bool = False) -> Path:
+                  confirmed: Optional[str] = None, bind_data: object = False) -> Path:
     """An install root holding the scenario's ``state/install/runtime.txt``
     (or none) and, when the scenario declares ``runtime_confirmed``, its
     ``state/install/runtime.confirmed`` — never the machine's own clone, whose
     record would leak in. ``bind_data`` (R10 J2): its ``infrastructure/.env``
-    relocates Weaviate's data to a non-empty folder (``_bind_dir``)."""
+    relocates Weaviate's data to a non-empty folder (``_bind_dir``); ``"all"``
+    (R11 L3) relocates Ollama's and the code_embed cache's too."""
     root = tmp_path / "install-root"
     root.mkdir()
     if bind_data:
@@ -104,8 +116,14 @@ def _install_root(tmp_path: Path, runtime_txt: Optional[str],
         folder.mkdir(parents=True)
         (folder / "classifications.db").write_text("x", encoding="utf-8")
         (root / "infrastructure").mkdir()
-        (root / "infrastructure" / ".env").write_text(
-            f"VCT_WEAVIATE_DATA_SOURCE={folder}\nVCT_WEAVIATE_VOLUME_NAME=\n", encoding="utf-8")
+        lines = f"VCT_WEAVIATE_DATA_SOURCE={folder}\nVCT_WEAVIATE_VOLUME_NAME=\n"
+        if bind_data == "all":
+            for key, name in (("VCT_OLLAMA_DATA_SOURCE", "ollama-folder"),
+                              ("VCT_CODE_EMBED_CACHE_SOURCE", "code-embed-folder")):
+                (root / name).mkdir()
+                (root / name / "blob").write_text("x", encoding="utf-8")
+                lines += f"{key}={root / name}\n"
+        (root / "infrastructure" / ".env").write_text(lines, encoding="utf-8")
     if runtime_txt is not None:
         containers.runtime_txt_path(root).parent.mkdir(parents=True)
         containers.runtime_txt_path(root).write_text(runtime_txt + "\n", encoding="utf-8")
@@ -125,7 +143,7 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
     env = {} if sc["env"] is None else {"VCT_CONTAINER_RUNTIME": sc["env"]}
     warnings: list[str] = []
     root = _install_root(tmp_path, sc.get("runtime_txt"), sc.get("runtime_confirmed"),
-                         bool(sc.get("bind_data")))
+                         sc.get("bind_data") or False)
     res = containers.resolve(
         env=env, which=which, run=run, warn=warnings.append, home=tmp_path,
         install_root=root,

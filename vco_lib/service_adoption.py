@@ -1261,12 +1261,7 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
     if unknown:
         raise ValueError(f"not adoptable services: {unknown} (known: {ADOPTION_ORDER})")
     infra_dir = root / "infrastructure"
-    compose_file = infra_dir / "docker-compose.yml"
-    try:
-        compose_text = compose_file.read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own_project = _containers.compose_project_name(infra_dir, compose_text)
+    own_project = _containers.own_compose_project(root)
 
     compose_argv: list[str] = [runtime, "compose"]
     compose_form: Optional[str] = None
@@ -1707,11 +1702,7 @@ def adopt_services(
     except Exception as exc:  # noqa: BLE001 — never block adoption on env write
         log(f"  [adopt] WARNING: infrastructure/.env refresh failed: {exc}")
 
-    try:
-        compose_text = (infra_dir / "docker-compose.yml").read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own_project = _containers.compose_project_name(infra_dir, compose_text)
+    own_project = _containers.own_compose_project(root)
     compose_argv = [runtime, "compose"]
     if resolution is not None and getattr(resolution, "compose", None):
         compose_argv = [str(p) for p in resolution.compose]

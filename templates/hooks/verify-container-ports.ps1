@@ -160,7 +160,14 @@ if ($VcoRt.state -ne "resolved") {
         # the output). Start-VcoDetachedProcess = the ONE guarded spawn home
         # (argument quoting, hidden window, soft-fail); the CLI bounds itself
         # and writes only an installed clone's ledger.
-        $RecOut = Join-Path ([System.IO.Path]::GetTempPath()) "vco-record-refusal.$PID.out"
+        # R11 L4: ONE fixed per-user file, TRUNCATED each spawn (Start-Process
+        # redirect overwrites) — the per-PID pair used to leave two files in
+        # %TEMP% per refused-pin session. The null device the .sh sibling uses
+        # is NOT reachable here: Start-Process rejects identical
+        # -RedirectStandard* paths on every edition and the helper's divert
+        # would fabricate `/dev/null.err` / `NUL.err`, so a fixed truncated
+        # pair (`.log` + `.log.err`) is the closest leak-free equivalent.
+        $RecOut = Join-Path ([System.IO.Path]::GetTempPath()) "vco-record-refusal.log"
         [void](Start-VcoDetachedProcess -FilePath $RunPy `
             -ArgumentList @('-m', 'vco_lib.runtime_reconcile', 'record-boot-refusal',
                             '--source', 'session', '--reason', [string]$VcoRt.reason) `

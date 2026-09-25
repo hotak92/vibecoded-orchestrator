@@ -361,6 +361,72 @@
       "binaries": [],
       "resolve": "podman",
       "expect": null
+    },
+    {
+      "name": "an_inherited_homebrew_with_a_trailing_slash_is_present",
+      "_why": "R11 L5: a hand-written rc line left `/opt/homebrew/bin/` on PATH. It IS Homebrew's dir, so it is never prepended again ahead of /usr/bin (Python compared raw strings and moved it; Rust compared Paths and did not).",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "path": ["/usr/bin", "/opt/homebrew/bin/"],
+      "expect_path": [
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/usr/bin",
+        "/opt/homebrew/bin/",
+        "/Users/u/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin"
+      ],
+      "binaries": ["/usr/bin/git", "/opt/homebrew/bin/git"],
+      "resolve": "git",
+      "expect": "/usr/bin/git"
+    },
+    {
+      "name": "duplicate_separators_do_not_make_an_entry_missing",
+      "_why": "R11 L5: `//home/u//.local/bin` is ~/.local/bin; it keeps its place and is not added again.",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/bin", "//home/u//.local/bin"],
+      "expect_path": [
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/bin",
+        "//home/u//.local/bin",
+        "/home/u/bin",
+        "/usr/local/bin"
+      ],
+      "binaries": ["/usr/bin/python3", "/home/u/.local/bin/python3"],
+      "resolve": "python3",
+      "expect": "/usr/bin/python3"
+    },
+    {
+      "name": "a_windows_entry_matches_regardless_of_case_slashes_and_trailing_separator",
+      "_why": "R11 L5: on Windows `c:/program files/docker/docker/resources/bin/` IS Docker Desktop's dir (case-insensitive, `/` = `\\\\`, trailing separator); it is not appended again.",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": "C:\\Program Files",
+        "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local"
+      },
+      "path": ["C:\\Windows\\system32", "c:/program files/docker/docker/resources/bin/"],
+      "expect_path": [
+        "C:\\Windows\\system32",
+        "c:/program files/docker/docker/resources/bin/",
+        "C:\\Program Files\\RedHat\\Podman",
+        "C:\\Users\\u\\AppData\\Local\\Programs\\Podman"
+      ],
+      "binaries": ["C:\\Program Files\\RedHat\\Podman\\podman.exe"],
+      "resolve": "podman.exe",
+      "expect": "C:\\Program Files\\RedHat\\Podman\\podman.exe"
     }
   ]
 }

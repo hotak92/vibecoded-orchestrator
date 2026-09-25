@@ -227,10 +227,12 @@ def test_an_empty_bind_folder_is_not_data(tmp_path):
 
 
 def test_a_bind_mount_layout_refuses_read_only_when_the_record_is_not_installed(tmp_path):
+    """Only a LEFTOVER volume under docker (no VCO container there): the folder
+    is the data, so the missing record is refused (R11 L2 (iii) — a VCO
+    container under docker is a different shape, see the R11 tests)."""
     root = _root(tmp_path, "podman")
     folder = _bind_layout(root)
-    m = Machine(installed={"docker"}, up={"docker"},
-                containers_={"docker": ["vco_weaviate"]}, volumes={"docker": ["vco_weaviate_data"]})
+    m = Machine(installed={"docker"}, up={"docker"}, volumes={"docker": ["vco_weaviate_data"]})
     res = rr.reconcile(root, env={}, which=m.which, run=m.run, rewrite=False)
     assert res.outcome is rr.Outcome.UNUSABLE and res.runtime is None
     assert res.detail == rr.unusable_detail(
@@ -248,7 +250,9 @@ def test_install_keeps_a_bind_mount_record_and_asks(tmp_path):
     [entry] = res.entries
     assert entry.condition_id == rr.CID_UNUSABLE
     assert "python install.py --update --container docker" in entry.command_to_apply
-    assert m.started == [], "nothing is started for a switch that will not happen"
+    # R11 L2: docker is started so its CONTAINERS can be looked at (a VCO
+    # container there would outrank the folder); it lists only a volume.
+    assert m.started == ["docker"]
     assert containers.read_runtime_txt(root) == "podman"
 
 

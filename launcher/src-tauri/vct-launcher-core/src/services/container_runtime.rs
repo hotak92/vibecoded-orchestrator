@@ -418,25 +418,35 @@ async fn list_names(cmd: &str, args: &[&str]) -> Option<Vec<String>> {
     )
 }
 
-/// Does `cmd` hold VCO's containers or named volumes? The Rust mirror of
-/// `vco_lib.runtime_reconcile.vco_data_under` (case-C mirror, pinned by
-/// the shared parity fixture's `vco_data_under` / `vco_data_unlistable`
-/// fields): `Some(true)` / `Some(false)` only when BOTH listings
-/// answered; `None` when either could not (daemon down, CLI error).
-/// Read-only: `ps -a`, `volume ls` and — only for an override-named volume
-/// that needs it — `volume inspect`. Only VCO-prefixed containers count,
-/// and the install's ACTUAL volume names ([`vco_volume_names`], R9 H6).
+/// WHAT `cmd` holds of VCO's data — running / stopped VCO containers, only
+/// volumes, or nothing ([`super::runtime_evidence::DataKind`], R11 L2). The
+/// Rust mirror of `vco_lib.runtime_reconcile.vco_data_kind` (case-C mirror,
+/// pinned by the shared parity fixture's `vco_data_under` / `vco_data_kind`
+/// / `vco_data_unlistable` fields): `None` when a listing could not run
+/// (daemon down, CLI error) — "could not look" is never "empty". Read-only:
+/// `ps -a`, `volume ls`, `ps` (only when a VCO container exists) and — only
+/// for an override-named volume that needs it — `volume inspect`. Only
+/// VCO-prefixed containers count, and the install's ACTUAL volume names
+/// ([`vco_volume_names`], R9 H6).
 ///
 /// This side only ever asks about the runtime a stale record would be
 /// SWITCHED TO, so it always judges the way Python does with
 /// `corroborate_overrides=True` (R10 J8): a `VCT_*_VOLUME_NAME` override is
 /// a name the user picked and counts only with VCO's compose project label
 /// ([`super::runtime_evidence::data_evidence`]).
-pub async fn vco_data_under(cmd: &str, install_root: Option<&Path>) -> Option<bool> {
-    use super::runtime_evidence::{data_evidence, override_volumes_present, vco_compose_project};
+pub async fn vco_data_kind(
+    cmd: &str,
+    install_root: Option<&Path>,
+) -> Option<super::runtime_evidence::DataKind> {
+    use super::runtime_evidence::{data_kind, override_volumes_present, vco_compose_project};
 
     let containers = list_names(cmd, &["ps", "-a", "--format", "{{.Names}}"]).await?;
     let volumes = list_names(cmd, &["volume", "ls", "--format", "{{.Name}}"]).await?;
+    let running = if containers.iter().any(|n| VCO_OUR_CONTAINER_NAMES.contains(&n.as_str())) {
+        list_names(cmd, &["ps", "--format", "{{.Names}}"]).await?
+    } else {
+        Vec::new()
+    };
     let names = vco_volume_names(install_root);
     let own_project = vco_compose_project(install_root);
     let mut labels: HashMap<String, String> = HashMap::new();
@@ -451,7 +461,7 @@ pub async fn vco_data_under(cmd: &str, install_root: Option<&Path>) -> Option<bo
             }
         }
     }
-    Some(data_evidence(&containers, &volumes, &names, &own_project, &|v| {
+    Some(data_kind(&containers, &running, &volumes, &names, &own_project, &|v| {
         labels.get(v).cloned()
     }))
 }
@@ -547,17 +557,21 @@ pub enum ModuleRuntimeProbe {
 /// containers/volumes → drive the other runtime, read-only — the next update
 /// re-records it.
 ///
-/// R9 H1: POSITIVE evidence only — `other_data_listed == Some(true)`. "No
-/// VCO data anywhere" (`Some(false)`) is install.py's decision alone (it
+/// R9 H1: POSITIVE evidence only — `other_data` shows VCO's containers or
+/// volumes. "No VCO data anywhere" (`Some(Nothing)`) is install.py's decision alone (it
 /// runs under the user's PATH and records what it did); this read-only
 /// surface may merely have failed to find the recorded runtime (a short
 /// PATH), and driving the other one would start the stack on EMPTY
 /// volumes. R9 H2: a record the user CONFIRMED with `install.py
 /// --container` (`confirmed`, [`read_runtime_confirmed`] == the pin) is
-/// never substituted. R10 J2: while a bind-mounted data folder of this
-/// install holds VCO's data (`bind_data`,
-/// [`super::runtime_evidence::bind_data_source`]) the data is on the HOST,
-/// under neither runtime — never substituted. The ENV pin is never
+/// never substituted. R10 J2 / R11 L2-L3: while a bind-mounted data folder
+/// of this install holds VCO's data (`bind_data`,
+/// [`super::runtime_evidence::bind_data_source`]) — or EVERY service's data
+/// is a folder (`all_bind`, [`super::runtime_evidence::all_services_bind`])
+/// — the other runtime's listing is read by
+/// [`super::runtime_evidence::bind_verdict`]: running VCO containers there
+/// switch, every-service-a-folder switches, stopped VCO containers are data
+/// under both (declined), a leftover volume alone never switches. The ENV pin is never
 /// reconciled, an installed-but-down recorded runtime is never switched
 /// (case (b)), and an unlistable other runtime is refused (`None` — "could
 /// not look" is never "empty").
@@ -571,14 +585,18 @@ pub enum ModuleRuntimeProbe {
 /// halves do; MUST MATCH the reconcile arm of `vco_lib.containers.resolve`
 /// (which fires only when the read-only `vco_lib.runtime_reconcile.reconcile`
 /// decides `REWRITTEN` on this same shape).
+#[allow(clippy::too_many_arguments)]
 pub fn record_reconcile_decision(
     pinned: Option<(&str, RuntimePinSource)>,
     pinned_missing: bool,
     other_responsive: bool,
-    other_data_listed: Option<bool>,
+    other_data: Option<DataKind>,
     confirmed: bool,
     bind_data: bool,
+    all_bind: bool,
 ) -> Option<Result<&'static str, ReconcileDecline>> {
+    use super::runtime_evidence::{bind_verdict, BindVerdict};
+
     let (pin, RuntimePinSource::RuntimeTxt) = pinned? else {
         return None; // env pin / no pin: never reconciled
     };
@@ -587,35 +605,41 @@ pub fn record_reconcile_decision(
     }
     Some(if confirmed {
         Err(ReconcileDecline::Confirmed)
-    } else if bind_data {
-        Err(ReconcileDecline::BindData)
     } else if !other_responsive {
         Err(ReconcileDecline::OtherNotUsable)
     } else {
-        match other_data_listed {
+        match other_data {
             None => Err(ReconcileDecline::Unlistable),
-            Some(false) => Err(ReconcileDecline::NoData),
-            Some(true) => Ok(other_runtime(pin)),
+            Some(kind) if bind_data || all_bind => match bind_verdict(kind, true, all_bind, false) {
+                BindVerdict::Switch => Ok(other_runtime(pin)),
+                BindVerdict::Both => Err(ReconcileDecline::DataUnderBoth),
+                BindVerdict::Keep => Err(ReconcileDecline::BindData),
+            },
+            Some(DataKind::Nothing) => Err(ReconcileDecline::NoData),
+            Some(_) => Ok(other_runtime(pin)),
         }
     })
 }
 
 /// [`record_reconcile_decision`], only its "switch to" answer.
+#[allow(clippy::too_many_arguments)]
 pub fn record_reconcile_decides(
     pinned: Option<(&str, RuntimePinSource)>,
     pinned_missing: bool,
     other_responsive: bool,
-    other_data_listed: Option<bool>,
+    other_data: Option<DataKind>,
     confirmed: bool,
     bind_data: bool,
+    all_bind: bool,
 ) -> Option<&'static str> {
     record_reconcile_decision(
         pinned,
         pinned_missing,
         other_responsive,
-        other_data_listed,
+        other_data,
         confirmed,
         bind_data,
+        all_bind,
     )
     .and_then(Result::ok)
 }
@@ -636,8 +660,9 @@ pub enum StaleRecord {
 /// (launcher module plane, hub supervisor) and `runtime.rs::resolve_runtime_in`
 /// (launcher infra stack) both call it; they carried two copies before R10.
 /// Probes only what the decision needs, in its order: nothing past a
-/// confirmed record or a bind-mounted data folder; the other runtime's
-/// listings only when it answers. "Not installed" is judged on the process
+/// confirmed record; the other runtime's listings only when it answers (a
+/// bind-mounted folder no longer short-circuits them — the other runtime's
+/// CONTAINERS outrank it, R11 L2). "Not installed" is judged on the process
 /// PATH, which the launcher and the hub augment at startup with the usual
 /// install locations (`runtime::augment_path_for_graphical_launch`, R9 H1(b)).
 pub async fn reconcile_stale_record(
@@ -652,16 +677,18 @@ pub async fn reconcile_stale_record(
         return StaleRecord::NotApplicable;
     }
     let confirmed = install_root.and_then(read_runtime_confirmed).as_deref() == Some(pin);
-    let bind = if confirmed {
-        None
+    let (bind, all_bind) = if confirmed {
+        (None, false)
     } else {
-        super::runtime_evidence::bind_data_source(install_root)
+        (
+            super::runtime_evidence::bind_data_source(install_root),
+            super::runtime_evidence::install_all_bind(install_root),
+        )
     };
     let other = other_runtime(pin);
-    let other_responsive =
-        !confirmed && bind.is_none() && runtime_daemon_responsive(other).await;
-    let other_data_listed = if other_responsive {
-        vco_data_under(other, install_root).await
+    let other_responsive = !confirmed && runtime_daemon_responsive(other).await;
+    let other_data = if other_responsive {
+        vco_data_kind(other, install_root).await
     } else {
         None
     };
@@ -669,9 +696,10 @@ pub async fn reconcile_stale_record(
         pinned,
         pinned_missing,
         other_responsive,
-        other_data_listed,
+        other_data,
         confirmed,
         bind.is_some(),
+        all_bind,
     ) {
         None => StaleRecord::NotApplicable,
         Some(Ok(sub)) => {
@@ -696,7 +724,7 @@ pub async fn reconcile_stale_record(
     }
 }
 
-pub use super::runtime_evidence::ReconcileDecline;
+pub use super::runtime_evidence::{DataKind, ReconcileDecline};
 
 /// The refusal message for a pinned-but-unusable runtime. Pure, and
 /// deliberately shaped like `vco_lib.containers._pin_refusal_reason`
@@ -4432,28 +4460,6 @@ mod tests {
         probes
     }
 
-    /// The fixture's answer to "could the other runtime's data be
-    /// listed": `None` when the scenario marks it unlistable ("could not
-    /// look" is never "empty"), else whether VCO's data is under it.
-    /// Scenarios that do not model data at all answer `Some(false)` —
-    /// their pins are never missing-with-other-responsive, so the
-    /// reconcile arm's data probe is never reached for them.
-    fn fixture_other_data_listed(sc: &serde_json::Value, other: &str) -> Option<bool> {
-        if sc
-            .get("vco_data_unlistable")
-            .and_then(|v| v.as_array())
-            .map(|arr| arr.iter().any(|n| n.as_str() == Some(other)))
-            .unwrap_or(false)
-        {
-            return None;
-        }
-        Some(
-            sc.get("vco_data_under")
-                .and_then(|v| v.get(other))
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false),
-        )
-    }
 
     /// Whether the scenario's `runtime_confirmed` (state/install/
     /// runtime.confirmed) names the pinned runtime — R9 H2.
@@ -4509,13 +4515,15 @@ mod tests {
             let mut declined: Option<ReconcileDecline> = None;
             if let Some((pin_name, _)) = pin {
                 let other = other_runtime(pin_name);
+                let (bind_data, all_bind) = parity_fixture::fixture_bind(sc);
                 match record_reconcile_decision(
                     pin,
                     probes.get(pin_name) == Some(&ModuleRuntimeProbe::Missing),
                     probes.get(other) == Some(&ModuleRuntimeProbe::Responsive),
-                    fixture_other_data_listed(sc, other),
+                    parity_fixture::fixture_other_data_kind(sc, other),
                     fixture_confirmed(sc, pin_name),
-                    sc.get("bind_data").and_then(|v| v.as_bool()) == Some(true),
+                    bind_data,
+                    all_bind,
                 ) {
                     Some(Ok(sub)) => order = vec![sub.to_string()],
                     Some(Err(why)) => declined = Some(why),
@@ -4634,31 +4642,38 @@ mod tests {
     /// (so not missing), other down, data unlistable — must NOT switch.
     #[test]
     fn record_reconcile_decides_only_on_the_stale_record_shape() {
+        use DataKind::*;
         let record = Some(("docker", RuntimePinSource::RuntimeTxt));
         let env = Some(("podman", RuntimePinSource::EnvOverride));
+        let d = record_reconcile_decides;
         // The one shape that reconciles: data under the other runtime.
-        assert_eq!(
-            record_reconcile_decides(record, true, true, Some(true), false, false),
-            Some("podman")
-        );
+        assert_eq!(d(record, true, true, Some(Running), false, false, false), Some("podman"));
+        assert_eq!(d(record, true, true, Some(Volumes), false, false, false), Some("podman"));
         // R9 H1: "no VCO data anywhere" is NOT positive evidence — this
         // read-only surface may simply not have found the recorded runtime.
-        assert_eq!(record_reconcile_decides(record, true, true, Some(false), false, false), None);
+        assert_eq!(d(record, true, true, Some(Nothing), false, false, false), None);
         // R9 H2: the user's confirmed choice is never substituted, even with
         // the data under the other runtime.
-        assert_eq!(record_reconcile_decides(record, true, true, Some(true), true, false), None);
-        // R10 J2: a bind-mounted data folder is data under the record.
-        assert_eq!(record_reconcile_decides(record, true, true, Some(true), false, true), None);
+        assert_eq!(d(record, true, true, Some(Running), true, false, false), None);
+        // R10 J2: a bind-mounted data folder outranks a leftover volume...
+        assert_eq!(d(record, true, true, Some(Volumes), false, true, false), None);
+        // ...R11 L2: but not a stack RUNNING under the other runtime...
+        assert_eq!(d(record, true, true, Some(Running), false, true, false), Some("podman"));
+        // ...and stopped VCO containers beside the folder are data under both.
+        assert_eq!(d(record, true, true, Some(Stopped), false, true, false), None);
+        // R11 L3: every service a folder — a switch strands no named volume.
+        assert_eq!(d(record, true, true, Some(Nothing), false, false, true), Some("podman"));
+        assert_eq!(d(record, true, true, Some(Stopped), false, true, true), Some("podman"));
         // The env pin is never reconciled.
-        assert_eq!(record_reconcile_decides(env, true, true, Some(true), false, false), None);
+        assert_eq!(d(env, true, true, Some(Running), false, false, false), None);
         // No pin at all.
-        assert_eq!(record_reconcile_decides(None, true, true, Some(true), false, false), None);
+        assert_eq!(d(None, true, true, Some(Running), false, false, false), None);
         // Recorded runtime installed (down, not missing): stays refused.
-        assert_eq!(record_reconcile_decides(record, false, true, Some(true), false, false), None);
+        assert_eq!(d(record, false, true, Some(Running), false, false, true), None);
         // Other runtime not answering: stays refused.
-        assert_eq!(record_reconcile_decides(record, true, false, Some(true), false, false), None);
+        assert_eq!(d(record, true, false, Some(Running), false, false, true), None);
         // Data could not be listed ("could not look" is never "empty").
-        assert_eq!(record_reconcile_decides(record, true, true, None, false, false), None);
+        assert_eq!(d(record, true, true, None, false, false, true), None);
     }
 
     /// R10 J6: a declined arm says WHY, in Python's order — the confirmed
@@ -4668,16 +4683,21 @@ mod tests {
     fn record_reconcile_decision_names_why_it_declined() {
         let record = Some(("docker", RuntimePinSource::RuntimeTxt));
         let env = Some(("docker", RuntimePinSource::EnvOverride));
+        use DataKind::{Nothing, Running, Stopped, Volumes};
         use ReconcileDecline::*;
         let d = record_reconcile_decision;
-        assert_eq!(d(record, true, true, Some(true), true, true), Some(Err(Confirmed)));
-        assert_eq!(d(record, true, true, Some(true), false, true), Some(Err(BindData)));
-        assert_eq!(d(record, true, false, None, false, false), Some(Err(OtherNotUsable)));
-        assert_eq!(d(record, true, true, None, false, false), Some(Err(Unlistable)));
-        assert_eq!(d(record, true, true, Some(false), false, false), Some(Err(NoData)));
-        assert_eq!(d(record, true, true, Some(true), false, false), Some(Ok("podman")));
-        assert_eq!(d(record, false, true, Some(true), false, false), None);
-        assert_eq!(d(env, true, true, Some(true), false, false), None);
+        assert_eq!(d(record, true, true, Some(Running), true, true, true), Some(Err(Confirmed)));
+        // R11 L2: the other runtime is asked before the folder is weighed.
+        assert_eq!(d(record, true, false, None, false, true, false), Some(Err(OtherNotUsable)));
+        assert_eq!(d(record, true, true, None, false, true, false), Some(Err(Unlistable)));
+        assert_eq!(d(record, true, true, Some(Volumes), false, true, false), Some(Err(BindData)));
+        assert_eq!(d(record, true, true, Some(Stopped), false, true, false), Some(Err(DataUnderBoth)));
+        assert_eq!(d(record, true, false, None, false, false, false), Some(Err(OtherNotUsable)));
+        assert_eq!(d(record, true, true, None, false, false, false), Some(Err(Unlistable)));
+        assert_eq!(d(record, true, true, Some(Nothing), false, false, false), Some(Err(NoData)));
+        assert_eq!(d(record, true, true, Some(Running), false, false, false), Some(Ok("podman")));
+        assert_eq!(d(record, false, true, Some(Running), false, false, false), None);
+        assert_eq!(d(env, true, true, Some(Running), false, false, false), None);
     }
 
     /// R10 J6, through the real module-plane detector: the record names
@@ -4686,12 +4706,24 @@ mod tests {
     /// wording, exactly as `vco_lib.containers.resolve`'s does. Fake podman
     /// on a thread-injected lookup PATH (never the process PATH).
     /// A stale docker record (docker not installed) with a fake podman that
-    /// answers and lists `ps_out` / `volumes_out`, detected through the real
-    /// module-plane detector on a thread-injected lookup PATH.
+    /// answers and lists `ps_out` (`ps -a`) / `volumes_out`, detected through
+    /// the real module-plane detector on a thread-injected lookup PATH.
+    /// `ps` without `-a` (the running containers, R11 L2) lists `ps_out` too.
     #[cfg(unix)]
     fn detect_with_fake_podman(
         root: &Path,
         ps_out: &str,
+        volumes_out: &str,
+    ) -> Result<(String, Option<RuntimePinSource>), String> {
+        detect_with_fake_podman_running(root, ps_out, ps_out, volumes_out)
+    }
+
+    /// [`detect_with_fake_podman`] with a separate `ps` (running) listing.
+    #[cfg(unix)]
+    fn detect_with_fake_podman_running(
+        root: &Path,
+        ps_out: &str,
+        running_out: &str,
         volumes_out: &str,
     ) -> Result<(String, Option<RuntimePinSource>), String> {
         use std::os::unix::fs::PermissionsExt;
@@ -4700,7 +4732,7 @@ mod tests {
         std::fs::write(
             &podman,
             format!(
-                "#!/bin/sh\ncase \"$1\" in ps) echo {ps_out} ;; volume) echo {volumes_out} ;; esac\nexit 0\n"
+                "#!/bin/sh\ncase \"$1 $2\" in 'ps -a') echo {ps_out} ;; ps*) echo {running_out} ;; volume*) echo {volumes_out} ;; esac\nexit 0\n"
             ),
         )
         .unwrap();
@@ -4719,9 +4751,11 @@ mod tests {
         })
     }
 
-    /// R10 J2, through the real detector: the same stale record, podman
-    /// answering WITH VCO's data (the shape that switches) — but Weaviate's
-    /// data is a bind-mounted host folder. Not switched; the refusal says so.
+    /// R10 J2 / R11 L2 (iii), through the real detector: the same stale
+    /// record, podman answering with a LEFTOVER `vco_weaviate_data` volume
+    /// (the shape that switches without a folder) — but Weaviate's data is a
+    /// bind-mounted host folder and no VCO container exists under podman.
+    /// Not switched; the refusal says so.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
@@ -4734,7 +4768,7 @@ mod tests {
         std::fs::write(folder.join("classifications.db"), "x").unwrap();
         // Control: without the bind layout this shape DOES switch to podman.
         assert_eq!(
-            detect_with_fake_podman(&root, "vco_weaviate", "vco_weaviate_data")
+            detect_with_fake_podman(&root, "someone_elses_ollama", "vco_weaviate_data")
                 .map(|(rt, _)| rt),
             Ok("podman".to_string())
         );
@@ -4743,7 +4777,7 @@ mod tests {
             format!("VCT_WEAVIATE_DATA_SOURCE={}\nVCT_WEAVIATE_VOLUME_NAME=\n", folder.display()),
         )
         .unwrap();
-        let err = detect_with_fake_podman(&root, "vco_weaviate", "vco_weaviate_data")
+        let err = detect_with_fake_podman(&root, "someone_elses_ollama", "vco_weaviate_data")
             .expect_err("a bind-mount layout keeps the record");
         let source = root.join("state").join("install").join("runtime.txt");
         let note = super::super::runtime_evidence::record_reconcile_note(
@@ -4755,6 +4789,79 @@ mod tests {
         assert!(
             err.ends_with(&super::super::runtime_evidence::not_switched_clause(&note)),
             "{err}"
+        );
+    }
+
+    /// R11 L2 (i)/(ii), through the real detector: Weaviate's data is a host
+    /// folder and the stale docker record is not installed. podman RUNNING
+    /// VCO's containers → the stack lives there: driven. podman holding them
+    /// STOPPED → data under both: refused, and the refusal says why in the
+    /// shared wording.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn vco_containers_under_the_other_runtime_outrank_the_bind_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        let folder = dir.path().join("srv-weaviate");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("classifications.db"), "x").unwrap();
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("VCT_WEAVIATE_DATA_SOURCE={}\n", folder.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_with_fake_podman_running(&root, "vco_weaviate", "vco_weaviate", "someone_elses")
+                .map(|(rt, _)| rt),
+            Ok("podman".to_string()),
+            "running VCO containers are where the stack lives"
+        );
+        let err = detect_with_fake_podman_running(&root, "vco_weaviate", "someone_elses", "someone_elses")
+            .expect_err("stopped VCO containers beside the folder are data under both");
+        let source = root.join("state").join("install").join("runtime.txt");
+        let note = super::super::runtime_evidence::record_reconcile_note(
+            "docker",
+            &source.display().to_string(),
+            ReconcileDecline::DataUnderBoth,
+            &folder.display().to_string(),
+        );
+        assert!(
+            err.ends_with(&super::super::runtime_evidence::not_switched_clause(&note)),
+            "{err}"
+        );
+    }
+
+    /// R11 L3, through the real detector: EVERY service's data is a folder
+    /// (none of them even exists yet) and the stale docker record is not
+    /// installed; podman answers holding nothing of VCO's. A switch strands
+    /// no named volume: podman is driven.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn every_service_in_a_folder_switches_the_module_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        let env_text = format!(
+            "VCT_WEAVIATE_DATA_SOURCE={}\nVCT_OLLAMA_DATA_SOURCE={}\n",
+            dir.path().join("w").display(),
+            dir.path().join("o").display()
+        );
+        std::fs::write(root.join("infrastructure").join(".env"), &env_text).unwrap();
+        assert!(
+            detect_with_fake_podman(&root, "someone_elses", "someone_elses").is_err(),
+            "control: the code_embed cache is still a named volume"
+        );
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("{env_text}VCT_CODE_EMBED_CACHE_SOURCE={}\n", dir.path().join("c").display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_with_fake_podman(&root, "someone_elses", "someone_elses").map(|(rt, _)| rt),
+            Ok("podman".to_string())
         );
     }
 
@@ -6075,5 +6182,50 @@ mod tests {
         let json = r#"{"9000/tcp":[{"HostPort":"22000"}],"11438/tcp":[{"HostPort":"11450"}]}"#;
         // Keys sort lexicographically: "11438/tcp" < "9000/tcp".
         assert_eq!(parse_published_host_port(json), Some(11450));
+    }
+}
+
+/// The parity fixture's data fields, read ONE way by both Rust legs of
+/// `tests/fixtures/container_runtime_parity.json` (this module's tests and
+/// `runtime.rs`'s) — they carried a copy each before R11.
+#[cfg(test)]
+pub(crate) mod parity_fixture {
+    use super::DataKind;
+
+    /// The fixture's answer to "what do the other runtime's listings
+    /// show": `None` when the scenario marks it unlistable ("could not look"
+    /// is never "empty"), else its `vco_data_kind` (R11 L2), else `Running`
+    /// for `vco_data_under: true` and `Nothing` otherwise. Scenarios that do
+    /// not model data at all answer `Nothing` — their pins are never
+    /// missing-with-other-responsive, so the reconcile arm's data probe is
+    /// never reached for them. MUST MATCH the Python harness `_probes`.
+    pub(crate) fn fixture_other_data_kind(sc: &serde_json::Value, other: &str) -> Option<DataKind> {
+        if sc
+            .get("vco_data_unlistable")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|n| n.as_str() == Some(other)))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        if let Some(kind) = sc.get("vco_data_kind").and_then(|v| v.get(other)).and_then(|v| v.as_str()) {
+            return Some(DataKind::from_key(kind).expect("a known vco_data_kind"));
+        }
+        let listed = sc
+            .get("vco_data_under")
+            .and_then(|v| v.get(other))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        Some(if listed { DataKind::Running } else { DataKind::Nothing })
+    }
+
+    /// The fixture's bind layout: `bind_data: true` (a Weaviate folder) or
+    /// `"all"` (every service a folder, R11 L3) → `(bind_data, all_bind)`.
+    pub(crate) fn fixture_bind(sc: &serde_json::Value) -> (bool, bool) {
+        match sc.get("bind_data") {
+            Some(serde_json::Value::Bool(b)) => (*b, false),
+            Some(serde_json::Value::String(s)) if s == "all" => (true, true),
+            _ => (false, false),
+        }
     }
 }
