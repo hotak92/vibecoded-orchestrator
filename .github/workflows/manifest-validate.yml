@@ -150,6 +150,23 @@ jobs:
           fi
           ./target/debug/validate-manifest "${fixtures[@]}"
 
+      # Step 2b (v0.2.97): the launcher's OWN bundled core-module manifests.
+      # This job only ever validated the paid-module fixture, so three of
+      # the six bundled files (a half `mcp_registration` block with no
+      # `mcp_name`) failed to parse unnoticed — and the hub dropped them
+      # silently. They are embedded in the binary and materialized at every
+      # start (`vct_launcher_core::bundled_manifests`), so a parse failure
+      # here is a shipped defect: never allow-empty.
+      - name: Validate the bundled core-module manifests (strict mode)
+        working-directory: launcher/src-tauri
+        run: |
+          bundled=(../bundled_manifests/*.json)
+          if [ ${#bundled[@]} -eq 0 ] || [ ! -e "${bundled[0]}" ]; then
+            echo "::error::no manifests under launcher/bundled_manifests/"
+            exit 1
+          fi
+          ./target/debug/validate-manifest "${bundled[@]}"
+
       # Step 3: validate any dev-only `paid-modules/` fixtures if they
       # happen to be committed. The public repo doesn't ship this
       # directory (paid modules are co-located in dev workspaces only),

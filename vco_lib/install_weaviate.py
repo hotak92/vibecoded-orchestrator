@@ -578,21 +578,31 @@ def _managed_env_value(text: str, key: str) -> Optional[str]:
     )
 
 
-def _settings_json_env_value(text: str, key: str) -> Optional[str]:
-    """Read ``env[key]`` from a ``.claude/settings.json`` document; ``None`` on
-    absence or any parse error (soft-fail)."""
-    import json as _json
+def _settings_json_env(text: str) -> Optional[dict]:
+    """The ``env`` block of a ``.claude/settings.json`` document — ``{}`` when
+    it has none, ``None`` when the document cannot be read as a JSON(C) object.
+
+    Parsed with the ONE JSONC reader (:func:`vco_lib.jsonc_edit.loads`, v0.2.97):
+    Claude Code accepts comments and trailing commas here, and a strict
+    ``json.loads`` read such a file as "no env" — which, for the orphan check
+    below, meant "no reference".
+    """
+    from vco_lib.jsonc_edit import loads
 
     try:
-        data = _json.loads(text)
-    except Exception:  # noqa: BLE001 — malformed settings.json → no reference
+        data = loads(text)
+    except ValueError:
         return None
     if not isinstance(data, dict):
         return None
     env_block = data.get("env")
-    if not isinstance(env_block, dict):
-        return None
-    value = env_block.get(key)
+    return env_block if isinstance(env_block, dict) else {}
+
+
+def _settings_json_env_value(text: str, key: str) -> Optional[str]:
+    """Read ``env[key]`` from a ``.claude/settings.json`` document; ``None`` on
+    absence or when the document cannot be read (soft-fail)."""
+    value = (_settings_json_env(text) or {}).get(key)
     return value if isinstance(value, str) and value else None
 
 
@@ -619,10 +629,13 @@ def dev_collection_is_referenced(
           catches the case where the on-disk env hasn't been repointed yet but
           the binding already names the paired dev collection.
 
-    Soft-fail throughout: an unreadable file / unreachable DB / import error on
-    ONE surface never raises — it simply contributes no reference (the next
-    surface is still consulted). A ``candidate`` that is empty/whitespace is
-    treated as un-referenced (nothing to match).
+    Never raises. An on-disk surface (a)/(b) that EXISTS but cannot be read
+    answers "referenced" (v0.2.97): the answer gates a destructive-drop
+    deferral, and a file nobody could read may well name the collection.
+    ``settings.json`` is read as JSONC. An unreachable DB / import error on
+    surface (d) contributes no reference — the surfaces before it were read.
+    A ``candidate`` that is empty/whitespace is treated as un-referenced
+    (nothing to match).
     """
     candidate = (candidate or "").strip()
     if not candidate:
@@ -636,31 +649,37 @@ def dev_collection_is_referenced(
             return True
         return False
 
-    # (a) settings.json env
+    # (a) settings.json env. A file that EXISTS but cannot be read is a check
+    # this function could not complete, so it answers "referenced" — the
+    # caller's own contract (`build_orphan_dev_deferral`: "never emitted on a
+    # check we could not positively complete"). Until v0.2.97 this surface
+    # soft-failed to "no reference", and a strict JSON parse made every JSONC
+    # settings.json such a file.
     settings_path = folder / ".claude" / "settings.json"
     if settings_path.is_file():
         try:
-            text = settings_path.read_text(encoding="utf-8")
-            if _matches(
-                _settings_json_env_value(text, "DEVELOPMENT_COLLECTION"),
-                _settings_json_env_value(text, "KG_COLLECTION"),
-            ):
-                return (True, ".claude/settings.json::env")
-        except Exception:  # noqa: BLE001 — soft-fail this surface only
-            pass
+            env = _settings_json_env(settings_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):  # ValueError: not UTF-8
+            env = None
+        if env is None:
+            return (True, ".claude/settings.json (unreadable — cannot rule out a reference)")
+        dev, kg = env.get("DEVELOPMENT_COLLECTION"), env.get("KG_COLLECTION")
+        if _matches(dev if isinstance(dev, str) else None,
+                    kg if isinstance(kg, str) else None):
+            return (True, ".claude/settings.json::env")
 
-    # (b) .claude/env managed block
+    # (b) .claude/env managed block — same rule for a file that cannot be read.
     env_path = folder / ".claude" / "env"
     if env_path.is_file():
         try:
             text = env_path.read_text(encoding="utf-8")
-            if _matches(
-                _managed_env_value(text, "DEVELOPMENT_COLLECTION"),
-                _managed_env_value(text, "KG_COLLECTION"),
-            ):
-                return (True, ".claude/env managed block")
-        except Exception:  # noqa: BLE001 — soft-fail this surface only
-            pass
+        except (OSError, ValueError):
+            return (True, ".claude/env (unreadable — cannot rule out a reference)")
+        if _matches(
+            _managed_env_value(text, "DEVELOPMENT_COLLECTION"),
+            _managed_env_value(text, "KG_COLLECTION"),
+        ):
+            return (True, ".claude/env managed block")
 
     # (c) process env (the existing pre-v0.2.84 check, generalized to sibling).
     import os as _os
@@ -1108,19 +1127,17 @@ def resolve_settings_weaviate_env(project_root: Path) -> "Optional[dict]":
     missing/unreadable / carries no comparable env — in which case the caller
     CANNOT prove staleness and must leave `.mcp.json` untouched.
     """
-    import json
-
     settings_path = project_root / ".claude" / "settings.json"
     if not settings_path.is_file():
         return None
     try:
-        data = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        # JSONC, through the same reader as the orphan check (v0.2.97) — a
+        # commented settings.json used to read as "no env", so a stale
+        # `.mcp.json` could never be proven stale there.
+        env = _settings_json_env(settings_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):  # ValueError: not UTF-8
         return None
-    if not isinstance(data, dict):
-        return None
-    env = data.get("env")
-    if not isinstance(env, dict):
+    if not env:
         return None
     out: dict = {}
     for key in MCP_JSON_STALE_ENV_KEYS:

@@ -4,7 +4,7 @@ description: Audits a scientific project for reproducibility — environment pin
 short_desc: audit scientific project for reproducibility gaps
 keywords: ["is this reproducible", "audit for reproducibility", "seed setting", "environment pinning", "manuscript submission", "provenance capture", "why do I get different results", "before submitting code"]
 model: opus
-effort: high
+effort: medium
 allowed-tools: Read, Write, Bash, Glob, Grep
 ---
 

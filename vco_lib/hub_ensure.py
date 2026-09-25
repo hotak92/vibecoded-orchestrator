@@ -44,10 +44,12 @@ The hub runtime contract (read-only here; PRESERVED exactly)
 * port — ``$VCT_HUB_PORT`` → ``<vct_root_dir()>/hub.port`` → ``7700``.
 * token — ``$VCT_HUB_TOKEN`` → ``<vct_root_dir()>/hub.token``.
 
-Port and token are NOT re-implemented here: :mod:`vco_lib.project_config`
-is their home (``_discover_hub``), and a second reader would be the very
-duplication this module exists to remove. The names + default live here as
-constants only so the contract is documented in one readable place.
+The PORT reader lives here — :func:`resolve_hub_port`, moved out of
+:func:`vco_lib.project_config._discover_hub` in v0.2.97 so the stdlib-only
+callers (``install.py --bootstrap --json``, which runs before any package is
+installed, and :mod:`vco_lib.secrets_bootstrap`) report the hub's real port
+without importing ``requests``. ``_discover_hub`` calls it, so there is still
+one reader. The TOKEN reader stays in :mod:`vco_lib.project_config`.
 
 What this module deliberately does NOT own
 ------------------------------------------
@@ -86,13 +88,14 @@ from __future__ import annotations
 import argparse
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib.intfile import read_int_line
 from vco_lib.paths import vct_root_dir
@@ -115,13 +118,18 @@ __all__ = [
     "hub_pid_file",
     "hub_port_file",
     "hub_token_file",
+    "parse_hub_port",
+    "read_hub_port_file",
+    "resolve_hub_port",
+    "running_hub_port",
     "is_running",
     "main",
 ]
 
 #: The hub's single-instance lockfile, port file and token file, all under
-#: :func:`vco_lib.paths.vct_root_dir`. Names only — see the module docstring
-#: for why the port/token READERS live in :mod:`vco_lib.project_config`.
+#: :func:`vco_lib.paths.vct_root_dir`. The port reader is
+#: :func:`resolve_hub_port` (below); the token reader lives in
+#: :mod:`vco_lib.project_config` — see the module docstring.
 HUB_PID_FILE = "hub.pid"
 HUB_PORT_FILE = "hub.port"
 HUB_TOKEN_FILE = "hub.token"
@@ -198,6 +206,138 @@ def hub_port_file() -> Path:
     return vct_root_dir() / HUB_PORT_FILE
 
 
+#: The characters a hub-port value may be padded with — C-locale ``isspace``
+#: (space, ``\t``, ``\n``, ``\v``, ``\f``, ``\r``). Only LEADING/TRAILING;
+#: whitespace inside the value makes it invalid.
+_HUB_PORT_PAD = " \t\n\v\f\r"
+#: ASCII digits only — ``[0-9]`` in a ``str`` pattern never matches the
+#: Unicode ``Nd`` digits that ``int()`` (and ``\d``) accept.
+_HUB_PORT_RE = re.compile(r"[0-9]{1,5}")
+
+
+def parse_hub_port(raw: Optional[str]) -> Optional[int]:
+    """The port ``raw`` names, or ``None`` when it is not a valid hub port.
+
+    THE value rule every hub-port reader applies, to ``$VCT_HUB_PORT`` and to
+    the whole content of ``hub.port`` alike (R7b F9): after trimming leading /
+    trailing whitespace the value is ``[0-9]{1,5}`` in ASCII and in 1..65535.
+    No sign (``+7822``), no digit separator (``7_700``), no Unicode digits, no
+    internal whitespace (``78 11``, or a second line) — each of those is
+    INVALID and the caller falls through to its next source. MUST MATCH the
+    other readers, which run the same table (``tests/fixtures/hub_port_cases.json``):
+    ``_hub_port_value`` in the bash clients, ``ConvertTo-HubPort`` in the ps1
+    clients, ``vct_launcher_core::services::hub_port::parse_hub_port`` and
+    ``vct-cli``'s ``valid_hub_port``. Before v0.2.97 Python used ``int()``,
+    which accepts all four shapes above, while the shell clients refused them.
+    """
+    if not isinstance(raw, str):
+        return None
+    value = raw.strip(_HUB_PORT_PAD)
+    if _HUB_PORT_RE.fullmatch(value) is None:
+        return None
+    port = int(value)
+    return port if 1 <= port <= 65535 else None
+
+
+def read_hub_port_file(vct_root: Optional[Path] = None) -> Optional[int]:
+    """STRICT: the port in ``<vct_root>/hub.port``, or ``None``. Never raises.
+
+    For a caller about to TALK to the running hub: no file means no running
+    hub, and guessing 7700 would send the request to whatever holds that
+    port. MUST MATCH ``vct_launcher_core::services::hub_port::read_hub_port_file_in``
+    (missing, unreadable and invalid are all "no port").
+    """
+    port_file = (vct_root if vct_root is not None else vct_root_dir()) / HUB_PORT_FILE
+    try:
+        raw = port_file.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return None
+    return parse_hub_port(raw)
+
+
+def running_hub_port(vct_root: Optional[Path] = None) -> int:
+    """Where the RUNNING hub listens: ``hub.port`` → ``$VCT_HUB_PORT`` → 7700.
+
+    File-first on purpose — this DESCRIBES the hub rather than pinning a
+    client to one: the hub walks past a taken port (``server.rs::try_bind``)
+    and writes the port it bound, so only the file knows. MUST MATCH
+    ``vct_launcher_core::services::hub_port::resolve_hub_port`` (the Rust
+    "describe the running hub" reader). Use :func:`resolve_hub_port` for a
+    client that honours an explicit ``$VCT_HUB_PORT`` pin.
+    """
+    from_file = read_hub_port_file(vct_root)
+    if from_file is not None:
+        return from_file
+    from_env = parse_hub_port(os.environ.get("VCT_HUB_PORT"))
+    return from_env if from_env is not None else DEFAULT_HUB_PORT
+
+
+def resolve_hub_port(
+    vct_root: Optional[Path] = None,
+    warn: Optional[Callable[[str, str], None]] = None,
+) -> int:
+    """The hub's port for a CLIENT: ``$VCT_HUB_PORT`` → ``<vct_root>/hub.port`` → 7700.
+
+    The ONE Python client port reader. Callers: ``vco_lib.project_config._discover_hub``,
+    ``vco_lib.access_resolver._hub_port``, ``vco_lib.codegraph_resync``,
+    ``claude_mcp_servers/rl_client/hub_writer._read_hub_port``,
+    ``claude_mcp_servers/wrappers/_base`` and ``weaviate_mcp/server``'s access
+    lookup, and ``vco verify-diagrams`` (check 5). Stdlib-only, so it works
+    before the install has installed anything. ``vct_root`` defaults to
+    :func:`vco_lib.paths.vct_root_dir`. ``install.py --bootstrap --json`` and
+    :mod:`vco_lib.secrets_bootstrap` DESCRIBE the hub and use
+    :func:`running_hub_port`; install.py's health probe talks to it and uses
+    the strict :func:`read_hub_port_file`.
+
+    A valid port is what :func:`parse_hub_port` accepts.
+
+    F-8 corrupt-input contract — MUST MATCH the bash sibling
+    ``vct_project_config.sh::hub_port`` and the ps1 sibling
+    ``vct_project_config.ps1::Get-HubPort``: nothing here raises.
+
+    * ``VCT_HUB_PORT`` set but not a valid port → ``warn("hub_port_invalid")``
+      and FALL THROUGH to ``hub.port``, then the default (owner ruling
+      2026-09-24: the file names the RUNNING hub, which beats a guess; before
+      v0.2.97 this jumped straight to 7700, and three other readers fell
+      through to the file — the readers disagreed).
+    * ``hub.port`` unreadable → ``warn("hub_port_unreadable")`` + default;
+      non-empty but not a valid port → ``warn("hub_port_invalid")`` + default;
+      absent or empty → the silent default.
+
+    ``warn`` defaults to silence (the bootstrap JSON's stdout is a contract);
+    ``project_config`` passes its stderr warner.
+    """
+    def _warn(kind: str, detail: str) -> None:
+        if warn is not None:
+            warn(kind, detail)
+
+    port_env = os.environ.get("VCT_HUB_PORT", "")
+    if port_env.strip(_HUB_PORT_PAD):
+        from_env = parse_hub_port(port_env)
+        if from_env is not None:
+            return from_env
+        _warn(
+            "hub_port_invalid",
+            "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700",
+        )
+    port_file = (vct_root if vct_root is not None else vct_root_dir()) / HUB_PORT_FILE
+    try:
+        raw = port_file.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return DEFAULT_HUB_PORT
+    except (OSError, ValueError):
+        _warn("hub_port_unreadable", "hub.port is not readable; using default 7700")
+        return DEFAULT_HUB_PORT
+    # The PARSE is shared (:func:`parse_hub_port`); the classification above
+    # is not, and must not be — an unreadable file and a file of nonsense
+    # emit DIFFERENT warnings, and that difference is the cross-language
+    # contract with the .sh/.ps1 siblings.
+    parsed = parse_hub_port(raw)
+    if raw.strip(_HUB_PORT_PAD) and parsed is None:
+        _warn("hub_port_invalid", "hub.port contains non-integer content; using default 7700")
+    return parsed if parsed is not None else DEFAULT_HUB_PORT
+
+
 def hub_token_file() -> Path:
     """``<vct_root_dir()>/hub.token``."""
     return vct_root_dir() / HUB_TOKEN_FILE
@@ -232,6 +372,58 @@ def is_running() -> bool:
     from vco_lib.deferral_probes import pid_is_alive
 
     return pid_is_alive(pid)
+
+
+def probe_hub_health(timeout: float = 0.5, vct_root: Optional[Path] = None) -> bool:
+    """GET the hub's ``/api/v1/health`` on the port ``hub.port`` names.
+
+    True when the hub responds with status < 400, False otherwise. The port
+    comes from the STRICT file-only reader (:func:`read_hub_port_file`): no
+    file / not a valid port means no running hub to probe, and guessing 7700
+    would send the request to whatever holds that port. The install-time
+    twin of ``vco_lib.deferral_probes.hub_answers_health`` (same endpoint,
+    same intentionally-AUTH-FREE request — the probe runs before the hub
+    token file is readable — same ``status < 400`` bar); that one resolves
+    the port through the client chain (env → file → 7700), this one through
+    the file alone, because the installer cannot trust an inherited pin.
+    Moved from install.py's ``_probe_vct_hub_health`` (v0.2.97) so the body
+    has one home; install.py keeps a thin shim under the old name.
+
+    v0.2.43 V0243-1: the endpoint is ``/api/v1/health`` (the hub's actual
+    health route; ``/health`` 404s on every vct-hub shipped since v0.2.21).
+
+    On a successful probe any pre-existing ``v0.2.21-cutover.flag`` next to
+    ``hub.port`` is unlinked — best-effort cleanup of a stale migration
+    sentinel an interrupted v0.2.21 install may have left behind.
+
+    Soft-fail on every error (file missing, port invalid, connection
+    refused, timeout): a health probe is never a crash path.
+    """
+    root = vct_root if vct_root is not None else vct_root_dir()
+    try:
+        port = read_hub_port_file(root)
+        if port is None:
+            return False
+        url = f"http://127.0.0.1:{port}/api/v1/health"
+        # R8 G10: the one probe opener — a stray process on that port
+        # answering `302 https://elsewhere/` is a 3xx (not healthy), never
+        # followed off-machine; and a proxy in the environment is not used
+        # for this loopback URL.
+        from vco_lib.service_probe_http import open_probe  # noqa: PLC0415
+
+        resp = open_probe(url, timeout)
+        healthy = resp.status < 400
+        if healthy:
+            # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
+            legacy_flag = root / "v0.2.21-cutover.flag"
+            try:
+                if legacy_flag.is_file():
+                    legacy_flag.unlink()
+            except OSError:
+                pass  # Best-effort; not critical.
+        return healthy
+    except Exception:
+        return False
 
 
 # ---------------------------------------------------------------------------
@@ -459,19 +651,15 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     short-circuits when already running and returns within ~100 ms, so the
     cost of the spawn is bounded either way.
     """
+    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs
+
     argv = [str(binary), "--start-if-not-running"]
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        # DETACHED_PROCESS | CREATE_NO_WINDOW — no conhost.exe flash when the
-        # parent is a GUI subsystem process.
-        creationflags = 0x0000_0008 | 0x0800_0000
-    else:
-        start_new_session = True
+    env = detached_child_env()  # the hub outlives us: no relaunch record
     try:
         if wait:
             completed = subprocess.run(
                 argv,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
@@ -489,11 +677,11 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
         else:
             subprocess.Popen(  # noqa: S603 — argv is a resolved absolute path
                 argv,
+                env=env,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=start_new_session,
-                creationflags=creationflags,
+                **detached_popen_kwargs(),
             )
     except OSError as exc:
         return EnsureResult(

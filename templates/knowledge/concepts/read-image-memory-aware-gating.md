@@ -3,13 +3,13 @@ title: read_image — Memory-Aware Vision-Model Gating
 type: concept
 tags: [ollama, vision, vlm, memory, mcp, low-level-implementation, vibecoded-orchestrator]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-12T00:00:00Z
+updated: 2026-09-24T00:00:00Z
 status: deprecated
 ---
 
 # read_image — Memory-Aware Vision-Model Gating
 
-**Availability note (historical reference)**: The Ollama MCP server was removed from the default VCO install in v0.2.11 (PR-14a), and its source code no longer ships in this repo — the `ollama_mcp/` directory was removed pre-v0.2.30 when the Ollama MCP became an opt-in module, installable via the launcher → Modules tab → **vct-ollama**. Claude's native vision via the `Read` tool on image paths is the recommended path. This node is kept as a design reference: the gating logic (resize tiers, VRAM thresholds) documented below applies whenever the opt-in `read_image` tool is invoked against a running Ollama instance.
+**Availability note (historical reference)**: The Ollama MCP server that provided `read_image` was removed in v0.2.11 — PR-14a (commit `a4706f46`) deleted `claude_mcp_servers/ollama_mcp/`, and PR-14b retired its `vct-ollama` module manifest in the same release. Nothing re-adds it: there is no Ollama MCP and no `vct-ollama` module. For images, use Claude's native vision — the `Read` tool on the image path. Ollama itself still runs, as VCO's embedding service. This node is kept only as a design reference for the gating logic below (resize tiers, VRAM thresholds), should a local vision tier ever be rebuilt.
 
 The `read_image` MCP tool (Ollama MCP) returns an image as a base64 data URL Claude can see directly. The optional **local description tier** runs a vision model (`qwen3.5:9b` default) on-device. Memory-aware gating probes free VRAM and system RAM at module load and either picks a fitting model, falls back to a smaller installed one, or skips the description with a clear reason. The image-as-base64 path is unchanged — it always returns.
 
@@ -40,7 +40,7 @@ Sources: [[Qwen3.5]], [[Gemma 4 E4B]], the Ollama library tag pages, and r/Local
 
 ## How probing works
 
-`probe_capabilities()` runs once at module load:
+`_detect_vision_capability()` ran once at module load:
 
 1. **GPU**: `nvidia-smi --query-gpu=memory.free` (NVIDIA), `system_profiler SPDisplaysDataType` (Apple), then a generic `nvidia-ml-py` fallback. Fails closed: any error → "no GPU".
 2. **RAM**: `psutil.virtual_memory().available` (psutil is a hard dep already).
@@ -92,7 +92,7 @@ The base64 data URL path is independent of vision-model state. Claude's own visi
 
 ## Files
 
-The implementation (`probe_capabilities()`, `_pick_vision_model()`, `read_image()`) and its unit tests ship with the opt-in **vct-ollama** module (launcher → Modules tab), not in this repo.
+The implementation (`_detect_vision_capability()`, `_select_vision_model()`, `read_image()`) and its unit tests (`tests/test_ollama_vision_gating.py`) no longer ship anywhere; both were deleted by commit `a4706f46` (PR-14a, v0.2.11). To read them: `git show a4706f46^:claude_mcp_servers/ollama_mcp/server.py`.
 
 ## See also
 

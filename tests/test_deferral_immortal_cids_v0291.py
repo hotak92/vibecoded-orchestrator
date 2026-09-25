@@ -134,14 +134,19 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
     # Deleting the named one cleared the row and left the orphan invisible —
     # "cleared on a subset of real outstanding work", which is precisely what
     # the truncation arm above exists to refuse, one layer in.
+    #
+    # v0.2.97: that field pair was CLAUDE.md, a RENDERED file whose sidecars
+    # hold nothing to adopt and no longer count (see
+    # test_v0297_rendered_file_sidecars.py). The hole itself is path-agnostic,
+    # so it is pinned here on an ordinary user-editable file.
     # -----------------------------------------------------------------
 
     def test_a_sidecar_the_entry_never_named_keeps_the_entry(self):
         """LEAVE-ALONE: every NAMED sidecar is gone and the list is complete,
         but an earlier run's orphan is still parked. RED before the fix: the
         complete-list arm returned False and deleted the last record of it."""
-        self._touch("CLAUDE.md.from-upstream-f1f5488")
-        entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
+        self._touch("README.md.from-upstream-f1f5488")
+        entry = _sidecar_entry("README.md.from-upstream-89a5530")
         self.assertIs(
             dp.orchestrator_sidecars_still_present(
                 dp.ProbeContext(folder=self.folder, entry=entry)

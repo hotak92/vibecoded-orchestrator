@@ -4,14 +4,10 @@
 //!   - [`runtime`]: detect Podman/Docker + compose form (subcommand vs
 //!     standalone), cached per launcher session. *Lives in
 //!     `vct-launcher-core::services::runtime` as of v0.2.21 (Step 3d).*
-//!   - [`picker`]: container picker for the
-//!     `com.docker.compose.service=<name>` label-collision case. *Also
-//!     in `vct-launcher-core::services::picker` as of v0.2.21.*
-//!   - [`adoption`]: persist the user's adopt-vs-parallel choice for
-//!     externally-managed services in `~/.vct/services.toml`. *Moved to
-//!     `vct_launcher_core::services::adoption` in v0.2.62 so the hub's
-//!     infra watchdog reads the same decisions; the launcher submodule
-//!     is now a thin `pub use` re-export.*
+//!   - The v0.2.7 container `picker` and the `services.toml` `adoption`
+//!     module are RETIRED (v0.2.97): each service's launcher.db
+//!     `service_endpoints` row says what it is, and candidate detection is
+//!     the Python detector behind `vco_lib_bridge::service_endpoint_candidates`.
 //!   - [`settings_json_watcher`]: launcher-side reactive watcher for
 //!     `.claude/settings.json` edits. Stays in the launcher.
 //!   - [`watcher`]: 30s polling supervisor that auto-restarts crashed
@@ -21,13 +17,10 @@
 //! Tauri commands that wire these into the UI live in
 //! `commands::lifecycle` (services_status, services_start_all, etc.).
 
-// Re-export the core halves so `crate::services::runtime::*` and
-// `crate::services::picker::*` continue to resolve from anywhere in
-// the launcher without per-file import rewrites.
-pub use vct_launcher_core::services::picker;
+// Re-export the core half so `crate::services::runtime::*` continues to
+// resolve from anywhere in the launcher without per-file import rewrites.
 pub use vct_launcher_core::services::runtime;
 
-pub mod adoption;
 /// v0.2.91 WP-A — dist-binary freshness: the ONE home for the pre-pull
 /// rename, its non-clobbering revert, `<target>.new` staging, the shared
 /// post-update handoff tail, and the at-rest (boot / update-check)

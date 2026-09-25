@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -33,6 +35,7 @@ from vco_lib.containers import (  # noqa: E402
     UnknownServiceError,
     all_known_names,
     canonical_name,
+    classify_container_probe,
     find_existing_container,
 )
 
@@ -205,12 +208,15 @@ class FindExistingContainerTests(unittest.TestCase):
         """Runtime is present but every probe returns non-zero (no
         container by that name exists) → return None."""
         # Fake runtime is on PATH.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
-        # Every subprocess.run returns rc != 0 (no container exists).
+        # Every subprocess.run returns the "no such container" failure
+        # both runtimes print for a name that is absent.
         class FakeCompleted:
             returncode = 1
+            stderr = "Error: no such container vco_weaviate"
+            stdout = ""
 
         with patch("vco_lib.containers.shutil.which", side_effect=fake_which):
             with patch(
@@ -225,12 +231,14 @@ class FindExistingContainerTests(unittest.TestCase):
 
     def test_returns_canonical_when_canonical_exists(self):
         """When the canonical container exists, it wins over aliases."""
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
         class FakeCompleted:
-            def __init__(self, rc):
+            def __init__(self, rc, stderr=""):
                 self.returncode = rc
+                self.stderr = stderr
+                self.stdout = ""
 
         # First probe (vco_weaviate) returns 0; subsequent should not
         # be reached. We verify by failing if anything except the first
@@ -239,11 +247,11 @@ class FindExistingContainerTests(unittest.TestCase):
 
         def fake_run(cmd, **kwargs):
             call_count["n"] += 1
-            # cmd is [bin, "container", "exists", name]
+            # cmd is [bin, "container", "inspect", "--format", fmt, name]
             name = cmd[-1]
             if name == "vco_weaviate":
                 return FakeCompleted(0)
-            return FakeCompleted(1)
+            return FakeCompleted(1, f"Error: no such container {name}")
 
         with patch("vco_lib.containers.shutil.which", side_effect=fake_which):
             with patch(
@@ -261,17 +269,21 @@ class FindExistingContainerTests(unittest.TestCase):
 
     def test_falls_through_to_legacy_alias(self):
         """When only a legacy alias exists, return that alias."""
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name == "podman" else None
 
         class FakeCompleted:
-            def __init__(self, rc):
+            def __init__(self, rc, stderr=""):
                 self.returncode = rc
+                self.stderr = stderr
+                self.stdout = ""
 
         def fake_run(cmd, **kwargs):
             name = cmd[-1]
             # Only `weaviate_claude` exists on this host.
-            return FakeCompleted(0 if name == "weaviate_claude" else 1)
+            if name == "weaviate_claude":
+                return FakeCompleted(0)
+            return FakeCompleted(1, f"Error: no such container {name}")
 
         with patch("vco_lib.containers.shutil.which", side_effect=fake_which):
             with patch(
@@ -297,6 +309,163 @@ class FindExistingContainerTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# Container-inspect probe (v0.2.97): Docker has NO `container exists`
+# subcommand, so the old probe answered "not found" for every Docker
+# lookup. The probe is now `container inspect --format {{.Name}}`, with a
+# tri-state classifier (`classify_container_probe`).
+# ---------------------------------------------------------------------------
+
+
+class ContainerInspectProbeTests(unittest.TestCase):
+    """The existence probe must work on BOTH runtimes.
+
+    The fake runner below implements `container inspect` and REFUSES
+    `container exists` (it fails the test if the source ever issues that
+    subcommand) — the exact shape of Docker's CLI, where the old probe
+    silently returned "not found" for every lookup."""
+
+    def _run_lookup(self, runtime, responses):
+        """`find_existing_container("weaviate")` pinned to `runtime`,
+        with `responses` mapping container name → (rc, stderr, stdout).
+        Names absent from the map are probed with rc 1 / empty output.
+        Returns (result, [argv of every probe])."""
+        argvs: list[list[str]] = []
+
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
+            return f"/fake/{name}" if name in ("podman", "docker") else None
+
+        def fake_run(cmd, **kwargs):
+            argvs.append(list(cmd))
+            if cmd[1:3] != ["container", "inspect"]:
+                self.fail(
+                    f"probe must be '<runtime> container inspect' (works on "
+                    f"docker AND podman), got: {cmd!r}"
+                )
+            rc, stderr, stdout = responses.get(cmd[-1], (1, "", ""))
+            return subprocess.CompletedProcess(cmd, rc, stdout, stderr)
+
+        with patch("vco_lib.containers.shutil.which", side_effect=fake_which):
+            with patch(
+                "vco_lib.containers.subprocess.run", side_effect=fake_run,
+            ):
+                with patch.dict(
+                    os.environ, {"VCT_CONTAINER_RUNTIME": runtime},
+                ):
+                    result = find_existing_container("weaviate")
+        return result, argvs
+
+    def test_docker_finds_container_via_inspect(self):
+        result, argvs = self._run_lookup(
+            "docker", {"vco_weaviate": (0, "", "/vco_weaviate\n")},
+        )
+        self.assertEqual(result, "vco_weaviate")
+        self.assertEqual(argvs[0][0], "docker")
+
+    def test_docker_not_found_probes_every_alias(self):
+        """Docker's 'Error: No such container: <name>' phrasing is a
+        POSITIVE not-found, so the search falls through the whole alias
+        list and answers None."""
+        result, argvs = self._run_lookup(
+            "docker",
+            {name: (1, f"Error: No such container: {name}", "")
+             for name in all_known_names("weaviate")},
+        )
+        self.assertIsNone(result)
+        self.assertEqual(
+            [a[-1] for a in argvs], all_known_names("weaviate"),
+        )
+
+    def test_docker_daemon_error_is_soft_failed_not_recorded_not_found(self):
+        """A non-'no such' failure (daemon down) is an ERROR: the lookup
+        soft-fails to None (never claims found), and the classifier
+        keeps it apart from not_found."""
+        daemon_down = (
+            1,
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. "
+            "Is the docker daemon running?",
+            "",
+        )
+        result, argvs = self._run_lookup(
+            "docker",
+            {name: daemon_down for name in all_known_names("weaviate")},
+        )
+        self.assertIsNone(result)
+        self.assertTrue(argvs, "no probe ran")
+        self.assertEqual(
+            classify_container_probe(
+                subprocess.CompletedProcess(["docker"], 1, "", daemon_down[1])
+            ),
+            "error",
+        )
+
+    def test_podman_not_found_phrasing_classified_not_found(self):
+        result, argvs = self._run_lookup(
+            "podman",
+            {name: (1, f"Error: no such container {name}", "")
+             for name in all_known_names("weaviate")},
+        )
+        self.assertIsNone(result)
+        self.assertEqual(
+            [a[-1] for a in argvs], all_known_names("weaviate"),
+        )
+
+    def test_podman_finds_container_via_inspect(self):
+        result, _ = self._run_lookup(
+            "podman", {"vco_weaviate": (0, "", "/vco_weaviate\n")},
+        )
+        self.assertEqual(result, "vco_weaviate")
+
+
+class ClassifyContainerProbeTests(unittest.TestCase):
+    """The tri-state classifier, pinned on both runtimes' phrasings."""
+
+    def _res(self, rc, stderr="", stdout=""):
+        return subprocess.CompletedProcess(["runtime"], rc, stdout, stderr)
+
+    def test_exit_zero_is_exists(self):
+        for stderr in ("", "some warning"):
+            self.assertEqual(
+                classify_container_probe(self._res(0, stderr)), "exists",
+            )
+
+    def test_docker_no_such_container_is_not_found(self):
+        self.assertEqual(
+            classify_container_probe(self._res(
+                1, "Error: No such container: vco_weaviate",
+            )),
+            "not_found",
+        )
+
+    def test_podman_no_such_container_is_not_found(self):
+        self.assertEqual(
+            classify_container_probe(self._res(
+                1, "Error: no such container vco_weaviate",
+            )),
+            "not_found",
+        )
+
+    def test_no_such_object_is_not_found(self):
+        """API-level phrasing (podman remote / older docker)."""
+        self.assertEqual(
+            classify_container_probe(self._res(1, "Error: no such object")),
+            "not_found",
+        )
+
+    def test_daemon_down_is_error_not_not_found(self):
+        for stderr in (
+            "Cannot connect to the Docker daemon at unix:///var/run/docker.sock",
+            "Error: failed to connect: dial unix /run/podman/podman.sock: "
+            "connect: no such file or directory — note: 'no such file' here "
+            "is the SOCKET, not a container, and must stay an error",
+            "",
+        ):
+            self.assertEqual(
+                classify_container_probe(self._res(1, stderr)), "error",
+                f"stderr {stderr!r} must classify as error",
+            )
+
+
+# ---------------------------------------------------------------------------
 # Runtime-selection contract
 # ---------------------------------------------------------------------------
 
@@ -310,13 +479,15 @@ class RuntimeSelectionTests(unittest.TestCase):
     def test_env_var_podman_overrides_docker_default(self):
         # When the env says podman and shutil reports podman present,
         # the probe should go through podman.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name in ("podman", "docker") else None
 
         seen_bins: list[str] = []
 
         class FakeCompleted:
             returncode = 1
+            stderr = "Error: no such container"
+            stdout = ""
 
         def fake_run(cmd, **kwargs):
             seen_bins.append(cmd[0])
@@ -346,13 +517,15 @@ class RuntimeSelectionTests(unittest.TestCase):
 
     def test_env_var_auto_uses_caller_default(self):
         # auto = no preference = caller's `runtime` argument wins.
-        def fake_which(name):
+        def fake_which(name, path=None):  # path=: tool_search_dirs looks up per directory
             return f"/fake/{name}" if name in ("podman", "docker") else None
 
         seen_bins: list[str] = []
 
         class FakeCompleted:
             returncode = 1
+            stderr = "Error: no such container"
+            stdout = ""
 
         def fake_run(cmd, **kwargs):
             seen_bins.append(cmd[0])
@@ -364,14 +537,100 @@ class RuntimeSelectionTests(unittest.TestCase):
             ):
                 with patch.dict(
                     os.environ, {"VCT_CONTAINER_RUNTIME": "auto"},
-                ):
-                    find_existing_container("weaviate", runtime="docker")
+                ), tempfile.TemporaryDirectory() as root:
+                    # An install root with no runtime.txt: nothing pins.
+                    find_existing_container("weaviate", runtime="docker", install_root=Path(root))
 
         self.assertTrue(
             all(b == "docker" for b in seen_bins),
             f"VCT_CONTAINER_RUNTIME=auto should have deferred to "
             f"caller's runtime='docker'; probes ran via {seen_bins}",
         )
+
+
+
+class PinnedRuntimeLookupTests(unittest.TestCase):
+    """Review round 7: a container lookup follows THE pin rule
+    (`containers.runtime_pin`: VCT_CONTAINER_RUNTIME → runtime.txt → auto).
+    A pinned runtime that is missing or down means "not found" — never a
+    container of the OTHER runtime, whose containers sit on other volumes.
+    Unpinned, the caller's runtime is tried and the other one only when it is
+    not installed (auto-detection keeps its fallback)."""
+
+    def _lookup(self, *, env_runtime, recorded, on_path, exists=(),
+                miss_stderr="Error: no such container {name}"):
+        """Run the lookup with `env_runtime` (None = unset), a scratch install
+        root whose runtime.txt records `recorded` (None = no file), `on_path`
+        binaries, and containers `exists` (name set) answering on ANY
+        runtime. `miss_stderr` is the failure output for absent names (the
+        default is the shared "no such container" miss; the daemon-down test
+        passes a socket error instead). Returns (result, the binaries the
+        probes ran)."""
+        seen: list[str] = []
+
+        class Done:
+            def __init__(self, rc, stderr=""):
+                self.returncode = rc
+                self.stderr = stderr
+                self.stdout = ""
+
+        def fake_run(cmd, **kwargs):
+            seen.append(cmd[0])
+            if cmd[-1] in exists:
+                return Done(0)
+            return Done(1, miss_stderr.format(name=cmd[-1]))
+
+        env = {k: v for k, v in os.environ.items() if k != "VCT_CONTAINER_RUNTIME"}
+        if env_runtime is not None:
+            env["VCT_CONTAINER_RUNTIME"] = env_runtime
+        with tempfile.TemporaryDirectory() as root:
+            if recorded is not None:
+                txt = Path(root) / "state" / "install" / "runtime.txt"
+                txt.parent.mkdir(parents=True)
+                txt.write_text(recorded + "\n", encoding="utf-8")
+            with patch("vco_lib.containers.shutil.which",
+                       side_effect=lambda n, path=None: f"/fake/{n}" if n in on_path else None), \
+                    patch("vco_lib.containers.subprocess.run", side_effect=fake_run), \
+                    patch.dict(os.environ, env, clear=True):
+                result = find_existing_container("weaviate", install_root=Path(root))
+        return result, seen
+
+    def test_an_env_pin_to_a_missing_runtime_never_asks_the_other(self):
+        result, seen = self._lookup(env_runtime="podman", recorded=None, on_path={"docker"},
+                                    exists={"vco_weaviate"})
+        self.assertIsNone(result)
+        self.assertEqual(seen, [], "the unpinned runtime was asked")
+
+    def test_a_runtime_txt_pin_to_a_missing_runtime_never_asks_the_other(self):
+        result, seen = self._lookup(env_runtime=None, recorded="docker", on_path={"podman"},
+                                    exists={"vco_weaviate"})
+        self.assertIsNone(result)
+        self.assertEqual(seen, [], "the unpinned runtime was asked")
+
+    def test_a_pinned_runtime_that_is_down_finds_nothing_and_asks_only_itself(self):
+        result, seen = self._lookup(
+            env_runtime=None, recorded="docker", on_path={"podman", "docker"},
+            exists=(),
+            # Daemon DOWN (socket refused), not a per-name miss — the
+            # probe ERROR path, which must soft-fail the same way.
+            miss_stderr="Cannot connect to the Docker daemon at "
+                        "unix:///var/run/docker.sock. Is the docker daemon running?",
+        )
+        self.assertIsNone(result)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {"docker"}, seen)
+
+    def test_the_env_pin_wins_over_runtime_txt(self):
+        result, seen = self._lookup(env_runtime="podman", recorded="docker",
+                                    on_path={"podman", "docker"}, exists={"vco_weaviate"})
+        self.assertEqual(result, "vco_weaviate")
+        self.assertEqual(set(seen), {"podman"})
+
+    def test_unpinned_auto_detection_keeps_its_fallback(self):
+        result, seen = self._lookup(env_runtime="auto", recorded=None, on_path={"docker"},
+                                    exists={"vco_weaviate"})
+        self.assertEqual(result, "vco_weaviate")
+        self.assertEqual(set(seen), {"docker"})
 
 
 if __name__ == "__main__":

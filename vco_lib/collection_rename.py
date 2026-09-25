@@ -1044,26 +1044,16 @@ def _reproject_env(plan: RenamePlan, *,
 
     The projection derives every value from the database, so re-running it
     after the flip rewrites ``KG_COLLECTION`` / ``CODE_GRAPH_PROJECT`` without
-    this module owning a list of keys to sed. Reuses W3's child-env builder
-    rather than composing a second one.
+    this module owning a list of keys to sed. Delegates to the move's
+    :func:`vco_lib.project_move.run_env_reprojection` (one home, v0.2.97 — the
+    two hand-built copies both carried a ``--folder`` flag ``apply`` rejects).
     """
-    import subprocess
+    from vco_lib.project_move import MoveError, run_env_reprojection
 
-    from vco_lib.project_move import build_child_env
-    from vco_lib.python_exe import resolve_or_current
-
-    # v0.2.94: the ONE resolver, not `sys.executable` — a rename can be driven
-    # from the launcher, whose bundle path spawns Python via a bare PATH probe.
-    argv = [resolve_or_current(), "-m", "vco_lib.config_projection", "apply",
-            "--project-id", plan.project_id, "--folder", plan.folder]
-    env = build_child_env({"CLAUDE_PROJECT_DIR": plan.folder,
-                           "KG_BASE_DIR": plan.folder})
-    proc = (runner(argv, env) if runner is not None
-            else subprocess.run(argv, env=env, capture_output=True, text=True,
-                                check=False))
-    if getattr(proc, "returncode", 1) != 0:
-        raise RenameError((getattr(proc, "stderr", "") or "").strip()[-400:]
-                          or f"exit {getattr(proc, 'returncode', '?')}")
+    try:
+        run_env_reprojection(plan.project_id, Path(plan.folder), runner=runner)
+    except MoveError as exc:
+        raise RenameError(str(exc)) from exc
 
 
 def write_completed_record(plan: RenamePlan) -> Path:
@@ -1115,7 +1105,8 @@ def drop_retired_command(folder: "str | Path", *,
 def _analyze_wrapper(folder: Path, *, platform: Optional[str] = None) -> str:
     """The bundled analyzer wrapper for ``folder``, as a real path.
 
-    There is no ``vco codegraph`` verb. The analyzer ships as the BUNDLED
+    No CLI verb analyzes a code graph (the launcher's ``vct-cli codegraph``
+    only lists and searches). The analyzer ships as the BUNDLED
     wrapper in the project's own ``.claude/scripts/``, so that is what any
     remediation names — a printed command is shipped code.
     """

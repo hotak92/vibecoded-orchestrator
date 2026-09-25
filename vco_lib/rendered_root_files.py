@@ -21,6 +21,9 @@ Who consumes what
   divergent path with :func:`is_rendered_path` semantics (normalise ``\\`` to
   ``/``, case-insensitive compare) so a rendered file never reaches the
   divergence modal.
+* :func:`render_all` also reaps a rendered file's stale ``.from-upstream-``
+  sidecars (v0.2.97, :func:`reap_stale_sidecars`), and the deferral clear
+  probe classifies them with the same rule (:func:`is_rendered_sidecar_path`).
 
 Failure mode
 ------------
@@ -32,8 +35,9 @@ re-introduce the two-language drift this table exists to remove.
 from __future__ import annotations
 
 import json
+import re
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 #: The format version this loader understands. Bumped in lockstep with the
@@ -157,6 +161,142 @@ def is_rendered_path(rel_path: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Stale `.from-upstream-` sidecars of a rendered file (v0.2.97)
+#
+# Before v0.2.95 R1 the launcher's pre-pull 3-way merge conflicted on every
+# rendered file at every release and parked upstream's tracked copy beside it
+# as `<path>.from-upstream-<sha>`. For a rendered file that copy is the
+# placeholder saying "install.py materializes this" — adopting it would REPLACE
+# the rendered file, so there is never anything to adopt, yet they accumulated
+# one per release. The launcher no longer writes them
+# (`git_user_editable_merge.rs`, conflict arm); THIS is the one place that
+# removes the old ones, run by `render_all` right after the re-render (which is
+# the merge for a rendered file). It is the only implementation: the untracked
+# sidecars never affect the pull, so the launcher does not need a pre-pull copy
+# of the rule, and install.py runs this on every install and update — GUI or
+# CLI, including the first update a pre-v0.2.97 launcher performs.
+#
+# DATA-SAFETY: a file is removed only on positive evidence that nothing is
+# lost — its name is exactly `<basename>.from-upstream-<4..40 hex>` in the
+# rendered file's own directory, it is a regular file (never a symlink or a
+# directory), and its exact bytes are a blob git already holds (`git
+# hash-object --no-filters` + `git cat-file -e`). A sidecar is by construction
+# a byte copy of upstream's blob, so one a user edited is left alone. Each
+# removal is recorded in the B-F9 auto-resolution trail with its blob id, so
+# `git cat-file -p <oid>` restores it.
+# ---------------------------------------------------------------------------
+
+#: Filed under the condition whose parked sidecars these are.
+SIDECAR_REAP_CONDITION = "orchestrator_user_modified_preserved"
+SIDECAR_REAP_ACTION = "removed un-adoptable rendered-file sidecar"
+
+_SIDECAR_MARKER = ".from-upstream-"
+_SIDECAR_SHA_RE = re.compile(r"[0-9A-Fa-f]{4,40}")
+
+
+@dataclass(frozen=True)
+class ReapedSidecar:
+    """One removed sidecar: root-relative POSIX path + the blob id of its bytes."""
+
+    rel_path: str
+    blob_oid: str
+
+
+def _split_rel(rel_path: str) -> tuple[str, str]:
+    """``(directory, basename)`` of a root-relative path, POSIX separators."""
+    norm = rel_path.replace("\\", "/")
+    head, sep, tail = norm.rpartition("/")
+    return (head if sep else ""), tail
+
+
+def is_sidecar_name_for(name: str, basename: str) -> bool:
+    """Is ``name`` exactly ``<basename>.from-upstream-<sha>`` (the shape the
+    launcher's ``sidecar_path_for`` writes)? Basename compare is case-folded
+    like :func:`is_rendered_path`; the sha must be 4..40 hex digits, so a
+    user's own ``CLAUDE.md.from-upstream-notes`` never qualifies."""
+    prefix = basename + _SIDECAR_MARKER
+    if len(name) <= len(prefix) or name[: len(prefix)].casefold() != prefix.casefold():
+        return False
+    return _SIDECAR_SHA_RE.fullmatch(name[len(prefix):]) is not None
+
+
+def is_rendered_sidecar_path(rel_path: str) -> bool:
+    """True when root-relative ``rel_path`` is a ``.from-upstream-`` sidecar of
+    a RENDERED file. The ONE name rule: the reap below and the deferral clear
+    probe (``deferral_probes.is_rendered_file_sidecar``) both ask it."""
+    directory, name = _split_rel(rel_path)
+    for entry in entries():
+        entry_dir, entry_base = _split_rel(entry.path)
+        if _normalise(directory) == _normalise(entry_dir) and is_sidecar_name_for(
+            name, entry_base
+        ):
+            return True
+    return False
+
+
+def _blob_oid_if_known_to_git(install_root: Path, path: Path) -> str | None:
+    """Blob id of ``path``'s exact bytes, ONLY when git already stores it."""
+    from vco_lib.git_meta import run_git
+
+    rc, oid, _err = run_git(install_root, ["hash-object", "--no-filters", "--", str(path)])
+    if rc != 0 or not oid:
+        return None
+    rc, _out, _err = run_git(install_root, ["cat-file", "-e", oid])
+    return oid if rc == 0 else None
+
+
+def _record_reap(install_root: Path, entry: RenderedRootFile, reaped: ReapedSidecar) -> None:
+    from vco_lib.deferral_emit import record_auto_resolution
+
+    record_auto_resolution(
+        install_root,
+        SIDECAR_REAP_CONDITION,
+        SIDECAR_REAP_ACTION,
+        f"{reaped.rel_path} held upstream's tracked placeholder for a file "
+        f"install.py renders from {entry.template}; adopting it would have "
+        "replaced the rendered file, so there was nothing to adopt. The bytes "
+        f"are still in git: `git cat-file -p {reaped.blob_oid}`",
+    )
+
+
+def reap_stale_sidecars(
+    install_root: Path, entry: RenderedRootFile
+) -> tuple[ReapedSidecar, ...]:
+    """Remove (and record) the stale sidecars parked beside ``entry``'s file.
+
+    Never raises: a per-file doubt or failure leaves that file in place.
+    """
+    directory, basename = _split_rel(entry.path)
+    parent = install_root / directory if directory else install_root
+    try:
+        candidates = sorted(p for p in parent.iterdir() if is_sidecar_name_for(p.name, basename))
+    except OSError:
+        return ()
+    reaped: list[ReapedSidecar] = []
+    for path in candidates:
+        try:
+            if path.is_symlink() or not path.is_file():
+                continue
+        except OSError:
+            continue
+        oid = _blob_oid_if_known_to_git(install_root, path)
+        if oid is None:
+            continue  # bytes unknown to git (hand-edited?) — keep it
+        try:
+            path.unlink()
+        except OSError:
+            continue
+        rel = f"{directory}/{path.name}" if directory else path.name
+        item = ReapedSidecar(rel, oid)
+        try:
+            _record_reap(install_root, entry, item)
+        except Exception:  # noqa: BLE001 — the outcome detail still reports it
+            pass
+        reaped.append(item)
+    return tuple(reaped)
+
+
+# ---------------------------------------------------------------------------
 # Rendering + the launcher hand-off (v0.2.95 R1)
 #
 # The bodies live HERE rather than in install.py for the reason install.py's
@@ -179,11 +319,15 @@ class RenderOutcome:
     ``status`` is one of ``created`` / ``auto_block_updated`` / ``full_rewrite``
     / ``template_missing`` / ``unknown_substitution`` / ``failed``; ``detail``
     is the human-readable suffix the installer prints and logs.
+    ``reaped_sidecars`` names the stale ``.from-upstream-`` sidecars
+    :func:`render_all` removed after a successful render (v0.2.97); ``detail``
+    says so too, which is how the installer's print + log line shows it.
     """
 
     path: str
     status: str
     detail: str
+    reaped_sidecars: tuple[str, ...] = ()
 
     @property
     def is_failure(self) -> bool:
@@ -250,9 +394,35 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
 
 
+#: Statuses after which the file on disk IS the fresh render.
+_RENDERED_OK = ("created", "auto_block_updated", "full_rewrite")
+
+
 def render_all(install_root: Path) -> tuple[RenderOutcome, ...]:
-    """Render every table entry into ``install_root``, in table order."""
-    return tuple(render_entry(install_root, entry) for entry in entries())
+    """Render every table entry into ``install_root``, in table order.
+
+    After an entry renders successfully its stale ``.from-upstream-`` sidecars
+    are reaped (see :func:`reap_stale_sidecars`) — the re-render is the merge
+    for a rendered file, so this is the moment they are provably redundant.
+    """
+    outcomes: list[RenderOutcome] = []
+    for entry in entries():
+        outcome = render_entry(install_root, entry)
+        if outcome.status in _RENDERED_OK:
+            reaped = reap_stale_sidecars(install_root, entry)
+            if reaped:
+                names = ", ".join(r.rel_path for r in reaped)
+                outcome = replace(
+                    outcome,
+                    detail=(
+                        f"{outcome.detail}; removed {len(reaped)} un-adoptable "
+                        f"upstream sidecar(s): {names} (recorded in "
+                        ".claude/logs/auto-resolutions.jsonl)"
+                    ),
+                    reaped_sidecars=tuple(r.rel_path for r in reaped),
+                )
+        outcomes.append(outcome)
+    return tuple(outcomes)
 
 
 def state_file_path(install_root: Path) -> Path:

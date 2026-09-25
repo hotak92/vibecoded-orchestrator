@@ -5,7 +5,7 @@ short_desc: cold email + LinkedIn outbound sequences
 keywords: ["cold email", "outbound sequence", "LinkedIn DM", "subject line", ICP, deliverability, "write cold email", "draft outbound sequence", "partnership outreach"]
 tools: Read, Write, Edit, Grep, Glob, Bash, WebFetch
 model: opus
-effort: high
+effort: medium
 ---
 
 # Outbound Sequence Writer

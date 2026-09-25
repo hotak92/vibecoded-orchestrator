@@ -617,3 +617,63 @@ fn resolve_image_ref_synthesizes_when_empty() {
         "{install.container.image}:{install.container.tag}"
     );
 }
+
+// ─── v0.2.97 (review R6 round 2): depends_on must name a known module ───
+
+fn dep_manifest(id: &str, deps: &[&str]) -> String {
+    serde_json::json!({
+        "manifest_version": 1,
+        "id": id,
+        "name": id,
+        "version": "1.0.0",
+        "description": "fixture",
+        "category": "paid-independent",
+        "license": {"required": false, "min_orchestrator_tier": "free"},
+        "compatibility": {"hosts": ["base"]},
+        "requirements": {"depends_on": deps},
+        "install": {"method": "local"},
+        "runtime": {"type": "cli"}
+    })
+    .to_string()
+}
+
+fn run_validate(args: &[&str]) -> (i32, String) {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_validate-manifest"))
+        .args(args)
+        .env("VCT_LAUNCHER_STRICT_MANIFEST", "1")
+        .output()
+        .expect("run validate-manifest");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    (out.status.code().unwrap_or(-1), text)
+}
+
+/// REFUSE: a depends_on id that nothing provides fails the file, named.
+/// ACT: the same id passes once it is known — a bundled id, another file
+/// of the same run, or `--known-module`.
+#[test]
+fn validate_manifest_requires_every_dependency_to_be_a_known_module() {
+    let dir = tempfile::tempdir().unwrap();
+    let needs = dir.path().join("needs.json");
+    std::fs::write(&needs, dep_manifest("vct-needs", &["vct-kg", "vct-ghost"])).unwrap();
+    let needs = needs.to_str().unwrap();
+
+    let (code, text) = run_validate(&[needs]);
+    assert_eq!(code, 1, "{}", text);
+    assert!(text.contains("vct-ghost") && text.contains("not known"), "{}", text);
+    assert!(!text.contains("vct-kg,"), "a bundled id is known: {}", text);
+
+    let (code, text) = run_validate(&["--known-module", "vct-ghost", needs]);
+    assert_eq!(code, 0, "{}", text);
+
+    let ghost = dir.path().join("ghost.json");
+    std::fs::write(&ghost, dep_manifest("vct-ghost", &[])).unwrap();
+    let (code, text) = run_validate(&[needs, ghost.to_str().unwrap()]);
+    assert_eq!(code, 0, "{}", text);
+
+    let (code, _) = run_validate(&["--known-module"]);
+    assert_eq!(code, 2, "a dangling --known-module is a usage error");
+}

@@ -4,7 +4,7 @@ description: Runs structured technical due diligence on a vendor, acquisition ta
 short_desc: "tech DD on vendor, M&A target, or strategic partner"
 keywords: [technical due diligence, vendor DD, acquisition target, strategic partner, risk-ranked report, M&A evaluation, "due diligence", "vendor assessment", "evaluate vendor", "assess this company", "DD on", "tech audit of vendor"]
 model: opus
-effort: high
+effort: medium
 argument-hint: "[target-name] [--scope vendor|acquisition|partnership] [--depth quick|standard|deep]"
 ---
 

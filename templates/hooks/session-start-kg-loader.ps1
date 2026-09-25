@@ -29,6 +29,10 @@ if (Test-Path $FindPy) { . $FindPy }
 
 # Optional RL retrieval server (Pro tier). Auto-launches if installed,
 # otherwise silently no-ops — free tier ships with KG + code graph only.
+# The launcher script (~\.claude\scripts\start-rl-server.ps1, or
+# $env:RL_SERVER_LAUNCHER) is NOT part of the OSS bundle: it is provided
+# by the paid RL module when that module is installed. Nothing in this
+# repo creates it, and the Test-Path guard keeps its absence a no-op.
 $UserHome = [System.Environment]::GetFolderPath('UserProfile')
 $DefaultLauncher = Join-Path $UserHome ".claude\scripts\start-rl-server.ps1"
 $RlLauncher = if ($env:RL_SERVER_LAUNCHER) { $env:RL_SERVER_LAUNCHER } else { $DefaultLauncher }

@@ -5,7 +5,7 @@ short_desc: synthesizes multi-client portfolio status for CTOs
 keywords: ["consulting portfolio", "multi-client", "stakeholder summary", "escalation triage", "portfolio digest", "engagement roll-up", "client comms", "weekly client status", "client status update", "executive summary"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
-effort: high
+effort: medium
 skills:
   - consulting-portfolio-status
   - task-breakdown

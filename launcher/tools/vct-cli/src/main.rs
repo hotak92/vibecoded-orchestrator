@@ -1,4 +1,4 @@
-//! vct — command-line interface for the VCT Launcher (P6).
+//! vct-cli — command-line interface for the VCT Launcher (P6).
 //!
 //! Talks to the launcher's local hub HTTP server (default port 7700,
 //! discoverable via `~/.vct/hub.port`). Every operation that the GUI
@@ -8,8 +8,12 @@
 //! Why a separate binary?
 //!   - The launcher GUI is Tauri (heavy native deps). Pulling Tauri
 //!     into a CLI tool is wasteful. A small reqwest client is enough.
-//!   - Built independently: `cargo build --release --bin vct` from
-//!     `tools/vct-cli/`. The Tauri app build is unaffected.
+//!   - Built independently: `cargo build --release --bin vct-cli` from
+//!     `launcher/tools/vct-cli/`. The Tauri app build is unaffected.
+//!
+//! The binary is `vct-cli` (v0.2.97). It was `vco` before, which is also the
+//! Python console script `pyproject.toml` registers (`vco doctor`,
+//! `vco project move`, ...); see the `[[bin]]` comment in Cargo.toml.
 //!   - Same Rust toolchain as the launcher, so we can share types
 //!     with copy-paste comments rather than a shared crate (the
 //!     surface here is tiny).
@@ -25,7 +29,7 @@ const DEFAULT_PORT: u16 = 7700;
 
 #[derive(Parser)]
 #[command(
-    name = "vco",
+    name = "vct-cli",
     version,
     about = "vibecoded-orchestrator CLI — power-user / CI escape hatch.",
     long_about = "\
@@ -33,8 +37,9 @@ Talks to the running VCT Launcher's local hub server (default 127.0.0.1:7700).
 The launcher must be running for these commands to succeed; if it is not,
 start it via the system tray or the desktop app first.
 
-Note: this CLI was renamed from `vct` to `vco` in v0.1.0 to avoid a name
-collision with the bash secrets tool at tools/vct-secrets/vct."
+Note: this CLI was named `vco` until v0.2.97 (and `vct` before v0.1.0). It is
+`vct-cli` now because `vco` is the orchestrator's Python CLI (`vco doctor`,
+`vco project move`, ...) and `vct` is the secrets tool (tools/vct-secrets/vct)."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -192,6 +197,10 @@ enum TelemetryCmd {
     On,
     /// Revoke telemetry consent.
     Off,
+    /// Print the events waiting in ~/.vibecoded/telemetry_pending.jsonl —
+    /// what an opted-in install would have uploaded. Reads the file
+    /// directly, so the launcher does not need to be running.
+    Pending,
 }
 
 #[derive(Subcommand)]
@@ -271,8 +280,16 @@ impl Hub {
     fn new(port_override: Option<u16>) -> Result<Self> {
         let port = resolve_port(port_override)?;
         let base = format!("http://127.0.0.1:{}/api/v1", port);
+        // MUST MATCH `vct_launcher_core::services::loopback_http` (the one
+        // loopback-client rule; this crate is a separate workspace without
+        // that dependency, and its client is blocking): the request carries
+        // the hub bearer token to 127.0.0.1, so no proxy — reqwest does not
+        // exempt loopback from HTTP_PROXY — and no redirects. Pinned by
+        // `tests::the_hub_client_never_goes_through_a_proxy`.
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(15))
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .context("build http client")?;
         let token = resolve_token();
@@ -514,24 +531,59 @@ fn warn_stale_env_token() {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     if !WARNED.swap(true, Ordering::SeqCst) {
-        eprintln!("vct: {}", STALE_ENV_TOKEN_MESSAGE);
+        eprintln!("vct-cli: {}", STALE_ENV_TOKEN_MESSAGE);
     }
 }
 
+/// THE hub-port value rule (R7b F9), for the env and the WHOLE file alike:
+/// trim C-locale whitespace at the ends, then ASCII `[0-9]{1,5}` in
+/// 1..=65535 — no sign (`str::parse::<u16>` accepts `+7822`), no `_`, no
+/// non-ASCII numerals, no internal whitespace. MUST MATCH
+/// `vct_launcher_core::services::hub_port::parse_hub_port` (this workspace
+/// cannot depend on it) and `vco_lib.hub_ensure.parse_hub_port`; the shared
+/// table `tests/fixtures/hub_port_cases.json` runs through both.
+fn valid_hub_port(raw: &str) -> Option<u16> {
+    let value = raw.trim_matches(|c: char| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    if value.is_empty() || value.len() > 5 || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse::<u32>().ok().filter(|p| (1..=65535).contains(p)).map(|p| p as u16)
+}
+
+/// The hub-port client ladder. MUST MATCH the ONE readers
+/// `vco_lib::hub_ensure::resolve_hub_port` (Python) and
+/// `vct_launcher_core::services::hub_port` (Rust) — vct-cli is its OWN cargo
+/// workspace and cannot depend on vct-launcher-core, so this is a B-tier
+/// mirror: the shared case table `tests/fixtures/hub_port_cases.json` runs
+/// through this function (`hub_port_ladder_matches_the_parity_table` below)
+/// and through the Python reader + sh/ps1 clients
+/// (`tests/test_v0297_hub_port_clients.py`).
+///
+/// Owner ruling 2026-09-24: a set-but-INVALID `VCT_HUB_PORT` (non-numeric, 0,
+/// > 65535) falls through to `<state dir>/hub.port` — the file names the
+/// RUNNING hub — and only then to 7700. The state dir honours
+/// `$VCT_STATE_DIR` (else `~/.vct`) the same way `on_disk_hub_token` above
+/// does, so dev launchers / tests stay isolated from the production state
+/// dir.
 fn resolve_port(override_port: Option<u16>) -> Result<u16> {
     if let Some(p) = override_port {
         return Ok(p);
     }
     if let Ok(s) = std::env::var("VCT_HUB_PORT") {
-        if let Ok(p) = s.parse::<u16>() {
+        if let Some(p) = valid_hub_port(&s) {
             return Ok(p);
         }
     }
-    // Read ~/.vct/hub.port if present (the launcher writes it on startup).
-    if let Some(d) = directories::UserDirs::new() {
-        let p = d.home_dir().join(".vct").join("hub.port");
-        if let Ok(content) = std::fs::read_to_string(&p) {
-            if let Ok(parsed) = content.trim().parse::<u16>() {
+    // Read <state dir>/hub.port if present (the launcher writes it on
+    // startup).
+    let state_dir = std::env::var("VCT_STATE_DIR")
+        .ok()
+        .filter(|s| !s.trim().is_empty())
+        .map(PathBuf::from)
+        .or_else(|| directories::UserDirs::new().map(|d| d.home_dir().join(".vct")));
+    if let Some(d) = state_dir {
+        if let Ok(content) = std::fs::read_to_string(d.join("hub.port")) {
+            if let Some(parsed) = valid_hub_port(&content) {
                 return Ok(parsed);
             }
         }
@@ -550,13 +602,18 @@ fn print_json<T: Serialize>(v: &T) -> Result<()> {
 
 fn main() {
     if let Err(e) = run() {
-        eprintln!("vct: {}", e);
+        eprintln!("vct-cli: {}", e);
         std::process::exit(1);
     }
 }
 
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    // A local file read: it must answer with the launcher down, so it never
+    // resolves a hub port or token.
+    if matches!(cli.command, TopCommand::Telemetry { cmd: TelemetryCmd::Pending }) {
+        return print_json(&telemetry_pending(&telemetry_pending_path()?)?);
+    }
     let hub = Hub::new(cli.port)?;
 
     match cli.command {
@@ -707,7 +764,51 @@ fn telemetry(hub: &Hub, cmd: TelemetryCmd) -> Result<()> {
             let v: serde_json::Value = hub.post_json("/cli/telemetry/consent", &body)?;
             print_json(&v)
         }
+        TelemetryCmd::Pending => print_json(&telemetry_pending(&telemetry_pending_path()?)?),
     }
+}
+
+/// Where opted-in telemetry waits while no upload endpoint is deployed.
+/// MUST MATCH the one writer, `VCThelpers/telemetry/uploader.py`
+/// (`Path.home() / ".vibecoded" / _PENDING_FILE`); pinned by
+/// `tests/test_v0297_cli_program_names.py`.
+const TELEMETRY_PENDING_DIR: &str = ".vibecoded";
+const TELEMETRY_PENDING_FILE: &str = "telemetry_pending.jsonl";
+
+fn telemetry_pending_path() -> Result<PathBuf> {
+    directories::UserDirs::new()
+        .map(|d| {
+            d.home_dir()
+                .join(TELEMETRY_PENDING_DIR)
+                .join(TELEMETRY_PENDING_FILE)
+        })
+        .ok_or_else(|| anyhow!("cannot resolve the home directory"))
+}
+
+/// The pending events, one JSON object per line. A missing file is the
+/// normal state (telemetry off, or nothing recorded yet), not an error. A
+/// line that is not JSON is counted, never dropped silently.
+fn telemetry_pending(path: &std::path::Path) -> Result<serde_json::Value> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e).with_context(|| format!("read {}", path.display())),
+    };
+    let mut events = Vec::new();
+    let mut unparsed_lines = 0u64;
+    for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        match serde_json::from_str::<serde_json::Value>(line) {
+            Ok(v) => events.push(v),
+            Err(_) => unparsed_lines += 1,
+        }
+    }
+    Ok(serde_json::json!({
+        "path": path.display().to_string(),
+        "exists": path.is_file(),
+        "count": events.len(),
+        "unparsed_lines": unparsed_lines,
+        "events": events,
+    }))
 }
 
 fn hub_cmd(hub: &Hub, cmd: HubCmd) -> Result<()> {
@@ -795,4 +896,189 @@ fn resolve_project_id(hub: &Hub, id_or_slug: &str) -> Result<String> {
         .and_then(|x| x.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| anyhow!("could not resolve slug '{}' to a project id", id_or_slug))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+    use std::collections::BTreeMap;
+
+    /// `cli_verbs.json` is the command tree other checks read without
+    /// building this crate (tests/test_v0297_cli_program_names.py uses it to
+    /// check every `vct-cli <verb>` and `vco <verb>` in shipped text). It is
+    /// only worth reading if it IS the tree clap builds — this proves that.
+    #[test]
+    fn verb_table_matches_the_parser() {
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("../cli_verbs.json")).expect("cli_verbs.json parses");
+        let mut cmd = Cli::command();
+        cmd.build();
+        assert_eq!(
+            cmd.get_name(),
+            env!("CARGO_BIN_NAME"),
+            "clap name != Cargo [[bin]] name"
+        );
+        assert_eq!(table["program"].as_str(), Some(cmd.get_name()));
+        let parsed: BTreeMap<String, Vec<String>> = cmd
+            .get_subcommands()
+            .map(|verb| {
+                let mut subs: Vec<String> = verb
+                    .get_subcommands()
+                    .map(|s| s.get_name().to_string())
+                    .collect();
+                subs.sort();
+                (verb.get_name().to_string(), subs)
+            })
+            .collect();
+        let committed: BTreeMap<String, Vec<String>> =
+            serde_json::from_value(table["verbs"].clone()).expect("verbs is {verb: [sub, ...]}");
+        assert_eq!(
+            parsed, committed,
+            "launcher/tools/vct-cli/cli_verbs.json no longer matches the clap tree — update it"
+        );
+    }
+
+    #[test]
+    fn telemetry_pending_reads_every_event_and_counts_bad_lines() {
+        let dir = std::env::temp_dir().join(format!("vct-cli-pending-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(TELEMETRY_PENDING_FILE);
+        std::fs::write(&path, "{\"event\":\"a\"}\n\nnot json\n{\"event\":\"b\"}\n").unwrap();
+        let v = telemetry_pending(&path).unwrap();
+        assert_eq!(v["exists"], true);
+        assert_eq!(v["count"], 2);
+        assert_eq!(v["unparsed_lines"], 1);
+        assert_eq!(v["events"][1]["event"], "b");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn telemetry_pending_without_a_file_is_empty_not_an_error() {
+        let path = std::env::temp_dir()
+            .join(format!("vct-cli-no-pending-{}", std::process::id()))
+            .join(TELEMETRY_PENDING_FILE);
+        let v = telemetry_pending(&path).unwrap();
+        assert_eq!(v["exists"], false);
+        assert_eq!(v["count"], 0);
+        assert_eq!(v["events"], serde_json::json!([]));
+    }
+
+    /// O-A1 (v0.2.97 review round 7): the hub-port ladder is a pinned mirror
+    /// of the ONE readers (`vco_lib.hub_ensure.resolve_hub_port`,
+    /// `vct_launcher_core::services::hub_port`). This test runs the SHARED
+    /// case table `tests/fixtures/hub_port_cases.json` through
+    /// `resolve_port(None)` exactly the way
+    /// `tests/test_v0297_hub_port_clients.py` runs it through the Python
+    /// reader and the sh/ps1 clients — before it, a drift here (e.g.
+    /// `VCT_HUB_PORT=0` winning, or `VCT_STATE_DIR` ignored for `hub.port`)
+    /// passed every test.
+    /// Serializes the tests that change the process environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// With every proxy variable pointing at a dead port and no `NO_PROXY`,
+    /// the hub client still reaches the hub on 127.0.0.1 (a test-owned
+    /// responder on an ephemeral port). Red without `.no_proxy()`: reqwest
+    /// would send the request — bearer token included — to the proxy.
+    #[test]
+    fn the_hub_client_never_goes_through_a_proxy() {
+        use std::io::{Read, Write};
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let mut stream = stream;
+                let mut buf = [0u8; 2048];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 11\r\nConnection: close\r\n\r\n{\"ok\":true}",
+                );
+            }
+        });
+        let vars = ["HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy"];
+        let saved: Vec<(&str, Option<String>)> = vars
+            .iter()
+            .chain(["NO_PROXY", "no_proxy"].iter())
+            .map(|k| (*k, std::env::var(k).ok()))
+            .collect();
+        for k in vars {
+            std::env::set_var(k, "http://127.0.0.1:9");
+        }
+        std::env::remove_var("NO_PROXY");
+        std::env::remove_var("no_proxy");
+        let hub = Hub::new(Some(port));
+        for (k, v) in &saved {
+            match v {
+                Some(v) => std::env::set_var(k, v),
+                None => std::env::remove_var(k),
+            }
+        }
+        let got: serde_json::Value = hub.expect("client").get_json("/health").expect("direct to the hub");
+        assert_eq!(got["ok"], true);
+    }
+
+    #[test]
+    fn hub_port_ladder_matches_the_parity_table() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        struct EnvGuard {
+            home: Option<String>,
+            port: Option<String>,
+            state: Option<String>,
+        }
+        impl Drop for EnvGuard {
+            fn drop(&mut self) {
+                match self.home.take() {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+                match self.port.take() {
+                    Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+                    None => std::env::remove_var("VCT_HUB_PORT"),
+                }
+                match self.state.take() {
+                    Some(v) => std::env::set_var("VCT_STATE_DIR", v),
+                    None => std::env::remove_var("VCT_STATE_DIR"),
+                }
+            }
+        }
+        let _guard = EnvGuard {
+            home: std::env::var("HOME").ok(),
+            port: std::env::var("VCT_HUB_PORT").ok(),
+            state: std::env::var("VCT_STATE_DIR").ok(),
+        };
+        let dir = std::env::temp_dir().join(format!("vct-cli-hub-port-{}", std::process::id()));
+        let state = dir.join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        // The home fallback must not reach the developer's real ~/.vct either.
+        std::env::set_var("HOME", &dir);
+        std::env::set_var("VCT_STATE_DIR", &state);
+        let port_file = state.join("hub.port");
+
+        let text = include_str!("../../../../tests/fixtures/hub_port_cases.json");
+        let table: serde_json::Value = serde_json::from_str(text).expect("fixture parses");
+        let cases = table["cases"].as_array().expect("cases");
+        assert!(!cases.is_empty());
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            match case["env_port"].as_str() {
+                Some(v) => std::env::set_var("VCT_HUB_PORT", v),
+                None => std::env::remove_var("VCT_HUB_PORT"),
+            }
+            match case["file_port"].as_str() {
+                Some(v) => std::fs::write(&port_file, v).unwrap(),
+                None => {
+                    let _ = std::fs::remove_file(&port_file);
+                }
+            }
+            assert_eq!(
+                resolve_port(None).expect("resolve_port never fails"),
+                case["expect"].as_u64().unwrap() as u16,
+                "case `{name}`"
+            );
+        }
+        std::env::remove_var("VCT_HUB_PORT");
+        let _ = std::fs::remove_file(&port_file);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

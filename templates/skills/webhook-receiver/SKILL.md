@@ -4,7 +4,7 @@ description: Hardens an inbound webhook endpoint with HMAC signature verificatio
 short_desc: "webhook receiver: HMAC, replay protection, idempotency"
 keywords: [webhook, HMAC, signature verification, replay protection, dead-letter, X-Hub-Signature, idempotency, retry-safe, DLQ]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Webhook Receiver (Opus)
@@ -146,12 +146,12 @@ For workflow engines (Temporal, Inngest), trigger the workflow from the worker; 
 
 After N attempts, an event lands in DLQ. The DLQ is NOT a place where events go to die — it's a queue for human review with explicit replay tooling.
 
-```
-.claude/scripts/webhook-dlq list                       # show pending DLQ events
-.claude/scripts/webhook-dlq inspect {event_id}         # show payload + error history
-.claude/scripts/webhook-dlq replay {event_id}          # mark as 'received', reset attempts
-.claude/scripts/webhook-dlq drop {event_id} "reason"   # archive with rationale
-```
+Build that tooling as part of this service (a small CLI or admin route over the `webhook_inbox` table — nothing off-the-shelf is assumed to exist). It should offer four operations:
+
+- `list` — show pending DLQ events
+- `inspect {event_id}` — show payload + error history
+- `replay {event_id}` — mark as 'received', reset attempts
+- `drop {event_id} "reason"` — archive with rationale
 
 Always log the human action with rationale ("dropped — duplicate of {event_id}", "replayed after fixing {bug}").
 

@@ -4,10 +4,18 @@
   import { toast } from '$lib/stores/toast';
   import { parseTaggedErrorPayload } from '$lib/tauri-error-payload';
   import { projects } from '$lib/stores/projects';
+  import { DEFAULT_UNREGISTER_OPTIONS } from '$lib/unregister-escape';
   import { pickDirectory, suggestProjectFolder } from '$lib/dialog';
   import { isTauriRuntime } from '$lib/tauri';
   import { isOnboardingComplete, markOnboardingComplete } from '$lib/onboarding';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { getEndpointCandidates, type DetectionReport } from '$lib/api/service_endpoints';
+  import {
+    wizardServiceChoiceValues,
+    wizardServiceQuestions,
+    type WeaviateChoice,
+  } from '$lib/components/onboarding-service-choice';
+  import { runtimeOwnerRefusal } from '$lib/components/onboarding-runtime-refusal';
   import type {
     OpenAiValidationResult,
     RegisterOpenAiResponse,
@@ -111,6 +119,17 @@
   let servicesError = $state<string | null>(null);
   let useSeparateContainers = $state(false);
 
+  // v0.2.97 (lane Y): third-party service adoption (ruling Q1).
+  // `detect_existing_services` above only probes default ports; the
+  // endpoint detector classifies OWNERSHIP, so it is the one that can say
+  // "someone else's Weaviate with no VCO data" (ask) and "a third-party
+  // Ollama" (adopt unattended, info line). Soft-fail: without a reply no
+  // question is shown and install.py runs its own detection flow.
+  let endpointDetection = $state<DetectionReport | null>(null);
+  let endpointDetectionError = $state<string | null>(null);
+  let weaviateChoice = $state<WeaviateChoice | null>(null);
+  const serviceQuestions = $derived(wizardServiceQuestions(endpointDetection));
+
   // Bug 31: volume location picker state. Loaded once on step 3 entry.
   // - When existing volumes are detected, the picker is REPLACED by a
   //   read-only info panel and the user can NOT pick a custom path
@@ -132,6 +151,11 @@
   }
   let volumesConfig = $state<VolumesConfig | null>(null);
   let volumesError = $state<string | null>(null);
+  // R7b F8: the storage commands' refusal to act on volumes that exist only
+  // under the other container runtime. Shown as a blocking panel with its
+  // remedy (quit, set the variable where the launcher starts, relaunch) —
+  // it used to fall into the generic error line and the wizard just stopped.
+  let runtimeRefusal = $state<string | null>(null);
   let volumeChoice = $state<'default' | 'custom'>('default');
   let customVolumesPath = $state('');
   let volumesPickError = $state<string | null>(null);
@@ -561,12 +585,22 @@
     } catch (e) {
       servicesError = String(e);
     }
+    // v0.2.97 (lane Y): ownership-aware endpoint detection for the ruling-Q1
+    // question. Soft-fail on error — the install is not blocked, it simply
+    // proceeds without wizard-side adoption flags.
+    try {
+      endpointDetection = await getEndpointCandidates();
+    } catch (e) {
+      endpointDetectionError = String(e);
+    }
     // Bug 31: probe existing volumes so the picker can render either the
     // chooser (no volumes) or the read-only info panel (volumes exist).
     try {
       volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+      runtimeRefusal = null;
     } catch (e) {
-      volumesError = String(e);
+      runtimeRefusal = runtimeOwnerRefusal(e);
+      volumesError = runtimeRefusal ? null : String(e);
     }
   }
 
@@ -582,6 +616,10 @@
   }
 
   function buildInstallConfig() {
+    // v0.2.97 (lane Y): the ruling-Q1 `--service` choices. The Install
+    // button is disabled while the Weaviate question is unanswered, so the
+    // `?? 'vco_copy'` leg only fires when there is no question at all.
+    const serviceChoices = wizardServiceChoiceValues(serviceQuestions, weaviateChoice ?? 'vco_copy');
     return {
       install_path: installPath,
       use_gpu: false,
@@ -589,6 +627,7 @@
       openai_key: null,
       container_runtime: null,
       skip_containers: false,
+      service_choices: serviceChoices.length > 0 ? serviceChoices : null,
     };
   }
 
@@ -621,9 +660,15 @@
           path: chosenPath,
         });
       } catch (e) {
+        installing = false;
+        runtimeRefusal = runtimeOwnerRefusal(e);
+        if (runtimeRefusal) {
+          // Not a picker error: the panel above the Install button says what
+          // happened and how to clear it.
+          return;
+        }
         volumesPickError = String(e);
         installError = String(e);
-        installing = false;
         return;
       }
 
@@ -724,16 +769,16 @@
     recreatingProject = true;
     try {
       // Find the existing project_id, delete it, then create fresh.
-      // 2026-05-06: delete_project_v2 now takes `{ id, options }` —
-      // pass null to get the backend defaults (purgeLauncherFiles=true,
-      // purgeCollections=false). Pre-fix this call passed `projectId`
+      // 2026-05-06: delete_project_v2 now takes `{ id, options }` — the
+      // default unregister, sent explicitly (review R6 F46; the same
+      // options as the settings page's untouched checkboxes). Pre-fix this call passed `projectId`
       // (wrong key, silently ignored) which left the previous DB row
       // orphaned. Routing via the projects store keeps the tauri shape
       // consistent with the rest of the codebase.
       const all = await invoke<Array<{ id: string; folder_path: string }>>('list_projects_v2');
       const existing = all.find((p) => p.folder_path === path);
       if (existing) {
-        await projects.delete(existing.id, null);
+        await projects.delete(existing.id, { ...DEFAULT_UNREGISTER_OPTIONS });
       }
       await projects.create(name, path, 'base');
       toast.success(`Project "${name}" recreated`);
@@ -1269,11 +1314,11 @@
                 <p class="ow-secondary ow-warn">
                   <strong>What this does:</strong> spawns a <em>new</em>
                   Weaviate, Ollama and code-embed instance dedicated to this
-                  install, instead of adopting the running ones. They will
-                  bind to non-default ports — set <code class="ow-mono">WEAVIATE_PORT</code>,
-                  <code class="ow-mono">OLLAMA_PORT</code>, <code class="ow-mono">CODE_EMBED_PORT</code>,
-                  and <code class="ow-mono">VCT_FORCE_SEPARATE_CONTAINERS=1</code> in your
-                  environment before clicking Install.
+                  install, instead of adopting the running ones. Set
+                  <code class="ow-mono">VCT_FORCE_SEPARATE_CONTAINERS=1</code> in your
+                  environment before clicking Install — the ports come from
+                  VCO's service-endpoint records, not environment variables
+                  (v0.2.97).
                 </p>
                 <p class="ow-secondary ow-warn">
                   <strong>When to use it:</strong> air-gapped per-project
@@ -1290,6 +1335,52 @@
             </div>
           {:else if servicesError}
             <p class="ow-secondary">Couldn't probe services ({servicesError}).</p>
+          {/if}
+
+          <!-- v0.2.97 (lane Y), owner ruling Q1: a third-party Weaviate with
+               no VCO data is NEVER adopted silently — ask; a third-party
+               Ollama IS adopted without asking and shown as info. The answer
+               reaches install.py as `--service` flags via
+               InstallConfig.service_choices. -->
+          {#if serviceQuestions.weaviate}
+            <div class="ow-services">
+              <h3>Weaviate found on this machine</h3>
+              <p class="ow-secondary">
+                VCO found a Weaviate it did not start at
+                <code class="ow-mono">{serviceQuestions.weaviate.url}</code>
+                {#if serviceQuestions.weaviate.containerName}
+                  (container <code class="ow-mono">{serviceQuestions.weaviate.containerName}</code>)
+                {/if}
+                — with no VCO data in it. Should this install use it?
+              </p>
+              <label class="ow-radio">
+                <input type="radio" name="weaviate-choice" value="use_this" bind:group={weaviateChoice} />
+                <span>
+                  Use this instance — VCO connects to it and starts/stops it by
+                  name; it never removes or recreates it.
+                </span>
+              </label>
+              <label class="ow-radio">
+                <input type="radio" name="weaviate-choice" value="vco_copy" bind:group={weaviateChoice} />
+                <span>Run VCO's own copy (recommended when in doubt).</span>
+              </label>
+              {#if weaviateChoice === null}
+                <p class="ow-secondary">Pick one to enable Install.</p>
+              {/if}
+            </div>
+          {/if}
+          {#if serviceQuestions.ollama}
+            <p class="ow-secondary">
+              Ollama found at <code class="ow-mono">{serviceQuestions.ollama.url}</code> —
+              this install will use it. VCO starts and stops it by name;
+              nothing else about it changes.
+            </p>
+          {/if}
+          {#if endpointDetectionError}
+            <p class="ow-secondary">
+              Service detection unavailable ({endpointDetectionError}) — the
+              install will decide on its own.
+            </p>
           {/if}
 
           <!-- Bug 31: container volumes location. Two render paths:
@@ -1371,11 +1462,25 @@
           {:else if volumesError}
             <p class="ow-secondary">Couldn't probe volumes ({volumesError}).</p>
           {/if}
+          {#if runtimeRefusal}
+            <div class="ow-runtime-refusal" role="alert">
+              <p>
+                <strong>Your container data is under the other container runtime.</strong>
+                The install is paused here: continuing would set VCO up against a copy
+                of the volumes that does not hold your data.
+              </p>
+              <p class="ow-error">{runtimeRefusal}</p>
+            </div>
+          {/if}
 
           {#if installed}
             <p class="ow-ok">Orchestrator already installed at this path.</p>
           {:else}
-            <button class="ow-btn-primary" onclick={requestInstall} disabled={installing || !!sourceError || !installPath}>
+            <button
+              class="ow-btn-primary"
+              onclick={requestInstall}
+              disabled={installing || !!sourceError || !!runtimeRefusal || !installPath || (serviceQuestions.weaviate !== null && weaviateChoice === null)}
+            >
               {installing ? 'Installing…' : 'Install'}
             </button>
           {/if}
@@ -2031,6 +2136,13 @@
   .ow-secondary { color: #888; font-size: 12px; }
   .ow-mono { font-family: ui-monospace, monospace; font-size: 11px; color: #c4b3ff; background: rgba(255,255,255,0.04); padding: 1px 5px; border-radius: 3px; word-break: break-all; }
   .ow-error { color: #f99; font-size: 12px; }
+  .ow-runtime-refusal {
+    margin: 10px 0;
+    padding: 10px 12px;
+    border: 1px solid #ff4fa0;
+    border-radius: 8px;
+    background: rgba(255, 79, 160, 0.08);
+  }
   .ow-ok { color: #0fc; font-size: 12px; }
   .ow-table { font-size: 12px; border-collapse: collapse; }
   .ow-table th { text-align: left; color: #888; font-weight: 500; padding: 4px 12px 4px 0; }

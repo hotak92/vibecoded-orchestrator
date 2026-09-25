@@ -15,14 +15,17 @@ call site                                               sentinel  bounds
 ``vco_lib.deferral_retry._read_pidfile``                None      >= 1
 ``vco_lib.hub_ensure.hub_pid``                          None      >= 1
 ``vco_lib.access_resolver._hub_port``                   None      1..65535
-``vco_lib.project_config`` (``parse_int_line`` only)    None      1..65535
+``vco_lib.hub_ensure.resolve_hub_port`` (parser only)  None      1..65535
 ``vco_lib.codegraph_resync`` — lane D, lands at merge
 ======================================================  ========  ==========
 
-``project_config`` shares the PARSER rather than the reader on purpose: it
+``resolve_hub_port`` shares the PARSER rather than the reader on purpose: it
 emits a different warning for an unreadable ``hub.port`` than for one full of
 nonsense, and both are a cross-language contract with the ``.sh``/``.ps1``
-siblings. Sharing the reader would have collapsed the two into one.
+siblings. Sharing the reader would have collapsed the two into one. (It was
+inline in ``vco_lib.project_config._discover_hub`` until v0.2.97, which moved it
+to the stdlib-only ``hub_ensure`` so ``install.py --bootstrap`` can report the
+real port; ``_discover_hub`` calls it with its own warner.)
 """
 from __future__ import annotations
 
@@ -153,9 +156,11 @@ class CallSiteSemanticsTests(unittest.TestCase):
     def test_the_hub_port_readers_use_the_shared_one(self) -> None:
         """Three files parsed ``hub.port`` privately, whole-file.
 
-        ``access_resolver`` shares the READER; ``project_config`` shares the
-        PARSER only, because it must classify "unreadable" and "nonsense"
-        into two different warnings that the .sh/.ps1 siblings also emit.
+        ``access_resolver`` calls ``hub_ensure.resolve_hub_port`` (which
+        ``project_config`` calls too); since v0.2.97 R7b F9 that reader's value
+        rule is ``hub_ensure.parse_hub_port``, shared by table with every
+        non-Python reader, and it classifies "unreadable" and "nonsense" into
+        the two different warnings the .sh/.ps1 siblings also emit.
         """
         from vco_lib import access_resolver
 
@@ -163,28 +168,36 @@ class CallSiteSemanticsTests(unittest.TestCase):
             os.environ.pop("VCT_HUB_PORT", None)
             self._file("hub.port", "7801\n")
             self.assertEqual(access_resolver._hub_port(), 7801)
-            self._file("hub.port", "7801\nstray line\n")
-            self.assertEqual(
-                access_resolver._hub_port(), 7801,
-                "a trailing line must read the number, not the default",
-            )
-            for junk in ("", "junk", "0", "70000"):
+            # v0.2.97 R7b F9: hub.port left the first-line reader — every
+            # hub-port reader (Python, sh, ps1, Rust, vct) applies ONE value
+            # rule to the whole content, and a second line is internal
+            # whitespace (tests/fixtures/hub_port_cases.json).
+            for junk in ("", "junk", "0", "70000", "7801\nstray line\n", "+7801", "7_801"):
                 with self.subTest(junk=junk):
                     self._file("hub.port", junk)
                     self.assertEqual(access_resolver._hub_port(), 7700)
 
-    def test_the_project_config_parser_keeps_both_warnings(self) -> None:
-        """Sharing the parse must not retire either warning."""
+    def test_the_hub_port_parser_keeps_both_warnings(self) -> None:
+        """Sharing the parse must not retire either warning — asserted on
+        behaviour (v0.2.97: this was a scan of project_config's source)."""
+        from vco_lib import hub_ensure
         from vco_lib.intfile import parse_int_line
 
         self.assertEqual(parse_int_line("7801\nstray\n", minimum=1), 7801)
         self.assertIsNone(parse_int_line("junk", minimum=1))
-        source = (
-            Path(__file__).resolve().parent.parent / "vco_lib/project_config.py"
-        ).read_text(encoding="utf-8")
-        for warning in ("hub_port_invalid", "hub_port_unreadable"):
-            with self.subTest(warning=warning):
-                self.assertIn(warning, source)
+        warned: list[str] = []
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("VCT_HUB_PORT", None)
+            self._file("hub.port", "junk")
+            self.assertEqual(
+                hub_ensure.resolve_hub_port(self.root, lambda k, _d: warned.append(k)), 7700
+            )
+            (self.root / "hub.port").unlink()
+            (self.root / "hub.port").mkdir()  # reading a directory: unreadable
+            self.assertEqual(
+                hub_ensure.resolve_hub_port(self.root, lambda k, _d: warned.append(k)), 7700
+            )
+        self.assertEqual(warned, ["hub_port_invalid", "hub_port_unreadable"])
 
     def test_no_call_site_keeps_a_private_parser(self) -> None:
         """The point of the extraction, asserted rather than assumed."""
@@ -194,8 +207,8 @@ class CallSiteSemanticsTests(unittest.TestCase):
             "claude_mcp_servers/model_router/__main__.py",
             "vco_lib/deferral_retry.py",
             "vco_lib/hub_ensure.py",
-            "vco_lib/access_resolver.py",
-            "vco_lib/project_config.py",
+            # access_resolver and project_config no longer parse hub.port at
+            # all: both call `hub_ensure.resolve_hub_port` (v0.2.97).
         ):
             with self.subTest(rel=rel):
                 source = (repo / rel).read_text(encoding="utf-8")
@@ -220,6 +233,11 @@ class CallSiteSemanticsTests(unittest.TestCase):
         """
         repo = Path(__file__).resolve().parent.parent
         source = (repo / "vco_lib/codegraph_resync.py").read_text(encoding="utf-8")
+        # v0.2.97: migrated — it calls `hub_ensure.resolve_hub_port`, which
+        # shares the parser, so it carries neither import itself.
+        if "resolve_hub_port" in source:
+            self.assertNotIn('root / "hub.port"', source)
+            return
         if "read_int_line" not in source and "parse_int_line" not in source:
             self.assertIn(
                 '(root / "hub.port").read_text', source,

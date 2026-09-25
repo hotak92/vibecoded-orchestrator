@@ -24,27 +24,29 @@ use std::sync::Arc;
 use vct_launcher_core::db::models::{ModuleInstallRow, ProjectHost, ProjectRow};
 use vct_launcher_core::db::Db;
 
-/// Sentinel project_id used by the launcher when scope is `shared`.
-/// Mirrors `commands::secrets_cmd::SENTINEL_SHARED` (which is private to
-/// that module). Pinned here as a module-private const because the hub's
-/// `/projects/{id}/env` resolver needs to look up shared-scope keychain
-/// entries at this fixed slot — the same slot
-/// `commands::installer::register_github_pat` writes to and the same slot
-/// the SecretsPanel "Shared (this user)" tab targets.
-///
-/// 0.1.7 fork-readiness sweep (item H1, 2026-05-08): pre-fix, this
-/// resolver passed `&project.id` (the real UUID) into
-/// `SecretScope::Shared { project_id }`, which produced a per-project
-/// keychain service-name (`vct.<UUID>.shared.<module>`). That was
-/// inconsistent with everything else in the launcher: writers (the
-/// SecretsPanel + `register_github_pat`) put shared secrets at
-/// `vct._user_shared_.shared.<module>`, but this reader looked at
-/// `vct.<UUID>.shared.<module>` — guaranteed miss. The fix: route every
-/// `Shared`-scope keychain lookup through SENTINEL_SHARED, matching the
-/// writer side. Per-project shared entries (legacy, before SENTINEL_SHARED
-/// existed) are no longer reachable via this resolver, but no in-tree
-/// code path writes that shape after PR #60.
-const SENTINEL_SHARED: &str = "_user_shared_";
+// The `shared`-scope keychain slot (SENTINEL_SHARED, `_user_shared_`).
+// v0.2.97 (lane V round 3): the hub-private const that lived here is retired —
+// every module-declared and orchestrator-bundled secret this route serves now
+// resolves through `vct_launcher_core::module_secrets_env::resolve_module_secret`,
+// which uses `vct_launcher_core::secrets::SENTINEL_SHARED` — the one
+// definition every writer and reader imports (R7b F15). Its history, kept:
+//
+// The slot is the one
+// `commands::installer::register_github_pat` writes to and the same slot
+// the SecretsPanel "Shared (this user)" tab targets.
+//
+// 0.1.7 fork-readiness sweep (item H1, 2026-05-08): pre-fix, this
+// resolver passed `&project.id` (the real UUID) into
+// `SecretScope::Shared { project_id }`, which produced a per-project
+// keychain service-name (`vct.<UUID>.shared.<module>`). That was
+// inconsistent with everything else in the launcher: writers (the
+// SecretsPanel + `register_github_pat`) put shared secrets at
+// `vct._user_shared_.shared.<module>`, but this reader looked at
+// `vct.<UUID>.shared.<module>` — guaranteed miss. The fix: route every
+// `Shared`-scope keychain lookup through SENTINEL_SHARED, matching the
+// writer side. Per-project shared entries (legacy, before SENTINEL_SHARED
+// existed) are no longer reachable via this resolver, but no in-tree
+// code path writes that shape after PR #60.
 
 /// Shared handle to the launcher DB opened by `hub::server::start_hub_server`.
 /// The Tauri-side code manages its own Db handle; the hub uses its own
@@ -110,6 +112,14 @@ struct CatalogEntry {
     category: String,
     license_required: bool,
     compatibility_hosts: Vec<String>,
+    /// v0.2.97 (lane V): the module's `runtime.health_check` status on this
+    /// machine (bundled / global instance) from `module_health`; `null`
+    /// when the module declares no health check or is not active here.
+    health: Option<crate::module_health::ModuleHealth>,
+    /// Per-project instances (a per-project install is probed on that
+    /// project's port), keyed by project id. Omitted when there are none.
+    #[serde(skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    project_health: std::collections::BTreeMap<String, crate::module_health::ModuleHealth>,
 }
 
 #[derive(Debug, Serialize)]
@@ -204,6 +214,8 @@ async fn catalog(State(h): State<LauncherDbHandle>) -> impl IntoResponse {
                 category: format!("{:?}", m.category).to_lowercase(),
                 license_required: m.license.required,
                 compatibility_hosts: m.compatibility.hosts.clone(),
+                health: crate::module_health::registry().get(&m.id, None),
+                project_health: crate::module_health::registry().per_project(&m.id),
             })
         })
         .collect();
@@ -231,7 +243,17 @@ async fn module_status(
     Query(q): Query<StatusQuery>,
 ) -> impl IntoResponse {
     match h.0.get_module_install(&q.project_id, &module_id) {
-        Ok(Some(row)) => Json(InstalledRowView::from(&row)).into_response(),
+        Ok(Some(row)) => {
+            // v0.2.97 (lane V): + this project's health instance, else the
+            // machine-wide one (a global install serves every project).
+            let health = crate::module_health::registry()
+                .get(&module_id, Some(&q.project_id))
+                .or_else(|| crate::module_health::registry().get(&module_id, None));
+            let mut body = serde_json::to_value(InstalledRowView::from(&row))
+                .unwrap_or_else(|_| serde_json::json!({}));
+            body["health"] = serde_json::to_value(health).unwrap_or(serde_json::Value::Null);
+            Json(body).into_response()
+        }
         Ok(None) => error_response(
             StatusCode::NOT_FOUND,
             "module_not_installed",
@@ -818,22 +840,92 @@ async fn project_env(
     env.insert("VCT_PROJECT_HOST".into(), serde_json::Value::String(project.host.as_str().into()));
     env.insert("VCT_PROJECT_PATH".into(), serde_json::Value::String(project.folder_path.clone()));
 
-    // Module settings + secrets — iterate installed modules, collect env
-    // per `runtime.env_from_secrets` / `env_from_settings` patterns. The
-    // exact list of manifest files to parse is the same set as scan_manifests.
+    // Module settings + secrets — iterate installed modules and serve EVERY
+    // declared per-project setting and every declared secret. This route
+    // does NOT consult `runtime.env_from_settings` / `env_from_secrets` (it
+    // never has — the comment here used to say it did): those lists are read
+    // when VCO spawns a container/service module
+    // (`vct_launcher_core::module_settings_env`); this route is how the
+    // modules VCO does not spawn (MCPs, hooks, CLIs) get their values. See
+    // docs/VCT_MODULE_MANIFEST_SPEC.md §8. The manifest files parsed are the
+    // same set as scan_manifests.
     let manifests = scan_manifests();
     let installs = h
         .0
         .list_module_installs_for_project(&project.id)
         .unwrap_or_default();
 
-    for install in &installs {
-        let Some((_, manifest)) = manifests.iter().find(|(_, m)| m.id == install.module_id) else {
+    // v0.2.97: the bundled core modules (`launcher/bundled_manifests/`,
+    // materialized by `bundled_manifests::sync_bundled_manifests`) are
+    // installed for EVERY project — the catalog's "bundled: always installed,
+    // cannot be uninstalled" — so their settings/secrets resolve without a
+    // `module_installs` row. An explicit row for one changes nothing.
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
+    let mut active: Vec<&vct_launcher_core::manifest::ModuleManifest> = installs
+        .iter()
+        .filter_map(|install| manifests.iter().find(|(_, m)| m.id == install.module_id))
+        .map(|(_, m)| m)
+        .collect();
+    // R7b F23: a module installed MACHINE-WIDE serves this project when that
+    // install is enabled and the enable cascade leaves it on here — the same
+    // rule the settings editor offers the project's fields by
+    // (`module_settings_schema::global_install_serves_project`). It serves
+    // its SETTINGS only (the owner's F23 ruling, R8 G4): its declared secrets
+    // keep the scope they had before — a per-project install, or a bundled
+    // module — so installing a module machine-wide never starts handing its
+    // secrets to every project.
+    let mut settings_only_ids: Vec<&str> = Vec::new();
+    for row in h.0.list_global_module_installs().unwrap_or_default() {
+        let serves = vct_launcher_core::module_settings_schema::global_install_serves_project(
+            &h.0,
+            &row.module_id,
+            &project.id,
+        )
+        .unwrap_or(false);
+        if !serves || active.iter().any(|m| m.id == row.module_id) {
             continue;
-        };
-        // Settings (non-secret)
+        }
+        if let Some((_, m)) = manifests.iter().find(|(_, m)| m.id == row.module_id) {
+            active.push(m);
+            settings_only_ids.push(&m.id);
+        }
+    }
+    let mut bundled_ids: Vec<&str> = Vec::new();
+    for (path, manifest) in &manifests {
+        if vct_launcher_core::bundled_manifests::is_bundled_manifest_path(&vct_root, path) {
+            bundled_ids.push(&manifest.id);
+            if !active.iter().any(|m| m.id == manifest.id) {
+                active.push(manifest);
+            }
+        }
+    }
+    // A bundled module is installed for every project: its secrets are
+    // served whether or not it is ALSO installed machine-wide.
+    settings_only_ids.retain(|id| !bundled_ids.contains(id));
+
+    for manifest in active {
+        // Settings (non-secret). An installed module's value is the
+        // project's row, else (and always, for a `scope: "global"` setting)
+        // the machine-wide row (`module_settings_env::stored_setting_value`,
+        // the spawns' precedence) — R7b F23: a machine-wide value used to be
+        // stored and served by nothing. A BUNDLED module is served its
+        // per-project rows only: each of its machine-wide settings has its
+        // own named reader (`module_setting_bindings` — e.g. the hub reads
+        // `VCT_HUB_PORT` itself; clients find the hub through `hub.port`,
+        // never through this route).
+        let bundled = bundled_ids.contains(&manifest.id.as_str());
         for s in &manifest.settings {
-            if let Ok(Some(v)) = h.0.get_setting(&project.id, &manifest.id, &s.key) {
+            let value = if bundled {
+                h.0.get_setting(&project.id, &manifest.id, &s.key).ok().flatten()
+            } else {
+                vct_launcher_core::module_settings_env::stored_setting_value(
+                    &h.0,
+                    &manifest.id,
+                    s,
+                    Some(&project.id),
+                )
+            };
+            if let Some(v) = value.filter(|v| !v.is_null()) {
                 let as_str = match v {
                     serde_json::Value::String(s) => s,
                     other => other.to_string(),
@@ -860,66 +952,29 @@ async fn project_env(
         // See secrets-and-access-matrix-audit-2026-05-06.md §6 (canary
         // test asymmetric-leak diagnosis) and the matching unit-test
         // `inactive_secret_does_not_leak_preview` in secrets_cmd.rs.
+        // v0.2.97 (lane V round 2): the gate itself — scope → (active-flag
+        // scope string, keychain slot) mapping, the per-requester active flag
+        // across every launcher DB, the Background keychain read — lives in
+        // `vct_launcher_core::module_secrets_env::resolve_module_secret`, the
+        // same function the container spawns use for `env_from_secrets`, so a
+        // spawn can never serve a secret this route would refuse. History of
+        // the rules it carries: PR-3 (2026-05-06) inactive entries are OMITTED,
+        // never returned empty; 0.1.7 H1 shared/global secrets resolve at the
+        // `_user_shared_` / `_global_` slots the writers use; 0.2.1 migration
+        // 009 THIS project is the requester, so a per-project pause of a
+        // shared/global secret applies; v0.2.82 WP-4a a non-lock keychain
+        // error marks the response degraded instead of silently dropping it.
+        if settings_only_ids.contains(&manifest.id.as_str()) {
+            continue;
+        }
         for s in &manifest.secrets {
-            // Resolve the same scope-string the active-flag DB uses.
-            // Mirrors `enforce_scope_invariants` in secrets_cmd.rs.
-            let scope_str = match s.scope.as_str() {
-                "global" => "global",
-                "shared" => "shared",
-                _ => "per_project",
-            };
-            // 0.1.7 fork-readiness sweep (item H1): the active-flag gate
-            // and the keychain lookup MUST use the same `project_id` slot
-            // the writer used. For shared scope that's SENTINEL_SHARED
-            // (`_user_shared_`); for global it's SENTINEL_GLOBAL
-            // (`_global_`); for per-project it's the real project UUID.
-            // Pre-H1 this code path passed `&project.id` for shared scope
-            // too, which yielded a per-project keychain key the writers
-            // never touched — guaranteed miss. See module-level
-            // `SENTINEL_SHARED` doc-comment for the full rationale.
-            let lookup_project_id: &str = match s.scope.as_str() {
-                "global" => "_global_",
-                "shared" => SENTINEL_SHARED,
-                _ => &project.id,
-            };
-            // Active-flag gate (cross-launcher, per-requester — 0.2.1
-            // migration 009). The consuming project's id is the requester
-            // so a per-project pause on a shared/global secret takes
-            // effect even though the keychain row is shared. The
-            // `_for_requester` variant follows the same lookup contract
-            // as the legacy gate (literal-requester row → `*` sentinel
-            // fallback → default-active when no row exists), so secrets
-            // that pre-date migration 009 still resolve normally.
-            let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
-                &h.0,
-                scope_str,
-                lookup_project_id,
-                &manifest.id,
-                &s.key,
-                &project.id,
-            );
-            if !active {
-                continue;
-            }
-            let scope = match s.scope.as_str() {
-                "global" => vct_launcher_core::secrets::SecretScope::Global,
-                "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
-                _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
-            };
-            // v0.2.82 (WP-4a): Background read; a non-lock keychain Err flips
-            // the request-degraded flag (surfaced honestly below) instead of
-            // silently omitting the key. Ok(None) = genuine miss → skip.
-            match vct_launcher_core::secrets::get_with_context(
-                scope,
-                &manifest.id,
-                &s.key,
-                vct_launcher_core::secrets::CallContext::Background,
-            ) {
-                Ok(Some(val)) => {
+            use vct_launcher_core::module_secrets_env::{resolve_module_secret, SecretLookup};
+            match resolve_module_secret(&h.0, &manifest.id, &s.key, &s.scope, Some(&project.id)) {
+                SecretLookup::Value(val) => {
                     env.insert(s.key.clone(), serde_json::Value::String(val));
                 }
-                Ok(None) => {}
-                Err(e) => {
+                SecretLookup::Inactive | SecretLookup::Missing | SecretLookup::NoProject => {}
+                SecretLookup::ReadError(e) => {
                     tracing::warn!(
                         key = ?s.key,
                         project = %project.id,
@@ -941,9 +996,10 @@ async fn project_env(
     // resolve them for every base-host project without the user having
     // to install a separate module first.
     //
-    // Same scope-string + active-flag-gate + keychain-scope mapping as
-    // the per-module loop above — kept inline rather than factored into
-    // a helper so the two code paths stay byte-comparable in code review.
+    // Same gate as the per-module loop above: both call
+    // `module_secrets_env::resolve_module_secret` (v0.2.97, lane V round 3 —
+    // until then this loop carried an inline copy "kept byte-comparable in
+    // review", which is exactly how two gates drift).
     // The deduplication step prevents an orchestrator-bundled key from
     // overwriting an installed module's value (an installed module's
     // declaration takes precedence — the user explicitly opted into it).
@@ -955,53 +1011,33 @@ async fn project_env(
             if env.contains_key(&bs.key) {
                 continue;
             }
-            let scope_str = match bs.scope.as_str() {
-                "global" => "global",
-                "shared" => "shared",
-                _ => "per_project",
-            };
-            let lookup_project_id: &str = match bs.scope.as_str() {
-                "global" => "_global_",
-                "shared" => SENTINEL_SHARED,
-                _ => &project.id,
-            };
-            let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
-                &h.0,
-                scope_str,
-                lookup_project_id,
-                &bs.module_id,
-                &bs.key,
-                &project.id,
-            );
-            let scope = match bs.scope.as_str() {
-                "global" => vct_launcher_core::secrets::SecretScope::Global,
-                "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id: SENTINEL_SHARED },
-                _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id: &project.id },
-            };
-            if active {
-                match vct_launcher_core::secrets::get_with_context(
-                    scope,
-                    &bs.module_id,
-                    &bs.key,
-                    vct_launcher_core::secrets::CallContext::Background,
-                ) {
-                    Ok(Some(val)) => {
-                        if !val.trim().is_empty() {
-                            env.insert(bs.key.clone(), serde_json::Value::String(val));
-                            continue;
-                        }
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(
-                            key = ?bs.key,
-                            project = %project.id,
-                            error = %e,
-                            "[vct-hub] keychain read failed for bundled secret — env marked degraded"
-                        );
-                        mark_keychain_degraded(&mut keychain_degraded);
-                    }
+            // v0.2.97 (lane V round 3): the SAME gate as the module loop
+            // above — `module_secrets_env::resolve_module_secret` (active flag
+            // with THIS project as the requester, then the Background keychain
+            // read at the scope's slot) — so the two loops cannot diverge.
+            // Behaviour kept exactly: a non-blank value wins and ends this
+            // key; blank / inactive / missing fall through to the legacy
+            // slot; a read error marks the response degraded and falls
+            // through.
+            use vct_launcher_core::module_secrets_env::{resolve_module_secret, SecretLookup};
+            match resolve_module_secret(&h.0, &bs.module_id, &bs.key, &bs.scope, Some(&project.id)) {
+                SecretLookup::Value(val) if !val.trim().is_empty() => {
+                    env.insert(bs.key.clone(), serde_json::Value::String(val));
+                    continue;
                 }
+                SecretLookup::ReadError(e) => {
+                    tracing::warn!(
+                        key = ?bs.key,
+                        project = %project.id,
+                        error = %e,
+                        "[vct-hub] keychain read failed for bundled secret — env marked degraded"
+                    );
+                    mark_keychain_degraded(&mut keychain_degraded);
+                }
+                SecretLookup::Value(_)
+                | SecretLookup::Inactive
+                | SecretLookup::Missing
+                | SecretLookup::NoProject => {}
             }
 
             // 2026-05-10 (post-0.2.0 backlog #6): legacy slot fallback
@@ -1013,40 +1049,26 @@ async fn project_env(
             // consolidate the slots), reads through the hub fall back
             // to the legacy slot so existing tokens stay reachable
             // across the upgrade. Once the migration has run the
-            // legacy slot is empty and this branch is a no-op.
+            // legacy slot is empty and this branch is a no-op. Same gate,
+            // on the legacy slot's OWN active flag.
             if bs.scope == "shared" && bs.key == "github_pat" && bs.module_id == "user" {
-                let legacy_module_id = "installer";
-                let legacy_active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
-                    &h.0,
-                    scope_str,
-                    lookup_project_id,
-                    legacy_module_id,
-                    &bs.key,
-                    &project.id,
-                );
-                if legacy_active {
-                    match vct_launcher_core::secrets::get_with_context(
-                        scope,
-                        legacy_module_id,
-                        &bs.key,
-                        vct_launcher_core::secrets::CallContext::Background,
-                    ) {
-                        Ok(Some(val)) => {
-                            if !val.trim().is_empty() {
-                                env.insert(bs.key.clone(), serde_json::Value::String(val));
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            tracing::warn!(
-                                project = %project.id,
-                                error = %e,
-                                "[vct-hub] keychain read failed for legacy github_pat \
-                                 slot — env marked degraded"
-                            );
-                            mark_keychain_degraded(&mut keychain_degraded);
-                        }
+                match resolve_module_secret(&h.0, "installer", &bs.key, "shared", Some(&project.id)) {
+                    SecretLookup::Value(val) if !val.trim().is_empty() => {
+                        env.insert(bs.key.clone(), serde_json::Value::String(val));
                     }
+                    SecretLookup::ReadError(e) => {
+                        tracing::warn!(
+                            project = %project.id,
+                            error = %e,
+                            "[vct-hub] keychain read failed for legacy github_pat \
+                             slot — env marked degraded"
+                        );
+                        mark_keychain_degraded(&mut keychain_degraded);
+                    }
+                    SecretLookup::Value(_)
+                    | SecretLookup::Inactive
+                    | SecretLookup::Missing
+                    | SecretLookup::NoProject => {}
                 }
             }
         }
@@ -1235,6 +1257,13 @@ async fn project_env(
 /// Returning `Option<String>` rather than emitting a `serde_json::Value`
 /// keeps this independent of the response shape so the unit test can
 /// pin behaviour without standing up axum + a hub server.
+///
+/// v0.2.97 (2026-09-25, second instance of the flaky keychain-read class):
+/// the keychain read used to end in `.ok().flatten()`, which read a
+/// Secret-Service timeout as "not set" and the caller's assert blamed the
+/// product. The read is now `Result`-returning; the test-side macro
+/// `resolve_or_skip!` (in `mod tests`) skips on a positively-identified
+/// timeout-class error and panics on any other Err.
 #[cfg(test)]
 pub(crate) fn resolve_secret_for_subprocess_env(
     db: &vct_launcher_core::db::Db,
@@ -1242,21 +1271,21 @@ pub(crate) fn resolve_secret_for_subprocess_env(
     project_id: &str,
     module_id: &str,
     key: &str,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     // PR-3 Commit 4: cross-launcher pause check (Option γ). A secret
     // paused in any launcher's DB blocks the read here.
     let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher(
         db, scope_str, project_id, module_id, key,
     );
     if !active {
-        return None;
+        return Ok(None);
     }
     let scope = match scope_str {
         "global" => vct_launcher_core::secrets::SecretScope::Global,
         "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id },
         _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id },
     };
-    vct_launcher_core::secrets::get(scope, module_id, key).ok().flatten()
+    vct_launcher_core::secrets::get(scope, module_id, key)
 }
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
@@ -1305,6 +1334,74 @@ pub(crate) fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::ma
 mod tests {
     use super::*;
     use vct_launcher_core::db::Db;
+
+    /// True when the error string positively identifies a keychain-op
+    /// timeout / worker unavailability — the ONE shared predicate in
+    /// `vct_launcher_core::secrets::for_tests` (same home the installer's
+    /// keychain tests use).
+    fn is_keychain_unavailable_err(e: &str) -> bool {
+        vct_launcher_core::secrets::for_tests::is_keychain_unavailable_err(e)
+    }
+
+    /// Call [`resolve_secret_for_subprocess_env`] without swallowing its
+    /// Err (v0.2.97, second instance of the flaky keychain-read class):
+    /// a positively-identified timeout skips the test (same posture as
+    /// a missing keychain backend), any other Err panics with the error
+    /// text, Ok(v) is the resolved value.
+    macro_rules! resolve_or_skip {
+        ($db:expr, $scope:expr, $project:expr, $module:expr, $key:expr) => {
+            match resolve_secret_for_subprocess_env($db, $scope, $project, $module, $key) {
+                Ok(v) => v,
+                Err(e) => {
+                    if is_keychain_unavailable_err(&e) {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as a missing keychain \
+                             backend — not a product regression",
+                            e
+                        );
+                        return;
+                    }
+                    panic!(
+                        "hub resolver test read of {}/{} failed (a failed read \
+                         must not masquerade as 'not set'): {}",
+                        $module, $key, e
+                    );
+                }
+            }
+        };
+    }
+
+    /// v0.2.97 (lane V): `/modules/catalog` carries each module's health from
+    /// the poller's registry — the machine-wide instance as `health`, the
+    /// per-project ones as `project_health` — and `null` for a module the
+    /// poller does not track.
+    #[tokio::test]
+    async fn catalog_serves_the_pollers_health() {
+        use crate::module_health::{registry, Probe, ProbeTarget, TargetKey};
+        let guard = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path());
+        let target = |project: Option<&str>| ProbeTarget {
+            key: TargetKey { module_id: "vct-hub-api".into(), project_id: project.map(str::to_string) },
+            probe: Probe::Unprobed { reason: "test reason".into() },
+            interval: std::time::Duration::from_secs(30),
+        };
+        registry().sync(vec![target(None), target(Some("p1"))], std::time::Instant::now());
+
+        let handle = LauncherDbHandle(Arc::new(Db::open_in_memory().unwrap()));
+        let resp = catalog(State(handle)).await.into_response();
+        let bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        registry().sync(vec![], std::time::Instant::now());
+
+        let modules = body["modules"].as_array().unwrap();
+        let hub = modules.iter().find(|m| m["id"] == "vct-hub-api").expect("hub-api listed");
+        assert_eq!(hub["health"]["state"], "unknown");
+        assert_eq!(hub["health"]["last_error"], "test reason");
+        assert_eq!(hub["project_health"]["p1"]["state"], "unknown");
+        let kg = modules.iter().find(|m| m["id"] == "vct-kg").expect("kg listed");
+        assert!(kg["health"].is_null() && kg.get("project_health").is_none());
+    }
 
     // v0.2.96 (L-15): `keyring_available()` lived here — a one-line
     // delegation to `vct_launcher_core::secrets::keyring_probe_available()`
@@ -1366,7 +1463,7 @@ mod tests {
         // While ACTIVE: the resolver returns the cleartext value (the
         // launcher's contract for unwrapped subprocess env vars).
         let resolved =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert_eq!(resolved.as_deref(), Some(canary.as_str()));
 
         // Unset (Lifecycle B): keychain UNTOUCHED, active flag flipped.
@@ -1385,7 +1482,7 @@ mod tests {
         // But the hub-side resolver MUST refuse to serve it. This is
         // the bug we're fixing in PR-3 Commit 3.
         let resolved_paused =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert!(
             resolved_paused.is_none(),
             "paused secret leaked through hub resolver: {:?}",
@@ -1396,15 +1493,30 @@ mod tests {
         db.mark_secret_active(scope_str, project_id, module_id, &key)
             .unwrap();
         let resolved_reactivated =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert_eq!(resolved_reactivated.as_deref(), Some(canary.as_str()));
 
-        // Cleanup keychain (best-effort).
-        let _ = vct_launcher_core::secrets::delete(
+        // Cleanup keychain (v0.2.97 flaky-class sweep: the delete's error
+        // is no longer swallowed — a timeout-class error is logged, any
+        // other Err panics).
+        if let Err(e) = vct_launcher_core::secrets::delete(
             vct_launcher_core::secrets::SecretScope::Global,
             module_id,
             &key,
-        );
+        ) {
+            if is_keychain_unavailable_err(&e) {
+                eprintln!(
+                    "[cleanup] keychain delete of {}/{} skipped (Secret Service \
+                     too slow/unavailable under load): {}",
+                    module_id, key, e
+                );
+            } else {
+                panic!(
+                    "cleanup keychain delete of {}/{} failed (residue risk): {}",
+                    module_id, key, e
+                );
+            }
+        }
         let _ = db.forget_secret_active_state(scope_str, project_id, module_id, &key);
     }
 
@@ -1415,12 +1527,12 @@ mod tests {
         // resolver returns None (omits the env var). Doesn't require the
         // keychain backend — `is_set` returns false on a never-written key.
         let db = Db::open_in_memory().unwrap();
-        let res = resolve_secret_for_subprocess_env(
+        let res = resolve_or_skip!(
             &db,
             "global",
             "_global_",
             "user",
-            "NEVER_SET_KEY_PR3_TEST",
+            "NEVER_SET_KEY_PR3_TEST"
         );
         assert!(res.is_none());
     }
@@ -1601,6 +1713,377 @@ mod tests {
         );
     }
 
+    /// v0.2.97 (owner ruling on review R5 F43 — the retired `# >>> module:`
+    /// `.env` sections): an INSTALLED module's setting reaches the project's
+    /// processes through the hub's `/env` (launcher DB `module_installs` +
+    /// `module_settings` → this resolver), never through `.env`.
+    #[tokio::test]
+    async fn project_env_delivers_an_installed_modules_setting() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        // A module manifest that declares one setting — built from the
+        // bundled `vct-search.json` (which parses, pinned by
+        // `bundled_search_manifest_parses_cleanly`) with a `settings` entry
+        // and its own id, installed under the scratch state dir.
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+        manifest["id"] = serde_json::json!("vct-f43-probe");
+        manifest["settings"] = serde_json::json!([
+            {"key": "RL_RERANK_TOP_K", "type": "integer", "default": 10}
+        ]);
+        let module_dir = guard.path().join("modules").join("vct-f43-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        assert!(
+            scan_manifests().iter().any(|(_, m)| m.id == "vct-f43-probe"),
+            "scan_manifests must see the module under the scratch state dir"
+        );
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-mod-1", "Module Project", "/tmp/module-project-1");
+
+        // Not installed: the module's key is absent.
+        let before: serde_json::Value = reqwest::get(format!("{}/projects/p-mod-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(before.get("RL_RERANK_TOP_K").is_none(), "{}", before);
+
+        h.0.insert_module_install("mi-1", "p-mod-1", "vct-f43-probe", "0.1.0", "/tmp/m")
+            .unwrap();
+        h.0.set_setting("p-mod-1", "vct-f43-probe", "RL_RERANK_TOP_K", &serde_json::json!(25))
+            .unwrap();
+        let after: serde_json::Value = reqwest::get(format!("{}/projects/p-mod-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(
+            after.get("RL_RERANK_TOP_K").and_then(|v| v.as_str()),
+            Some("25"),
+            "{}",
+            after
+        );
+    }
+
+    /// R7b F23, per kind: `/env` serves the settings of a module installed
+    /// MACHINE-WIDE (enabled, and on for the project) — a `global` setting
+    /// from the machine-wide row, a per-project one from the project's row
+    /// else the machine-wide row — for every runtime type; a project the
+    /// enable cascade turns it off for gets none; a per-project install falls
+    /// back to the machine-wide row too. A BUNDLED module's machine-wide row
+    /// (the hub's own `VCT_HUB_PORT`) is not served.
+    #[tokio::test]
+    async fn project_env_serves_machine_wide_installs_and_machine_wide_rows() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path());
+        for kind in ["mcp_stdio", "mcp_http", "cli", "container", "service"] {
+            let id = format!("vct-f23-{}", kind.replace('_', "-"));
+            let manifest = serde_json::json!({
+                "id": id, "name": id, "version": "1.0.0", "category": "core",
+                "license": { "required": false },
+                "install": { "method": "local", "install_dir": format!("{{VCT_MODULES}}/{id}") },
+                "settings": [
+                    { "key": format!("{}_PER", kind.to_uppercase()), "type": "string" },
+                    { "key": format!("{}_GLOBAL", kind.to_uppercase()), "type": "string", "scope": "global" }
+                ],
+                "runtime": { "type": kind }
+            });
+            let dir = guard.path().join("modules").join(&id);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        }
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-on", "On", "/tmp/f23-on");
+        seed_project(&h.0, "p-off", "Off", "/tmp/f23-off");
+        let env_of = |pid: &'static str| {
+            let base = base.clone();
+            async move {
+                reqwest::get(format!("{}/projects/{pid}/env", base))
+                    .await
+                    .unwrap()
+                    .json::<serde_json::Value>()
+                    .await
+                    .unwrap()
+            }
+        };
+        for kind in ["mcp_stdio", "mcp_http", "cli", "container", "service"] {
+            let id = format!("vct-f23-{}", kind.replace('_', "-"));
+            let (per, global) = (format!("{}_PER", kind.to_uppercase()), format!("{}_GLOBAL", kind.to_uppercase()));
+            h.0.insert_global_module_install(&format!("g-{id}"), &id, "1.0.0", "/tmp/g").unwrap();
+            h.0.module_set_enabled_for_project("p-off", &id, false).unwrap();
+            h.0.set_global_setting(&id, &global, &serde_json::json!("machine")).unwrap();
+            h.0.set_global_setting(&id, &per, &serde_json::json!("machine-default")).unwrap();
+            h.0.set_setting("p-on", &id, &per, &serde_json::json!("project")).unwrap();
+
+            let on = env_of("p-on").await;
+            assert_eq!(on[&global].as_str(), Some("machine"), "{kind}: {on}");
+            assert_eq!(on[&per].as_str(), Some("project"), "{kind}: the project's row wins");
+            let off = env_of("p-off").await;
+            assert!(off.get(&global).is_none() && off.get(&per).is_none(), "{kind}: {off}");
+        }
+
+        // A per-project install with only a machine-wide row: served.
+        seed_project(&h.0, "p-per", "Per", "/tmp/f23-per");
+        h.0.insert_module_install("mi-f23", "p-per", "vct-f23-cli", "1.0.0", "/tmp/m").unwrap();
+        h.0.delete_global_module_install("vct-f23-cli").ok();
+        let per = env_of("p-per").await;
+        assert_eq!(per["CLI_PER"].as_str(), Some("machine-default"), "{per}");
+
+        // The bundled hub module's machine-wide port is not served.
+        h.0.set_global_setting("vct-hub-api", "VCT_HUB_PORT", &serde_json::json!(7811)).unwrap();
+        assert!(env_of("p-on").await.get("VCT_HUB_PORT").is_none());
+    }
+
+    /// R8 G4 (the owner's F23 ruling: settings, not secrets): a module
+    /// installed MACHINE-WIDE serves every project its settings, but NOT its
+    /// declared secrets — those keep the scope they had before F23 (a
+    /// per-project install, or a bundled module). The control half proves the
+    /// secret is resolvable: the same project with a per-project install of
+    /// the module does receive it.
+    #[tokio::test]
+    async fn project_env_serves_a_machine_wide_install_its_settings_but_not_its_secrets() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let id = "vct-g4-probe";
+        let manifest = serde_json::json!({
+            "id": id, "name": id, "version": "1.0.0", "category": "core",
+            "license": { "required": false },
+            "install": { "method": "local", "install_dir": format!("{{VCT_MODULES}}/{id}") },
+            "settings": [ { "key": "G4_SETTING", "type": "string", "scope": "global" } ],
+            "secrets": [
+                { "key": "G4_GLOBAL_TOKEN", "scope": "global", "required": false },
+                { "key": "G4_PROJECT_TOKEN", "scope": "per-project", "required": false }
+            ],
+            "runtime": { "type": "mcp_stdio" }
+        });
+        let dir = guard.path().join("modules").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-g4", "G4", "/tmp/g4-project");
+        h.0.insert_global_module_install("g-g4", id, "1.0.0", "/tmp/g").unwrap();
+        h.0.set_global_setting(id, "G4_SETTING", &serde_json::json!("machine")).unwrap();
+        use vct_launcher_core::secrets::SecretScope;
+        vct_launcher_core::secrets::set(SecretScope::Global, id, "G4_GLOBAL_TOKEN", "synthetic-global")
+            .unwrap();
+        vct_launcher_core::secrets::set(
+            SecretScope::PerProject { project_id: "p-g4" },
+            id,
+            "G4_PROJECT_TOKEN",
+            "synthetic-project",
+        )
+        .unwrap();
+        let get = || async {
+            reqwest::get(format!("{}/projects/p-g4/env", base))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let machine_wide = get().await;
+        assert_eq!(machine_wide["G4_SETTING"].as_str(), Some("machine"), "{machine_wide}");
+        assert!(
+            machine_wide.get("G4_GLOBAL_TOKEN").is_none()
+                && machine_wide.get("G4_PROJECT_TOKEN").is_none(),
+            "a machine-wide install served its secrets: {machine_wide}"
+        );
+
+        h.0.insert_module_install("mi-g4", "p-g4", id, "1.0.0", "/tmp/m").unwrap();
+        let installed = get().await;
+        assert_eq!(installed["G4_GLOBAL_TOKEN"].as_str(), Some("synthetic-global"), "{installed}");
+        assert_eq!(installed["G4_PROJECT_TOKEN"].as_str(), Some("synthetic-project"), "{installed}");
+    }
+
+    /// v0.2.97 (lane V round 2): an installed module's declared secret is
+    /// served by `/env` through the shared gate
+    /// (`module_secrets_env::resolve_module_secret`) — active → served;
+    /// paused for THIS project as the requester → omitted. Runs on the mock
+    /// keychain, unlike the `#[ignore]`d real-keychain tests of this loop.
+    #[tokio::test]
+    async fn project_env_serves_an_installed_modules_secret_through_the_gate() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+        manifest["id"] = serde_json::json!("vct-sec-probe");
+        manifest["secrets"] = serde_json::json!([{ "key": "PROBE_TOKEN", "scope": "per-project" }]);
+        let module_dir = guard.path().join("modules").join("vct-sec-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-sec-1", "Secret Project", "/tmp/secret-project-1");
+        h.0.insert_module_install("mi-s", "p-sec-1", "vct-sec-probe", "0.1.0", "/tmp/m").unwrap();
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "p-sec-1" },
+            "vct-sec-probe",
+            "PROBE_TOKEN",
+            "synthetic-probe-value",
+        )
+        .unwrap();
+
+        let get = || async {
+            reqwest::get(format!("{}/projects/p-sec-1/env", base))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        assert_eq!(get().await["PROBE_TOKEN"], "synthetic-probe-value");
+        h.0.mark_secret_inactive_for_requester(
+            "per_project", "p-sec-1", "vct-sec-probe", "PROBE_TOKEN", "p-sec-1",
+        )
+        .unwrap();
+        let paused = get().await;
+        assert!(paused.get("PROBE_TOKEN").is_none(), "paused secret served: {paused}");
+    }
+
+    /// v0.2.97 (lane V round 3): `/env`'s TWO secret loops — an installed
+    /// module's declared secret and the orchestrator's bundled `github_pat`
+    /// (shared, module `user`) — go through the ONE gate. Each serves its key
+    /// while active and refuses it once paused for this project; a pause
+    /// honoured by one loop and not the other is a divergence and fails here.
+    /// The legacy `installer` slot stays empty, so the fallback serves
+    /// nothing. Mock keychain (the real-keychain tests of these loops are
+    /// `#[ignore]`d on headless hosts).
+    #[tokio::test]
+    async fn both_env_secret_loops_refuse_a_paused_key() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let bundled = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
+            .expect("vct-module.json discoverable");
+        let pat = bundled
+            .bundled_secrets
+            .iter()
+            .find(|b| b.key == "github_pat")
+            .expect("github_pat is a bundled secret");
+        assert_eq!((pat.scope.as_str(), pat.module_id.as_str()), ("shared", "user"));
+
+        let mut manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+        manifest["id"] = serde_json::json!("vct-div-probe");
+        manifest["secrets"] = serde_json::json!([{ "key": "DIV_TOKEN", "scope": "shared" }]);
+        let module_dir = guard.path().join("modules").join("vct-div-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(module_dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-div", "Divergence Project", "/tmp/div-project");
+        h.0.insert_module_install("mi-div", "p-div", "vct-div-probe", "0.1.0", "/tmp/m").unwrap();
+        let shared = vct_launcher_core::secrets::SecretScope::Shared { project_id: "_user_shared_" };
+        vct_launcher_core::secrets::set(shared, "vct-div-probe", "DIV_TOKEN", "div-value").unwrap();
+        vct_launcher_core::secrets::set(shared, "user", "github_pat", "pat-value").unwrap();
+
+        let get = || async {
+            reqwest::get(format!("{}/projects/p-div/env", base))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        let active = get().await;
+        assert_eq!(active["DIV_TOKEN"], "div-value", "module loop: {active}");
+        assert_eq!(active["github_pat"], "pat-value", "bundled loop: {active}");
+
+        for (module, key) in [("vct-div-probe", "DIV_TOKEN"), ("user", "github_pat")] {
+            h.0.mark_secret_inactive_for_requester("shared", "_user_shared_", module, key, "p-div")
+                .unwrap();
+        }
+        let paused = get().await;
+        assert!(paused.get("DIV_TOKEN").is_none(), "module loop served a paused key: {paused}");
+        assert!(paused.get("github_pat").is_none(), "bundled loop served a paused key: {paused}");
+    }
+
+    /// v0.2.97 (lane V round 3): the legacy `installer` slot fallback for
+    /// `github_pat`, unchanged through the shared gate — with the canonical
+    /// `user` slot empty the legacy value is served, gated on the legacy
+    /// slot's OWN active flag; a filled `user` slot wins. Mock keychain.
+    #[tokio::test]
+    async fn github_pat_legacy_slot_fallback_is_gated_and_loses_to_the_user_slot() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _guard = vct_launcher_core::test_env::state_dir_guard();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-legacy", "Legacy Project", "/tmp/legacy-project");
+        let shared = vct_launcher_core::secrets::SecretScope::Shared { project_id: "_user_shared_" };
+        vct_launcher_core::secrets::set(shared, "installer", "github_pat", "legacy-pat").unwrap();
+        let get = || async {
+            reqwest::get(format!("{}/projects/p-legacy/env", base))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+        assert_eq!(get().await["github_pat"], "legacy-pat");
+
+        vct_launcher_core::secrets::set(shared, "user", "github_pat", "user-pat").unwrap();
+        assert_eq!(get().await["github_pat"], "user-pat", "the canonical slot wins");
+
+        vct_launcher_core::secrets::delete(shared, "user", "github_pat").unwrap();
+        h.0.mark_secret_inactive_for_requester("shared", "_user_shared_", "installer", "github_pat", "p-legacy")
+            .unwrap();
+        let paused = get().await;
+        assert!(paused.get("github_pat").is_none(), "paused legacy slot served: {paused}");
+    }
+
+    /// v0.2.97: the bundled `vct-session-state` module, materialized by the
+    /// ONE load path (`sync_bundled_manifests`, run at hub start), is
+    /// installed for every project — its settings reach `/env` with no
+    /// `module_installs` row. Before, the manifest was never materialized
+    /// (and did not parse), so they never did.
+    #[tokio::test]
+    async fn project_env_delivers_the_bundled_session_state_settings() {
+        let _kc_lock = h1_lock();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let report = vct_launcher_core::bundled_manifests::sync_bundled_manifests(guard.path());
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        let written = report.written;
+        assert!(written.contains(&"vct-session-state.json".to_string()));
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-bundled-1", "Bundled Project", "/tmp/bundled-project-1");
+
+        // No setting stored → nothing emitted (the hook applies the default).
+        let before: serde_json::Value = reqwest::get(format!("{}/projects/p-bundled-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert!(before.get("CONTEXT_STATE_MAX_LINES").is_none(), "{}", before);
+
+        h.0.set_setting("p-bundled-1", "vct-session-state", "CONTEXT_STATE_MAX_LINES", &serde_json::json!(800))
+            .unwrap();
+        h.0.set_setting("p-bundled-1", "vct-session-state", "MEMORY_MAX_LINES", &serde_json::json!(150))
+            .unwrap();
+        let key: serde_json::Value = reqwest::get(format!(
+            "{}/projects/p-bundled-1/env?key=CONTEXT_STATE_MAX_LINES",
+            base
+        ))
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+        assert_eq!(key.get("CONTEXT_STATE_MAX_LINES").and_then(|v| v.as_str()), Some("800"), "{}", key);
+        let all: serde_json::Value = reqwest::get(format!("{}/projects/p-bundled-1/env", base))
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(all.get("MEMORY_MAX_LINES").and_then(|v| v.as_str()), Some("150"), "{}", all);
+    }
+
     #[tokio::test]
     async fn project_env_filter_rejects_empty_key_with_400() {
         // 2026-09-17: `GET /env` walks the orchestrator manifest's
@@ -1723,7 +2206,7 @@ mod tests {
     //
     // H1 fixes both:
     //   * Hub maps `scope='shared'` keychain lookups to SENTINEL_SHARED
-    //     (`_user_shared_`) — see `SENTINEL_SHARED` const at the top of
+    //     (`_user_shared_`) — see `vct_launcher_core::secrets::SENTINEL_SHARED`, named at the top of
     //     this module.
     //   * `OrchestratorManifest::bundled_secrets` lets the orchestrator
     //     core declare its own secrets the hub iterates alongside

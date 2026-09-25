@@ -14,7 +14,7 @@ short_desc: (retired) migrates existing project to VCO workflow
 keywords: [migrate project, existing project to Orchestrator, brownfield, preserve customizations, workflow migration, "port project", "bring project into VCO", "migrate to VCO", "existing project setup"]
 tools: Read, Write, Edit, Glob, Bash, Task, AskUserQuestion
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Project Migrator Agent

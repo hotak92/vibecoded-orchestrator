@@ -109,10 +109,15 @@ user in Claude Code's GUI remembered across sessions." So:
   remembered by their client. Removing the env pin is what lets it be
   obeyed, because the pin outranks it on every launch;
 * a machine that ALREADY carries a pin is migrated once —
-  :func:`migrate_default_pins`, run by ``install.py`` on every install/update
-  through :mod:`vco_lib.machine_migrations`. A fix only new installs receive
-  would be a fix delivered nowhere. :func:`migrate_default_pin` documents how
-  "ours" is told from "theirs" and what the residual risk is;
+  :func:`migrate_default_pins`, which :mod:`vco_lib.machine_migrations` runs
+  on every install/update (after the venv step) as the ``migrate-default-pin``
+  CLI in the install's VENV, never in-process: this module imports
+  ``model_router``, which install.py's own interpreter need not have. In
+  v0.2.95 and v0.2.96 it was imported in-process and failed on exactly that
+  import on every launcher update (logged, never shown), so no machine was
+  migrated. A fix only new installs receive would be a fix delivered nowhere.
+  :func:`migrate_default_pin` documents how "ours" is told from "theirs" and
+  what the residual risk is;
 * the mode switch is unaffected: it still stashes only what it DROPS and
   restores it verbatim, so neither leg can introduce a pin that was not
   there. A stashed ``ANTHROPIC_MODEL`` is by construction a gateway-only id
@@ -224,11 +229,17 @@ them.
 
 JSONC
 -----
-VS Code accepts comments and trailing commas in ``settings.json``. Parsing
-that with :func:`json.loads` raises, and "helpfully" re-serialising a parsed
-form would silently delete the user's comments. So a file that is not strict
-JSON is REFUSED, byte-for-byte untouched, with the exact key block the user
-should paste returned in ``paste_block``.
+VS Code accepts comments and trailing commas in ``settings.json``, and
+"helpfully" re-serialising a parsed form would silently delete the user's
+comments. Since v0.2.97 every reader here parses JSONC and every writer
+(point, the mode switch, ``clear-default``, ``reset``, the Default-pin
+migration) reaches its new settings by editing the ORIGINAL text member by
+member, verified by re-parsing — all through the one editor,
+:mod:`vco_lib.jsonc_edit`, via :func:`_write_settings`. What is still
+REFUSED, byte-for-byte untouched, with the exact key block the user should
+paste returned in ``paste_block``: a file that is not valid JSONC at all, and
+an edit the editor cannot verify (a duplicate key, a replaced value holding
+comments).
 
 Permissions
 -----------
@@ -258,8 +269,13 @@ and adding a fourth answer to "restrict this file to its owner" is exactly
 what the modularity rule forbids. ``install.py`` step 4/10 runs
 ``pip install -e claude_mcp_servers/`` on every install where that
 directory's ``pyproject.toml`` exists — i.e. every clone — so the import
-resolves on every healthy install; a failure means a broken install and
-surfaces loudly. The register's item 24 (extract to ``vco_lib/fileperms.py``,
+resolves IN THE INSTALL'S VENV on every healthy install, and nowhere else:
+a base interpreter (``/usr/bin/python3``, which the launcher starts
+install.py with before it relaunches into the venv) never has it. So a
+caller that may be outside the venv runs this module as a child of the venv
+interpreter (:mod:`vco_lib.machine_migrations` does); an ImportError INSIDE
+the venv means a broken install, and that child reports it as a failure the
+user sees. The register's item 24 (extract to ``vco_lib/fileperms.py``,
 which would put the layering back) is a merge-lane item; this module follows
 it with a one-line import change when it lands.
 """
@@ -295,7 +311,9 @@ from model_router.fileperms import (  # pyright: ignore[reportMissingImports]
     restrict_to_owner,
 )
 
+from vco_lib import jsonc_edit
 from vco_lib.atomic import atomic_copy_file, atomic_write_text
+from vco_lib.jsonc_edit import sniff_indent, sniff_newline
 from vco_lib.paths import user_home
 
 # ---------------------------------------------------------------------------
@@ -694,32 +712,16 @@ class SettingsRefused(Exception):
         self.message = message
 
 
-_COMMENT_HINT = re.compile(r"(^|\s)(//|/\*)")
-_TRAILING_COMMA_HINT = re.compile(r",\s*[}\]]")
-
-
 def describe_json_failure(text: str, error: str) -> str:
-    """Name the LIKELY cause of a strict-JSON failure, in the user's terms.
+    """Why a settings file could not be read — in the user's terms.
 
-    VS Code accepts JSON with comments and trailing commas; ``json.loads``
-    does not. Saying "expecting property name" to someone whose file simply
-    has a ``// note`` on line 3 is a diagnostic dead end.
+    JSONC (comments, trailing commas) IS read, by :mod:`vco_lib.jsonc_edit`,
+    so this is only reached for a file that is not valid JSONC either. The
+    parser's own words are quoted; nothing is guessed.
     """
-    hints: list[str] = []
-    if _COMMENT_HINT.search(text):
-        hints.append("comments (`//` or `/* */`)")
-    if _TRAILING_COMMA_HINT.search(text):
-        hints.append("a trailing comma before `}` or `]`")
-    if hints:
-        return (
-            "This settings.json is JSONC — VS Code accepts it, strict JSON "
-            f"does not. Found {' and '.join(hints)}. VCO will not rewrite the "
-            "file, because re-serialising it would silently delete your "
-            f"comments. (Parser said: {error})"
-        )
     return (
-        "This settings.json is not valid JSON, so VCO will not rewrite it — "
-        f"an edit could destroy content. (Parser said: {error})"
+        "This settings.json is not valid JSON or JSONC, so VCO will not "
+        f"rewrite it — an edit could destroy content. (Parser said: {error})"
     )
 
 
@@ -748,22 +750,6 @@ def _read_text(path: Path) -> str:
         ) from exc
 
 
-def sniff_indent(text: str) -> str:
-    """The file's own indentation, so a rewrite does not reformat it.
-
-    Returns a tab or a run of spaces taken from the first indented line;
-    falls back to four spaces, which is what VS Code writes.
-    """
-    for line in text.splitlines():
-        if not line.strip():
-            continue
-        stripped = line.lstrip(" \t")
-        prefix = line[: len(line) - len(stripped)]
-        if prefix:
-            return "\t" if prefix.startswith("\t") else prefix
-    return "    "
-
-
 def _load_settings(path: Path) -> tuple[dict, str]:
     """Return ``(settings, original_text)``; raise :class:`SettingsRefused`.
 
@@ -787,8 +773,15 @@ def _load_settings(path: Path) -> tuple[dict, str]:
         return {}, text
     try:
         parsed = json.loads(text)
-    except ValueError as exc:
-        raise SettingsRefused("not_strict_json", describe_json_failure(text, str(exc))) from exc
+    except ValueError:
+        # VS Code's own format: comments and trailing commas. Read it; the
+        # writer then edits the TEXT (`_write_settings`), never re-serialises.
+        try:
+            parsed = jsonc_edit.loads(text)
+        except ValueError as exc:
+            raise SettingsRefused(
+                "not_strict_json", describe_json_failure(text, str(exc)),
+            ) from exc
     if not isinstance(parsed, dict):
         raise SettingsRefused(
             "not_an_object",
@@ -817,16 +810,13 @@ def is_loopback_host(host: str) -> bool:
 
     Deliberately does NOT resolve names: this function decides whether a URL
     in a config file is OUR gateway, and a DNS lookup would make that answer
-    depend on the network at the moment of a status refresh.
+    depend on the network at the moment of a status refresh. The rule is
+    :func:`vco_lib.service_probe_http.is_loopback_host` (the one Python home,
+    mirroring the Rust one), except that an EMPTY host is not a gateway URL.
     """
-    h = (host or "").strip().strip("[]").lower()
-    if h in {"localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1"}:
-        return True
-    # 127.0.0.0/8 — anything in the loopback block.
-    parts = h.split(".")
-    if len(parts) == 4 and parts[0] == "127":
-        return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-    return False
+    from vco_lib.service_probe_http import is_loopback_host as _rule  # noqa: PLC0415
+
+    return bool((host or "").strip().strip("[]")) and _rule(host)
 
 
 def is_vco_gateway_base_url(
@@ -1808,17 +1798,6 @@ def paste_block(
     return json.dumps(body, indent=4)[1:-1].strip("\n")
 
 
-def sniff_newline(text: str) -> str:
-    """``"\\r\\n"`` when the file already uses CRLF, else ``"\\n"``.
-
-    Rewriting a Windows user's CRLF settings file as LF would show up as a
-    whole-file diff in their VCS and is not a change this module was asked to
-    make. ``json.dumps`` only ever emits ``\\n``, so the translation is done
-    on the way out.
-    """
-    return "\r\n" if "\r\n" in text else "\n"
-
-
 def _dump(
     settings: Mapping[str, Any],
     *,
@@ -1866,12 +1845,30 @@ def _write_settings(
 
     Returns ``(backup_path_or_None, permissions_state)``.
 
+    A JSONC original (comments / trailing commas) is never re-serialised: the
+    new ``settings`` are reached by editing the ORIGINAL text, member by
+    member (:func:`vco_lib.jsonc_edit.rewrite_preserving`), and verified by
+    re-parsing. An edit that cannot be verified is refused BEFORE anything —
+    backup included — is written.
+
     The rollback is the point of this function. Once the new bytes are on
     disk the token is on disk, so a permission failure after the write is
     not something to warn about and move on from — the file goes back to
     what it was (or is removed if we created it) and the caller gets a
     refusal.
     """
+    jsonc_body: Optional[str] = None
+    if original_text.strip() and not jsonc_edit.is_strict_json(original_text):
+        try:
+            jsonc_body = jsonc_edit.rewrite_preserving(original_text, settings)
+        except jsonc_edit.JsoncEditRefused as exc:
+            raise SettingsRefused(
+                exc.reason,
+                f"{path} has comments or trailing commas (JSONC), and VCO could "
+                f"not make this change without risking other content "
+                f"({exc.message}), so nothing was written.",
+            ) from exc
+
     backup: Optional[Path] = None
     if existed:
         backup = _backup_path(path)
@@ -1892,15 +1889,18 @@ def _write_settings(
                 "was changed.",
             ) from exc
 
-    indent = sniff_indent(original_text) if original_text else "    "
-    body = _dump(
-        settings,
-        indent=indent,
-        trailing_newline=(
-            original_text.endswith(("\n", "\r")) if original_text.strip() else True
-        ),
-        newline=sniff_newline(original_text),
-    )
+    if jsonc_body is not None:
+        body = jsonc_body
+    else:
+        indent = sniff_indent(original_text) if original_text else "    "
+        body = _dump(
+            settings,
+            indent=indent,
+            trailing_newline=(
+                original_text.endswith(("\n", "\r")) if original_text.strip() else True
+            ),
+            newline=sniff_newline(original_text),
+        )
     atomic_write_text(path, body)
     try:
         restrict_to_owner(path)
@@ -2391,6 +2391,14 @@ def migrate_default_pin(path: Path) -> dict:
 
     Never writes when there is nothing to remove: a missing file, a missing
     key and an unparseable file all leave the bytes untouched.
+
+    **JSONC** (v0.2.97). VS Code's own ``settings.json`` routinely carries
+    comments and trailing commas, and a refused file was a file this
+    migration never checked. Such a file is now read, and the pin removed by
+    editing the TEXT — every comment kept — through the same
+    :func:`clear_default_model` every writer here shares (see
+    :func:`_write_settings`); an edit that does not verify is refused and
+    nothing is written.
     """
     path = Path(path)
     result: dict[str, Any] = {
@@ -2456,6 +2464,23 @@ def migrate_default_pin(path: Path) -> dict:
     return result
 
 
+def _pin_ledger_rows(ledger_path: Path) -> list[dict]:
+    """The ledger's per-target rows; ``[]`` when it cannot be read.
+
+    An unreadable ledger still means "the migration ran" — its EXISTENCE is
+    the guard — so the conservative answer is "nothing left to retry", never
+    "run the whole migration again".
+    """
+    try:
+        doc = json.loads(ledger_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    rows = doc.get("targets") if isinstance(doc, dict) else None
+    if not isinstance(rows, list):
+        return []
+    return [r for r in rows if isinstance(r, dict) and isinstance(r.get("path"), str)]
+
+
 def migrate_default_pins(
     *,
     ledger: Optional[Path] = None,
@@ -2476,6 +2501,14 @@ def migrate_default_pins(
     before any file is opened. A ledger that cannot be WRITTEN is reported and
     not raised — the removal already happened, and the worst consequence of
     losing the record is that a later update re-runs a no-op.
+
+    The ONE exception to "an existing ledger opens nothing" (v0.2.97): a
+    target the ledger records as ``refused`` was never CHECKED — its pin, if
+    any, still outranks the user's choice — so every later run retries
+    exactly those files, and only those, until one is read. Every other
+    target stays done for good. The residual risk is the one
+    :func:`migrate_default_pin` states, bounded the same way: a first-party
+    pin in a file VCO could not read until now is removed once, with a backup.
     """
     ledger_path = Path(ledger) if ledger is not None else pin_migration_ledger_path()
     result: dict[str, Any] = {
@@ -2489,14 +2522,17 @@ def migrate_default_pins(
         "kept": [],
         "message": "",
     }
+    prior_rows: list[dict] = []
     if ledger_path.is_file():
-        result["message"] = (
-            f"The Default-pin migration already ran (see {ledger_path}); a "
-            f"{MODEL_KEY} set since then is yours and is left alone."
-        )
-        return result
-
-    if targets is None:
+        prior_rows = _pin_ledger_rows(ledger_path)
+        paths = [row["path"] for row in prior_rows if row.get("status") == "refused"]
+        if not paths:
+            result["message"] = (
+                f"The Default-pin migration already ran (see {ledger_path}); a "
+                f"{MODEL_KEY} set since then is yours and is left alone."
+            )
+            return result
+    elif targets is None:
         paths = [t.path for t in detect_targets(env=env)]
     else:
         paths = [str(t) for t in targets]
@@ -2509,18 +2545,21 @@ def migrate_default_pins(
         elif one["status"] == "kept":
             result["kept"].append({"path": one["path"], "value": one["value"]})
 
+    fresh = {
+        one["path"]: {
+            "path": one["path"],
+            "status": one["status"],
+            "value": one["value"],
+            "backup_path": one["backup_path"],
+        }
+        for one in result["targets"]
+    }
+    # A retry updates ITS rows in place; every other row is kept as recorded.
+    rows = [fresh.pop(row["path"], row) for row in prior_rows] + list(fresh.values())
     doc = {
         "schema_version": _PIN_MIGRATION_SCHEMA_VERSION,
         "migrated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-        "targets": [
-            {
-                "path": one["path"],
-                "status": one["status"],
-                "value": one["value"],
-                "backup_path": one["backup_path"],
-            }
-            for one in result["targets"]
-        ],
+        "targets": rows,
     }
     try:
         _write_owner_only_json(
@@ -2854,7 +2893,7 @@ def panel_mode(
       a missing file counts, it IS stock).
     * ``unmanaged`` — a base URL that is not ours. The switch never touches
       this state; the user set it, and only the user unsets it.
-    * ``unparseable`` — JSONC or otherwise unreadable; nothing is guessed.
+    * ``unparseable`` — not valid JSON or JSONC, or unreadable; nothing is guessed.
 
     Three fields beyond the mode, each one a thing the GUI decided WRONGLY
     before it existed (2026-09-08 incident report):

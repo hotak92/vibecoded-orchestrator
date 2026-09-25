@@ -42,6 +42,10 @@ PS1_ONLY_LIB: frozenset[str] = frozenset({
     # for both `podman-compose` and `podman compose`, while PowerShell needs an
     # explicit splat whose naive form mis-handles the one-token shape.
     "compose-invocation.ps1",
+    # v0.2.97 R7a F10: the session-start container lock as a PowerShell
+    # FileStream; the bash hooks take the same lock by re-running under
+    # `python -m vco_lib.service_lifecycle with-session-lock`.
+    "session-lock.ps1",
 })
 
 

@@ -15,6 +15,10 @@ The contract is intentionally narrow:
   - ``unregister_artifact_version(...)`` → delete a row (used by V52-O.2's
     pre-drop step; FK cascade handles project deletion automatically).
   - ``list_artifacts_for_project(...)`` → diagnostic / GUI surface.
+  - ``record_bundle_materialization(...)`` → the bundle's own write, read from
+    the manifest it just wrote (CLI verb ``record-bundle-materialization``,
+    spawned by the launcher's post-bundle pipeline; called in-process by
+    install.py for the root).
 
 Callers DO NOT compute the canonical version themselves — they read it from
 ``vco_lib.schema_versions.canonical_version(artifact_type)``. The registry
@@ -30,8 +34,12 @@ See ``v0.2.52`` backlog ``§ V52-AG`` for the full 4-layer design.
 
 from __future__ import annotations
 
+import argparse
+import json
 import logging
 import sqlite3
+import sys
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import Enum
@@ -305,9 +313,12 @@ def stale_artifacts_for_project(
 ) -> list[tuple[ArtifactVersionRow, ArtifactVersionStatus]]:
     """Find every registered artifact whose stored version != canonical.
 
-    Returns ``(row, status)`` pairs for artifacts needing action. Used by
-    V52-AF's apply_post_bundle_steps to decide what to recreate/upgrade
-    on a per-project update.
+    Returns ``(row, status)`` pairs for artifacts needing action — a
+    diagnostic view. The recreate/upgrade DECISION on a per-project update
+    was planned here (V52-AF) and is made by
+    ``schema_migration_runner.run_schema_migrations`` instead (v0.2.60),
+    which the post-bundle pipeline runs through ``project_init
+    migrate-schema`` and which also sees ``NEVER_MATERIALIZED``.
 
     ``NEVER_MATERIALIZED`` artifacts don't appear here (they have no row).
     Callers needing that signal should iterate ``sv.all_artifact_types()``
@@ -325,9 +336,9 @@ def stale_artifacts_for_project(
             )
         except KeyError:
             # artifact_type no longer registered in schema_versions.py.
-            # Surface as "unknown — caller decides". Skipping here so the
-            # main consumers (V52-AF + V52-O.2) don't crash on the legacy
-            # type; they can list_artifacts_for_project for visibility.
+            # Surface as "unknown — caller decides". Skipping here so a
+            # caller does not crash on the legacy type; it can
+            # list_artifacts_for_project for visibility.
             logger.debug(
                 "stale_artifacts_for_project: unknown artifact_type "
                 "%r in registry; skipping",
@@ -337,3 +348,119 @@ def stale_artifacts_for_project(
         if status != ArtifactVersionStatus.UP_TO_DATE:
             stale.append((row, status))
     return stale
+
+
+# ---------------------------------------------------------------------------
+# bundle_materialization — the bundle's own registry write (V52-AG layer 3)
+# ---------------------------------------------------------------------------
+
+#: The row name of every artifact that is not a named Weaviate class.
+#: ``schema_migration_runner._resolve_artifact_names`` resolves THIS constant,
+#: so the row written here is the row the runner reads.
+DEFAULT_ARTIFACT_NAME = "default"
+
+BUNDLE_MATERIALIZATION = "bundle_materialization"
+
+
+def _not_recorded(code: str, error: str, **extra: object) -> dict:
+    return {"ok": False, "code": code, "error": error, **extra}
+
+
+def record_bundle_materialization(
+    db_path: Path,
+    *,
+    project_id: str,
+    folder: Path,
+    now_ms: Optional[int] = None,
+) -> dict:
+    """Record the bundle schema version ``folder`` now holds.
+
+    Evidence, not intent: the version is the ``schema_version`` the bundle
+    engine wrote into ``<folder>/.claude/.vco-manifest.json`` when it finished,
+    recorded only when it equals the canonical ``bundle_materialization``
+    version. Both callers run this straight after a bundle install/update and
+    BEFORE the schema-migration runner, so the runner (the registry's reader)
+    sees ``UP_TO_DATE`` for a bundle that was just re-materialized, and a row
+    still behind canonical means the bundle did not reach the current version
+    — the drift the registry exists to show.
+
+    Never raises. ``{"ok": True, "action": "registered", ...}`` on a write;
+    otherwise ``{"ok": False, "code": ..., "error": <sentence>}`` and the
+    registry is untouched. A missing launcher.db is reported, never created
+    (``sqlite3.connect`` would create an empty file).
+    """
+    from vco_lib.manifest_paths import manifest_path
+
+    canonical = sv.canonical_version(BUNDLE_MATERIALIZATION)
+    manifest = manifest_path(folder)
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return _not_recorded("no_manifest", f"{manifest} does not exist: no bundle "
+                             "was materialized in this folder")
+    except (OSError, ValueError) as exc:
+        return _not_recorded("manifest_unreadable", f"{manifest} could not be read "
+                             f"({type(exc).__name__}: {exc})")
+    applied = data.get("schema_version") if isinstance(data, dict) else None
+    if not isinstance(applied, int) or isinstance(applied, bool):
+        return _not_recorded("manifest_unreadable",
+                             f"{manifest} carries no integer `schema_version`")
+    if applied != canonical:
+        return _not_recorded(
+            "manifest_version_mismatch",
+            f"{manifest} records bundle schema v{applied}, but this orchestrator "
+            f"materializes v{canonical}: the bundle update did not rewrite it",
+            schema_version=applied, canonical=canonical)
+    if not Path(db_path).is_file():
+        return _not_recorded("no_launcher_db", f"{db_path} does not exist")
+    ok = register_artifact_version(
+        Path(db_path),
+        project_id=project_id,
+        artifact_type=BUNDLE_MATERIALIZATION,
+        artifact_name=DEFAULT_ARTIFACT_NAME,
+        schema_version=canonical,
+        materialized_at=int(now_ms if now_ms is not None else time.time() * 1000),
+    )
+    if not ok:
+        return _not_recorded(
+            "registry_write_failed",
+            f"the artifact_schema_versions write to {db_path} failed (locked, "
+            f"read-only, no such table, or project {project_id!r} not registered)",
+            schema_version=applied, canonical=canonical)
+    return {"ok": True, "action": "registered", "project_id": project_id,
+            "artifact_type": BUNDLE_MATERIALIZATION, "schema_version": applied}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="python -m vco_lib.artifact_version_registry",
+        description="artifact_schema_versions registry writes. Machine "
+        "interface: one JSON object on stdout; exit 0 only when recorded.",
+    )
+    sub = parser.add_subparsers(dest="op", required=True)
+    rec = sub.add_parser(
+        "record-bundle-materialization",
+        help="Record the bundle schema version a project folder now holds.",
+    )
+    rec.add_argument("--folder", required=True)
+    rec.add_argument("--project-id", required=True)
+    rec.add_argument("--db", help="launcher.db (default: the resolved one)")
+    return parser
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    args = _build_parser().parse_args(argv)
+    if args.db:
+        db_path = Path(args.db)
+    else:
+        from vco_lib.paths import launcher_db_path
+
+        db_path = launcher_db_path()
+    result = record_bundle_materialization(
+        db_path, project_id=args.project_id, folder=Path(args.folder))
+    print(json.dumps(result))
+    return 0 if result.get("ok") else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

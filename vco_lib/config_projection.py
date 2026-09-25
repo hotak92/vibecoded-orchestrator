@@ -14,21 +14,21 @@ Why this exists
 Pre-Phase-0, env values reached on-disk surfaces via FOUR independent
 paths:
 
-  * Rust ``write_project_env_files`` (the dominant writer; called during
-    project create/rename/refresh).
+  * The Rust env writer (the dominant writer until Phase 0.B Part 2;
+    retired in v0.2.97 — this module is now the only one).
   * Rust ``ensure_project_env_template`` (the ``.env`` template — sibling
     surface, NOT in scope for this contract; see Out of scope below).
   * Python ``install.py`` backfill helpers (removed v0.2.92 — superseded by the config-projection single writer) (``_backfill_kg_collection_env_in_project``
     and friends) that scribble missing canonical keys when ``install-bundle
     --update`` runs against an older project.
-  * Per-grant-change Tauri commands that called ``write_project_env_files``
+  * Per-grant-change Tauri commands that called the Rust env writer
     directly (e.g. ``kg_set_collection_access_mode``).
 
 Each path had its own opinion about what to write and how to merge. Bug-4
 of the install-flow architectural overhaul (PR-145, 2026-05-06) was
 specifically a wholesale-replace of the ``env`` sub-block in
 ``.claude/settings.json`` that silently dropped user-added keys. The
-fix was a deep-merge in ``write_project_env_files``, but other writers
+fix was a deep-merge in the Rust env writer, but other writers
 remained free to regress the same bug by accident — a CI lint had to be
 added retroactively.
 
@@ -102,35 +102,29 @@ For Rust callers that want the write surface in Python::
 
     python -m vco_lib.config_projection apply --project-id <uuid>
     python -m vco_lib.config_projection list-keys --json
-    python -m vco_lib.config_projection from-db --project-id <uuid> --json
+    python -m vco_lib.config_projection from-db --project-id <uuid>   # always JSON
 
 Out of scope
 ~~~~~~~~~~~~
 
-* The ``<project_root>/.env`` template file managed by
-  ``ensure_project_env_template`` (Rust) and
-  ``_ensure_env_template`` (Python). That file uses different rules
-  (append-only, ``# added by vco`` markers, commented placeholders)
-  and a different audience (CLI users who edit it by hand). It will
-  be migrated through a parallel ``apply_project_env_template``
-  contract in a future Phase 0.D when the cross-language ``.env``
-  template-key parity test (``env_template_canonical_keys_match_python``)
-  is also tightened.
+* The ``<project_root>/.env`` file. It has different rules (a
+  VCO-managed block inside a human-edited file, commented placeholders)
+  and a different audience (CLI users who edit it by hand), so it has
+  its own contract: :mod:`vco_lib.env_template` (Phase 0.D) — since
+  v0.2.97 that file's only writer, reached from the launcher through
+  ``python -m vco_lib.env_template apply`` and from ``install.py``
+  through :mod:`vco_lib.install_env`.
 * Adding new canonical env keys. This module ROUTES existing keys
   through one contract; widening the canonical key set is a separate
   governance step that must update both the Rust ``CANONICAL_INSTALL_ENV_KEYS``
   const and :func:`list_canonical_keys` here.
-* User-bucket secret VALUES (keychain-resident). The OS keychain is
-  Rust-owned; there is no Python keychain bridge yet. Phase 0.E
-  (2026-05-25) adds :func:`apply_user_secrets` which ROUTES the
-  byte layout through this module while accepting pre-resolved
-  (KEY, VALUE) pairs from the Rust caller (which queries the
-  keychain). The DB-side resolver
-  :func:`user_secret_known_keys_from_db` reads the strip set
-  (every KEY ever observed across the three buckets — per_project,
-  shared, global) so paused / deleted secrets actually leave the
-  surfaces. See the "User-secret writes (Phase 0.E)" section
-  below for the contract shape.
+* User-bucket secret VALUES (keychain-resident). VCO never writes one
+  into a project. The DB-side resolver
+  :func:`user_secret_known_keys_from_db` lists every KEY ever observed
+  across the three buckets (per_project, shared, global); every
+  :func:`apply_project_env` removes an in-tree value of one of them
+  ONLY when it equals the launcher's stored value (value evidence —
+  see "User-secret values in the tree" below).
 
 Cross-OS rules (non-negotiable)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -176,42 +170,32 @@ Byte-identical output guarantee
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 Running ``apply_project_env`` against a freshly-created project must
-produce output BYTE-IDENTICAL to what the Rust
-``write_project_env_files`` produces for the same input. This is the
+produce output BYTE-IDENTICAL to what the (since-retired, v0.2.97) Rust
+env writer produced for the same input. This is the
 regression-proof acceptance criterion of Phase 0.B and is tested by
 ``tests/test_config_projection_byte_identical.py`` (parity guard).
 Divergences caught by the parity test must be fixed by changing the
 Python side (Rust is the source of truth for byte layout until the
 follow-up PR that flips production callers).
 
-User-secret writes — STRIP-ONLY (Phase 0.E emit arm retired v0.2.75 P3)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+User-secret values in the tree
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-Phase 0.E (2026-05-25) shipped an emit-capable
-``apply-user-secrets --pairs-json`` verb that could write user-secret
-``(KEY, VALUE)`` pairs into the env surfaces. v0.2.73 abolished
-value-emission everywhere (the Rust writer projects an ALWAYS-EMPTY
-emit set — ``projects_v2.rs`` keeps ``user_secret_pairs`` empty and
-strips ALL known keys), leaving the Python emit arm dormant with zero
-live callers. v0.2.75 P3 DELETED it: the sole surviving contract is
+Phase 0.E (2026-05-25) shipped an ``apply-user-secrets`` verb that could
+write user-secret ``(KEY, VALUE)`` pairs into the env surfaces; v0.2.73
+abolished value-emission everywhere and v0.2.75 P3 cut the verb down to a
+strip of every launcher-known key NAME. v0.2.97 retired that verb too — it
+had no caller, and removing a value by NAME destroys a key the user typed.
+It is SUPERSEDED by the evidence-gated scrub inside every
+:func:`apply_project_env` (and the launcher's unregister, via
+``strip-proven-secret-values``): a value is removed only when it equals the
+launcher's stored value. The surviving contract is
 
-  **VCO never writes secret values into the project tree.**
+  **VCO never writes secret values into the project tree** — pinned by
+  ``tests/test_config_projection_byte_identical.py``, the grep-gate in
+  ``tests/test_config_projection_user_secrets.py`` and the Rust
+  ``secrets_cmd`` refresh tests.
 
-What remains:
-
-  * :func:`apply_user_secrets` is STRIP-ONLY. It removes every key in
-    ``user_secret_known_keys`` (computed from the launcher DB via
-    :func:`user_secret_known_keys_from_db` — every KEY ever observed in
-    ``secret_active_state`` across the three buckets, regardless of
-    active flag) from the JSON env sub-blocks, and rebuilds the
-    ``.claude/env`` managed block WITHOUT a user-secret section.
-  * A non-empty ``user_secret_pairs`` in the bundle is a HARD
-    ``ConfigProjectionError`` — the loud runtime backstop against any
-    future caller resurrecting the retired emit contract. The tree-wide
-    never-writes-values invariant tests
-    (``projects_v2.rs::no_secret_value_anywhere_under_project_tree_after_projection``
-    and ``tests/test_config_projection_byte_identical.py``) plus the
-    grep-gate in ``tests/test_config_projection_user_secrets.py`` pin it.
   * Secret VALUES stay Rust/keychain-owned and are resolved at need
     through the hub / file-store / project-.env chain
     (``docs/VCT_SECRETS_PRIMITIVE.md``) — never projected into any file
@@ -222,13 +206,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, NotRequired, Optional, TypedDict
+from typing import Any, Callable, Iterable, Mapping, NotRequired, Optional, TypedDict
 
-from vco_lib.atomic import atomic_write_text
+from vco_lib import jsonc_edit, settings_refusal
+from vco_lib import service_endpoints as _service_endpoints
+from vco_lib.atomic import atomic_rewrite_text
 # v0.2.92 W18 — the tri-state probe result. Imported from `weaviate_helpers`
 # because that module is `vco_lib`'s dependency-free leaf (stdlib only), which
 # is what makes it a safe home for a type every other module needs; the type
@@ -279,8 +266,8 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     # The Rust ``CANONICAL_INSTALL_ENV_KEYS`` constant
     # (launcher/src-tauri/src/commands/projects_v2.rs L3087) does NOT
     # yet include this key — adding it there is a separate Rust-side PR.
-    # Until that lands, the Rust ``write_project_env_files`` path will
-    # NOT emit DIAGRAMS_COLLECTION (only this Python contract does).
+    # The Rust env writer never emitted DIAGRAMS_COLLECTION (it was
+    # retired in v0.2.97; only this Python contract writes the key).
     # That's deliberate: the Python ``vco_lib.config_projection apply``
     # CLI is the canonical writer per the Option-A interop strategy
     # documented at the top of this module; production callers that
@@ -368,6 +355,13 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "OLLAMA_PORT",
     "CODE_EMBED_URL",
     "CODE_EMBED_PORT",
+    # v0.2.97: the code-embed URL under the name its clients actually read.
+    # (``CODE_EMBED_URL`` above is the alias the ONE client resolver —
+    # ``vco_lib.code_embed_image.service_base_url`` — accepts after
+    # ``CODE_EMBED_SERVICE_URL``, lane Y.) Python-only, like the
+    # DIAGRAMS_COLLECTION / DUAL_* keys: the Rust CANONICAL_INSTALL_ENV_KEYS
+    # does not list it, and the subset parity test allows that direction.
+    "CODE_EMBED_SERVICE_URL",
     "VCT_ORCHESTRATOR_ROOT",
     "VCT_INFRASTRUCTURE_DIR",
     # v0.2.37 (Gap 6a): legacy alias for VCT_ORCHESTRATOR_ROOT consumed
@@ -405,8 +399,8 @@ _CANONICAL_KEYS: tuple[str, ...] = (
     "VCT_DIAGRAMS_ACCESS_LIST",
     "GITHUB_TOKEN",
     # A-8 (v0.2.73): KG_BASE_DIR — the project's folder path. Previously
-    # Rust-only (emitted "always" by the legacy ``write_project_env_files``
-    # SecretsPanel path) but ABSENT from this Python canonical set. Because
+    # Rust-only (emitted "always" by the legacy Rust env writer's
+    # SecretsPanel path, retired v0.2.97) but ABSENT from this Python canonical set. Because
     # the Python ``apply`` rebuilds the managed block from scratch and drops
     # keys not in this set, KG_BASE_DIR would appear after a secrets toggle
     # and VANISH on the next Python apply (create/rename/refresh) — a
@@ -436,9 +430,10 @@ def list_canonical_keys() -> set[str]:
 
 # ─── Bracket markers for the .claude/env surface ────────────────────────
 #
-# Must remain byte-identical to the Rust ``CLAUDE_ENV_MANAGED_BEGIN`` /
-# ``CLAUDE_ENV_MANAGED_END`` constants in projects_v2.rs. The in-place
-# replace on the next call depends on substring match.
+# The ONE definition (v0.2.97 review R6 retired the Rust copies with the
+# Rust splice): the writer below and the unregister's strip
+# (:mod:`vco_lib.unregister_env`) both use these. The in-place replace on the
+# next call depends on substring match.
 
 CLAUDE_ENV_MANAGED_BEGIN: str = "# vco-managed-begin"
 CLAUDE_ENV_MANAGED_END: str = "# vco-managed-end"
@@ -473,47 +468,21 @@ class ProjectEnvBundle(TypedDict):
     JSON surfaces, and their absence is not a signal to strip anything (the
     shell block is rebuilt wholesale, so a removed key simply stops being
     emitted). Absent or empty ⇒ nothing extra is written.
+
+    ``user_secret_known_keys`` (v0.2.97, optional) — every KEY the launcher
+    knows as a user secret for this project (per-project + shared + global
+    buckets, :func:`_fetch_user_secret_known_keys`). Pre-v0.2.73 launchers
+    wrote the VALUES of exactly these keys into the JSON env blocks; every
+    :func:`apply_project_env` removes them again (the secrets stay in the
+    keychain), which is what makes the ``user_secret_values_retained_in_tree``
+    deferral's "the next refresh removes them" true.
     """
 
     canonical_env: dict[str, str]
     project_id: str
     project_root: Path
     shell_defaulted_env: NotRequired[dict[str, str]]
-
-
-class UserSecretBundle(TypedDict):
-    """Phase 0.E (2026-05-25) — input bundle for :func:`apply_user_secrets`.
-
-    The Rust caller resolves the keychain VALUES (via the existing
-    ``commands::project_env_settings::resolve_user_secret_state``)
-    and produces this bundle for the Python writer to consume.
-
-    ``user_secret_pairs`` MUST be empty (v0.2.75 P3). The field is
-    retained for wire-shape stability with the Rust
-    ``resolve_user_secret_state`` bucket (which has projected an
-    always-empty emit set since v0.2.73), but the value-emitting arm
-    of :func:`apply_user_secrets` was deleted — a non-empty list is a
-    hard ``ConfigProjectionError``. VCO never writes secret values
-    into the project tree.
-
-    ``user_secret_known_keys`` is the STRIP set — every KEY that has
-    ever had an active-flag row across the three buckets, regardless
-    of current active flag. The writer REMOVES every key in this list
-    from the JSON env blocks (signal-to-remove semantics; the
-    ``.claude/env`` BEGIN/END replace handles strip implicitly via
-    wholesale block rebuild without a user-secret section).
-
-    ``project_id`` and ``project_root`` are carried alongside so
-    callers don't have to re-query the DB to know where to write.
-
-    See also the module-level "User-secret writes — STRIP-ONLY" doc
-    section.
-    """
-
-    user_secret_pairs: list[tuple[str, str]]
-    user_secret_known_keys: list[str]
-    project_id: str
-    project_root: Path
+    user_secret_known_keys: NotRequired[list[str]]
 
 
 # Sentinel project_id values used in the secret_active_state schema.
@@ -1637,10 +1606,10 @@ def user_secret_known_keys_from_db(
 
     Reads the union of user-bucket secret KEYS observed in
     ``secret_active_state`` across the three buckets (per-project,
-    shared, global) for the given project. Used by
-    :func:`apply_user_secrets` to drive the STRIP pass, and also
-    available to Rust subprocess callers that want to inspect the
-    set without applying.
+    shared, global) for the given project — the names whose in-tree values
+    every :func:`apply_project_env` checks for value evidence
+    (:func:`classify_json_env_secrets`), also printed by the
+    ``user-secret-known-keys`` verb.
 
     Args:
         project_id: The project's UUID.
@@ -1809,6 +1778,25 @@ class DbUnreachable(ConfigProjectionError):
     """Could not open the launcher DB (missing, perms, corrupt)."""
 
 
+class SettingsWriteRefused(ConfigProjectionError):
+    """A settings file exists but could not be edited safely, so it was left
+    byte-identical (v0.2.97, :mod:`vco_lib.settings_refusal`).
+
+    ``refusals`` names each file and why. Raised after every OTHER requested
+    surface was written, so one broken file never blocks the rest.
+    """
+
+    def __init__(self, refusals: Iterable["settings_refusal.Refusal"]) -> None:
+        self.refusals = list(refusals)
+        super().__init__(
+            "; ".join(r.sentence() for r in self.refusals)
+            + ". VCO never overwrites a settings file it cannot safely edit — "
+            "everything else in it would be lost. Repair the file (or move it "
+            "aside so a fresh one is created) and re-run; the project's "
+            "UPDATE_DEFERRED.md has the details."
+        )
+
+
 # ─── orchestrator-root fallback ─────────────────────────────────────────
 
 
@@ -1865,9 +1853,9 @@ def project_env_from_db(
     ollama_url_override: str | None = None,
     active_embedding_override: str | None = None,
     shared_kg_default: str | None = None,
-    weaviate_port_default: int = 8081,
-    ollama_port_default: int = 11435,
-    code_embed_port_default: int = 11440,
+    weaviate_port_default: int | None = None,
+    ollama_port_default: int | None = None,
+    code_embed_port_default: int | None = None,
     orchestrator_root: Path | None = None,
 ) -> ProjectEnvBundle:
     """Resolve the complete canonical env bundle for a project.
@@ -1888,21 +1876,25 @@ def project_env_from_db(
     treat omission as the signal to remove the key from existing
     surfaces (see :func:`apply_project_env`).
 
-    PURE FUNCTION: same DB state in → same dict out. No filesystem writes,
-    no caching, no environment-variable reads (overrides come in via
-    explicit keyword arguments so test fixtures can pin them).
+    PURE FUNCTION over its inputs: same DB state in → same dict out. No
+    filesystem writes, no caching, no environment read: the service
+    endpoints come from the same DB's ``service_endpoints`` rows (row →
+    compiled default — see :mod:`vco_lib.service_endpoints`); neither the
+    projected transport (``WEAVIATE_URL`` …) nor the retired statements
+    (``VCT_WEAVIATE_URL``, ``vct-config.toml``) are read. Test fixtures pin
+    values through the keyword arguments.
 
     Args:
         project_id: The project's UUID (the ``projects.id`` column).
         db_path: Optional override of the launcher DB location. Defaults
             to :func:`_resolve_launcher_db_path`. Tests should pass an
             explicit path to avoid touching the real ``~/.vct/launcher.db``.
-        weaviate_url_override: Pin the WEAVIATE_URL value (otherwise
-            derived from ``http://localhost:<weaviate_port_default>``).
-            The Rust resolver pulls this from ``LocalConfig`` /
-            ``services.toml``; this Python contract takes the resolved
-            value as an explicit arg so the caller can plumb their own
-            services-config reader if needed.
+        weaviate_url_override: Pin the WEAVIATE_URL value. Unpinned, it is
+            this machine's Weaviate as
+            :func:`vco_lib.service_endpoints.machine_weaviate_url` resolves
+            it — the ``service_endpoints`` row, else ``localhost:8081`` — the
+            same answer the hub's ``/config`` serves. The launcher pins it
+            with its own Rust resolution of the same row.
         ollama_url_override: Same shape, for OLLAMA_URL.
         active_embedding_override: Pin ACTIVE_EMBEDDING; otherwise read
             from ``module_settings`` (orchestrator-core /
@@ -1931,12 +1923,14 @@ def project_env_from_db(
 
             Explicit string overrides (CLI tests, white-label installs)
             still win and skip the DB-read.
-        weaviate_port_default: Port to use when constructing
-            ``WEAVIATE_URL`` (and as ``WEAVIATE_PORT``). Default 8081.
-        ollama_port_default: Port for OLLAMA_URL / OLLAMA_PORT. Default
-            11435.
-        code_embed_port_default: Port for CODE_EMBED_URL / CODE_EMBED_PORT.
-            Default 11440.
+        weaviate_port_default: Replaces the compiled default port when
+            this machine has NO ``weaviate`` row (``None`` = 8081); a row
+            always wins. ``WEAVIATE_PORT`` is the row's port (or this value
+            when the URL is pinned).
+        ollama_port_default: Same, for OLLAMA_URL / OLLAMA_PORT
+            (``None`` = 11435).
+        code_embed_port_default: Same, for CODE_EMBED_URL /
+            CODE_EMBED_SERVICE_URL / CODE_EMBED_PORT (``None`` = 11440).
         orchestrator_root: The orchestrator clone to emit
             ``VCT_ORCHESTRATOR_ROOT`` / ``VCT_INFRASTRUCTURE_DIR`` /
             ``VCT_INSTALL_ROOT`` for. When ``None`` (default, and what the
@@ -2189,23 +2183,57 @@ def project_env_from_db(
                 code_graph_project = canonical_class_prefix(proj.name)
             except ValueError:
                 code_graph_project = sanitized
+        # v0.2.97: the keys whose pre-v0.2.73 in-tree VALUES every apply
+        # removes (see ProjectEnvBundle.user_secret_known_keys).
+        user_secret_known_keys = _fetch_user_secret_known_keys(conn, project_id)
+        # v0.2.97: this machine's `service_endpoints` rows, read while the
+        # connection is open — the SAME launcher.db the rest of the bundle
+        # comes from. Rendered below through the ONE rule
+        # (vco_lib/service_endpoints.py, mirrored by the hub): row → compiled
+        # default, no other leg.
+        endpoint_rows = _service_endpoints.read_rows(conn)
     finally:
         try:
             conn.close()
         except sqlite3.Error:
             pass
 
-    # Compose URLs from ports (matches Rust's
-    # `format!("http://localhost:{}", weaviate_port)`).
-    weaviate_url = (
-        weaviate_url_override
-        or f"http://localhost:{weaviate_port_default}"
+    # Service endpoints. A caller-pinned value wins; otherwise the machine's
+    # row — the answer `service_endpoints.rs` gives the hub's `/config` and
+    # the launcher's `populate`, so the three agree. A `*_port_default`
+    # replaces the compiled default for an ABSENT row only (the launcher
+    # passes the ports it resolved from the same rows, so the two cannot
+    # differ).
+    _service_endpoints.warn_absent(endpoint_rows)
+    weaviate_row = endpoint_rows.get("weaviate")
+    ollama_row = endpoint_rows.get("ollama")
+    code_embed_row = endpoint_rows.get("code_embed")
+    if weaviate_url_override:
+        weaviate_url = weaviate_url_override
+        weaviate_port = (
+            weaviate_port_default
+            if weaviate_port_default is not None
+            else _service_endpoints.weaviate_port_for_url(weaviate_url)
+        )
+    else:
+        weaviate_url = _service_endpoints.render_url(
+            "weaviate", weaviate_row, default_port=weaviate_port_default,
+        )
+        weaviate_port = _service_endpoints.render_port(
+            "weaviate", weaviate_row, default_port=weaviate_port_default,
+        )
+    ollama_port = _service_endpoints.render_port(
+        "ollama", ollama_row, default_port=ollama_port_default,
     )
-    ollama_url = (
-        ollama_url_override
-        or f"http://localhost:{ollama_port_default}"
+    code_embed_port = _service_endpoints.render_port(
+        "code_embed", code_embed_row, default_port=code_embed_port_default,
     )
-    code_embed_url = f"http://localhost:{code_embed_port_default}"
+    ollama_url = ollama_url_override or _service_endpoints.render_url(
+        "ollama", ollama_row, default_port=ollama_port_default,
+    )
+    code_embed_url = _service_endpoints.render_url(
+        "code_embed", code_embed_row, default_port=code_embed_port_default,
+    )
 
     # Build the canonical env map. Keys with None/empty value are OMITTED.
     # We use a plain dict because Python's dict is insertion-ordered
@@ -2300,11 +2328,16 @@ def project_env_from_db(
     # of this function, reaching `.claude/env` only, in the defaulted form.
     # See SHELL_DEFAULTED_ENV_KEYS.)
     _set("WEAVIATE_URL", weaviate_url)
-    _set("WEAVIATE_PORT", str(weaviate_port_default))
+    _set("WEAVIATE_PORT", str(weaviate_port))
     _set("OLLAMA_URL", ollama_url)
-    _set("OLLAMA_PORT", str(ollama_port_default))
+    _set("OLLAMA_PORT", str(ollama_port))
     _set("CODE_EMBED_URL", code_embed_url)
-    _set("CODE_EMBED_PORT", str(code_embed_port_default))
+    _set("CODE_EMBED_PORT", str(code_embed_port))
+    # v0.2.97: the name every code-embed CLIENT reads
+    # (weaviate_mcp/embeddings.py, query_code_graph.py, vco_lib.code_embed_image)
+    # — before, only `~/.claude.json`'s weaviate-kg entry carried it, so the
+    # projected CODE_EMBED_URL reached no consumer. Same value, by construction.
+    _set("CODE_EMBED_SERVICE_URL", code_embed_url)
 
     # NOTE (WP-Q item 3 / G6): RL_SERVER_PORT / RL_SERVER_URL are DELIBERATELY
     # NOT projected here. Per the H.1 design contract (see
@@ -2369,14 +2402,12 @@ def project_env_from_db(
         # VCT_CODE_GRAPH_ACCESS_LIST (signal-to-remove on apply).
         _set("VCT_DIAGRAMS_ACCESS_LIST", ",".join(diagram_access))
 
-    # GITHUB_TOKEN intentionally NOT resolved here. The Rust resolver
-    # pulls it from the OS keychain with active-flag gating; replicating
-    # that lifecycle from Python would require a keychain bridge that
-    # doesn't exist yet. Production callers that need GITHUB_TOKEN
-    # should pass it as a future explicit kwarg; today the keychain
-    # path stays Rust-owned and config_projection emits no value for
-    # this key (matching the "keychain empty / paused" omit behaviour
-    # the Rust resolver already documents).
+    # GITHUB_TOKEN is never resolved here, by design: since v0.2.73 VCO
+    # writes no secret value into a project (consumers resolve the PAT at
+    # need through the hub — the "Secrets" section of
+    # templates/ORCHESTRATOR-CLAUDE.md.template). It stays in the
+    # canonical set so every apply REMOVES a GITHUB_TOKEN a pre-v0.2.73
+    # writer left in `.claude/settings.json` env (signal-to-remove).
 
     # v0.2.91 WP-L (decision #21): the diagnostic log level rides the
     # shell-defaulted channel, NOT `canonical_env` — see
@@ -2392,6 +2423,7 @@ def project_env_from_db(
         "project_id": project_id,
         "project_root": Path(proj.folder_path),
         "shell_defaulted_env": shell_defaulted,
+        "user_secret_known_keys": user_secret_known_keys,
     }
 
 
@@ -2554,6 +2586,11 @@ _ALL_SURFACES: tuple[str, ...] = (
     _SURFACE_CLAUDE_ENV,
     _SURFACE_VSCODE_SETTINGS,
 )
+#: The JSON surfaces: ``surface -> (path relative to the project, env key)``.
+_JSON_SURFACE_FILES: dict[str, tuple[str, str]] = {
+    _SURFACE_CLAUDE_SETTINGS: (".claude/settings.json", "env"),
+    _SURFACE_VSCODE_SETTINGS: (".vscode/settings.json", "claude-code.env"),
+}
 
 
 # v0.2.84 D2 (P2) — env-repoint audit.
@@ -2580,17 +2617,14 @@ def _read_surface_canonical_value(
 
     Returns the string value under ``root[env_key][key]`` when present and
     a string; ``None`` when the file is missing / malformed / the key is
-    absent. Soft-fail throughout (audit reads never break a write).
+    absent. Soft-fail throughout (audit reads never break a write) — which
+    v0.2.97 made true: a non-UTF-8 file used to raise here, BEFORE any
+    surface was written. JSONC is read too (the same reader the writer uses).
     """
-    if not path.exists():
+    loaded = jsonc_edit.load_object(path) if path.exists() else None
+    if loaded is None:
         return None
-    try:
-        parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(parsed, dict):
-        return None
-    block = parsed.get(env_key)
+    block = loaded[0].get(env_key)
     if not isinstance(block, dict):
         return None
     val = block.get(key)
@@ -2604,28 +2638,23 @@ def _read_managed_env_canonical_value(path: Path, key: str) -> Optional[str]:
     Returns the unescaped string value when a matching export line exists
     inside the BEGIN/END managed block; ``None`` otherwise. Soft-fail:
     missing file / no marker / no matching line → ``None``.
+
+    The parse is the ONE managed-block reader,
+    :func:`vco_lib.envfile.env_value` with the block markers (v0.2.97 — this
+    was a second parser that disagreed with it on ``\\"``); this function
+    only binds the file and the markers.
     """
+    from vco_lib.envfile import env_value
+
     if not path.exists():
         return None
     try:
         text = path.read_text(encoding="utf-8")
-    except OSError:
+    except (OSError, ValueError):  # ValueError: a non-UTF-8 file (v0.2.97)
         return None
-    begin_idx = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-    if begin_idx == -1:
-        return None
-    end_off = text[begin_idx:].find(CLAUDE_ENV_MANAGED_END)
-    if end_off == -1:
-        return None
-    block_text = text[begin_idx: begin_idx + end_off]
-    prefix = f'export {key}="'
-    for line in block_text.splitlines():
-        stripped = line.strip()
-        if stripped.startswith(prefix) and stripped.endswith('"'):
-            raw = stripped[len(prefix): -1]
-            # Reverse the writer's only escape (`"` → `\"`).
-            return raw.replace('\\"', '"')
-    return None
+    return env_value(
+        text, key, begin_marker=CLAUDE_ENV_MANAGED_BEGIN, end_marker=CLAUDE_ENV_MANAGED_END,
+    )
 
 
 def _emit_repoint_audit_rows(
@@ -2677,7 +2706,6 @@ def apply_project_env(
     bundle: ProjectEnvBundle,
     *,
     surfaces: Iterable[str] | None = None,
-    user_secret_bundle: UserSecretBundle | None = None,
 ) -> dict[str, list[str]]:
     """Project ``bundle`` to the requested env surfaces.
 
@@ -2685,7 +2713,7 @@ def apply_project_env(
         bundle: As returned by :func:`project_env_from_db`.
         surfaces: Sequence of surface names. Defaults to
             ``("claude_settings_json", "claude_env")`` — matching the
-            production Rust writer ``write_project_env_files`` after
+            former production Rust writer (retired v0.2.97) after
             PR-27 (v0.2.12, 2026-05-16) removed the historical
             ``.vscode/settings.json`` write. Pass
             ``("claude_settings_json", "claude_env", "vscode_settings_json")``
@@ -2693,14 +2721,6 @@ def apply_project_env(
             useful for the diagrams flow where the VS Code extension's
             claude-code.env block is the only path to the embedded
             editor).
-        user_secret_bundle: Optional user-secret STRIP payload
-            (v0.2.75 P3: strip-only — a non-empty
-            ``user_secret_pairs`` raises ``ConfigProjectionError``;
-            the value-emitting arm was retired). When provided, the
-            strip set is applied to the JSON env blocks in the same
-            atomic-per-surface write pass as the canonical update.
-            Production callers use :func:`apply_user_secrets`
-            instead of threading this argument.
 
     Returns:
         ``{surface_name: [keys_written, ...]}`` — a dict mapping each
@@ -2713,6 +2733,10 @@ def apply_project_env(
             Other surfaces may have been written successfully before
             the failure — the function does NOT roll back across
             surfaces (each surface is independently atomic).
+        SettingsWriteRefused: a JSON surface exists but could not be
+            edited safely (v0.2.97). It is left byte-identical, the
+            refusal is recorded in the project's deferral ledger, and
+            every other requested surface is still written first.
     """
     if surfaces is None:
         surfaces_seq: tuple[str, ...] = _DEFAULT_SURFACES
@@ -2727,7 +2751,11 @@ def apply_project_env(
 
     project_root = bundle["project_root"]
     env = bundle["canonical_env"]
-    canonical_keys = list_canonical_keys()
+    # v0.2.97 review R2 F18: GITHUB_TOKEN is canonical but no bundle ever
+    # carries it, so leaving it in this set made every apply delete it BY
+    # NAME — a token the user typed included. It is removed only on value
+    # evidence, with the user secrets below.
+    canonical_keys = list_canonical_keys() - _LEGACY_SECRET_ENV_KEYS
 
     # v0.2.84 D2 (P2): snapshot the on-disk KG_COLLECTION /
     # DEVELOPMENT_COLLECTION values BEFORE writing so we can emit a repoint
@@ -2755,33 +2783,37 @@ def apply_project_env(
                 env_key="claude-code.env",
             )
 
-    # v0.2.75 P3: the user-secret EMIT arm is retired — the combined
-    # path is STRIP-ONLY too (same contract as apply_user_secrets; the
-    # low-level `_with_user_secrets`-mirroring writer params survive
-    # solely to stay byte-parallel with the Rust helpers, which the
-    # Rust production caller also feeds an always-empty emit set).
+    # v0.2.75 P3: the user-secret EMIT arm is retired; the writer's
+    # `user_secret_pairs` parameter is always fed an empty set.
     us_pairs: list[tuple[str, str]] = []
-    us_strip_keys: list[str] = []
-    if user_secret_bundle is not None:
-        if list(user_secret_bundle.get("user_secret_pairs") or []):
-            raise ConfigProjectionError(
-                "user_secret_pairs is non-empty — the value-emitting arm of "
-                "the combined apply path was retired in v0.2.75 (VCO never "
-                "writes secret values into the project tree). Pass an empty "
-                "emit set."
-            )
-        us_strip_keys = list(user_secret_bundle["user_secret_known_keys"])
+    # v0.2.97 (review R2 F18): every apply removes from the JSON env blocks
+    # the values VCO can PROVE it wrote — the in-file value equals the one the
+    # launcher stores for that key (:func:`classify_json_env_secrets`). A name
+    # match alone proves nothing and removes nothing; such a key is the
+    # user's, reported by ``user_owned_secret_value_in_tree``. The secrets
+    # stay in the keychain; only proven copies in committable files go.
+    known_secret_keys = list(bundle.get("user_secret_known_keys") or [])
+    verdicts = classify_json_env_secrets(project_root, known_keys=known_secret_keys)
+    residue_before = retained_launcher_value_names(project_root, verdicts=verdicts)
+    us_strip_keys: list[str] = residue_before.get(".claude/settings.json", [])
+    vscode_strip_keys: list[str] = residue_before.get(".vscode/settings.json", [])
 
     report: dict[str, list[str]] = {}
+    refusals: list[settings_refusal.Refusal] = []
+    project_id = bundle.get("project_id")
 
     if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
         path = project_root / ".claude" / "settings.json"
-        keys = _write_json_env_block(
-            path, env, canonical_keys, env_key="env",
-            user_secret_pairs=us_pairs,
-            user_secret_strip_keys=us_strip_keys,
+        keys = _write_json_surface(
+            project_root, _SURFACE_CLAUDE_SETTINGS, refusals, project_id,
+            lambda: _write_json_env_block(
+                path, env, canonical_keys, env_key="env",
+                user_secret_pairs=us_pairs,
+                user_secret_strip_keys=us_strip_keys,
+            ),
         )
-        report[_SURFACE_CLAUDE_SETTINGS] = keys
+        if keys is not None:
+            report[_SURFACE_CLAUDE_SETTINGS] = keys
 
     if _SURFACE_CLAUDE_ENV in surfaces_seq:
         path = project_root / ".claude" / "env"
@@ -2796,21 +2828,432 @@ def apply_project_env(
         report[_SURFACE_CLAUDE_ENV] = keys
 
     if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
-        path = project_root / ".vscode" / "settings.json"
-        keys = _write_json_env_block(
-            path, env, canonical_keys, env_key="claude-code.env",
-            user_secret_pairs=us_pairs,
-            user_secret_strip_keys=us_strip_keys,
+        vscode_path = project_root / ".vscode" / "settings.json"
+        keys = _write_json_surface(
+            project_root, _SURFACE_VSCODE_SETTINGS, refusals, project_id,
+            lambda: _write_json_env_block(
+                vscode_path, env, canonical_keys, env_key="claude-code.env",
+                user_secret_pairs=us_pairs,
+                user_secret_strip_keys=vscode_strip_keys,
+            ),
         )
-        report[_SURFACE_VSCODE_SETTINGS] = keys
+        if keys is not None:
+            report[_SURFACE_VSCODE_SETTINGS] = keys
+
+    # v0.2.97: `.vscode/settings.json` is not a default surface, but a
+    # pre-PR-27 (v0.2.12) launcher wrote its `claude-code.env` block too. When
+    # a value VCO can prove it wrote is still there, strip exactly those keys
+    # through the same editor (never creates the file; refuses — and records —
+    # one it cannot edit).
+    if _SURFACE_VSCODE_SETTINGS not in surfaces_seq and vscode_strip_keys:
+        try:
+            strip_env_keys(project_root, _SURFACE_VSCODE_SETTINGS, vscode_strip_keys)
+        except SettingsWriteRefused as exc:
+            refusals.extend(exc.refusals)
 
     # v0.2.84 D2 (P2): emit a `dev_collection_env_repointed` audit row for
     # each audited key whose existing on-disk value the write just changed
     # (old != new, old non-empty). Runs AFTER the surface writes so the
     # audit reflects a completed repoint. Best-effort — never raises.
     _emit_repoint_audit_rows(project_root, old_repoint_values, env)
+    _record_secret_value_scrubs(project_root, residue_before, known_secret_keys)
 
+    if refusals:
+        raise SettingsWriteRefused(refusals)
     return report
+
+
+# ─── Pre-v0.2.73 in-tree user-secret VALUES ─────────────────────────────
+#
+# ``user_secret_values_retained_in_tree`` (a bundle-update deferral owned by
+# ``vco_lib.project_init``) and every :func:`apply_project_env` share ONE rule
+# (v0.2.97, review R2 F18 — owner rule "never destroy data without positive
+# evidence"): an env value in a JSON settings file is VCO's to remove ONLY when
+# VCO can PROVE it wrote it — the in-file value EQUALS the value the launcher
+# stores for that key, read through the sanctioned resolver (the hub, with its
+# per-project active gate) and compared in constant time. A NAME match proves
+# nothing: the user can type a key the launcher also knows. Anything else —
+# a different value, a paused or unknown key (the hub refuses it: no evidence),
+# a resolver that could not answer — is left byte-for-byte and reported by
+# ``user_owned_secret_value_in_tree`` (:mod:`vco_lib.user_owned_secrets`).
+# The ``.claude/env`` managed block is different: it is VCO's own region
+# (between its markers), rebuilt wholesale on every apply.
+
+#: The shared PAT reached every project's env surfaces under this name; its
+#: stored slot is ``github_pat``. Canonical, but NEVER removed by name (see
+#: :func:`apply_project_env`): only with the same value evidence as the rest.
+_LEGACY_SECRET_ENV_KEYS: frozenset[str] = frozenset({"GITHUB_TOKEN"})
+_STORED_SLOT_FOR_ENV_KEY: dict[str, str] = {"GITHUB_TOKEN": "github_pat"}
+
+# A condition id, not a secret: the constant's name avoids "secret" because
+# CodeQL's clear-text-storage query taints identifiers by name, and this id is
+# written to the auto-resolution trail.
+_RETAINED_VALUES_CID = "user_secret_values_retained_in_tree"
+
+#: The JSON env surfaces: ``(file, env-block key)``.
+_JSON_SECRET_SURFACES: tuple[tuple[str, str], ...] = (
+    (".claude/settings.json", "env"),
+    (".vscode/settings.json", "claude-code.env"),
+)
+
+#: Evidence verdicts, per in-file key (or, in a ``.env``-style file, per line).
+EVIDENCE_PROVEN = "proven"              # the value equals the launcher's stored value
+EVIDENCE_NOT_VCO = "not_vco"            # the launcher holds a different value, or none
+EVIDENCE_PAUSED = "paused"              # the hub refused: not active for this project
+EVIDENCE_UNKNOWN = "unknown"            # the resolver could not answer (hub down, ...)
+EVIDENCE_NEVER_STORED = "never_stored"  # a secret-shaped name the launcher never stored
+
+#: The ONE wording of each verdict, used in every report (the Python deferral
+#: entries and — handed over the bridge — the launcher's unregister result).
+EVIDENCE_REASONS: dict[str, str] = {
+    EVIDENCE_PROVEN: "it equals the value the launcher stores (VCO wrote it)",
+    EVIDENCE_NOT_VCO: "it is not the value the launcher stores for it",
+    EVIDENCE_PAUSED: (
+        "VCO could not check it — the launcher's copy is paused (or not "
+        "granted) for this project"
+    ),
+    EVIDENCE_UNKNOWN: "VCO could not check it — the launcher could not be asked",
+    EVIDENCE_NEVER_STORED: "the launcher never stored a secret with this name",
+}
+
+#: ``export KEY="value"`` inside the ``.claude/env`` managed block — the shape
+#: the projection writer emits. Only ``bool(value)`` is ever used.
+_MANAGED_EXPORT_RE = re.compile(
+    r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"', re.MULTILINE,
+)
+
+
+def _stored_secret_value(env_key: str, project_root: Path) -> tuple[str, Optional[str]]:
+    """What the launcher stores for ``env_key``, through the sanctioned resolver.
+
+    ``("ok", value)``; ``("paused", None)`` when the hub refused the key as not
+    active for this project (a paused secret is NOT read around the permission
+    matrix — no evidence either way); ``("absent", None)`` when the launcher
+    holds no value for it; ``("unknown", None)`` on any resolver failure. Hub
+    tier ONLY (``allow_file_fallback=False``): the pre-v0.2.73 writer copied the
+    keychain value, so the keychain is the only store whose value is evidence.
+    The value never leaves this process and is never logged — the resolver's
+    errors name keys, not values.
+    """
+    from vco_lib import agent_secrets
+
+    slot = _STORED_SLOT_FOR_ENV_KEY.get(env_key, env_key)
+    try:
+        return "ok", agent_secrets.get(slot, project=str(project_root), allow_file_fallback=False)
+    except agent_secrets.AccessDenied:
+        return "paused", None
+    except agent_secrets.SecretNotFound:
+        return "absent", None
+    except Exception:  # noqa: BLE001 — any resolver failure is "no evidence"
+        return "unknown", None
+
+
+def _json_env_block(path: Path, env_key: str) -> dict:
+    loaded = jsonc_edit.load_object(path) if path.is_file() else None
+    block = loaded[0].get(env_key) if loaded is not None else None
+    return block if isinstance(block, dict) else {}
+
+
+def classify_json_env_secrets(
+    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
+) -> dict[str, dict[str, str]]:
+    """``{file: {KEY: verdict}}`` for every candidate in the JSON env blocks.
+
+    A candidate is a key with a non-empty string value that is either a
+    launcher-known user secret / ``GITHUB_TOKEN`` (verdict by value evidence,
+    :func:`_stored_secret_value`, compared with :func:`hmac.compare_digest`) or
+    merely secret-SHAPED (:func:`vco_lib.secrets_audit.is_secret_shaped_env_key`
+    — ``never_stored``). VCO's other canonical keys are never candidates.
+    Values are compared and dropped; only verdicts leave this function.
+    """
+    from vco_lib.secrets_audit import is_secret_shaped_env_key
+
+    folder = Path(folder)
+    vco_names = _vco_secret_names(folder, known_keys)
+    other_canonical = list_canonical_keys() - _LEGACY_SECRET_ENV_KEYS
+    lookups: dict[str, tuple[str, Optional[str]]] = {}
+    verdicts: dict[str, dict[str, str]] = {}
+    for rel, env_key in _JSON_SECRET_SURFACES:
+        for name, value in _json_env_block(folder / rel, env_key).items():
+            if name in other_canonical or not isinstance(value, str) or not value:
+                continue
+            if name in vco_names:
+                verdict = _value_verdict(name, value, folder, lookups)
+            elif is_secret_shaped_env_key(name):
+                verdict = EVIDENCE_NEVER_STORED
+            else:
+                continue
+            verdicts.setdefault(rel, {})[name] = verdict
+    return verdicts
+
+
+def _vco_secret_names(folder: Path, known_keys: Optional[Iterable[str]]) -> set[str]:
+    known = known_user_secret_keys_for_folder(folder) if known_keys is None else list(known_keys)
+    return set(known) | _LEGACY_SECRET_ENV_KEYS
+
+
+def _value_verdict(
+    name: str, value: str, folder: Path, lookups: dict[str, tuple[str, Optional[str]]],
+) -> str:
+    """The evidence verdict for one in-file ``value`` of a launcher-known key:
+    ``proven`` only when it equals the stored value (constant-time compare).
+    ``lookups`` caches one resolver answer per key for the caller's pass; the
+    stored value never leaves the caller's process."""
+    import hmac
+
+    if name not in lookups:
+        lookups[name] = _stored_secret_value(name, folder)
+    status, stored = lookups[name]
+    if status == "ok" and stored and hmac.compare_digest(
+        value.encode("utf-8"), stored.encode("utf-8"),
+    ):
+        return EVIDENCE_PROVEN
+    return {
+        "paused": EVIDENCE_PAUSED, "unknown": EVIDENCE_UNKNOWN,
+    }.get(status, EVIDENCE_NOT_VCO)
+
+
+def _strip_proven_env_lines(
+    path: Path, vco_names: set[str], folder: Path,
+    lookups: dict[str, tuple[str, Optional[str]]], *, managed_block: bool,
+) -> tuple[list[str], dict[str, str], Optional[str]]:
+    """Drop from one ``.env``-style file every line whose OWN value is proven;
+    ``(proven names, {name: verdict of a line left}, error or None)`` — with an
+    error, the proven names are the ones that were NOT removed.
+
+    Per OCCURRENCE (review R3 F23): a file may carry a key twice — a line the
+    user wrote above one VCO wrote — and only the line whose value equals the
+    stored one goes. Lines are read with the ONE line grammar,
+    :func:`vco_lib.envfile.parse_env_line`; comments, blank lines and — when
+    ``managed_block`` (``.claude/env``) — every line of VCO's managed block
+    (located by the ONE extractor, :func:`vco_lib.envfile.extract_managed_block`;
+    VCO's region, handled whole by the unregister) are kept. Every other byte,
+    CRLF included, is kept, and so is the file's MODE (review R4 F29).
+
+    A failed REWRITE is not raised (review R4 F25): the file is untouched (the
+    write is atomic), and the error comes back with the proven names so the
+    caller can report exactly what was NOT removed and move on to the next
+    surface.
+    """
+    from vco_lib.envfile import extract_managed_block, parse_env_line
+
+    try:
+        with path.open(encoding="utf-8", newline="") as handle:
+            text = handle.read()
+    except (OSError, ValueError):
+        return [], {}, None
+    skip_from, skip_to = len(text), len(text)
+    block = (
+        extract_managed_block(text, CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END)
+        if managed_block else None
+    )
+    if block is not None:
+        skip_from = text.find(block)
+        skip_to = skip_from + len(block) + len(CLAUDE_ENV_MANAGED_END)
+    kept: list[str] = []
+    removed: list[str] = []
+    left: dict[str, str] = {}
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        start, offset = offset, offset + len(line)
+        pair = None if skip_from <= start < skip_to else parse_env_line(line)
+        if pair is not None and pair[0] in vco_names and pair[1]:
+            verdict = _value_verdict(pair[0], pair[1], folder, lookups)
+            if verdict == EVIDENCE_PROVEN:
+                removed.append(pair[0])
+                continue
+            left[pair[0]] = verdict
+        kept.append(line)
+    if removed:
+        try:
+            _atomic_write_text(path, "".join(kept))
+        except OSError as exc:
+            return sorted(set(removed)), left, f"could not rewrite {path}: {exc.strerror or exc}"
+    return sorted(set(removed)), left, None
+
+
+def strip_proven_secret_values(
+    folder: Path, *, known_keys: Optional[Iterable[str]] = None,
+) -> dict[str, Any]:
+    """Remove every secret VALUE VCO can PROVE it wrote from the four env
+    files a pre-v0.2.73 launcher wrote; report the rest. The unregister's
+    evidence step (v0.2.97): a confirmed "unregister" consents to removing
+    what VCO wrote, not a same-named key the user typed.
+
+    Candidates are the launcher-known user secrets (every bucket) and
+    ``GITHUB_TOKEN``. ``.env`` / ``.claude/env`` (outside the managed block)
+    are edited per LINE — only a line whose own value equals the stored one
+    goes; the JSON env blocks per key, through :func:`strip_env_keys` (JSONC
+    in place, refusal recorded). Names the launcher never stored are not
+    touched or listed — they were never VCO's.
+
+    Returns ``{"removed": {file: [KEY]}, "left": {file: {KEY: verdict}},
+    "not_removed": {file: [KEY]}, "errors": [message]}`` — names and verdicts
+    only, never a value. ``not_removed`` lists PROVEN names whose removal
+    failed (a rewrite error, a refused JSONC edit); each surface is attempted
+    regardless of an earlier one's failure (review R4 F25).
+    """
+    folder = Path(folder)
+    vco_names = _vco_secret_names(folder, known_keys)
+    lookups: dict[str, tuple[str, Optional[str]]] = {}
+    removed: dict[str, list[str]] = {}
+    left: dict[str, dict[str, str]] = {}
+    not_removed: dict[str, list[str]] = {}
+    errors: list[str] = []
+    for rel in (".env", ".claude/env"):
+        gone, kept, error = _strip_proven_env_lines(
+            folder / rel, vco_names, folder, lookups, managed_block=rel == ".claude/env",
+        )
+        if gone and error:
+            errors.append(error)
+            not_removed[rel] = gone
+        elif gone:
+            removed[rel] = gone
+        if kept:
+            left[rel] = kept
+    for rel, env_key in _JSON_SECRET_SURFACES:
+        proven: list[str] = []
+        for name, value in _json_env_block(folder / rel, env_key).items():
+            if name in vco_names and isinstance(value, str) and value:
+                verdict = _value_verdict(name, value, folder, lookups)
+                if verdict == EVIDENCE_PROVEN:
+                    proven.append(name)
+                else:
+                    left.setdefault(rel, {})[name] = verdict
+        if proven:
+            surface = next(s for s, (r, _k) in _JSON_SURFACE_FILES.items() if r == rel)
+            try:
+                gone = strip_env_keys(folder, surface, proven)
+            except (SettingsWriteRefused, OSError) as exc:
+                errors.append(f"{rel}: {exc}")
+                not_removed[rel] = sorted(proven)
+                gone = []
+            if gone:
+                removed[rel] = gone
+    return {"removed": removed, "left": left, "not_removed": not_removed, "errors": errors}
+
+
+def _managed_block_secret_exports(path: Path) -> list[str]:
+    """Secret-shaped exports with a value inside ``.claude/env``'s managed block
+    (VCO's own region). The block is located by the ONE extractor,
+    :func:`vco_lib.envfile.extract_managed_block` — the END that closes the
+    block is the first one AFTER its BEGIN (review R2 F21)."""
+    from vco_lib.envfile import extract_managed_block
+    from vco_lib.secrets_audit import is_secret_shaped_env_key
+
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        return []
+    block = extract_managed_block(text, CLAUDE_ENV_MANAGED_BEGIN, CLAUDE_ENV_MANAGED_END)
+    if block is None:
+        return []
+    return sorted({
+        key for key, value in _MANAGED_EXPORT_RE.findall(block)
+        if value and is_secret_shaped_env_key(key)
+    })
+
+
+def retained_secret_keys_in(path: Path, known_keys: Iterable[str] = ()) -> list[str]:
+    """NAMES of values in one env surface that VCO can prove it wrote.
+
+    ``.claude/env``: secret-shaped exports inside VCO's managed block. A JSON
+    settings file: keys whose value EQUALS the launcher's stored value
+    (:func:`classify_json_env_secrets`). Never reads a value out. Soft: ``[]``
+    for a missing or unreadable file.
+    """
+    if not path.is_file():
+        return []
+    if path.name == "env":
+        return _managed_block_secret_exports(path)
+    folder = path.parent.parent
+    rel = path.relative_to(folder).as_posix()
+    verdicts = classify_json_env_secrets(folder, known_keys=known_keys).get(rel, {})
+    return sorted(k for k, v in verdicts.items() if v == EVIDENCE_PROVEN)
+
+
+def known_user_secret_keys_for_folder(folder: Path) -> list[str]:
+    """The launcher-known user-secret keys of the project registered at
+    ``folder``; ``[]`` when there is no launcher DB or the folder is not a
+    registered project (there is then no refresh to run either)."""
+    from vco_lib.module_gated_delivery import resolve_project_id_for_folder
+
+    db_path = _resolve_launcher_db_path()
+    if not db_path.is_file():
+        return []
+    project_id = resolve_project_id_for_folder(Path(folder), db_path=db_path)
+    if not project_id:
+        return []
+    try:
+        return user_secret_known_keys_from_db(project_id, db_path=db_path)
+    except (DbUnreachable, sqlite3.Error):
+        return []
+
+
+def retained_launcher_value_names(
+    folder: Path,
+    *,
+    known_keys: Optional[Iterable[str]] = None,
+    verdicts: Optional[Mapping[str, Mapping[str, str]]] = None,
+) -> dict[str, list[str]]:
+    """``{surface: [key NAMES]}`` of values VCO can prove it wrote that are
+    still in the project's env surfaces; empty when there are none.
+
+    The ONE detection behind ``user_secret_values_retained_in_tree``: its
+    emitter and bundle reconciler call this, and :func:`apply_project_env`
+    removes exactly this set, so the entry never promises a removal the
+    refresh does not make. ``verdicts`` reuses a classification already made.
+    """
+    folder = Path(folder)
+    if verdicts is None:
+        verdicts = classify_json_env_secrets(folder, known_keys=known_keys)
+    found: dict[str, list[str]] = {}
+    managed = _managed_block_secret_exports(folder / ".claude" / "env")
+    if managed:
+        found[".claude/env"] = managed
+    for rel, _env_key in _JSON_SECRET_SURFACES:
+        names = sorted(k for k, v in verdicts.get(rel, {}).items() if v == EVIDENCE_PROVEN)
+        if names:
+            found[rel] = names
+    return found
+
+
+def retained_user_secret_state(folder: Path) -> Optional[bool]:
+    """The reconciler's tri-state: ``True`` — a provably VCO-written value
+    remains; ``None`` — none proven, but a launcher-known key's value could not
+    be checked (keep the entry: no evidence it is over); ``False`` — clean."""
+    verdicts = classify_json_env_secrets(Path(folder))
+    if retained_launcher_value_names(folder, verdicts=verdicts):
+        return True
+    if any(
+        v in (EVIDENCE_UNKNOWN, EVIDENCE_PAUSED) for per in verdicts.values() for v in per.values()
+    ):
+        return None
+    return False
+
+
+def _record_secret_value_scrubs(
+    project_root: Path, before: Mapping[str, list[str]], known_keys: list[str],
+) -> None:
+    """Trail each value this apply removed (key NAME only, never the value)
+    and clear ``user_secret_values_retained_in_tree`` once nothing remains.
+    Best-effort: observability never fails a write that already landed."""
+    try:
+        from vco_lib.deferral_emit import record_auto_resolution, resolve_conditions
+        from vco_lib.deferral_report import DeferralReport
+
+        after = retained_launcher_value_names(project_root, known_keys=known_keys)
+        for rel, names in before.items():
+            for name in sorted(set(names) - set(after.get(rel, []))):
+                record_auto_resolution(
+                    project_root, _RETAINED_VALUES_CID, "scrubbed_user_secret_value",
+                    f"removed the in-tree value of {name} from {rel} (it equalled the "
+                    "value the launcher stores); the secret itself stays in the keychain",
+                )
+        if not after and DeferralReport.read(project_root).has_condition(_RETAINED_VALUES_CID):
+            resolve_conditions(project_root, [_RETAINED_VALUES_CID])
+    except Exception:  # noqa: BLE001 — trail + ledger are observability
+        pass
 
 
 # ─── Update-time migration: re-project ALL registered projects ──────────
@@ -2834,7 +3277,7 @@ class ProjectReprojectOutcome(TypedDict):
 
     project_id: str
     project_name: str
-    status: str  # "migrated" | "failed" | "skipped"
+    status: str  # "migrated" | "failed" | "refused" | "skipped"
     detail: str
     keys_written: list[str]
 
@@ -2864,6 +3307,15 @@ def reproject_all_registered_projects(
     silently. A single project's failure never aborts the sweep — the
     remaining projects still migrate, and each failure gets its own
     deferral row + ``"failed"`` outcome.
+
+    v0.2.97 — a settings file the writer would not touch is NOT that
+    failure: :class:`SettingsWriteRefused` means the projection left an
+    unparseable / uneditable ``settings.json`` byte-identical and has ALREADY
+    recorded the accurate condition, ``settings_write_refused_<surface>``, in
+    THAT project's ledger. Such a project gets a ``"refused"`` outcome and no
+    ``codegraph_access_list_reprojection_failed`` entry, whose wording (a
+    code-graph migration failure, fixed by re-running ``reproject-all``)
+    would send the user after the wrong cause.
 
     Cleanup semantics: the migration IS the cleanup. Re-projecting a
     project OVERWRITES the stale slug-form ``VCT_CODE_GRAPH_ACCESS_LIST``
@@ -2934,6 +3386,16 @@ def reproject_all_registered_projects(
                     keys_written=sorted(keys_written),
                 )
             )
+        except SettingsWriteRefused as exc:
+            outcomes.append(
+                ProjectReprojectOutcome(
+                    project_id=pid,
+                    project_name=pname,
+                    status="refused",
+                    detail=str(exc),
+                    keys_written=[],
+                )
+            )
         except Exception as exc:  # noqa: BLE001 — one project's failure never aborts the sweep
             detail = f"{type(exc).__name__}: {exc}"
             outcomes.append(
@@ -2977,259 +3439,10 @@ def reproject_all_registered_projects(
     return outcomes
 
 
-# ─── Phase 0.E: user-secret writer ──────────────────────────────────────
-
-
-def apply_user_secrets(
-    secret_bundle: UserSecretBundle,
-    *,
-    surfaces: Iterable[str] | None = None,
-) -> dict[str, dict[str, list[str]]]:
-    """STRIP user-secret keys from the requested env surfaces.
-
-    v0.2.75 P3: the Phase 0.E emit arm is DELETED. This function no
-    longer writes secret VALUES anywhere — the sole surviving contract
-    is the tree-wide invariant "VCO never writes secret values into the
-    project tree". A non-empty ``user_secret_pairs`` raises
-    ``ConfigProjectionError`` (loud backstop against a resurrected emit
-    caller; the production Rust writer has projected an always-empty
-    emit set since v0.2.73).
-
-    Behaviour:
-
-      * For each requested JSON surface (settings.json /
-        vscode.settings.json): STRIP every key in
-        ``user_secret_known_keys`` from the existing ``env`` /
-        ``claude-code.env`` sub-block. Canonical keys and
-        user-added-by-hand keys are PRESERVED untouched.
-      * For ``.claude/env``: the BEGIN/END managed block is rebuilt
-        wholesale with the canonical exports preserved and NO
-        user-secret section (strip is implicit in the rebuild).
-
-    Production callers pass the result of
-    :func:`user_secret_known_keys_from_db` as the strip set; an empty
-    list makes the JSON strip pass a no-op (the ``.claude/env`` rebuild
-    still removes any legacy user-secret section).
-
-    Returns a two-level audit report; ``emitted`` is retained in the
-    shape for wire-stability and is ALWAYS empty::
-
-        {
-          "claude_settings_json": {
-            "emitted": [],
-            "stripped": ["OLD_PAUSED_KEY", ...],
-          },
-          ...
-        }
-
-    Raises:
-        ConfigProjectionError: an unknown surface was passed, or the
-            bundle carries a non-empty emit set (retired contract).
-
-    Cross-OS: same atomic-write discipline as
-    :func:`apply_project_env`. The tempfile lands in the target
-    directory; ``os.replace`` is invariant across POSIX and
-    Windows 10+.
-    """
-    if surfaces is None:
-        surfaces_seq: tuple[str, ...] = _DEFAULT_SURFACES
-    else:
-        surfaces_seq = tuple(surfaces)
-
-    for s in surfaces_seq:
-        if s not in _ALL_SURFACES:
-            raise ConfigProjectionError(
-                f"unknown surface {s!r}; valid: {sorted(_ALL_SURFACES)}"
-            )
-
-    pairs = list(secret_bundle.get("user_secret_pairs") or [])
-    if pairs:
-        raise ConfigProjectionError(
-            "user_secret_pairs is non-empty — the value-emitting arm of "
-            "apply_user_secrets was retired in v0.2.75 (VCO never writes "
-            "secret values into the project tree). Pass an empty emit set; "
-            "secret VALUES are resolved at need via the hub/file-store/.env "
-            "chain, never projected to disk."
-        )
-
-    project_root = secret_bundle["project_root"]
-    strip_keys: list[str] = list(secret_bundle["user_secret_known_keys"])
-
-    # User-secret keys aren't canonical, so the json writer's
-    # signal-to-remove path doesn't run for them — we drive STRIP
-    # explicitly via the strip_keys argument.
-    report: dict[str, dict[str, list[str]]] = {}
-
-    if _SURFACE_CLAUDE_SETTINGS in surfaces_seq:
-        path = project_root / ".claude" / "settings.json"
-        _, stripped = _user_secret_apply_json(
-            path, strip_keys, env_key="env",
-        )
-        report[_SURFACE_CLAUDE_SETTINGS] = {
-            "emitted": [], "stripped": stripped,
-        }
-
-    if _SURFACE_CLAUDE_ENV in surfaces_seq:
-        path = project_root / ".claude" / "env"
-        _user_secret_apply_claude_env(path)
-        report[_SURFACE_CLAUDE_ENV] = {
-            "emitted": [],
-            # .claude/env strip is implicit (BEGIN/END replace rebuilds
-            # the entire block without a user-secret section); we surface
-            # the strip-set keys for parity with the JSON report.
-            "stripped": sorted(strip_keys),
-        }
-
-    if _SURFACE_VSCODE_SETTINGS in surfaces_seq:
-        path = project_root / ".vscode" / "settings.json"
-        _, stripped = _user_secret_apply_json(
-            path, strip_keys, env_key="claude-code.env",
-        )
-        report[_SURFACE_VSCODE_SETTINGS] = {
-            "emitted": [], "stripped": stripped,
-        }
-
-    return report
-
-
-def _user_secret_apply_json(
-    path: Path,
-    strip_keys: list[str],
-    *,
-    env_key: str,
-) -> tuple[bool, list[str]]:
-    """STRIP user-secret keys from a JSON env sub-block (v0.2.75 P3:
-    the EMIT arm is deleted — this helper never writes a secret VALUE).
-
-    Surgical: only removes the strip-set keys. Canonical and user-
-    added-by-hand keys survive verbatim. The file is created (with
-    just the env sub-block) if it doesn't exist, mirroring the
-    canonical writer's "fresh file" semantics.
-
-    Returns:
-        Tuple of (file_existed, stripped_keys). The file_existed flag
-        is for audit logging — useful to detect "user-secret write
-        created the file from scratch" which usually means a canonical
-        write hasn't run yet (a Rust-side ordering bug worth
-        surfacing).
-    """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-
-    file_existed = path.exists()
-    existing_root: Any = {}
-    if file_existed:
-        try:
-            raw = path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                existing_root = parsed
-            else:
-                existing_root = {}
-        except (OSError, json.JSONDecodeError):
-            existing_root = {}
-
-    env_block_raw = existing_root.get(env_key)
-    if not isinstance(env_block_raw, dict):
-        env_block: dict[str, Any] = {}
-    else:
-        env_block = dict(env_block_raw)
-
-    stripped: list[str] = []
-    for k in strip_keys:
-        if k in env_block:
-            del env_block[k]
-            stripped.append(k)
-
-    existing_root[env_key] = env_block
-
-    serialised = json.dumps(existing_root, indent=2, ensure_ascii=False)
-    _atomic_write_text(path, serialised)
-
-    stripped.sort()
-    return file_existed, stripped
-
-
-def _user_secret_apply_claude_env(
-    path: Path,
-) -> None:
-    """STRIP the user-secret section from ``.claude/env`` (v0.2.75 P3:
-    the EMIT arm is deleted — this helper never writes a secret VALUE).
-
-    Re-reads the existing managed block, extracts the canonical
-    section (everything before the user-secret section header OR
-    before END if no header), and rebuilds the block with ONLY the
-    canonical exports — any legacy user-secret section (written by a
-    pre-v0.2.73 launcher) is removed. Lines outside the BEGIN/END
-    markers are preserved verbatim.
-
-    If the file doesn't exist OR has no managed block: writes a fresh
-    empty managed block. The next :func:`apply_project_env` call will
-    re-emit canonical content.
-    """
-    parent = path.parent
-    parent.mkdir(parents=True, exist_ok=True)
-
-    prior: Optional[str]
-    if path.exists():
-        try:
-            prior = path.read_text(encoding="utf-8")
-        except OSError:
-            prior = None
-    else:
-        prior = None
-
-    # Extract the canonical lines from the existing managed block (if
-    # any) so we can preserve them across user-secret-only writes.
-    # The canonical exports look like `export KEY="value"` — we
-    # capture every line between BEGIN and either the user-secret
-    # section header OR the END marker.
-    canonical_lines: list[str] = []
-    if prior is not None:
-        begin_idx = prior.find(CLAUDE_ENV_MANAGED_BEGIN)
-        if begin_idx != -1:
-            end_off = prior[begin_idx:].find(CLAUDE_ENV_MANAGED_END)
-            if end_off != -1:
-                block_text = prior[begin_idx:begin_idx + end_off]
-                # Split into lines; drop the BEGIN line (first one).
-                lines = block_text.splitlines()[1:]
-                user_secret_header = (
-                    "# user secrets (per-project; "
-                    "managed via launcher GUI Secrets panel)"
-                )
-                for line in lines:
-                    # Stop at the user-secret section header — everything
-                    # after it is the OLD user-secret block we're
-                    # rebuilding.
-                    if line == user_secret_header:
-                        # Drop the preceding blank line if there is one;
-                        # the rebuild re-emits it. The canonical exports
-                        # are everything before the blank line that
-                        # precedes the header.
-                        if canonical_lines and canonical_lines[-1] == "":
-                            canonical_lines.pop()
-                        break
-                    canonical_lines.append(line)
-
-    # Rebuild the managed block with ONLY the canonical exports — no
-    # user-secret section, ever (v0.2.75 P3: the emit arm is deleted;
-    # a legacy section from a pre-v0.2.73 launcher is dropped here).
-    out: list[str] = [CLAUDE_ENV_MANAGED_BEGIN]
-    out.extend(canonical_lines)
-    out.append(CLAUDE_ENV_MANAGED_END)
-    managed = "\n".join(out) + "\n"
-
-    new_text = _merge_managed_block(prior, managed)
-    _atomic_write_text(path, new_text)
-
-
-# ─── Surface writers ────────────────────────────────────────────────────
-
-
 def _write_json_env_block(
     path: Path,
     canonical_env: Mapping[str, str],
-    canonical_keys: set[str],
+    canonical_keys: Iterable[str],
     *,
     env_key: str,
     user_secret_pairs: Iterable[tuple[str, str]] | None = None,
@@ -3237,12 +3450,19 @@ def _write_json_env_block(
 ) -> list[str]:
     """Write the canonical env into a JSON file's ``<env_key>`` sub-block.
 
-    Deep-merge contract (mirrors Rust's
-    ``merge_env_object_canonical_with_user_secrets``):
+    Deep-merge contract (inherited from the Rust writer's deep-merge,
+    retired v0.2.97):
 
       * Read the existing JSON (if present). Treat missing file as
-        ``{}``. Treat malformed JSON or non-object root as ``{}``
-        (matching the Rust fallback at projects_v2.rs lines 1881-1883).
+        ``{}``. A JSONC file (comments / trailing commas — VS Code's own
+        format for ``.vscode/settings.json``) is READ and later edited in
+        place, comments kept (v0.2.97, :mod:`vco_lib.jsonc_edit`). A file
+        that exists but is not JSONC either, is not UTF-8, cannot be read,
+        or has a non-object root is NEVER written:
+        :class:`SettingsWriteRefused` is raised and the file stays
+        byte-identical (v0.2.97, :mod:`vco_lib.settings_refusal`). Before
+        v0.2.97 each of those cases was treated as ``{}`` and rewritten as
+        only the env block — every other setting in it destroyed.
       * Locate the ``env_key`` sub-block. If missing or not an object,
         create a fresh object.
       * For each canonical key in ``canonical_keys``:
@@ -3251,31 +3471,31 @@ def _write_json_env_block(
           - if absent from ``canonical_env``: delete ``env[key]`` if
             present (signal-to-remove semantics; supports "the launcher
             decided this project no longer has any peer KG access").
-      * Phase 0.E user-secret handling (mirrors Rust):
-          - STRIP first: ``user_secret_strip_keys`` are removed from
-            ``env_block`` BEFORE inserting active pairs. Run before
-            canonical so a same-tick toggle (active→inactive across
-            two writes) can't rely on residual state. The strip set
-            is by construction disjoint from the emit set (the resolver
-            computes ``strip = known - emit``), so removing-then-
-            inserting is safe.
-          - EMIT last: ``user_secret_pairs`` are inserted after the
-            canonical keys. A hypothetical KEY collision (which
-            ``set_secret_v2`` prevents at the GUI layer) resolves
-            user-wins, matching the Rust ordering at
-            ``merge_env_object_canonical_with_user_secrets`` step 3.
+      * User-secret keys (v0.2.97, review R4 F26):
+          - ``user_secret_strip_keys`` are the names whose in-file value
+            the CALLER PROVED equals the launcher's stored value
+            (:func:`classify_json_env_secrets`) — a paused, unknown or
+            different value is never in it. They are removed before the
+            canonical keys are applied.
+          - ``user_secret_pairs`` is always empty since v0.2.73: VCO never
+            writes a secret value. The parameter survives only so the
+            call shape stays stable; a non-empty list would be inserted
+            after the canonical keys.
       * Non-canonical, non-user-secret keys (user-added by hand
         directly in the JSON) are PRESERVED untouched.
       * Write the result back with 2-space indent, no trailing newline,
         ``ensure_ascii=False`` (matching Rust's
-        ``serde_json::to_string_pretty`` byte layout).
+        ``serde_json::to_string_pretty`` byte layout) — for a strict-JSON
+        original. A JSONC original is edited member by member instead and
+        verified by re-parsing; an edit that cannot be verified writes
+        NOTHING and raises :class:`SettingsWriteRefused`.
 
     Returns the sorted list of canonical keys whose value was set
     (those that were deleted are not listed — the audit consumer wants
     to see what's NOW exported, not what was previously there). User-
     secret keys are NOT in the returned list (audit reporting for
-    user secrets uses a separate report channel; see
-    :func:`apply_user_secrets`).
+    user secrets is the auto-resolution trail; see
+    :func:`_record_secret_value_scrubs`).
 
     Atomic write: writes to a tempfile in the same directory as ``path``,
     then ``os.replace``-s into place. This is atomic on POSIX (rename
@@ -3286,22 +3506,7 @@ def _write_json_env_block(
     parent.mkdir(parents=True, exist_ok=True)
 
     # Read-merge-write.
-    existing_root: Any = {}
-    if path.exists():
-        try:
-            raw = path.read_text(encoding="utf-8")
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                existing_root = parsed
-            else:
-                # Non-object root (someone hand-edited it into an array
-                # or string) — reset to empty object, matching Rust's
-                # fallback at projects_v2.rs L1881-1883.
-                existing_root = {}
-        except (OSError, json.JSONDecodeError):
-            # Unreadable / malformed — start fresh. Matches Rust which
-            # logs a warning + falls back to {}.
-            existing_root = {}
+    existing_root, jsonc_text = _read_json_env_root(path)
 
     env_block_raw = existing_root.get(env_key)
     if not isinstance(env_block_raw, dict):
@@ -3309,10 +3514,9 @@ def _write_json_env_block(
     else:
         env_block = dict(env_block_raw)  # defensive copy
 
-    # Phase 0.E step 1: STRIP paused / removed user-secret keys.
-    # Matches Rust's `merge_env_object_canonical_with_user_secrets`
-    # step 1: remove BEFORE canonical / emit so a buggy resolver
-    # can't silently drop the active value.
+    # Remove the user-secret keys whose value the caller PROVED VCO wrote
+    # (equal to the launcher's stored value; never a paused / unknown /
+    # different one), before the canonical keys are applied.
     if user_secret_strip_keys:
         for k in user_secret_strip_keys:
             env_block.pop(k, None)
@@ -3330,8 +3534,8 @@ def _write_json_env_block(
             del env_block[key]
         # else: not in bundle, not in surface — nothing to do.
 
-    # Phase 0.E step 3: EMIT active user-secret pairs LAST so they
-    # win on a hypothetical KEY collision with a canonical key.
+    # `user_secret_pairs` is always empty since v0.2.73 (VCO never writes a
+    # secret value); kept only for the call shape.
     if user_secret_pairs:
         for k, v in user_secret_pairs:
             env_block[k] = v
@@ -3343,13 +3547,222 @@ def _write_json_env_block(
     # ``serde_json::to_string_pretty``. No trailing newline matches
     # Rust's ``std::fs::write(&path, pretty)`` where ``pretty`` has
     # no trailing newline (verified by reading projects_v2.rs L1896-1898).
-    serialised = json.dumps(
-        existing_root, indent=2, ensure_ascii=False
-    )
-    _atomic_write_text(path, serialised)
+    _atomic_write_text(path, _serialise_json_env_root(path, existing_root, jsonc_text))
 
     written_keys.sort()
     return written_keys
+
+
+def _read_json_env_root(path: Path) -> tuple[dict[str, Any], Optional[str]]:
+    """``(root, jsonc_text)`` for a JSON env surface — the ONE reader both
+    JSON writers use.
+
+    ``jsonc_text`` is the original text when the file is JSONC (valid only
+    with comments / trailing commas): the writer must then EDIT that text
+    (:func:`_serialise_json_env_root`), never re-serialise it. A missing
+    file is ``{}`` (the writer creates it). A file that exists but cannot be
+    read as an object raises :class:`SettingsWriteRefused` — it is never
+    treated as ``{}``, because writing ``{}`` plus the env block back is
+    exactly how every other setting in it used to be destroyed.
+    """
+    loaded = settings_refusal.load_for_edit(path)
+    if loaded is None:
+        return {}, None
+    if isinstance(loaded, settings_refusal.Refusal):
+        raise SettingsWriteRefused([loaded])
+    parsed, raw = loaded
+    return parsed, (None if jsonc_edit.is_strict_json(raw) else raw)
+
+
+def _serialise_json_env_root(
+    path: Path, root: Mapping[str, Any], jsonc_text: Optional[str],
+) -> str:
+    """The bytes to write.
+
+    Strict JSON (or a fresh file): the Rust-parity layout. JSONC: the
+    original text edited member by member and verified
+    (:func:`vco_lib.jsonc_edit.rewrite_preserving`); an edit that cannot be
+    verified raises :class:`SettingsWriteRefused` and the file is left
+    exactly as it was.
+    """
+    if jsonc_text is None:
+        return json.dumps(root, indent=2, ensure_ascii=False)
+    try:
+        return jsonc_edit.rewrite_preserving(jsonc_text, root)
+    except jsonc_edit.JsoncEditRefused as exc:
+        raise SettingsWriteRefused([settings_refusal.Refusal(
+            path, settings_refusal.KIND_EDIT_REFUSED,
+            "it has comments or trailing commas (JSONC) and this change could "
+            f"not be made in place without risking other content ({exc.message}); "
+            "edit it by hand, or remove the comments",
+        )]) from exc
+
+
+def _write_json_surface(
+    project_root: Path,
+    surface: str,
+    refusals: list["settings_refusal.Refusal"],
+    project_id: Optional[str],
+    write: Any,
+) -> Any:
+    """Run one JSON surface's ``write()``; a refusal is recorded, not raised.
+
+    The caller raises :class:`SettingsWriteRefused` once every requested
+    surface has had its turn, so one unreadable file never blocks the
+    others. A refusal is left in the project's deferral ledger
+    (:func:`vco_lib.settings_refusal.record`); a successful write clears a
+    refusal recorded for the same surface earlier. Returns ``write()``'s
+    result, or ``None`` when the surface was refused.
+    """
+    try:
+        result = write()
+    except SettingsWriteRefused as exc:
+        for refusal in exc.refusals:
+            settings_refusal.record(project_root, surface, refusal, project_id=project_id)
+        refusals.extend(exc.refusals)
+        return None
+    settings_refusal.clear_recorded(project_root, surface)
+    return result
+
+
+def write_env_block(
+    project_folder: Path,
+    surface: str,
+    values: Mapping[str, str],
+    owned_keys: Iterable[str],
+) -> list[str]:
+    """Set ``values`` in one JSON surface's env block; remove every other
+    ``owned_keys`` member; leave all other keys (and, for JSONC, bytes) alone.
+
+    The ONE implementation of a surgical env-block edit, for writers that own
+    a key set outside the canonical projection — the launcher's module-
+    deprecation keys and the orchestrator root's MCP-setting keys
+    (``module_deprecation.rs`` / ``dashboard.rs`` call it through the
+    ``write-env-block`` CLI instead of carrying a second, Rust, copy). Same
+    read-merge-write, JSONC handling and refusal as :func:`apply_project_env`.
+    Its removal-only twin is :func:`strip_env_keys`.
+
+    Keys new to the block are appended in ``values`` order, then
+    ``owned_keys`` order — never in set-iteration order, which would vary
+    with the interpreter's hash seed from one run to the next.
+
+    Raises:
+        ConfigProjectionError: an unknown surface, a value that is not a
+            string, or a key in ``values`` that ``owned_keys`` does not own.
+        SettingsWriteRefused: the file exists but cannot be edited safely;
+            it was left byte-identical and the refusal recorded.
+    """
+    if surface not in _JSON_SURFACE_FILES:
+        raise ConfigProjectionError(
+            f"unknown JSON surface {surface!r}; valid: {sorted(_JSON_SURFACE_FILES)}"
+        )
+    owned = set(owned_keys)
+    stray = sorted(set(values) - owned)
+    if stray:
+        raise ConfigProjectionError(f"keys not in owned_keys: {stray}")
+    if not all(isinstance(v, str) for v in values.values()):
+        raise ConfigProjectionError("every value must be a string")
+    rel, env_key = _JSON_SURFACE_FILES[surface]
+    ordered = list(dict.fromkeys([*values, *owned_keys]))
+    refusals: list[settings_refusal.Refusal] = []
+    written = _write_json_surface(
+        project_folder, surface, refusals, None,
+        lambda: _write_json_env_block(
+            project_folder / rel, values, ordered, env_key=env_key,
+        ),
+    )
+    if refusals:
+        raise SettingsWriteRefused(refusals)
+    return written
+
+
+def strip_env_keys(
+    project_folder: Path, surface: str, keys: Iterable[str],
+) -> list[str]:
+    """Remove ``keys`` from one JSON surface's env block; nothing else.
+
+    The removal-only twin of :func:`write_env_block`: every ``apply`` uses
+    it for the proven secret values in ``.vscode/settings.json``, and the
+    unregister's value-checked twin is :func:`strip_env_keys_holding`.
+    Unlike a write it never CREATES anything: a missing file, a missing env
+    block, or an env block holding none of ``keys`` is left alone and costs
+    no write. An env block the strip empties is removed, so no ``"env": {}``
+    is left behind. JSONC is edited in place; a file that cannot be edited
+    safely is refused and recorded exactly as a write would be.
+
+    Returns the sorted keys actually removed.
+
+    Raises:
+        ConfigProjectionError: an unknown surface.
+        SettingsWriteRefused: as :func:`write_env_block`.
+    """
+    wanted = set(keys)
+    return _strip_json_env(project_folder, surface, lambda key, _value: key in wanted)[0]
+
+
+def strip_env_keys_holding(
+    project_folder: Path, surface: str, expected: Mapping[str, str], keys: Iterable[str],
+) -> tuple[list[str], list[str]]:
+    """The evidence-rule strip (v0.2.97 review R6): of ``keys``, remove from
+    one JSON surface's env block only those whose value EQUALS ``expected``
+    (what VCO projects for this project); a key holding anything else is the
+    user's and stays. Returns ``(removed, left)`` — sorted key names; ``left``
+    are the ``keys`` present with a different value (or none expected).
+    Same file discipline and refusals as :func:`strip_env_keys`.
+    """
+    wanted = set(keys)
+    return _strip_json_env(
+        project_folder, surface,
+        lambda key, value: key in wanted and key in expected and value == expected[key],
+        report=wanted,
+    )
+
+
+def _strip_json_env(
+    project_folder: Path,
+    surface: str,
+    remove: Callable[[str, Any], bool],
+    *,
+    report: "set[str] | None" = None,
+) -> tuple[list[str], list[str]]:
+    """Remove from one JSON surface's env block every entry ``remove(key,
+    value)`` accepts — the ONE removal core of :func:`strip_env_keys` and
+    :func:`strip_env_keys_holding`. Returns ``(removed, left)``: ``left`` =
+    the ``report`` keys present but not removed. Never creates a file; drops
+    an env block it empties; a file it cannot edit safely is refused and
+    recorded (:class:`SettingsWriteRefused`).
+    """
+    if surface not in _JSON_SURFACE_FILES:
+        raise ConfigProjectionError(
+            f"unknown JSON surface {surface!r}; valid: {sorted(_JSON_SURFACE_FILES)}"
+        )
+    rel, env_key = _JSON_SURFACE_FILES[surface]
+    path = project_folder / rel
+    if not path.exists():
+        return [], []
+
+    def _strip() -> tuple[list[str], list[str]]:
+        root, jsonc_text = _read_json_env_root(path)
+        block = root.get(env_key)
+        if not isinstance(block, dict):
+            return [], []
+        removed = sorted(k for k, v in block.items() if remove(k, v))
+        left = sorted(k for k in block if k in (report or ()) and k not in removed)
+        if not removed:
+            return [], left
+        remaining = {k: v for k, v in block.items() if k not in removed}
+        if remaining:
+            root[env_key] = remaining
+        else:
+            del root[env_key]
+        _atomic_write_text(path, _serialise_json_env_root(path, root, jsonc_text))
+        return removed, left
+
+    refusals: list[settings_refusal.Refusal] = []
+    outcome = _write_json_surface(project_folder, surface, refusals, None, _strip)
+    if refusals:
+        raise SettingsWriteRefused(refusals)
+    return outcome
 
 
 def _write_shell_env_managed_block(
@@ -3361,8 +3774,7 @@ def _write_shell_env_managed_block(
 ) -> list[str]:
     """Write the canonical env between bracket markers in ``.claude/env``.
 
-    Behaviour (mirrors Rust's
-    ``merge_claude_env_managed_block`` + ``build_claude_env_managed_block``):
+    Behaviour (the splice is :func:`_merge_managed_block`):
 
       * If the file doesn't exist: create it with just the managed block.
       * If the file exists and contains :data:`CLAUDE_ENV_MANAGED_BEGIN`:
@@ -3381,7 +3793,7 @@ def _write_shell_env_managed_block(
     the user-secret exports land AFTER the canonical block, preceded
     by a blank line + ``# user secrets (per-project; managed via
     launcher GUI Secrets panel)`` section header — byte-identical to
-    Rust's ``build_claude_env_managed_block_with_user_secrets``.
+    the retired Rust block builder's output (v0.2.97).
 
     STRIP for ``.claude/env`` is IMPLICIT: the entire BEGIN/END block
     is replaced on every write, so a paused / removed user secret
@@ -3427,8 +3839,7 @@ def _build_managed_block(
 ) -> str:
     """Render the managed block for ``.claude/env``.
 
-    Format (byte-identical to Rust's
-    ``build_claude_env_managed_block_with_user_secrets``):
+    Format (byte-identical to the retired Rust block builder's output):
 
       ``# vco-managed-begin\\n``
       ``<header comments — 11 lines>\\n``
@@ -3448,7 +3859,7 @@ def _build_managed_block(
     Phase 0.E (2026-05-25): user-secret exports land BETWEEN the
     canonical block and the END marker, preceded by a blank line +
     section header for diff readability. This block is byte-identical
-    to Rust's ``build_claude_env_managed_block_with_user_secrets``.
+    to the retired Rust block builder's output.
     Paused / removed secrets are simply absent from this list (the
     BEGIN/END replace strips them implicitly).
     """
@@ -3494,9 +3905,8 @@ def _build_managed_block(
     # is the authority and reconciles a hand-set value away) and an
     # operator-override DEBUG knob (where the person who exported it is).
     #
-    # This section is the one deliberate divergence from Rust's
-    # `build_claude_env_managed_block_with_user_secrets`: the Rust writer has
-    # no defaulted form, and does not need one — the Python `apply` CLI is
+    # This section was the one deliberate divergence from the retired Rust
+    # block builder: the Rust writer had no defaulted form, and did not need one — the Python `apply` CLI is
     # the canonical writer for these keys (the Option-A interop strategy at
     # the top of this module), exactly as it already is for DUAL_* / the
     # code-graph floors / the RL globals.
@@ -3531,7 +3941,8 @@ def _build_managed_block(
 def _merge_managed_block(prior: Optional[str], managed: str) -> str:
     """Splice ``managed`` into ``prior`` between the bracket markers.
 
-    Behaviour matches Rust's ``merge_claude_env_managed_block``:
+    The one splice (its Rust mirror retired in v0.2.97 review R6 with its
+    only caller, the unregister strip — now :mod:`vco_lib.unregister_env`):
 
       * ``prior is None``: return ``managed`` as-is.
       * ``prior`` lacks the BEGIN marker: append ``managed`` at EOF
@@ -3576,7 +3987,7 @@ def _merge_managed_block(prior: Optional[str], managed: str) -> str:
 def _atomic_write_text(path: Path, content: str) -> None:
     """Write ``content`` to ``path`` atomically.
 
-    Thin delegate to :func:`vco_lib.atomic.atomic_write_text` (v0.2.54
+    Thin delegate to :func:`vco_lib.atomic.atomic_rewrite_text` (v0.2.54
     Track J consolidation — this module, ``env_template``,
     ``deferral_report`` and ``cli/codegraph_diagram`` each carried a
     copy of the mkstemp + fsync + ``os.replace`` recipe). The name is
@@ -3588,8 +3999,13 @@ def _atomic_write_text(path: Path, content: str) -> None:
     equivalent to the previous ``newline="\\n"``), so ``\\n`` in
     ``content`` lands verbatim as LF, matching Rust's
     ``std::fs::write`` which never CRLF-converts.
+
+    v0.2.97 (review R4 F29): an EXISTING file keeps its permission bits —
+    ``mkstemp`` creates the replacement 0600, so without this a group-readable
+    ``.env`` / settings file came out unreadable to its group. A new file is
+    created as before. One home: :func:`vco_lib.atomic.atomic_rewrite_text`.
     """
-    atomic_write_text(path, content)
+    atomic_rewrite_text(path, content)
 
 
 # ─── CLI entry point ────────────────────────────────────────────────────
@@ -3604,6 +4020,7 @@ def _cli_apply(args: argparse.Namespace) -> int:
             orchestrator_root=(
                 Path(args.orchestrator_root) if args.orchestrator_root else None
             ),
+            weaviate_url_override=args.weaviate_url,
             weaviate_port_default=args.weaviate_port,
             ollama_port_default=args.ollama_port,
             code_embed_port_default=args.code_embed_port,
@@ -3622,6 +4039,9 @@ def _cli_apply(args: argparse.Namespace) -> int:
         surfaces = tuple(args.surfaces.split(","))
     try:
         report = apply_project_env(bundle, surfaces=surfaces)
+    except SettingsWriteRefused as exc:
+        print(json.dumps(_refused_payload(exc)), file=sys.stderr)
+        return 4
     except ConfigProjectionError as exc:
         print(json.dumps({"error": "apply_failed", "message": str(exc)}),
               file=sys.stderr)
@@ -3629,6 +4049,67 @@ def _cli_apply(args: argparse.Namespace) -> int:
 
     print(json.dumps({"ok": True, "report": report, "project_id": args.project_id,
                       "project_root": str(bundle["project_root"])}))
+    return 0
+
+
+def _refused_payload(exc: SettingsWriteRefused) -> dict[str, Any]:
+    """The machine form of a refusal, shared by every CLI verb that writes."""
+    return {
+        "error": "settings_write_refused",
+        "message": str(exc),
+        "refused": [r.as_json() for r in exc.refusals],
+    }
+
+
+def _cli_write_env_block(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection write-env-block``.
+
+    stdin: ``{"set": {KEY: "value", ...}, "owned_keys": [KEY, ...]}``. stdout
+    carries exactly ONE JSON object on every path (``ok`` true/false), which
+    is what the launcher parses. Exit codes: 0 written, 2 bad request,
+    4 refused or failed (a refused file is left byte-identical).
+    """
+    try:
+        request = json.loads(sys.stdin.read() or "{}")
+        values = request.get("set", {}) if isinstance(request, dict) else None
+        owned = request.get("owned_keys", []) if isinstance(request, dict) else None
+        if not isinstance(values, dict) or not isinstance(owned, list):
+            raise ConfigProjectionError(
+                'stdin must be {"set": {...}, "owned_keys": [...]}'
+            )
+        written = write_env_block(
+            Path(args.project_folder), args.surface, values, owned,
+        )
+    except SettingsWriteRefused as exc:
+        print(json.dumps({"ok": False, **_refused_payload(exc)}))
+        return 4
+    except (ConfigProjectionError, ValueError) as exc:
+        print(json.dumps({"ok": False, "error": "bad_request", "message": str(exc)}))
+        return 2
+    except OSError as exc:
+        print(json.dumps({"ok": False, "error": "write_failed", "message": str(exc)}))
+        return 4
+    print(json.dumps({"ok": True, "surface": args.surface, "written": written}))
+    return 0
+
+
+def _cli_strip_proven_secret_values(args: argparse.Namespace) -> int:
+    """``python -m vco_lib.config_projection strip-proven-secret-values``.
+
+    stdout: ONE JSON object — ``{"ok": true, "removed": {file: [KEY]},
+    "left": {file: {KEY: verdict}}, "reasons": {verdict: sentence},
+    "errors": [message]}`` — key names, verdicts and the ONE wording of each
+    verdict; never a value. The launcher's unregister acts on it
+    (:func:`strip_proven_secret_values`). Exit 0; 4 with ``{"ok": false, ...}``
+    on an unexpected failure.
+    """
+    try:
+        result = strip_proven_secret_values(Path(args.project_folder))
+    except Exception as exc:  # noqa: BLE001 — the caller must see a failure, loudly
+        print(json.dumps({"ok": False, "error": "strip_failed",
+                          "message": f"{type(exc).__name__}: {exc}"}))
+        return 4
+    print(json.dumps({"ok": True, **result, "reasons": EVIDENCE_REASONS}))
     return 0
 
 
@@ -3643,98 +4124,13 @@ def _cli_list_keys(args: argparse.Namespace) -> int:
     return 0
 
 
-def _cli_apply_user_secrets(args: argparse.Namespace) -> int:
-    """``python -m vco_lib.config_projection apply-user-secrets``.
-
-    STRIP-ONLY since v0.2.75 P3 (the Phase 0.E ``--pairs-json`` emit
-    arm was deleted along with its exit code 5 — VCO never writes
-    secret values into the project tree). The strip set is resolved
-    from the launcher DB via :func:`user_secret_known_keys_from_db`
-    and removed from the env surfaces; the ``.claude/env`` managed
-    block is rebuilt without a user-secret section.
-
-    Exit codes (parallel to ``apply``):
-        0 — success
-        2 — project_not_found
-        3 — db_unreachable
-        4 — apply_failed (surface write error)
-    """
-    # 1. Resolve project folder (we need this for the write target).
-    try:
-        project_folder = resolve_project_folder(
-            args.project_id,
-            db_path=Path(args.db_path) if args.db_path else None,
-        )
-    except LookupError as exc:
-        print(
-            json.dumps({"error": "project_not_found", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 2
-    except DbUnreachable as exc:
-        print(
-            json.dumps({"error": "db_unreachable", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 3
-
-    # 2. Resolve the strip set from the launcher DB.
-    try:
-        known_keys = user_secret_known_keys_from_db(
-            args.project_id,
-            db_path=Path(args.db_path) if args.db_path else None,
-        )
-    except DbUnreachable as exc:
-        print(
-            json.dumps({"error": "db_unreachable", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 3
-
-    # 3. Build the strip-only bundle. v0.2.75 P3: no pairs input exists
-    # any more — the emit set is empty by construction.
-    secret_bundle: UserSecretBundle = {
-        "user_secret_pairs": [],
-        "user_secret_known_keys": known_keys,
-        "project_id": args.project_id,
-        "project_root": project_folder,
-    }
-
-    surfaces: Iterable[str] | None = None
-    if args.surfaces:
-        surfaces = tuple(args.surfaces.split(","))
-
-    try:
-        report = apply_user_secrets(secret_bundle, surfaces=surfaces)
-    except ConfigProjectionError as exc:
-        print(
-            json.dumps({"error": "apply_failed", "message": str(exc)}),
-            file=sys.stderr,
-        )
-        return 4
-
-    # codeql[py/clear-text-logging-sensitive-data]: false positive —
-    # `known_keys` is a list of env-var NAME strings (e.g. "GITHUB_TOKEN"),
-    # not their values. It is the "strip set" used to redact secrets from
-    # the projection output. No secret values are printed here.
-    print(json.dumps({
-        "ok": True,
-        "report": report,
-        "project_id": args.project_id,
-        "project_root": str(project_folder),
-        "known_keys": known_keys,
-    }))
-    return 0
-
-
 def _cli_user_secret_known_keys(args: argparse.Namespace) -> int:
     """``python -m vco_lib.config_projection user-secret-known-keys
     --project-id <id>``.
 
-    Print the STRIP set (every user-bucket KEY observed across the
-    three buckets) without applying. Useful for the Rust caller to
-    verify the bridge before invoking ``apply-user-secrets`` (e.g.
-    in CI parity checks).
+    Print every user-bucket KEY the launcher has observed across the three
+    buckets — the names whose in-tree values the env refresh checks for
+    value evidence (:func:`classify_json_env_secrets`). Names only.
     """
     try:
         keys = user_secret_known_keys_from_db(
@@ -3826,10 +4222,12 @@ def _cli_reproject_all(args: argparse.Namespace) -> int:
 
     migrated = [o for o in outcomes if o["status"] == "migrated"]
     failed = [o for o in outcomes if o["status"] == "failed"]
+    refused = [o for o in outcomes if o["status"] == "refused"]
     summary = {
         "total": len(outcomes),
         "migrated": len(migrated),
         "failed": len(failed),
+        "refused": len(refused),
         "outcomes": outcomes,
     }
     print(json.dumps(summary, indent=2, ensure_ascii=False))
@@ -3862,9 +4260,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--orchestrator-root", default=None,
         help="path to orchestrator clone (emits VCT_ORCHESTRATOR_ROOT etc.)",
     )
-    p_apply.add_argument("--weaviate-port", type=int, default=8081)
-    p_apply.add_argument("--ollama-port", type=int, default=11435)
-    p_apply.add_argument("--code-embed-port", type=int, default=11440)
+    # v0.2.97 (lane W): unset = this machine's value (vco_lib.service_endpoints);
+    # the launcher passes its own Rust resolution.
+    p_apply.add_argument("--weaviate-url", default=None)
+    p_apply.add_argument("--weaviate-port", type=int, default=None)
+    p_apply.add_argument("--ollama-port", type=int, default=None)
+    p_apply.add_argument("--code-embed-port", type=int, default=None)
     p_apply.set_defaults(handler=_cli_apply)
 
     p_list = sub.add_parser(
@@ -3883,30 +4284,13 @@ def _build_parser() -> argparse.ArgumentParser:
     p_from.add_argument("--orchestrator-root", default=None)
     p_from.set_defaults(handler=_cli_from_db)
 
-    # Phase 0.E (2026-05-25); STRIP-ONLY since v0.2.75 P3 (the
-    # emit-capable --pairs-json flag was deleted — VCO never writes
-    # secret values into the project tree).
-    p_us_apply = sub.add_parser(
-        "apply-user-secrets",
-        help="STRIP user-bucket secret keys from the env surfaces "
-             "(strip-only; the value-emitting arm was retired in v0.2.75)",
-    )
-    p_us_apply.add_argument("--project-id", required=True)
-    p_us_apply.add_argument(
-        "--db-path", default=None,
-        help="override launcher DB path (defaults to ~/.vct/launcher.db)",
-    )
-    p_us_apply.add_argument(
-        "--surfaces", default=None,
-        help="comma-separated subset of "
-             "claude_settings_json,claude_env,vscode_settings_json "
-             "(default: claude_settings_json,claude_env)",
-    )
-    p_us_apply.set_defaults(handler=_cli_apply_user_secrets)
-
+    # v0.2.97: the `apply-user-secrets` verb (a strip of every launcher-known
+    # key NAME) was retired — SUPERSEDED by the evidence-gated scrub every
+    # `apply` performs and by `strip-proven-secret-values` for the unregister.
     p_us_known = sub.add_parser(
         "user-secret-known-keys",
-        help="print the STRIP set (every user-bucket KEY observed in DB)",
+        help="print every user-bucket KEY observed in the DB (the names the "
+             "refresh checks for value evidence)",
     )
     p_us_known.add_argument("--project-id", required=True)
     p_us_known.add_argument("--db-path", default=None)
@@ -3934,7 +4318,62 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_reproj.set_defaults(handler=_cli_reproject_all)
 
+    # v0.2.97: the ONE surgical env-block editor for launcher writers that
+    # own a key set outside the canonical projection (module deprecation).
+    p_block = sub.add_parser(
+        "write-env-block",
+        help="set/strip owned keys in one JSON surface's env block "
+             "(request JSON on stdin; refuses a file it cannot safely edit)",
+    )
+    p_block.add_argument("--project-folder", required=True)
+    p_block.add_argument(
+        "--surface", default=_SURFACE_CLAUDE_SETTINGS,
+        choices=sorted(_JSON_SURFACE_FILES),
+    )
+    p_block.set_defaults(handler=_cli_write_env_block)
+
+    # v0.2.97 review R6: the `strip-env-keys` verb (a by-name strip, whose
+    # only caller was the launcher's unregister) is retired — SUPERSEDED by
+    # `python -m vco_lib.unregister_env strip-routing`, which removes a key
+    # only where its value is VCO's.
+
+    # v0.2.97: the unregister's evidence step (names + verdicts only).
+    p_proven = sub.add_parser(
+        "strip-proven-secret-values",
+        help="remove the secret values VCO provably wrote from a project's env "
+             "files; report the rest (names and verdicts only; never a value)",
+    )
+    p_proven.add_argument("--project-folder", required=True)
+    p_proven.set_defaults(handler=_cli_strip_proven_secret_values)
+
     return p
+
+
+def build_apply_argv(
+    python: str,
+    project_id: str,
+    *,
+    db_path: Path | str | None = None,
+    orchestrator_root: Path | str | None = None,
+) -> list[str]:
+    """The ``apply`` verb's argv, built next to the parser that must accept it.
+
+    The ONE Python-side builder (v0.2.97): the project mover and the
+    collection rename each hand-built this argv with a ``--folder`` flag the
+    verb has never had, so argparse exited 2 and every post-move / post-rename
+    env re-projection failed. The project root is not an input: ``apply``
+    re-derives it from the launcher DB row, which is the point of calling it
+    after a flip. The Rust twin is ``build_config_projection_apply_args`` in
+    ``launcher/src-tauri/src/commands/projects_v2.rs``; both are parsed by
+    this module's real parser in ``tests/test_v0297_vco_lib_argv_contract.py``.
+    """
+    argv = [python, "-m", "vco_lib.config_projection", "apply",
+            "--project-id", project_id]
+    if db_path is not None:
+        argv += ["--db-path", str(db_path)]
+    if orchestrator_root is not None:
+        argv += ["--orchestrator-root", str(orchestrator_root)]
+    return argv
 
 
 
@@ -3970,10 +4409,14 @@ def run_update_reprojection_step(
         return
     migrated = sum(1 for o in outcomes if o["status"] == "migrated")
     failed = sum(1 for o in outcomes if o["status"] == "failed")
+    refused = sum(1 for o in outcomes if o["status"] == "refused")
     if outcomes:
         msg = f"  Access-list re-projection: {migrated} project(s) re-projected"
         if failed:
             msg += f", {failed} deferred (see UPDATE_DEFERRED.md)"
+        if refused:
+            msg += (f", {refused} with a settings file left untouched (see that "
+                    "project's own UPDATE_DEFERRED.md)")
         try:
             print_fn(msg)
         except Exception:
@@ -3983,7 +4426,7 @@ def run_update_reprojection_step(
             log_event(
                 "9/10", "info",
                 "reproject_all_registered_projects "
-                f"migrated={migrated} failed={failed}",
+                f"migrated={migrated} failed={failed} refused={refused}",
             )
         except Exception:
             pass
@@ -4006,14 +4449,22 @@ __all__ = [
     "DbUnreachable",
     "ProjectEnvBundle",
     "ProjectNotFound",
-    "UserSecretBundle",
     "ProjectReprojectOutcome",
+    "SettingsWriteRefused",
     "apply_project_env",
-    "apply_user_secrets",
+    "build_apply_argv",
+    "known_user_secret_keys_for_folder",
     "list_canonical_keys",
     "list_registered_projects",
     "project_env_from_db",
     "reproject_all_registered_projects",
     "resolve_project_folder",
+    "classify_json_env_secrets",
+    "strip_proven_secret_values",
+    "retained_secret_keys_in",
+    "retained_user_secret_state",
+    "retained_launcher_value_names",
+    "strip_env_keys",
     "user_secret_known_keys_from_db",
+    "write_env_block",
 ]

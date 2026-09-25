@@ -4,7 +4,7 @@ description: Builds a reliable LLM-powered extraction pipeline for messy inputs 
 short_desc: LLM JSON extraction pipeline with validation + corrections
 keywords: [JSON extraction, schema validation, extraction pipeline, LLM extraction, Pydantic, unstructured data, "extract from PDF", "extract from email", "structured output", "JSON schema", "messy input", "extraction from documents"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Structured Output Extraction (Opus)

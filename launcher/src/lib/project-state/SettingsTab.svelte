@@ -19,6 +19,8 @@
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import { projects } from '$lib/stores/projects';
+  import { DEFAULT_UNREGISTER_OPTIONS, runUnregister } from '$lib/unregister-escape';
+  import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
   import type {
     ProjectView,
     RenameCollectionsPreview,
@@ -150,8 +152,8 @@
   //   - purgeCollections: OFF by default (opt-in); drops the project's
   //     own Weaviate collections. Shared never touched. Tooltip
   //     surfaces the rebuild path so users don't fear the choice.
-  let purgeLauncherFiles = $state(true);
-  let purgeCollections = $state(false);
+  let purgeLauncherFiles = $state(DEFAULT_UNREGISTER_OPTIONS.purgeLauncherFiles);
+  let purgeCollections = $state(DEFAULT_UNREGISTER_OPTIONS.purgeCollections);
   let unregisterConfirmText = $state('');
   let unregistering = $state(false);
   // The Unregister button is enabled only when the user has typed the
@@ -324,14 +326,35 @@
    * On success we navigate back to /projects — the deleted project
    * is no longer in the store, so /project/<id> would 404.
    */
+  // Owner ruling (review R5 F39): the unregister STOP opens a dialog whose
+  // second action is "Unregister anyway — leave these values".
+  let stopMessage = $state('');
+  let stopOpen = $state(false);
+  let resolveStop: ((leaveAnyway: boolean) => void) | null = null;
+  function askLeaveAnyway(message: string): Promise<boolean> {
+    stopMessage = message;
+    stopOpen = true;
+    return new Promise((resolve) => (resolveStop = resolve));
+  }
+  function onStopDecided(leaveAnyway: boolean) {
+    resolveStop?.(leaveAnyway);
+    resolveStop = null;
+  }
+
   async function unregister() {
     if (!project || !unregisterReady) return;
     unregistering = true;
     try {
-      const report = await projects.delete(project.id, {
-        purgeLauncherFiles,
-        purgeCollections,
-      });
+      const outcome = await runUnregister(
+        (options) => projects.delete(project!.id, options),
+        { purgeLauncherFiles, purgeCollections },
+        askLeaveAnyway,
+      );
+      if (outcome.kind === 'kept') {
+        toast.info('Unregister stopped — the project is still registered.');
+        return;
+      }
+      const report = outcome.report;
 
       // Surface every soft-fail warning as its own error toast (each is
       // distinct enough that batching would lose information).
@@ -361,6 +384,7 @@
       unregistering = false;
     }
   }
+
 
 
   // ── v0.2.92 WP-17 (W3): change the project's folder ────────────────────
@@ -893,10 +917,14 @@
             <strong>Remove launcher-managed files</strong>
             <small>
               Removes <code>.claude/hooks/</code>, <code>.claude/scripts/</code>,
-              infra compose YAMLs, and the canonical keys from your
-              <code>.env</code> / <code>.claude/env</code> /
-              <code>.claude/settings.json</code> /
-              <code>.vscode/settings.json</code>.
+              infra compose YAMLs, VCO's managed blocks in your
+              <code>.env</code> / <code>.claude/env</code>, the launcher's
+              routing keys in <code>.claude/settings.json</code> /
+              <code>.vscode/settings.json</code> where they still hold the
+              value the launcher writes, and a secret value in them only where
+              it equals the one the launcher stores (so VCO wrote it). A value
+              you set yourself is kept, and listed when the unregister
+              finishes.
               Your agents, skills, <code>CONTEXT_STATE.md</code>,
               <code>CLAUDE.md</code>, source code, and user-added
               <code>.env</code> values are preserved.
@@ -954,6 +982,13 @@
     modelSwitch={modelSwitchCtx}
   />
 {/if}
+
+<UnregisterStoppedDialog
+  bind:open={stopOpen}
+  message={stopMessage}
+  projectName={project?.name ?? ''}
+  onDecide={onStopDecided}
+/>
 
 <style>
   .ps-empty { padding: 40px; text-align: center; color: #888; }

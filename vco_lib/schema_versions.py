@@ -212,6 +212,12 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 47 = migration 047_service_endpoints.sql (v0.2.97 — one row per core
+#: service: mode, scheme/host/port, grpc_port, container + data-mount
+#: identity. The launcher DB becomes the one source of truth for where
+#: Weaviate/Ollama/code-embed are reached; resolvers answer row -> compiled
+#: default, and ``vco_lib.service_endpoints`` is the only writer). Bumped
+#: ATOMICALLY with mig 047's Rust registration.
 #: 46 = migration 046_chat_model_context_max_output_unstated.sql (v0.2.96 —
 #: chat_model_context.max_output CHECK widened from > 0 to >= 0 so the seed
 #: can carry 0 = "vendor does not publish a figure" for the qwen rows; an
@@ -274,7 +280,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 46
+LAUNCHER_DB_TABLE_SET_VERSION = 47
 
 
 # ===========================================================================

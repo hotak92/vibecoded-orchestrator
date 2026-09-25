@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Iterable
+from typing import Optional, Iterable
 
 import pytest
 
@@ -164,10 +164,8 @@ _LEGACY_ENV_TEMPLATE_MARKER = "env_template: legacy_caller_pending_migration"
 #   * launcher/src-tauri/src/commands/projects_v2.rs — production
 #     callers (create / rename / refresh / write-disabled-toggle) now
 #     subprocess into `python -m vco_lib.config_projection apply`
-#     via `apply_project_env_via_python`. The legacy
-#     `write_project_env_files` function is retained for test fixtures
-#     and for the user-secret SecretsPanel flow (which uses an in-Rust
-#     code path the Python contract doesn't cover yet — Phase 0.E).
+#     via `apply_project_env_via_python`. The legacy Rust env
+#     writer was deleted in v0.2.97 (no production caller remained).
 #   * install.py — `_backfill_code_graph_project_env` (orchestrator-root
 #     env projection) now imports + calls `apply_project_env` directly.
 #   * vco_lib/project_init.py — the per-user-project install-bundle
@@ -180,35 +178,40 @@ _LEGACY_PRODUCTION_WRITERS: set[Path] = set()
 
 # Phase 0.D: production code that writes ``.env`` directly and hasn't
 # been fully migrated. Each entry MUST carry
-# ``_LEGACY_ENV_TEMPLATE_MARKER``. Empty allowlist = full migration
-# complete.
-#
-# Current entries:
-#   * install.py — the fresh-write branch in ``_write_env_config`` still
-#     writes a mix of canonical Phase 0.D keys + install-time-only keys
-#     (EMBEDDING_MODEL / EMBEDDING_DIMS / EMBEDDING_PROVIDER /
-#     CODE_EMBED_BACKEND / CODE_EMBED_MODEL / CODE_EMBED_DIMS /
-#     VCT_JOERN_AVAILABLE / VCT_TELEMETRY / banner comments /
-#     RL-section placeholders). Splitting those into a managed-block-
-#     only path + a separate writer for the install-time tail is a
-#     follow-up refactor beyond Phase 0.D's brief. The EXISTING-file
-#     branch DOES route through ``apply_env_template`` via
-#     ``_ensure_env_template`` (migrated in this PR).
-#   * launcher/src-tauri/src/commands/projects_v2.rs —
-#     ``ensure_project_env_template`` is the Rust legacy writer; full
-#     migration to subprocess-into-Python is Phase 0.D Part 2 (a
-#     follow-up matching the Phase 0.B Part 2 / write_project_env_files
-#     pattern; out of scope for this PR).
-_LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = {
-    REPO_ROOT / "install.py",
-    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
-    # v0.2.54 Track B: writes to infrastructure/.env (compose project's
-    # env file, a different surface from the canonical project .env).
-    # Pre-extraction the same write lived in install.py and was on this
-    # allowlist; carry forward until the compose-env surface gets its
-    # own contract decision (Phase 0.D follow-up).
+# ``_LEGACY_ENV_TEMPLATE_MARKER``. The project ``.env`` surface is fully
+# migrated (v0.2.97) — see
+# ``test_project_dotenv_writers_are_migrated_v0297`` below, which fails if
+# either retired writer comes back:
+#   * install.py — ``_write_env_config`` (fresh + existing file) and
+#     ``_reconcile_env_keys`` go through
+#     ``vco_lib.install_env.write_orchestrator_env`` →
+#     ``vco_lib.env_template.apply_env_template``; the install-time-only
+#     keys are the new-file scaffold ``render_install_env_tail`` returns.
+#   * launcher/src-tauri/src/commands/projects_v2.rs — the Rust
+#     ``ensure_project_env_template`` / ``build_canonical_env_text`` /
+#     ``write_env_reference_sidecar`` are deleted; ``create_project_v2``
+#     runs ``python -m vco_lib.env_template apply`` (``reference`` under
+#     Safe add) through ``services/vco_lib_bridge.rs``.
+_LEGACY_ENV_TEMPLATE_WRITERS: set[Path] = set()
+
+# Writers of a file NAMED ``.env`` that is NOT the project ``.env`` surface
+# — allowlisted as the one writer of THEIR surface, not as a pending
+# migration (so no marker):
+#   * ``vco_lib/compose_env.py`` writes ``infrastructure/.env``, the
+#     container-compose project's variable file (read by ``podman/docker
+#     compose`` for the shared Weaviate/Ollama/code-embed services — image
+#     build knobs, not per-project keys). It has no VCO-managed block and a
+#     different reader, so ``apply_env_template``'s contract does not apply;
+#     ``compose_env.write_infrastructure_env`` is that surface's one writer.
+_OTHER_DOTENV_SURFACE_WRITERS: set[Path] = {
     REPO_ROOT / "vco_lib" / "compose_env.py",
 }
+
+# The files the project-``.env`` migration emptied out of the allowlist.
+_MIGRATED_DOTENV_WRITERS: tuple[Path, ...] = (
+    REPO_ROOT / "install.py",
+    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "projects_v2.rs",
+)
 
 
 # ─── Scanners ───────────────────────────────────────────────────────────
@@ -422,7 +425,13 @@ def _python_file_level_dotenv_writes(content: str) -> list[tuple[int, str]]:
 
       * ``target = <something> / ".env"`` (single literal)
       * ``target = <project_root> / ".env"`` (path-builder chain)
-      * THEN later: ``target.write_text(...)`` / ``target.write_bytes(...)``
+      * THEN later, any WRITE shape on ``target`` (v0.2.97 review R5 F40 —
+        by shape, not by name): ``target.write_text/write_bytes(…)``,
+        ``target.open("w"|"a"…)``, ``open(target, "w"|"a"…)``, an atomic
+        writer called on it (``atomic_write_text`` / ``atomic_write_bytes`` /
+        ``atomic_rewrite_text`` / ``_atomic_write_text``), or ``target`` as
+        the DESTINATION of ``os.replace`` / ``os.rename`` /
+        ``shutil.copy*`` / ``shutil.move``.
 
     Same single-function-body scope as
     :func:`_python_file_level_path_writes`.
@@ -434,16 +443,36 @@ def _python_file_level_dotenv_writes(content: str) -> list[tuple[int, str]]:
     tainted_assign = re.compile(
         r"""^\s*([a-zA-Z_][a-zA-Z_0-9]*)\s*=\s*[^=].*?["']\.env(["'])"""
     )
-    write_call = re.compile(
-        r"""^\s*([a-zA-Z_][a-zA-Z_0-9]*)\s*\.\s*write_(?:text|bytes)\s*\("""
-    )
+
+    def _writes(var: str) -> re.Pattern:
+        v = re.escape(var)
+        return re.compile(
+            rf"""\b{v}\s*\.\s*write_(?:text|bytes)\s*\("""
+            rf"""|\b{v}\s*\.\s*open\s*\(\s*["'][wax]"""
+            rf"""|\bopen\s*\(\s*{v}\s*,\s*["'][wax]"""
+            rf"""|\b_?atomic_(?:re)?write_(?:text|bytes)\s*\(\s*{v}\b"""
+            rf"""|\b(?:os\.replace|os\.rename|shutil\.(?:copy|copy2|copyfile|move))\s*\([^)]*,\s*(?:str\(\s*)?{v}\s*\)?\s*[,)]"""
+        )
 
     violations: list[tuple[int, str]] = []
     tainted: set[str] = set()
+    signature: Optional[str] = None
     for lineno, line in enumerate(content.splitlines(), start=1):
         stripped = line.strip()
+        if signature is not None:
+            # A multi-line `def` header: collect it until it closes.
+            signature += " " + stripped
+            if stripped.endswith(":"):
+                tainted |= {m.group(1) for m in _PY_ENV_PARAM.finditer(signature)}
+                signature = None
+            continue
         if stripped.startswith(("def ", "async def ", "class ")):
             tainted.clear()
+            # A `.env` path handed IN as a parameter is tainted too.
+            if stripped.endswith(":"):
+                tainted |= {m.group(1) for m in _PY_ENV_PARAM.finditer(stripped)}
+            else:
+                signature = stripped
             continue
         if not stripped or stripped.startswith(("#", '"""', "'''")):
             continue
@@ -454,9 +483,71 @@ def _python_file_level_dotenv_writes(content: str) -> list[tuple[int, str]]:
             # after the matched group's closing quote NOT to be a continuation.
             tainted.add(m_assign.group(1))
             continue
-        m_write = write_call.search(line)
-        if m_write and m_write.group(1) in tainted:
+        if any(_writes(var).search(line) for var in tainted):
             violations.append((lineno, line.rstrip()))
+    return violations
+
+
+#: Parameter names that carry a project ``.env`` path into a function — the
+#: names this codebase uses for one (``env_path``, ``env_file``,
+#: ``dotenv_path``, ``dot_env`` …). A ``.claude/env`` path is spelled
+#: ``claude_env*`` and is a different surface, so it does not match.
+_ENV_PARAM_NAMES = r"(?:env_path|env_file|env_file_path|dotenv|dotenv_path|dot_env|dot_env_path|root_env)"
+_RUST_ENV_PARAM = re.compile(
+    rf"""\b({_ENV_PARAM_NAMES})\s*:\s*&?\s*(?:mut\s+)?(?:std::path::)?(?:Path|PathBuf)\b"""
+)
+_PY_ENV_PARAM = re.compile(rf"""[(,]\s*\*?\s*({_ENV_PARAM_NAMES})\s*(?::[^,)=]*)?(?:=[^,)]*)?\s*(?=[,)])""")
+
+
+def _rust_file_level_dotenv_writes(content: str) -> list[tuple[int, str]]:
+    """Rust twin of :func:`_python_file_level_dotenv_writes` (v0.2.97 review
+    R5 F40). The call-level patterns need the ``.env`` literal INSIDE the
+    write call; the retired writer's shape — ``let env_path =
+    folder.join(".env"); … std::fs::write(&env_path, text)`` — carries it on
+    the binding instead. Per function (a line opening a ``fn`` resets the
+    taint): a ``let <var> = ….join(".env")`` / ``Path::new(".env")`` /
+    ``PathBuf::from(".env")`` binding taints ``<var>``; then any write shape on
+    it — ``fs::write(&var``, ``File::create(&var``, ``.open(&var)`` on an
+    ``OpenOptions`` builder, an ``atomic_write*`` helper, or ``var`` as the
+    destination of ``fs::copy`` / ``fs::rename`` — is a hit. Statements may
+    span lines, so each function's text is searched as a whole.
+    """
+    fn_start = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?(?:unsafe\s+)?fn\s")
+    taint = re.compile(
+        r"""\blet\s+(?:mut\s+)?([a-zA-Z_][a-zA-Z_0-9]*)\b[^=;]*=\s*[^;]*?"""
+        r"""(?:\.join\(\s*"\.env"\s*\)|Path::new\(\s*"\.env"\s*\)|PathBuf::from\(\s*"\.env"\s*\))""",
+        re.S,
+    )
+
+    def _writes(var: str) -> re.Pattern:
+        v = re.escape(var)
+        return re.compile(
+            rf"""\bfs::write\s*\(\s*&?\s*{v}\b"""
+            rf"""|\bFile::create\s*\(\s*&?\s*{v}\b"""
+            rf"""|\.open\s*\(\s*&?\s*{v}\s*\)"""
+            rf"""|\batomic_write\w*\s*\(\s*&?\s*{v}\b"""
+            rf"""|\bfs::(?:copy|rename)\s*\([^;]*?,\s*&?\s*{v}\b""",
+            re.S,
+        )
+
+    lines = content.splitlines()
+    starts = [i for i, ln in enumerate(lines) if fn_start.match(ln)] + [len(lines)]
+    chunks = [(0, starts[0])] + list(zip(starts, starts[1:]))
+    violations: list[tuple[int, str]] = []
+    for lo, hi in chunks:
+        body = "\n".join(
+            "" if ln.strip().startswith("//") else ln for ln in lines[lo:hi]
+        )
+        tainted = {m.group(1) for m in taint.finditer(body)}
+        # A `.env` path handed IN as a parameter (review follow-up, v0.2.97:
+        # the retired B12 repair was `fn …(env_path: &Path, …)` +
+        # `std::fs::write(env_path, joined)` — no `.join(".env")` in sight).
+        signature = body.split("{", 1)[0]
+        tainted |= {m.group(1) for m in _RUST_ENV_PARAM.finditer(signature)}
+        for var in tainted:
+            for m in _writes(var).finditer(body):
+                lineno = lo + body.count("\n", 0, m.start()) + 1
+                violations.append((lineno, lines[lineno - 1].rstrip()))
     return violations
 
 
@@ -843,7 +934,7 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
     legacy_files_with_hits: set[Path] = set()
 
     for path in _iter_target_files():
-        if path in _ALLOWLIST_FILES:
+        if path in _ALLOWLIST_FILES or path in _OTHER_DOTENV_SURFACE_WRITERS:
             continue
         if any(_path_is_under(path, d) for d in _ALLOWLIST_DIRS):
             continue
@@ -877,9 +968,12 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
                     file_hits.append((lineno, line.rstrip()))
                     break
 
-        # Python file-level alias pattern.
+        # File-level alias patterns (a variable bound to the `.env` path,
+        # written through later) — by shape, both languages.
         if path.suffix == ".py":
             file_hits.extend(_python_file_level_dotenv_writes(content))
+        elif path.suffix == ".rs":
+            file_hits.extend(_rust_file_level_dotenv_writes(content))
 
         if not file_hits:
             continue
@@ -916,6 +1010,133 @@ def test_no_direct_writes_to_dotenv_outside_contract() -> None:
             f"Allowed path: vco_lib.env_template.apply_env_template "
             f"(or its CLI: `python -m vco_lib.env_template apply`).\n"
         )
+
+
+def test_project_dotenv_writers_are_migrated_v0297() -> None:
+    """v0.2.97: the project ``.env`` migration is complete — the legacy
+    allowlist is EMPTY, so the scan above treats any direct ``.env`` write
+    in the two retired writers' files as a violation, and they carry no
+    migration marker. (Whether a retired writer came back is decided BY
+    SHAPE — ``test_the_guard_sees_the_retired_writers_by_shape`` — never by
+    looking for its function name.)"""
+    assert _LEGACY_ENV_TEMPLATE_WRITERS == set()
+    for path in _MIGRATED_DOTENV_WRITERS:
+        assert path not in _LEGACY_ENV_TEMPLATE_WRITERS, path
+        content = _read_text_safely(path)
+        assert not _file_carries_env_template_marker(content), path
+
+
+# The retired writers' exact write shapes (review R5 F40). The guard above must
+# see them BY SHAPE — a renamed function or variable changes nothing.
+_RETIRED_RUST_WRITER = """
+pub fn renamed_writer(folder: &Path, settings: &Settings) -> Result<(), String> {
+    let env_path = folder.join(".env");
+    if !env_path.exists() {
+        let text = render(settings);
+        std::fs::write(&env_path, text)
+            .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
+        return Ok(());
+    }
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(&env_path)
+        .map_err(|e| e.to_string())?;
+    Ok(())
+}
+"""
+_RETIRED_PY_WRITER = """
+def renamed_writer(root):
+    env_file = root / ".env"
+    env_file.write_text("A=1\\n")
+
+
+def via_atomic(root):
+    target = root / ".env"
+    atomic_write_text(target, "A=1\\n")
+
+
+def via_open(root):
+    target = root / ".env"
+    with open(target, "a") as fh:
+        fh.write("A=1\\n")
+"""
+
+
+def test_the_guard_sees_the_retired_writers_by_shape() -> None:
+    rust_hits = _rust_file_level_dotenv_writes(_RETIRED_RUST_WRITER)
+    assert any("std::fs::write(&env_path" in line for _, line in rust_hits), rust_hits
+    assert any(".open(&env_path)" in line for _, line in rust_hits), rust_hits
+    # A different variable name is the same shape.
+    renamed = _RETIRED_RUST_WRITER.replace("env_path", "target")
+    assert len(_rust_file_level_dotenv_writes(renamed)) == len(rust_hits)
+    py_hits = _python_file_level_dotenv_writes(_RETIRED_PY_WRITER)
+    assert len(py_hits) == 3, py_hits
+
+
+def test_the_guard_sees_a_dotenv_path_passed_in_as_a_parameter() -> None:
+    """The retired B12 repair's exact shape: the path arrives as a parameter
+    and is written directly. Both languages, and a read stays clean."""
+    retired_b12 = """
+pub fn b12_repair_stale_kg_collection(
+    env_path: &Path,
+    project_name: &str,
+) -> std::io::Result<B12Outcome> {
+    let env_text = std::fs::read_to_string(env_path)?;
+    let joined = env_text.clone();
+    std::fs::write(env_path, joined)?;
+    Ok(B12Outcome::NoChangeNeeded)
+}
+"""
+    hits = _rust_file_level_dotenv_writes(retired_b12)
+    assert [line.strip() for _, line in hits] == ["std::fs::write(env_path, joined)?;"], hits
+    reader = retired_b12.replace("    std::fs::write(env_path, joined)?;\n", "")
+    assert _rust_file_level_dotenv_writes(reader) == []
+    other_surface = retired_b12.replace("env_path", "claude_env_path")
+    assert _rust_file_level_dotenv_writes(other_surface) == []
+
+    py = (
+        "def repair(env_path: Path, name: str) -> None:\n"
+        "    env_path.write_text('KG_COLLECTION=x\\n')\n"
+        "\n"
+        "def read(env_file):\n"
+        "    return env_file.read_text()\n"
+    )
+    assert len(_python_file_level_dotenv_writes(py)) == 1
+
+
+def test_the_shape_scanners_leave_reads_and_other_files_alone() -> None:
+    reads = """
+fn reader(folder: &Path) -> String {
+    let env_path = folder.join(".env");
+    std::fs::read_to_string(&env_path).unwrap_or_default()
+}
+fn other(folder: &Path) {
+    let example = folder.join(".env.example");
+    std::fs::write(&example, "x").ok();
+}
+"""
+    assert _rust_file_level_dotenv_writes(reads) == []
+    py_reads = """
+def reader(root):
+    env_path = root / ".env"
+    return env_path.read_text()
+
+
+def other(root):
+    example = root / ".env.example"
+    example.write_text("x")
+"""
+    assert _python_file_level_dotenv_writes(py_reads) == []
+
+
+def test_other_dotenv_surface_writers_write_a_non_project_env() -> None:
+    """Each non-project ``.env`` writer really writes ANOTHER surface: its
+    source names that surface's directory next to the ``.env`` literal."""
+    compose = _read_text_safely(REPO_ROOT / "vco_lib" / "compose_env.py")
+    assert 'infra_env = infra_dir / ".env"' in compose
+    for path in _OTHER_DOTENV_SURFACE_WRITERS:
+        assert path.exists(), path
+        assert not _file_carries_env_template_marker(_read_text_safely(path)), path
 
 
 def test_legacy_env_template_writers_carry_marker() -> None:

@@ -44,12 +44,10 @@ const MIN_TIER: &str = "pro";
 /// Feature noun-phrase for the refusal copy (`tier_required_message`).
 const FEATURE: &str = "The Orchestrator Hub";
 
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
 /// Read the per-startup auth token written by `hub::auth::write_token_file`.
@@ -58,20 +56,15 @@ fn hub_port() -> Result<u16, String> {
 /// `hub_port()` (the hub isn't fully up; treat both as "hub
 /// unreachable" upstream so callers don't have to differentiate).
 fn hub_token() -> Result<String, String> {
-    let path = crate::paths::vct_root_dir().join("hub.token");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.token: {}", e))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("hub.token at {} is empty", path.display()));
-    }
-    Ok(trimmed.to_string())
+    vct_launcher_core::services::boot_token::read_nonempty_token_file(
+        &crate::paths::vct_root_dir().join("hub.token"),
+    )
 }
 
+/// The hub carries the bearer token: never through a proxy, never
+/// redirected (`vct_launcher_core::services::loopback_http`).
 fn hub_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(8))
-        .build()
-        .map_err(|e| format!("http client: {}", e))
+    vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(8))
 }
 
 async fn hub_get(path: &str) -> Result<Value, String> {
@@ -218,5 +211,42 @@ mod tests {
     #[test]
     fn min_tier_is_pro() {
         assert_eq!(MIN_TIER, "pro");
+    }
+
+    /// R7b F19 (generalised): with every proxy variable pointing at a dead
+    /// port and no `NO_PROXY`, `hub_get` still reaches the hub on 127.0.0.1
+    /// with its bearer token — it never goes through the proxy. A test-owned
+    /// axum server on an ephemeral port stands in for the hub (`hub.port`
+    /// and `hub.token` in a scratch state dir). Red if `hub_client` is built
+    /// without `services::loopback_http`.
+    #[tokio::test]
+    async fn hub_get_never_goes_through_a_proxy() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = axum::Router::new().route(
+            "/api/v1/apps",
+            axum::routing::get(|headers: axum::http::HeaderMap| async move {
+                let auth = headers.get("authorization").and_then(|v| v.to_str().ok()).unwrap_or("").to_string();
+                axum::Json(serde_json::json!({ "auth": auth }))
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, app).await.ok() });
+
+        let dead = Some("http://127.0.0.1:9");
+        let guard = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("HTTP_PROXY", dead),
+            ("http_proxy", dead),
+            ("HTTPS_PROXY", dead),
+            ("https_proxy", dead),
+            ("ALL_PROXY", dead),
+            ("all_proxy", dead),
+            ("NO_PROXY", None),
+            ("no_proxy", None),
+            ("VCT_HUB_PORT", None),
+        ]);
+        std::fs::write(guard.path().join("hub.port"), format!("{port}\n")).unwrap();
+        std::fs::write(guard.path().join("hub.token"), "test-token\n").unwrap();
+        let got = hub_get("/apps").await.expect("direct to the hub, not through the proxy");
+        assert_eq!(got["auth"], "Bearer test-token");
     }
 }

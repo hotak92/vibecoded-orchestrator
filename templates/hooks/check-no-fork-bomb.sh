@@ -23,8 +23,9 @@
 # fork-bomb count (4512), so it sits squarely in the unambiguous-bomb
 # zone without false positives on normal workloads.
 #
-# See knowledge/concepts/lean-ctx-shim-disabled.md for full incident
-# forensics and the original proposal this hook implements.
+# (A fuller forensic write-up exists in the maintainer's private KG; it does
+# not ship with the orchestrator. The incident summary above is the shipped
+# record.)
 
 set -u
 
@@ -74,7 +75,7 @@ hook_tag="[check-no-fork-bomb ${timestamp}]"
 
 echo "${hook_tag} ⚠️  Fork-bomb detected: ${LEAN_CTX_COUNT} lean-ctx processes (threshold ${LEAN_CTX_FORK_BOMB_THRESHOLD})." >&2
 echo "${hook_tag} Killing all lean-ctx processes for user ${USER:-$(id -un)}..." >&2
-echo "${hook_tag} See knowledge/concepts/lean-ctx-shim-disabled.md for context." >&2
+echo "${hook_tag} Context: the pre-0.2.11 BASH_ENV lean-ctx shim could recurse into this; it was removed in 0.2.11 and replaced by the PreToolUse lean-ctx-rewrite hook." >&2
 
 # `pkill -KILL -x -u $USER lean-ctx` — exact name match, current user only.
 # `-KILL` is portable to BSD pkill (macOS) and GNU pkill (Linux). We

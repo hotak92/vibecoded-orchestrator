@@ -22,8 +22,8 @@
 #
 # Real damage observed: 4000+ processes spawned in seconds, 88% memory
 # pressure, system OOM. Incident 2026-04-30 (lean-ctx 3.x rollout) and
-# again on 2026-05-15 (recidiva). Full forensic write-up:
-# knowledge/concepts/lean-ctx-shim-disabled.md (orchestrator KG).
+# again on 2026-05-15 (recidiva). (A fuller forensic write-up exists in the
+# maintainer's private KG; it does not ship with the orchestrator.)
 #
 # WHAT REPLACED IT
 # ----------------

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # search-mcp wrapper — runs the search MCP server with GITHUB_TOKEN
-# populated from the launcher's keychain (via the hub HTTP API), never
-# leaking the secret to the calling shell.
+# populated from the launcher's keychain (via the hub HTTP API) when one
+# resolves, never leaking the secret to the calling shell. The token is
+# OPTIONAL: the server does not read it, so the server starts without it
+# (v0.2.97 — see "Path 1" below).
 #
 # Why a wrapper:
 #   Claude Code's ~/.claude.json `env:` block does not expand ${VAR}
@@ -14,13 +16,11 @@
 #   Two resolution paths, in order:
 #
 #   1. Env-first (canonical 0.1.7 path): if $GITHUB_TOKEN is already
-#      exported, use it. The launcher's `write_project_env_files`
-#      writes GITHUB_TOKEN to `.claude/env`, `.claude/settings.json`
-#      `env`, and `.vscode/settings.json` `claude-code.env` for every
-#      registered project, sourced from the keychain entry at
-#      `vct._user_shared_.shared.installer/github_pat`. Subprocesses
-#      spawned in any registered project's Claude Code session inherit
-#      it directly — no resolver call needed.
+#      exported, use it (exported by the user, or injected by
+#      `vct exec --secret github_pat=GITHUB_TOKEN`). The launcher writes
+#      NO secret values into project env files (v0.2.73 write
+#      invariant), so in a launcher-managed session this is normally
+#      unset and path 2 answers.
 #
 #   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`):
 #      reads from the launcher's hub HTTP API at
@@ -101,10 +101,8 @@ done
 
 # ── Resolve GITHUB_TOKEN ─────────────────────────────────────────────────────
 # Two paths, in order (legacy file fallback retired in 0.1.7 final, item H4):
-#   1. $GITHUB_TOKEN already exported in the environment — canonical 0.1.7
-#      path. Set by the launcher's `write_project_env_files` for every
-#      registered project, sourced from the keychain entry at
-#      `vct._user_shared_.shared.installer/github_pat`.
+#   1. $GITHUB_TOKEN already exported in the environment (by the user or
+#      `vct exec`; the launcher never writes it into project files).
 #   2. Resolver helper (`vct_secrets_resolve.sh <path> github_pat`) —
 #      reads the keychain via the launcher hub. Works end-to-end for
 #      every base-host project after 0.1.7 H1: the orchestrator's
@@ -115,8 +113,17 @@ done
 project_path="${VCT_PROJECT_PATH:-$PWD}"
 
 # Path 1: env-first.
+#
+# GITHUB_TOKEN is OPTIONAL here. The search server reads no GitHub token —
+# it exposes `search_papers` only (OpenAlex + arXiv; the GitHub-backed tools
+# were retired in v0.2.11, see mcp_registration.rs). The wrapper passes one
+# through for anything that wants it, so a token it cannot resolve is
+# REPORTED on stderr and the server still starts. Until v0.2.97 every
+# resolution failure was fatal (`exit 1`), so on a machine with no registered
+# PAT — or with the PAT paused for this project — the MCP failed to start
+# ("Failed to connect") for a secret it never uses.
 if [[ -n "${GITHUB_TOKEN:-}" ]]; then
-    : # already in env via launcher's per-project env-file emission
+    : # already exported by the user or injected by `vct exec --secret`
 elif [[ -n "$RESOLVER" ]]; then
     # Capture ONLY stdout (the secret value) via command substitution. The
     # resolver's stderr carries the operator-facing diagnostic (e.g. "keychain
@@ -128,61 +135,59 @@ elif [[ -n "$RESOLVER" ]]; then
     GITHUB_TOKEN=$("$RESOLVER" "$project_path" github_pat)
     rc=$?
     set -e
+    [[ "$rc" -eq 0 ]] || GITHUB_TOKEN=""
     case "$rc" in
         0)
             : # ok — resolver returned the value
             ;;
         1)
-            echo "[search-mcp-wrapper] WARN: launcher hub unreachable; the launcher must be running to resolve secrets" >&2
+            echo "[search-mcp-wrapper] NOTE: launcher hub unreachable; the launcher must be running to resolve secrets" >&2
             ;;
         2)
-            echo "[search-mcp-wrapper] WARN: project $project_path not registered with the launcher" >&2
+            echo "[search-mcp-wrapper] NOTE: project $project_path not registered with the launcher" >&2
             ;;
         3)
-            echo "[search-mcp-wrapper] ERROR: github_pat is paused for project $project_path; reactivate it via the launcher GUI" >&2
-            exit 1
+            echo "[search-mcp-wrapper] NOTE: github_pat is paused for project $project_path (reactivate it in the launcher's Secrets panel if a tool here needs it)" >&2
             ;;
         4)
-            echo "[search-mcp-wrapper] WARN: github_pat not declared by any installed module nor by the orchestrator's bundled_secrets for $project_path" >&2
+            echo "[search-mcp-wrapper] NOTE: github_pat not declared by any installed module nor by the orchestrator's bundled_secrets for $project_path" >&2
             ;;
         5)
             # Hub refused the token on /env — a scoped hub.token.<id> is
             # required (or the token was for the wrong project). See
             # vct_secrets_resolve.sh's exit-code contract (5 = forbidden).
-            echo "[search-mcp-wrapper] ERROR: hub refused the token resolving github_pat for $project_path (forbidden — a project-scoped hub token is required); restart the launcher/session so a fresh scoped token is minted" >&2
-            exit 1
+            echo "[search-mcp-wrapper] NOTE: hub refused the token resolving github_pat for $project_path (forbidden — a project-scoped hub token is required); restart the launcher/session so a fresh scoped token is minted" >&2
             ;;
         6)
             # OS keychain is locked or a per-key read failed (hub 503
             # keychain_locked / keychain_error). The resolver already printed a
             # keychain-specific diagnostic to stderr (now visible — see above).
-            echo "[search-mcp-wrapper] ERROR: OS keychain is locked or unreadable resolving github_pat for $project_path; unlock the login keychain (or open the launcher) and retry" >&2
-            exit 1
+            echo "[search-mcp-wrapper] NOTE: OS keychain is locked or unreadable resolving github_pat for $project_path; unlock the login keychain (or open the launcher) and retry" >&2
             ;;
         *)
-            echo "[search-mcp-wrapper] WARN: resolver exited with code $rc" >&2
+            echo "[search-mcp-wrapper] NOTE: resolver exited with code $rc" >&2
             ;;
     esac
 else
-    echo "[search-mcp-wrapper] WARN: vct_secrets_resolve.sh not found; orchestrator may not be installed" >&2
+    echo "[search-mcp-wrapper] NOTE: vct_secrets_resolve.sh not found; orchestrator may not be installed" >&2
 fi
 
 if [[ -z "${GITHUB_TOKEN:-}" ]]; then
-    echo "[search-mcp-wrapper] ERROR: could not resolve github_pat" >&2
-    echo "[search-mcp-wrapper] Canonical fix (0.1.7+):" >&2
-    echo "  1. Make sure the VCO Launcher is running" >&2
-    echo "  2. Open the launcher's OnboardingWizard or Settings → GitHub Token" >&2
-    echo "     (writes to keychain at vct._user_shared_.shared.installer/github_pat)" >&2
-    echo "  3. The launcher auto-writes GITHUB_TOKEN to every registered project's" >&2
-    echo "     .claude/env, .claude/settings.json env, and .vscode/settings.json" >&2
-    echo "     claude-code.env. Verify: grep '^export GITHUB_TOKEN=' .claude/env" >&2
-    echo "  4. If the env var is set but you're still seeing this error, restart" >&2
-    echo "     your Claude Code session (env files are read at session start)." >&2
-    echo "  5. As a last resort, run vct_secrets_resolve.sh \"\$PWD\" github_pat" >&2
-    echo "     directly to see the resolver's exit code + diagnostic output." >&2
-    exit 1
+    # A printed command is shipped code: every line below names something
+    # that exists and works (v0.2.97 — this block used to promise that "the
+    # launcher auto-writes GITHUB_TOKEN to every registered project's
+    # .claude/env", which no writer has done since v0.2.73).
+    unset GITHUB_TOKEN
+    echo "[search-mcp-wrapper] NOTE: starting WITHOUT GITHUB_TOKEN — the search server does not need it." >&2
+    echo "  To make one available: register the PAT in the launcher (OnboardingWizard, or" >&2
+    echo "  Preferences -> Special Secrets). It lives in the OS keychain and is resolved at" >&2
+    echo "  need through vct-hub — VCO writes no secret value into project files (v0.2.73)." >&2
+    echo "  Check that it resolves (the exit code names the reason):" >&2
+    echo "    ${RESOLVER:-$REPO_ROOT/.claude/scripts/vct_secrets_resolve.sh} \"$project_path\" github_pat" >&2
+    echo "  Or inject one for a single command: vct exec --secret github_pat=GITHUB_TOKEN -- <cmd>" >&2
+else
+    export GITHUB_TOKEN
 fi
-export GITHUB_TOKEN
 
 # ── Sanity checks for the python runtime ─────────────────────────────────────
 if [[ ! -x "$PYTHON_BIN" ]]; then

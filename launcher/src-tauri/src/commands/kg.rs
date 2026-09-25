@@ -12,35 +12,20 @@
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
-use crate::config::LocalConfig;
 use crate::db::Db;
 
-/// Resolve the local Weaviate URL with full env > config-file > default
-/// precedence. The compiled default mirrors `config::DEFAULT_WEAVIATE_URL`
-/// so a Tauri command invoked outside a managed `LocalConfig` (e.g. unit
-/// tests that spin up an axum router without a full app) still gets a
-/// working URL — `WEAVIATE_URL` env var continues to work as the test
-/// override hook (see hub::cli_api tests).
-fn weaviate_url(cfg: Option<&LocalConfig>) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.map(|c| c.weaviate_url.clone())
-        .unwrap_or_else(|| crate::config::DEFAULT_WEAVIATE_URL.to_string())
+/// Where the KG dashboard reaches Weaviate — the machine row
+/// (`service_endpoints::machine_weaviate_url`). The launcher reads no
+/// endpoint env var: it is machine-scoped, and a project's hook may have
+/// started it with that project's projected `WEAVIATE_URL` (v0.2.97).
+fn weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
-fn weaviate_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))
+/// A client for `base` (the machine's Weaviate — loopback unless adopted
+/// elsewhere): `vct_launcher_core::services::loopback_http::client_for`.
+fn weaviate_client(base: &str) -> Result<reqwest::Client, String> {
+    vct_launcher_core::services::loopback_http::client_for(base, std::time::Duration::from_secs(15))
 }
 
 // ─── Collection access ───────────────────────────────────────────────────
@@ -103,10 +88,9 @@ fn is_codegraph_class(name: &str) -> bool {
 pub async fn kg_list_collections(
     project_id: String,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<Vec<KgCollectionAccess>, String> {
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     // Weaviate exposes a schema listing at /v1/schema
     let schema_resp = client
         .get(format!("{}/v1/schema", &base))
@@ -237,12 +221,11 @@ pub struct CodegraphProjectSummary {
 pub async fn codegraph_list_projects(
     project_id: String,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
     include_untracked_projects: Option<bool>,
 ) -> Result<Vec<CodegraphProjectSummary>, String> {
     let include_untracked = include_untracked_projects.unwrap_or(false);
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     let schema_resp = client
         .get(format!("{}/v1/schema", &base))
         .send()
@@ -452,13 +435,12 @@ pub async fn kg_load_graph(
     tag_filter: Option<Vec<String>>,
     max_nodes: Option<u32>,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<KgGraph, String> {
     require_kg_read(&db, &project_id, &collection)?;
     let limit = max_nodes.unwrap_or(500).min(2000);
 
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     let total = fetch_class_count(&client, &base, &collection)
         .await
         .unwrap_or(0);
@@ -603,14 +585,13 @@ pub async fn kg_search(
     query: String,
     limit: Option<u32>,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<Vec<KgNode>, String> {
     for c in &collections {
         require_kg_read(&db, &project_id, c)?;
     }
     let limit = limit.unwrap_or(20).min(100);
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
 
     let mut out = Vec::new();
     for collection in collections {
@@ -727,11 +708,10 @@ pub async fn kg_get_node(
     collection: String,
     node_id: String,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<KgNodeFull, String> {
     require_kg_read(&db, &project_id, &collection)?;
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     let resp = client
         .get(format!("{}/v1/objects/{}/{}", &base, collection, node_id))
         .send()
@@ -785,15 +765,14 @@ pub struct PromoteReq {
 pub async fn kg_promote_to_shared(
     req: PromoteReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<(), String> {
     require_kg_read(&db, &req.project_id, &req.source_collection)?;
     let shared = req
         .shared_collection
         .unwrap_or_else(|| "sharedVCT".to_string());
 
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     // 1. Fetch the source node (properties only)
     let src = client
         .get(format!(
@@ -1028,15 +1007,14 @@ pub struct NodeAccessReq {
 pub async fn kg_set_node_access(
     req: NodeAccessReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<(), String> {
     require_kg_read(&db, &req.project_id, &req.collection)?;
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
         return Err(format!("invalid mode: {}", req.mode));
     }
     let allowed = compute_allowed_ids(&req.mode, &req.project_ids);
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     patch_node_access(&client, &base, &req.collection, &req.node_id, &allowed).await?;
     db.audit(
         "kg_node_access_set",
@@ -1123,7 +1101,6 @@ pub struct BulkFailure {
 pub async fn kg_set_node_access_bulk(
     req: NodeAccessBulkReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<BulkAccessResult, String> {
     require_kg_read(&db, &req.project_id, &req.collection)?;
     if !matches!(req.mode.as_str(), "shared" | "projects" | "private") {
@@ -1134,8 +1111,8 @@ pub async fn kg_set_node_access_bulk(
     }
 
     let allowed = compute_allowed_ids(&req.mode, &req.project_ids);
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
 
     let mut succeeded = 0usize;
     let mut failures: Vec<BulkFailure> = Vec::new();
@@ -1173,10 +1150,10 @@ pub async fn kg_set_node_access_bulk(
 #[command]
 pub async fn kg_ensure_node_access_schema(
     collection: String,
-    cfg: State<'_, LocalConfig>,
+    db: State<'_, Db>,
 ) -> Result<bool, String> {
-    let base = weaviate_url(Some(&cfg));
-    let client = weaviate_client()?;
+    let base = weaviate_url(&db);
+    let client = weaviate_client(&base)?;
     let url = format!("{}/v1/schema/{}", &base, collection);
     let resp = client
         .get(&url)

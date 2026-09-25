@@ -531,6 +531,93 @@ fn free_bytes_at(_path: &Path) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// Which runtime owns the volumes (v0.2.97 owner ruling "Honour the pin")
+// ---------------------------------------------------------------------------
+
+/// The orchestrator volumes under the runtime storage commands drive
+/// (`storage_ux::storage_runtime`, the shared pin-first detector) — or a
+/// REFUSAL when they exist only under the other runtime.
+///
+/// Pre-v0.2.97 this file listed volumes under whichever runtime answered
+/// first (podman, then docker) and ran `compose stop` / `volume rm` under a
+/// separate podman-first PATH probe — both ignoring `VCT_CONTAINER_RUNTIME`.
+/// On a docker-pinned machine with a leftover podman copy, that inspected
+/// and migrated the podman copy. podman and docker keep separate volumes, so
+/// a volume only the other runtime has is refused, never adopted.
+///
+/// R7b F4: PER VOLUME. This used to ask the other runtime only when the
+/// chosen one had NO orchestrator volume at all, so with docker owning
+/// `ollama_data` and `weaviate_data` only under podman, a migration moved
+/// `ollama_data` and said nothing about `weaviate_data` (compose would then
+/// create an empty one). Now every name in `ORCHESTRATOR_VOLUME_NAMES` is
+/// checked, and any the chosen runtime lacks but the other one HAS is
+/// refused by name. A failed inspect under the chosen runtime is an error,
+/// not "absent" (R7b F25(b)); under the other runtime it is not ownership.
+async fn existing_volumes_owned_by(
+    rt: &super::storage_ux::StorageRuntime,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    use super::storage_ux::{probe_volume, VolumeProbe};
+    use vct_launcher_core::services::container_runtime::{check_runtime_owns, other_runtime};
+    let other = other_runtime(&rt.name);
+    let mut owned: Vec<ExistingVolume> = Vec::new();
+    let mut only_elsewhere: Vec<String> = Vec::new();
+    for name in super::installer::ORCHESTRATOR_VOLUME_NAMES {
+        match probe_volume(&rt.name, name).await {
+            VolumeProbe::Found { mountpoint, driver } => {
+                owned.push(ExistingVolume { name: name.to_string(), mountpoint, driver });
+            }
+            VolumeProbe::Unknown(why) => {
+                return Err(format!(
+                    "could not tell whether {} holds the orchestrator volume `{name}` ({why}); \
+                     refusing to {action} the volumes until `{} volume inspect {name}` answers",
+                    rt.name, rt.name
+                ));
+            }
+            VolumeProbe::Missing => {
+                if matches!(probe_volume(other, name).await, VolumeProbe::Found { .. }) {
+                    only_elsewhere.push(format!("`{name}`"));
+                }
+            }
+        }
+    }
+    check_runtime_owns(
+        action,
+        &format!("the orchestrator volume(s) {}", only_elsewhere.join(", ")),
+        &rt.name,
+        rt.pin,
+        false,
+        !only_elsewhere.is_empty(),
+    )?;
+    Ok(owned)
+}
+
+/// [`existing_volumes_owned_by`] for the read-only and install-time
+/// commands. No usable runtime → an empty list, as before (a machine before
+/// its first install has none); the only error is the ownership refusal.
+pub(crate) async fn existing_volumes_on_storage_runtime(
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    let install_root = super::installer::find_local_repo_root().ok();
+    existing_volumes_on_storage_runtime_at(install_root.as_deref(), action).await
+}
+
+/// [`existing_volumes_on_storage_runtime`] with the install root passed in
+/// (tests point it at a temp dir, so no machine's `runtime.txt` leaks in).
+pub(crate) async fn existing_volumes_on_storage_runtime_at(
+    install_root: Option<&Path>,
+    action: &str,
+) -> Result<Vec<ExistingVolume>, String> {
+    match super::storage_ux::storage_runtime_at(install_root).await {
+        Ok(rt) => existing_volumes_owned_by(&rt, action).await,
+        Err(e) => {
+            tracing::info!("[volumes] no usable container runtime ({e}); no existing volumes");
+            Ok(Vec::new())
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tauri commands
 // ---------------------------------------------------------------------------
 
@@ -539,7 +626,7 @@ fn free_bytes_at(_path: &Path) -> Option<u64> {
 #[command]
 pub async fn get_volumes_config() -> Result<VolumesConfig, String> {
     let cfg = read_launcher_config();
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("inspect").await?;
 
     // Compute per-volume sizes by `du`-walking each mountpoint.
     let mut volumes: Vec<VolumeWithSize> = Vec::new();
@@ -598,7 +685,7 @@ pub async fn set_volumes_config_for_install(
 ) -> Result<VolumesConfig, String> {
     // Read existing first — if anything is found, we go down the
     // "detected" branch regardless of what the caller passed.
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("adopt").await?;
     if !existing.is_empty() {
         let mut mapping: Vec<LegacyVolumeMapping> = Vec::new();
         for ev in &existing {
@@ -675,38 +762,19 @@ pub async fn set_volumes_config_for_install(
 }
 
 /// Append/update `VCT_VOLUMES_PATH=<path>` in `infrastructure/.env` (or
-/// create the file). Other env keys are preserved.
+/// create the file). Other env keys are preserved. v0.2.97 (review R5 F40):
+/// through the ONE writer of that file, `vco_lib.compose_env`
+/// (`services::vco_lib_bridge::set_infrastructure_env_key`) — this was a
+/// second, Rust read-modify-write of it.
 fn write_volumes_env_var(path: &Path) -> Result<(), String> {
-    let env_path = orchestrator_root()?.join("infrastructure").join(".env");
-    let mut lines: Vec<String> = if env_path.exists() {
-        std::fs::read_to_string(&env_path)
-            .map_err(|e| format!("read {}: {}", env_path.display(), e))?
-            .lines()
-            .map(|l| l.to_string())
-            .collect()
-    } else {
-        Vec::new()
-    };
-    let new_line = format!("VCT_VOLUMES_PATH={}", path.display());
-    let mut replaced = false;
-    for line in lines.iter_mut() {
-        if line.starts_with("VCT_VOLUMES_PATH=") {
-            *line = new_line.clone();
-            replaced = true;
-            break;
-        }
-    }
-    if !replaced {
-        lines.push(new_line);
-    }
-    let body = lines.join("\n") + "\n";
-    if let Some(parent) = env_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("create {}: {}", parent.display(), e))?;
-    }
-    std::fs::write(&env_path, body)
-        .map_err(|e| format!("write {}: {}", env_path.display(), e))?;
-    Ok(())
+    let root = orchestrator_root()?;
+    crate::services::vco_lib_bridge::set_infrastructure_env_key(
+        Some(&root),
+        &root.join("infrastructure"),
+        "VCT_VOLUMES_PATH",
+        &path.display().to_string(),
+    )
+    .map(|_| ())
 }
 
 /// Build a migration plan WITHOUT touching anything. Frontend renders
@@ -714,7 +782,7 @@ fn write_volumes_env_var(path: &Path) -> Result<(), String> {
 #[command]
 pub async fn set_volumes_config_dry_run(path: String) -> Result<MigrationPlan, String> {
     let cfg = read_launcher_config();
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    let existing = existing_volumes_on_storage_runtime("plan a migration of").await?;
 
     let target = if path.trim() == "default" || path.trim().is_empty() {
         // Migrating BACK to default: target path is the runtime default.
@@ -839,10 +907,12 @@ pub async fn migrate_volumes(
     let _plan = set_volumes_config_dry_run(path.clone()).await?;
     let target = validate_custom_volumes_path(path.trim())?;
 
-    let runtime = which_container_runtime()
-        .ok_or("no container runtime (podman/docker) found on PATH")?;
-
-    let existing = super::installer::detect_existing_volumes_for_volumes_module().await;
+    // The shared pin-first runtime (v0.2.97 owner ruling "Honour the pin"),
+    // and only the volumes THAT runtime owns — refused before anything stops
+    // when they exist only under the other one.
+    let storage = super::storage_ux::storage_runtime().await?;
+    let existing = existing_volumes_owned_by(&storage, "migrate").await?;
+    let runtime = storage.name;
     if existing.is_empty() {
         return Err("no existing volumes to migrate".into());
     }
@@ -1018,29 +1088,39 @@ async fn restart_services_for_rollback(runtime: &str, compose_dir: &Path) -> Res
     Ok(())
 }
 
-/// HTTP-probe the three default endpoints in a tight loop until they
-/// all respond 2xx/3xx, or `timeout_secs` elapses.
+/// The health URLs [`wait_until_healthy`] polls: Weaviate's and Ollama's
+/// at their `service_endpoints` rows (v0.2.97) — the literals 8081 / 11435
+/// it used before timed out on a machine whose services live elsewhere.
+fn healthy_probe_urls() -> Vec<String> {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    [CoreService::Weaviate, CoreService::Ollama]
+        .into_iter()
+        .map(|s| health_url(s, machine_row_from_disk(s).as_ref()))
+        .collect()
+}
+
+/// HTTP-probe Weaviate and Ollama in a tight loop until they both respond
+/// 2xx (a redirect is never followed — `probe_http`), or `timeout_secs`
+/// elapses.
 async fn wait_until_healthy(timeout_secs: u64) -> bool {
+    let urls = healthy_probe_urls();
+    wait_until_urls_healthy(&urls, timeout_secs).await
+}
+
+/// [`wait_until_healthy`] over explicit `urls` (the test seam).
+async fn wait_until_urls_healthy(urls: &[String], timeout_secs: u64) -> bool {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
-    // /v1/meta is the right liveness probe for Weaviate — see
-    // commands/lifecycle.rs::canonical_services for why
-    // /v1/.well-known/ready is too strict.
-    let urls = [
-        "http://localhost:8081/v1/meta",
-        "http://localhost:11435/api/tags",
-    ];
+    // /v1/meta is the right liveness probe for Weaviate (see
+    // `service_status::health_path`).
     while std::time::Instant::now() < deadline {
         let mut all_ok = true;
-        for u in &urls {
-            match client.get(*u).send().await {
-                Ok(r) if r.status().as_u16() < 400 => {}
+        for u in urls {
+            let Ok(client) = vct_launcher_core::services::loopback_http::client_for(u, std::time::Duration::from_secs(2)) else {
+                return false;
+            };
+            match client.get(u.as_str()).send().await {
+                Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()) => {}
                 _ => {
                     all_ok = false;
                     break;
@@ -1055,26 +1135,6 @@ async fn wait_until_healthy(timeout_secs: u64) -> bool {
     false
 }
 
-fn which_container_runtime() -> Option<String> {
-    for runtime in &["podman", "docker"] {
-        if let Some(paths) = std::env::var_os("PATH") {
-            for dir in std::env::split_paths(&paths) {
-                if dir.join(runtime).is_file() {
-                    return Some(runtime.to_string());
-                }
-            }
-        }
-    }
-    None
-}
-
-// Force ExistingVolume to be used so the import isn't dead code (the
-// type is consumed implicitly via tokio process JSON deserialization
-// inside detect_existing_volumes_for_volumes_module which we delegate
-// to via super::installer).
-#[allow(dead_code)]
-fn _force_existing_volume_used(_: ExistingVolume) {}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -1082,6 +1142,111 @@ fn _force_existing_volume_used(_: ExistingVolume) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ----- v0.2.97 owner ruling "Honour the pin" ---------------------------
+
+    #[cfg(unix)]
+    use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+    #[cfg(unix)]
+    use crate::commands::storage_ux::StorageRuntime;
+    #[cfg(unix)]
+    use vct_launcher_core::services::container_runtime::RuntimePinSource;
+
+    /// docker is pinned but the orchestrator volumes exist only under podman:
+    /// the migration is REFUSED (naming both runtimes and the fix) instead of
+    /// the pre-v0.2.97 behaviour — list podman's volumes, then drive podman.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_only_the_other_runtime_owns_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data", "ollama_data"]);
+        fake_runtime(dir.path(), "docker", &[]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        for needle in [
+            "refusing to migrate the orchestrator volume(s) `weaviate_data`, `ollama_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker",
+            "set VCT_CONTAINER_RUNTIME=podman",
+        ] {
+            assert!(err.contains(needle), "{needle:?} missing from {err:?}");
+        }
+    }
+
+    /// R7b F4 — the MIXED case: docker (pinned) owns `ollama_data`,
+    /// `weaviate_data` exists only under podman. The refusal is per volume:
+    /// it names `weaviate_data` and only it. Before, docker owning ANY
+    /// orchestrator volume meant podman was never asked, and the migration
+    /// went ahead without `weaviate_data`.
+    #[cfg(unix)]
+    #[test]
+    fn a_volume_only_the_other_runtime_owns_is_refused_even_beside_owned_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let err = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap_err();
+        assert!(
+            err.contains("refusing to migrate the orchestrator volume(s) `weaviate_data`:"),
+            "{err}"
+        );
+        assert!(!err.contains("`ollama_data`"), "a volume docker owns was named: {err}");
+    }
+
+    /// Leave-alone: the runtime VCO drives owns the volumes → exactly its
+    /// copies, even when the other runtime also has some; nobody has any →
+    /// an empty list, not a refusal.
+    #[cfg(unix)]
+    #[test]
+    fn volumes_the_chosen_runtime_owns_are_used() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
+        let rt = StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::EnvOverride) };
+        let found = with_fake_runtimes(dir.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"))
+            .unwrap();
+        let mounts: Vec<&str> = found.iter().map(|v| v.mountpoint.as_str()).collect();
+        assert_eq!(mounts, ["/fake/docker/weaviate_data", "/fake/docker/ollama_data"]);
+
+        let empty = tempfile::tempdir().unwrap();
+        fake_runtime(empty.path(), "podman", &[]);
+        fake_runtime(empty.path(), "docker", &[]);
+        let none = with_fake_runtimes(empty.path(), Some("docker"), existing_volumes_owned_by(&rt, "migrate"));
+        assert!(none.unwrap().is_empty());
+    }
+
+    /// The read-only commands go through the pin: with docker pinned they
+    /// list docker's volumes, not podman's; unpinned they still list
+    /// podman's first; a recorded `runtime.txt` pins like the env does. The
+    /// install root is a temp dir, so this machine's own `runtime.txt` (a
+    /// developer checkout may have one) cannot change the answer.
+    #[cfg(unix)]
+    #[test]
+    fn listing_follows_the_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &["weaviate_data"]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data"]);
+        let root = tempfile::tempdir().unwrap();
+        use crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib;
+        use_checkout_vco_lib(root.path());
+        let list = |pin: Option<&str>| {
+            with_fake_runtimes(dir.path(), pin, async {
+                // The verdict cache keys (root, mode, purpose) — no pin — so
+                // each ask must not replay the previous one's answer.
+                vct_launcher_core::services::runtime_verdict::invalidate();
+                existing_volumes_on_storage_runtime_at(Some(root.path()), "inspect").await
+            })
+            .unwrap()
+        };
+        assert_eq!(list(Some("docker"))[0].mountpoint, "/fake/docker/weaviate_data");
+        assert_eq!(list(None)[0].mountpoint, "/fake/podman/weaviate_data");
+
+        std::fs::create_dir_all(root.path().join("state/install")).unwrap();
+        std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        assert_eq!(list(None)[0].mountpoint, "/fake/docker/weaviate_data");
+    }
 
     /// Replace every Python triple-quoted docstring (both """ and ''')
     /// with whitespace of the same length. Used by the source-level
@@ -1411,19 +1576,28 @@ mod tests {
     /// reports a sensible `from_mode` based on launcher.toml and
     /// validates the target path. Anything that would mutate the
     /// filesystem should NOT happen during this call.
-    #[tokio::test]
-    async fn dry_run_validates_target_path_without_mutating() {
+    #[test]
+    fn dry_run_validates_target_path_without_mutating() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("vct-volumes-dryrun");
 
         // Pre-condition: dir doesn't yet exist; dry-run must not create it.
         assert!(!target.exists());
 
-        let plan = set_volumes_config_dry_run(target.to_string_lossy().to_string()).await;
-
-        // The plan succeeds (validation only — parent exists, path is
-        // absolute) regardless of whether existing volumes are running.
-        let plan = plan.expect("dry run returns plan");
+        // The dry run resolves the storage runtime itself (repo root, the
+        // thread's PATH) — under stubs both runtimes answer with no volumes,
+        // so the plan is deterministic instead of probing this host's
+        // daemons. The cache is invalidated first: another test may have
+        // cached a verdict for the repo-root key.
+        use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+        let stubs = tempfile::tempdir().unwrap();
+        fake_runtime(stubs.path(), "podman", &[]);
+        fake_runtime(stubs.path(), "docker", &[]);
+        let plan = with_fake_runtimes(stubs.path(), None, async {
+            vct_launcher_core::services::runtime_verdict::invalidate();
+            set_volumes_config_dry_run(target.to_string_lossy().to_string()).await
+        })
+        .expect("dry run returns plan");
         assert!(plan.to_path.contains("vct-volumes-dryrun"));
         assert!(plan.warnings.iter().any(|w| !w.is_empty()));
 
@@ -1502,5 +1676,45 @@ mod tests {
             "found {} `return Err(...)` past the override-write without rollback cleanup",
             suspicious
         );
+    }
+
+    /// SE-4 red-proof (6): `wait_until_healthy` polls Weaviate and Ollama
+    /// where their `service_endpoints` ROWS say — here two live mocks on
+    /// non-default ports. Red against the literal 8081 / 11435 it polled
+    /// before (nothing answers there in a harness; it would time out).
+    #[tokio::test]
+    async fn wait_until_healthy_probes_the_rows() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        async fn mock(path: &'static str) -> u16 {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            tokio::spawn(async move {
+                let app = axum::Router::new().route(path, axum::routing::get(|| async { "{}" }));
+                let _ = axum::serve(listener, app).await;
+            });
+            port
+        }
+        let weaviate_port = mock("/v1/meta").await;
+        let ollama_port = mock("/api/tags").await;
+        let db = crate::db::Db::open().unwrap();
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let mut w = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "127.0.0.1", weaviate_port);
+        w.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&w).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::VcoManaged,
+            "127.0.0.1",
+            ollama_port,
+        ))
+        .unwrap();
+        assert_eq!(
+            healthy_probe_urls(),
+            vec![
+                format!("http://127.0.0.1:{}/v1/meta", weaviate_port),
+                format!("http://127.0.0.1:{}/api/tags", ollama_port),
+            ]
+        );
+        assert!(wait_until_healthy(5).await, "both rows' endpoints answer");
     }
 }

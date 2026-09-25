@@ -67,7 +67,12 @@ logger = logging.getLogger("migrate_embeddings")
 WEAVIATE_URL = weaviate_url_default()
 GRPC_PORT = int(os.getenv("GRPC_PORT", "50052"))
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11435")
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
+# v0.2.97 (lane Y): through the ONE client resolver — explicit →
+# CODE_EMBED_SERVICE_URL → CODE_EMBED_URL (client alias) →
+# http://localhost:<CODE_EMBED_PORT|11440> (vco_lib.code_embed_image).
+from vco_lib.code_embed_image import service_base_url  # noqa: E402
+
+CODE_EMBED_SERVICE_URL = service_base_url()
 
 # v0.2.18: prefer EmbeddingService for catalog discovery + per-active-
 # backend dispatch. Import is graceful so this script still works on a

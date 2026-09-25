@@ -95,7 +95,8 @@ from typing import Any, Callable, Optional
 import requests
 import requests.adapters
 
-from vco_lib.intfile import parse_int_line
+from vco_lib.hub_ensure import DEFAULT_HUB_PORT as _HUB_DEFAULT_PORT
+from vco_lib.hub_ensure import resolve_hub_port
 from vco_lib.paths import vct_root_dir
 
 
@@ -117,9 +118,10 @@ RESOLVER_PROTOCOL_VERSION: int = 1
 
 # ─── Constants ──────────────────────────────────────────────────────────
 
-#: Default hub port. Mirrors ``DEFAULT_PORT`` in
-#: ``launcher/src-tauri/vct-hub/src/server.rs``.
-DEFAULT_HUB_PORT: int = 7700
+#: Default hub port — :data:`vco_lib.hub_ensure.DEFAULT_HUB_PORT`, which
+#: mirrors ``DEFAULT_HUB_PORT`` in
+#: ``launcher/src-tauri/vct-launcher-core/src/services/hub_port.rs``.
+DEFAULT_HUB_PORT: int = _HUB_DEFAULT_PORT
 
 #: TTL (seconds) for the in-process hub-discovery cache. Short enough
 #: that a launcher restart is observed quickly, long enough to amortise
@@ -204,11 +206,12 @@ class FieldNotFound(ResolverError):
 class Forbidden(ResolverError):
     """The hub responded 403 on a per-project ``/env`` / ``/config`` route.
 
-    v0.2.77 flip. A HARD scoped-credential boundary refusal — the hub
-    ACCEPTED the request and knows the project, but refused the bearer:
-    either the coarse global ``hub.token`` on a per-project route with the
-    compat window closed (``VCT_HUB_LEGACY_GLOBAL_ENV`` unset/deny), or a
-    per-project token minted for a DIFFERENT project.
+    v0.2.77 flip (window REMOVED v0.2.97). A HARD scoped-credential
+    boundary refusal — the hub ACCEPTED the request and knows the project,
+    but refused the bearer: the coarse global ``hub.token`` on a
+    per-project route (refused unconditionally since v0.2.97 removed the
+    ``VCT_HUB_LEGACY_GLOBAL_ENV`` opt-in), or a per-project token minted
+    for a DIFFERENT project.
 
     Deliberately NOT a :class:`HubUnreachable` subclass: unreachability is
     a transient condition callers degrade to env-fallback on, whereas a 403
@@ -218,8 +221,8 @@ class Forbidden(ResolverError):
     resolving stale env values. The scoped ``hub.token.<id>`` is already
     preferred by the resolver's token picker; a 403 means that file was
     absent/unreadable (so we rode the global token) or the wrong project's
-    token was presented. Fix: ensure the scoped token file exists, or set
-    ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` on the hub to reopen the compat window.
+    token was presented. Fix: ensure the scoped token file exists (the hub
+    lazy-mints one on the first request for a project added mid-session).
     """
 
 
@@ -492,6 +495,13 @@ class ProjectConfig:
     #: clients. New hubs paired with old clients have the field
     #: silently ignored.
     rl_server_port: Optional[int] = None
+    #: v0.2.97 (service endpoints SSOT): the code-embedding service URL —
+    #: the machine's ``service_endpoints`` row, rendered by the hub like
+    #: ``weaviate_url`` / ``ollama_url``. Additive (``schema_version`` is
+    #: unchanged): pre-v0.2.97 hubs omit it and the parser back-fills the
+    #: empty string, which callers treat as "unset" (fall through to the
+    #: projected ``CODE_EMBED_SERVICE_URL``).
+    code_embed_url: str = ""
 
 
 # ─── Internal: hub discovery ────────────────────────────────────────────
@@ -566,56 +576,12 @@ def _discover_hub() -> tuple[int, str]:
         if cached is not None and cached.expires_at > now:
             return cached.port, cached.token
 
-        # Port: env > file > default.
-        #
-        # F-8 corrupt-input contract — MUST MATCH the bash sibling
-        # `vct_project_config.sh::hub_port` and the ps1 sibling
-        # `vct_project_config.ps1::Get-HubPort`: a non-integer
-        # `VCT_HUB_PORT`, a non-integer `hub.port` file, or an unreadable
-        # `hub.port` (perm-denied) must NOT raise — the port has a sane
-        # default (7700), so we emit ONE stderr warning and fall through to
-        # it. Only a truly ABSENT file (FileNotFoundError) is the silent
-        # default path (that is the normal env-only / dev case). This makes
-        # all three resolvers behave identically on corrupt port input:
-        # warn + default, never crash, never a garbage/partial resolution.
-        port_env = os.environ.get("VCT_HUB_PORT", "").strip()
-        if port_env:
-            try:
-                port = int(port_env)
-            except ValueError:
-                _warn_discovery(
-                    "hub_port_invalid",
-                    "VCT_HUB_PORT is not a positive integer; "
-                    "using default 7700",
-                )
-                port = DEFAULT_HUB_PORT
-        else:
-            port_file = vct_root_dir() / "hub.port"
-            try:
-                raw = port_file.read_text(encoding="utf-8").strip()
-            except FileNotFoundError:
-                port = DEFAULT_HUB_PORT
-            except OSError:
-                _warn_discovery(
-                    "hub_port_unreadable",
-                    "hub.port is not readable; using default 7700",
-                )
-                port = DEFAULT_HUB_PORT
-            else:
-                # The PARSE is shared (:func:`vco_lib.intfile.parse_int_line`);
-                # the classification above is not, and must not be — an
-                # unreadable file and a file of nonsense emit DIFFERENT
-                # warnings here, and that difference is the cross-language
-                # contract with the .sh/.ps1 siblings. Sharing the reader
-                # instead of the parser would have collapsed both into one.
-                parsed = parse_int_line(raw, minimum=1, maximum=65535)
-                if raw and parsed is None:
-                    _warn_discovery(
-                        "hub_port_invalid",
-                        "hub.port contains non-integer content; "
-                        "using default 7700",
-                    )
-                port = parsed if parsed is not None else DEFAULT_HUB_PORT
+        # Port: env > file > default — the ONE Python reader,
+        # :func:`vco_lib.hub_ensure.resolve_hub_port` (moved there in v0.2.97
+        # so stdlib-only callers can use it). The F-8 corrupt-input contract
+        # (warn once + default, never crash) is unchanged: this module's
+        # warner is handed in, and this module's ``vct_root_dir`` too.
+        port = resolve_hub_port(vct_root_dir(), _warn_discovery)
 
         # Token: env > file > fail.
         #
@@ -1401,6 +1367,7 @@ def _from_hub_body(body: dict[str, Any]) -> ProjectConfig:
             # malformed string) as ``None`` so the MCP falls through to
             # env-resolution / disabled mode.
             rl_server_port=_coerce_optional_port(body.get("rl_server_port")),
+            code_embed_url=str(body.get("code_embed_url") or ""),
         )
     except (KeyError, TypeError, ValueError) as exc:
         raise HubUnreachable(
@@ -1515,9 +1482,10 @@ def resolve(project_root: Path | str) -> ProjectConfig:
         # caller catching HubUnreachable for env-fallback will not mask it.
         raise Forbidden(
             f"hub returned 403 forbidden for project {pid}: {err_msg}. "
-            f"Present the scoped hub.token.{pid}, or set "
-            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
-            f"one-release compat window."
+            f"Present the scoped hub.token.{pid} (the resolver prefers "
+            f"it; the hub mints one on first request). The legacy "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in "
+            f"v0.2.97."
         )
     if resp.status_code == 404:
         if err_code == "field_not_found":
@@ -1610,9 +1578,10 @@ def resolve_field(
         # HubUnreachable subclass so env-fallback callers don't mask it.
         raise Forbidden(
             f"hub returned 403 forbidden for project {pid}: {err_msg}. "
-            f"Present the scoped hub.token.{pid}, or set "
-            f"VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the "
-            f"one-release compat window."
+            f"Present the scoped hub.token.{pid} (the resolver prefers "
+            f"it; the hub mints one on first request). The legacy "
+            f"VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in "
+            f"v0.2.97."
         )
     if resp.status_code == 404:
         if err_code == "field_not_found":

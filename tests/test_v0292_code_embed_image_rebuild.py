@@ -528,7 +528,33 @@ class ComposeArgvTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 # doctor — the reported, deferred, and self-clearing halves
 # ---------------------------------------------------------------------------
-class DoctorProbeTests(unittest.TestCase):
+class _FixtureInstallRootCase(unittest.TestCase):
+    """``self.root``: a throwaway folder shaped like an install root
+    (``vco_lib/__init__.py`` + ``.claude/``), which is what the doctor's
+    ``code_embed_image`` probe requires before it looks at all.
+
+    Not the checkout (v0.2.97, W-CHECKOUT-LEDGER): ``run_doctor`` at FULL
+    scope runs EVERY probe against its folder, and the ``bundle_staleness``
+    census resolves ``project_bundles_stale`` on that folder's ledger and
+    writes ``.claude/state/bundle-census.json`` there. With the checkout as the
+    folder, a stale ledger in it was re-rendered — reminder block included —
+    into the tracked ``CLAUDE.md``. The code-embed state and rebuild context
+    are injected, so nothing these tests assert depends on the real tree.
+    """
+
+    def setUp(self):
+        super().setUp()
+        import tempfile
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name) / "install_root"
+        (self.root / "vco_lib").mkdir(parents=True)
+        (self.root / "vco_lib" / "__init__.py").write_text("", encoding="utf-8")
+        (self.root / ".claude" / "context").mkdir(parents=True)
+
+
+class DoctorProbeTests(_FixtureInstallRootCase):
     def _report(self, state, context=None):
         # The rebuild context is INJECTED for the same reason the image state
         # is: its default reads the machine (runtime resolution + two
@@ -542,7 +568,7 @@ class DoctorProbeTests(unittest.TestCase):
                 else code_embed_image.RebuildContext(compose_cmd="podman compose")
             ),
         )
-        return doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
+        return doctor.run_doctor(self.root, scope=doctor.SCOPE_FULL, resolvers=res)
 
     def _finding(self, state, context=None):
         report = self._report(state, context)
@@ -598,7 +624,7 @@ class DoctorProbeTests(unittest.TestCase):
         )
 
 
-class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
+class TheRemediationCanActuallyRebuildTests(_FixtureInstallRootCase):
     """v0.2.95 F2 — the printed command must not be the one that refused.
 
     The loop: ``install.py --update`` rebuilds the image only where its own
@@ -640,7 +666,7 @@ class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
                 code_embed_image.STALE, "old image"),
             code_embed_rebuild_context=lambda: context,
         )
-        report = doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
+        report = doctor.run_doctor(self.root, scope=doctor.SCOPE_FULL, resolvers=res)
         finding = next(
             f for f in report.findings if f.probe == "code_embed_image"
         )
@@ -717,7 +743,7 @@ class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
     def test_no_foreign_owner_falls_back_to_the_installers_own_project(self):
         cmd = self._command(code_embed_image.RebuildContext(
             compose_cmd="podman compose"))
-        self.assertIn(str(Path(REPO_ROOT) / "infrastructure"), cmd)
+        self.assertIn(str(self.root / "infrastructure"), cmd)
         self.assertIn("--build", cmd)
         self.assertNotIn("--project-directory", cmd)
 
@@ -736,12 +762,12 @@ class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
             code_embed_rebuild_context=lambda: (_ for _ in ()).throw(
                 RuntimeError("no runtime")),
         )
-        report = doctor.run_doctor(REPO_ROOT, scope=doctor.SCOPE_FULL, resolvers=res)
+        report = doctor.run_doctor(self.root, scope=doctor.SCOPE_FULL, resolvers=res)
         finding = next(f for f in report.findings if f.probe == "code_embed_image")
         self.assertEqual(finding.status, doctor.STATUS_PROBLEM)
         self.assertEqual(finding.condition_id, doctor.CID_CODE_EMBED_IMAGE_STALE)
         self.assertIn("--build", finding.command)
-        self.assertIn(str(Path(REPO_ROOT) / "infrastructure"), finding.command)
+        self.assertIn(str(self.root / "infrastructure"), finding.command)
 
     def test_rebuild_command_has_a_caller(self):
         """It shipped in v0.2.92 with ZERO callers while the doctor's own
@@ -749,7 +775,7 @@ class TheRemediationCanActuallyRebuildTests(unittest.TestCase):
         cmd = self._command(code_embed_image.RebuildContext(
             compose_cmd="podman compose"))
         self.assertIn(
-            code_embed_image.rebuild_command(REPO_ROOT, "podman compose"), cmd,
+            code_embed_image.rebuild_command(self.root, "podman compose"), cmd,
         )
 
     def test_the_guard_that_strips_code_embed_is_the_reason_for_step_two(self):

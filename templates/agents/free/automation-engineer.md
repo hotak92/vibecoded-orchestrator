@@ -5,7 +5,7 @@ short_desc: design cross-system workflows with retries and DLQs
 keywords: ["automation workflow", "cross-system automation", "idempotency design", DLQ, "retries with backoff", CI/CD, "pipeline design", "design idempotent", "handle failures gracefully"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
-effort: high
+effort: medium
 skills:
   - api-designer
   - architect

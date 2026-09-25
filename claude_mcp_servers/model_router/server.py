@@ -7,6 +7,9 @@ Routes (each also served with a trailing slash — see :func:`_add_route`)::
     GET  /health                    liveness; no auth, no blocking work
     GET  /usage                     per-chat token accounting, newest row per
                                     chat (``?session=<id>`` filters to one)
+    GET  /usage/windows             subscription usage windows per vendor,
+                                    from cache (``?format=line`` = one line of
+                                    text; :mod:`model_router.usage_windows`)
     GET  /v1/models                 union catalog
     POST /v1/messages               proxied, streaming or not
     POST /v1/messages/count_tokens  proxied
@@ -134,8 +137,19 @@ from aiohttp import web
 
 from . import __version__
 from .auth import OAuthReader, host_token_stamp, token_matches
-from .catalog import CatalogEntry, CatalogService, resolve_window, to_models_response
-from .config import SERVICE_NAME, UPSTREAM_CONNECT_TIMEOUT_S, GatewayConfig
+from .catalog import (
+    CatalogEntry,
+    CatalogService,
+    resolve_window,
+    to_models_response,
+    with_usage_labels,
+)
+from .config import (
+    PICKER_USAGE_ON,
+    SERVICE_NAME,
+    UPSTREAM_CONNECT_TIMEOUT_S,
+    GatewayConfig,
+)
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
 from .quota import (
@@ -147,6 +161,13 @@ from .quota import (
 )
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
+from .source_identity import source_sha as _package_source_sha
+from .usage_windows import (
+    UsageWindows,
+    label_suffixes,
+    render_line,
+    session_fetcher,
+)
 from .usage import (
     UsageAccumulator,
     UsageLedger,
@@ -179,6 +200,15 @@ from .vendors import (
 )
 
 logger = logging.getLogger(__name__)
+
+#: Digest of the package source THIS process was started from, taken once at
+#: import (``model_router.source_identity``). Reported on ``/health`` so the
+#: host can PROVE whether a running gateway is behind its checkout after an
+#: update rewrote the editable install underneath it
+#: (``vco_lib.gateway_freshness``). Computed here, not per request: hashing the
+#: files at request time would hash the NEW files and report a stale daemon as
+#: current, which is the one answer this exists to never give.
+SOURCE_SHA: Optional[str] = _package_source_sha(Path(__file__).resolve().parent)
 
 #: Request headers never forwarded upstream. ``authorization`` / ``x-api-key``
 #: are dropped because the client presents the LOCAL host token there, and
@@ -474,6 +504,18 @@ class Gateway:
             live_ttl_s=config.catalog_ttl_s,
             static_ttl_s=config.static_retry_ttl_s,
         )
+        #: Subscription usage windows (``/usage/windows``). Its secrets come
+        #: through THIS gateway's reader and resolver — no second resolver —
+        #: and its fetches run in a background task a read schedules, never
+        #: on a request path. See :mod:`model_router.usage_windows`.
+        self.usage_windows = UsageWindows(
+            anthropic_upstream=anthropic.upstream,
+            vendors=vendors,
+            oauth_token=lambda: self.oauth.read().token,
+            vendor_key=self._catalog_vendor_key,
+            fetch=session_fetcher(lambda: self.session),
+            ledger_path=lambda: self.usage.path,
+        )
 
     # ── lifecycle ────────────────────────────────────────────────────────
     async def start(self) -> None:
@@ -487,6 +529,8 @@ class Gateway:
         # context monitor cares most about. Bounded by the number of requests
         # still in flight, which at shutdown is none or nearly none.
         await self.usage.drain()
+        # Before the session closes: an in-flight usage refresh holds it.
+        await self.usage_windows.stop()
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
@@ -754,12 +798,21 @@ async def health_handler(request: web.Request) -> web.Response:
     Emitted fields — this list and the code below are kept in step by
     ``test_health_reports_exactly_the_documented_fields``:
 
-    ``ok`` (bool), ``service``, ``version``, ``port``, ``host``,
+    ``ok`` (bool), ``service``, ``version``,
+    ``source_sha`` (sha256 of the package source this process was started
+    from, hashed once at import by ``model_router.source_identity``; ``null``
+    when it could not be read, which callers treat as unknown. Its PRESENCE is
+    itself evidence: every daemon since it was added emits the key, so a
+    ``/health`` without it is positively an older daemon),
+    ``port``, ``host``,
     ``catalog_source`` (family -> ``live``/``static``/``declared``/
     ``unfetched``/``unavailable``),
     ``catalog_filter`` (``latest``/``all`` — which versions of a family reach
     the picker), ``window_rows`` (``one_m_only``/``both`` — whether a 1M
     first-party model shows its plain row beside its ``[1m]`` one),
+    ``picker_usage`` (``on``/``off`` — whether vendor rows in ``/v1/models``
+    carry their subscription's usage in the label; the mode IN FORCE, so an
+    unrecognised knob value that fell back to the default shows here),
     ``catalog_hidden`` (int, how many rows the last catalog build
     withheld under that filter; ``0`` before the picker has ever opened, which
     reads the same as "nothing hidden" and correctly so),
@@ -816,6 +869,8 @@ async def health_handler(request: web.Request) -> web.Response:
             # the same constant to tell this daemon from any other listener.
             "service": SERVICE_NAME,
             "version": __version__,
+            # Taken at import, never recomputed: see SOURCE_SHA.
+            "source_sha": SOURCE_SHA,
             "port": gateway.config.port,
             "host": gateway.config.host,
             "catalog_source": gateway.catalog.sources(),
@@ -824,6 +879,7 @@ async def health_handler(request: web.Request) -> web.Response:
             # thing /health exists not to be.
             "catalog_filter": gateway.config.catalog_filter,
             "window_rows": gateway.config.window_rows,
+            "picker_usage": gateway.config.picker_usage,
             "catalog_hidden": gateway.catalog.hidden_count(),
             "context_table_source": table.source,
             "context_table_path": str(table.path) if table.path else None,
@@ -904,7 +960,44 @@ async def usage_handler(request: web.Request) -> web.Response:
     )
 
 
+async def usage_windows_handler(request: web.Request) -> web.Response:
+    """Subscription usage windows per vendor, from the gateway's cache.
+
+    JSON by default (:meth:`model_router.usage_windows.UsageWindows.snapshot`);
+    ``?format=line`` answers ``text/plain`` with the ONE rendering the
+    status-line scripts print verbatim (empty when nothing is known yet).
+
+    Host-token authorised and loopback-only like ``/usage``: it names the
+    user's subscription plan and consumption. Answers from MEMORY: a read that
+    finds the cache due schedules one background refresh and returns what is
+    cached now, so this route can never wait on a vendor.
+    """
+    gateway: Gateway = request.app[APP_KEY]
+    started = time.monotonic()
+    if not gateway.authorised(request):
+        _log_unauthorised(gateway, request, started=started)
+        return _unauthorised()
+    windows = gateway.usage_windows
+    windows.request_refresh()
+    snapshot = windows.snapshot()
+    if request.query.get("format") == "line":
+        return web.Response(text=render_line(snapshot), content_type="text/plain")
+    return web.json_response(snapshot)
+
+
 async def models_handler(request: web.Request) -> web.Response:
+    """The picker catalog; vendor labels carry subscription usage when known.
+
+    The usage text (``picker_usage``, on by default) comes from the
+    :class:`model_router.usage_windows.UsageWindows` CACHE and nothing else:
+    this route may schedule a background refresh but never awaits one, so a
+    stalled vendor quota endpoint cannot delay the picker. A cold or stale
+    cache answers without the text. The refresh is requested BEFORE the
+    catalog is built, so on a daemon whose catalog needs fetching the usage
+    reading gets that long to land and the answer may already carry it.
+    Claude Code fetches this route once per session start, so the label is a
+    snapshot of that moment (see :func:`model_router.usage_windows.label_suffix`).
+    """
     gateway: Gateway = request.app[APP_KEY]
     started = time.monotonic()
     if not gateway.authorised(request):
@@ -914,12 +1007,20 @@ async def models_handler(request: web.Request) -> web.Response:
         # client makes FIRST.
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
+    usage_labels = gateway.config.picker_usage == PICKER_USAGE_ON
+    if usage_labels:
+        gateway.usage_windows.request_refresh()
     table = gateway.context.current()
     catalog = await gateway.catalog.union(
         table=table,
         catalog_filter=gateway.config.catalog_filter,
         window_rows=gateway.config.window_rows,
     )
+    entries = catalog.entries
+    if usage_labels:
+        entries = with_usage_labels(
+            entries, label_suffixes(gateway.usage_windows.snapshot()),
+        )
     logger.info(
         "model-gateway: /v1/models -> %d entries (%s)%s",
         len(catalog.entries),
@@ -935,7 +1036,7 @@ async def models_handler(request: web.Request) -> web.Response:
         ),
     )
     return web.json_response(
-        to_models_response(catalog.entries, catalog.sources, catalog.hidden),
+        to_models_response(entries, catalog.sources, catalog.hidden),
     )
 
 
@@ -1446,6 +1547,11 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     if not gateway.authorised(request):
         _log_unauthorised(gateway, request, started=started)
         return _unauthorised()
+    # "Warm while chats flow" (owner, 2026-09-23): a synchronous O(1) signal
+    # that may schedule ONE background usage refresh per interval. Nothing is
+    # awaited here, and a defect in it is guarded like every optional pass —
+    # it can never delay, fail or alter this request.
+    _guarded(gateway.usage_windows.note_activity, what="usage-window activity signal")
 
     buffer_limit = gateway.config.rewrite_buffer_bytes
     raw, over_buffer = await _buffer_bounded(request.content, buffer_limit)
@@ -1969,6 +2075,15 @@ async def _proxy(
                 )
 
             relay = gateway.relay_headers(upstream)
+            if decision.is_anthropic:
+                # Passive read of the unified rate-limit headers the answer
+                # already carries: a dict parse, no I/O, guarded like every
+                # other optional pass so it can never cost the request.
+                _guarded(
+                    gateway.usage_windows.observe_anthropic_headers,
+                    upstream.headers,
+                    what="usage-window header capture",
+                )
             content_type = upstream.headers.get("Content-Type", "application/json")
             is_stream = _STREAM_CHUNK_HINT in content_type
 
@@ -2564,7 +2679,7 @@ async def not_found_handler(request: web.Request) -> web.Response:
         404,
         "not_found_error",
         f"the model gateway has no route for {request.path!r}. It serves "
-        "/health, /usage, /v1/models, /v1/messages and "
+        "/health, /usage, /usage/windows, /v1/models, /v1/messages and "
         "/v1/messages/count_tokens.",
     )
 
@@ -2597,6 +2712,9 @@ def create_app(
 
     _add_route(app, "GET", "/health", health_handler, name="health")
     _add_route(app, "GET", "/usage", usage_handler, name="usage")
+    _add_route(
+        app, "GET", "/usage/windows", usage_windows_handler, name="usage_windows",
+    )
     _add_route(app, "HEAD", "/api/hello", hello_handler, name="hello_head")
     _add_route(app, "GET", "/api/hello", hello_handler, name="hello_get")
     _add_route(app, "GET", "/v1/models", models_handler, name="models")
@@ -2633,4 +2751,5 @@ __all__ = [
     "create_app",
     "loopback_only_middleware",
     "usage_handler",
+    "usage_windows_handler",
 ]

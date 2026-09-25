@@ -1595,9 +1595,21 @@ pub struct SettingDecl {
     pub min: Option<i64>,
     #[serde(default)]
     pub max: Option<i64>,
+    /// `"per-project"` (default) — one value per project, stored in that
+    /// project's `module_settings` row and delivered to it through the hub's
+    /// `/env`; or `"global"` — ONE machine-wide value (the `project_id IS
+    /// NULL` row), read by the module itself when it starts (e.g.
+    /// `vct-hub-api`'s `VCT_HUB_PORT`: there is one hub per machine). The
+    /// launcher's settings editor and the `set_module_setting` command route
+    /// the write by this field; see `crate::module_settings_schema`.
+    #[serde(default = "default_setting_scope")]
+    pub scope: String,
 }
 fn default_setting_type() -> String {
     "string".into()
+}
+fn default_setting_scope() -> String {
+    crate::module_settings_schema::SCOPE_PER_PROJECT.into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1696,8 +1708,11 @@ pub struct RuntimeBlock {
     // pure-Python MCPs) simply omit them and fall through to the legacy
     // "no GPU detection" path.
     //
-    // See knowledge/concepts/gpu-mode-decision-policy.md for the full
-    // design rationale.
+    // Rationale: PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive
+    // at pip-install time, so each GPU mode needs its own prebuilt
+    // image — the launcher never derives one variant's ref from
+    // another's; module authors enumerate and pin every variant they
+    // ship (see `gpu_image_variants` below).
 
     /// Per-module VRAM threshold (GB). When set, the launcher passes
     /// this value to `decide_gpu_mode` for this module's install/start
@@ -1839,9 +1854,9 @@ impl RuntimeBlock {
 /// Per-GPU-mode image tag variants. Each variant ships as a separate
 /// OCI image tag (e.g. `:0.1.0-cpu`, `:0.1.0-cuda`, `:0.1.0-rocm`)
 /// because PyTorch's CUDA/ROCm/CPU wheels are mutually exclusive at
-/// pip-install time. See `knowledge/concepts/gpu-mode-decision-policy.md`
-/// > "Why CUDA wheels vs ROCm wheels need different containers" for
-/// the full rationale.
+/// pip-install time — one container cannot serve two wheel families,
+/// so there is nothing to derive: every variant a module ships is
+/// built and pinned independently.
 ///
 /// All three variants are REQUIRED when the block is present — the
 /// launcher would have no fallback if one were missing. Modules that
@@ -2016,6 +2031,37 @@ pub struct UninstallBlock {
     pub clear_secrets: bool,
 }
 
+/// One `provides` entry of kind `http_api`, as the launcher shows it: its
+/// `base_url` with every placeholder RESOLVED (`{hub_port}` → the running
+/// hub's port, `{weaviate_port}` … → the service row's port), so the page
+/// never states a wrong port. Built by [`ModuleManifest::provided_http_apis`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ProvidedHttpApi {
+    pub base_url: String,
+    pub description: String,
+}
+
+impl ModuleManifest {
+    /// Every `provides` entry `{ "kind": "http_api", "base_url": … }`, its
+    /// `base_url` resolved through `ctx` ([`PlaceholderCtx::resolve`]).
+    /// Entries without a string `base_url` are skipped. The reader is the
+    /// launcher's Preferences → Modules list (`module_settings_schema::
+    /// list_module_settings`, rendered by `CoreModuleSettingsPanel.svelte`).
+    pub fn provided_http_apis(&self, ctx: &PlaceholderCtx) -> Vec<ProvidedHttpApi> {
+        self.provides
+            .iter()
+            .filter(|p| p.get("kind").and_then(|k| k.as_str()) == Some("http_api"))
+            .filter_map(|p| {
+                let raw = p.get("base_url")?.as_str()?;
+                Some(ProvidedHttpApi {
+                    base_url: ctx.resolve(raw),
+                    description: p.get("description").and_then(|d| d.as_str()).unwrap_or("").to_string(),
+                })
+            })
+            .collect()
+    }
+}
+
 // ─── Parsing ─────────────────────────────────────────────────────────────
 
 impl ModuleManifest {
@@ -2080,6 +2126,9 @@ impl ModuleManifest {
             if !matches!(s.scope.as_str(), "global" | "per-project" | "shared") {
                 return Err(format!("secret '{}' has invalid scope '{}'", s.key, s.scope));
             }
+        }
+        for s in &m.settings {
+            crate::module_settings_schema::check_setting_scope(s)?;
         }
 
         if !matches!(
@@ -2402,6 +2451,26 @@ pub fn render_log_path_template(template: &str, project_id: &str, project_slug: 
 
 // ─── Placeholder resolution ──────────────────────────────────────────────
 
+/// v0.2.97 (lane T): the port the running vct-hub listens on, resolved by
+/// [`crate::services::hub_port::resolve_hub_port`] (`hub.port` →
+/// `$VCT_HUB_PORT` → 7700) at the moment a string is resolved. The hub's
+/// port is configurable (the `vct-hub-api` module's `VCT_HUB_PORT` setting)
+/// and the hub walks past a taken port, so a manifest that names the hub
+/// writes `http://127.0.0.1:{hub_port}/api/v1`, never a literal 7700.
+pub const HUB_PORT_PLACEHOLDER: &str = "{hub_port}";
+
+/// v0.2.97: the host ports of the three core services, resolved by
+/// [`crate::services::service_endpoints::machine_port_from_disk`] — the
+/// answer the project env projection and the hub's `/config` give (the
+/// launcher.db `service_endpoints` row → the compiled default). A manifest naming one of these
+/// services writes `http://localhost:{code_embed_port}/health`, never a
+/// literal 11440, so a moved service is not reported down.
+pub const SERVICE_PORT_PLACEHOLDERS: [(&str, crate::services::service_endpoints::CoreService); 3] = [
+    ("{weaviate_port}", crate::services::service_endpoints::CoreService::Weaviate),
+    ("{ollama_port}", crate::services::service_endpoints::CoreService::Ollama),
+    ("{code_embed_port}", crate::services::service_endpoints::CoreService::CodeEmbed),
+];
+
 /// Runtime environment for resolving placeholder strings.
 ///
 /// Builders fill in the fields they know; `resolve` substitutes `{TOKEN}`
@@ -2480,6 +2549,19 @@ impl PlaceholderCtx {
         ];
         for (token, value) in replacements {
             out = out.replace(token, &value);
+        }
+        // Resolved only when present: it reads `hub.port`, and most strings
+        // never name the hub.
+        if out.contains(HUB_PORT_PLACEHOLDER) {
+            let port = crate::services::hub_port::resolve_hub_port();
+            out = out.replace(HUB_PORT_PLACEHOLDER, &port.to_string());
+        }
+        // Same rule: each reads launcher.db, so only when named.
+        for (token, service) in SERVICE_PORT_PLACEHOLDERS {
+            if out.contains(token) {
+                let port = crate::services::service_endpoints::machine_port_from_disk(service);
+                out = out.replace(token, &port.to_string());
+            }
         }
         out
     }
@@ -3847,6 +3929,56 @@ mod tests {
     #[test]
     fn log_path_template_accepts_uuid_form() {
         assert!(validate_log_path_template("/data/logs/{project_id}/events.jsonl").is_ok());
+    }
+
+    /// v0.2.97 (lane T): `{hub_port}` is the running hub's port — the port
+    /// file the hub wrote wins over `$VCT_HUB_PORT`, and the default applies
+    /// only when neither answers. A string without the token is untouched.
+    #[test]
+    fn hub_port_placeholder_resolves_to_the_running_hubs_port() {
+        let guard = crate::test_env::state_dir_guard_with(&[("VCT_HUB_PORT", Some("8802"))]);
+        let ctx = PlaceholderCtx::new("vct-example");
+        assert_eq!(ctx.resolve("http://127.0.0.1:{hub_port}/x"), "http://127.0.0.1:8802/x");
+        std::fs::write(guard.path().join("hub.port"), "8123\n").unwrap();
+        assert_eq!(ctx.resolve("http://127.0.0.1:{hub_port}/x"), "http://127.0.0.1:8123/x");
+        assert_eq!(ctx.resolve("{MODULE_ID}:7700"), "vct-example:7700");
+    }
+
+    /// v0.2.97: the service-port placeholders resolve through the machine
+    /// resolver — the compiled default with no row, then each service's
+    /// `service_endpoints` row.
+    #[test]
+    fn service_port_placeholders_follow_the_machine_resolver() {
+        use crate::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let _g = crate::test_env::state_dir_guard();
+        // About the compiled default itself (nothing is requested).
+        let _allow = crate::services::service_endpoints::allow_compiled_default_on_this_thread();
+        let ctx = PlaceholderCtx::new("vct-example");
+        assert_eq!(
+            ctx.resolve("http://localhost:{code_embed_port}/health"),
+            "http://localhost:11440/health"
+        );
+        assert_eq!(ctx.resolve("{weaviate_port}/{ollama_port}"), "8081/11435");
+        let db = crate::db::Db::open().unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "code_embed",
+            EndpointMode::VcoManaged,
+            "localhost",
+            21440,
+        ))
+        .unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            11436,
+        ))
+        .unwrap();
+        assert_eq!(
+            ctx.resolve("http://localhost:{code_embed_port}/health"),
+            "http://localhost:21440/health"
+        );
+        assert_eq!(ctx.resolve("{ollama_port}"), "11436");
     }
 
     #[test]

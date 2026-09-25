@@ -264,10 +264,18 @@ const MCP_RELEVANT_ENV_KEYS: &[&str] = &[
 /// present relevant keys, sort them, and feed them to the hasher. This
 /// makes the result robust to JSON key-ordering differences between the
 /// writer and any re-serialisation.
+///
+/// Strict JSON only: a body that is not strict JSON (a JSONC file, which
+/// Claude Code accepts) returns `None` here and is hashed from the env object
+/// the Python JSONC reader returns instead — see [`jsonc_hashes`].
 fn hash_mcp_env(settings_json: &str) -> Option<u64> {
     let parsed: serde_json::Value = serde_json::from_str(settings_json).ok()?;
-    let env = parsed.get("env").and_then(|e| e.as_object());
+    Some(hash_env_subset(parsed.get("env").and_then(|e| e.as_object())))
+}
 
+/// The order-independent hash of the MCP-relevant subset of an `env`
+/// object — ONE hash rule for the strict-JSON fast path and the JSONC path.
+fn hash_env_subset(env: Option<&serde_json::Map<String, serde_json::Value>>) -> u64 {
     let mut pairs: Vec<(&str, String)> = Vec::new();
     if let Some(env) = env {
         for &key in MCP_RELEVANT_ENV_KEYS {
@@ -290,7 +298,58 @@ fn hash_mcp_env(settings_json: &str) -> Option<u64> {
         k.hash(&mut hasher);
         v.hash(&mut hasher);
     }
-    Some(hasher.finish())
+    hasher.finish()
+}
+
+/// v0.2.97: MCP-env hashes for the drained paths whose body is NOT strict
+/// JSON, read through the ONE JSONC reader (`vco_lib_bridge::
+/// read_settings_env_blocks` → `python -m vco_lib.env_projection_check
+/// read-env`). Before this, such a body was "unparseable", so EVERY write to
+/// a JSONC settings.json — including the idempotent re-projections the
+/// diff-guard exists to absorb — SIGHUPped the MCPs.
+///
+/// Why the bridge and not a Rust JSONC parse: comment / trailing-comma rules
+/// have one home (`vco_lib.jsonc_edit`). Cost: ONE spawn per debounce window
+/// for all such paths together, and none at all for strict-JSON bodies
+/// (JSON is a subset of JSONC, so serde's parse of those is the same answer).
+/// A path the bridge cannot read is simply absent from the map, which keeps
+/// the existing fail-OPEN reload for it — and a reload writes no
+/// settings.json, so a failing bridge cannot start a reload loop.
+fn jsonc_hashes(
+    root: Option<&Path>,
+    bodies: &HashMap<PathBuf, String>,
+) -> HashMap<PathBuf, u64> {
+    let jsonc: Vec<(&PathBuf, PathBuf)> = bodies
+        .iter()
+        .filter(|(_, body)| !body.trim().is_empty() && hash_mcp_env(body).is_none())
+        .filter_map(|(path, _)| {
+            let folder = path.parent()?.parent()?.to_path_buf();
+            Some((path, folder))
+        })
+        .collect();
+    let mut out = HashMap::new();
+    if jsonc.is_empty() {
+        return out;
+    }
+    let folders: Vec<&Path> = jsonc.iter().map(|(_, f)| f.as_path()).collect();
+    let blocks = match crate::services::vco_lib_bridge::read_settings_env_blocks(root, &folders) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                "[settings_json_watcher] JSONC settings.json read failed ({}) — failing open",
+                e
+            );
+            return out;
+        }
+    };
+    for (path, folder) in jsonc {
+        if let Ok(Some(env)) =
+            crate::services::vco_lib_bridge::env_block_of(&blocks, &folder, "claude_settings_json")
+        {
+            out.insert(path.clone(), hash_env_subset(Some(&env)));
+        }
+    }
+    out
 }
 
 /// Pure decision function: should the watcher fire an MCP reload for a
@@ -308,8 +367,18 @@ fn hash_mcp_env(settings_json: &str) -> Option<u64> {
 /// updating its per-project cache with `hash_mcp_env(new_settings_json)`
 /// whenever this returns `true` (or whenever the file first becomes
 /// readable) — see `fire_reload`.
+// Test-only since v0.2.97: production composes `hash_moved` with the JSONC
+// fallback in `evaluate_drained_paths`; the body-level form is what the
+// diff-guard tests below pin.
+#[cfg(test)]
 fn mcp_env_changed(old_hash: Option<u64>, new_settings_json: &str) -> bool {
-    match (old_hash, hash_mcp_env(new_settings_json)) {
+    hash_moved(old_hash, hash_mcp_env(new_settings_json))
+}
+
+/// The decision core of [`mcp_env_changed`], on hashes: `now == None` (could
+/// not read) and `old == None` (no baseline) both fail OPEN.
+fn hash_moved(old_hash: Option<u64>, now_hash: Option<u64>) -> bool {
+    match (old_hash, now_hash) {
         // Unparseable current file → fail-open (can't prove irrelevance).
         (_, None) => true,
         // No baseline → fail-open (first event / cache miss).
@@ -654,6 +723,7 @@ fn evaluate_drained_paths(
     drained: &[PathBuf],
     cache: &mut HashMap<PathBuf, u64>,
     read_body: impl Fn(&Path) -> String,
+    jsonc_hash: impl Fn(&Path) -> Option<u64>,
 ) -> DrainDecision {
     let mut decision = DrainDecision {
         reload: false,
@@ -663,8 +733,11 @@ fn evaluate_drained_paths(
     for path in drained {
         let body = read_body(path);
         let prev_hash = cache.get(path).copied();
-        let path_changed = mcp_env_changed(prev_hash, &body);
-        if let Some(now_hash) = hash_mcp_env(&body) {
+        // Strict JSON is hashed here; a JSONC body by the hash its env
+        // object read through the Python JSONC reader gave (v0.2.97).
+        let now = hash_mcp_env(&body).or_else(|| jsonc_hash(path));
+        let path_changed = hash_moved(prev_hash, now);
+        if let Some(now_hash) = now {
             cache.insert(path.clone(), now_hash);
         }
         if path_changed {
@@ -707,13 +780,31 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
         return;
     }
 
-    // We do NOT read on a blocking pool: settings.json files are a few KB
-    // each and this runs at most once per debounce window.
+    // Read every drained body ONCE; settings.json files are a few KB each and
+    // this runs at most once per debounce window. A body that is not strict
+    // JSON (JSONC) is hashed from the Python JSONC reader's env object, in
+    // ONE bridge spawn for all of them, on a blocking thread.
+    let bodies: HashMap<PathBuf, String> = drained
+        .iter()
+        .map(|p| (p.clone(), std::fs::read_to_string(p).unwrap_or_default()))
+        .collect();
+    let root = app
+        .try_state::<Db>()
+        .and_then(|db| crate::services::vco_lib_bridge::resolve_orchestrator_root(&db));
+    let jsonc = {
+        let bodies = bodies.clone();
+        tokio::task::spawn_blocking(move || jsonc_hashes(root.as_deref(), &bodies))
+            .await
+            .unwrap_or_default()
+    };
     let decision = {
         let mut cache = state.last_mcp_env_hash.lock().await;
-        evaluate_drained_paths(&drained, &mut cache, |p| {
-            std::fs::read_to_string(p).unwrap_or_default()
-        })
+        evaluate_drained_paths(
+            &drained,
+            &mut cache,
+            |p| bodies.get(p).cloned().unwrap_or_default(),
+            |p| jsonc.get(p).copied(),
+        )
     };
 
     if !decision.reload {
@@ -1036,6 +1127,81 @@ mod tests {
         assert!(!mcp_env_changed(hash_mcp_env(a), b));
     }
 
+    /// v0.2.97: a JSONC settings.json (comment + trailing comma — Claude Code
+    /// accepts both) is hashed from the env object the Python JSONC reader
+    /// returns, through the REAL bridge. RED before: `hash_mcp_env` returned
+    /// None for it, so every write — idempotent re-projections included —
+    /// failed open into a SIGHUP.
+    #[test]
+    fn a_jsonc_settings_json_is_hashed_through_the_bridge_and_skips_idempotent_writes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let path = tmp.path().join(".claude").join("settings.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let jsonc = "// team settings\n{\n  \"env\": { \"KG_COLLECTION\": \"MyKG\", },\n}\n";
+        std::fs::write(&path, jsonc).unwrap();
+        assert_eq!(hash_mcp_env(jsonc), None, "not strict JSON");
+
+        let bodies: HashMap<PathBuf, String> = [(path.clone(), jsonc.to_string())].into();
+        let hashes = jsonc_hashes(None, &bodies);
+        let strict = settings_with_env(&[("KG_COLLECTION", "MyKG")], "x");
+        assert_eq!(
+            hashes.get(&path).copied(),
+            hash_mcp_env(&strict),
+            "the JSONC body hashes exactly like the same env written as strict JSON"
+        );
+
+        // Idempotent re-write of the JSONC file → no reload.
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        cache.insert(path.clone(), hashes[&path]);
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| jsonc.to_string(),
+            |p| hashes.get(p).copied(),
+        );
+        assert!(!decision.reload, "an idempotent JSONC write must not SIGHUP");
+
+        // A real change in the JSONC file → reload.
+        let changed = jsonc.replace("MyKG", "OtherKG");
+        std::fs::write(&path, &changed).unwrap();
+        let bodies: HashMap<PathBuf, String> = [(path.clone(), changed.clone())].into();
+        let hashes2 = jsonc_hashes(None, &bodies);
+        let decision = evaluate_drained_paths(
+            &[path.clone()],
+            &mut cache,
+            |_| changed.clone(),
+            |p| hashes2.get(p).copied(),
+        );
+        assert!(decision.reload, "a changed MCP-relevant key in a JSONC file must reload");
+    }
+
+    /// Leave-alone twin: a body that is neither JSON nor JSONC is absent from
+    /// the bridge map, so it keeps failing OPEN (reload) — and strict JSON is
+    /// never sent to the bridge at all.
+    #[test]
+    fn an_unreadable_body_still_fails_open_and_strict_json_skips_the_bridge() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let bad = tmp.path().join("a").join(".claude").join("settings.json");
+        std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+        std::fs::write(&bad, "{ broken").unwrap();
+        let strict_path = tmp.path().join("b").join(".claude").join("settings.json");
+        let strict = settings_with_env(&[("KG_COLLECTION", "MyKG")], "x");
+        let bodies: HashMap<PathBuf, String> = [
+            (bad.clone(), "{ broken".to_string()),
+            (strict_path.clone(), strict.clone()),
+        ]
+        .into();
+        let hashes = jsonc_hashes(None, &bodies);
+        assert!(hashes.get(&bad).is_none(), "unreadable → no hash → fail open");
+        assert!(hashes.get(&strict_path).is_none(), "strict JSON is hashed in Rust, not sent");
+        let mut cache: HashMap<PathBuf, u64> = HashMap::new();
+        cache.insert(bad.clone(), 42);
+        let decision =
+            evaluate_drained_paths(&[bad.clone()], &mut cache, |_| "{ broken".into(), |p| hashes.get(p).copied());
+        assert!(decision.reload);
+        assert_eq!(cache.get(&bad), Some(&42), "an unreadable body keeps the old baseline");
+    }
+
     #[test]
     fn hash_mcp_env_unparseable_is_none() {
         assert_eq!(hash_mcp_env("garbage{{"), None);
@@ -1093,6 +1259,7 @@ mod tests {
                 (winner.clone(), winner_body),
                 (loser.clone(), loser_after),
             ]),
+            |_| None,
         );
 
         assert!(
@@ -1121,6 +1288,7 @@ mod tests {
             &[a.clone(), b.clone()],
             &mut cache,
             body_reader(vec![(a, body_a), (b, body_b)]),
+            |_| None,
         );
 
         assert!(
@@ -1168,6 +1336,7 @@ mod tests {
                 (unchanged.clone(), unchanged_body.clone()),
                 (first_seen.clone(), first_seen_body.clone()),
             ]),
+            |_| None,
         );
 
         assert!(decision.reload, "changed + first-seen paths fail open");
@@ -1202,7 +1371,7 @@ mod tests {
     fn drained_paths_empty_is_noop() {
         let mut cache = HashMap::new();
         let decision =
-            evaluate_drained_paths(&[], &mut cache, body_reader(vec![]));
+            evaluate_drained_paths(&[], &mut cache, body_reader(vec![]), |_| None);
         assert!(!decision.reload);
         assert!(decision.changed.is_empty());
         assert!(decision.skipped.is_empty());

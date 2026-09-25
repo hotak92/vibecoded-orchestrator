@@ -837,10 +837,8 @@ impl Db {
         &self,
         weaviate_url: &str,
     ) -> Result<usize, String> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("reconcile_at_boot: reqwest client: {}", e))?;
+        let client = crate::services::loopback_http::client_for(weaviate_url, std::time::Duration::from_secs(5))
+            .map_err(|e| format!("reconcile_at_boot: {}", e))?;
 
         let schema_url = format!("{}/v1/schema", weaviate_url.trim_end_matches('/'));
         let resp = client
@@ -1195,10 +1193,8 @@ impl Db {
         //
         // Single GET /v1/schema. Failure → return Err so the caller can
         // log; don't probe per-row with no schema context.
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(5))
-            .build()
-            .map_err(|e| format!("adopt_populated: reqwest client: {}", e))?;
+        let client = crate::services::loopback_http::client_for(weaviate_url, std::time::Duration::from_secs(5))
+            .map_err(|e| format!("adopt_populated: {}", e))?;
 
         let schema_url = format!("{}/v1/schema", weaviate_url.trim_end_matches('/'));
         let resp = client

@@ -188,8 +188,9 @@ impl RuntimeInfo {
 
 /// Augment the process-wide `PATH` with the OS-appropriate locations where
 /// user-installed CLI tooling (homebrew, cargo, pipx, linuxbrew, snap, flatpak)
-/// typically lives but which graphical launchers (Finder on macOS,
-/// `.desktop` files under GNOME/KDE on Linux) do NOT inherit.
+/// and the container runtimes typically live but which graphical launchers
+/// (Finder on macOS, `.desktop` files under GNOME/KDE on Linux) and boot units
+/// do NOT inherit.
 ///
 /// Why this exists (v0.2.53 M-P0-7 / L-P0-4):
 ///   - macOS: when the launcher is started by double-clicking
@@ -198,123 +199,335 @@ impl RuntimeInfo {
 ///     default PATH: `/usr/bin:/bin:/usr/sbin:/sbin` — `/opt/homebrew/bin/`
 ///     and `$HOME/.cargo/bin/` are NOT on it. Every subsequent `python3`,
 ///     `cargo`, `joern`, `podman`, `git` spawn fails with "command not
-///     found" until the user manually re-launches the launcher from a
-///     terminal session that DID source `.zshrc` /
-///     `eval "$(brew shellenv)"`.
+///     found" — or runs `/usr/bin/git` / `/usr/bin/python3`, the Xcode
+///     Command Line Tools stubs — until the user re-launches from a terminal
+///     session that DID source `.zshrc` / `eval "$(brew shellenv)"`.
 ///   - Linux: same shape via `.desktop` launchers. Under systemd-user,
 ///     the PATH is
 ///     `/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin` —
 ///     `$HOME/.cargo/bin`, `$HOME/.local/bin`, Linuxbrew, snap, flatpak
-///     are missing. Frequency is lower than macOS (Linux dev users tend
-///     to launch from terminal) but the bug shape is identical.
+///     are missing.
 ///   - Windows: Explorer-launched apps inherit the user PATH via
-///     registry (`HKCU\Environment`), so no augmentation is needed.
-///
-/// Cross-OS triage finding (`cross-os-triage-2026-06-10.md` §P0-7)
-/// confirms the macOS + Linux PATH inheritance class is the same root
-/// cause: launcher processes spawned from graphical contexts do NOT
-/// see the user's interactive-shell PATH. Single helper, OS-cfg'd
-/// candidates.
+///     registry (`HKCU\Environment`); since v0.2.97 R9 the Docker Desktop /
+///     Podman installer directories are still added when missing (a
+///     Scheduled Task or a service may run with a different PATH).
+///   - v0.2.97 R9 H1(b)/H5: the candidate list is the shared table
+///     `vco_lib/tool_search_dirs.toml` (see [`augment_candidates`]), and the
+///     HUB calls this too (`vct-hub/src/main.rs`, before its tokio runtime
+///     exists): both processes decide "is the container runtime installed?"
+///     and a short inherited PATH must not answer "no" for a runtime in
+///     `~/bin` or `/opt/homebrew/bin`.
 ///
 /// Properties:
 ///   - Idempotent: calling twice does not duplicate entries.
-///   - Order-preserving: existing user PATH stays in its original
-///     order; augment candidates are PREPENDED so they take precedence
-///     over the system PATH (but only when missing). This matters when
-///     the user has both a system `python3` and a homebrew `python3` —
-///     homebrew should win for parity with their interactive shell.
+///   - The order rule (v0.2.97 R10 J3, split by the table's per-entry
+///     `placement`; see [`augmented_entries`]): the v0.2.53 graphical-launch
+///     candidates (`prepend-when-missing`) the inherited PATH lacks go AHEAD
+///     of it — a login shell's order, so Homebrew's `git` beats the
+///     `/usr/bin` stub in a Finder launch, exactly as before v0.2.97 — and
+///     the v0.2.97 runtime locations (`append`) it lacks go AFTER it, so they
+///     never shadow an inherited entry. An entry already on the inherited
+///     PATH is never moved, so the inherited PATH keeps its own order.
+///     `vco_lib.tool_search_dirs` (`which`, `run`, `reachable_path`) follows
+///     the same rule, so a name resolves to the SAME binary in the launcher,
+///     the hub and every Python/shell surface.
 ///   - Soft-fail: if `HOME` is unset (CI / sandboxed contexts) the
 ///     candidates that reference `$HOME` are silently dropped.
 ///   - Resolves `~` expansion: `$HOME/.cargo/bin` is materialised, not
 ///     literal.
 pub fn augment_path_for_graphical_launch() {
-    let candidates = augment_candidates();
-    if candidates.is_empty() {
-        return;
-    }
-
     let current = std::env::var_os("PATH").unwrap_or_default();
-    let mut seen: std::collections::HashSet<PathBuf> =
-        std::env::split_paths(&current).collect();
-
-    // Prepend candidates that are not already on PATH, preserving the
-    // order declared in `augment_candidates()`. Existing PATH entries
-    // follow.
-    let mut new_entries: Vec<PathBuf> = Vec::with_capacity(candidates.len());
-    for cand in candidates {
-        if seen.insert(cand.clone()) {
-            new_entries.push(cand);
-        }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    if let Some(joined) = augmented_path(&current, home.as_deref()) {
+        // Safety: setting PATH process-wide is sound because we are
+        // single-threaded at this call site (lib.rs `setup()` runs before
+        // any subprocess spawn or Tauri-managed thread is unparked; the
+        // hub's `main` calls it before building its tokio runtime).
+        // `set_var` itself is `unsafe` on edition 2024+, but stable Rust
+        // allows the safe form on the current crate edition (2021).
+        std::env::set_var("PATH", &joined);
     }
-    if new_entries.is_empty() {
-        return; // All candidates already on PATH — nothing to do.
+}
+
+/// The PATH [`augment_path_for_graphical_launch`] sets, from `current` and
+/// `home` — `None` when there is nothing to add (every candidate is already
+/// on it, or the OS has none) or the result cannot be joined (logged).
+///
+/// Pure, so it is tested without touching the process `PATH`: tests share
+/// that variable with every concurrently running test and every child a test
+/// spawns by bare name (v0.2.97 review R6 — a Rust test never sets it;
+/// `tests/test_rust_tests_never_mutate_process_path.py`).
+pub fn augmented_path(
+    current: &std::ffi::OsStr,
+    home: Option<&std::path::Path>,
+) -> Option<std::ffi::OsString> {
+    // An empty PATH has no entries (split_paths would yield one empty entry,
+    // i.e. the current directory, in the middle of the result).
+    let inherited: Vec<PathBuf> = if current.is_empty() {
+        Vec::new()
+    } else {
+        std::env::split_paths(current).collect()
+    };
+    let entries = augmented_entries(&inherited, &augment_candidates(home));
+    if entries.len() == inherited.len() {
+        return None; // All candidates already on PATH — nothing to do.
     }
-
-    // Append existing PATH entries after the new prepended candidates.
-    new_entries.extend(std::env::split_paths(&current));
-
-    match std::env::join_paths(new_entries.iter()) {
-        Ok(joined) => {
-            // Safety: setting PATH process-wide is sound because we
-            // are single-threaded at this call site (lib.rs `setup()`
-            // runs before any subprocess spawn or Tauri-managed thread
-            // is unparked). `set_var` itself is `unsafe` on edition
-            // 2024+, but stable Rust allows the safe form via
-            // std::env::set_var on current crate edition (2021).
-            std::env::set_var("PATH", &joined);
-        }
+    match std::env::join_paths(entries.iter()) {
+        Ok(joined) => Some(joined),
         Err(e) => {
             tracing::warn!(
                 error = %e,
                 "[vct] augment_path_for_graphical_launch: join_paths failed — \
                  PATH left unchanged"
             );
+            None
         }
     }
 }
 
-/// OS-specific list of directories to prepend to PATH, in priority
-/// order (first entry wins for collisions). Candidates that do not
-/// exist on disk are still added — the user may install the tooling
-/// later and re-launch. Only `$HOME`-relative candidates are dropped
-/// when `HOME` is unset.
-fn augment_candidates() -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+/// [`augmented_entries_for`] with this OS's comparison rule.
+pub fn augmented_entries(current: &[PathBuf], candidates: &[(PathBuf, Placement)]) -> Vec<PathBuf> {
+    augmented_entries_for(current, candidates, cfg!(windows))
+}
 
-    #[cfg(target_os = "macos")]
-    {
-        let mut out: Vec<PathBuf> = vec![
-            PathBuf::from("/opt/homebrew/bin"),
-            PathBuf::from("/opt/homebrew/sbin"),
-        ];
-        if let Some(h) = home.as_ref() {
-            out.push(h.join(".cargo/bin"));
-            out.push(h.join(".local/bin"));
+/// What two PATH entries are compared by (v0.2.97 R11 L5): duplicate
+/// separators collapsed and trailing ones dropped (a root stays a root), so
+/// `/opt/homebrew/bin/` and `//opt//homebrew/bin` are `/opt/homebrew/bin`; on
+/// Windows also case-insensitive and `/` read as `\` (a leading `\\` UNC
+/// prefix and a drive root `C:\` are kept). Only a comparison key — no entry
+/// is ever rewritten. Deliberately NOT `Path` equality (which also drops `.`
+/// components and so answered differently from Python). MUST MATCH
+/// `vco_lib.tool_search_dirs.path_key`.
+pub fn path_key(entry: &str, windows: bool) -> String {
+    let sep = if windows { '\\' } else { '/' };
+    let text: String = if windows {
+        entry.replace('/', "\\").to_lowercase()
+    } else {
+        entry.to_string()
+    };
+    let (lead, body): (&str, String) = if windows && text.starts_with("\\\\") {
+        ("\\\\", text[2..].to_string())
+    } else {
+        ("", text)
+    };
+    let mut collapsed = String::with_capacity(body.len());
+    for c in body.chars() {
+        if c == sep && collapsed.ends_with(sep) {
+            continue;
         }
-        out
+        collapsed.push(c);
     }
-
-    #[cfg(target_os = "linux")]
+    let mut stripped = collapsed.trim_end_matches(sep).to_string();
+    let b = stripped.as_bytes();
+    if stripped.is_empty() && !collapsed.is_empty() {
+        stripped.push(sep); // the root
+    } else if windows
+        && stripped.len() != collapsed.len()
+        && b.len() == 2
+        && b[0].is_ascii_lowercase()
+        && b[1] == b':'
     {
-        let mut out: Vec<PathBuf> = Vec::new();
-        if let Some(h) = home.as_ref() {
-            out.push(h.join(".local/bin"));
-            out.push(h.join(".cargo/bin"));
+        stripped.push(sep); // a drive root, not the drive's current directory
+    }
+    format!("{lead}{stripped}")
+}
+
+/// THE ORDER RULE, pure: the `prepend-when-missing` candidates `current`
+/// lacks (candidate order), then `current` unchanged, then the `append`
+/// candidates it lacks (candidate order). A candidate already in `current`
+/// — compared by [`path_key`] (`windows` = the comparison rule of the OS the
+/// PATH belongs to) — is never moved nor duplicated. MUST MATCH
+/// `vco_lib.tool_search_dirs.lookup_entries`
+/// (`tests/fixtures/tool_search_dirs_cases.json` `order_cases` run both).
+pub fn augmented_entries_for(
+    current: &[PathBuf],
+    candidates: &[(PathBuf, Placement)],
+    windows: bool,
+) -> Vec<PathBuf> {
+    let key = |p: &PathBuf| path_key(&p.to_string_lossy(), windows);
+    let mut seen: std::collections::HashSet<String> = current.iter().map(key).collect();
+    let mut before: Vec<PathBuf> = Vec::new();
+    let mut after: Vec<PathBuf> = Vec::new();
+    for (dir, placement) in candidates {
+        if !seen.insert(key(dir)) {
+            continue;
         }
-        out.push(PathBuf::from("/home/linuxbrew/.linuxbrew/bin"));
-        out.push(PathBuf::from("/snap/bin"));
-        out.push(PathBuf::from("/var/lib/flatpak/exports/bin"));
-        out
+        match placement {
+            Placement::PrependWhenMissing => before.push(dir.clone()),
+            Placement::Append => after.push(dir.clone()),
+        }
     }
+    before.extend(current.iter().cloned());
+    before.extend(after);
+    before
+}
 
-    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
-    {
-        // Windows + other targets: no-op. Explorer-launched apps
-        // inherit the user PATH via the registry, so augmentation is
-        // unnecessary.
-        let _ = home;
-        Vec::new()
+/// This OS's table entries (see [`tool_search_entries_for`]) with `home`
+/// and the process environment — what the launcher and the hub augment
+/// with. Candidates that do not exist on disk are still added — the user may
+/// install the tooling later and re-launch. Only `$HOME`-relative candidates
+/// are dropped when `HOME` is unset (and `${VAR}` ones when the variable is
+/// unset).
+///
+/// v0.2.97 R9 H1(b)/H5: the list is no longer hard-coded here — it is the
+/// ONE committed table `vco_lib/tool_search_dirs.toml` that the Python side
+/// (`vco_lib.tool_search_dirs`) also reads: the v0.2.53 graphical-launch
+/// list plus the places the container runtimes live (`~/bin` for rootless
+/// Docker, `/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle,
+/// the Windows installers), each with its `placement` (R10).
+fn augment_candidates(home: Option<&std::path::Path>) -> Vec<(PathBuf, Placement)> {
+    let home = home.map(|h| h.to_string_lossy().into_owned());
+    tool_search_entries_for(current_os_key(), home.as_deref(), &|k| std::env::var(k).ok())
+        .into_iter()
+        .map(|(d, p)| (PathBuf::from(d), p))
+        .collect()
+}
+
+/// The shared table of usual tool install locations (see
+/// [`augment_candidates`]). Embedded at compile time — the SAME file the
+/// Python reader parses.
+const TOOL_SEARCH_DIRS_TOML: &str = include_str!("../../../../../vco_lib/tool_search_dirs.toml");
+
+/// When SET (even to ""), replaces the table's list for this OS: entries
+/// separated by the OS path separator, same syntax, every one placed
+/// [`Placement::Append`]. MUST MATCH `vco_lib.tool_search_dirs.ENV_OVERRIDE`.
+pub const TOOL_SEARCH_DIRS_ENV: &str = "VCT_TOOL_SEARCH_DIRS";
+
+/// Where a table directory the PATH lacks goes (v0.2.97 R10): the table's
+/// per-entry `placement`. MUST MATCH `vco_lib.tool_search_dirs.PLACEMENT_*`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Placement {
+    /// `prepend-when-missing` — ahead of the inherited PATH (the v0.2.53
+    /// graphical-launch list: a login shell's order).
+    PrependWhenMissing,
+    /// `append` — after the inherited PATH (the v0.2.97 runtime locations:
+    /// reach only, never shadow).
+    Append,
+}
+
+impl Placement {
+    /// The table's spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Placement::PrependWhenMissing => "prepend-when-missing",
+            Placement::Append => "append",
+        }
     }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ToolSearchDirEntry {
+    dir: String,
+    placement: Placement,
+}
+
+#[derive(serde::Deserialize)]
+struct ToolSearchDirsFile {
+    format_version: u32,
+    dirs: std::collections::HashMap<String, Vec<ToolSearchDirEntry>>,
+}
+
+static TOOL_SEARCH_DIRS: std::sync::LazyLock<
+    std::collections::HashMap<String, Vec<(String, Placement)>>,
+> = std::sync::LazyLock::new(|| {
+    let parsed: ToolSearchDirsFile = toml::from_str(TOOL_SEARCH_DIRS_TOML)
+        .expect("vco_lib/tool_search_dirs.toml is embedded at compile time and must parse");
+    assert_eq!(
+        parsed.format_version, 2,
+        "vco_lib/tool_search_dirs.toml format_version this reader supports is 2"
+    );
+    parsed
+        .dirs
+        .into_iter()
+        .map(|(os, entries)| (os, entries.into_iter().map(|e| (e.dir, e.placement)).collect()))
+        .collect()
+});
+
+/// The table's key for the OS this binary runs on (`linux` / `macos` /
+/// `windows`; `other` has no entries). MUST MATCH
+/// `vco_lib.tool_search_dirs.os_key`.
+pub fn current_os_key() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "macos"
+    } else if cfg!(target_os = "linux") {
+        "linux"
+    } else if cfg!(windows) {
+        "windows"
+    } else {
+        "other"
+    }
+}
+
+/// One table entry → a directory, or `None` when it cannot be expanded:
+/// `~/rest` needs a home, `${NAME}rest` a set, non-empty `NAME`; anything
+/// else is literal. MUST MATCH `vco_lib.tool_search_dirs.expand_entry`
+/// (`tests/fixtures/tool_search_dirs_cases.json` runs both).
+pub fn expand_search_dir(
+    entry: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Option<String> {
+    if entry == "~" || entry.starts_with("~/") {
+        let h = home.filter(|h| !h.is_empty())?;
+        return Some(format!("{}{}", h.trim_end_matches(['/', '\\']), &entry[1..]));
+    }
+    if let Some(rest) = entry.strip_prefix("${") {
+        if let Some(end) = rest.find('}') {
+            let name = &rest[..end];
+            let valid = !name.is_empty()
+                && name.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+                && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+            if valid {
+                let value = env(name).filter(|v| !v.is_empty())?;
+                return Some(format!("{}{}", value, &rest[end + 1..]));
+            }
+        }
+    }
+    Some(entry.to_string())
+}
+
+/// The expanded `(directory, placement)` entries for `os` (table order,
+/// duplicate directories dropped — the first keeps its placement), or the
+/// `VCT_TOOL_SEARCH_DIRS` override when `env` has it (every entry
+/// [`Placement::Append`]). Pure (home and env injected) so the shared
+/// fixture can drive every OS from any host. MUST MATCH
+/// `vco_lib.tool_search_dirs.search_entries`.
+pub fn tool_search_entries_for(
+    os: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<(String, Placement)> {
+    let raw: Vec<(String, Placement)> = match env(TOOL_SEARCH_DIRS_ENV) {
+        Some(over) => {
+            let sep = if os == "windows" { ';' } else { ':' };
+            over.split(sep)
+                .filter(|p| !p.trim().is_empty())
+                .map(|p| (p.to_string(), Placement::Append))
+                .collect()
+        }
+        None => TOOL_SEARCH_DIRS.get(os).cloned().unwrap_or_default(),
+    };
+    let mut out: Vec<(String, Placement)> = Vec::new();
+    for (entry, placement) in raw {
+        if let Some(d) = expand_search_dir(entry.trim(), home, env) {
+            if !d.is_empty() && !out.iter().any(|(seen, _)| seen == &d) {
+                out.push((d, placement));
+            }
+        }
+    }
+    out
+}
+
+/// The directories of [`tool_search_entries_for`], in table order. MUST
+/// MATCH `vco_lib.tool_search_dirs.candidate_dirs`.
+pub fn tool_search_dirs_for(
+    os: &str,
+    home: Option<&str>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Vec<String> {
+    tool_search_entries_for(os, home, env).into_iter().map(|(d, _)| d).collect()
 }
 
 // v0.2.53 L-P0-4 (Track G3) — coverage note:
@@ -344,7 +557,9 @@ fn augment_candidates() -> Vec<PathBuf> {
 //   This is fixed by Track C's M-P0-7 process-wide PATH augment:
 //   `augment_path_for_graphical_launch()` in this same module is called
 //   from `lib.rs::setup()` BEFORE any subprocess spawn or thread spawn,
-//   prepending the OS-specific candidate directories to PATH. After that
+//   adding the OS-specific candidate directories the PATH lacks (the
+//   graphical-launch ones ahead of it, the runtime locations after it —
+//   R10 J3). After that
 //   runs, this `which_on_path()` resolves Node, Joern, lean-ctx, cargo,
 //   npm correctly under both interactive-shell AND .desktop launch
 //   contexts.
@@ -372,280 +587,8 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
 // Detection
 // ---------------------------------------------------------------------------
 
-/// Probe a binary's `--version` flag. Returns true if the binary executes
-/// successfully. We don't parse the version string — the binary either
-/// runs or it doesn't; "podman from 2018 that lacks compose" surfaces
-/// later when the compose-form probe fails.
-///
-/// Timeout: 5s on Linux, 15s on Windows + macOS.
-///
-/// History:
-///   - pre-2026-04-27: 2s, raised to 5s after disk I/O pressure on slower
-///     machines competing with first-install's final container-restart
-///     phase caused false negatives.
-///   - 2026-05-23: raised to 15s on Windows after a fresh-install launcher
-///     boot on a contributor's Win11 machine fired the "No container runtime found"
-///     modal despite Docker Desktop being healthy. The Hyper-V VM that
-///     hosts Docker on Windows can take 3-10s to respond to `docker
-///     --version` on cold cache; 5s is too tight as a worst-case ceiling.
-///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
-///     Docker Desktop for Mac runs inside HyperKit / Apple Virtualization
-///     Framework VMs with the same cold-cache + named-socket cost profile
-///     as the Hyper-V VM on Windows; real-world `docker --version` on
-///     Mac is 6-10s on cold start. Native Linux podman/docker remains
-///     a local process with sub-second startup, so Linux still uses 5s.
-async fn version_probe(binary: &PathBuf) -> bool {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let timeout_secs = 15u64;
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let timeout_secs = 5u64;
 
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        silent_command(binary).arg("--version").output(),
-    )
-    .await;
-    let elapsed_ms = start.elapsed().as_millis();
-    let ok = matches!(&result, Ok(Ok(out)) if out.status.success());
-    if !ok {
-        // Diagnostic log — runtime detection silently returning None has
-        // surfaced as a launcher UX bug (firing the no-container modal
-        // even when the user has Podman installed). When this fires the
-        // user sees a misleading dialog; we want stderr breadcrumbs in
-        // the launcher log to prove cause without strace. Elapsed-time
-        // helps distinguish timeout-near-ceiling (raise the limit) from
-        // genuine missing-binary (spawn error in <50ms).
-        tracing::warn!(
-            binary = %binary.display(),
-            elapsed_ms,
-            ceiling_secs = timeout_secs,
-            cause = ?match &result {
-                Err(_) => "timeout".to_string(),
-                Ok(Err(e)) => format!("spawn error: {}", e),
-                Ok(Ok(out)) => format!("non-zero exit {:?}", out.status.code()),
-            },
-            "[runtime] version_probe failed"
-        );
-    } else {
-        // Non-error path: log elapsed only when slow enough to be
-        // interesting (>1s). Quiet on the happy path.
-        if elapsed_ms > 1000 {
-            tracing::info!(
-                binary = %binary.display(),
-                elapsed_ms,
-                "[runtime] version_probe ok but slow"
-            );
-        }
-    }
-    ok
-}
 
-/// PR-15 G1 (v0.2.11): validate that the runtime's daemon is actually
-/// reachable, not just that the binary exists on PATH. Mirrors the bash
-/// `_runtime_usable()` helper PR-12 added to
-/// `scripts/launch-claude-mcp-stack.sh`.
-///
-/// The 2026-05-16 cascade root cause: `version_probe` returns true as
-/// soon as `<binary> --version` exits 0, which only confirms the binary
-/// is installed. A user with Docker Desktop installed but NOT in the
-/// `docker` group has a working `docker --version` but every `docker ps`
-/// / `docker compose up` returns "permission denied while trying to
-/// connect to the Docker daemon socket". The launcher would then pick
-/// Docker as the runtime, every subsequent compose call would fail
-/// silently, and `vco_code_embed` (the GPU container) would never come
-/// up. The user sees only weaviate + ollama in the launcher UI with no
-/// indication of why.
-///
-/// Validation strategy per runtime:
-///
-///   - **docker**: `docker info` must report a `Server:` line. The
-///     `Client:` section appears even without daemon access; only
-///     `Server:` requires the daemon socket to be reachable. We grep
-///     stdout for `Server:` rather than `Server Version:` so the check
-///     is robust across `docker info` output format changes
-///     (the literal `Server:` header line is stable across Docker
-///     20.10..28.x).
-///   - **podman**: `podman info` exits 0 only when the rootless setup
-///     actually works (subuid/subgid mappings present, storage path
-///     writable, conmon found). A `podman info` exit 0 is sufficient
-///     validation — no extra grep needed because rootless podman has
-///     no client/server split.
-///
-/// Timeout: 5s on Linux, 15s on Windows + macOS.
-///
-/// History:
-///   - originally 5s — `docker info` on a real Linux daemon answers in
-///     <1s, so 5s was a wide-enough ceiling.
-///   - 2026-05-23: raised to 15s on Windows after `daemon_usable_probe`
-///     spuriously failed in fresh-install testing on a contributor's Win11 machine
-///     even with Docker Desktop healthy. `docker info` on Windows queries
-///     the Hyper-V VM via named pipe + gathers daemon metadata (images,
-///     networks, plugins); cold-cache or VM-under-load this can take
-///     7-12s. 5s missed the window.
-///   - 2026-05-26 (v0.2.36 Agent U): same 15s ceiling extended to macOS.
-///     Docker Desktop for Mac issues `docker info` against the HyperKit /
-///     Apple Virtualization Framework VM (socket-style transport with
-///     daemon-metadata gather); cold-cache profile matches Windows, and
-///     5s spuriously failed against healthy Docker Desktop installs.
-///     Native Linux daemons stay at 5s — local daemon, sub-second.
-///
-/// Soft-fail: any error (timeout, spawn failure, non-zero exit)
-/// returns `false`, never panics. Caller (`resolve_runtime`) then
-/// falls through to the next candidate runtime.
-async fn daemon_usable_probe(binary: &PathBuf, runtime: ContainerRuntime) -> bool {
-    #[cfg(any(target_os = "windows", target_os = "macos"))]
-    let timeout_secs = 15u64;
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    let timeout_secs = 5u64;
-
-    let start = std::time::Instant::now();
-    let result = tokio::time::timeout(
-        std::time::Duration::from_secs(timeout_secs),
-        silent_command(binary).arg("info").output(),
-    )
-    .await;
-    let elapsed_ms = start.elapsed().as_millis();
-    // Diagnostic breadcrumb: ALWAYS log elapsed for `docker info`/`podman
-    // info` because this is the single most common source of "launcher
-    // says no runtime but I have it installed" reports. Slow-but-OK runs
-    // (1.5-7s) are interesting precursors to future timeout regressions.
-    if elapsed_ms > 1000 {
-        tracing::info!(
-            runtime = runtime.display_name(),
-            binary = %binary.display(),
-            elapsed_ms,
-            ceiling_secs = timeout_secs,
-            "[runtime] daemon_usable_probe slow"
-        );
-    }
-    let output = match result {
-        Ok(Ok(out)) => out,
-        Ok(Err(e)) => {
-            tracing::warn!(
-                runtime = runtime.display_name(),
-                binary = %binary.display(),
-                error = %e,
-                "[runtime] daemon_usable_probe spawn error"
-            );
-            return false;
-        }
-        Err(_) => {
-            tracing::warn!(
-                runtime = runtime.display_name(),
-                binary = %binary.display(),
-                ceiling_secs = timeout_secs,
-                "[runtime] daemon_usable_probe timeout"
-            );
-            return false;
-        }
-    };
-    if !output.status.success() {
-        tracing::warn!(
-            runtime = runtime.display_name(),
-            exit_code = ?output.status.code(),
-            "[runtime] daemon_usable_probe: `info` exited non-zero — daemon likely \
-             unreachable (Docker: user not in `docker` group? Docker Desktop not \
-             started? Podman: rootless setup broken?)"
-        );
-        return false;
-    }
-    match runtime {
-        ContainerRuntime::Docker => {
-            // `docker info` always returns 0 if the binary can read
-            // *something*; the daemon-reachable signal is the literal
-            // `Server:` line in stdout. Client-only output has only
-            // `Client:` + an error block at the bottom mentioning the
-            // daemon connection refusal.
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            let has_server = stdout
-                .lines()
-                .any(|line| {
-                    let trimmed = line.trim_start();
-                    trimmed.starts_with("Server:") || trimmed.starts_with("Server Version:")
-                });
-            if !has_server {
-                tracing::warn!(
-                    "[runtime] daemon_usable_probe: `docker info` succeeded but \
-                     stdout has no `Server:` section — daemon not reachable \
-                     (user not in docker group, or Docker Desktop not started)"
-                );
-            }
-            has_server
-        }
-        ContainerRuntime::Podman => true, // exit 0 sufficient for rootless podman
-    }
-}
-
-/// Probe `<runtime> compose version`. Returns true when the subcommand
-/// is present (modern Podman/Docker). Falls back to checking for the
-/// standalone `<runtime>-compose` binary if the subcommand is absent.
-///
-/// Timeout 5s per probe (was 2s). `podman compose version` can be slow
-/// because Podman v4 delegates to an "external compose provider" (often
-/// docker-compose at /usr/local/bin/docker-compose), printing a banner
-/// to stderr before the version output. When the provider lookup hits
-/// a cold disk cache, 2s was sometimes not enough.
-async fn detect_compose_form(binary: &PathBuf, runtime: ContainerRuntime) -> Option<ComposeForm> {
-    // Subcommand probe — `podman compose version` or `docker compose version`.
-    let sub = tokio::time::timeout(
-        std::time::Duration::from_secs(5),
-        silent_command(binary)
-            .args(["compose", "version"])
-            .output(),
-    )
-    .await;
-    if let Ok(Ok(out)) = &sub {
-        if out.status.success() {
-            return Some(ComposeForm::Subcommand);
-        }
-    }
-
-    // Standalone fallback — `podman-compose --version`.
-    // NOTE: which_on_path uses the launcher process's PATH. When the
-    // launcher is spawned by `setsid nohup` from post-install-launcher.sh,
-    // PATH is the shell-default (typically /usr/bin:/bin) and does NOT
-    // include `~/.local/bin/`, where pip-installed `podman-compose` lives.
-    // We also probe ~/.local/bin/ explicitly so the standalone fallback
-    // doesn't silently miss user-local installs.
-    let standalone_name = format!("{}-compose", runtime.binary());
-    let mut standalone_paths: Vec<PathBuf> = Vec::new();
-    if let Some(p) = which_on_path(&standalone_name) {
-        standalone_paths.push(p);
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        let user_local = PathBuf::from(home).join(".local/bin").join(&standalone_name);
-        if user_local.is_file() && !standalone_paths.contains(&user_local) {
-            standalone_paths.push(user_local);
-        }
-    }
-    for path in &standalone_paths {
-        let sa = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            silent_command(path).arg("--version").output(),
-        )
-        .await;
-        if let Ok(Ok(out)) = sa {
-            if out.status.success() {
-                return Some(ComposeForm::Standalone);
-            }
-        }
-    }
-
-    tracing::warn!(
-        "[runtime] detect_compose_form: no compose support for {} (subcommand_status={:?}, \
-         standalone_candidates={:?})",
-        binary.display(),
-        match &sub {
-            Err(_) => "timeout".to_string(),
-            Ok(Err(e)) => format!("spawn error: {}", e),
-            Ok(Ok(out)) => format!("exit {:?}, stderr={}", out.status.code(),
-                String::from_utf8_lossy(&out.stderr).chars().take(200).collect::<String>()),
-        },
-        standalone_paths
-    );
-    None
-}
 
 /// On macOS/Windows, Podman runs inside a VM ("Podman machine") that
 /// must be started before any container ops. Returns true when we
@@ -680,26 +623,82 @@ async fn detect_podman_machine_needed(_binary: &PathBuf) -> bool {
     false
 }
 
-/// Cached detection result. `None` means "not yet probed". `Some(None)`
-/// means "probed and found no runtime". `Some(Some(...))` is the live
-/// answer. We use a `Mutex<Option<Option<RuntimeInfo>>>` so the second
-/// caller can read the first caller's verdict without redoing the probe.
-static CACHE: Mutex<Option<Option<RuntimeInfo>>> = Mutex::new(None);
+/// What one detection pass established: the runtime to drive, or — when
+/// there is none — why, in words a user can act on (v0.2.97 R11 L6).
+/// v0.2.97 R12: every field is a rendering of the ONE Python verdict
+/// (`runtime_verdict::decide`); the refusal is Python's text VERBATIM (M3).
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeDetection {
+    /// The runtime to drive (`None` = nothing may be driven).
+    pub info: Option<RuntimeInfo>,
+    /// Why a stale runtime record was NOT switched to the other runtime —
+    /// the shared table's wording (`vco_lib/runtime_reconcile_messages.toml`,
+    /// R10 J6), rendered by Python — when the stale-record arm declined;
+    /// else `None`.
+    pub not_switched: Option<String>,
+    /// The full refusal when `info` is `None`: Python's `refusal` text
+    /// verbatim (a refused pin, carrying `not_switched`), the verdict's
+    /// `reason` when it RESOLVED without compose (R12-bis P3-2: an
+    /// installed, answering runtime without compose is not "no container
+    /// runtime found" — the reason explains the compose gap), or the loud
+    /// broken-install error when the verdict itself could not run. `None`
+    /// otherwise.
+    pub refusal: Option<String>,
+    /// The first candidate binary INSTALLED, usable or not (the verdict's
+    /// `installed`; `None` = no container runtime is installed at all —
+    /// EXCEPT under [`verdict_failed`], where nothing was learned and
+    /// `None` means UNKNOWN, not "none"). M4: the boot path offers the
+    /// install dialog on this, pin or not.
+    pub installed: Option<String>,
+    /// True when the ONE verdict could not be obtained at all (missing or
+    /// broken Python, spawn failure, timeout, unparseable output). The
+    /// `refusal` then carries the loud broken-install error WITH its
+    /// remedy, and `installed` is unknown — a surface must answer with
+    /// that error, never with the "install a container runtime" download
+    /// dialog (R12-bis P3-3).
+    pub verdict_failed: bool,
+}
+
+impl RuntimeDetection {
+    /// The sentence a surface shows when there is no runtime to drive: the
+    /// pin refusal (with why), else "no container runtime found". Only
+    /// meaningful when `info` is `None`.
+    pub fn no_runtime_message(&self) -> String {
+        self.refusal.clone().unwrap_or_else(|| {
+            "No container runtime found. Install Podman or Docker to run VCT services.".to_string()
+        })
+    }
+}
+
+/// Cached detection result. `None` means "not yet probed"; `Some(d)` is the
+/// last pass's [`RuntimeDetection`], so the second caller can read the first
+/// caller's verdict — refusal included — without redoing the probe.
+static CACHE: Mutex<Option<RuntimeDetection>> = Mutex::new(None);
 
 /// Force a fresh detection pass. Called from a Tauri command when the
-/// user clicks "Re-detect" in the Services preferences screen.
+/// user clicks "Re-detect" in the Services preferences screen. Clears the
+/// verdict TTL cache too (R12): the next pass must re-ask Python, not
+/// replay a cached verdict.
 pub fn invalidate_cache() {
     if let Ok(mut g) = CACHE.lock() {
         *g = None;
     }
+    super::runtime_verdict::invalidate();
 }
 
 /// Detect the active runtime once per launcher session. Returns `None`
 /// when neither Podman nor Docker is installed. Result is cached; call
 /// `invalidate_cache()` to force a re-probe.
 pub async fn detect_runtime() -> Option<RuntimeInfo> {
-    {
-        let g = CACHE.lock().ok()?;
+    detect_runtime_detailed().await.info
+}
+
+/// [`detect_runtime`] with the reason there is none (v0.2.97 R11 L6): the
+/// install preflight, the start path and the hub's watchdog show a refused
+/// pin — and why the stale record was not switched — instead of "no
+/// container runtime found". Same cache.
+pub async fn detect_runtime_detailed() -> RuntimeDetection {
+    if let Ok(g) = CACHE.lock() {
         if let Some(cached) = g.as_ref() {
             return cached.clone();
         }
@@ -711,189 +710,142 @@ pub async fn detect_runtime() -> Option<RuntimeInfo> {
     resolved
 }
 
+/// [`detect_runtime`] for a caller that cannot go on without a runtime:
+/// `Err` carries [`RuntimeDetection::no_runtime_message`].
+pub async fn require_runtime() -> Result<RuntimeInfo, String> {
+    let detection = detect_runtime_detailed().await;
+    detection.info.clone().ok_or_else(|| detection.no_runtime_message())
+}
+
 // ---------------------------------------------------------------------------
-// The DECISION, separated from the PROBES (v0.2.92 PLAN-EXTENSION §3.5 / R13)
+// The DECISION — v0.2.97 R12: ONE Python verdict (owner ruling "Consolidate
+// now", 2026-09-25)
 // ---------------------------------------------------------------------------
 //
-// `vco_lib/containers.py::resolve()` is the Python home for "which runtime,
-// which compose?" — install.py and the three session-start hook pairs go
-// through it. This module is the DECLARED CLASS-C MIRROR for the launcher
-// (a compiled binary cannot shell out to Python on every services-watcher
-// tick). What keeps the two from drifting is ONE fixture,
-// `tests/fixtures/container_runtime_parity.json`, describing hosts and the
-// expected decision; `tests/test_container_runtime_ssot.py` drives the Python
-// side and `tests::parity_fixture_*` below drives `candidate_order` +
-// `select_runtime`. The async probes stay here; the decision they feed is a
-// pure function so the fixture can exercise it without podman or docker.
+// `vco_lib.runtime_reconcile.decide` (CLI: `python -m
+// vco_lib.runtime_reconcile decide --json`) is the ONE answer for "which
+// runtime, which compose, which pin, and why" — this module ASKS it through
+// `runtime_verdict::decide` and renders the JSON. The Rust decision mirror
+// (`candidate_order` + `select_runtime` + the stale-record arm and their
+// probes) is RETIRED: it was a class-C mirror of the reconcile rules, and
+// the pin discipline / stale-record / bind-folder / one-engine rules now
+// have exactly one home. The parity fixture
+// (`tests/fixtures/container_runtime_parity.json`) and the contract fixture
+// (`tests/fixtures/runtime_decide_cases.json`) drive this surface THROUGH
+// THE CLIENT (see `services::runtime_verdict`'s tests).
 //
-// The pin arm USED to diverge (v0.2.92 merge-lane ASK #1 let the Python side
-// fall through to the other runtime, loudly, while this module stayed strict).
-// BLOCKER-4 overturned that: a pinned runtime that is unusable is REFUSED on
-// both surfaces, because podman and docker have PER-RUNTIME NAMED VOLUMES
-// (`infrastructure/docker-compose.yml`) — driving the runtime the user did not
-// pin does not rescue them, it stands an EMPTY Weaviate up on :8081 that every
-// downstream heal then reads as their knowledge graph, while this module (and
-// so the GUI) reports no runtime at all. That split-brain is exactly what the
-// PR-43 override comment in `resolve_runtime` below was written to prevent.
-// `candidate_order` here and `vco_lib.containers.runtime_candidate_order` are
-// now identical for EVERY arm, and the fixture's
-// `env_pref_unusable_is_refused_not_substituted` scenario pins both sides to
-// the same answer (`expect.state = absent` for Python, `expect_rust = null`
-// here). What still differs — deliberately — is a usable runtime WITHOUT
-// compose: Python returns `resolved` with `compose: null` so install.py can
-// print compose's own error; this module returns `None` because it has
-// nothing to drive.
+// A pinned runtime that is unusable stays REFUSED — Python's answer, with
+// Python's refusal text shown verbatim (M3: the Rust side never re-derives
+// "does not answer info" from PATH state). A usable runtime WITHOUT compose
+// still maps to `info: None` here (Python says `resolved` + `compose: null`
+// so install.py can print compose's own error; this module has nothing to
+// drive) — the deliberate divergence the fixture's `expect_rust` records.
+// R12-bis P3-2: on that branch the verdict's `reason` rides as the
+// detection's refusal, so the surfaces say "installed but no compose"
+// (Python's explanation) instead of "No container runtime found".
 
-/// Parse `VCT_CONTAINER_RUNTIME` into the probe order. MUST MATCH
-/// `vco_lib.containers.runtime_candidate_order` for the auto / unset /
-/// unrecognised arms (pinned by the parity fixture); see the divergence note
-/// above for the explicit-preference arm.
-pub(crate) fn candidate_order(override_pref: Option<&str>) -> Vec<ContainerRuntime> {
-    // Preference order: env override first; else Podman > Docker.
-    // Per user policy: "check for availability on podman first".
-    match override_pref {
-        Some("podman") => vec![ContainerRuntime::Podman],
-        Some("docker") => vec![ContainerRuntime::Docker],
-        Some(other) => {
-            tracing::warn!(
-                value = ?other,
-                "[vct] runtime: VCT_CONTAINER_RUNTIME not recognized (expected \
-                 'podman', 'docker', or 'auto'); falling back to podman-then-docker \
-                 auto-detection"
-            );
-            vec![ContainerRuntime::Podman, ContainerRuntime::Docker]
-        }
-        None => vec![ContainerRuntime::Podman, ContainerRuntime::Docker],
-    }
+async fn resolve_runtime() -> RuntimeDetection {
+    resolve_runtime_in(crate::orchestrator_manifest::orchestrator_install_root().as_deref()).await
 }
 
-/// Normalise the raw env value the way `resolve_runtime` always has:
-/// trimmed, lower-cased, and `""` / `auto` → no preference.
-pub(crate) fn normalise_override(raw: Option<&str>) -> Option<String> {
-    raw.map(|s| s.trim().to_lowercase())
-        .filter(|s| !s.is_empty() && s != "auto")
-}
-
-/// One candidate after probing. Fields are short-circuited the way the
-/// lazy probe loop short-circuits (a binary not on PATH has `version_ok ==
-/// false`, etc.), so the pure decision below sees exactly what the probes
-/// established.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct ProbedCandidate {
-    pub runtime: ContainerRuntime,
-    pub on_path: bool,
-    pub version_ok: bool,
-    pub daemon_ok: bool,
-    pub compose: Option<ComposeForm>,
-}
-
-/// The pure decision: the FIRST candidate that is on PATH, whose client
-/// binary runs, whose daemon answers, AND that has a compose invocation.
-/// A usable runtime WITHOUT compose is skipped (a Podman 3.x without
-/// compose cannot bring the stack up) — which is also why this returns
-/// `None` where the Python side returns `resolved` + `compose: null`
-/// (install.py wants to print compose's own error, the launcher has
-/// nothing to drive).
-pub(crate) fn select_runtime(
-    probed: &[ProbedCandidate],
-) -> Option<(ContainerRuntime, ComposeForm)> {
-    probed
-        .iter()
-        .find(|c| c.on_path && c.version_ok && c.daemon_ok && c.compose.is_some())
-        .map(|c| (c.runtime, c.compose.expect("checked is_some")))
-}
-
-async fn resolve_runtime() -> Option<RuntimeInfo> {
-    // PR-43 (v0.2.12): honor VCT_CONTAINER_RUNTIME env override so the
-    // GUI matches the hooks' behavior (templates/hooks/ensure-containers.sh,
-    // verify-container-ports.sh, ensure-code-embed-service.sh — since
-    // v0.2.92 all three go through `vco_lib.containers`, which reads the
-    // same variable). Without this, a user setting the var to force a
-    // specific runtime would see hooks pick one and the launcher GUI pick
-    // another — silent split-brain.
-    //
-    // Accepted values: "podman", "docker", "auto" (or unset → auto).
-    // Invalid values fall through to auto-detection with a clear stderr.
-    let override_pref = normalise_override(
-        std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref(),
-    );
-    let order = candidate_order(override_pref.as_deref());
-
-    for runtime in order {
-        // Probe lazily (stop at the first acceptable runtime), but feed the
-        // result through the SAME pure decision the parity fixture pins.
-        if let Some(info) = probe_runtime(runtime).await {
-            return Some(info);
-        }
-    }
-    None
-}
-
-/// Whether a runtime's binary is on PATH at all, regardless of whether it
-/// works. Splits "you pinned podman and it is not installed" (install it, or
-/// repin) from "you pinned podman and it is installed but down" (start it).
-pub fn runtime_on_path(runtime: ContainerRuntime) -> bool {
-    which_on_path(runtime.binary()).is_some()
-}
-
-/// The runtime the user PINNED via `VCT_CONTAINER_RUNTIME`, normalised the
-/// same way `resolve_runtime` normalises it (`""` / `auto` / unrecognised →
-/// no pin). Exposed so the install preflight can say "podman is pinned but
-/// unusable; docker is usable" instead of "no runtime installed" (BLOCKER-4).
-pub fn pinned_runtime() -> Option<ContainerRuntime> {
-    match normalise_override(std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref())
-        .as_deref()
-    {
-        Some("podman") => Some(ContainerRuntime::Podman),
-        Some("docker") => Some(ContainerRuntime::Docker),
-        _ => None,
-    }
-}
-
-/// Probe ONE named runtime end-to-end — PATH, `version`, daemon, compose —
-/// and return what to drive, or `None` when any rung fails.
-///
-/// This is the body `resolve_runtime`'s loop used to inline; it is a function
-/// so the install preflight can ask about a SPECIFIC runtime (the one the
-/// user did not pin) without a second copy of the ladder. Uncached by design:
-/// both callers are user-initiated (an Install click), where freshness beats
-/// the ~50 ms probe.
-pub async fn probe_runtime(runtime: ContainerRuntime) -> Option<RuntimeInfo> {
-    let bin_path = which_on_path(runtime.binary())?;
-    if !version_probe(&bin_path).await {
-        return None;
-    }
-    // PR-15 G1 (v0.2.11): daemon-access check. version_probe only
-    // confirms the binary runs; daemon_usable_probe confirms the
-    // daemon socket is actually reachable. Without this check, the
-    // launcher could pick a runtime whose every subsequent compose
-    // call fails silently with "permission denied". Mirrors the
-    // bash _runtime_usable() that PR-12 added to
-    // scripts/launch-claude-mcp-stack.sh::detect_runtime().
-    if !daemon_usable_probe(&bin_path, runtime).await {
-        return None;
-    }
-    let probed = ProbedCandidate {
-        runtime,
-        on_path: true,
-        version_ok: true,
-        daemon_ok: true,
-        compose: detect_compose_form(&bin_path, runtime).await,
-    };
-    // Binary exists but no compose support → `None` (a Podman 3.x without
-    // compose is useless to us), so the caller tries the next runtime.
-    let (_, compose_form) = select_runtime(&[probed])?;
-    let needs_machine_start = match runtime {
-        ContainerRuntime::Podman => detect_podman_machine_needed(&bin_path).await,
-        ContainerRuntime::Docker => false,
-    };
-    Some(RuntimeInfo {
-        runtime,
-        compose_form,
-        needs_machine_start,
-        binary_path: bin_path,
+/// [`resolve_runtime`] against an explicit clone root (where the install's
+/// `state/install/runtime.txt` lives) — a test hands it a temp dir so this
+/// machine's own record cannot change the answer.
+async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> RuntimeDetection {
+    resolve_runtime_in_with(super::runtime_verdict::VerdictOpts {
+        install_root,
+        mode: Some(super::runtime_verdict::Mode::ReadOnly),
+        purpose: Some(super::runtime_verdict::Purpose::Infra),
+        ..super::runtime_verdict::VerdictOpts::default()
     })
+    .await
 }
+
+/// The same funnel with full opts — the contract and probe-path tests inject
+/// the interpreter, the PATH and the pin env here instead of mutating the
+/// process env.
+async fn resolve_runtime_in_with(
+    opts: super::runtime_verdict::VerdictOpts<'_>,
+) -> RuntimeDetection {
+    let verdict = match super::runtime_verdict::decide_cached(opts).await {
+        Ok(v) => v,
+        // Loud-fail (R12): a missing or broken Python is a broken install.
+        // The error is shown as the refusal — never a Rust fallback.
+        Err(e) => {
+            tracing::error!("[vct] runtime: the one verdict could not run: {}", e);
+            return RuntimeDetection {
+                info: None,
+                not_switched: None,
+                refusal: Some(e),
+                // UNKNOWN, not "none" — `verdict_failed` tells the boot
+                // path to show the error above and NOT open the runtime
+                // download dialog (R12-bis P3-3).
+                installed: None,
+                verdict_failed: true,
+            };
+        }
+    };
+    let needs_machine_start = match verdict.runtime.as_deref() {
+        Some("podman") => match verdict.binary_path.as_ref() {
+            Some(b) => detect_podman_machine_needed(b).await,
+            None => false,
+        },
+        _ => false,
+    };
+    detection_from_verdict(&verdict, needs_machine_start)
+}
+
+/// The verdict rendered as this module's answer — pure, so the mapping is
+/// testable without a Python interpreter. `state`/`runtime`/`compose`/
+/// `binary_path` become [`RuntimeInfo`]; a refusal keeps Python's text
+/// VERBATIM (M3); `not_switched` travels for the surfaces that show it
+/// separately; `installed` drives the boot path's install dialog (M4).
+/// When the verdict RESOLVED but compose is missing/unknown (`info` is
+/// `None` with no refusal), the verdict's `reason` rides as the refusal
+/// (R12-bis P3-2): it explains the compose gap, and no surface may call
+/// an installed, answering runtime "No container runtime found".
+pub(crate) fn detection_from_verdict(
+    verdict: &super::runtime_verdict::RuntimeVerdict,
+    needs_machine_start: bool,
+) -> RuntimeDetection {
+    let info = verdict
+        .runtime
+        .as_deref()
+        .zip(verdict.compose_form.as_deref())
+        .and_then(|(name, form)| {
+            let runtime = if name == "docker" { ContainerRuntime::Docker } else { ContainerRuntime::Podman };
+            let compose_form = match form {
+                "subcommand" => ComposeForm::Subcommand,
+                "standalone" => ComposeForm::Standalone,
+                _ => return None, // resolved without compose: nothing to drive
+            };
+            let binary_path = verdict
+                .binary_path
+                .clone()
+                .or_else(|| which_on_path(runtime.binary()))?;
+            Some(RuntimeInfo { runtime, compose_form, needs_machine_start, binary_path })
+        });
+    let nothing_to_drive = info.is_none();
+    RuntimeDetection {
+        info,
+        not_switched: verdict.not_switched.clone(),
+        refusal: verdict.refusal.clone().or_else(|| {
+            // R12-bis P3-2: resolved WITHOUT compose (or any no-refusal
+            // shape with nothing to drive) — Python's `reason` explains
+            // the gap; Python sets `refusal` only when NOT resolved
+            // (`vco_lib/runtime_reconcile.py`), so without this the
+            // surfaces would fall back to "No container runtime found".
+            if nothing_to_drive {
+                Some(verdict.reason.clone())
+            } else {
+                None
+            }
+        }),
+        installed: verdict.installed.clone(),
+        verdict_failed: false,
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Tests
@@ -917,23 +869,6 @@ mod tests {
         serde_json::from_str(&text).expect("fixture parses")
     }
 
-    fn names(v: &serde_json::Value, key: &str) -> Vec<String> {
-        v[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("fixture scenario lacks `{}`", key))
-            .iter()
-            .map(|s| s.as_str().unwrap().to_string())
-            .collect()
-    }
-
-    fn runtime_from(name: &str) -> ContainerRuntime {
-        match name {
-            "podman" => ContainerRuntime::Podman,
-            "docker" => ContainerRuntime::Docker,
-            other => panic!("unknown runtime in fixture: {}", other),
-        }
-    }
-
     fn form_name(f: ComposeForm) -> &'static str {
         match f {
             ComposeForm::Subcommand => "subcommand",
@@ -955,71 +890,87 @@ mod tests {
         }
     }
 
-    #[test]
-    fn parity_fixture_select_runtime_matches_every_scenario() {
+    /// R13, THROUGH THE ONE CLIENT (2026-09-25 consolidation): each scenario
+    /// is a real `decide --purpose infra --mode read-only` spawn over the
+    /// same stub machine the module-plane leg drives, rendered through
+    /// [`detection_from_verdict`]. `expect_rust` records this plane's ONE
+    /// deliberate divergence from Python's `expect`: `resolved` with
+    /// `compose: null` maps to `info: None` here (the launcher's infra
+    /// stack drives nothing without compose), and `null` rows are the
+    /// refusals. The Rust decision mirror this file used to keep
+    /// (`select_runtime` + `candidate_order` + the stale-record arm) is
+    /// retired — Python decides, this renders.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parity_fixture_infra_plane_matches_every_scenario() {
+        use super::super::container_runtime::parity_fixture as pf;
+        use super::super::runtime_verdict::contract_support::{isolation_env, make_executable, test_python};
         let fx = parity_fixture();
         for sc in fx["scenarios"].as_array().unwrap() {
             let name = sc["name"].as_str().unwrap();
-            let env = sc["env"].as_str();
-            let order = candidate_order(normalise_override(env).as_deref());
-            let on_path = names(sc, "on_path");
-            let version_ok = names(sc, "version_ok");
-            let daemon_ok = names(sc, "daemon_ok");
-            let sub_ok = names(sc, "compose_subcommand_ok");
-            let standalone = names(sc, "standalone_on_path");
-            let probed: Vec<ProbedCandidate> = order
+            let dir = tempfile::tempdir().unwrap();
+            let root = pf::parity_root(dir.path(), sc);
+            let bin_dir = dir.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            for rt in ["podman", "docker"] {
+                pf::write_parity_stub(&bin_dir, rt, sc);
+            }
+            for standalone in sc["standalone_on_path"]
+                .as_array()
+                .unwrap()
                 .iter()
-                .map(|rt| {
-                    let b = rt.binary().to_string();
-                    let compose = if sub_ok.contains(&b) {
-                        Some(ComposeForm::Subcommand)
-                    } else if standalone.contains(&format!("{}-compose", b)) {
-                        Some(ComposeForm::Standalone)
-                    } else {
-                        None
-                    };
-                    ProbedCandidate {
-                        runtime: *rt,
-                        on_path: on_path.contains(&b),
-                        version_ok: version_ok.contains(&b),
-                        daemon_ok: daemon_ok.contains(&b),
-                        compose,
-                    }
-                })
-                .collect();
-            let got = select_runtime(&probed);
-            let want = &sc["expect_rust"];
-            match (got, want.is_null()) {
-                (None, true) => {}
-                (Some((rt, form)), false) => {
-                    assert_eq!(
-                        rt,
-                        runtime_from(want["runtime"].as_str().unwrap()),
-                        "scenario {}: runtime",
-                        name
-                    );
-                    assert_eq!(
-                        form_name(form),
-                        want["compose_form"].as_str().unwrap(),
-                        "scenario {}: compose form",
-                        name
-                    );
+                .filter_map(|v| v.as_str())
+            {
+                let s = bin_dir.join(standalone);
+                std::fs::write(&s, "#!/bin/sh\nexit 0\n").unwrap();
+                make_executable(&s);
+            }
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let mut env_pairs = isolation_env(&bin_dir, &home);
+            let mut unset_keys = Vec::new();
+            match sc["env"].as_str() {
+                // Verbatim: "auto"/"bogus" are PYTHON's non-pins to read.
+                Some(pin) => {
+                    env_pairs.push(("VCT_CONTAINER_RUNTIME".to_string(), pin.to_string()))
                 }
-                (got, _) => panic!(
-                    "scenario {}: got {:?}, fixture expect_rust = {}",
-                    name, got, want
-                ),
+                None => unset_keys.push("VCT_CONTAINER_RUNTIME".to_string()),
+            }
+            let verdict = super::super::runtime_verdict::decide_cached(super::super::runtime_verdict::VerdictOpts {
+                install_root: Some(root.as_path()),
+                mode: Some(super::super::runtime_verdict::Mode::ReadOnly),
+                purpose: Some(super::super::runtime_verdict::Purpose::Infra),
+                python: Some(test_python().as_path()),
+                path_env: None,
+                env_pairs,
+                unset_keys,
+            })
+            .await
+            .unwrap_or_else(|e| panic!("scenario {name}: decide failed: {e}"));
+            let detection = detection_from_verdict(&verdict, false);
+            let want = &sc["expect_rust"];
+            if want.is_null() {
+                assert!(
+                    detection.info.is_none(),
+                    "scenario {name}: a refusal must not drive a runtime"
+                );
+            } else {
+                let info = detection
+                    .info
+                    .unwrap_or_else(|| panic!("scenario {name}: fixture expects a runtime"));
+                assert_eq!(
+                    info.runtime.binary(),
+                    want["runtime"].as_str().unwrap(),
+                    "scenario {name}"
+                );
+                assert_eq!(
+                    form_name(info.compose_form),
+                    want["compose_form"].as_str().unwrap(),
+                    "scenario {name}"
+                );
             }
         }
-    }
-
-    #[test]
-    fn normalise_override_matches_the_python_parser() {
-        assert_eq!(normalise_override(None), None);
-        assert_eq!(normalise_override(Some("")), None);
-        assert_eq!(normalise_override(Some(" AUTO ")), None);
-        assert_eq!(normalise_override(Some(" Docker ")).as_deref(), Some("docker"));
-        assert_eq!(normalise_override(Some("bogus")).as_deref(), Some("bogus"));
     }
 
     #[test]
@@ -1028,33 +979,206 @@ mod tests {
         assert_eq!(ContainerRuntime::Docker.other(), ContainerRuntime::Podman);
     }
 
+    /// R7b F5, through the ONE client: docker answers everything, podman
+    /// refuses. Unpinned, the launcher's infra stack drives docker; with the
+    /// install's record naming podman it drives NOTHING — the record is a
+    /// pin, and a pinned runtime that is unusable is refused (read-only
+    /// switching needs positive evidence the other runtime serves VCO),
+    /// never swapped for docker (whose volumes are a different, possibly
+    /// empty, copy). The stubs and the pin env go to the CHILD.
+    #[cfg(unix)]
     #[test]
     #[serial]
-    fn pinned_runtime_reads_the_pin_and_ignores_non_pins() {
-        // Mirrors `vco_lib.containers.runtime_preference_from_env`: only the
-        // two known names pin; `auto` / empty / garbage do not.
-        struct Guard(Option<String>);
-        impl Drop for Guard {
-            fn drop(&mut self) {
-                match self.0.take() {
-                    Some(v) => std::env::set_var("VCT_CONTAINER_RUNTIME", v),
-                    None => std::env::remove_var("VCT_CONTAINER_RUNTIME"),
-                }
-            }
-        }
-        let _g = Guard(std::env::var("VCT_CONTAINER_RUNTIME").ok());
-        for (value, want) in [
-            ("podman", Some(ContainerRuntime::Podman)),
-            (" Docker ", Some(ContainerRuntime::Docker)),
-            ("auto", None),
-            ("", None),
-            ("bogus", None),
-        ] {
-            std::env::set_var("VCT_CONTAINER_RUNTIME", value);
-            assert_eq!(pinned_runtime(), want, "value = {:?}", value);
-        }
-        std::env::remove_var("VCT_CONTAINER_RUNTIME");
-        assert_eq!(pinned_runtime(), None);
+    fn resolve_runtime_honours_the_install_record() {
+        use super::super::runtime_verdict::contract_support::{isolation_env, test_python};
+        let bins = tempfile::tempdir().unwrap();
+        write_fake_runtime(bins.path(), "docker", "Server: Docker Engine - Community", 0);
+        write_fake_runtime(bins.path(), "podman", "", 1);
+        let home = bins.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let ask = |root: Option<&std::path::Path>| {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(resolve_runtime_in_with(super::super::runtime_verdict::VerdictOpts {
+                install_root: root,
+                mode: Some(super::super::runtime_verdict::Mode::ReadOnly),
+                purpose: Some(super::super::runtime_verdict::Purpose::Infra),
+                python: Some(test_python().as_path()),
+                path_env: None,
+                env_pairs: isolation_env(bins.path(), &home),
+                unset_keys: vec!["VCT_CONTAINER_RUNTIME".to_string()],
+            }))
+        };
+        let bare_root = tempfile::tempdir().unwrap();
+        let pinned_root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(pinned_root.path().join("state/install")).unwrap();
+        std::fs::write(pinned_root.path().join("state/install/runtime.txt"), "podman\n").unwrap();
+        let unpinned = ask(Some(bare_root.path())).info.map(|i| i.runtime);
+        let pinned = ask(Some(pinned_root.path())).info.map(|i| i.runtime);
+        assert_eq!(unpinned, Some(ContainerRuntime::Docker));
+        assert_eq!(pinned, None, "the recorded podman must pin, not fall through to docker");
+    }
+
+    /// R11 L6, through the ONE client: the install's record names docker,
+    /// which is not installed; podman answers holding none of VCO's data,
+    /// so the stale record is not switched. The detection carries the
+    /// refusal — the pin, the record file, why it was not switched, and
+    /// the remedy — which every "no runtime" surface (install preflight,
+    /// start path, hub watchdog) shows instead of "No container runtime
+    /// found". M3: the text is PYTHON's, verbatim; no Rust renderer
+    /// rebuilds it.
+    #[cfg(unix)]
+    #[test]
+    #[serial]
+    fn a_refused_record_pin_carries_why_to_every_surface() {
+        use super::super::runtime_verdict::contract_support::{isolation_env, test_python};
+        let bins = tempfile::tempdir().unwrap();
+        write_fake_runtime(bins.path(), "podman", "someone_elses_ollama", 0);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("state/install")).unwrap();
+        std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        let home = bins.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let detection = {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(resolve_runtime_in_with(super::super::runtime_verdict::VerdictOpts {
+                install_root: Some(root.path()),
+                mode: Some(super::super::runtime_verdict::Mode::ReadOnly),
+                purpose: Some(super::super::runtime_verdict::Purpose::Infra),
+                python: Some(test_python().as_path()),
+                path_env: None,
+                env_pairs: isolation_env(bins.path(), &home),
+                unset_keys: vec!["VCT_CONTAINER_RUNTIME".to_string()],
+            }))
+        };
+        assert!(detection.info.is_none());
+        let source = root.path().join("state/install/runtime.txt").display().to_string();
+        let refusal = detection.refusal.clone().expect("a refused pin says so");
+        assert!(refusal.contains("recorded docker"), "{refusal}");
+        assert!(refusal.contains(&source), "{refusal}");
+        assert!(refusal.contains("(not switched: "), "{refusal}");
+        assert!(refusal.contains("holds none of VCO's containers or volumes"), "{refusal}");
+        assert!(refusal.contains("--container podman"), "{refusal}");
+        assert!(
+            detection
+                .not_switched
+                .as_deref()
+                .unwrap()
+                .contains("pinned to docker by"),
+            "{:?}",
+            detection.not_switched
+        );
+        assert_eq!(detection.no_runtime_message(), refusal);
+        assert!(!detection.no_runtime_message().contains("No container runtime found"));
+    }
+
+    /// M3 (2026-09-25 consolidation), pure over the parsed verdict so the
+    /// mapping needs no interpreter: the refusal shown on every surface is
+    /// Python's text VERBATIM — `no_runtime_message` IS the refusal, never
+    /// re-derived from PATH state — `not_switched` rides Python's text, and
+    /// `installed` travels for the boot path's install dialog (M4). The
+    /// unpinned "found nothing" shape keeps the legacy headline (there is
+    /// no refusal to show when nothing was pinned).
+    #[test]
+    fn detection_from_verdict_shows_pythons_refusal_verbatim() {
+        let refusal = "the install recorded docker as this machine's container runtime \
+                       (/x/state/install/runtime.txt) but docker is not on PATH \
+                       (not switched: the container runtime is pinned to docker by \
+                       /x/state/install/runtime.txt)";
+        let verdict = super::super::runtime_verdict::RuntimeVerdict {
+            runtime: None,
+            state: "absent".to_string(),
+            resolved: false,
+            compose: None,
+            compose_form: None,
+            binary_path: None,
+            search_path: None,
+            installed: Some("docker".to_string()),
+            requested: Some("docker".to_string()),
+            requested_via: "record".to_string(),
+            requested_installed: false,
+            alternative_usable: Some("podman".to_string()),
+            record_reconciled: false,
+            outcome: "refused".to_string(),
+            not_switched_key: Some("no_data".to_string()),
+            not_switched: Some(
+                "the container runtime is pinned to docker by \
+                 /x/state/install/runtime.txt"
+                    .to_string(),
+            ),
+            same_engine: false,
+            refused: true,
+            refusal: Some(refusal.to_string()),
+            reason: "record pin refused".to_string(),
+        };
+        let detection = detection_from_verdict(&verdict, false);
+        assert_eq!(detection.refusal.as_deref(), Some(refusal));
+        assert_eq!(detection.no_runtime_message(), refusal);
+        assert!(!detection.no_runtime_message().contains("No container runtime found"));
+        assert!(detection.not_switched.as_deref().unwrap().contains("pinned to docker by"));
+        assert_eq!(detection.installed.as_deref(), Some("docker"), "M4: installed travels");
+        let none = RuntimeDetection::default();
+        assert!(none.no_runtime_message().starts_with("No container runtime found"));
+    }
+
+    /// R12-bis P3-2, pure over the parsed verdict: RESOLVED without
+    /// compose (Python sets `refusal` only when NOT resolved) — the
+    /// mapping carries the verdict's `reason` as the refusal so every
+    /// surface explains the compose gap instead of falling back to "No
+    /// container runtime found" about an installed, answering runtime.
+    /// Leave-alone: a resolved verdict WITH compose keeps `refusal: None`.
+    #[test]
+    fn detection_from_verdict_carries_the_reason_when_resolved_without_compose() {
+        let base = super::super::runtime_verdict::RuntimeVerdict {
+            runtime: Some("podman".to_string()),
+            state: "resolved".to_string(),
+            resolved: true,
+            compose: None,
+            compose_form: None,
+            binary_path: None,
+            search_path: None,
+            installed: Some("podman".to_string()),
+            requested: None,
+            requested_via: "auto".to_string(),
+            requested_installed: false,
+            alternative_usable: None,
+            record_reconciled: false,
+            outcome: "usable_runtime_but_no_compose_anywhere".to_string(),
+            not_switched_key: None,
+            not_switched: None,
+            same_engine: false,
+            refused: false,
+            refusal: None,
+            reason: "podman is installed and answering, but no compose is available \
+                     (neither `podman compose` nor podman-compose)."
+                .to_string(),
+        };
+        let detection = detection_from_verdict(&base, false);
+        assert!(detection.info.is_none(), "nothing to drive without compose");
+        assert_eq!(detection.refusal.as_deref(), Some(base.reason.as_str()));
+        assert!(
+            !detection.no_runtime_message().contains("No container runtime found"),
+            "an installed runtime without compose is not 'no container runtime found': {}",
+            detection.no_runtime_message()
+        );
+        assert_eq!(detection.installed.as_deref(), Some("podman"));
+        assert!(!detection.verdict_failed);
+        // Leave-alone: with compose the refusal stays None (nothing to
+        // complain about) and the runtime drives.
+        let with_compose = super::super::runtime_verdict::RuntimeVerdict {
+            compose: Some(vec!["podman".to_string(), "compose".to_string()]),
+            compose_form: Some("subcommand".to_string()),
+            binary_path: Some("/usr/bin/podman".into()),
+            ..base
+        };
+        let detection = detection_from_verdict(&with_compose, false);
+        assert!(detection.info.is_some(), "a compose-bearing verdict drives");
+        assert!(detection.refusal.is_none(), "no refusal when resolved with compose");
     }
 
     #[test]
@@ -1078,59 +1202,33 @@ mod tests {
 
     // ----- v0.2.53 M-P0-7: launcher PATH augmentation tests -----
 
-    /// Augmentation is idempotent — calling twice does not duplicate
-    /// entries. On Windows this is a no-op and the PATH is unchanged.
-    #[test]
-    #[serial]
-    fn augment_path_is_idempotent() {
-        // Snapshot the existing PATH so we can restore it at the end.
-        let original = std::env::var_os("PATH");
-
-        // Use a minimal known PATH so the test does not depend on the
-        // host environment.
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        augment_path_for_graphical_launch();
-        let first = std::env::var_os("PATH").unwrap_or_default();
-
-        augment_path_for_graphical_launch();
-        let second = std::env::var_os("PATH").unwrap_or_default();
-
-        assert_eq!(
-            first, second,
-            "second augment_path call must NOT modify PATH again"
-        );
-
-        // Restore.
-        match original {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
-        }
+    /// The augmented PATH for `current`, or `current` itself when nothing
+    /// is added — what the process PATH would be after one call.
+    fn after_augment(current: &str, home: Option<&str>) -> std::ffi::OsString {
+        augmented_path(std::ffi::OsStr::new(current), home.map(std::path::Path::new))
+            .unwrap_or_else(|| std::ffi::OsString::from(current))
     }
 
-    /// Augmentation prepends candidates but preserves the existing PATH
-    /// after them — order is not destroyed. We assert this by checking
-    /// that the original entries appear AFTER any newly-prepended ones.
+    /// Augmentation is idempotent — a second call adds nothing. On Windows
+    /// it is a no-op and the PATH is unchanged.
     #[test]
-    #[serial]
+    fn augment_path_is_idempotent() {
+        let first = after_augment("/usr/bin:/bin", Some("/tmp/vct-augment-test-home"));
+        assert!(
+            augmented_path(&first, Some(std::path::Path::new("/tmp/vct-augment-test-home"))).is_none(),
+            "second augment_path call must NOT modify PATH again"
+        );
+    }
+
+    /// Augmentation keeps the existing PATH in its order (candidates go
+    /// ahead of or behind it, per placement — R10) — order is not destroyed.
+    #[test]
     fn augment_path_preserves_user_path_order() {
-        let original = std::env::var_os("PATH");
-
-        // Use a marker directory the augment_candidates() list will NOT
-        // emit — so we can verify it survives the prepend.
-        std::env::set_var("PATH", "/zzz_marker_a:/zzz_marker_b");
-
-        augment_path_for_graphical_launch();
-        let after = std::env::var_os("PATH").unwrap_or_default();
+        let after = after_augment("/zzz_marker_a:/zzz_marker_b", Some("/tmp/vct-augment-test-home"));
         let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
-        let pos_a = parts
-            .iter()
-            .position(|p| p == &PathBuf::from("/zzz_marker_a"));
-        let pos_b = parts
-            .iter()
-            .position(|p| p == &PathBuf::from("/zzz_marker_b"));
-
+        let pos_a = parts.iter().position(|p| p == &PathBuf::from("/zzz_marker_a"));
+        let pos_b = parts.iter().position(|p| p == &PathBuf::from("/zzz_marker_b"));
         // Both markers must still be present (augment does not delete).
         assert!(pos_a.is_some(), "marker_a must still be on PATH");
         assert!(pos_b.is_some(), "marker_b must still be on PATH");
@@ -1142,28 +1240,125 @@ mod tests {
             pos_a,
             pos_b
         );
+    }
 
-        match original {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
+    /// The table's entries for `os` as the augment consumes them.
+    fn entries_for(os: &str, home: &str) -> Vec<(PathBuf, Placement)> {
+        tool_search_entries_for(os, Some(home), &|_k| None)
+            .into_iter()
+            .map(|(d, p)| (PathBuf::from(d), p))
+            .collect()
+    }
+
+    /// R10 J3 (split by placement): an inherited entry is never displaced.
+    /// The inherited PATH appears in the result contiguous and unchanged —
+    /// including a table directory it already holds, of EITHER placement
+    /// (`/usr/bin` is `append`, `~/.local/bin` is `prepend-when-missing`),
+    /// which is neither moved nor duplicated. Ahead of it: exactly the
+    /// `prepend-when-missing` entries it lacked; behind it: exactly the
+    /// `append` entries it lacked, each in table order.
+    #[test]
+    fn augment_path_never_displaces_an_inherited_entry() {
+        let home = "/tmp/vct-augment-test-home";
+        for os in ["linux", "macos"] {
+            let cands = entries_for(os, home);
+            let late_graphical = PathBuf::from(format!("{home}/.local/bin"));
+            assert!(cands.contains(&(late_graphical.clone(), Placement::PrependWhenMissing)), "{os}");
+            let inherited = vec![
+                PathBuf::from("/zzz_first"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/zzz_second"),
+                late_graphical.clone(),
+            ];
+            let after = augmented_entries(&inherited, &cands);
+            let lacked = |want: Placement| -> Vec<PathBuf> {
+                cands
+                    .iter()
+                    .filter(|(d, p)| *p == want && !inherited.contains(d))
+                    .map(|(d, _)| d.clone())
+                    .collect()
+            };
+            let before = lacked(Placement::PrependWhenMissing);
+            let behind = lacked(Placement::Append);
+            assert_eq!(&after[..before.len()], before.as_slice(), "{os}: {after:?}");
+            assert_eq!(
+                &after[before.len()..before.len() + inherited.len()],
+                inherited.as_slice(),
+                "{os}: the inherited PATH must stay contiguous and in order: {after:?}"
+            );
+            assert_eq!(&after[before.len() + inherited.len()..], behind.as_slice(), "{os}: {after:?}");
+            for kept in [PathBuf::from("/usr/bin"), late_graphical] {
+                assert_eq!(after.iter().filter(|p| **p == kept).count(), 1, "{os}: {kept:?} duplicated");
+            }
         }
+    }
+
+    /// R10 J3, by name resolution: a binary the inherited PATH reaches is the
+    /// one found after augment — even when a table directory holds a
+    /// same-named binary: an `append` one (`~/bin`, the rootless-Docker
+    /// location) because it goes behind the PATH, a `prepend-when-missing`
+    /// one (`~/.local/bin`) that the PATH already holds, later, because it is
+    /// never moved. Such a table dir only reaches what the PATH does not. Pure over
+    /// the returned PATH (never the process PATH, `with_lookup_path`).
+    #[cfg(unix)]
+    #[test]
+    fn a_same_named_binary_earlier_on_path_still_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        let inherited = dir.path().join("inherited");
+        let appended = home.join("bin");
+        let graphical = home.join(".local").join("bin");
+        for d in [&inherited, &appended, &graphical] {
+            std::fs::create_dir_all(d).unwrap();
+            write_fake_runtime(d, "vct-r10-tool", "", 0);
+        }
+        write_fake_runtime(&appended, "vct-r10-only-in-table", "", 0);
+        let current = std::env::join_paths([&inherited, &graphical]).unwrap();
+        let after = augmented_path(&current, Some(&home)).expect("the table adds ~/bin");
+        crate::paths::with_lookup_path(Some(after.as_os_str()), || {
+            assert_eq!(
+                crate::paths::which_on_path("vct-r10-tool"),
+                Some(inherited.join("vct-r10-tool")),
+                "the inherited PATH's binary must win"
+            );
+            assert_eq!(
+                crate::paths::which_on_path("vct-r10-only-in-table"),
+                Some(appended.join("vct-r10-only-in-table")),
+                "a tool only the table reaches still resolves"
+            );
+        });
+    }
+
+    /// v0.2.53 M-P0-7 restored (R10 split): a Finder launch's PATH
+    /// (`/usr/bin:/bin:/usr/sbin:/sbin`, LaunchServices) lacks Homebrew, and
+    /// `/usr/bin/git` / `/usr/bin/python3` are the Xcode Command Line Tools
+    /// stubs. Homebrew is `prepend-when-missing`, so after the augment it is
+    /// AHEAD of `/usr/bin` — as in the user's login shell — and `git`
+    /// resolves to Homebrew's. (With every candidate appended, R10 J3's first
+    /// cut, the stub won.)
+    #[test]
+    fn a_graphical_launch_still_prefers_homebrew_over_the_system_stub() {
+        let finder: Vec<PathBuf> = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+            .iter()
+            .map(PathBuf::from)
+            .collect();
+        let after = augmented_entries(&finder, &entries_for("macos", "/Users/u"));
+        let pos = |d: &str| after.iter().position(|p| p == &PathBuf::from(d));
+        assert!(
+            pos("/opt/homebrew/bin").unwrap() < pos("/usr/bin").unwrap(),
+            "Homebrew must precede the system dir: {after:?}"
+        );
+        let installed = [PathBuf::from("/usr/bin/git"), PathBuf::from("/opt/homebrew/bin/git")];
+        let git = after.iter().map(|d| d.join("git")).find(|p| installed.contains(p));
+        assert_eq!(git, Some(PathBuf::from("/opt/homebrew/bin/git")));
     }
 
     /// On macOS, the homebrew prefix must appear on PATH after augment.
     /// On Linux, `$HOME/.local/bin` must appear (when HOME is set).
     /// On Windows, augment is a no-op so PATH is unchanged.
     #[test]
-    #[serial]
     fn augment_path_adds_expected_os_specific_dirs() {
-        let original_path = std::env::var_os("PATH");
-        let original_home = std::env::var_os("HOME");
-
-        // Set a deterministic HOME so candidate construction is stable.
-        std::env::set_var("HOME", "/tmp/vct-augment-test-home");
-        std::env::set_var("PATH", "/usr/bin:/bin");
-
-        augment_path_for_graphical_launch();
-        let after = std::env::var_os("PATH").unwrap_or_default();
+        let after = after_augment("/usr/bin:/bin", Some("/tmp/vct-augment-test-home"));
         let parts: Vec<PathBuf> = std::env::split_paths(&after).collect();
 
         #[cfg(target_os = "macos")]
@@ -1207,23 +1402,190 @@ mod tests {
 
         #[cfg(not(any(target_os = "macos", target_os = "linux")))]
         {
-            // Windows + other: no-op.
+            // Windows + other: the original PATH, then the shared table's
+            // entries for this OS (R9: the container runtimes' install dirs,
+            // all `append` — R10).
+            // The baseline split the way THIS OS splits a PATH (";" on Windows).
+            let mut want: Vec<PathBuf> =
+                std::env::split_paths(std::ffi::OsStr::new("/usr/bin:/bin")).collect();
+            for (d, placement) in tool_search_entries_for(
+                current_os_key(),
+                Some("/tmp/vct-augment-test-home"),
+                &|k| std::env::var(k).ok(),
+            ) {
+                assert_eq!(placement, Placement::Append, "{d}");
+                want.push(PathBuf::from(d));
+            }
+            assert_eq!(parts, want, "PATH={:?}", parts);
+        }
+    }
+
+    // ----- v0.2.97 R9 H1(b)/H5: the shared tool-search table -----
+
+    fn fixture_env(case: &serde_json::Value) -> std::collections::HashMap<String, String> {
+        case["env"]
+            .as_object()
+            .map(|m| {
+                m.iter()
+                    .map(|(k, v)| (k.clone(), v.as_str().unwrap().to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// The expansion rule and every OS's list, driven by the SAME fixture
+    /// the Python suite runs (`tests/fixtures/tool_search_dirs_cases.json`).
+    #[test]
+    fn tool_search_dirs_match_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/tool_search_dirs_cases.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fx: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+        let cases = fx["cases"].as_array().expect("cases");
+        assert!(cases.len() >= 6, "fixture shrank");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let env = fixture_env(case);
+            let os = case["os"].as_str().unwrap();
+            let got: Vec<(String, String)> =
+                tool_search_entries_for(os, case["home"].as_str(), &|k| env.get(k).cloned())
+                    .into_iter()
+                    .map(|(d, p)| (d, p.as_str().to_string()))
+                    .collect();
+            let want: Vec<(String, String)> = case["expect"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|pair| {
+                    (
+                        pair[0].as_str().unwrap().to_string(),
+                        pair[1].as_str().unwrap().to_string(),
+                    )
+                })
+                .collect();
+            assert_eq!(got, want, "case {}", name);
+            let dirs: Vec<String> = want.into_iter().map(|(d, _)| d).collect();
             assert_eq!(
-                parts,
-                vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-                "Windows augment must be a no-op; PATH={:?}",
-                parts
+                tool_search_dirs_for(os, case["home"].as_str(), &|k| env.get(k).cloned()),
+                dirs,
+                "case {}",
+                name
             );
         }
+    }
 
-        match original_path {
-            Some(p) => std::env::set_var("PATH", p),
-            None => std::env::remove_var("PATH"),
+    /// R10 J3 split — THE ORDER RULE and the resolution it implies, driven by
+    /// the SAME `order_cases` the Python suite runs
+    /// (`test_the_order_rule_matches_the_shared_fixture`): graphical-launch
+    /// dirs the PATH lacks ahead of it, runtime locations it lacks behind it,
+    /// a dir already on it never moved.
+    #[test]
+    fn tool_search_order_matches_the_shared_fixture() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/tool_search_dirs_cases.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fx: serde_json::Value = serde_json::from_str(&text).expect("fixture parses");
+        let cases = fx["order_cases"].as_array().expect("order_cases");
+        assert!(cases.len() >= 3, "fixture shrank");
+        let strings = |v: &serde_json::Value| -> Vec<String> {
+            v.as_array().unwrap().iter().map(|s| s.as_str().unwrap().to_string()).collect()
+        };
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let os = case["os"].as_str().unwrap();
+            let env = fixture_env(case);
+            let cands: Vec<(PathBuf, Placement)> =
+                tool_search_entries_for(os, case["home"].as_str(), &|k| env.get(k).cloned())
+                    .into_iter()
+                    .map(|(d, p)| (PathBuf::from(d), p))
+                    .collect();
+            let current: Vec<PathBuf> = strings(&case["path"]).into_iter().map(PathBuf::from).collect();
+            let got: Vec<String> = augmented_entries_for(&current, &cands, os == "windows")
+                .into_iter()
+                .map(|p| p.to_string_lossy().into_owned())
+                .collect();
+            assert_eq!(got, strings(&case["expect_path"]), "case {}", name);
+            let sep = if os == "windows" { "\\" } else { "/" };
+            let binaries = strings(&case["binaries"]);
+            let tool = case["resolve"].as_str().unwrap();
+            let hit = got
+                .iter()
+                .map(|d| format!("{d}{sep}{tool}"))
+                .find(|p| binaries.contains(p));
+            assert_eq!(hit.as_deref(), case["expect"].as_str(), "case {}", name);
         }
-        match original_home {
-            Some(h) => std::env::set_var("HOME", h),
-            None => std::env::remove_var("HOME"),
+    }
+
+    /// R9 H5: a runtime installed ONLY in a user-local directory (rootless
+    /// Docker's `~/bin`) is found by a process started with the minimal
+    /// boot-unit PATH once the startup augment ran — the lookup every
+    /// runtime decision in this crate goes through (`which_on_path`).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_runtime_only_in_a_user_local_dir_is_found_under_a_short_path() {
+        let home = tempfile::tempdir().unwrap();
+        let bin = home.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(&docker, b"#!/bin/sh\nexit 0\n").unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        let systemd_user = std::ffi::OsString::from(
+            "/usr/local/sbin:/nonexistent-vct-r9-sbin:/nonexistent-vct-r9-bin",
+        );
+        // Baseline: the boot unit's PATH alone does not reach it.
+        crate::paths::with_lookup_path(Some(&systemd_user), || {
+            assert_ne!(which_on_path("docker"), Some(docker.clone()));
+        });
+        let env = |k: &str| -> Option<String> {
+            if k == TOOL_SEARCH_DIRS_ENV {
+                None // the real table
+            } else {
+                std::env::var(k).ok()
+            }
+        };
+        let cands: Vec<(PathBuf, Placement)> =
+            tool_search_entries_for("linux", home.path().to_str(), &env)
+                .into_iter()
+                .map(|(d, p)| (PathBuf::from(d), p))
+                .collect();
+        let inherited: Vec<PathBuf> = std::env::split_paths(&systemd_user).collect();
+        let augmented = std::env::join_paths(augmented_entries(&inherited, &cands)).unwrap();
+        crate::paths::with_lookup_path(Some(&augmented), || {
+            assert_eq!(which_on_path("docker"), Some(docker.clone()));
+        });
+    }
+
+    /// R9 H5 (macOS): the Homebrew prefixes and Docker Desktop's bundle are
+    /// on the list a launchd-started process augments with.
+    #[test]
+    fn the_macos_list_covers_homebrew_and_docker_desktop() {
+        let dirs = tool_search_dirs_for("macos", Some("/Users/u"), &|_k| None);
+        for want in [
+            "/opt/homebrew/bin",
+            "/usr/local/bin",
+            "/opt/podman/bin",
+            "/Applications/Docker.app/Contents/Resources/bin",
+            "/Users/u/bin",
+            "/Users/u/.local/bin",
+        ] {
+            assert!(dirs.iter().any(|d| d == want), "{want} missing from {dirs:?}");
+        }
+    }
+
+    /// Without a HOME, the HOME-relative candidates are dropped (soft-fail).
+    #[test]
+    fn augment_path_without_home_drops_home_relative_candidates() {
+        let after = after_augment("/usr/bin:/bin", None);
+        assert!(
+            !std::env::split_paths(&after).any(|p| p.ends_with(".local/bin") || p.ends_with(".cargo/bin")),
+            "{:?}",
+            after
+        );
     }
 
     // ----- PR-15 G1: daemon_usable_probe tests -----
@@ -1251,110 +1613,7 @@ mod tests {
         script
     }
 
-    // ─── PR-15 G1: daemon_usable_probe coverage ────────────────────
-    //
-    // Why #[ignore] on these 3 tests:
-    //
-    // The tests spawn real bash subprocesses (fake docker/podman
-    // scripts) to verify the daemon-access check parses stdout
-    // correctly. Under the full `cargo test --lib` parallel run, they
-    // compete for host-level subprocess slots with the pre-existing
-    // kg_sync timing-sensitive tests
-    // (concurrent_drain_does_not_deadlock_on_large_stderr,
-    // stall_watchdog_kills_silent_subprocess). When scheduler pressure
-    // delays a subprocess by >2s, BOTH suites flake — the kg_sync
-    // tests trip their internal timeouts, and our tests trip the 5s
-    // ceiling in daemon_usable_probe.
-    //
-    // The fix is workflow, not code: ignore by default in the full
-    // suite. Developers run them targeted:
-    //
-    //   cargo test --lib --manifest-path launcher/src-tauri/Cargo.toml \
-    //     daemon_usable -- --ignored
-    //
-    // CI runs them as a SEPARATE step (`cargo test -- --ignored`)
-    // outside the full-suite parallel pool.
-    //
-    // The function itself is otherwise verified by the daemon-usable
-    // logic in resolve_runtime() being exercised end-to-end via
-    // detect_runtime_returns_option_without_panic (which uses the real
-    // host's podman/docker if installed). The unit-level coverage is
-    // belt-and-suspenders.
-
-    #[tokio::test]
-    #[serial]
-    async fn daemon_usable_probe_docker_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        // (script_name, stdout, exit_code, expected_usable, label)
-        let cases: Vec<(&str, &str, i32, bool, &str)> = vec![
-            (
-                "docker_with_server",
-                "Client:\n Version: 28.0\nServer:\n Version: 28.0\n",
-                0,
-                true,
-                "stdout has 'Server:' line → usable",
-            ),
-            (
-                "docker_client_only",
-                "Client:\n Version: 28.0\n Context:    default\n",
-                0,
-                false,
-                "stdout has only 'Client:' → unusable (daemon unreachable)",
-            ),
-            (
-                "docker_nonzero_exit",
-                "",
-                1,
-                false,
-                "exit non-zero → unusable",
-            ),
-        ];
-        for (name, stdout, exit_code, expected, label) in cases {
-            let script = write_fake_runtime(dir.path(), name, stdout, exit_code);
-            let actual = daemon_usable_probe(&script, ContainerRuntime::Docker).await;
-            assert_eq!(actual, expected, "docker case '{}' failed: {}", name, label);
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn daemon_usable_probe_podman_cases() {
-        let dir = tempfile::tempdir().unwrap();
-        let cases: Vec<(&str, &str, i32, bool, &str)> = vec![
-            (
-                "podman_zero_exit",
-                "host:\n arch: amd64\nstore:\n graphRoot: /var/x\n",
-                0,
-                true,
-                "exit 0 → usable (rootless setup works)",
-            ),
-            (
-                "podman_nonzero_exit",
-                "",
-                1,
-                false,
-                "exit non-zero → unusable",
-            ),
-        ];
-        for (name, stdout, exit_code, expected, label) in cases {
-            let script = write_fake_runtime(dir.path(), name, stdout, exit_code);
-            let actual = daemon_usable_probe(&script, ContainerRuntime::Podman).await;
-            assert_eq!(actual, expected, "podman case '{}' failed: {}", name, label);
-        }
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn daemon_usable_probe_spawn_failure_returns_false() {
-        // Path to a binary that doesn't exist — must soft-fail, not panic.
-        let bogus = PathBuf::from("/nonexistent/path/to/docker");
-        assert!(
-            !daemon_usable_probe(&bogus, ContainerRuntime::Docker).await,
-            "spawn failure on bogus binary must return false, not panic"
-        );
-    }
-
-    /// Detection is purely additive — calling it on a CI box without
+    /// Detection is purely additive    /// Detection is purely additive — calling it on a CI box without
     /// podman/docker must return None, not panic.
     #[tokio::test]
     async fn detect_runtime_returns_option_without_panic() {
@@ -1395,7 +1654,18 @@ mod tests {
             return;
         }
         invalidate_cache();
-        let info = detect_runtime().await;
+        // The verdict comes from Python now (2026-09-25 consolidation): on a
+        // host whose interpreter ladder cannot run the CLI the loud-fail
+        // refusal — not a silent None — is the contract; that branch is
+        // pinned by the contract tests, skip here.
+        let detailed = detect_runtime_detailed().await;
+        if let Some(r) = &detailed.refusal {
+            if r.contains("runtime_reconcile") || r.contains("broken install") {
+                eprintln!("decide could not run on this host ({r}); skipping");
+                return;
+            }
+        }
+        let info = detailed.info;
         assert!(
             info.is_some(),
             "host has a container runtime on PATH \
@@ -1508,8 +1778,13 @@ mod tests {
             );
             return;
         }
-        // Populate the cache.
-        let _ = detect_runtime().await;
+        // Loud-fail skip, same as detect_runtime_succeeds_when_runtime_on_path.
+        if let Some(r) = &detect_runtime_detailed().await.refusal {
+            if r.contains("runtime_reconcile") || r.contains("broken install") {
+                eprintln!("decide could not run on this host ({r}); skipping");
+                return;
+            }
+        }
         // Invalidate it.
         invalidate_cache();
         // Cache should now be empty.

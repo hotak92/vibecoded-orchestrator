@@ -30,12 +30,12 @@
 #   4  field not found (--field NAME, NAME not in config)
 #   5  forbidden (403 — a scoped-credential boundary refusal; NOT a
 #      transient/unreachable condition, so callers must NOT env-fallback.
-#      Post-flip the hub returns 403 when a resolver presents the coarse
-#      global hub.token on a per-project /env|/config route while the
-#      compat window is closed, or presents a per-project token minted
-#      for a DIFFERENT project. Fix: present the scoped hub.token.<id>
-#      (this resolver already prefers it) or set
-#      VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the compat window.)
+#      The hub returns 403 when a resolver presents the coarse global
+#      hub.token on a per-project /env|/config route (refused
+#      unconditionally since v0.2.97 removed VCT_HUB_LEGACY_GLOBAL_ENV),
+#      or presents a per-project token minted for a DIFFERENT project.
+#      Fix: present the scoped hub.token.<id> (this resolver already
+#      prefers it; the hub mints one on first request).
 #   64 usage error
 #
 # Hub discovery:
@@ -277,27 +277,49 @@ _emit_warning() {
 # ── Hub port discovery ──────────────────────────────────────────────────
 # CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the ps1 sibling
 # `vct_project_config.ps1::Get-HubPort` and the python sibling
-# `vco_lib/project_config.py::_discover_hub` (port branch):
-#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
-#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
-#     fall through to the default port. NEVER print a garbage value (that
-#     would build a malformed URL that curl then fails on, mis-classed as
-#     `hub_unreachable`).
-#   * `hub.port` present but UNREADABLE (perm-denied) → warn
-#     (`hub_port_unreadable`) + default.
-# A valid numeric port matches `^[0-9]+$`. This is the ONE conservative
-# contract: invalid content → warn + default, never crash, never emit a
-# partial/garbage resolution.
+# `vco_lib/hub_ensure.py::resolve_hub_port` (which `project_config` uses):
+#   * a valid port is an integer in 1..65535 (`_hub_port_value`);
+#   * env `VCT_HUB_PORT` set but not a valid port → ONE rate-limited stderr
+#     warning (kind `hub_port_invalid`) and FALL THROUGH to `hub.port`, then
+#     the default (v0.2.97 owner ruling: the file names the running hub;
+#     this used to jump straight to 7700);
+#   * `hub.port` non-empty but not a valid port → warn (`hub_port_invalid`)
+#     + default; UNREADABLE (perm-denied) → warn (`hub_port_unreadable`) +
+#     default; absent or empty → silent default.
+# NEVER print a garbage value (that would build a malformed URL that curl
+# then fails on, mis-classed as `hub_unreachable`).
+
+# Print the port `$1` names (normalised, e.g. `07700` → `7700`) and succeed,
+# or fail silently when it is not an integer in 1..65535.
+_hub_port_value() {
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # A sign, `_`, a non-ASCII numeral or INTERNAL whitespace is invalid. The
+    # numeral class is spelled out: `[0-9]` follows the collation locale.
+    local v="$1" pad=$' \t\n\v\f\r'
+    v="${v#"${v%%[!$pad]*}"}"
+    v="${v%"${v##*[!$pad]}"}"
+    [[ "$v" =~ ^[0123456789]{1,5}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+    printf '%s\n' "$((10#$v))"
+}
+
+# A hub-PORT warning, through the same rate-limited emitter. R7b F25(c): the
+# default `_emit_warning` line ends "Falling back to env.", which is true for
+# a config-resolution failure and FALSE here — a bad port falls back to
+# hub.port / 7700 (the detail says which) and resolution carries on against
+# the hub. MUST MATCH `Emit-PortWarning` in vct_project_config.ps1.
+_emit_port_warning() {
+    _emit_warning "$1" "$2" "" \
+        "[vct] project_config: $1: $2. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
+}
+
 hub_port() {
     if [[ -n "${VCT_HUB_PORT:-}" ]]; then
-        if [[ "$VCT_HUB_PORT" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$VCT_HUB_PORT"
-            return 0
-        fi
-        _emit_warning "hub_port_invalid" \
-            "VCT_HUB_PORT is not a positive integer; using default 7700"
-        printf '7700\n'
-        return 0
+        _hub_port_value "$VCT_HUB_PORT" && return 0
+        _emit_port_warning "hub_port_invalid" \
+            "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700"
     fi
     local state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
     local port_file="$state_dir/hub.port"
@@ -307,19 +329,16 @@ hub_port() {
         # stderr; suppress that and detect the failure via the readability
         # test so we can emit our own single warning instead.
         if [[ ! -r "$port_file" ]]; then
-            _emit_warning "hub_port_unreadable" \
+            _emit_port_warning "hub_port_unreadable" \
                 "hub.port is not readable; using default 7700"
             printf '7700\n'
             return 0
         fi
-        p=$(tr -d '[:space:]' < "$port_file" 2>/dev/null)
-        if [[ "$p" =~ ^[0-9]+$ ]]; then
-            printf '%s\n' "$p"
-            return 0
-        fi
-        if [[ -n "$p" ]]; then
-            _emit_warning "hub_port_invalid" \
-                "hub.port contains non-integer content; using default 7700"
+        p=$(cat -- "$port_file" 2>/dev/null)
+        _hub_port_value "$p" && return 0
+        if [[ -n "${p//[$' \t\n\v\f\r']/}" ]]; then
+            _emit_port_warning "hub_port_invalid" \
+                "hub.port does not hold a port (1-65535); using default 7700"
         fi
         # empty (whitespace-only / truncated write) → silent default.
         printf '7700\n'
@@ -857,7 +876,7 @@ fetch_config() {
             # hub.token.<id> is already preferred by hub_token; a 403
             # therefore means that file was absent/unreadable so we rode the
             # global token, OR the wrong project's token was presented.
-            _emit_warning "forbidden" "403 forbidden for project $pid: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$body"
+            _emit_warning "forbidden" "403 forbidden for project $pid: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.$pid (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97. body=$body"
             return 5
             ;;
         404)

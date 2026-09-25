@@ -9,7 +9,9 @@ reviewer):
   — returns the canonical env bundle for the project. Raises
   ``LookupError`` when the project is not registered in the launcher DB.
 * ``vco_lib.config_projection.apply_project_env(bundle, *, project_folder: Path) -> ApplyResult``
-  — writes the bundle atomically to all three on-disk surfaces.
+  — writes the bundle to the surfaces ``apply`` writes by default
+  (``.claude/settings.json`` ``env`` and ``.claude/env``; v0.2.97 — the
+  VS Code surface is neither written nor compared).
   Return must expose ``.ok`` and ``.message`` (dict or attr-style).
 * ``vco_lib.config_projection.resolve_project_folder(project_id) -> Path``
   — maps a slug/rowid to its on-disk folder root.
@@ -18,7 +20,10 @@ reviewer):
 
 Coverage:
 * All-match → exit 0.
-* Mutation to one of the three surfaces → drift detected → exit 1.
+* Mutation to one of the applied surfaces → drift detected → exit 1;
+  ``.vscode/settings.json`` is not compared (v0.2.97).
+* JSONC settings read correctly; an unreadable surface → exit 2
+  (``cannot_verify``), never ok / drift (v0.2.97).
 * ``--fix`` repairs to byte-identical state.
 * Round-trip idempotency: a second ``--fix`` is a no-op.
 * JSON envelope schema sane.
@@ -60,9 +65,16 @@ CANONICAL_BUNDLE: dict[str, str] = {
 
 
 def _write_canonical_surfaces(folder: Path, bundle: Mapping[str, str]) -> None:
-    """Lay down the three on-disk surfaces in canonical state. Mirrors
-    what ``config_projection.apply_project_env`` is expected to produce.
+    """Lay down the surfaces ``config_projection.apply_project_env`` writes by
+    default, in canonical state. ``.claude/env`` is rendered by the writer's
+    OWN block builder (a user export sits outside it, as in the field).
+
+    Also leaves a ``.vscode/settings.json`` behind — a surface ``apply`` does
+    not write unless asked, holding a value from long ago — so every test
+    here also proves the verifier does not compare it.
     """
+    from vco_lib.config_projection import _build_managed_block
+
     claude_dir = folder / ".claude"
     vscode_dir = folder / ".vscode"
     claude_dir.mkdir(parents=True, exist_ok=True)
@@ -74,12 +86,13 @@ def _write_canonical_surfaces(folder: Path, bundle: Mapping[str, str]) -> None:
         json.dumps(settings, indent=2, sort_keys=True), encoding="utf-8"
     )
 
-    # .claude/env — KEY=VALUE shell-style, alphabetical.
-    lines = [f"{k}={v}" for k, v in sorted(bundle.items())]
-    (claude_dir / "env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    # .claude/env — the managed block, plus a user line outside it.
+    (claude_dir / "env").write_text(
+        'export MY_OWN="kept"\n' + _build_managed_block(dict(bundle)), encoding="utf-8"
+    )
 
-    # .vscode/settings.json — claude-code.env mapping.
-    vscode_settings = {"claude-code.env": dict(bundle)}
+    # .vscode/settings.json — NOT an applied surface; deliberately stale.
+    vscode_settings = {"claude-code.env": {"KG_COLLECTION": "Acme_KnowledgeGraph"}}
     (vscode_dir / "settings.json").write_text(
         json.dumps(vscode_settings, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -174,8 +187,9 @@ def test_mutation_claude_env_detected(stub_db, project_folder, capsys):
     # Mutate just the .claude/env file.
     env_path = project_folder / ".claude" / "env"
     content = env_path.read_text(encoding="utf-8").replace(
-        "PROJECT_NAME=MyProject", "PROJECT_NAME=Tampered"
+        'export PROJECT_NAME="MyProject"', 'export PROJECT_NAME="Tampered"'
     )
+    assert "Tampered" in content
     env_path.write_text(content, encoding="utf-8")
 
     code = verify.cmd_verify_env_projection(_args())
@@ -186,17 +200,105 @@ def test_mutation_claude_env_detected(stub_db, project_folder, capsys):
     assert "Tampered" in out
 
 
-def test_mutation_vscode_settings_detected(stub_db, project_folder, capsys):
+def test_vscode_settings_is_not_compared(stub_db, project_folder, capsys):
+    """LEAVE-ALONE (v0.2.97): ``apply`` does not write ``.vscode/settings.json``
+    unless a caller asks, so its content — stale, drifted or absent — is not
+    evidence about the projection. RED before: every project that had never
+    opted into that surface reported DRIFT forever."""
     vscode_path = project_folder / ".vscode" / "settings.json"
     payload = json.loads(vscode_path.read_text(encoding="utf-8"))
     payload["claude-code.env"]["DEVELOPMENT_COLLECTION"] = "Drifted_Development"
     vscode_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-
-    code = verify.cmd_verify_env_projection(_args())
-    assert code == verify.EXIT_DRIFT
+    assert verify.cmd_verify_env_projection(_args()) == verify.EXIT_OK
+    vscode_path.unlink()
+    assert verify.cmd_verify_env_projection(_args()) == verify.EXIT_OK
     out = capsys.readouterr().out
-    assert ".vscode/settings.json" in out
-    assert "Drifted_Development" in out
+    assert ".vscode" not in out
+
+
+def _as_jsonc(path: Path) -> None:
+    text = path.read_text(encoding="utf-8").rstrip()
+    path.write_text("// my note\n" + text[:-1].rstrip() + ",\n}\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_jsonc_settings_file_verifies_clean(stub_db, project_folder):
+    """JSONC (v0.2.97). RED before: the strict reader read a commented
+    settings.json as holding nothing and reported every key as drift."""
+    _as_jsonc(project_folder / ".claude" / "settings.json")
+    assert verify.cmd_verify_env_projection(_args()) == verify.EXIT_OK
+
+
+def test_jsonc_settings_drift_names_the_real_value(stub_db, project_folder, capsys):
+    """ACT on JSONC: a real mismatch is reported with the value on disk,
+    not as ``<missing>``."""
+    settings_path = project_folder / ".claude" / "settings.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["env"]["KG_COLLECTION"] = "Wrong"
+    settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    _as_jsonc(settings_path)
+    assert verify.cmd_verify_env_projection(_args(json_mode=True)) == verify.EXIT_DRIFT
+    obj = json.loads(capsys.readouterr().out.strip())
+    assert obj["drift"] == [{"surface": ".claude/settings.json", "key": "KG_COLLECTION",
+                             "expected": CANONICAL_BUNDLE["KG_COLLECTION"], "actual": "Wrong"}]
+
+
+def test_a_canonical_key_the_projection_omits_is_drift(stub_db, project_folder, capsys):
+    """``apply`` DELETES a canonical key its bundle omits, so one left in a
+    surface is drift (``expected`` = ``<absent>``). A non-canonical key is
+    the user's and is never reported."""
+    settings_path = project_folder / ".claude" / "settings.json"
+    payload = json.loads(settings_path.read_text(encoding="utf-8"))
+    payload["env"]["VCT_ORCHESTRATOR_ROOT"] = "/somewhere/old"
+    payload["env"]["MY_OWN_KEY"] = "mine"
+    settings_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    assert verify.cmd_verify_env_projection(_args(json_mode=True)) == verify.EXIT_DRIFT
+    obj = json.loads(capsys.readouterr().out.strip())
+    assert obj["drift"] == [{"surface": ".claude/settings.json", "key": "VCT_ORCHESTRATOR_ROOT",
+                             "expected": "<absent>", "actual": "/somewhere/old"}]
+
+
+@pytest.mark.parametrize("rel,raw", [
+    (".claude/settings.json", b"{ not jsonc at all"),
+    (".claude/settings.json", b"[1, 2]\n"),
+    (".claude/settings.json", b"\xff\xfe{\"env\": {}}"),
+    (".claude/env", b"export KG_COLLECTION=\"\xff\xfe\"\n"),
+])
+def test_an_unreadable_surface_is_cannot_verify(stub_db, project_folder, monkeypatch,
+                                                capsys, rel, raw):
+    """UNREADABLE (v0.2.97): never ``ok``, never ``drift`` — exit 2 with the
+    file and the reason, and ``--fix`` does not run on it. RED before: a
+    broken settings.json read as empty and was reported as full DRIFT."""
+    (project_folder / rel).write_bytes(raw)
+    apply_calls = _stub_apply(monkeypatch, project_folder=project_folder)
+    for fix in (False, True):
+        code = verify.cmd_verify_env_projection(_args(json_mode=True, fix=fix))
+        assert code == verify.EXIT_TOOL_MISSING
+        obj = json.loads(capsys.readouterr().out.strip())
+        assert obj["overall"] == "cannot_verify"
+        assert [u["surface"] for u in obj["unreadable"]] == [rel]
+        assert "drift" not in obj
+    assert apply_calls["n"] == 0
+    verify.cmd_verify_env_projection(_args())
+    assert "CANNOT VERIFY" in capsys.readouterr().err
+
+
+def test_fix_writes_exactly_the_surfaces_it_verifies(tmp_path, monkeypatch):
+    """The REAL ``apply`` behind ``--fix``: the default surfaces are
+    repaired, and no ``.vscode/settings.json`` is created. RED before: --fix
+    forced the VS Code surface into every project it touched."""
+    folder = tmp_path / "fresh"
+    (folder / ".claude").mkdir(parents=True)
+    (folder / ".claude" / "settings.json").write_text(
+        json.dumps({"hooks": {}, "env": {"KG_COLLECTION": "Drifted"}}), encoding="utf-8")
+    monkeypatch.setattr(verify, "_project_env_from_db", lambda _pid: dict(CANONICAL_BUNDLE))
+    monkeypatch.setattr(verify, "_resolve_project_folder", lambda _pid: folder)
+    assert verify.cmd_verify_env_projection(_args("p")) == verify.EXIT_DRIFT
+    assert verify.cmd_verify_env_projection(_args("p", fix=True)) == verify.EXIT_OK
+    assert not (folder / ".vscode").exists()
+    assert verify.cmd_verify_env_projection(_args("p")) == verify.EXIT_OK
+    assert json.loads((folder / ".claude" / "settings.json").read_text())["hooks"] == {}
 
 
 def test_missing_surface_treated_as_full_drift(stub_db, project_folder, capsys):

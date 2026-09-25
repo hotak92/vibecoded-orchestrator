@@ -5,7 +5,7 @@ short_desc: "triage PDFs: method, dataset, claims, figures"
 keywords: ["paper triage", "systematic review", "PDF extraction", "effect size", "sample size", "supporting figure", "triage papers", "extract from PDFs"]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebSearch, mcp__weaviate-kg__*, mcp__search__search_papers
 model: opus
-effort: high
+effort: medium
 ---
 
 # Paper Triage Agent (Opus)

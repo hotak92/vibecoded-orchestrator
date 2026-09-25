@@ -531,14 +531,13 @@ def _redacted_env_snapshot() -> dict[str, str]:
         val = os.environ.get(key, "")
         if val:
             out[key] = val
-    # Redact: present-but-truncated to avoid full-secret leakage.
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    if api_key:
-        # First 4 chars + length, so a maintainer can sanity-check the prefix
-        # ("sk-p" vs "sk-") without exposing the secret in plain text.
-        out["OPENAI_API_KEY"] = f"<redacted prefix={api_key[:4]!r} len={len(api_key)}>"
-    else:
-        out["OPENAI_API_KEY"] = "<unset>"
+    # Redact: presence + length only — no character of the key reaches the
+    # failure log (v0.2.97; it used to carry a 4-char prefix). Resolved the
+    # way the service resolves it (env, else the `openai_api_key` secret).
+    from vco_lib.openai_key import resolve_openai_api_key
+
+    api_key = resolve_openai_api_key()
+    out["OPENAI_API_KEY"] = f"<redacted len={len(api_key)}>" if api_key else "<unset>"
     return out
 
 
@@ -1688,8 +1687,10 @@ def configured_text_models() -> "list[str]":
     # Secondary OpenAI slot (unless active is already OpenAI) when a key exists.
     # Presence of the key is the config signal; validity is a runtime concern.
     if "openai" not in active_model.lower():
+        from vco_lib.openai_key import resolve_openai_api_key
+
         openai_key = (
-            os.environ.get("OPENAI_API_KEY", "").strip()
+            resolve_openai_api_key()
             or os.environ.get("OPENAI_EMBEDDING_API_KEY", "").strip()
         )
         if openai_key:
@@ -2035,7 +2036,11 @@ class EmbeddingService:
         else:
             code_model_id = DEFAULT_CODE_MODEL
 
-        openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+        # v0.2.97: env first, else the `openai_api_key` secret (launcher
+        # keychain → file store → the project's .env) — vco_lib.openai_key.
+        from vco_lib.openai_key import resolve_openai_api_key
+
+        openai_api_key = resolve_openai_api_key(str(resolved_root))
 
         svc = cls(
             project_root=resolved_root,

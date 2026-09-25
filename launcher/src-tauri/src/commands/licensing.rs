@@ -1942,38 +1942,43 @@ mod tests {
     /// RAII guard that sets `VCT_MACHINE_ID_OVERRIDE` to a known value
     /// for the duration of a test and restores the previous value (or
     /// unsets) on drop. Holds the global env mutex while live.
-    struct MachineIdOverrideGuard<'a> {
-        _lock: std::sync::MutexGuard<'a, ()>,
+    struct MachineIdOverrideGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        // v0.2.97 review R6: and THE env lock (taken second — nothing takes
+        // them the other way round). The module lock alone ordered only this
+        // module's tests; the variable is the whole binary's.
+        _env: vct_launcher_core::test_env::EnvLock,
         previous: Option<String>,
     }
 
-    impl<'a> MachineIdOverrideGuard<'a> {
+    impl MachineIdOverrideGuard {
         fn set(value: &str) -> Self {
-            // Panicking on poisoned mutex is acceptable in tests — it
-            // means an earlier test crashed mid-mutation, surfacing the
-            // crash is more useful than masking it. The mutex itself is
-            // the cross-thread synchronisation point that makes the
-            // (still-safe-on-edition-2021) `set_var`/`remove_var` calls
-            // race-free across our parallel test runner.
+            // The poisoned-mutex recovery mirrors `env_lock`: an earlier
+            // test that crashed mid-mutation restored from `Drop` already.
+            // The mutexes are the cross-thread synchronisation point that
+            // makes the (still-safe-on-edition-2021) `set_var`/`remove_var`
+            // calls race-free across our parallel test runner.
             let lock = MACHINE_ID_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            let env = vct_launcher_core::test_env::env_lock();
             let previous = std::env::var(MACHINE_ID_OVERRIDE_ENV).ok();
             std::env::set_var(MACHINE_ID_OVERRIDE_ENV, value);
-            Self { _lock: lock, previous }
+            Self { _lock: lock, _env: env, previous }
         }
 
         fn unset() -> Self {
             let lock = MACHINE_ID_ENV_LOCK
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
+            let env = vct_launcher_core::test_env::env_lock();
             let previous = std::env::var(MACHINE_ID_OVERRIDE_ENV).ok();
             std::env::remove_var(MACHINE_ID_OVERRIDE_ENV);
-            Self { _lock: lock, previous }
+            Self { _lock: lock, _env: env, previous }
         }
     }
 
-    impl<'a> Drop for MachineIdOverrideGuard<'a> {
+    impl Drop for MachineIdOverrideGuard {
         fn drop(&mut self) {
             match &self.previous {
                 Some(v) => std::env::set_var(MACHINE_ID_OVERRIDE_ENV, v),

@@ -12,8 +12,10 @@
 # and stayed dead until the user manually started them hours later.
 #
 # Fix: this script wraps the compose invocation with:
-#   1. Runtime detection (docker preferred, else podman-compose, else podman compose).
-#      An optional state/install/runtime.txt is the authoritative source.
+#   1. Runtime selection — THE pin rule (vco_lib.containers.runtime_pin):
+#      VCT_CONTAINER_RUNTIME, else state/install/runtime.txt, is a PIN; a
+#      pinned runtime that is not usable starts NOTHING (one log line naming
+#      the pin and the fix). Unpinned: podman first, then docker.
 #   2. NVIDIA presence probe (`nvidia-smi -L`).
 #   3. CDI-ready wait — poll /var/run/cdi/nvidia.yaml up to 30s, parse-check.
 #   4. On success: compose-up with the GPU overlay.
@@ -41,12 +43,15 @@ set -u
 #                                 (default: ${VCT_ORCHESTRATOR_ROOT:-<script_dir>/..}/claude_mcp_servers)
 #   - VCT_STACK_LOG_FILE      — log path (default: /tmp/claude-mcp-containers.log)
 #   - VCT_STACK_CDI_TIMEOUT   — seconds to wait for CDI yaml (default: 30)
-#   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path. When set, this
-#                                 wins over all candidate-path search (PR-12
-#                                 Bug B). When unset, candidates probed in
-#                                 order — see resolve_runtime_file().
-#   - VCT_ORCHESTRATOR_ROOT   — orchestrator install root (used as one of
-#                                 the runtime.txt candidate-path roots).
+#   - VCT_STACK_RUNTIME_FILE  — explicit runtime.txt path (a caller
+#                                 override, strict like VCT_CONTAINER_RUNTIME).
+#                                 Otherwise the record is THIS wrapper's own
+#                                 clone's state/install/runtime.txt — see
+#                                 resolve_runtime_file() (R8 G5).
+#   - VCT_ORCHESTRATOR_ROOT   — orchestrator install root (the default
+#                                 compose home when VCT_STACK_WORKING_DIR is
+#                                 unset). NOT a runtime.txt source: another
+#                                 clone's record is not this install's.
 #   - VCT_STACK_GPU_OVERLAY   — overlay filename for podman path
 #                                 (default: infrastructure/podman-compose.gpu.yml)
 #   - VCT_STACK_GPU_OVERLAY_DOCKER — overlay for docker path
@@ -70,23 +75,67 @@ set -u
 # orchestrator root). systemd units / launchctl jobs always set
 # VCT_STACK_WORKING_DIR explicitly so this default rarely fires.
 _VCT_DEFAULT_STACK_ROOT="$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "${BASH_SOURCE[0]}")")/.."
-VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-${VCT_ORCHESTRATOR_ROOT:-${_VCT_DEFAULT_STACK_ROOT}}/claude_mcp_servers}"
+# v0.2.97: the INSTALLER's compose (<root>/infrastructure) is the default when
+# it exists. A VCO-managed service composed from the legacy
+# claude_mcp_servers/ home gets THAT project's label (and, for Ollama, its
+# differently-named volume) — the foreign-owned shape the service_endpoints
+# migration exists to undo. The legacy home stays the fallback for a clone
+# without infrastructure/.
+_VCT_DEFAULT_STACK_BASE="${VCT_ORCHESTRATOR_ROOT:-${_VCT_DEFAULT_STACK_ROOT}}"
+if [ -f "$_VCT_DEFAULT_STACK_BASE/infrastructure/docker-compose.yml" ]; then
+    _VCT_DEFAULT_STACK_DIR="$_VCT_DEFAULT_STACK_BASE/infrastructure"
+else
+    _VCT_DEFAULT_STACK_DIR="$_VCT_DEFAULT_STACK_BASE/claude_mcp_servers"
+fi
+VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-$_VCT_DEFAULT_STACK_DIR}"
 VCT_STACK_LOG_FILE="${VCT_STACK_LOG_FILE:-/tmp/claude-mcp-containers.log}"
 VCT_STACK_CDI_TIMEOUT="${VCT_STACK_CDI_TIMEOUT:-30}"
-# NOTE (PR-12 Bug B): VCT_STACK_RUNTIME_FILE is no longer eagerly defaulted
-# to ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt — that single path
-# was too narrow when systemd's WorkingDirectory pointed at a stale install
-# location (Bug C). resolve_runtime_file() now probes multiple candidates
-# and picks the first one that contains a USABLE runtime token.
+# NOTE (PR-12 Bug C): VCT_STACK_RUNTIME_FILE is not eagerly defaulted to
+# ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt — that single path was
+# too narrow when systemd's WorkingDirectory pointed at a stale install
+# location. resolve_runtime_file() probes several candidate paths and the
+# first that EXISTS with a podman/docker token is the pin. (PR-12 Bug B's
+# "skip a runtime.txt whose runtime is down" is superseded by the pin rule,
+# v0.2.97: see detect_runtime.)
+# v0.2.97: remember which file knobs the CALLER set, so main() can adapt the
+# defaults to the working dir's layout (infrastructure/ holds
+# docker-compose.yml + its overlays side by side; the legacy
+# claude_mcp_servers/ holds compose.yaml with the overlays one level down).
+_VCT_STACK_COMPOSE_FILE_SET="${VCT_STACK_COMPOSE_FILE+1}"
+_VCT_STACK_GPU_OVERLAY_SET="${VCT_STACK_GPU_OVERLAY+1}"
+_VCT_STACK_GPU_OVERLAY_DOCKER_SET="${VCT_STACK_GPU_OVERLAY_DOCKER+1}"
 VCT_STACK_GPU_OVERLAY="${VCT_STACK_GPU_OVERLAY:-infrastructure/podman-compose.gpu.yml}"
 VCT_STACK_GPU_OVERLAY_DOCKER="${VCT_STACK_GPU_OVERLAY_DOCKER:-infrastructure/docker-compose.gpu.yml}"
 VCT_STACK_COMPOSE_FILE="${VCT_STACK_COMPOSE_FILE:-compose.yaml}"
 VCT_STACK_COMPOSE_OVERRIDE="${VCT_STACK_COMPOSE_OVERRIDE:-compose.override.yaml}"
+# v0.2.97 — WHICH services this script composes (plan invariant I1: never a
+# bare whole-stack `up -d`). Order of precedence:
+#   1. service names on the command line (`launch-claude-mcp-stack.sh
+#      [up|start|restart] <service>...` — the verb is optional and means
+#      "bring up", as it always did);
+#   2. VCO_COMPOSE_SERVICES in the environment (space-separated; set but
+#      EMPTY means "nothing" → no compose call);
+#   3. the launcher.db service_endpoints plan (`python -m
+#      vco_lib.service_lifecycle plan`) — the boot unit's case, which ALSO
+#      starts adopted containers BY NAME.
+# 1 and 2 are intersected with the plan's VCO-managed list: an adopted
+# service is never composed, whoever asks. No readable plan → nothing runs.
+#   - VCT_STACK_BUILD=1       — add `--build` (code_embed's image is built
+#                                 from the checkout; the session hook sets it
+#                                 when it is creating that container).
+_VCT_CALLER_SERVICES_SET="${VCO_COMPOSE_SERVICES+1}"
+_VCT_CALLER_SERVICES="${VCO_COMPOSE_SERVICES-}"
 
 # Resolve the directory that contains THIS script — used as one fallback
 # root for runtime.txt resolution. Works whether the script is sourced or
 # executed directly.
 _VCT_SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)" || _VCT_SCRIPT_DIR=""
+# The clone this wrapper belongs to — the install it serves (R8 G5): its
+# runtime.txt is THE record, its infrastructure/ the fallback compose home,
+# its ledger where an exit 3 is recorded (G6). Same answer as Python's
+# resolve_install_root() and Rust's orchestrator_install_root().
+_VCT_OWN_ROOT=""
+[ -n "$_VCT_SCRIPT_DIR" ] && _VCT_OWN_ROOT="$(cd "$_VCT_SCRIPT_DIR/.." 2>/dev/null && pwd)"
 
 # ---------------------------------------------------------------------------
 # log :: append a timestamped line to the log file. Best-effort; never errors.
@@ -99,38 +148,31 @@ log() {
 }
 
 # ---------------------------------------------------------------------------
-# resolve_runtime_file :: prints the path to the FIRST runtime.txt candidate
-# that exists on disk and contains a usable runtime token. Empty string if
-# none usable (PR-12 Bug B).
+# resolve_runtime_file :: prints the path of THE runtime.txt record — the
+# runtime.txt pin. Empty string when there is none (unpinned).
 #
-# Probe order (first hit wins):
+# Candidates (first that records podman/docker wins):
 #   1. ${VCT_STACK_RUNTIME_FILE} if explicitly set (caller override).
-#   2. ${VCT_STACK_WORKING_DIR}/state/install/runtime.txt
-#   3. ${VCT_ORCHESTRATOR_ROOT}/state/install/runtime.txt
-#   4. <script_dir>/../state/install/runtime.txt   (script lives in
-#      <orchestrator>/scripts/, so .. is the orchestrator root).
+#   2. <own clone>/state/install/runtime.txt — the install this wrapper
+#      belongs to and serves (R8 G5). The same record Python
+#      (resolve_install_root) and Rust (orchestrator_install_root) read.
+# VCT_STACK_WORKING_DIR (a compose dir, possibly a stale unit
+# WorkingDirectory — PR-12 Bug C) and VCT_ORCHESTRATOR_ROOT are NOT
+# candidates: before v0.2.97 R8 the FIRST of them that held a record won,
+# so another clone's record could pin this install's stack onto empty
+# volumes. A differing record there is logged, never used.
 #
-# A candidate is "usable" iff:
-#   - the file exists + is readable + non-empty, AND
-#   - the token it contains corresponds to a runtime whose daemon access
-#     check passes (_runtime_usable).
-#
-# We log every candidate that exists-but-is-not-usable so a stale unit
-# WorkingDirectory pointing at a dead install doesn't fail silently.
+# A candidate that is missing, empty or names no runtime is skipped. One
+# whose runtime is DOWN is NOT skipped: it is the pin, and detect_runtime
+# refuses it (or, for the own clone's record, reconciles it read-only).
 # ---------------------------------------------------------------------------
 resolve_runtime_file() {
     local candidates=()
     if [ -n "${VCT_STACK_RUNTIME_FILE:-}" ]; then
         candidates+=("$VCT_STACK_RUNTIME_FILE")
     fi
-    if [ -n "${VCT_STACK_WORKING_DIR:-}" ]; then
-        candidates+=("${VCT_STACK_WORKING_DIR}/state/install/runtime.txt")
-    fi
-    if [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ]; then
-        candidates+=("${VCT_ORCHESTRATOR_ROOT}/state/install/runtime.txt")
-    fi
-    if [ -n "${_VCT_SCRIPT_DIR:-}" ]; then
-        candidates+=("${_VCT_SCRIPT_DIR}/../state/install/runtime.txt")
+    if [ -n "${_VCT_OWN_ROOT:-}" ]; then
+        candidates+=("${_VCT_OWN_ROOT}/state/install/runtime.txt")
     fi
 
     local seen_path=""
@@ -143,15 +185,130 @@ resolve_runtime_file() {
         [ -r "$cand" ] || continue
         local token
         token="$(head -n 1 "$cand" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        [ -z "$token" ] && continue
-        if _runtime_usable "$token"; then
-            printf '%s\n' "$cand"
-            return 0
-        else
-            log "runtime.txt at $cand names '$token' but its daemon is not reachable — falling through to live probe"
-        fi
+        case "$token" in
+            podman|docker)
+                _log_foreign_record "$cand" "$token"
+                printf '%s\n' "$cand"
+                return 0
+                ;;
+            '') ;;
+            *) log "runtime.txt at $cand names '$token', not podman or docker — ignoring it" >&2 ;;
+        esac
     done
     printf ''
+}
+
+# _log_foreign_record :: say so when VCT_ORCHESTRATOR_ROOT's clone records a
+# DIFFERENT runtime than the one used ($1 path, $2 token) — never use it.
+_log_foreign_record() {
+    local foreign="${VCT_ORCHESTRATOR_ROOT:-}/state/install/runtime.txt" ftok
+    [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ] && [ -r "$foreign" ] || return 0
+    [ "$foreign" = "$1" ] && return 0
+    ftok="$(head -n 1 "$foreign" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    case "$ftok" in
+        podman|docker)
+            [ "$ftok" = "$2" ] || log "note: $foreign records $ftok, but this wrapper serves the install whose record is $1 ($2) — ignoring the other clone's record" >&2 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# reconcile_record :: the READ-ONLY form of install.py's runtime-record
+# reconcile (python -m vco_lib.runtime_reconcile boot — the one home of the
+# decision; this wrapper never rewrites state). Prints the runtime to use
+# for THIS boot when VCO's own record is stale AND there is positive evidence
+# of where the data is — its runtime is not installed (not on PATH nor in the
+# usual install locations) and the other one holds VCO's containers/volumes,
+# or it holds none of them while the other does — and nothing otherwise (then
+# the pin is refused as before). Under a bind-mounted data folder (R10 J2,
+# R11 L2/L3) only VCO containers RUNNING under the other runtime — or every
+# service's data being a folder — switch; a leftover volume there never does.
+# "No VCO data anywhere" is never switched
+# here (R9 H1: install.py decides that one), nor is a runtime the user
+# confirmed with `install.py --container` (R9 H2). The next install/update
+# re-records it.
+# ---------------------------------------------------------------------------
+reconcile_record() {
+    local py="${STACK_PY:-}" out
+    [ -n "$py" ] || py="$(resolve_stack_python)"
+    [ -n "$py" ] && [ -n "$_VCT_OWN_ROOT" ] || return 0
+    out="$(PYTHONPATH="${_VCT_OWN_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m vco_lib.runtime_reconcile boot --root "$_VCT_OWN_ROOT" 2>/dev/null)" || return 0
+    local VCO_RECONCILE_OUTCOME="" VCO_RECONCILE_RUNTIME="" VCO_RECONCILE_DETAIL=""
+    eval "$out"
+    if [ "$VCO_RECONCILE_OUTCOME" = "rewritten" ] && [ -n "$VCO_RECONCILE_RUNTIME" ]; then
+        log "$VCO_RECONCILE_DETAIL" >&2
+        printf '%s\n' "$VCO_RECONCILE_RUNTIME"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# record_boot_refusal :: R8 G6 — an exit 3 must not be a dead end. Records
+# `container_runtime_unusable` in the own clone's ledger through the one
+# Python emitter (python -m vco_lib.runtime_reconcile record-boot-refusal),
+# which session start and the launcher show; it clears once the runtime
+# answers. Best effort, bounded, never blocks boot. $1 = the reason.
+#
+# R9 H7: the CLI bounds ITSELF — no coreutils `timeout` (absent on macOS):
+# it waits at most BOOT_LEDGER_LOCK_TIMEOUT_S for the ledger lock an in-flight
+# update may hold (non-blocking retries, then it skips with a log line), and
+# exits by RECORD_REFUSAL_DEADLINE_S whatever else is in flight.
+# ---------------------------------------------------------------------------
+record_boot_refusal() {
+    local py="${STACK_PY:-}"
+    [ -n "$py" ] || py="$(resolve_stack_python)"
+    [ -n "$py" ] && [ -n "$_VCT_OWN_ROOT" ] || return 0
+    PYTHONPATH="${_VCT_OWN_ROOT}${PYTHONPATH:+:$PYTHONPATH}" "$py" -m vco_lib.runtime_reconcile \
+        record-boot-refusal --root "$_VCT_OWN_ROOT" --reason "$1" >/dev/null 2>&1 || true
+}
+
+# ---------------------------------------------------------------------------
+# _bounded :: run "$@" for at most $1 seconds — coreutils `timeout` when it
+# exists, else a portable background watchdog (macOS ships no `timeout`, and
+# before R9 H7 every bounded probe here simply FAILED there: `timeout 5 docker
+# info` is "command not found", so every runtime read as unusable at boot).
+# Returns the command's exit code (non-zero when it was cut off).
+# ---------------------------------------------------------------------------
+_bounded() {
+    local secs="$1"
+    shift
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    "$@" &
+    local pid=$! watcher rc
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null; sleep 2; kill -KILL "$pid" 2>/dev/null ) >/dev/null 2>&1 &
+    watcher=$!
+    wait "$pid"
+    rc=$?
+    kill "$watcher" 2>/dev/null
+    wait "$watcher" 2>/dev/null
+    return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# augment_tool_path :: R9 H1(b)/H5 — a boot unit's PATH (systemd --user,
+# launchd) lacks ~/bin, ~/.local/bin, /opt/homebrew/bin, /usr/local/bin, ...
+# where podman/docker (or their compose front-ends) are often installed, so
+# `command -v` called an installed runtime "not installed" — and a runtime
+# judged not installed is one the record reconcile may switch away from.
+# Asks the ONE table (vco_lib/tool_search_dirs.toml, through
+# `python -m vco_lib.tool_search_dirs search-path`) and adds the directory of
+# every such tool found outside PATH, per the table's placement (a
+# graphical-launch dir such as Homebrew ahead of PATH, as a login shell has it;
+# a runtime location such as ~/bin after it) — the order the launcher, the hub
+# and every Python surface use. PATH itself is kept as it is. Soft: no Python
+# or no answer leaves PATH as it is.
+# ---------------------------------------------------------------------------
+augment_tool_path() {
+    local p
+    [ -n "${STACK_PY:-}" ] || return 0
+    p="$(stack_py vco_lib.tool_search_dirs search-path 2>/dev/null)" || return 0
+    [ -n "$p" ] || return 0
+    if [ "$p" != "$PATH" ]; then
+        PATH="$p"
+        export PATH
+        log "container runtime tools found outside this service's PATH; PATH is now: $PATH"
+    fi
 }
 
 # ---------------------------------------------------------------------------
@@ -173,8 +330,8 @@ resolve_runtime_file() {
 #            backend isn't initialized).
 #   anything else → not usable.
 #
-# Both probes carry a 5s timeout — a hung daemon socket must NOT block
-# boot indefinitely.
+# Both probes carry a 5s bound (_bounded — portable, R9 H7) — a hung
+# daemon socket must NOT block boot indefinitely.
 # ---------------------------------------------------------------------------
 _runtime_usable() {
     local token="$1"
@@ -182,7 +339,7 @@ _runtime_usable() {
         docker)
             command -v docker >/dev/null 2>&1 || return 1
             local info_out
-            if ! info_out="$(timeout 5 docker info 2>&1)"; then
+            if ! info_out="$(_bounded 5 docker info 2>&1)"; then
                 return 1
             fi
             # Server: section presence is the daemon-access proxy.
@@ -191,7 +348,7 @@ _runtime_usable() {
             ;;
         podman)
             command -v podman >/dev/null 2>&1 || return 1
-            timeout 5 podman info >/dev/null 2>&1 || return 1
+            _bounded 5 podman info >/dev/null 2>&1 || return 1
             return 0
             ;;
         *)
@@ -201,73 +358,89 @@ _runtime_usable() {
 }
 
 # ---------------------------------------------------------------------------
+# refuse_pin :: log THE one line for a pinned runtime that cannot be used —
+# naming the pin's source and the fix — on stderr and in the log file (never
+# on stdout: detect_runtime's stdout is its answer).
+#   $1 = pinned runtime, $2 = pin source (VCT_CONTAINER_RUNTIME or the
+#   runtime.txt path), $3 = what is wrong with it.
+# MUST MATCH Write-RuntimePinRefusal in launch-claude-mcp-stack.ps1.
+# ---------------------------------------------------------------------------
+refuse_pin() {
+    local pinned="$1" source="$2" why="$3" other="docker" change
+    [ "$pinned" = "docker" ] && other="podman"
+    if [ "$source" = "VCT_CONTAINER_RUNTIME" ]; then
+        change="unset VCT_CONTAINER_RUNTIME (or set it to $other) if the data is not in $pinned"
+    else
+        change="set VCT_CONTAINER_RUNTIME=$other if the data is not in $pinned (the install recorded $pinned in $source)"
+    fi
+    log "FATAL: the container runtime is pinned to $pinned by $source, but $why — starting nothing (the stack's data is in $pinned's volumes; $other would start it on empty ones). Fix: start $pinned, or $change." >&2
+}
+
+# ---------------------------------------------------------------------------
 # detect_runtime :: prints one of "docker", "podman-compose", "podman compose", or ""
 #
-# Order (PR-12 Bug A + v0.2.14 Bug #3 — every candidate validated via
-# _runtime_usable):
-#   0. VCT_CONTAINER_RUNTIME env var — if set to "podman" or "docker" and
-#      that runtime is usable, return it. "auto" / unset / unknown → fall
-#      through to step 1. Honoring this env var here matches the contract
-#      shipped in PR-43 (launcher Rust) + the install.py + the hook scripts;
-#      previously detect_runtime ignored it, causing split-brain between
-#      the env-honoring surfaces and the boot-wrapper.
-#   1. resolve_runtime_file → token from runtime.txt → expand to compose
-#      invocation IFF the runtime is usable. Otherwise log + fall through.
-#   2. Probe podman first (preferred default — it's the VCO-recommended
-#      runtime, has no group-permission gotcha).
-#   3. Probe docker.
-#   4. Empty (no usable runtime).
+# THE pin rule (vco_lib.containers.runtime_pin, v0.2.97 — the same rule as
+# the session hooks, install.py and the launcher):
+#   1. VCT_CONTAINER_RUNTIME=podman|docker is a PIN ("auto"/unset: none).
+#   2. Else the first runtime.txt resolve_runtime_file finds is a PIN.
+#   A pinned runtime is the ONLY candidate. When it is not usable (binary
+#   missing, daemon / machine down, or podman without a compose front-end)
+#   refuse_pin logs one line and this returns 4 with empty output: starting
+#   the stack under the OTHER runtime would create its containers on that
+#   runtime's empty volumes next to the real data (plan invariants I1/I2).
+#   This supersedes PR-12 Bug B's fall-through to the other runtime.
+#   3. Unpinned: podman first (preferred default, no group-permission
+#      gotcha), then docker; podman without a compose front-end falls
+#      through to docker.
+#   4. Empty (no usable runtime), return 0.
 #
 # A "usable" docker means `docker info` reaches the daemon (Server section
-# present); a "usable" podman means `podman info` succeeds. This prevents
-# the boot-time "permission denied" failure when Docker Desktop is present
-# but the user is not in the `docker` group.
+# present); a "usable" podman means `podman info` succeeds (_runtime_usable).
 # ---------------------------------------------------------------------------
 detect_runtime() {
-    # 0. VCT_CONTAINER_RUNTIME explicit preference (v0.2.14 Bug #3 fix).
-    local pref
+    local pref pin="" pin_source=""
     pref="$(printf '%s' "${VCT_CONTAINER_RUNTIME:-}" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
     case "$pref" in
-        podman)
-            if _runtime_usable podman; then
-                if command -v podman-compose >/dev/null 2>&1; then
-                    printf 'podman-compose\n'
-                    return 0
-                fi
-                if podman compose --help >/dev/null 2>&1; then
-                    printf 'podman compose\n'
-                    return 0
-                fi
-                log "VCT_CONTAINER_RUNTIME=podman but no compose front-end available — falling through to runtime.txt / auto-detect"
-            else
-                log "VCT_CONTAINER_RUNTIME=podman but podman not usable — falling through to runtime.txt / auto-detect"
-            fi
-            ;;
-        docker)
-            if _runtime_usable docker; then
-                printf 'docker\n'
-                return 0
-            fi
-            log "VCT_CONTAINER_RUNTIME=docker but docker not usable — falling through to runtime.txt / auto-detect"
+        podman|docker)
+            pin="$pref"
+            pin_source="VCT_CONTAINER_RUNTIME"
             ;;
         ''|auto)
-            : # no preference; auto-detect path below
+            : # no env pin
             ;;
         *)
-            log "VCT_CONTAINER_RUNTIME=${pref} unrecognized (expected 'podman'/'docker'/'auto') — ignoring"
+            log "VCT_CONTAINER_RUNTIME=${pref} unrecognized (expected 'podman'/'docker'/'auto') — ignoring" >&2
             ;;
     esac
+    if [ -z "$pin" ]; then
+        local runtime_file
+        runtime_file="$(resolve_runtime_file)"
+        if [ -n "$runtime_file" ]; then
+            pin="$(head -n 1 "$runtime_file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+            pin_source="$runtime_file"
+        fi
+    fi
 
-    # 1. runtime.txt — only honored if its named runtime is actually usable.
-    local runtime_file
-    runtime_file="$(resolve_runtime_file)"
-    if [ -n "$runtime_file" ]; then
-        local persisted
-        persisted="$(head -n 1 "$runtime_file" 2>/dev/null | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
-        case "$persisted" in
+    # R8 G5: VCO's OWN record (never the user's VCT_CONTAINER_RUNTIME, never an
+    # explicit VCT_STACK_RUNTIME_FILE) is reconciled read-only when its runtime
+    # is not usable, so a stale record does not strand the stack at boot.
+    if [ -n "$pin" ] && [ "$pin_source" = "${_VCT_OWN_ROOT}/state/install/runtime.txt" ] \
+        && ! _runtime_usable "$pin"; then
+        local reconciled
+        reconciled="$(reconcile_record)"
+        if [ -n "$reconciled" ] && [ "$reconciled" != "$pin" ]; then
+            pin="$reconciled"
+            pin_source="$pin_source (stale; reconciled to $reconciled for this boot)"
+        fi
+    fi
+
+    if [ -n "$pin" ]; then
+        if ! _runtime_usable "$pin"; then
+            refuse_pin "$pin" "$pin_source" "$pin is not usable (not installed, or \`$pin info\` fails: daemon / machine not running)"
+            return 4
+        fi
+        case "$pin" in
             docker)
-                # _runtime_usable already validated docker daemon access in
-                # resolve_runtime_file; we trust that result here.
                 printf 'docker\n'
                 return 0
                 ;;
@@ -280,14 +453,13 @@ detect_runtime() {
                     printf 'podman compose\n'
                     return 0
                 fi
-                # podman is usable but no compose front-end available —
-                # fall through to live probe (which will also fail, but at
-                # least surfaces the right diagnostic).
+                refuse_pin podman "$pin_source" "neither podman-compose nor \`podman compose\` is available"
+                return 4
                 ;;
         esac
     fi
 
-    # 2. Probe podman first — preferred default, no group-perm gotcha.
+    # Unpinned: podman first — preferred default, no group-perm gotcha.
     if _runtime_usable podman; then
         if command -v podman-compose >/dev/null 2>&1; then
             printf 'podman-compose\n'
@@ -298,16 +470,16 @@ detect_runtime() {
             return 0
         fi
         # podman daemon usable but no compose front-end — log and try docker.
-        log "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker"
+        log "podman daemon is reachable but neither 'podman-compose' nor 'podman compose' is available — falling through to docker" >&2
     fi
 
-    # 3. Probe docker (only if its daemon is actually reachable).
+    # Then docker (only if its daemon is actually reachable).
     if _runtime_usable docker; then
         printf 'docker\n'
         return 0
     fi
 
-    # 4. No usable runtime.
+    # No usable runtime.
     printf ''
 }
 
@@ -512,23 +684,193 @@ pick_compose_invocation() {
 }
 
 # ---------------------------------------------------------------------------
+# adapt_file_defaults :: fit the DEFAULT compose-file / overlay names to the
+# working dir's layout (v0.2.97). Caller-set knobs are never touched.
+#   - compose file: `compose.yaml` when present, else `docker-compose.yml`
+#     (infrastructure/ — the installer's compose; before this the session
+#     hook and the hub watchdog pointed the wrapper at infrastructure/ and it
+#     asked for a compose.yaml that does not exist there).
+#   - GPU overlays: `infrastructure/<overlay>` when present, else the same
+#     name directly in the working dir (infrastructure/ again).
+# Arg: working dir.
+# ---------------------------------------------------------------------------
+adapt_file_defaults() {
+    local dir="$1"
+    if [ -z "$_VCT_STACK_COMPOSE_FILE_SET" ] && [ ! -f "$dir/compose.yaml" ] \
+        && [ -f "$dir/docker-compose.yml" ]; then
+        VCT_STACK_COMPOSE_FILE="docker-compose.yml"
+    fi
+    if [ -z "$_VCT_STACK_GPU_OVERLAY_SET" ] && [ ! -f "$dir/$VCT_STACK_GPU_OVERLAY" ] \
+        && [ -f "$dir/$(basename "$VCT_STACK_GPU_OVERLAY")" ]; then
+        VCT_STACK_GPU_OVERLAY="$(basename "$VCT_STACK_GPU_OVERLAY")"
+    fi
+    if [ -z "$_VCT_STACK_GPU_OVERLAY_DOCKER_SET" ] && [ ! -f "$dir/$VCT_STACK_GPU_OVERLAY_DOCKER" ] \
+        && [ -f "$dir/$(basename "$VCT_STACK_GPU_OVERLAY_DOCKER")" ]; then
+        VCT_STACK_GPU_OVERLAY_DOCKER="$(basename "$VCT_STACK_GPU_OVERLAY_DOCKER")"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# is_stack_dir :: 0 iff $1 is a compose home (a directory holding the
+# installer's docker-compose.yml or the legacy compose.yaml).
+# own_stack_dir :: THIS wrapper's clone's compose home (infrastructure/, else
+# the legacy claude_mcp_servers/), or empty.
+# ---------------------------------------------------------------------------
+is_stack_dir() {
+    [ -n "$1" ] && [ -d "$1" ] || return 1
+    [ -f "$1/docker-compose.yml" ] || [ -f "$1/compose.yaml" ] || [ -f "$1/$VCT_STACK_COMPOSE_FILE" ]
+}
+
+own_stack_dir() {
+    [ -n "$_VCT_OWN_ROOT" ] || return 0
+    if is_stack_dir "$_VCT_OWN_ROOT/infrastructure"; then
+        printf '%s\n' "$_VCT_OWN_ROOT/infrastructure"
+    elif is_stack_dir "$_VCT_OWN_ROOT/claude_mcp_servers"; then
+        printf '%s\n' "$_VCT_OWN_ROOT/claude_mcp_servers"
+    fi
+}
+
+# resolve_working_dir :: R8 G5 — a VCT_STACK_WORKING_DIR that is not a compose
+# home (a moved / re-cloned install's old unit WorkingDirectory — PR-12 Bug C)
+# is logged and replaced by THIS wrapper's own clone's, whose compose names the
+# same volumes — never an empty stack elsewhere. Mirrors Resolve-WorkingDir.
+resolve_working_dir() {
+    is_stack_dir "$VCT_STACK_WORKING_DIR" && return 0
+    local own_dir
+    own_dir="$(own_stack_dir)"
+    if [ -n "$own_dir" ] && [ "$own_dir" != "$VCT_STACK_WORKING_DIR" ]; then
+        log "VCT_STACK_WORKING_DIR=$VCT_STACK_WORKING_DIR is not a VCO compose directory (stale?) — using this wrapper's own clone: $own_dir"
+        VCT_STACK_WORKING_DIR="$own_dir"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# resolve_stack_python :: print an interpreter that can import vco_lib from
+# THIS checkout (the wrapper lives in <root>/scripts). VCO_VENV_PYTHON wins;
+# then the hooks' shared venv resolver; then <root>/.venv; then python3.
+# Empty when none — the caller then refuses to compose anything.
+# ---------------------------------------------------------------------------
+resolve_stack_python() {
+    local root="${_VCT_SCRIPT_DIR:+$_VCT_SCRIPT_DIR/..}"
+    if [ -n "${VCO_VENV_PYTHON:-}" ] && [ -f "$VCO_VENV_PYTHON" ] && [ -x "$VCO_VENV_PYTHON" ]; then
+        printf '%s\n' "$VCO_VENV_PYTHON"
+        return 0
+    fi
+    if [ -n "$root" ] && [ -f "$root/templates/hooks/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=/dev/null
+        . "$root/templates/hooks/_lib/resolve-vco-venv.sh"
+        VCO_VENV_PYTHON=""
+        resolve_vco_venv_python "$root/templates/hooks"
+        if [ -n "$VCO_VENV_PYTHON" ]; then
+            printf '%s\n' "$VCO_VENV_PYTHON"
+            return 0
+        fi
+    fi
+    if [ -n "$root" ] && [ -x "$root/.venv/bin/python" ]; then
+        printf '%s\n' "$root/.venv/bin/python"
+        return 0
+    fi
+    command -v python3 2>/dev/null || true
+}
+
+# ---------------------------------------------------------------------------
+# stack_py :: run `python -m <args>` with THIS checkout first on PYTHONPATH.
+# ---------------------------------------------------------------------------
+stack_py() {
+    local root="${_VCT_SCRIPT_DIR:+$_VCT_SCRIPT_DIR/..}"
+    PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" "$STACK_PY" -m "$@"
+}
+
+# ---------------------------------------------------------------------------
+# select_services :: decide the compose service list (see the header).
+# Args: the service names from the command line (verb already stripped).
+# Sets SELECTED_SERVICES (space-separated) and FROM_PLAN (1 when the plan
+# supplied the list — the boot case that also starts adopted containers).
+# Requires the plan variables (VCO_COMPOSE_SERVICES = VCO-managed list).
+# ---------------------------------------------------------------------------
+select_services() {
+    local managed=" ${VCO_COMPOSE_SERVICES:-} " requested s
+    FROM_PLAN=0
+    if [ "$#" -gt 0 ]; then
+        requested="$*"
+    elif [ -n "$_VCT_CALLER_SERVICES_SET" ]; then
+        requested="$_VCT_CALLER_SERVICES"
+    else
+        requested="${VCO_COMPOSE_SERVICES:-}"
+        FROM_PLAN=1
+    fi
+    SELECTED_SERVICES=""
+    for s in $requested; do
+        case "$managed" in
+            *" $s "*) SELECTED_SERVICES="${SELECTED_SERVICES:+$SELECTED_SERVICES }$s" ;;
+            *) log "skipping '$s': not a VCO-managed service in launcher.db service_endpoints (an adopted service is never composed)" ;;
+        esac
+    done
+}
+
+# ---------------------------------------------------------------------------
 # main :: orchestrate the boot-safe compose-up.
 # ---------------------------------------------------------------------------
 main() {
     log "starting (working_dir=$VCT_STACK_WORKING_DIR cdi_timeout=$VCT_STACK_CDI_TIMEOUT)"
 
+    # Optional leading verb: the launcher passes `start` / `restart`; both
+    # have always meant "bring the services up".
+    case "${1:-}" in
+        up|start|restart) shift ;;
+    esac
+
+    resolve_working_dir
     if [ ! -d "$VCT_STACK_WORKING_DIR" ]; then
         log "FATAL: working directory does not exist: $VCT_STACK_WORKING_DIR"
         exit 2
     fi
     cd "$VCT_STACK_WORKING_DIR" || { log "FATAL: cd $VCT_STACK_WORKING_DIR failed"; exit 2; }
+    adapt_file_defaults "$VCT_STACK_WORKING_DIR"
 
-    local runtime
-    runtime="$(detect_runtime)"
+    # The service_endpoints plan (VCO-managed list + adopted containers).
+    STACK_PY="$(resolve_stack_python)"
+    if [ -z "$STACK_PY" ]; then
+        log "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) — nothing composed"
+        exit 5
+    fi
+    # Before any runtime probe: a runtime installed outside this service's
+    # PATH is found (and driven) instead of read as absent (R9 H1(b)/H5).
+    augment_tool_path
+    local plan_out plan_err
+    plan_err="${TMPDIR:-/tmp}/vco-stack-plan.$$"
+    if ! plan_out="$(stack_py vco_lib.service_lifecycle plan --shell 2>"$plan_err")"; then
+        log "FATAL: vco_lib.service_lifecycle plan failed — nothing composed: $(tail -n 3 "$plan_err" 2>/dev/null | tr '\n' ' ')"
+        rm -f "$plan_err"
+        exit 5
+    fi
+    rm -f "$plan_err"
+    eval "$plan_out"
+    select_services "$@"
+    if [ -z "$SELECTED_SERVICES" ] && { [ "$FROM_PLAN" != "1" ] || [ -z "${VCO_ADOPTED_CONTAINERS:-}" ]; }; then
+        log "nothing to compose: no VCO-managed service selected"
+        exit 0
+    fi
+
+    local runtime runtime_rc reason rt_err="${TMPDIR:-/tmp}/vco-stack-runtime.$$"
+    runtime="$(detect_runtime 2>"$rt_err")"
+    runtime_rc=$?
+    cat "$rt_err" >&2 2>/dev/null
     if [ -z "$runtime" ]; then
-        log "FATAL: no container runtime found (tried runtime.txt, docker, podman-compose, podman compose)"
+        # rc 4: a pinned runtime is not usable — refuse_pin already logged
+        # the one line that names the pin and the fix.
+        if [ "$runtime_rc" -eq 4 ]; then
+            reason="$(grep 'FATAL:' "$rt_err" 2>/dev/null | tail -n 1 | sed 's/^.*FATAL: //')"
+        else
+            reason="no container runtime found (tried runtime.txt, docker, podman-compose, podman compose)"
+            log "FATAL: $reason"
+        fi
+        rm -f "$rt_err"
+        # R8 G6: exit 3 is recorded where session start and the launcher look.
+        record_boot_refusal "$reason"
         exit 3
     fi
+    rm -f "$rt_err"
     log "runtime=$runtime"
 
     local gpu_mode="cpu"
@@ -582,12 +924,47 @@ main() {
         esac
         log "WARNING: inline-GPU compose assumed — overlay file '${VCT_STACK_WORKING_DIR}/${missing_overlay}' not found, proceeding without overlay"
     fi
-    log "exec: $argv up -d"
+
+    # Adopted containers (somebody else's, started BY NAME, never composed)
+    # come up on the boot path only — an explicit list is a caller asking
+    # for those services and nothing else.
+    local name
+    if [ "$FROM_PLAN" = "1" ]; then
+        local rt_bin="podman"
+        [ "$runtime" = "docker" ] && rt_bin="docker"
+        for name in ${VCO_ADOPTED_CONTAINERS:-}; do
+            if "$rt_bin" start "$name" >/dev/null 2>&1; then
+                log "started adopted container $name (by name — never re-created)"
+            else
+                log "WARNING: could not start adopted container $name"
+            fi
+        done
+    fi
+
+    # The `up` argv for EXACTLY the selected services — from the one home of
+    # the rule (`--no-deps`; code_embed only with the gpu profile, and not at
+    # all in CPU mode). An empty list is NO compose call, never a bare up.
+    local up_line
+    local -a up_args=() build_flag=()
+    [ "${VCT_STACK_BUILD:-}" = "1" ] && build_flag=(--build)
+    if ! up_line="$(stack_py vco_lib.service_lifecycle compose-args --shell \
+            --services "$SELECTED_SERVICES" --gpu-mode "$gpu_mode" \
+            "${build_flag[@]}")"; then
+        log "FATAL: vco_lib.service_lifecycle compose-args failed for '$SELECTED_SERVICES' — nothing composed"
+        exit 5
+    fi
+    if [ -z "$up_line" ]; then
+        log "nothing to compose (selected: '${SELECTED_SERVICES}', gpu_mode=$gpu_mode)"
+        exit 0
+    fi
+    # `up_line` is shlex-quoted by the Python side; this only splits it.
+    eval "up_args=($up_line)"
+    log "exec: $argv $up_line"
 
     # shellcheck disable=SC2086
     # Intentional word splitting — `argv` is a space-separated string
     # built from a controlled set of values inside `pick_compose_invocation`.
-    $argv up -d
+    $argv "${up_args[@]}"
     local rc=$?
     log "compose exited rc=$rc"
     # Exit 125 from podman-compose means "one or more containers failed

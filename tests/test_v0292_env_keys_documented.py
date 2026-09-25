@@ -262,6 +262,7 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCO_HUB_STATE": "session-start-ensure-hub hook plumbing",
     "VCO_PROGRESS_STREAM": "install.py machine-readable progress channel for the launcher GUI",
     "VCO_RUNTIME": "container-hook plumbing (resolved runtime handoff)",
+    "VCO_SESSION_LOCK_HELD": "container-hook plumbing: `service_lifecycle with-session-lock` sets it for the hook it re-runs under the session lock (R7a F10)",
     "VCO_RUNTIME_REASON": "container-hook plumbing (runtime decision provenance)",
     "VCO_RUNTIME_REQUESTED": "container-hook plumbing (requested-runtime handoff)",
     "VCO_RUNTIME_STATE": "container-hook plumbing (runtime state handoff)",
@@ -273,7 +274,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_DIAGRAMS_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
     "VCT_FIELD": "hook-script -> embedded-python value channel (vct_project_config.sh)",
     "VCT_FORCE_RESTART_DEFERRAL": "install.py internal escape hatch (support tooling)",
-    "VCT_INSTALL_RELAUNCHED": "install.py self-relaunch loop guard",
     "VCT_INSTALL_ROOT": "install-root handoff consumed by venv resolution in bundled hooks",
     "VCT_JSON_PATH": "hook-script -> embedded-python value channel",
     "VCT_KG_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
@@ -302,22 +302,44 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_TUNING_PATH": "hook-script -> embedded-python value channel",
     "VCT_TUNING_TARGET": "hook-script -> embedded-python value channel",
     "VCT_TUNING_VALUES": "hook-script -> embedded-python value channel",
-    "VCT_VENV": "venv-path handoff between bundled hooks and children",
     # --- shell variables ASSIGNED (unconditionally, before any read) by
     # --- templates/hooks/_lib/container-names.sh — a user-set env value is
     # --- clobbered by the assignment, so these are not env knobs at all.
     # --- The user-facing override is VCT_REQUIRED_CONTAINERS (documented in
     # --- docs/features/03-agents-skills-hooks.md).
-    "VCO_CODE_EMBED_CONTAINER": "library-assigned shell var (container-names.sh:40); user env is overwritten before any read",
-    "VCO_OLLAMA_CONTAINER": "library-assigned shell var (container-names.sh:39); user env is overwritten before any read",
-    "VCO_REQUIRED_CONTAINERS": "array set by container-names.sh:51-60 from VCT_REQUIRED_CONTAINERS or the canonical names; never read from user env as an override",
-    "VCO_WEAVIATE_CONTAINER": "library-assigned shell var (container-names.sh:38); user env is overwritten before any read",
+    "VCO_CODE_EMBED_CONTAINER": "shell var assigned by container-names.sh and re-assigned by the eval'd `vco_lib.service_lifecycle plan --shell` output (the row's container) before ensure-containers.sh reads it; user env is overwritten",
+    "VCO_REQUIRED_CONTAINERS": "array set by container-names.sh from VCT_REQUIRED_CONTAINERS (empty when unset — v0.2.97: the service_endpoints plan supplies the default set); never read from user env as an override",
+    # --- v0.2.97 SE-3: shell variables ASSIGNED by eval'ing
+    # --- `python -m vco_lib.service_lifecycle plan --shell` (rows → per-
+    # --- container lifecycle policy) immediately before they are read; a
+    # --- user-set value is overwritten, so these are not env knobs.
+    "VCO_ADOPTED_CONTAINERS": "assigned by the eval'd service_lifecycle plan (adopted containers to start by name); user env is overwritten before any read",
+    # --- v0.2.97 R8 G5: `local`s assigned by eval'ing `python -m
+    # --- vco_lib.runtime_reconcile boot` in the boot wrapper's
+    # --- reconcile_record, declared empty right before the eval.
+    "VCO_RECONCILE_OUTCOME": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
+    "VCO_RECONCILE_RUNTIME": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
+    "VCO_RECONCILE_DETAIL": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
+    "VCO_LC_CONTAINER": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_LC_ON_MISSING": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_LC_ON_STOPPED": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_LC_ON_ZOMBIE": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_LC_SERVICE": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
+    "VCO_WEAVIATE_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
+    "VCO_OLLAMA_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
+    "VCO_CODE_EMBED_PORT": "assigned by the eval'd service_lifecycle plan (the row's port); verify-container-ports unsets it before the eval, so user env is never read",
+    # --- v0.2.97 SE-3: caller → boot-wrapper handoffs (the launcher, the hub
+    # --- watchdog and the session hook set them for ONE wrapper run; the
+    # --- same kind of plumbing as VCT_STACK_WORKING_DIR).
+    "VCO_COMPOSE_SERVICES": "caller → launch-claude-mcp-stack service-list handoff (launcher lifecycle, hub watchdog); intersected with the VCO-managed rows, never a user knob",
+    "VCT_STACK_BUILD": "session hook → launch-claude-mcp-stack `--build` handoff (set only while creating the code_embed container)",
     # --- test-only / diagnostic sentinels
     "VCO_HOOK_TRACE": "debug trace flag for pre-edit-context-inject",
     "VCO_LOG_LEVEL": "internal logging verbosity (vco_lib.log_setup)",
     "VCT_DISABLE_HUB_RESOLVER": "diagnostic kill-switch bypassing the hub config resolver",
     "VCT_HOOK_LEAK_PROBE": "leak-probe sentinel in post-tool-security",
     "VCT_HUB_ALLOW_TEST_POST": "test-only sentinel in the rl hub writer",
+    "VCO_SESSION_RECONCILE_ARGV": "test-only seam: replaces the session-reconcile command in vco_lib.service_lifecycle (the real one probes the canonical ports); pinned suite-wide by tests/conftest.py",
     "VCT_MANIFEST_SANITIZER_BYPASS": "test/CI bypass for the module-manifest sanitizer",
     "VCT_PORT_WATCHDOG_VERBOSE": "verbosity flag for the port-watchdog hook",
     "VCT_SKIP_PORT_WATCHDOG": "CI kill-switch for the port-watchdog hook",
@@ -334,9 +356,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCT_REBIND_ADMIN_TOKEN_URL": "staging/endpoint override for paid-module infrastructure; operator-only",
     "VCT_RL_LATEST_VERSION_URL": "staging/endpoint override for paid-module infrastructure; operator-only",
     "VCT_RL_LATEST_WEIGHTS_URL": "staging/endpoint override for paid-module infrastructure; operator-only",
-    "VCT_WEAVIATE_URL": "launcher-side Weaviate URL probe; the documented user channel is WEAVIATE_URL",
-    "VCT_GRPC_PORT": "hub-side gRPC port probe (vct-hub config_api); the documented user channel is GRPC_PORT",
-    "VCT_OLLAMA_URL": "hub-side Ollama URL probe (vct-hub config_api); the documented user channel is OLLAMA_URL",
     "VCT_HUB_BUILD_FINGERPRINT": "compile-time build fingerprint injected by release CI and read via option_env!; build plumbing",
     "VCT_TEST_LIVE_KEYCHAIN": "test-only gate for the live-keychain smoke (default cargo test no-ops without it)",
     # --- repo-maintainer tooling (scripts/, not a shipped user surface)

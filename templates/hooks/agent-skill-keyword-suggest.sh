@@ -3,8 +3,10 @@
 # prompt for keywords declared in agents'/skills' `keywords:` frontmatter
 # and injects a short suggestion as additionalContext.
 #
-# Filesystem contract: the hook globs `.claude/agents/*.md` and
-# `.claude/skills/*/SKILL.md`. That is the entire source of truth. The
+# Filesystem contract: the hook globs `.claude/agents/*.md`,
+# `.claude/skills/*/SKILL.md`, and — on main-loop invocations, which do not
+# pass --skills-only — `.claude/workflows/*.mjs|*.js`. That is the entire
+# source of truth. The
 # launcher's "disable agent/skill" toggle moves the file to a SIBLING
 # `.claude/agents.disabled/` / `.claude/skills.disabled/` directory, so
 # disabled files naturally fall outside this glob — no DB lookup needed.

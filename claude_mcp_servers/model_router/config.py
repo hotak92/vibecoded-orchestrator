@@ -68,6 +68,18 @@ Environment knobs (all optional; every one is read by code in this package)
     knob decides what is ADVERTISED, never what the gateway will answer to.
     An unrecognised value is an error at startup
     (:func:`resolve_window_rows`), for the reason given just above.
+``VCT_MODEL_GATEWAY_PICKER_USAGE``
+    Whether a vendor row's ``/model`` picker label carries its
+    subscription's usage, e.g. ``glm-5.3 · Z.ai subscription · 1M ctx · 5h
+    10% · wk 72% used``: :data:`PICKER_USAGE_ON` (the default) or
+    :data:`PICKER_USAGE_OFF` for clean labels — ``off`` also means
+    ``/v1/models`` never schedules a usage refresh. ``1``/``true``/``yes``
+    and ``0``/``false``/``no`` are accepted as the same two answers. Unlike
+    the two enums above, an unrecognised value does NOT refuse startup: it is
+    the one knob here that changes only TEXT, and a daemon that will not
+    start takes every chat routed through it down with it. It WARNs, names
+    the valid values, and runs with the default — and ``/health`` reports the
+    mode actually in force as ``picker_usage``, so the typo is visible.
 ``VCT_MODEL_GATEWAY_CATALOG_TTL`` / ``VCT_MODEL_GATEWAY_STATIC_RETRY_TTL`` /
 ``VCT_MODEL_GATEWAY_KEY_TTL``
     Cache lifetimes in seconds. Present so the smoke tests can drive the
@@ -97,6 +109,7 @@ Environment knobs (all optional; every one is read by code in this package)
 
 from __future__ import annotations
 
+import logging
 import os
 import socket
 from dataclasses import dataclass, field
@@ -127,6 +140,20 @@ from .catalog import (
 # that owns every ``VCT_MODEL_GATEWAY_*`` env read — re-exports it so the
 # knob's default and its reader cannot drift apart.
 from .secrets import DEFAULT_SERVE_STALE_MAX_AGE_S
+
+logger = logging.getLogger(__name__)
+
+#: Picker labels carry each vendor subscription's usage (the default).
+PICKER_USAGE_ON = "on"
+#: Clean picker labels, and no usage refresh scheduled by ``/v1/models``.
+PICKER_USAGE_OFF = "off"
+PICKER_USAGE_MODES = (PICKER_USAGE_ON, PICKER_USAGE_OFF)
+DEFAULT_PICKER_USAGE = PICKER_USAGE_ON
+#: The boolean spellings a shell user types first, mapped to the two modes.
+_PICKER_USAGE_ALIASES = {
+    "1": PICKER_USAGE_ON, "true": PICKER_USAGE_ON, "yes": PICKER_USAGE_ON,
+    "0": PICKER_USAGE_OFF, "false": PICKER_USAGE_OFF, "no": PICKER_USAGE_OFF,
+}
 
 #: Documented in CLAUDE.md as the model-router port. The field prototype ran
 #: on 8787; the shipped daemon uses the documented port and the collision with
@@ -445,6 +472,31 @@ def resolve_window_rows() -> str:
     return raw
 
 
+def resolve_picker_usage() -> str:
+    """Whether picker labels carry subscription usage: ``on`` or ``off``.
+
+    Unset or empty is the default. An unrecognised value WARNs and runs with
+    the default instead of refusing to start — the deliberate exception to
+    :func:`resolve_catalog_filter`'s rule, because this knob changes label
+    text only and the gateway must never cause a chat failure over a label.
+    The warning names the valid values, and ``/health`` reports the mode in
+    force, so the typo is not silent.
+    """
+    raw = (os.environ.get("VCT_MODEL_GATEWAY_PICKER_USAGE") or "").strip().lower()
+    if not raw:
+        return DEFAULT_PICKER_USAGE
+    if raw in PICKER_USAGE_MODES:
+        return raw
+    if raw in _PICKER_USAGE_ALIASES:
+        return _PICKER_USAGE_ALIASES[raw]
+    logger.warning(
+        "model-gateway: VCT_MODEL_GATEWAY_PICKER_USAGE=%r is not a picker-usage "
+        "mode; using %r. Use one of: %s (or 1/true/yes, 0/false/no).",
+        raw, DEFAULT_PICKER_USAGE, ", ".join(PICKER_USAGE_MODES),
+    )
+    return DEFAULT_PICKER_USAGE
+
+
 class HostNotLoopbackError(ValueError):
     """A non-loopback bind address was requested."""
 
@@ -547,6 +599,9 @@ class GatewayConfig:
     #: ``/health`` for the same reason — "why is there only one Opus row?"
     #: should be answerable without knowing the knob exists.
     window_rows: str = DEFAULT_WINDOW_ROWS
+    #: Whether vendor picker labels carry subscription usage. Read by
+    #: :func:`model_router.server.models_handler`; reported in ``/health``.
+    picker_usage: str = DEFAULT_PICKER_USAGE
 
     @classmethod
     def from_env(cls, *, token: str = "") -> "GatewayConfig":
@@ -576,6 +631,7 @@ class GatewayConfig:
             ),
             catalog_filter=resolve_catalog_filter(),
             window_rows=resolve_window_rows(),
+            picker_usage=resolve_picker_usage(),
         )
 
 
@@ -592,6 +648,11 @@ __all__ = [
     "WINDOW_ROWS_ONE_M_ONLY",
     "WindowRowsError",
     "resolve_window_rows",
+    "DEFAULT_PICKER_USAGE",
+    "PICKER_USAGE_MODES",
+    "PICKER_USAGE_OFF",
+    "PICKER_USAGE_ON",
+    "resolve_picker_usage",
     "DEFAULT_CATALOG_TTL_S",
     "DEFAULT_HOST",
     "DEFAULT_KEY_TTL_S",

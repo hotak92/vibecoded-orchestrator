@@ -27,6 +27,12 @@
 //!                                        auto-start unit; idempotent
 //!   vct-hub --boot-status              → report the boot autostart state
 //!                                        (enabled / disabled / not-installed)
+//!   vct-hub --ensure-db                → create + migrate launcher.db through
+//!                                        the one sanctioned creator
+//!                                        (`Db::open`), then exit. Starts no
+//!                                        server, claims no lockfile. Used by
+//!                                        install.py before the first
+//!                                        `service_endpoints` write (v0.2.97).
 //!
 //! The boot sub-commands dispatch to `boot::run_*` (see `boot.rs`), which
 //! renders + writes the per-OS init artifact. Boot autostart is DEFAULT-OFF
@@ -57,6 +63,10 @@ pub enum Command {
     /// `--boot-status`. Report whether boot autostart is
     /// enabled / disabled / not-installed.
     BootStatus,
+    /// `--ensure-db`. Create/migrate launcher.db and exit — no server, no
+    /// lockfile, no port file (v0.2.97: the headless schema step install.py
+    /// runs before Python writes the first `service_endpoints` row).
+    EnsureDb,
     /// `--help` / `-h`. Print usage on stdout and exit 0.
     Help,
     /// Unrecognised argv shape. The caller should print usage to stderr
@@ -80,6 +90,7 @@ pub fn parse_args(args: &[String]) -> Command {
         "--register-boot" => Command::RegisterBoot,
         "--unregister-boot" => Command::UnregisterBoot,
         "--boot-status" => Command::BootStatus,
+        "--ensure-db" => Command::EnsureDb,
         "--foreground" => Command::Foreground,
         "--help" | "-h" => Command::Help,
         _ => Command::Usage,
@@ -123,13 +134,48 @@ Usage:
   vct-hub --boot-status        Print the boot autostart state on stdout.
                                Exits 0 enabled, 1 disabled, 2 not-installed,
                                3 inspection error.
+  vct-hub --ensure-db          Create launcher.db if absent and apply every
+                               pending schema migration, then exit. Starts
+                               no server and writes no hub.pid / hub.port.
+                               Prints a JSON object (db_path, schema_version)
+                               on stdout. Exits 0 on success, 1 on error.
   vct-hub --help               Show this banner.
 
 Environment:
   VCT_STATE_DIR  Override the launcher state-root (default: ~/.vct/).
                  Affects hub.pid, hub.port, hub.token, etc.
-  VCT_HUB_PORT   Bind port (default: 7700).
+  VCT_HUB_PORT   Bind port. Overrides the vct-hub-api module's global
+                 VCT_HUB_PORT setting (launcher.db); default 7700.
 "
+}
+
+/// What `--ensure-db` did: the DB it opened and the schema version it left.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct EnsureDbReport {
+    pub db_path: String,
+    pub schema_version: u32,
+}
+
+/// `vct-hub --ensure-db`: open `<vct root>/launcher.db` through
+/// `Db::open` — which creates the file, applies every pending migration and
+/// runs the same open-time housekeeping the hub and the launcher run — and
+/// report the resulting schema version. Deliberately NOT a Python
+/// `executescript` of the migration files: the Rust runner and its
+/// `_schema_migrations` ledger stay the schema's only owner.
+pub fn ensure_db() -> Result<EnsureDbReport, String> {
+    let db = vct_launcher_core::db::Db::open()?;
+    let schema_version: u32 = db
+        .lock()
+        .query_row(
+            "SELECT COALESCE(MAX(version), 0) FROM _schema_migrations",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("read schema version: {}", e))?;
+    Ok(EnsureDbReport {
+        db_path: vct_launcher_core::db::db_path().display().to_string(),
+        schema_version,
+    })
 }
 
 #[cfg(test)]
@@ -174,6 +220,12 @@ mod tests {
     }
 
     #[test]
+    fn ensure_db_recognised() {
+        assert_eq!(parse(&["--ensure-db"]), Command::EnsureDb);
+        assert_eq!(parse(&["--ensure-db", "extra"]), Command::Usage);
+    }
+
+    #[test]
     fn help_long_and_short() {
         assert_eq!(parse(&["--help"]), Command::Help);
         assert_eq!(parse(&["-h"]), Command::Help);
@@ -201,6 +253,7 @@ mod tests {
             "--register-boot",
             "--unregister-boot",
             "--boot-status",
+            "--ensure-db",
             "--foreground",
             "--help",
             "VCT_STATE_DIR",

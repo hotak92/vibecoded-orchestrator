@@ -89,16 +89,40 @@ function Get-AccessStateDir {
     return (Join-Path $HOME ".vct")
 }
 
+# A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
+# through to hub.port, then 7700 (v0.2.97 owner ruling). MUST MATCH
+# `vct_project_config.ps1::ConvertTo-HubPort` / `Get-HubPort` (which also
+# warns) and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every
+# client by `tests/test_v0297_hub_port_clients.py`.
+function ConvertTo-HubPort {
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # `\d` is NOT used: .NET matches every Unicode numeral with it, and the
+    # `[long]` cast of such a value then THREW under `$ErrorActionPreference =
+    # 'Stop'` — this function must never throw. `-cmatch` + `\z` pin an
+    # ASCII-only, whole-string match (`$` would also accept a trailing LF).
+    param([string]$Value)
+    if ($null -eq $Value) { return $null }
+    $v = $Value.Trim([char[]]@([char]32, [char]9, [char]10, [char]11, [char]12, [char]13))
+    if ($v -cmatch '\A[0-9]{1,5}\z') {
+        $n = [int]::Parse($v, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($n -ge 1 -and $n -le 65535) { return $n }
+    }
+    return $null
+}
+
 function Get-AccessHubPort {
     if ($Env:VCT_HUB_PORT) {
-        try { return [int]$Env:VCT_HUB_PORT } catch { }
+        $fromEnv = ConvertTo-HubPort $Env:VCT_HUB_PORT
+        if ($null -ne $fromEnv) { return $fromEnv }
     }
     $portFile = Join-Path (Get-AccessStateDir) "hub.port"
     if (Test-Path $portFile) {
-        try {
-            $raw = (Get-Content -LiteralPath $portFile -Raw -ErrorAction Stop).Trim()
-            if ($raw -match '^[0-9]+$') { return [int]$raw }
-        } catch { }
+        $raw = $null
+        try { $raw = Get-Content -LiteralPath $portFile -Raw -ErrorAction Stop } catch { }
+        $fromFile = ConvertTo-HubPort $raw
+        if ($null -ne $fromFile) { return $fromFile }
     }
     return 7700
 }

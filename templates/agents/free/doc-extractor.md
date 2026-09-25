@@ -5,7 +5,7 @@ short_desc: extract knowledge from docs into structured reports
 keywords: ["scattered documentation", "extraction report", "knowledge extraction", "consolidate documentation", "documentation extraction", "extract from documentation", "summarize docs", "documentation review", "knowledge consolidation"]
 tools: Read, Write, Edit, Glob, Grep, Bash, WebFetch
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Document Extractor Agent

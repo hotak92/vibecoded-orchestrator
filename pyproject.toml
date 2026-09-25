@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "vibecoded-orchestrator"
-version = "0.2.96"
+version = "0.2.97"
 description = "VibeCoded Orchestrator — local-first agentic infrastructure for Claude Code"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -59,7 +59,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Full MCP server stack — required for weaviate-kg, search, ollama MCPs
+# Full MCP server stack — required for the weaviate-kg and search MCPs
 # and for the diagram indexer's Weaviate-backed path. Mirrors
 # requirements.txt; kept loose-pinned here so the optional install
 # resolves cleanly with whatever requirements.txt has nailed down.

@@ -337,10 +337,14 @@ class WrapperRootPinningTests(unittest.TestCase):
         (self.foreign / "knowledge").mkdir(parents=True)
 
     def _run_wrapper(self, extra_env: dict) -> subprocess.CompletedProcess:
-        env = _base_env(VCT_INSTALL_ROOT=str(self.install_root), **extra_env)
+        env = _base_env(**extra_env)
+        # Deliberate opt-out of child_env's VCT_INSTALL_ROOT pin: the
+        # fixture install root holds the fake venv the wrapper's ladder must
+        # resolve (an override is how child_env takes a chosen value).
         return subprocess.run(
             ["bash", str(self.wrapper), "--all"],
-            env=child_env(env), capture_output=True, text=True, timeout=90,
+            env=child_env(env, VCT_INSTALL_ROOT=str(self.install_root)),
+            capture_output=True, text=True, timeout=90,
         )
 
     def test_fabio_repro_wrapper_tree_wins_over_leaked_kg_base_dir(self) -> None:

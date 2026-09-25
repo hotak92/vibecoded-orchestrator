@@ -8,6 +8,7 @@
 //! launcher and hub both depend on this crate via path dependencies in
 //! their respective Cargo.toml.
 
+pub mod bundled_manifests;
 pub mod bundled_versions;
 // v0.2.92 WP-13: the ONE "what did this probe establish?" shape —
 // `Ok | NotApplicable | Unknown{error}`. Replaces the `*_ok: bool` +
@@ -53,6 +54,17 @@ pub mod manifest;
 // `vco_lib/mcp_scan_rules.toml` (one home for the rule DATA). Rust embeds
 // the .toml at compile time via `include_str!`; Python parses the same file.
 pub mod mcp_scan_rules;
+// v0.2.97 (review R6 round 2): the `requirements.depends_on` reader — one home
+// for the install/update/enable gate and validate-manifest's known-id rule.
+pub mod module_deps;
+pub mod module_setting_bindings;
+pub mod module_settings_schema;
+// v0.2.97 (lane V): the one reader of `runtime.env_from_settings` — the
+// settings a spawned module process receives.
+pub mod module_settings_env;
+// v0.2.97 (lane V round 2): the one reader of `runtime.env_from_secrets` and the
+// permission-gated lookup of a module-declared secret (shared with the hub's /env).
+pub mod module_secrets_env;
 pub mod orchestrator_manifest;
 pub mod paths;
 pub mod process;

@@ -62,12 +62,8 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use tauri::{command, State};
 
-use crate::config::LocalConfig;
 use crate::db::Db;
-use crate::mcp_registration::{
-    register_default_orchestrator_mcps, user_claude_json, DEFAULT_CODE_EMBED_PORT,
-    DEFAULT_GRPC_PORT, DEFAULT_OLLAMA_PORT, DEFAULT_WEAVIATE_PORT, ServicePorts,
-};
+use crate::mcp_registration::{register_default_orchestrator_mcps, user_claude_json};
 use vct_launcher_core::process::CommandExt as _;
 
 /// Consent-token TTL for `run_schema_migrations`. Tokens issued by the
@@ -509,16 +505,10 @@ pub async fn rerun_mcp_registration(
     }
     let install_path = PathBuf::from(&install_root);
 
-    // We don't currently re-read user-overridden ports from app_state;
-    // the canonical defaults match what the installer wrote into the
-    // entries originally. A future PR can wire user-overridden ports
-    // here if a user changes them post-install.
-    let ports = ServicePorts {
-        weaviate_port: DEFAULT_WEAVIATE_PORT,
-        ollama_port: DEFAULT_OLLAMA_PORT,
-        grpc_port: DEFAULT_GRPC_PORT,
-        code_embed_port: DEFAULT_CODE_EMBED_PORT,
-    };
+    // v0.2.97: the machine's `service_endpoints` rows — the same values the
+    // installer's registration writes. (This used the compiled defaults, so
+    // a repair re-registered an adopted or moved service at 8081 / 11435.)
+    let ports = crate::mcp_registration::machine_service_ports();
 
     let report = register_default_orchestrator_mcps(
         &install_path,
@@ -631,18 +621,11 @@ const TEMPORAL_PROPS: &[&str] = &["created", "updated", "valid_from", "valid_unt
 /// the source-of-truth constant.
 const DEFAULT_SHARED_KG_CLASS: &str = "VibeCodedOrchestrator_KnowledgeGraph";
 
-fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.weaviate_url.clone()
+/// The machine row (`service_endpoints::machine_weaviate_url`, v0.2.97) —
+/// this was a private copy that never saw an adopted external Weaviate. No
+/// endpoint env var is read (the launcher is machine-scoped).
+fn resolve_weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 fn parse_schema_response(
@@ -721,10 +704,9 @@ fn parse_schema_response(
 
 #[command]
 pub async fn schema_migration_status(
-    cfg: State<'_, LocalConfig>,
     db: State<'_, Db>,
 ) -> Result<SchemaMigrationStatusReport, String> {
-    let base = resolve_weaviate_url(&cfg);
+    let base = resolve_weaviate_url(&db);
     // v0.2.49 access-matrix Phase 2 (item #7, S-1) — read the
     // persisted canonical name from `app_state` (Step A migration 028)
     // instead of the hardcoded constant. White-label installs override
@@ -737,10 +719,7 @@ pub async fn schema_migration_status(
         .get_orchestrator_root_kg_collection()
         .unwrap_or_else(|_| DEFAULT_SHARED_KG_CLASS.to_string());
 
-    let client = match reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, Duration::from_secs(5)) {
         Ok(c) => c,
         Err(_) => {
             return Ok(SchemaMigrationStatusReport {
@@ -915,7 +894,6 @@ fn run_migration_script(
 #[command]
 pub async fn run_schema_migrations(
     consent_token: String,
-    cfg: State<'_, LocalConfig>,
     db: State<'_, Db>,
 ) -> Result<SchemaMigrationReport, String> {
     // Validate the consent token (and remove it — single-use).
@@ -944,7 +922,7 @@ pub async fn run_schema_migrations(
         );
     }
     let install_path = PathBuf::from(&install_root);
-    let weaviate_url = resolve_weaviate_url(&cfg);
+    let weaviate_url = resolve_weaviate_url(&db);
 
     let mut outcomes = Vec::new();
     outcomes.push(run_migration_script(

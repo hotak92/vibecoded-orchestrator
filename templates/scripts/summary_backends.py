@@ -1227,7 +1227,8 @@ def call_api(prompt: str) -> str:
 # Backend: OpenAI API (v0.2.23 C10 — gated by `kg_summary_openai_consent`)
 # ──────────────────────────────────────────────────────────────────────
 def openai_available() -> bool:
-    """Return True if an `OPENAI_API_KEY` env var is set.
+    """Return True if an OpenAI key is configured (`OPENAI_API_KEY`, else the
+    stored `openai_api_key` secret — :func:`_openai_api_key`).
 
     The actual gating (consent + key) is composed by `select_backend`
     — this just answers "is a key present at all". The consent check
@@ -1235,7 +1236,52 @@ def openai_available() -> bool:
     "no key" from "key present but consent withheld" (the latter is
     actionable; the former just means OpenAI isn't an option).
     """
-    return bool(os.getenv("OPENAI_API_KEY", "").strip())
+    return bool(_openai_api_key())
+
+
+# v0.2.97: resolved, not only read from the environment. The key's home is
+# the `openai_api_key` secret (launcher keychain → ~/.vct-secrets → the
+# project's own .env); `install.py --openai-key` stores it there and never
+# in `.env`. This script cannot import `vco_lib` (see `_save_breaker_file`),
+# so it asks the SHIPPED resolver next to it — `vct_secrets_resolve.sh`
+# (`.ps1` on Windows), the sibling of `vco_lib.openai_key` /
+# `vco_lib.agent_secrets.get` — once per process.
+_OPENAI_SECRET_NAME = "openai_api_key"  # must match vco_lib.openai_key.OPENAI_SECRET_NAME
+_openai_key_cache: list[str] = []
+
+
+def _resolve_secret_via_shipped_resolver(key: str) -> str:
+    """The value the shipped resolver prints for ``key`` (stdout, exit 0), or
+    ``""``. The value stays in this process: never logged, never in argv."""
+    here = Path(__file__).resolve().parent
+    project = os.environ.get("KG_PROJECT_ROOT", "").strip() or os.getcwd()
+    if os.name == "nt":
+        shell = shutil.which("pwsh") or shutil.which("powershell")
+        script = here / "vct_secrets_resolve.ps1"
+        argv = [shell, "-NoProfile", "-File", str(script), project, key] if shell else None
+    else:
+        shell = shutil.which("bash")
+        script = here / "vct_secrets_resolve.sh"
+        argv = [shell, str(script), project, key] if shell else None
+    if argv is None or not script.is_file():
+        return ""
+    import subprocess
+
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout.strip() if done.returncode == 0 else ""
+
+
+def _openai_api_key() -> str:
+    """``$OPENAI_API_KEY`` when set, else the resolved ``openai_api_key``."""
+    env = os.getenv("OPENAI_API_KEY", "").strip()
+    if env:
+        return env
+    if not _openai_key_cache:
+        _openai_key_cache.append(_resolve_secret_via_shipped_resolver(_OPENAI_SECRET_NAME))
+    return _openai_key_cache[0]
 
 
 def _read_app_state_value(key: str) -> "str | None":
@@ -1310,9 +1356,12 @@ def call_openai(prompt: str) -> str:
     gpt-4o, gpt-4.1-mini, …) is a chat model. System + user messages
     are sent in the standard two-turn shape.
     """
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = _openai_api_key()
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY is not set")
+        raise RuntimeError(
+            "no OpenAI key: OPENAI_API_KEY is not set and the `openai_api_key` "
+            "secret is not stored"
+        )
     model = _openai_model()
     payload = json.dumps(
         {

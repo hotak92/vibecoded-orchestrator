@@ -50,34 +50,32 @@ The envelope is also useful as a diagnostic artifact: when reporting an install 
 
 ## `.env` template management
 
-Both `install.py` Step 9 and the launcher's `create_project_v2` Tauri command call `ensure_project_env_template` (Python: `_ensure_env_template`; Rust: `ensure_project_env_template`) on the project root. The behaviour is:
-
-- **`.env` missing** → write a fresh canonical template with all known keys. Active keys (`KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_COLLECTION`) get values substituted from the project name. Optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`) stay commented out.
-- **`.env` exists** → diff against the canonical key list. Any keys not yet present (commented or active) get appended in a marked block tagged `# added by vco YYYY-MM-DD`. The user's existing values are preserved verbatim — never overwritten.
-- **Idempotent** — a second invocation against an up-to-date file is a no-op.
-
-The Python and Rust canonical key lists are kept in lockstep by the cross-language test `env_template_canonical_keys_match_python` (in `commands/projects_v2.rs`). When you add a new key, update both `list_canonical_env_template_keys` (`vco_lib/env_template.py`, the Python authority) AND `env_canonical_keys` (projects_v2.rs).
-
-Canonical keys:
+A project's `.env` has ONE writer, `vco_lib.env_template` (v0.2.97). The launcher's `create_project_v2` runs `python -m vco_lib.env_template apply` on the project root; `install.py` Step 9 (and `--update`) writes the orchestrator root's `.env` through the same function, via `vco_lib.install_env`. VCO owns only the block between the markers:
 
 ```
-# Service URLs (commented; launcher writes resolved values into .claude/settings.json)
-WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL
+# >>> VCO-MANAGED ENV (do not edit between markers) >>>
+# added by vco — KG_COLLECTION=Acme_KnowledgeGraph
+KG_COLLECTION=Acme_KnowledgeGraph
+...
+# <<< VCO-MANAGED ENV <<<
+```
 
-# Per-project Weaviate collections (active; filled at create time)
-KG_COLLECTION, SHARED_KG_COLLECTION, DEVELOPMENT_COLLECTION, PROJECT_NAME
+- **`.env` missing** → a new file: commented placeholders for the optional keys (LLM API keys, `GITHUB_TOKEN`, RL module URLs, `VCT_TELEMETRY`), then the managed block. For the orchestrator root the new file starts with the install-time keys instead (`EMBEDDING_MODEL`, `CODE_EMBED_*`, `EMBEDDING_PROVIDER`, `VCT_TELEMETRY`, …).
+- **`.env` exists** → the managed block is replaced in place (or appended once, when the file has none). Everything outside the markers is preserved byte-for-byte, and **a key you assign outside the block is never rendered inside it** — your line is that key's only assignment, wherever it sits. A commented `# KEY=` line sets nothing, so it does not suppress the managed value.
+- **Legacy lines** written by pre-v0.2.97 VCO (`# added by vco YYYY-MM-DD: appended missing canonical keys`, the old template's `# === Service URLs …` / `# === Per-project Weaviate collections ===` sections, `# --- Added by install.py --update on … ---`) are folded into the block: their lines for keys the block now carries are removed, so each key ends up assigned once. A folded line whose value differed from VCO's is kept outside the block as `<KEY>_old=<value>` (`_old2`, … when that name is taken; never overwritten, never duplicated), with the key name recorded in `.claude/logs/auto-resolutions.jsonl` and one comment line above them (written once); secret-looking keys are never folded.
+- **Unregistering the project** removes only what VCO wrote to `.env`: the block, the legacy sections above, that comment, and VCO's header at the top of a `.env` it created (only while the header is unedited). A key you assign on your own line, your `<KEY>_old` values and any `# KEY=` comment stay, and the unregister result names the keys. The same rule covers `.claude/env` (VCO's marked block goes whole) and the `env` blocks of `.claude/settings.json` / `.vscode/settings.json`: outside a marked block, a routing key goes only when it holds the value VCO writes for the project.
+- **Safe add** → the live `.env` is never touched; `python -m vco_lib.env_template reference` writes what a new `.env` would hold to `.env.vco.reference` instead.
+- **Idempotent** — a second run against an up-to-date file writes nothing.
+- The orchestrator root's refresh (`install.py` re-install / `--update`) is fill-only: it adds keys to the block but never changes a value already there.
 
-# LLM API keys (commented)
-ANTHROPIC_API_KEY, OPENAI_API_KEY
+Keys the managed block carries (`list_canonical_env_template_keys`):
 
-# GitHub access for search-mcp wrapper (commented)
-GITHUB_TOKEN
-
-# RL retrieval module — Pro tier (commented)
-RL_SERVER_URL, RL_SERVER_PORT, RL_PROJECT_ROOT
-
-# Telemetry (commented; opt-in only)
-VCT_TELEMETRY
+```
+PROJECT_NAME, CODE_GRAPH_PROJECT
+KG_COLLECTION, DEVELOPMENT_COLLECTION, SHARED_KG_COLLECTION
+SHARED_KG_WRITE_DISABLED, SHARED_KG_OPT_OUT, SHARED_KG_READ_DISABLED
+ACTIVE_EMBEDDING
+WEAVIATE_URL, WEAVIATE_PORT, OLLAMA_URL, OLLAMA_PORT, CODE_EMBED_URL, CODE_EMBED_PORT
 ```
 
 ## What goes in each file
@@ -85,8 +83,8 @@ VCT_TELEMETRY
 | Config | Lives in | Scope | Managed by |
 |---|---|---|---|
 | Effort level, max tokens, OS-level denies | `~/.claude/settings.json` | global | you, manually |
-| MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's `write_project_env_files` |
-| MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's `write_project_env_files` |
+| MCP env (URLs, collection names, paths) — every Claude Code surface (CLI / Desktop / VS Code extension) AND MCP subprocesses | `.claude/settings.json` → `env` | per-project | launcher's env projection (`python -m vco_lib.config_projection apply`) |
+| MCP env, POSIX shell-sourceable copy (for the `tools/claude` wrapper) | `.claude/env` | per-project | launcher's env projection (`python -m vco_lib.config_projection apply`) |
 | VS Code editor preferences (Pylance excludes, formatOnSave, etc.) | `.vscode/settings.json` | per-project | launcher's Python `_backfill_vscode_excludes_in_project` + you |
 | VS Code `folderOpen` task that ensures `vct-hub` is running | `.vscode/tasks.json` | per-project | install.py Step 8 / `update_project_v2` bundle update |
 | Shell/script env | `.env` | per-project | you, `.env.example` template |
@@ -113,7 +111,7 @@ If you see any of these in your global `~/.claude/settings.json`, move them to t
 Per-project env vars (KG / codegraph / embedding selections, service URLs) flow through a fixed 5-level precedence chain. Higher levels override lower ones; consumers (MCP subprocesses, hooks, install.py, the launcher) all resolve through this chain so the active workspace's identity is consistent:
 
 1. **vct-hub resolved values** (highest precedence). When the hub is running on `http://127.0.0.1:7700` (port configurable via `VCT_HUB_PORT`), MCP startup queries `GET /api/v1/projects/{id}/config` and uses the hub's resolved per-project record from `launcher.db`.
-2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's `write_project_env_files`, read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
+2. **`.claude/settings.json` `env` block**. The canonical per-project channel — written by the launcher's env projection (`python -m vco_lib.config_projection apply`), read by every Claude Code surface (CLI, Desktop app, VS Code extension) and propagated to MCP subprocesses. (`.vscode/settings.json` `claude-code.env` is NOT part of this chain — that surface does not propagate to MCP subprocesses on Linux.)
 3. **`.claude/env`** (POSIX shell-sourceable). Same keys as #2; used by CLI users sourcing it from a shell rc via the `tools/claude` wrapper.
 4. **`~/.claude.json` `mcpServers.<name>.env`**. The launcher intentionally restricts this surface to machine-invariant keys (e.g. `WEAVIATE_URL`); per-project keys like `KG_COLLECTION` are dropped here. See `launcher/src-tauri/src/mcp_registration.rs::ALLOWED_ENV_KEYS`.
 5. **Bundled defaults** baked into `claude_mcp_servers/weaviate_mcp/server.py` (lowest precedence). Reaching this layer is logged at WARNING level. Explicit empty-string env values for `KG_COLLECTION` are coerced to the default rather than used literally.
@@ -127,29 +125,32 @@ The chain above resolves **per-project** values. The Weaviate *instance* is not 
 | Concern | Scope | Resolved by |
 |---|---|---|
 | **Collection** — `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, the code-graph prefix | **per-project** | the 5-level chain above (hub → `.claude/settings.json` → `.claude/env` → `~/.claude.json` → bundled default) |
-| **Instance** — which Weaviate server is addressed at all | **machine-global** | `WEAVIATE_URL` → `WEAVIATE_PORT` → `http://localhost:8081` |
+| **Instance** — which Weaviate server is addressed at all | **machine-global** | the `service_endpoints` row in `launcher.db` (v0.2.97), projected into every project as `WEAVIATE_URL` + `WEAVIATE_PORT` |
 
 There is deliberately no per-project instance override. `project_kg_bindings` carries a `weaviate_url` column, but no resolver reads it — it is preserved across writes and nothing more (stated in source at `launcher/src-tauri/src/commands/binding_reconcile.rs`). Two projects on one machine are isolated by **collection namespace**, not by separate servers.
 
-**Precedence, and why it is not "env overriding the database".** `WEAVIATE_URL` wins over `WEAVIATE_PORT` even when their ports disagree — a full URL names scheme, host *and* port, so rewriting its port from a bare port variable would make `WEAVIATE_URL` unable to mean what it says. At either level, empty or whitespace-only is treated as **unset**, not as a literal (a `.env` written on Windows and sourced on Linux carries a trailing `\r`). A non-numeric `WEAVIATE_PORT` is interpolated anyway rather than discarded, so a typo fails loudly at connect instead of quietly resolving back to 8081 and addressing whatever else is on the canonical port. Reading these variables does not compete with the launcher's database: `vco_lib/config_projection.py` writes the DB-resolved port *out* as `WEAVIATE_URL` **and** `WEAVIATE_PORT` together, so they are the transport of that value, one hop later.
+**Precedence, and why it is not "env overriding the database".** `WEAVIATE_URL` wins over `WEAVIATE_PORT` even when their ports disagree — a full URL names scheme, host *and* port, so rewriting its port from a bare port variable would make `WEAVIATE_URL` unable to mean what it says. At either level, empty or whitespace-only is treated as **unset**, not as a literal (a `.env` written on Windows and sourced on Linux carries a trailing `\r`). A non-numeric `WEAVIATE_PORT` is interpolated anyway rather than discarded, so a typo fails loudly at connect instead of quietly resolving back to 8081 and addressing whatever else is on the canonical port. Reading these variables does not compete with the launcher's database: `vco_lib/config_projection.py` writes the row-resolved endpoint *out* as `WEAVIATE_URL` **and** `WEAVIATE_PORT` together, so they are the transport of that value, one hop later.
 
 **Before v0.2.96 the port variable was declared but unread** by everything except `install.py`'s own hand-written copies. On a relocated Weaviate that meant the rest of the install addressed `localhost:8081` — the *other* instance — and on the retrieval path the symptom was not an error but an empty result set. Since v0.2.96 the precedence lives in one home (`vco_lib/weaviate_helpers.py::weaviate_url_default`) that every Python call-site reaches; the MCP server keeps a deliberate copy because it must boot on half-installed environments where importing `vco_lib` fails, and a parity test executes that copy against the shared helper so the two cannot drift.
 
-**One scope caveat worth knowing when you relocate Weaviate**: the launcher's own Rust-side config resolver reads `WEAVIATE_URL` (plus one launcher-internal alias of it), but **not** `WEAVIATE_PORT`, and its Services-card liveness probe uses the compiled canonical port. Set `WEAVIATE_URL` — not `WEAVIATE_PORT` alone — if you want every surface to follow. Running two orchestrator installs with genuinely separate stacks is `VCT_FORCE_SEPARATE_CONTAINERS=1` plus the port overrides; see [`features/05-install-and-secrets.md`](features/05-install-and-secrets.md).
+**Where the written value comes from (v0.2.97).** The value the projection writes, and the ones the hub's `/config` and the MCP registration serve, come from ONE place: the `service_endpoints` table in `launcher.db` (migration 047). One row per core service (`weaviate`, `ollama`, `code_embed`) records the **mode** (`vco_managed` — VCO's compose owns the container; `adopted_container` — someone else's container, which VCO starts and stops **by name only** and never removes or recreates; `adopted_external` — a URL, native process or remote host, over which VCO has no lifecycle), the scheme/host/port (plus `grpc_port` for Weaviate), the container identity and the data-mount identity. `vco_lib/service_endpoints.py` is the only writer; the hub, the launcher, the projection and the MCP registration read the rows (Rust side: `vct-launcher-core/src/db/service_endpoints.rs` + `services/service_endpoints.rs`; the ~20-line row→URL render is the one cross-language mirror, pinned by `tests/fixtures/service_endpoint_parity.json`). When no row exists — first boot before install finishes, or a broken install — the render answers the compiled defaults (Weaviate 8081/50052, Ollama 11435, code-embed 11440) and logs a WARNING once. `WEAVIATE_URL` is deliberately not an input — it is the resolver's output, and reading it back would re-project a stale value.
+
+The inputs this chain replaced are **retired**: `VCT_WEAVIATE_URL` / `VCT_OLLAMA_URL` / `VCT_GRPC_PORT`, the `weaviate_url` key in `vct-config.toml`, `~/.vct/services.toml`, and the `*.port_override` launcher settings were imported into the rows once on the first v0.2.97 update and are no longer read by any resolver (`services.toml` is renamed `services.toml.migrated-v0297`, never deleted). `vco doctor` warns while a retired variable is still exported. To point every surface at a different endpoint, change the row — the launcher's Services page ("Change…"), `python -m vco_lib.service_endpoints adopt|use-vco-copy|move`, or `install.py --service <svc>=adopt:container:<name>|adopt:url:<url>|vco[:<port>]` — and every registered project is re-projected and the MCP registration refreshed as part of the same change. Running two orchestrator installs with genuinely separate stacks is `VCT_FORCE_SEPARATE_CONTAINERS=1` plus per-install ports chosen through `--service <svc>=vco:<port>`; see [`features/05-install-and-secrets.md`](features/05-install-and-secrets.md).
 
 | Var | Default | Effect |
 |---|---|---|
-| `WEAVIATE_URL` | unset | Complete base URL of the Weaviate server, used verbatim. Highest precedence; also the variable the launcher's own resolver honours. |
-| `WEAVIATE_PORT` | `8081` | Port on `localhost`, used only when `WEAVIATE_URL` is unset. Read by every Python call-site since v0.2.96. |
-| `OLLAMA_URL` | `http://localhost:11435` | Ollama base URL (embeddings + the local KG-summary tier). |
-| `OLLAMA_PORT` | `11435` | Host port for the Ollama container, consumed by `infrastructure/docker-compose.yml` and the install-time port probes. |
-| `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | Code-embedding service base URL (see [Embedding configuration](#embedding-configuration)). |
-| `CODE_EMBED_PORT` | `11440` | Host port for the code-embed container, read directly by `infrastructure/docker-compose.yml`. |
-| `WEAVIATE_GRPC_PORT` | `50052` | Weaviate gRPC port used by the `weaviate-kg` MCP client and published by the compose file. `GRPC_PORT` is the legacy `.claude/settings.json` spelling and still works; the `WEAVIATE_`-prefixed name is canonical. |
+| `WEAVIATE_URL` | unset (projected) | Complete base URL of the Weaviate server, used verbatim. Since v0.2.97 this is an **output**: the projection writes it (with `WEAVIATE_PORT`) into every registered project from the machine's `service_endpoints` row. In a project process, a value you set yourself still wins for the clients started from that shell. |
+| `WEAVIATE_PORT` | `8081` | Port on `localhost`, used only when `WEAVIATE_URL` is unset — the client-side floor of the projected pair, read by every Python call-site since v0.2.96 (`vco_lib/weaviate_helpers.py::weaviate_url_default`). |
+| `VCT_WEAVIATE_URL` | unset | **Retired in v0.2.97.** A legacy machine-level Weaviate statement: its value was imported into the `service_endpoints` row on the first v0.2.97 update and nothing reads it since. `vco doctor` warns while it is still exported. |
+| `OLLAMA_URL` | `http://localhost:11435` | Ollama base URL (embeddings + the local KG-summary tier). Projected output of the Ollama row. |
+| `OLLAMA_PORT` | `11435` | Host port for the Ollama container. Written from the row into `infrastructure/.env` by `vco_lib/compose_env.py` — not a user knob; move Ollama with `python -m vco_lib.service_endpoints move`. |
+| `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | Code-embedding service base URL (see [Embedding configuration](#embedding-configuration)). Projected output of the code_embed row; `CODE_EMBED_URL` is an accepted alias. |
+| `CODE_EMBED_PORT` | `11440` | Host port for the code-embed container, written from the row into `infrastructure/.env`. Same not-a-user-knob rule as `OLLAMA_PORT`. |
+| `WEAVIATE_GRPC_PORT` | `50052` | Weaviate gRPC port used by the `weaviate-kg` MCP client and published by the compose file; projected from the row's `grpc_port`. `GRPC_PORT` is the legacy `.claude/settings.json` spelling and still works; the `WEAVIATE_`-prefixed name is canonical. |
 
 ## Knowledge graph env vars
 
-The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's `write_project_env_files` writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
+The MCP server (`claude_mcp_servers/weaviate_mcp/server.py`) reads these on startup, resolved through the 5-level chain above. The launcher's env projection (`python -m vco_lib.config_projection apply`) writes the canonical per-project values into both `.claude/env` (POSIX shell-sourceable) and `.claude/settings.json::env` (the channel that actually propagates to MCP subprocesses on Linux).
 
 | Var | Default | What it does |
 |---|---|---|
@@ -175,7 +176,7 @@ The `EmbeddingService` (in `vco_lib/embedding_service.py`) is the unified entry 
 | `ACTIVE_EMBEDDING` | `qwen3` (default) | `openai` | Selects the active text-embedding slot for KG + development collections. `qwen3` → `qwen3_embed` named vector; `openai` → `openai_embed`. |
 | `EMBEDDING_MODEL` | `qwen3-embedding:0.6b` (default) | model id | Explicit text model override. When `ACTIVE_EMBEDDING=openai` and this is unset, defaults to `text-embedding-3-small`. |
 | `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` (default) | OpenAI model id | Used only when `ACTIVE_EMBEDDING=openai` and `EMBEDDING_MODEL` is unset. |
-| `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per-process from env; the launcher injects it from the shared keychain slot (see Secrets below). |
+| `OPENAI_API_KEY` | (unset) | API key | Required when `ACTIVE_EMBEDDING=openai`. Resolved per process by `vco_lib.openai_key`: `$OPENAI_API_KEY` when set, else the `openai_api_key` secret through the canonical chain (launcher keychain → `~/.vct-secrets/shared/` → the project's own `.env`). `install.py --openai-key` stores it there — never in `.env`. |
 | `OLLAMA_URL` | `http://localhost:11435` | URL | Ollama base URL used by the qwen3 slot. |
 | `CODE_EMBED_SERVICE_URL` | `http://localhost:11440` | URL | Code-embedding FastAPI service URL. |
 | `CODE_EMBED_BACKEND` | `gpu` (default) | `ollama` | `gpu` → CodeSage-Large-v2 via the FastAPI service (sentence-transformers); `ollama` → routes embeds through Ollama. The Ollama-path default model is `unclemusclez/jina-embeddings-v2-base-code:latest` (768-dim); install.py overrides `CODE_EMBED_MODEL` to `qwen3-embedding:0.6b` (1024-dim) on 6-12 GB GPU hosts. |
@@ -204,7 +205,7 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 **Resolver flow** (subprocess perspective):
 
 1. Wrapper script (`search_mcp/wrapper.sh` or equivalent) runs.
-2. Wrapper checks `$GITHUB_TOKEN` — if already exported (launcher's `write_project_env_files` populates it from the keychain on project registration), use it directly.
+2. Wrapper checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
 3. Otherwise call `vct_secrets_resolve.sh <project_path> github_pat` → hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`.
 4. Hub resolves via SENTINEL_SHARED + `module_id=user`, applies the cross-launcher active-flag gate, returns the secret.
 5. Wrapper exports the value and `exec`s the real MCP server binary.
@@ -230,11 +231,13 @@ A detached local HTTP server (port 7700 default) that serves as the single sourc
 
 | Var / path | Default | What it does |
 |---|---|---|
-| `VCT_HUB_PORT` env | `7700` | Hub port override. Falls back to `<vct_root_dir>/hub.port` (written on startup), then `7700`. |
+| `VCT_VENV` env | (unset) | Explicit venv override — tier 1 of every venv-resolution ladder (`vco_lib/python_exe.py::ladder_candidates`; shipped wrapper `templates/scripts/vct_venv_ladder.sh` / `.ps1`). Accepts a venv DIRECTORY or the interpreter binary itself; with it unset the ladder falls back `.claude/env` → the orchestrator install's `.venv` → a VCO clone, refusing loudly when no candidate works. Read by the dependency-gated shell wrappers to hand their Python backend a known-good interpreter. |
+| `VCT_HUB_PORT` env | `7700` | Hub port override. Falls back to `<vct_root_dir>/hub.port` (written on startup), then `7700`. The hub ITSELF binds, in order: its own `VCT_HUB_PORT` env → the `vct-hub-api` module's global `VCT_HUB_PORT` setting (launcher.db; 1024–65535) → `7700`. |
 | `VCT_HUB_TOKEN` env | (unset) | Hub auth token override (tests / dev). Production reads from `<vct_root_dir>/hub.token`. The pin wins on every FIRST attempt; since v0.2.91, a request the hub PROVABLY refuses (401/403) is retried ONCE with the on-disk token when the two differ — see the stale-token note below. |
 | `VCT_HUB_TOKEN_STRICT` env | (unset) | Set to `1` to DISABLE that one-shot fallback, so a `VCT_HUB_TOKEN` pin is authoritative even when the hub refuses it. For tests / harnesses that pin a deliberately-wrong token and assert the 401 path. |
+| `VCT_HUB_MODULE_HEALTH` env | (unset = on) | The hub's module health poller — it probes each active module's `runtime.health_check` (loopback only) for the status pill on the launcher's module tiles (`docs/VCT_MODULE_MANIFEST_SPEC.md` §6). `0`, `false`, `no` or `off` (any case) in the HUB's environment turns it off; every pill then reads unknown. Read once, when the hub starts. |
 | `VCT_STATE_DIR` env | `$HOME/.vct` | Root directory for `hub.port`, `hub.token`, `hub.pid`, `cache/`, etc. Resolution: `VCT_STATE_DIR` → `~/.vct/` → relative `./.vct/` last-resort fallback. Setting this lets dev launchers run side-by-side with production without contaminating state. |
-| `<vct_root_dir>/hub.token` | — | Bearer token (32 bytes hex, OS CSPRNG). Regenerated on every hub startup, mode `0o600` on Unix. Required on every `/api/v1/*` route except `/api/v1/health` — but the two per-project `/env` + `/config` routes require a project-scoped `hub.token.<project_id>` and refuse this global token by default (`VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub reopens a compat window). Never appears in argv — clients read the file and pass via `Authorization: Bearer ...` header. |
+| `<vct_root_dir>/hub.token` | — | Bearer token (32 bytes hex, OS CSPRNG). Regenerated on every hub startup, mode `0o600` on Unix. Required on every `/api/v1/*` route except `/api/v1/health` — but the two per-project `/env` + `/config` routes require a project-scoped `hub.token.<project_id>` and refuse this global token unconditionally (the `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in was removed in v0.2.97). Never appears in argv — clients read the file and pass via `Authorization: Bearer ...` header. |
 | `<vct_root_dir>/hub.port` | — | Plain integer, the port the hub bound to. Written before `hub.token` so a racing client either sees neither file or both. |
 | `<vct_root_dir>/hub.pid` | — | Single-instance lockfile. Contains the running hub's PID. CLI checks it via OS-specific liveness probe (`kill(pid, 0)` on Unix, `OpenProcess` on Windows) + a `TcpListener::bind` probe on the hub port. |
 
@@ -296,7 +299,7 @@ Environment keys for this leg:
 
 Discovery: `VCT_HUB_PORT` env → `<vct_root_dir>/hub.port` → `7700` default; token: `VCT_HUB_TOKEN` env → `<vct_root_dir>/hub.token`. All clients enforce the same exit-code shape (0 success / 1 hub unreachable / 2 project not registered / 3 service misconfigured / 4 field not found / 5 forbidden — hub refused the token on `/env`|`/config`, callers MUST NOT env/file-fallback / 64 usage error). Stderr emissions are rate-limited per `(pid, error_kind)` to one line per 5 minutes — `VCO_HOOK_DEBUG=1` bypasses the limit.
 
-**Stale `VCT_HUB_TOKEN` (v0.2.91)**: the hub regenerates `hub.token` on every start, so a shell that exported `VCT_HUB_TOKEN` before an update holds a value the hub refuses — and the env pin wins over the file, so every resolve from that shell used to fail with a misleading "hub unreachable / launcher may have restarted" diagnostic until the shell was replaced. Now, on a PROVABLE refusal (401/403) where the exported token differs from the on-disk one, every hub client — the resolver script quadruplet, the access-matrix gate trio `vct_access_check.{sh,ps1}` + `vco_lib/access_resolver.py`, `vco_lib/project_config.py`, the wrapper MCPs, the weaviate MCP's writable-collections probe, `vco verify-diagrams`, the codegraph-resync spawn registration, `vco` (`launcher/tools/vct-cli`) and `vct` (`tools/vct-secrets`) — retries **once** with the on-disk token (scoped `hub.token.<project_id>` on the per-project routes, global otherwise) and prints one line to stderr:
+**Stale `VCT_HUB_TOKEN` (v0.2.91)**: the hub regenerates `hub.token` on every start, so a shell that exported `VCT_HUB_TOKEN` before an update holds a value the hub refuses — and the env pin wins over the file, so every resolve from that shell used to fail with a misleading "hub unreachable / launcher may have restarted" diagnostic until the shell was replaced. Now, on a PROVABLE refusal (401/403) where the exported token differs from the on-disk one, every hub client — the resolver script quadruplet, the access-matrix gate trio `vct_access_check.{sh,ps1}` + `vco_lib/access_resolver.py`, `vco_lib/project_config.py`, the wrapper MCPs, the weaviate MCP's writable-collections probe, `vco verify-diagrams`, the codegraph-resync spawn registration, `vct-cli` (`launcher/tools/vct-cli`) and `vct` (`tools/vct-secrets`) — retries **once** with the on-disk token (scoped `hub.token.<project_id>` on the per-project routes, global otherwise) and prints one line to stderr:
 
 ```
 stale VCT_HUB_TOKEN in env overridden by on-disk hub.token — run `unset VCT_HUB_TOKEN` or open a new shell
@@ -351,14 +354,45 @@ Since v0.2.91 the prune is **archive-then-delete**: victim rows are written to a
 `vco_lib/containers.py` resolves the runtime via:
 
 1. `VCT_CONTAINER_RUNTIME` env var — explicit `podman` or `docker`. It is a **pin**, not a preference: when set, it is the *only* candidate. If the pinned runtime is unusable (not installed, client binary refuses, daemon/machine/socket down), VCO **refuses** with an actionable message naming what you pinned, why it is unusable, and whether the other runtime is usable — it does **not** fall back to the other one. See [Why a refused pin is not a fallback](#why-a-refused-pin-is-not-a-fallback) below.
-2. Caller-passed `runtime` arg.
-3. `auto` (or unset) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
+2. The runtime the install recorded in `state/install/runtime.txt` — VCO's own note of where it put your data. Same pin semantics (probed alone; unusable → refusal), except that a READ-ONLY surface (a session, the boot service, the launcher, the hub) may answer the other runtime when the recorded one is no longer installed AND that one already holds VCO's containers or volumes — and never when the record is a `--container` choice of yours (`state/install/runtime.confirmed`). The next `install.py --update` re-records the runtime your data is on.
+3. Caller-passed `runtime` arg.
+4. `auto` (or unset, the last fallback of the one rule) → probe `podman` first, then `docker`. Podman-first is intentional: podman's rootless mode is the orchestrator's default deployment.
 
-The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` (canonical) and `claude_mcp_servers/compose.yaml` (legacy path, same shared volumes).
+The chosen executable is returned as a string (`podman` or `docker`) and used uniformly through the rest of the codebase. Compose files live in `infrastructure/docker-compose.yml` — the one home every VCO path composes from (wrapper, hook, launcher, install.py), always naming the `vco_managed` services explicitly with `--no-deps`. The legacy `claude_mcp_servers/compose.yaml` home is no longer composed from; containers created there are adopted as `adopted_container` rows.
+
+### Where VCO looks for the runtime (v0.2.97)
+
+"Is podman (or docker) installed?" is answered on the calling process's `PATH`
+**and** in the usual install locations — one list, `vco_lib/tool_search_dirs.toml`,
+read by the Python side (`vco_lib.tool_search_dirs`), by the launcher and the
+hub (both add the directories their `PATH` lacks at startup) and by the boot
+wrapper `scripts/launch-claude-mcp-stack.{sh,ps1}` (it adds the directory of a
+runtime found outside its `PATH`). Each entry has a **placement**, and every
+surface applies the same order, so a name resolves to the same binary everywhere:
+
+| Placement | Entries | Where a missing one goes |
+|---|---|---|
+| `prepend-when-missing` | the graphical-launch list (v0.2.53). Linux: `~/.local/bin`, `~/.cargo/bin`, Linuxbrew, `/snap/bin`, flatpak. macOS: `/opt/homebrew/bin` and `/sbin`, `~/.cargo/bin`, `~/.local/bin` | **ahead** of your `PATH` — the order your login shell builds, so a Finder launch runs Homebrew's `git`/`python3` rather than the `/usr/bin` Xcode Command Line Tools stubs |
+| `append` | the container-runtime locations (v0.2.97). Linux: `~/bin` (rootless Docker), `/usr/local/bin`, `/usr/bin`. macOS: `~/bin`, `/usr/local/bin`, `/opt/podman/bin`, Docker Desktop's app bundle, `~/.docker/bin`, MacPorts, `/usr/bin`. Windows: the Docker Desktop and Podman installer directories | **after** your `PATH` — they only reach a tool nothing on it provides, and never shadow one |
+
+A directory already on your `PATH` is never moved, whatever its placement.
+A boot unit, a Finder/`.desktop`-launched launcher and the hub start with a short
+`PATH`; without this list they read a runtime in `~/bin` or `/opt/homebrew/bin` as
+**not installed** — and a runtime that is not installed is the one case in which
+VCO's own record (`state/install/runtime.txt`) may be switched to the other
+runtime. Even then, a read-only surface (a session, the boot service, the
+launcher, the hub) switches only when the other runtime **holds VCO's data**, and
+never away from a runtime you chose with `install.py --container` (that record is
+`state/install/runtime.confirmed`; run `install.py --update --container <other>`
+to change it — both files are rewritten).
+
+| Var | Effect |
+|---|---|
+| `VCT_TOOL_SEARCH_DIRS` | When **set** (even to an empty string), replaces the list above for this OS: entries separated by the OS path separator (`:` / `;`), each `~/…` or `${NAME}…` expanded, every one placed `append` (after your `PATH`). Empty means "look on `PATH` only" — the test suite runs that way so it never finds the host's own runtimes. |
 
 ### Forcing Docker when both runtimes are installed
 
-Hosts with both Podman AND Docker installed default to Podman (step 3 above; see `_detect_container_runtime` at `install.py:8920`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
+Hosts with both Podman AND Docker installed default to Podman (step 4 above; see `_detect_container_runtime` in `install.py`, a thin call into `vco_lib/containers.py::resolve`). To force Docker — for example because the Docker daemon is the one wired to team registry credentials, or because Podman's rootless mode hits a permission wall on the filesystem — export `VCT_CONTAINER_RUNTIME=docker` before running install or any container-touching hook:
 
 ```bash
 export VCT_CONTAINER_RUNTIME=docker
@@ -384,17 +418,34 @@ ensure-containers: VCT_CONTAINER_RUNTIME=podman is set but `podman info` failed 
 
 Your three ways out, in the order the message lists them: **start the pinned runtime** (usual fix — `podman machine start`, `systemctl --user start podman.socket`, launch Docker Desktop); **unset `VCT_CONTAINER_RUNTIME`** to return to auto-probe; or **repin** to the runtime the message named as usable — knowing that its volumes are a different data plane, so an existing KG on the other runtime will not be there.
 
+### Volume source overrides (v0.2.97)
+
+`infrastructure/docker-compose.yml` mounts three named volumes — `weaviate_data` → `vco_weaviate_data`, `ollama_data` → `vco_ollama_data`, `code_embed_cache` → `vco_code_embed_cache`. A machine whose services were first stood up with **bind mounts** (for example an Ollama model directory at a host path shared with other containers) could not adopt that file without copying the data — and a blind `--force-recreate` from it silently re-pointed the service at an **empty** default volume, orphaning the data without deleting it. Each volume source is therefore env-overridable (the `VCT_CODE_EMBED_BUILD_CONTEXT` pattern), two knobs per service:
+
+| Var | Default | What it does |
+|---|---|---|
+| `VCT_WEAVIATE_DATA_SOURCE` | `weaviate_data` | The weaviate service's mount source. Set it to a **host path** (`/`, `./` or `~` prefix) to make the mount a bind at that path. |
+| `VCT_WEAVIATE_VOLUME_NAME` | `vco_weaviate_data` | The resolved name of the `weaviate_data` volume. Set it to an **existing volume name** to reuse that volume. |
+| `VCT_OLLAMA_DATA_SOURCE` | `ollama_data` | Same, for the ollama service's `/root/.ollama` mount. |
+| `VCT_OLLAMA_VOLUME_NAME` | `vco_ollama_data` | Same resolved-name knob for `ollama_data`. |
+| `VCT_CODE_EMBED_CACHE_SOURCE` | `code_embed_cache` | Same, for the code_embed service's `/cache` mount. |
+| `VCT_CODE_EMBED_VOLUME_NAME` | `vco_code_embed_cache` | Same resolved-name knob for `code_embed_cache`. |
+
+Why two knobs and not one: compose classifies a short-syntax source as a **bind** when it starts with `/`, `./` or `~`, and as a **named volume** otherwise — and a named volume that is not declared under top-level `volumes:` is a hard error (`service refers to undefined volume`, docker compose v2; podman-compose likewise fails to parse). So "an existing volume name" can only enter through the declared volume's `name:` field. Both runtimes honour `${VAR:-default}` in both positions (verified on docker compose v2.40.3 and podman-compose 1.5.0 via side-effect-free `config` renders, 2026-09-23).
+
+**Who writes them: VCO, not you.** Since v0.2.97 `infrastructure/.env` is written from the `service_endpoints` rows by `vco_lib/compose_env.py::write_service_keys` — the port keys (`WEAVIATE_PORT`, `WEAVIATE_GRPC_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`) and the data-source knobs alike, for `vco_managed` rows only, inside one marker-delimited block that every row change rewrites. Never hand-edit the file: a line outside the block that assigns a key the rows state is superseded on the next write, because the row is the source of truth and compose must never see two assignments. The code_embed row stores the observed `/cache` mount (bind path or volume name) and projects it as `VCT_CODE_EMBED_CACHE_SOURCE` / `VCT_CODE_EMBED_VOLUME_NAME`; every recreate of the container verifies the mount before and after, and a mismatch refuses or rolls back — an existing model cache is never bypassed. To change a service's data source, change its row (`python -m vco_lib.service_endpoints adopt|move|hand-to-vco`, or the launcher's Services page): the mount identity travels with the row. When Ollama is not `vco_managed`, the same writer states `CODE_EMBED_OLLAMA_URL` so the code-embed container reaches it through the runtime's loopback alias (`host.containers.internal` on podman, `host.docker.internal:host-gateway` on docker) instead of the in-network name. On SELinux-enforcing hosts a swapped-in bind source needs the `:Z` flag — see [SELinux: bind-mount layouts need a `:Z` flag](TROUBLESHOOTING.md) in the troubleshooting guide.
+
 ## MCP Servers
 
-MCP servers are registered in the user's `~/.claude.json`. Each launches via the project venv (`claude_mcp_servers/.venv`).
+MCP servers are registered in the user's `~/.claude.json`. Each launches via the orchestrator install's venv — canonical `<install>/.venv`, with the legacy `claude_mcp_servers/.venv` accepted as a fallback for pre-unification installs (`mcp_registration.rs::resolve_venv_python`).
 
 **weaviate-kg** — semantic search + code graph.
-- Command: `claude_mcp_servers/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py`
+- Command: `<install>/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py` (legacy installs: `claude_mcp_servers/.venv/bin/python`)
 - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `OPENAI_API_KEY`, `CODE_EMBED_SERVICE_URL`, etc.).
 
 **search** — academic paper search via OpenAlex and arXiv.
 - Command (Unix): `claude_mcp_servers/search_mcp/wrapper.sh` — exports `GITHUB_TOKEN` from the keychain (env-first then resolver), then `exec`s the real server.
-- Command (Windows): `claude_mcp_servers/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret).
+- Command (Windows): `<install>/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret; legacy installs use `claude_mcp_servers/.venv/Scripts/python.exe`).
 - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
 - Tools: `search_papers` only. (Claude's built-in WebFetch covers ad-hoc web retrieval, so no general web-search tool is exposed.)
 
@@ -445,6 +496,22 @@ Set these before running `bash first-install.sh` (or export them for the duratio
 | `VCT_MODULE_PULL_TIMEOUT_SECS=<n>` | Upper bound, in seconds, on a single module-image `podman`/`docker pull` during a module install or update. Default `1800` (30 min). The bound exists to catch a genuinely *stalled* registry (network black hole, half-open connection, a registry that accepts the connection but never streams layers) — without it, a stalled pull leaves the install row wedged at `status='installing'` forever (the pull future never resolves). On timeout the pull is killed and the install transitions to `status='error'` with an actionable message, then becomes retry-eligible. Raise it for unusually large GPU-variant images on a slow link. A zero, negative, or non-numeric value is **ignored** and the default is used — the bound is never disabled (a stalled pull must always be able to fail). |
 | `VCT_INSTALL_DOCKER_TIMEOUT=<seconds>` | Cap on the `compose up -d` step of `install.py` / `install.py --update` (first-run image pulls included). Default `900` (15 min), clamped to a 60 s minimum; a non-numeric value falls back to the default. A hung container daemon fails the step with a message naming this variable instead of blocking forever — raise it (e.g. `1800`) on slow links with a cold image cache where healthy pulls legitimately exceed 15 min. |
 
+The five `VCT_INSTALL_*` names below are **internal — do not set them**. `install.py` sets them itself when it
+relaunches under the install's `.venv` (the launcher starts it with the system `python3`, which cannot import the
+venv's packages) and reads them back in the relaunched run (`vco_lib/install_companions.py`); they are listed here so
+their names are not a mystery in a process listing. They describe ONE hop, so they are never passed on: every
+long-lived process `install.py` starts (hub, updater, launcher, background drivers) and every `install.py` the
+launcher spawns gets an environment without them — the list both sides strip is `vco_lib/install_relaunch_env.toml`
+— and a run whose argv does not carry the matching token ignores and drops any it finds (one stderr line).
+
+| Var | Meaning |
+|---|---|
+| `VCT_INSTALL_RELAUNCHED` | `1` on every relaunched run — the loop guard: a relaunched run never relaunches again. |
+| `VCT_INSTALL_BASE_PYTHON` | The interpreter that STARTED `install.py`, recorded on the first hop only. A venv (re)build uses it, never the venv's own python, so a rebuild follows the Python you launched with and never runs from the tree it deletes. |
+| `VCT_INSTALL_BASE_PYTHON_VERSION` | That interpreter's `X.Y`. The venv-drift check compares the `.venv` against it — after the relaunch `install.py`'s own version IS the venv's, so comparing with that would never see drift. |
+| `VCT_INSTALL_RELAUNCH_TOKEN` | A fresh random token per relaunch, also passed to the relaunched run as its last argument (`--vct-relaunch-token=<token>`, removed before the arguments are parsed). The environment reaches every descendant; the argument reaches only the run it was made for — so a match proves the other four were set for THIS run, not inherited from an older one through some other process. |
+| `VCT_INSTALL_PARENT_WAITS` | Windows only: the **pid** of the `install.py` waiting for this run. Windows cannot replace a process (`os.exec*` starts a new one and ends the caller with exit code 0 at once), so there the relaunch runs as a child and the parent exits with the child's exit code. The child uses the pid twice: a relaunched run that must rebuild the venv it runs from hands the run back to that parent (exit code `22083`, `0x5643`), which runs outside the venv and re-runs it once; and the child watches the parent, so when the parent is killed (the launcher cancelling a run) the run stops at once with exit code `22084` (`0x5644`) and one stderr line — what killing `install.py` does on Linux/macOS. Only the run stops: services it already started (hub, model gateway, updater, analyzer) keep running there too. If the watch cannot be set up, a stderr line says so and the run continues. |
+
 ## Runtime env knobs
 
 Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.json` `env` (propagates to MCP subprocesses), or export them for one shell. Unlike the table above they are read at use-time, not at install-time.
@@ -479,11 +546,45 @@ Set these in the per-project `.claude/env` (shell-sourced) or `.claude/settings.
 
 The local model-gateway daemon (`claude_mcp_servers/model_router/`, default port `11436`) is started, stopped and boot-registered by the launcher (Services page). Every knob below is optional and read at daemon startup by `model_router/config.py`; a healthy install needs none of them.
 
-The daemon serves `/health` (unauthenticated liveness), `/usage`, `/v1/models`, `/v1/messages` and
+The daemon serves `/health` (unauthenticated liveness), `/usage`, `/usage/windows`, `/v1/models`, `/v1/messages` and
 `/v1/messages/count_tokens`; all but `/health` require the host token and every route is loopback-only.
 `/usage` returns the newest token-accounting row per chat (`?session=<id>` for one of them); the rows are
 appended to `<vct-state-dir>/metrics/gateway-usage.jsonl`, whose path and counters also appear as
 `usage_ledger` in `/health`. The ledger is for CONTEXT management, not cost — no price is recorded anywhere.
+
+**Subscription usage — `/usage/windows`.** With the panel on the gateway, Claude Code's Account & Usage view shows a
+dollar figure priced at API rates, which means nothing on a subscription. `/usage/windows` (host token, loopback)
+answers the subscriptions' own windows instead: Claude's 5-hour, weekly and per-model weekly (e.g. Fable) windows
+from `api.anthropic.com/api/oauth/usage` under your Claude login plus the `anthropic-ratelimit-unified-*` headers on
+every relayed answer; Z.ai's 5-hour and weekly windows from its monitor endpoint (`quota_url` in
+`model_router/vendors.py`); and, for QwenCloud — whose Token Plan publishes no quota anywhere — the tokens this
+gateway relayed for it since the start of the month, labelled as tokens, never as a percentage. All the vendor
+sources are undocumented: anything missing, unreadable, older than 30 minutes or past its own reset reads `null`
+("unknown") with the reason, never 0 % or 100 %. The answer comes from the gateway's cache, which is refreshed in the
+background at most once every 4–5 minutes (jittered, one refresh in flight at a time) when either a read finds it due
+or chat requests are passing through the gateway — the second keeps the numbers warm, so a session started during
+active use finds them fresh in its model picker. There is no timer: a gateway with no chat traffic and no readers
+makes no vendor calls, and no request ever waits on a vendor. `?format=line` answers one line of text — what the status-line script prints — and
+the launcher's home page shows the same data as bars with reset countdowns.
+
+**Usage in the `/model` picker.** The same data also rides in the picker itself, as text on each vendor row's
+label: `glm-5.3 · Z.ai subscription · 1M ctx · 5h 10% · wk 72% used`, and for QwenCloud `… · 1.2M tokens used this
+month` (or `since Sep 2` when the ledger covers only part of the month). It always reads *used*, shortest window
+first; an unknown window is left out and a vendor with nothing known gets no suffix at all. Claude Code fetches
+`/v1/models` once, when a session starts, and never refreshes it, so the label is a snapshot of that moment — when
+the reading was already older than one refresh interval then, it says so as a clock time, `(as of 14:05)`. Building
+the list never waits on a vendor: a cold cache answers without the text and starts the refresh, so the next session
+has it. Claude's own windows cannot appear there: the client fills the picker with its built-in Claude rows and
+discards the gateway's rows for the same models, text included — read them from the status line or the launcher.
+Only the display text changes; model ids never do. Turn it off with `VCT_MODEL_GATEWAY_PICKER_USAGE=off`.
+
+**Status line.** `.claude/scripts/gateway-usage-statusline.sh` (`.ps1` on Windows) prints that line for Claude Code's
+`statusLine`, e.g. `Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72% │ Qwen 1.2M tok/mo`, and prints
+nothing at all when the gateway is not running or refuses it. VCO does not add it to your settings — a project-level
+`statusLine` would override one you set in `~/.claude/settings.json` — so enable it yourself:
+`"statusLine": {"type": "command", "command": "bash .claude/scripts/gateway-usage-statusline.sh"}` (Windows:
+`"pwsh -NoProfile -File .claude/scripts/gateway-usage-statusline.ps1"`). The status line is drawn by the terminal
+client (`claude`); the VS Code panel does not render `statusLine`.
 
 **Panel mode — `remote-control` vs `multimodel`.** The launcher's status-bar pills (CLI: `python -m vco_lib.vscode_settings mode --set {multimodel,remote-control} --path <settings.json>`) flip the VS Code Claude Code panel between two states, one at a time — `claudeCode.environmentVariables` is VS Code machine-scope, so there is no per-workspace split. **`remote-control` is the stock client**: the four routing keys and the login-prompt key are removed, the panel talks to api.anthropic.com again, and the `/model` picker, the context-window sizing and the token accounting are all Claude Code's own. VCO writes none of `CLAUDE_CODE_MAX_CONTEXT_TOKENS`, `CLAUDE_CODE_DISABLE_1M_CONTEXT` or `CLAUDE_CODE_AUTO_COMPACT_WINDOW` in *either* mode — that absence is what leaves the accounting native; a knob you set yourself is carried through untouched. **`multimodel` points the panel at the gateway**: the picker becomes the gateway's `/v1/models` catalog (the Z.ai subscription's GLM models, the QwenCloud Token-Plan models, and Claude in one list), and the client takes the context window from the model ID, so pick the "(1M context)" rows — their ids carry the `[1m]` suffix — when you want the 1M budget; ids only the gateway can resolve are stashed on the way to `remote-control` and restored on the way back. Remote Control (`/remote-control`, phone access) therefore works only in `remote-control` mode: Claude Code >= 2.1.196 refuses it whenever `ANTHROPIC_BASE_URL` is not api.anthropic.com, and a claude.ai sign-in does not bypass that. To have both at once, leave the panel on the gateway and run a detached native-auth server with the bundled `rc-native` skill (see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md), "Remote Control").
 
@@ -496,12 +597,13 @@ appended to `<vct-state-dir>/metrics/gateway-usage.jsonl`, whose path and counte
 | `VCT_MODEL_GATEWAY_SECRET_PROJECT` | unset — the gateway then uses **this install's orchestrator root**, resolved at runtime | **The per-project override for the gateway's vendor keys.** By default a gateway vendor key is a SHARED secret: put it in the launcher's Secrets panel with scope `shared` (OS keychain) or `vct set --shared --key <name>` (file store), and every install resolves it. The daemon still has to ASK as a registered project, because shared keychain secrets are reachable only through the hub's per-project `/env` route (their bucket is `_user_shared_`, owned by no project, and both stores resolve project-first-then-shared for whoever asks) — so with nothing pinned the gateway asks as the orchestrator root, which the launcher always registers. Set this variable to a project's path and THAT project's own key outranks the shared one; its `.no-shared-fallback` marker is honoured too, because there is one chain and no second mechanism. Before v0.2.95 the unpinned default was the process's **working directory**, which for a login-started daemon is the state root — not a registered project, so the hub tier was skipped entirely and every OS-keychain key was invisible while `/health` showed the vendor present with an empty key cache. The default is resolved at runtime, never baked into the boot unit, so a moved install self-heals — the systemd unit / LaunchAgent / Scheduled Task ships this variable EMPTY, and a non-empty one is always a scope you set (it is then preserved across every re-render, and a re-render of an older unit whose value merely equals this install's root drops it, so the runtime default takes over). `/health`'s `secret_scope` reports which scope is in force, where it came from (`pin` / `install_root` / `cwd`) and whether it resolves, and the daemon logs that verdict at startup. The launcher passes the variable through when it starts the daemon from the GUI. |
 | `VCT_MODEL_GATEWAY_CATALOG` | `latest` | Which versions of a model family reach the `/model` picker. `latest` publishes only the newest version of each family (Fable 5.1 without Fable 5; one GLM 5 row instead of six) — variant lines like `-flash`, `-turbo` and `-air` are families of their own and each keep their newest. `all` publishes every version each upstream returns, EXCEPT ids withheld on grounds this knob does not govern: truth-withheld ids (`verified_ids` — an id that answers as a different model) and curated-hidden ids (`catalog_hide_ids`) stay hidden under `all` too, and ids matching `catalog_exclude_prefixes` are dropped from the catalog entirely and appear in neither list, by design. What this knob narrows is not lost quietly: ids it withholds come back in `_vct_catalog_hidden` on `/v1/models`, are counted as `catalog_hidden` in `/health`, and remain selectable by name — the filter narrows the picker, never the router. An unrecognised value is refused at startup rather than silently treated as the default. |
 | `VCT_MODEL_GATEWAY_WINDOW_ROWS` | `one_m_only` | How many picker rows a 1M **first-party** model occupies. The gateway sizes a client's context budget from the id string — `[1m]` means 1M, any other spelling behind a custom base URL means the smaller default — so a 1M first-party model has two useful spellings and used to be published as a pair. `one_m_only` publishes just the `[1m]` one, so one model is one row. `both` also publishes the plain id, which is how you hold a 1M model to the smaller budget deliberately (the way to keep a long session under the upstream's long-context pricing tier). The withheld plain id comes back in `_vct_catalog_hidden` and stays selectable by name: this knob decides what is advertised, never what the gateway will answer to. **Scope**: only first-party rows are paired, so this knob moves nothing else — a 200K model has no second spelling, and a vendor model is always published as the single id its resolved window earns (already carrying `[1m]` when that window is 1M). An unrecognised value is refused at startup. `/health` reports the resolved mode as `window_rows`. |
+| `VCT_MODEL_GATEWAY_PICKER_USAGE` | `on` | Whether each vendor row in the `/model` picker carries its subscription's usage as text (see "Usage in the `/model` picker" above). `off` gives clean labels and also stops `/v1/models` from scheduling a usage refresh; `1`/`true`/`yes` and `0`/`false`/`no` mean the same two things. Unlike the two enums above, an unrecognised value does not refuse startup — this knob changes label text only, and a gateway that will not start takes every chat routed through it down with it — it logs a warning naming the valid values and runs with `on`. `/health` reports the mode in force as `picker_usage`. |
 | `VCT_MODEL_GATEWAY_CATALOG_TTL` | `21600` (6 h) | Seconds before the live model catalog is re-fetched. |
 | `VCT_MODEL_GATEWAY_STATIC_RETRY_TTL` | `300` | When a live catalog fetch fails and the static fallback is serving, retry the live fetch after this many seconds instead of waiting out the full catalog TTL (a one-minute vendor outage must not cost six hours of a stale picker). |
 | `VCT_MODEL_GATEWAY_KEY_TTL` | `300` | Seconds before the vendor key is re-resolved, so a rotation is picked up — and a hub that was down at boot is retried — without restarting the daemon. |
 | `VCT_MODEL_GATEWAY_KEY_STALE_MAX_S` | `21600` | While key RESOLUTION fails (e.g. vct-hub stopped by an orchestrator update), keep answering with the last-known-good key for at most this long since its last successful resolution. Three consecutive KEY-level vendor rejections invalidate it immediately — serve-stale never outlives a key the vendor itself rejects. Only key-level rejections count: every 401, and a 403 whose body is not the vendor's documented model-level `access_denied` shape. A 403 `AccessDenied` means the MODEL is deprecated or gated while the key is fine, and it must not (three of them would otherwise invalidate a healthy key). Any 2xx clears the count. |
 | `VCT_MODEL_GATEWAY_REWRITE_BUFFER_BYTES` | `33554432` (32 MiB) | How much of a request body the daemon HOLDS in order to rewrite ids inside it. **Not a size limit**: nothing is ever refused for being bigger — a body past this bound is streamed straight through to the upstream (with only the gateway's own `claude-gw/` namespace spliced out of the model id) and the upstream's own answer is relayed. The default sits just above Anthropic's documented 32 MB request ceiling, so every body the first-party API can accept is one the gateway still rewrites. Lower it to cap memory; raising it past the upstream's ceiling only moves a refusal from there to there. **One assumption**: routing a body past this bound reads the top-level `model` out of the first 64 KiB without parsing the rest, so `model` must be an early field. Claude Code and the JS SDK put it first; the Python SDK emits `max_tokens, messages, model`, so a >32 MiB request built with it — with `messages` ahead of `model` — cannot be routed and gets a 400 naming this (`reason=model_unreadable_in_head`). Nothing is refused for its size. |
-| `VCT_GW_TMP_TOKEN` | unset | Passes the gateway's host token to `vco` CLI subcommands without putting it in argv (shell history, `ps` listings). Unset is the normal case: the token is then read from the gateway's own token file and never crosses a process boundary. |
+| `VCT_GW_TMP_TOKEN` | unset | Passes the gateway's host token to `python -m vco_lib.vscode_settings` subcommands without putting it in argv (shell history, `ps` listings). Unset is the normal case: the token is then read from the gateway's own token file and never crosses a process boundary. |
 
 The three TTL knobs exist primarily so the smoke tests can drive the caches without sleeping; they are documented because a knob nobody can find is a knob that gets re-invented.
 

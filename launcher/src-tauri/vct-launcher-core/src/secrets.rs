@@ -30,7 +30,7 @@
 //! + active-flag gating + cross-launcher pause check, all in one
 //! place. Bundled wrappers consume that endpoint via the shared
 //! resolver helper at `templates/scripts/vct_secrets_resolve.sh`
-//! (Bash) / `.ps1` (PowerShell). See `docs/MIGRATION-0.2.0.md`.
+//! (Bash) / `.ps1` (PowerShell). See `docs/VCT_SECRETS_PRIMITIVE.md`.
 //!
 //! Reads in this module go through the keychain only. There is no
 //! file-side mirror anywhere in the launcher's set/delete paths.
@@ -64,10 +64,10 @@
 //! row, eliminating the stale-shadow row that appeared when a user
 //! used both UI flows over time.
 //!
-//! That tuple is also what the env-pair builder in
-//! `commands/projects_v2.rs::write_project_env_files` reads when
-//! emitting `GITHUB_TOKEN` to per-project env files (replaces the
-//! retired `git-credential-vct` helper).
+//! That tuple is also what the launcher's PAT resolver
+//! (`commands/installer.rs::resolve_github_pat`, behind the PAT status
+//! surfaces) reads. No env writer emits `GITHUB_TOKEN` into project files
+//! since v0.2.73 — consumers resolve it at need through the hub.
 //!
 //! `commands::installer::*` is the only path that calls into this
 //! module from outside `commands/secrets_cmd.rs`. This module remains
@@ -308,6 +308,16 @@ pub fn shutdown_keychain_connection() {
     #[cfg(target_os = "linux")]
     crate::secrets_ss_connection::shutdown();
 }
+
+/// The `project_id` slot of a `shared`-scope secret — in the keychain
+/// (`SecretScope::Shared { project_id: SENTINEL_SHARED }` →
+/// `vct._user_shared_.shared.<module>`) and in `secret_active_state`. THE one
+/// definition (R7b F15: until v0.2.97 seven files each declared their own
+/// copy); every writer and reader imports it from here.
+pub const SENTINEL_SHARED: &str = "_user_shared_";
+/// The `project_id` slot of a `global`-scope secret in `secret_active_state`
+/// (the keychain's `Global` scope carries no project). The one definition.
+pub const SENTINEL_GLOBAL: &str = "_global_";
 
 #[derive(Debug, Clone, Copy)]
 pub enum SecretScope<'a> {
@@ -2674,6 +2684,27 @@ pub mod for_tests {
     use std::cell::RefCell;
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// True when an error string positively identifies a keychain-op
+    /// timeout / worker unavailability — the deterministic `Display`
+    /// strings of [`super::KeychainTimeout`], embedded verbatim in the
+    /// error details by `set_raw` / `get_with_context` /
+    /// `delete_with_context`. No other error source produces these
+    /// substrings, so matching them is positive identification.
+    ///
+    /// ONE home (v0.2.97 flaky-keychain-test sweep, 2026-09-25) for the
+    /// predicate every keychain-touching test module uses to separate
+    /// "Secret Service too slow under load → SKIP the test" from "real
+    /// failure → panic with the error" — instead of `.ok().flatten()`
+    /// swallowing the error and the assert blaming the product.
+    /// Consumers: `commands::installer::github_pat_keychain_tests`,
+    /// `commands::secrets_cmd` / `commands::dashboard` real-keychain
+    /// tests, `vct-hub::modules_api` resolver tests.
+    pub fn is_keychain_unavailable_err(e: &str) -> bool {
+        e.contains("keychain operation timed out")
+            || e.contains("keychain worker stuck")
+            || e.contains("keychain worker unavailable")
+    }
 
     // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
     //

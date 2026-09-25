@@ -4,7 +4,7 @@ description: Turns a directory of per-client engagement files into a board-ready
 short_desc: "multi-engagement roll-up from client status files"
 keywords: [portfolio status, weekly digest, steering committee, board-ready report, multi-engagement roll-up, "status report", "client status report", "portfolio update", "digest for clients", "weekly portfolio"]
 model: opus
-effort: high
+effort: medium
 argument-hint: "[engagements-directory-or-rollup-file] [--audience internal|board|partner]"
 ---
 

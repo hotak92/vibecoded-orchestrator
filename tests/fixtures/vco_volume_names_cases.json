@@ -1,0 +1,60 @@
+{
+  "_comment": [
+    "v0.2.97 R9 H6 — ONE fixture for \"which named volumes hold VCO's data\", read by",
+    "tests/test_v0297_r9_runtime_locations.py (Python: vco_lib.runtime_reconcile.volume_names_from) AND by",
+    "launcher/src-tauri/vct-launcher-core/src/services/container_runtime.rs (Rust: volume_names_from). The answer",
+    "is the compose defaults, then every non-empty VCT_{WEAVIATE,OLLAMA,CODE_EMBED}_VOLUME_NAME value in the",
+    "install's infrastructure/.env (`env_file`, whole file, file order, the vco_lib.envfile line rule) and then in",
+    "the process environment (`env`, key order). A union: an adopted volume name never hides the defaults."
+  ],
+  "cases": [
+    {
+      "name": "defaults_only",
+      "env_file": "",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache"]
+    },
+    {
+      "name": "an_adopted_volume_in_the_managed_block",
+      "env_file": "WEAVIATE_PORT=8081\n# >>> VCO service endpoints: written from launcher.db service_endpoints; change them with `python -m vco_lib.service_endpoints` >>>\nVCT_WEAVIATE_DATA_SOURCE=\nVCT_WEAVIATE_VOLUME_NAME=my_weaviate\n# <<< VCO service endpoints <<<\n",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache", "my_weaviate"]
+    },
+    {
+      "name": "export_prefix_quotes_and_comments_follow_the_envfile_rule",
+      "env_file": "export VCT_OLLAMA_VOLUME_NAME='ollama models'\n# VCT_CODE_EMBED_VOLUME_NAME=commented_out\nVCT_CODE_EMBED_VOLUME_NAME=\"embed_cache\"\n",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache", "ollama models", "embed_cache"]
+    },
+    {
+      "name": "an_empty_value_states_a_bind_mount_and_adds_nothing",
+      "env_file": "VCT_WEAVIATE_VOLUME_NAME=\nVCT_WEAVIATE_DATA_SOURCE=/srv/weaviate\n",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache"]
+    },
+    {
+      "name": "the_process_environment_adds_after_the_file",
+      "env_file": "VCT_WEAVIATE_VOLUME_NAME=file_weaviate\n",
+      "env": {"VCT_OLLAMA_VOLUME_NAME": "shell_ollama", "VCT_WEAVIATE_VOLUME_NAME": "file_weaviate"},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache", "file_weaviate", "shell_ollama"]
+    },
+    {
+      "name": "a_default_name_is_never_repeated",
+      "env_file": "VCT_WEAVIATE_VOLUME_NAME=vco_weaviate_data\n",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache"]
+    },
+    {
+      "name": "unrelated_and_lookalike_keys_are_ignored",
+      "env_file": "WEAVIATE_PORT=8081\nVCT_WEAVIATE_VOLUME_NAMEX=nope\nVCT_OLLAMA_DATA_SOURCE=/srv/ollama\n",
+      "env": {"VCT_VOLUMES_PATH": "/srv"},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache"]
+    },
+    {
+      "name": "crlf_lines_and_the_first_equals_sign",
+      "env_file": "VCT_WEAVIATE_VOLUME_NAME=crlf_vol\r\nVCT_OLLAMA_VOLUME_NAME=a=b\r\n",
+      "env": {},
+      "expect": ["vco_weaviate_data", "vco_ollama_data", "vco_code_embed_cache", "crlf_vol", "a=b"]
+    }
+  ]
+}

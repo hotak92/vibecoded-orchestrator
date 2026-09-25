@@ -11,8 +11,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   canToggle,
+  detectHintOs,
   gitVisibilityNote,
   isChecked,
+  newHookCommandPlaceholder,
   parseTimeoutSeconds,
   registerBlockedReason,
   settingsErrorBanner,
@@ -93,7 +95,7 @@ describe('state labels and tooltips are specific, not generic', () => {
 
 describe('settingsErrorBanner — a refusal the user can act on', () => {
   it('says nothing was written for the destructive-looking failures', () => {
-    for (const code of ['unparseable', 'hooks_block_malformed', 'no_python']) {
+    for (const code of ['unparseable', 'jsonc_edit_refused', 'hooks_block_malformed', 'no_python']) {
       expect(settingsErrorBanner(code, null, SETTINGS)).toMatch(/[Nn]othing was written/);
     }
   });
@@ -104,8 +106,14 @@ describe('settingsErrorBanner — a refusal the user can act on', () => {
 
   it('explains WHY an unparseable file is not rewritten', () => {
     const t = settingsErrorBanner('unparseable', null, SETTINGS);
-    expect(t).toMatch(/not valid JSON/);
+    expect(t).toMatch(/not valid JSON or JSONC/);
     expect(t).toMatch(/could destroy/);
+  });
+
+  it('explains a refused in-place JSONC edit (v0.2.97: JSONC is edited, not refused)', () => {
+    const t = settingsErrorBanner('jsonc_edit_refused', null, SETTINGS);
+    expect(t).toMatch(/comments or trailing commas/);
+    expect(t).toMatch(/UPDATE_DEFERRED\.md/);
   });
 
   it('falls back to the backend message for an unknown code', () => {
@@ -201,5 +209,32 @@ describe('registerBlockedReason', () => {
 
   it('surfaces the timeout error rather than letting it round-trip', () => {
     expect(registerBlockedReason('Stop', 'cmd', 'soon')).toMatch(/whole number/);
+  });
+});
+
+describe('newHookCommandPlaceholder — the hint must fit the OS that reads it', () => {
+  it('shows the bash form on Linux and macOS', () => {
+    for (const ua of [
+      'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36',
+      'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36',
+    ]) {
+      expect(detectHintOs(ua)).toBe('other');
+      expect(newHookCommandPlaceholder(detectHintOs(ua))).toBe(
+        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"',
+      );
+    }
+  });
+
+  it('shows the exact powershell -File form on Windows — the form the compatibility doc says survives the PowerShell fallback', () => {
+    expect(detectHintOs('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')).toBe(
+      'windows',
+    );
+    expect(newHookCommandPlaceholder('windows')).toBe(
+      'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.ps1"',
+    );
+  });
+
+  it('never shows the bash form on Windows (a copied bash hint is a broken hook)', () => {
+    expect(newHookCommandPlaceholder('windows')).not.toContain('bash');
   });
 });

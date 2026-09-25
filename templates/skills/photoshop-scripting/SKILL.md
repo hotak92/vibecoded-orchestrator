@@ -4,7 +4,7 @@ description: Writes Adobe Photoshop automation scripts in UXP (JavaScript) or le
 short_desc: Photoshop UXP/ExtendScript + GIMP automation
 keywords: ["Photoshop automation", UXP, ExtendScript, "JSX panel", GIMP, "Script-Fu", "batch process images", "automate Photoshop", "write a Photoshop script"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Photoshop & GIMP Scripting

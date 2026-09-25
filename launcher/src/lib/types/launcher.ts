@@ -280,6 +280,9 @@ export interface UpdateAllReport {
  *     managed files (.claude/hooks, .claude/scripts, .claude/env, infra
  *     compose YAMLs) AND strip canonical env keys from .env / .claude/env
  *     / .claude/settings.json env / .vscode/settings.json claude-code.env.
+ *     A secret VALUE (a user secret, or GITHUB_TOKEN) is removed only where
+ *     it equals the one the launcher stores (v0.2.97); a same-named value
+ *     the user typed is kept and listed in `UnregisterReport.warnings`.
  *     User content (agents/skills/CONTEXT_STATE/CLAUDE.md/source code/
  *     user-added .env keys) is preserved.
  *   - `purgeCollections` (default false): drop the project's OWN Weaviate
@@ -291,6 +294,10 @@ export interface UpdateAllReport {
 export interface UnregisterOptions {
   purgeLauncherFiles?: boolean;
   purgeCollections?: boolean;
+  /** Owner ruling (review R5 F39): the escape from the unregister STOP —
+   *  "Unregister anyway — leave these values". Only ever sent as the SECOND
+   *  action of that stop (`$lib/unregister-escape`). */
+  leaveUnremovable?: boolean;
 }
 
 /**
@@ -308,6 +315,10 @@ export interface UnregisterReport {
   keysPurgedFromEnv: string[];
   collectionsDropped: string[];
   warnings: string[];
+  /** `KEY in <file>` for each value left in place by "Unregister anyway". */
+  leftInPlace: string[];
+  /** Where the note listing `leftInPlace` was written, when it was. */
+  leftoversNote: string | null;
 }
 
 export interface TierCacheView {

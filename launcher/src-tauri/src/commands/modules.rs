@@ -1583,16 +1583,21 @@ fn install_in_flight_should_refuse(
     }
 }
 
-#[command]
-pub async fn install_module_for_project(
-    app: AppHandle,
-    project_id: String,
-    module_id: String,
-    db: State<'_, Db>,
-) -> Result<ModuleInstallRow, String> {
+/// Everything `install_module_for_project` must establish before it writes
+/// an install row: the project, the resolved manifest, host compatibility,
+/// the license gate and — v0.2.97 (review R6 round 2) — the
+/// `requirements.depends_on` gate (`vct_launcher_core::module_deps`). The
+/// command gets its manifest ONLY from here, so no install can skip a check.
+/// A missing dependency is refused with a message naming it; nothing is ever
+/// installed on the user's behalf.
+pub(crate) fn preflight_install(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+) -> Result<(crate::db::models::ProjectRow, ModuleManifest, ManifestSource), String> {
     // 1. Project exists + get host
     let project = db
-        .get_project(&project_id)?
+        .get_project(project_id)?
         .ok_or_else(|| format!("project {} not found", project_id))?;
 
     // 2. Manifest lookup — v0.2.33 B2 cold-start synth wired in.
@@ -1612,7 +1617,7 @@ pub async fn install_module_for_project(
     //      `extract_manifest_from_image` writes the REAL manifest to
     //      `~/.vct/modules/<id>/vct-module.json` — the synth is
     //      replaced in-flight, never persisted.
-    let (manifest, manifest_source) = resolve_manifest_for_install(&db, &module_id)?;
+    let (manifest, manifest_source) = resolve_manifest_for_install(db, module_id)?;
 
     // 3. Host compatibility
     let host_str = project.host.as_str();
@@ -1624,12 +1629,68 @@ pub async fn install_module_for_project(
     }
 
     // 4. License gate
-    if !is_module_licensed(&manifest, &db) {
+    if !is_module_licensed(&manifest, db) {
         return Err(format!(
             "module {} requires a license (variant_ids: {:?} or orchestrator tier >= {})",
             module_id, manifest.license.variant_ids, manifest.license.min_orchestrator_tier
         ));
     }
+
+    // 4a. Dependencies (v0.2.97).
+    dependency_gate(db, project_id, &manifest, "install")?;
+    Ok((project, manifest, manifest_source))
+}
+
+/// The dependency gate shared by install / update / enable: refuses (and
+/// audits the refusal) when a declared `depends_on` module is not there.
+pub(crate) fn dependency_gate(
+    db: &Db,
+    project_id: &str,
+    manifest: &ModuleManifest,
+    action: &str,
+) -> Result<(), String> {
+    vct_launcher_core::module_deps::check_dependencies(db, project_id, manifest, action).map_err(|msg| {
+        let _ = db.audit(
+            "module_dependency_refused",
+            Some(project_id),
+            Some(&manifest.id),
+            &serde_json::json!({
+                "action": action,
+                "depends_on": vct_launcher_core::module_deps::declared_dependencies(manifest),
+                "message": msg,
+            }),
+        );
+        msg
+    })
+}
+
+/// `set_module_enabled_v2`'s gate: enabling a module whose declared
+/// dependency is not installed is refused. Disabling is never gated, and a
+/// module with no manifest on disk declares nothing to check.
+pub(crate) fn enable_dependency_gate(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+    enabled: bool,
+) -> Result<(), String> {
+    if !enabled {
+        return Ok(());
+    }
+    match find_installed_manifest(db, module_id) {
+        Ok((manifest, _)) => dependency_gate(db, project_id, &manifest, "enable"),
+        Err(_) => Ok(()),
+    }
+}
+
+#[command]
+pub async fn install_module_for_project(
+    app: AppHandle,
+    project_id: String,
+    module_id: String,
+    db: State<'_, Db>,
+) -> Result<ModuleInstallRow, String> {
+    // 1-4a. Project, manifest, host, license, dependencies.
+    let (project, manifest, manifest_source) = preflight_install(&db, &project_id, &module_id)?;
 
     // 4b. v0.2.67: re-entrancy backstop. Refuse a second install when one
     // is already in flight for the same module (a reported case showed
@@ -2289,6 +2350,63 @@ pub async fn install_module_for_project(
     }
 }
 
+/// Everything `update_module_for_project` must establish before it runs the
+/// upgrade: the existing install row, the project, the resolved manifest, the
+/// license gate and — v0.2.97 (review R6 round 2) — the `depends_on` gate. The
+/// command gets its manifest ONLY from here.
+pub(crate) fn preflight_update(
+    db: &Db,
+    project_id: &str,
+    module_id: &str,
+) -> Result<(ModuleInstallRow, ModuleManifest, ManifestSource), String> {
+    // 1. Verify the module IS installed.
+    let previous_install = db
+        .get_module_install(project_id, module_id)?
+        .ok_or_else(|| {
+            format!(
+                "module {} not installed for project {}; use install_module_for_project instead",
+                module_id, project_id,
+            )
+        })?;
+
+    // 2. Project exists + manifest lookup.
+    //
+    // v0.2.33 B2: update path uses the same three-phase resolver as
+    // install. In practice the on-disk extracted manifest from the
+    // PRIOR version is already present (we're updating, not first-
+    // installing), so phase 1 wins. The L0-synth phase 3 is a safety
+    // net for the "module_installs row exists but on-disk file went
+    // missing" case (e.g. user manually rm'd ~/.vct/modules/<id>/) —
+    // Agent C's reconciler should mark such rows broken at startup,
+    // but if the row survived we'd rather drive update from L0 than
+    // hard-fail.
+    //
+    // Note: the synth's version will be the L0 CURRENT version, which
+    // is what we want for an update (`installer_engine::run_upgrade`
+    // reads `manifest.version` to pick the new tag). The previous
+    // version stays in `previous_install.module_version` for the
+    // audit row.
+    let _project = db
+        .get_project(project_id)?
+        .ok_or_else(|| format!("project {} not found", project_id))?;
+    let (manifest, manifest_source) = resolve_manifest_for_install(db, module_id)?;
+
+    // 3. License gate (same as install — paid modules require an active
+    //    license at update time too, in case a Pro subscription lapsed
+    //    between install and update).
+    if !is_module_licensed(&manifest, db) {
+        return Err(format!(
+            "module {} requires a license (variant_ids: {:?} or orchestrator tier >= {})",
+            module_id, manifest.license.variant_ids, manifest.license.min_orchestrator_tier
+        ));
+    }
+
+    // 3a. Dependencies (v0.2.97) — a new version may declare one the project
+    //     does not have.
+    dependency_gate(db, project_id, &manifest, "update")?;
+    Ok((previous_install, manifest, manifest_source))
+}
+
 /// v0.2.31 (#20-Fix-3): update an already-installed module to the catalog's
 /// current version WITHOUT forcing the user through an uninstall+reinstall.
 ///
@@ -2331,47 +2449,9 @@ pub async fn update_module_for_project(
     // happens to have visited Modules tab recently" lottery.
     let _ = crate::commands::module_catalog_client::cached_module_catalog(&db).await;
 
-    // 1. Verify the module IS installed.
-    let previous_install = db
-        .get_module_install(&project_id, &module_id)?
-        .ok_or_else(|| {
-            format!(
-                "module {} not installed for project {}; use install_module_for_project instead",
-                module_id, project_id,
-            )
-        })?;
-
-    // 2. Project exists + manifest lookup.
-    //
-    // v0.2.33 B2: update path uses the same three-phase resolver as
-    // install. In practice the on-disk extracted manifest from the
-    // PRIOR version is already present (we're updating, not first-
-    // installing), so phase 1 wins. The L0-synth phase 3 is a safety
-    // net for the "module_installs row exists but on-disk file went
-    // missing" case (e.g. user manually rm'd ~/.vct/modules/<id>/) —
-    // Agent C's reconciler should mark such rows broken at startup,
-    // but if the row survived we'd rather drive update from L0 than
-    // hard-fail.
-    //
-    // Note: the synth's version will be the L0 CURRENT version, which
-    // is what we want for an update (`installer_engine::run_upgrade`
-    // reads `manifest.version` to pick the new tag). The previous
-    // version stays in `previous_install.module_version` for the
-    // audit row.
-    let _project = db
-        .get_project(&project_id)?
-        .ok_or_else(|| format!("project {} not found", project_id))?;
-    let (manifest, manifest_source) = resolve_manifest_for_install(&db, &module_id)?;
-
-    // 3. License gate (same as install — paid modules require an active
-    //    license at update time too, in case a Pro subscription lapsed
-    //    between install and update).
-    if !is_module_licensed(&manifest, &db) {
-        return Err(format!(
-            "module {} requires a license (variant_ids: {:?} or orchestrator tier >= {})",
-            module_id, manifest.license.variant_ids, manifest.license.min_orchestrator_tier
-        ));
-    }
+    // 1-3a. Install row, project, manifest, license, dependencies.
+    let (previous_install, manifest, manifest_source) =
+        preflight_update(&db, &project_id, &module_id)?;
 
     db.audit(
         "module_update_start",
@@ -3160,6 +3240,7 @@ pub async fn set_module_enabled_v2(
     enabled: bool,
     db: State<'_, Db>,
 ) -> Result<(), String> {
+    enable_dependency_gate(&db, &project_id, &module_id, enabled)?;
     db.set_module_enabled(&project_id, &module_id, enabled)?;
     db.audit(
         "module_enabled_toggle",
@@ -5609,5 +5690,96 @@ mod tests {
             for_pair, 1,
             "exactly one install row for the pair — no duplicate spawned",
         );
+    }
+
+    // ─── v0.2.97 (review R6 round 2): the `depends_on` gate ──────────────
+
+    fn write_dep_manifest(state: &std::path::Path, id: &str, deps: &[&str]) {
+        let dir = state.join("modules").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        let json = serde_json::json!({
+            "manifest_version": 1,
+            "id": id,
+            "name": id,
+            "version": "1.0.0",
+            "description": "fixture",
+            "category": "paid-independent",
+            "license": {"required": false, "min_orchestrator_tier": "free"},
+            "compatibility": {"hosts": ["base"]},
+            "requirements": {"depends_on": deps},
+            "install": {"method": "local"},
+            "runtime": {"type": "cli"}
+        });
+        std::fs::write(dir.join("vct-module.json"), json.to_string()).unwrap();
+    }
+
+    fn db_with_dep_project() -> Db {
+        let db = open_db();
+        db.insert_project("p-dep", "Dep", "/tmp/p-dep", ProjectHost::Base, "p-dep").unwrap();
+        db
+    }
+
+    /// REFUSE: the install preflight — the only source of the manifest the
+    /// install command uses — refuses a module whose dependency is absent,
+    /// names it, audits the refusal, and writes no install row.
+    #[test]
+    fn install_preflight_refuses_a_missing_dependency() {
+        let (_lock, tmp) = isolate_state();
+        let db = db_with_dep_project();
+        write_dep_manifest(tmp.path(), "vct-needs-dep", &["vct-kg", "vct-dep"]);
+        let err = preflight_install(&db, "p-dep", "vct-needs-dep").unwrap_err();
+        assert!(err.contains("cannot install vct-needs-dep") && err.contains("vct-dep"), "{}", err);
+        assert!(!err.contains("vct-kg,"), "a bundled dependency is never missing: {}", err);
+        assert!(db.get_module_install("p-dep", "vct-needs-dep").unwrap().is_none());
+        assert!(db.get_module_install("p-dep", "vct-dep").unwrap().is_none(), "never installed on the user's behalf");
+    }
+
+    /// ACT: with the dependency installed (or only bundled ones declared),
+    /// the preflight passes and returns the manifest.
+    #[test]
+    fn install_preflight_passes_once_the_dependency_is_installed() {
+        let (_lock, tmp) = isolate_state();
+        let db = db_with_dep_project();
+        write_dep_manifest(tmp.path(), "vct-needs-dep", &["vct-kg", "vct-dep"]);
+        db.insert_module_install("i-dep", "p-dep", "vct-dep", "1.0.0", "/x").unwrap();
+        db.set_module_status("p-dep", "vct-dep", ModuleStatus::Installed, None).unwrap();
+        let (_project, manifest, _src) = preflight_install(&db, "p-dep", "vct-needs-dep").unwrap();
+        assert_eq!(manifest.id, "vct-needs-dep");
+
+        write_dep_manifest(tmp.path(), "vct-bundled-only", &["vct-kg", "vct-code-embedding"]);
+        assert!(preflight_install(&db, "p-dep", "vct-bundled-only").is_ok());
+    }
+
+    /// Enable is gated the same way; disable never is; a module with no
+    /// manifest on disk declares nothing to check.
+    #[test]
+    fn enable_gate_refuses_enabling_without_the_dependency_only() {
+        let (_lock, tmp) = isolate_state();
+        let db = db_with_dep_project();
+        write_dep_manifest(tmp.path(), "vct-needs-dep", &["vct-dep"]);
+        let err = enable_dependency_gate(&db, "p-dep", "vct-needs-dep", true).unwrap_err();
+        assert!(err.contains("cannot enable vct-needs-dep") && err.contains("vct-dep"), "{}", err);
+        assert!(enable_dependency_gate(&db, "p-dep", "vct-needs-dep", false).is_ok());
+        assert!(enable_dependency_gate(&db, "p-dep", "vct-no-manifest", true).is_ok());
+        db.insert_global_module_install("g-dep", "vct-dep", "1.0.0", "/g").unwrap();
+        db.set_global_module_status("vct-dep", ModuleStatus::Running, None).unwrap();
+        assert!(enable_dependency_gate(&db, "p-dep", "vct-needs-dep", true).is_ok());
+    }
+
+    /// Update is gated too: a new version that declares a dependency the
+    /// project does not have is refused before any upgrade runs.
+    #[test]
+    fn update_preflight_refuses_a_missing_dependency_and_passes_with_it() {
+        let (_lock, tmp) = isolate_state();
+        let db = db_with_dep_project();
+        write_dep_manifest(tmp.path(), "vct-needs-dep", &["vct-dep"]);
+        db.insert_module_install("i-m", "p-dep", "vct-needs-dep", "0.9.0", "/m").unwrap();
+        db.set_module_status("p-dep", "vct-needs-dep", ModuleStatus::Installed, None).unwrap();
+        let err = preflight_update(&db, "p-dep", "vct-needs-dep").unwrap_err();
+        assert!(err.contains("cannot update vct-needs-dep") && err.contains("vct-dep"), "{}", err);
+        db.insert_module_install("i-dep", "p-dep", "vct-dep", "1.0.0", "/x").unwrap();
+        db.set_module_status("p-dep", "vct-dep", ModuleStatus::Stopped, None).unwrap();
+        let (previous, manifest, _src) = preflight_update(&db, "p-dep", "vct-needs-dep").unwrap();
+        assert_eq!((previous.module_version.as_str(), manifest.version.as_str()), ("0.9.0", "1.0.0"));
     }
 }

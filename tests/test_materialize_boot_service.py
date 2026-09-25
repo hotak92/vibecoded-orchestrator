@@ -135,7 +135,7 @@ def test_no_compose_working_dir_resolved_skips_oses(tmp_path, monkeypatch):
     monkeypatch.setattr(install, "PROJECT_ROOT", tmp_path)
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
-    # Empty install dir → no claude_mcp_servers, no infrastructure → None
+    # Empty install dir → no infrastructure/ → None
     empty_install = tmp_path / "empty"
     empty_install.mkdir()
     install._materialize_boot_service(empty_install, None, _ns())
@@ -169,7 +169,7 @@ def test_linux_materializes_systemd_unit_when_systemctl_present(
     monkeypatch.setattr(install.platform, "system", lambda: "Linux")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     (install_path / "scripts").mkdir()
     (install_path / "scripts" / "launch-claude-mcp-stack.sh").write_text("#!/bin/bash\n")
 
@@ -186,7 +186,7 @@ def test_linux_materializes_systemd_unit_when_systemctl_present(
     assert unit.is_file(), "systemd unit should be written"
     body = unit.read_text()
     # Substitutions landed.
-    assert str(install_path / "claude_mcp_servers") in body
+    assert str(install_path / "infrastructure") in body
     assert "launch-claude-mcp-stack.sh" in body
     # systemctl invocations fired.
     cmd_strs = [" ".join(c) for c in calls]
@@ -203,7 +203,7 @@ def test_linux_skips_systemctl_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "system", lambda: "Linux")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -224,7 +224,7 @@ def test_linux_idempotent_rewrite(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "system", lambda: "Linux")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -252,7 +252,7 @@ def test_macos_materializes_launchagent_plist(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "system", lambda: "Darwin")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -278,7 +278,7 @@ def test_macos_skips_launchctl_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "system", lambda: "Darwin")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -304,7 +304,7 @@ def test_windows_materializes_task_xml(tmp_path, monkeypatch):
     monkeypatch.setenv("USERNAME", "tester")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -327,7 +327,7 @@ def test_windows_skips_schtasks_when_missing(tmp_path, monkeypatch):
     monkeypatch.setattr(install.platform, "system", lambda: "Windows")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
 
     calls = []
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log(calls))
@@ -337,51 +337,6 @@ def test_windows_skips_schtasks_when_missing(tmp_path, monkeypatch):
     # XML is still materialized as an audit artefact.
     assert (install_path / "state" / "installed_boot_task.xml").is_file()
     assert calls == []
-
-
-# ---------------------------------------------------------------------------
-# _probe_compose_working_dir_via_ps — soft-fail
-# ---------------------------------------------------------------------------
-
-
-def test_probe_ps_returns_none_when_runtime_missing(monkeypatch):
-    monkeypatch.setattr(install.shutil, "which", lambda _: None)
-    assert install._probe_compose_working_dir_via_ps("podman") is None
-
-
-def test_probe_ps_returns_none_on_empty_string(monkeypatch):
-    assert install._probe_compose_working_dir_via_ps("") is None
-
-
-def test_probe_ps_returns_none_on_failure(monkeypatch):
-    monkeypatch.setattr(install.shutil, "which", lambda _: "/usr/bin/podman")
-    def run(*a, **kw):
-        return types.SimpleNamespace(returncode=1, stdout="", stderr="boom")
-    monkeypatch.setattr(install.subprocess, "run", run)
-    assert install._probe_compose_working_dir_via_ps("podman") is None
-
-
-def test_probe_ps_parses_label(monkeypatch, tmp_path):
-    monkeypatch.setattr(install.shutil, "which", lambda _: "/usr/bin/podman")
-    label = "/home/u/code/orch/claude_mcp_servers"
-    def run(*a, **kw):
-        return types.SimpleNamespace(returncode=0, stdout=label + "\n", stderr="")
-    monkeypatch.setattr(install.subprocess, "run", run)
-    assert install._probe_compose_working_dir_via_ps("podman") == label
-
-
-def test_probe_ps_handles_multiline_output(monkeypatch):
-    """`podman ps` may emit one line per container — take the first
-    non-empty value."""
-    monkeypatch.setattr(install.shutil, "which", lambda _: "/usr/bin/podman")
-    def run(*a, **kw):
-        return types.SimpleNamespace(
-            returncode=0,
-            stdout="\n/tmp/first\n/tmp/second\n",
-            stderr="",
-        )
-    monkeypatch.setattr(install.subprocess, "run", run)
-    assert install._probe_compose_working_dir_via_ps("podman") == "/tmp/first"
 
 
 # ---------------------------------------------------------------------------
@@ -403,7 +358,7 @@ def test_internal_exception_does_not_propagate(tmp_path, monkeypatch):
     to re-run on any developer's box.
     """
     monkeypatch.setattr(install, "PROJECT_ROOT", Path(__file__).resolve().parent.parent)
-    (tmp_path / "claude_mcp_servers").mkdir()
+    (tmp_path / "infrastructure").mkdir()
     monkeypatch.setattr(install.platform, "system", lambda: "Linux")
 
     def boom(*a, **kw):
@@ -469,7 +424,7 @@ def test_dispatcher_never_writes_to_real_user_systemd_dir(tmp_path, monkeypatch)
     monkeypatch.setattr(install, "PROJECT_ROOT", Path(__file__).resolve().parent.parent)
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     monkeypatch.setattr(install.platform, "system", lambda: "Linux")
     monkeypatch.setattr(install.subprocess, "run", _fake_run_log([]))
     monkeypatch.setattr(install.shutil, "which", _fake_which({"systemctl", "loginctl"}))

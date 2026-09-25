@@ -1931,6 +1931,7 @@ mod tests {
     /// prune of a long-neglected corpus. Successive passes drain the rest.
     #[test]
     fn prune_is_incremental_and_drains_oldest_first() {
+        let _env_lock = crate::test_env::env_lock();
         let db = fresh_db();
         let arch = tmp_archive();
         let key = super::RL_PRUNE_MAX_TASKS_ENV;
@@ -1970,6 +1971,7 @@ mod tests {
     /// launcher.db in the resolved state dir.
     #[test]
     fn archive_dir_env_override_and_default() {
+        let _env_lock = crate::test_env::env_lock();
         let key = super::RL_ARCHIVE_DIR_ENV;
         let prev = std::env::var(key).ok();
         std::env::set_var(key, "/tmp/vco-test-archive-dir");

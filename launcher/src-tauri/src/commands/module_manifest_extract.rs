@@ -493,7 +493,7 @@ fn which_python() -> Option<String> {
 mod tests {
     use super::*;
     use std::fs;
-    use vct_launcher_core::test_env::state_dir_guard;
+    use vct_launcher_core::test_env::state_dir_guard_with;
 
     // v0.2.92: the file-local `SERIALIZE` mutex is GONE. Every test
     // that took it also redirects `VCT_STATE_DIR`, and
@@ -623,50 +623,32 @@ esac
         tmp.to_path_buf()
     }
 
-    /// Prepend `dir` to PATH for the lifetime of the returned guard.
-    /// Restores PATH on drop so other tests aren't affected (even
-    /// though SERIALIZE already excludes that race).
-    struct PathGuard {
-        prev: Option<String>,
-    }
-    impl Drop for PathGuard {
-        fn drop(&mut self) {
-            match &self.prev {
-                Some(v) => std::env::set_var("PATH", v),
-                None => std::env::remove_var("PATH"),
-            }
-        }
-    }
-    fn push_path(dir: &Path) -> PathGuard {
-        let prev = std::env::var("PATH").ok();
-        let new_path = match &prev {
-            Some(p) => format!("{}:{}", dir.display(), p),
-            None => dir.display().to_string(),
-        };
-        std::env::set_var("PATH", new_path);
-        PathGuard { prev }
+    /// The fake runtime by ABSOLUTE path — `extract_manifest_from_image`
+    /// spawns `runtime` as given, so no PATH lookup is involved. v0.2.97
+    /// review R6: these tests used to prepend `dir` to the PROCESS PATH,
+    /// which every concurrently running test (and every child spawned by
+    /// bare name) shares.
+    fn fake_runtime(dir: &Path) -> String {
+        dir.join("podman").display().to_string()
     }
 
-    /// Set every behaviour-control env var to a known baseline so
-    /// previous tests can't leak state.
-    fn reset_fake_env() {
-        for k in [
-            "FAKE_PODMAN_MODE",
-            "FAKE_PODMAN_MANIFEST_BODY",
-            "FAKE_PODMAN_CP_STDERR",
-            "FAKE_PODMAN_CID",
-            "VCT_TEST_CLEANUP_COUNTER_FILE",
-        ] {
-            std::env::remove_var(k);
-        }
-    }
+    /// Every behaviour-control env var unset — the baseline each test starts
+    /// from, applied by `state_dir_guard_with` (which holds GLOBAL_ENV_MUTEX
+    /// and restores the prior values when the test's guard drops; v0.2.97
+    /// review R6: a hand-rolled reset used to run before the lock was taken).
+    const FAKE_ENV_BASELINE: &[(&str, Option<&str>)] = &[
+        ("FAKE_PODMAN_MODE", None),
+        ("FAKE_PODMAN_MANIFEST_BODY", None),
+        ("FAKE_PODMAN_CP_STDERR", None),
+        ("FAKE_PODMAN_CID", None),
+        ("VCT_TEST_CLEANUP_COUNTER_FILE", None),
+    ];
 
     #[tokio::test]
     async fn extract_manifest_happy_path() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         let body = minimal_manifest_json("vct-test-mod", "0.1.0");
         std::env::set_var("FAKE_PODMAN_MODE", "create_ok");
@@ -675,7 +657,7 @@ esac
         let out = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect("happy path must succeed");
@@ -690,15 +672,13 @@ esac
             .join("vct-module.json");
         assert_eq!(out.on_disk_path, expected);
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_image_missing_file() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         std::env::set_var("FAKE_PODMAN_MODE", "cp_missing");
         std::env::set_var(
@@ -709,7 +689,7 @@ esac
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("missing file must error");
@@ -720,15 +700,13 @@ esac
             err
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_invalid_json() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         std::env::set_var("FAKE_PODMAN_MODE", "cp_garbage");
         // Garbage that serde_json will refuse.
@@ -737,7 +715,7 @@ esac
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("garbage must error");
@@ -748,15 +726,13 @@ esac
             err
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_id_mismatch() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         let body = minimal_manifest_json("vct-other-mod", "0.1.0");
         std::env::set_var("FAKE_PODMAN_MODE", "cp_mismatch");
@@ -765,7 +741,7 @@ esac
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-other-mod:0.1.0",
             "vct-expected-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("id mismatch must error");
@@ -776,15 +752,13 @@ esac
             err
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_atomic_bak_rollback_on_rename_failure() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         // Pre-create a previous manifest at the final path. We then
         // trigger a rename failure by deleting the tmpdir's parent
@@ -817,7 +791,7 @@ esac
         let out = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect("upgrade-shaped extract must succeed");
@@ -842,15 +816,13 @@ esac
             ".bak must hold the pre-rename manifest body"
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_cleans_up_tmp_dir_on_success() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         let body = minimal_manifest_json("vct-test-mod", "0.1.0");
         std::env::set_var("FAKE_PODMAN_MODE", "create_ok");
@@ -859,7 +831,7 @@ esac
         let _out = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect("happy path must succeed");
@@ -875,15 +847,13 @@ esac
             tmp_dir.display()
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_cleans_up_container_on_drop() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         // The cleanup-counter file is the spy hook. ContainerCleanup::drop
         // appends `<runtime>:<cid>\n` to it instead of spawning the
@@ -903,7 +873,7 @@ esac
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-other-mod:0.1.0",
             "vct-expected-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("id mismatch must error");
@@ -922,22 +892,20 @@ esac
             log
         );
 
-        reset_fake_env();
     }
 
     #[tokio::test]
     async fn extract_manifest_create_failure_surfaces_stderr() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         std::env::set_var("FAKE_PODMAN_MODE", "create_fail");
 
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("create-fail mode must error");
@@ -952,7 +920,6 @@ esac
             err
         );
 
-        reset_fake_env();
     }
 
     /// V52-D.3: when the extracted manifest carries the pre-v0.2.49
@@ -971,8 +938,7 @@ esac
     /// reachable and the test runs; otherwise we skip cleanly.
     #[tokio::test]
     async fn v0252_d3_extract_rejects_bug_e_manifest() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
 
         // Self-gate: can we reach the sanitizer? Probe by running
         // the CLI against a known-bad manifest in the tempdir.
@@ -1010,7 +976,7 @@ esac
         }
 
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         // Build a manifest that PARSES through ModuleManifest::from_json
         // (so Step 4 passes) but the Python sanitizer rejects at
@@ -1050,7 +1016,7 @@ esac
         let err = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect_err("Bug E manifest must be rejected by V52-D.3 sanitizer");
@@ -1088,7 +1054,6 @@ esac
         }
 
         std::env::remove_var("PYTHONPATH");
-        reset_fake_env();
     }
 
     /// V52-D.3: `VCT_MANIFEST_SANITIZER_BYPASS=1` short-circuits the
@@ -1097,10 +1062,9 @@ esac
     /// through the pipeline.
     #[tokio::test]
     async fn v0252_d3_extract_bypass_env_skips_sanitizer() {
-        reset_fake_env();
-        let tmp = state_dir_guard();
+        let tmp = state_dir_guard_with(FAKE_ENV_BASELINE);
         let bin = install_fake_podman(tmp.path());
-        let _p = push_path(&bin);
+        let runtime = fake_runtime(&bin);
 
         let body = minimal_manifest_json("vct-test-mod", "0.1.0");
         std::env::set_var("FAKE_PODMAN_MODE", "create_ok");
@@ -1114,13 +1078,12 @@ esac
         let out = extract_manifest_from_image(
             "ghcr.io/test/vct-test-mod:0.1.0",
             "vct-test-mod",
-            "podman",
+            &runtime,
         )
         .await
         .expect("bypass + good manifest must succeed");
         assert_eq!(out.parsed.id, "vct-test-mod");
 
         std::env::remove_var("VCT_MANIFEST_SANITIZER_BYPASS");
-        reset_fake_env();
     }
 }

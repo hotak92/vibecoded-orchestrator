@@ -4,7 +4,7 @@ description: Coordinates multi-channel incident response for a consulting engage
 short_desc: "client incident comms, war-room, and post-mortems"
 keywords: ["client incident", "war-room update", "client comms", "post-incident review", "consulting incident", "incident review", "client outage", "coordinate client incident", "client incident response", "update the client about", "incident communication"]
 model: opus
-effort: high
+effort: medium
 argument-hint: "[incident-slug-or-description] [--phase active|stabilising|review]"
 ---
 

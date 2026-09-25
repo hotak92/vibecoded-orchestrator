@@ -200,6 +200,21 @@ pub fn read_token_file(path: &Path) -> Result<String, String> {
     Ok(raw.trim().to_string())
 }
 
+/// [`read_token_file`], refusing an EMPTY token: for a caller about to
+/// present it as a bearer (the launcher's hub clients read `hub.token` fresh
+/// per call so a hub restart's rotated token propagates). A missing, unreadable
+/// or empty file is an error naming the path — "hub not reachable" upstream.
+///
+/// v0.2.97 (lane T): `commands::hub_proxy`, `commands::module_service` and
+/// `commands::secrets_cmd` each carried this read + trim + empty check.
+pub fn read_nonempty_token_file(path: &Path) -> Result<String, String> {
+    let token = read_token_file(path)?;
+    if token.is_empty() {
+        return Err(format!("{} is empty", path.display()));
+    }
+    Ok(token)
+}
+
 /// Constant-time compare of two byte slices.
 ///
 /// Returns true iff slices are byte-equal. The accumulator pattern
@@ -274,6 +289,17 @@ mod tests {
         let path = dir.path().join("nested").join("x.token");
         write_token_file(&path, "abc123").unwrap();
         assert_eq!(read_token_file(&path).unwrap(), "abc123");
+    }
+
+    #[test]
+    fn read_nonempty_token_file_refuses_missing_and_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hub.token");
+        assert!(read_nonempty_token_file(&path).unwrap_err().starts_with("read "));
+        std::fs::write(&path, " \n").unwrap();
+        assert!(read_nonempty_token_file(&path).unwrap_err().ends_with("is empty"));
+        std::fs::write(&path, "tok\n").unwrap();
+        assert_eq!(read_nonempty_token_file(&path).unwrap(), "tok");
     }
 
     #[test]

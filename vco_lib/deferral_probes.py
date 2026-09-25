@@ -159,17 +159,53 @@ def upstream_sidecar_paths(entry: Any) -> tuple[str, ...]:
     return tuple(sorted(found))
 
 
+def is_rendered_file_sidecar(rel_path: str) -> bool:
+    """True when ``rel_path`` is a ``.from-upstream-`` sidecar of a RENDERED file.
+
+    v0.2.97. A rendered root file (``vco_lib/rendered_root_files.toml`` —
+    ``CLAUDE.md`` today) is materialized by install.py from its template, and
+    upstream's tracked copy is only the placeholder saying so. A sidecar of it
+    therefore holds nothing to adopt — adopting it would REPLACE the rendered
+    file with the placeholder — so it is not outstanding work. The launcher no
+    longer writes one, and install.py's re-render reaps the ones older
+    launchers parked (``rendered_root_files.reap_stale_sidecars``); this is the
+    probe-side half, so such a sidecar can never keep the entry alive.
+
+    The name rule is the reap's own (``rendered_root_files.is_rendered_sidecar_path``),
+    never re-stated here.
+    """
+    from vco_lib.rendered_root_files import is_rendered_sidecar_path
+
+    return is_rendered_sidecar_path(rel_path)
+
+
+def adoptable_upstream_sidecar_paths(entry: Any) -> tuple[str, ...]:
+    """:func:`upstream_sidecar_paths` minus sidecars of RENDERED files.
+
+    The set whose disappearance is the condition's lifecycle: see
+    :func:`is_rendered_file_sidecar` for why a rendered file's sidecar is not
+    in it.
+    """
+    return tuple(
+        p for p in upstream_sidecar_paths(entry) if not is_rendered_file_sidecar(p)
+    )
+
+
 def dismiss_fields_for_sidecars(entry: Any) -> dict:
     """``dismiss_key`` payload for ``orchestrator_user_modified_preserved``.
 
     Same extractor as the clear probe, so a dismissal is keyed on exactly the
     set of sidecars whose disappearance would have cleared the entry anyway.
     """
-    return {"preserved_sidecars": list(upstream_sidecar_paths(entry))}
+    return {"preserved_sidecars": list(adoptable_upstream_sidecar_paths(entry))}
 
 
 def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
-    """Bounded, read-only sweep: does ANY ``*.from-upstream-*`` file exist?
+    """Bounded, read-only sweep: does ANY adoptable ``*.from-upstream-*`` file exist?
+
+    "Adoptable" excludes a RENDERED file's sidecar (v0.2.97, see
+    :func:`is_rendered_file_sidecar`): it holds nothing to adopt, so its
+    presence is not outstanding work and must not keep an entry alive.
 
     The fallback for an entry that names no sidecar paths of its own — the
     LEGACY shape this probe could not otherwise touch (an entry written before
@@ -202,7 +238,9 @@ def any_upstream_sidecar_on_disk(root: Path) -> Optional[bool]:
             visited += len(dirnames) + len(filenames)
             for name in filenames:
                 if ".from-upstream-" in name:
-                    return True
+                    rel = Path(os.path.relpath(os.path.join(dirpath, name), root))
+                    if not is_rendered_file_sidecar(rel.as_posix()):
+                        return True
             if visited > _SIDECAR_SCAN_MAX_ENTRIES:
                 return None
     except OSError:
@@ -375,8 +413,16 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     the complete-list arm ends in the SAME bounded sweep the list-less arm
     uses: every sidecar this condition can create is accounted for, not the
     subset one entry happened to name.
+
+    v0.2.97 — RENDERED files. Both arms look only at ADOPTABLE sidecars
+    (:func:`adoptable_upstream_sidecar_paths`, and the same exclusion inside
+    the sweep). A ``CLAUDE.md.from-upstream-<sha>`` is upstream's placeholder
+    for a file install.py renders; it was never work the user owed, so an
+    entry naming only such sidecars clears (the field case above: both
+    ``CLAUDE.md`` sidecars were of this kind), while any genuine sidecar still
+    keeps the entry exactly as before.
     """
-    paths = upstream_sidecar_paths(ctx.entry)
+    paths = adoptable_upstream_sidecar_paths(ctx.entry)
     if not paths:
         return any_upstream_sidecar_on_disk(ctx.folder)
     try:
@@ -615,6 +661,85 @@ def kg_binding_evidence_still_mismatched(ctx: ProbeContext) -> Optional[bool]:
     return bool(scan.mismatches)
 
 
+def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``parked_hook_live_conflict`` — is a launcher-parked hook still running?
+
+    A thin wrapper over :func:`vco_lib.parked_hooks.conflict_still_present`,
+    the SAME detection the bundle update emits from, so the probe can never
+    clear an entry the next update would re-emit. ``None`` when launcher.db or
+    settings.json cannot be read.
+    """
+    from vco_lib.parked_hooks import conflict_still_present
+
+    try:
+        return conflict_still_present(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def user_owned_secret_values_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``user_owned_secret_value_in_tree`` — does a user-put secret-shaped key
+    still carry a value? The SAME detection the emitter uses
+    (:func:`vco_lib.user_owned_secrets.found`); ``None`` on any failure."""
+    from vco_lib.user_owned_secrets import still_present
+
+    try:
+        return still_present(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def settings_write_refusal_still_applies(ctx: ProbeContext) -> Optional[bool]:
+    """``settings_write_refused_*`` — is the refused settings file still unfit?
+
+    A thin wrapper over :func:`vco_lib.settings_refusal.refusal_still_applies`,
+    the SAME read the writers refuse on, so the probe can never clear an entry
+    the next write would re-emit. It reads the path the emitter recorded in
+    ``dismiss_fields`` — ``None`` when an entry carries none (a Markdown-only
+    ledger).
+    """
+    from vco_lib.settings_refusal import refusal_still_applies
+
+    try:
+        return refusal_still_applies(Path(ctx.folder), ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def bash_env_cleanup_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``legacy_bash_env_cleanup_pending`` — does settings.json still carry the
+    legacy lean-ctx ``BASH_ENV`` pointer (or stay unreadable)?
+
+    A thin wrapper over :func:`vco_lib.project_init.legacy_bash_env_still_owed`,
+    which uses the cleanup's own read (``settings_refusal.load_for_edit``) and
+    shim rule, so the probe cannot clear what the next cleanup would re-emit.
+    """
+    from vco_lib.project_init import legacy_bash_env_still_owed
+
+    try:
+        return legacy_bash_env_still_owed(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def env_reprojection_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``project_move_env_reprojection_failed`` — are the env surfaces still stale?
+
+    A thin wrapper over :func:`vco_lib.project_move.env_reprojection_still_owed`,
+    which compares ``.claude/settings.json`` / ``.claude/env`` against what
+    ``config_projection apply`` derives from the project's current row — the
+    same comparison ``vco project move --verify`` clears on. It reads the
+    project id the emitter recorded in ``dismiss_fields``; ``None`` when the
+    entry carries none, or the database / settings file cannot be read.
+    """
+    from vco_lib.project_move import env_reprojection_still_owed as still_owed
+
+    try:
+        return still_owed(Path(ctx.folder), ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``kg_unclaimed_populated_classes`` — is unclaimed data still unclaimed?
 
@@ -643,6 +768,78 @@ def kg_unclaimed_classes_still_present(ctx: ProbeContext) -> Optional[bool]:
     if scan is None:
         return None
     return bool(scan.unclaimed)
+
+
+def service_endpoint_still_unreachable(ctx: ProbeContext) -> Optional[bool]:
+    """``service_endpoint_unreachable`` — do the named rows still not answer?
+
+    The SAME probe the emitter uses (``service_reconcile.probe_unreachable``
+    → ``service_detection.probe_endpoint`` on the row's URL). True: one still
+    does not answer; False: every named service answers; None: no rows /
+    no service named (could not look)."""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_unreachable(ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def service_endpoint_still_ambiguous(ctx: ProbeContext) -> Optional[bool]:
+    """``service_endpoint_ambiguous`` — do several instances still hold VCO
+    data for a row the user has not confirmed?"""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_ambiguous(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def adopted_service_config_drift_persists(ctx: ProbeContext) -> Optional[bool]:
+    """``adopted_service_config_drift`` — does an adopted container still lack
+    VCO's behaviour-critical env? Read from ``inspect`` (no container, no
+    runtime ⇒ None)."""
+    from vco_lib import service_reconcile
+
+    try:
+        root = Path(__file__).resolve().parent.parent
+        return service_reconcile.probe_config_drift(ctx.entry, orchestrator_root=root)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def service_adoption_confirmation_still_pending(ctx: ProbeContext) -> Optional[bool]:
+    """``service_adoption_confirmation_required`` — is the Weaviate row still
+    the disabled, awaiting-a-choice shape?"""
+    from vco_lib import service_reconcile
+
+    try:
+        return service_reconcile.probe_confirmation_pending(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def container_runtime_still_unusable(ctx: ProbeContext) -> Optional[bool]:
+    """``container_runtime_unusable`` — does the pin still resolve to nothing?
+    One home for the rule: :func:`vco_lib.runtime_reconcile.unusable_still_applies`."""
+    from vco_lib import runtime_reconcile
+
+    try:
+        return runtime_reconcile.unusable_still_applies(ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def container_runtime_data_still_under_both(ctx: ProbeContext) -> Optional[bool]:
+    """``container_runtime_data_under_both`` — do both runtimes still hold VCO
+    data for a record the user has not confirmed?"""
+    from vco_lib import runtime_reconcile
+
+    try:
+        return runtime_reconcile.data_still_under_both(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
 
 
 #: name → probe. Referenced from the registry as ``probe:py:<name>``.
@@ -719,6 +916,27 @@ def gateway_exec_still_unrunnable(ctx: ProbeContext) -> Optional[bool]:
     ):
         return False
     return None
+
+
+def former_launcher_cli_still_on_path(ctx: ProbeContext) -> Optional[bool]:
+    """``former_launcher_cli_on_path`` — is an old copy of the launcher CLI
+    still there?
+
+    The doctor's own reading (:mod:`vco_lib.launcher_cli_identity`). The paths
+    the entry named are re-checked BY PATH first, so a caller whose PATH
+    differs from the user's shell cannot clear an entry for a copy that is
+    still on disk; then the current PATH is scanned for any other copy.
+
+    Returns True while any copy remains, False when none does, None when the
+    reading could not run.
+    """
+    from vco_lib import launcher_cli_identity as identity
+
+    try:
+        recorded = identity.paths_in_remedy(getattr(ctx.entry, "command_to_apply", "") or "")
+        return identity.still_present(recorded)
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
 
 
 #: Socket timeout for the hub health read. Mirrors the timeout
@@ -832,6 +1050,7 @@ def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
 
 
 PROBES: dict[str, ProbeFn] = {
+    "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
     "chunker_resync_still_owed": chunker_resync_still_owed,
     "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
     "hub_back_after_restart_failure": hub_back_after_restart_failure,
@@ -839,9 +1058,20 @@ PROBES: dict[str, ProbeFn] = {
     "launcher_dist_still_dirty": launcher_dist_still_dirty,
     "launcher_binary_stale_still_applies": launcher_binary_stale_still_applies,
     "disk_space_still_low": disk_space_still_low,
+    "env_reprojection_still_owed": env_reprojection_still_owed,
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
+    "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
+    "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
+    "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,
+    "former_launcher_cli_still_on_path": former_launcher_cli_still_on_path,
+    "service_endpoint_still_unreachable": service_endpoint_still_unreachable,
+    "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
+    "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
+    "service_adoption_confirmation_still_pending": service_adoption_confirmation_still_pending,
+    "container_runtime_still_unusable": container_runtime_still_unusable,
+    "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
 }
 
 
@@ -1395,11 +1625,13 @@ __all__ = [
     "ProbeContext",
     "ProbeFn",
     "ProbePass",
+    "adoptable_upstream_sidecar_paths",
     "any_upstream_sidecar_on_disk",
     "apply_probe_statuses",
     "clear_mechanism_sentence",
     "dismiss_fields_for_sidecars",
     "format_probe_pass_summary",
+    "is_rendered_file_sidecar",
     "owned_record_is_expirable",
     "probe_report",
     "probe_status_sentence",

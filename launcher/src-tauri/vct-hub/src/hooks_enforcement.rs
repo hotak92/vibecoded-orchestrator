@@ -16,7 +16,7 @@
 //!
 //!   * `PATCH /api/v1/projects/{project_id}/hooks/{hook_id}` (`project_state_api`)
 //!   * `PATCH /api/v1/cli/hooks/{hook_id}/enabled` (`cli_api`), reachable
-//!     from the shipped `vco hooks enable/disable <id> --project <p>` CLI
+//!     from the shipped `vct-cli hooks enable/disable <id> --project <p>` CLI
 //!     (`launcher/tools/vct-cli`)
 //!
 //! Both silently did nothing to what actually runs — the review evidence
@@ -139,8 +139,7 @@ fn project_folder(db: &Db, project_id: &str) -> Result<PathBuf, HookEnforceError
 }
 
 fn orchestrator_root() -> Result<PathBuf, HookEnforceError> {
-    vct_launcher_core::orchestrator_manifest::find_orchestrator_manifest()
-        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+    vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
         .ok_or_else(|| {
             refuse(
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -497,7 +496,14 @@ mod tests {
             .await
             .expect("enable must succeed");
 
-        assert_eq!(f.raw(), before, "re-enable restores the exact original bytes");
+        // Byte-for-byte, except the deliberate v0.2.97 change: a VCO-shipped
+        // hook parked in the RELATIVE form comes back anchored at the project
+        // root (`vco_lib.hooks_settings.insert_hook`).
+        assert_eq!(
+            f.raw(),
+            before.replace(r#""bash .claude/hooks/notify-stop.sh""#, r#""bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh\"""#),
+            "re-enable restores the original bytes, the hook path anchored"
+        );
         assert_eq!(
             f.db
                 .get_parked_project_hook_entry(&f.pid, "Stop", "", "bash .claude/hooks/notify-stop.sh")
@@ -590,6 +596,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     #[serial_test::serial]
     async fn hooks_cli_spawns_the_ladders_resolved_interpreter_not_a_bare_path_lookup() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         use std::os::unix::fs::PermissionsExt;
 
         let venv_dir = tempfile::TempDir::new().unwrap();

@@ -1086,8 +1086,10 @@ class HookMergeSupersedeTests(unittest.TestCase):
         )
 
     def test_identity_resolves_after_disable_guard_prefix(self):
-        # The VCO disable-guard prefix is the real shipped shape — `bash` after
-        # the `||` IS the interpreter, so the hook path resolves.
+        # The VCO disable-guard prefix is the pre-v0.2.97 shipped shape —
+        # installs from earlier releases carry it, and identity must still
+        # resolve through it (`bash` after the `||` IS the interpreter) so
+        # the supersede pass can heal those installs on bundle update.
         guarded = '[ -n "$VCT_DISABLE_HOOKS" ] || bash .claude/hooks/ensure-containers.sh'
         self.assertEqual(
             project_init._vco_hook_script_identity(guarded), "ensure-containers.sh"

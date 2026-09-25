@@ -9,7 +9,8 @@ Options:
     --no-containers     Skip Docker/Podman service setup
     --gpu               Enable GPU support for Ollama + code embeddings
     --cpu-only          Force CPU-only (skip GPU detection)
-    --openai-key KEY    Use OpenAI embeddings instead of local models
+    --openai-key KEY    Use OpenAI embeddings instead of local models (the key is
+                        stored in the launcher keychain / ~/.vct-secrets, never .env)
     --container CMD     Force container runtime: docker | podman
     --dev               Install development dependencies
     --skip-models       Skip pulling Ollama models (manual later)
@@ -158,11 +159,12 @@ from vco_lib import install_companions as _install_companions  # noqa: E402
 from vco_lib import manifest_paths as _manifest_paths  # noqa: E402
 from vco_lib import npx_resolver as _npx_resolver  # noqa: E402
 from vco_lib import paths as _paths  # noqa: E402
+from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
+from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
-from vco_lib import service_adoption as _service_adoption  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
@@ -1138,17 +1140,17 @@ def _bootstrap_launcher_dist_subdir() -> Optional[str]:
     return None
 
 
-def _run_machine_migrations() -> None:
+def _run_machine_migrations(deferral_report: "DeferralReport") -> None:
     """Every one-time MACHINE-level migration, on every run. Soft-fail.
 
-    THE LEGS AND THE REASONING LIVE IN :mod:`vco_lib.machine_migrations`
-    (v0.2.95): the v0.2.92 WP-D metrics-archive copy + the Q1 panel
-    ``ANTHROPIC_MODEL`` pin removal. The NAME stays a module global: main()
-    calls it as one, and a test monkeypatches it there.
+    THE LEGS, THE REASONING AND WHERE IT IS CALLED LIVE IN :mod:`vco_lib.machine_migrations`.
+    A leg that could not run lands in ``deferral_report``. Called as a module global.
     """
     try:
         from vco_lib import machine_migrations
-        machine_migrations.run_every_run(on_event=_log_install_event)
+        machine_migrations.run_every_run(
+            on_event=_log_install_event, install_root=PROJECT_ROOT, report=deferral_report,
+        )
     except Exception as exc:  # noqa: BLE001 — best-effort by design
         _log_install_event("machine_migrations", "warn", f"could not run: {exc}")
 
@@ -1417,19 +1419,21 @@ def _bootstrap_compute_missing_prereqs(system_block: dict) -> list[dict]:
 
 def _bootstrap_weaviate_endpoints() -> dict:
     """Bootstrap envelope's ``weaviate_endpoints`` — NEW-4 SSOT: health is
-    ``/v1/.well-known/ready``. The base resolves through the ONE home
-    (``WEAVIATE_URL`` > ``WEAVIATE_PORT`` > 8081); v0.2.96 (6a) replaced the
-    five hardcoded ``http://localhost:8081`` literals that read no env, so
-    ``--bootstrap --json`` advertised the wrong port on a relocated install.
+    ``/v1/.well-known/ready``. v0.2.96 (6a) replaced five hardcoded literals;
+    v0.2.97: the base is this machine's ``service_endpoints`` row (else the
+    compiled default) — install.py takes no endpoint from env.
     """
-    base = _wh.weaviate_url_default().rstrip("/")
+    urls = _service_endpoint_urls()
+    base = str(urls["weaviate_url"]).rstrip("/")
+    host = base.split("://", 1)[-1].split("/", 1)[0]
+    host = host.rsplit(":", 1)[0] if not host.endswith("]") and ":" in host else host
     return {
         "base": base,
         "health": f"{base}/v1/.well-known/ready",
         "meta": f"{base}/v1/meta",
         "schema": f"{base}/v1/schema",
         "graphql": f"{base}/v1/graphql",
-        "grpc_host": "localhost:50052",
+        "grpc_host": f"{host}:{urls['weaviate_grpc_port']}",
     }
 
 
@@ -1542,10 +1546,12 @@ def _bootstrap_build_envelope(root: Path) -> dict:
         "base": "http://localhost:11440",
         "health": "http://localhost:11440/health",
     }
-    vct_hub_endpoints = {
-        "base": "http://127.0.0.1:7700",
-        "health": "http://127.0.0.1:7700/api/v1/health",
-    }
+    # R7b F7: DESCRIBE the running hub — `hub.port` first (the hub walks past a
+    # taken port and writes the one it bound), then `$VCT_HUB_PORT`, then 7700;
+    # the same file-first rule as Rust `services::hub_port::resolve_hub_port`.
+    from vco_lib.hub_ensure import running_hub_port  # stdlib-only: bootstrap-safe
+    hub_base = f"http://127.0.0.1:{running_hub_port()}"
+    vct_hub_endpoints = {"base": hub_base, "health": f"{hub_base}/api/v1/health"}
 
     missing = _bootstrap_compute_missing_prereqs(system_block)
     blocker_messages = [m["human"] for m in missing if m["severity"] == "blocking"]
@@ -3410,16 +3416,13 @@ def _read_project_name_from_vscode_settings(install_path: Path) -> str | None:
          Claude Code VS Code extension uses)
       2. `env.PROJECT_NAME` (a degenerate layout some users hand-write)
     """
-    settings = install_path / ".vscode" / "settings.json"
-    if not settings.is_file():
+    from vco_lib.jsonc_edit import load_object
+
+    # VS Code's own settings format is JSONC — read it as such (v0.2.97).
+    loaded = load_object(install_path / ".vscode" / "settings.json")
+    if loaded is None:
         return None
-    try:
-        text = settings.read_text(encoding="utf-8")
-        data = json.loads(text)
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(data, dict):
-        return None
+    data = loaded[0]
     # Layout 1: claude-code.env.PROJECT_NAME (canonical).
     cc_env = data.get("claude-code.env")
     if isinstance(cc_env, dict):
@@ -3443,35 +3446,18 @@ def _read_project_name_from_envfile(env_path: Path) -> str | None:
     not a placeholder. Soft-fails to None on any read error.
 
     Strips surrounding single/double quotes if the value is wrapped in
-    them (common in env-file convention: PROJECT_NAME="My Project").
+    them (common in env-file convention: PROJECT_NAME="My Project"), and an
+    ``export `` prefix — the form VCO's own ``.claude/env`` managed block
+    writes, which the hand-rolled parse here missed until v0.2.97. The parse
+    is the ONE line-level env parser (:func:`vco_lib.envfile.env_value`).
     """
-    if not env_path.is_file():
-        return None
+    from vco_lib.envfile import env_value
+
     try:
-        text = env_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
+        return env_value(env_path.read_text(encoding="utf-8", errors="replace"),
+                         "PROJECT_NAME") or None
+    except OSError:  # includes a missing file
         return None
-    for raw in text.splitlines():
-        s = raw.lstrip()
-        # Skip blank lines + comments. A line beginning with "#" is NOT
-        # an active assignment — the V47-F resolver must not pick up a
-        # disabled placeholder.
-        if not s or s.startswith("#"):
-            continue
-        eq = s.find("=")
-        if eq <= 0:
-            continue
-        key = s[:eq].strip()
-        if key != "PROJECT_NAME":
-            continue
-        val = s[eq + 1:].strip()
-        # Strip surrounding quotes if any.
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in ('"', "'"):
-            val = val[1:-1]
-        if val:
-            return val
-        return None
-    return None
 
 
 def _resolve_project_name_for_adopt(
@@ -3683,12 +3669,11 @@ def _venv_triage(install_path: Path,
 
     Cases:
       1. .venv missing       → action="create", recreate fully
-      2. .venv exists, no manifest, no requirements.txt, no force →
-         action="skip-no-manifest" (NEW; 3rd-party venv VCO can't manage)
-      3. .venv exists, Python version mismatch:
-         - manifest present OR replace-all OR force_rebuild →
-           action="recreate"
-         - else → action="skip-no-manifest" (NEW; preserve 3rd-party venv)
+      1b. force_rebuild (`--rebuild-venv`) → action="recreate", always
+      2. .venv exists, no manifest, no requirements.txt → "skip-no-manifest"
+      3. .venv's Python != the LAUNCHING interpreter's (v0.2.97: recorded by
+         the venv relaunch, `install_companions.launcher_python_version`):
+         manifest present OR replace-all → "recreate"; else "skip-no-manifest"
       4. .venv exists, Python OK, requirements.txt drift →
          action="upgrade", pip install -r ... --upgrade in place
       5. .venv exists, all matches  → action="skip"
@@ -3705,6 +3690,9 @@ def _venv_triage(install_path: Path,
     if not venv.is_dir() or not venv_python.exists():
         return {"action": "create", "reason": ".venv missing",
                 "venv_python": None}
+    if force_rebuild:  # the flag's promise: a rebuild, whatever the version arm says
+        return {"action": "recreate", "reason": "--rebuild-venv: rebuild requested",
+                "venv_python": None}
 
     # v0.2.46 V47-D: figure out whether VCO has a manifest record proving
     # it owns this venv. Absence of .vco-manifest.json is the load-bearing
@@ -3718,7 +3706,6 @@ def _venv_triage(install_path: Path,
     # neither manifest nor requirements.txt → don't recreate, don't
     # upgrade, just inform the caller via deferral.
     if (not has_manifest and not has_requirements
-            and not force_rebuild
             and adopt_project_mode != "replace-all"):
         return {
             "action": "skip-no-manifest",
@@ -3742,7 +3729,7 @@ def _venv_triage(install_path: Path,
     except (subprocess.SubprocessError, OSError):
         venv_pyver = ""
 
-    expected = f"{sys.version_info.major}.{sys.version_info.minor}"
+    expected = _install_companions.launcher_python_version()
     if not venv_pyver or venv_pyver != expected:
         # v0.2.46 V47-D: ONLY recreate when (a) we have a manifest
         # proving VCO owns this venv, OR (b) the user has explicitly
@@ -3751,8 +3738,7 @@ def _venv_triage(install_path: Path,
         # environment (e.g. a large 3rd-party scientific stack) on a
         # Python-version-drift adopt — the HIGH finding from the
         # venv-architecture audit (2026-06-03).
-        if not has_manifest and adopt_project_mode != "replace-all" \
-                and not force_rebuild:
+        if not has_manifest and adopt_project_mode != "replace-all":
             return {
                 "action": "skip-no-manifest",
                 "reason": (
@@ -3804,6 +3790,8 @@ def _run_lightweight(args: argparse.Namespace) -> int:
 
     # Step 1: state directory must exist before logging will hit disk.
     _create_state_directory()
+    if getattr(args, "openai_key", ""):  # review R5 F38: never silently dropped
+        _store_install_openai_key(args.openai_key)
 
     # Step 2: path rewrite in .env / .claude/settings.json
     if args.lightweight_old_path:
@@ -3857,8 +3845,12 @@ def _run_lightweight(args: argparse.Namespace) -> int:
                         else "bin/python"))
         _install_requirements(venv_python, dev=args.dev)
     elif triage["action"] == "recreate":
-        # Drop the old venv first.
+        # Drop the old venv first — never from INSIDE it: hand off to the base
+        # interpreter (install_companions.reexec_outside_venv), or refuse.
         venv = PROJECT_ROOT / ".venv"
+        if _is_running_inside_venv(venv / "bin" / "python") and not _install_companions.reexec_outside_venv(sys.argv, venv):
+            print(f"[2/4] Venv rebuild REFUSED: {venv} was left untouched (reason above).")
+            return 1
         if venv.is_dir():
             shutil.rmtree(venv, ignore_errors=True)
         _create_venv(PROJECT_ROOT)
@@ -3978,6 +3970,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     _venv_skip_entry = getattr(args, "_venv_skip_no_manifest_entry", None)
     if _venv_skip_entry is not None:
         _lightweight_deferral.add_entry(_venv_skip_entry)
+    _run_machine_migrations(_lightweight_deferral)  # after venv triage (v0.2.97)
 
     # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
     # default compose stack; Ollama MCP is dropped from the default install;
@@ -4806,25 +4799,21 @@ def _persist_storage_choice(choice: dict, install_root: Path) -> str:
 # Main
 # ---------------------------------------------------------------------------
 
+_is_running_inside_venv = _install_companions.is_running_inside_venv  # one home (v0.2.97)
+
+
 def _ensure_running_under_mcp_venv() -> None:
-    """v0.2.45 V45-A: relaunch under MCP venv if weaviate import is missing.
+    """v0.2.45 V45-A: relaunch under the install's venv when weaviate is missing.
 
-    Why: the launcher's update_orchestrator Tauri command (installer.rs)
-    spawns install.py under detect_python() — typically /usr/bin/python3.12
-    on Linux, NOT claude_mcp_servers/.venv/bin/python. install.py step 7d
-    (_migrate_kg_named_vector_slots) does an in-process `import weaviate`
-    via vco_lib.project_init._connect_v4_client. weaviate-client only lives
-    in the MCP venv. Without this relaunch, every launcher-driven update
-    deferred 4 entries to UPDATE_DEFERRED.md with ModuleNotFoundError.
+    The launcher spawns install.py under detect_python() — typically
+    /usr/bin/python3.12 — and what the venv provides (weaviate-client, the
+    editable ``model_router``) imports only from the venv.
 
-    No-op when:
-      - weaviate is already importable (CLI users with venv activated)
-      - we're already running under the resolved MCP venv (re-entry guard
-        via VCT_INSTALL_RELAUNCHED env)
-      - the resolved interpreter doesn't exist / can't be resolved
-        (soft-fail; install proceeds with system Python and step 7d will
-        still raise — but at least UPDATE_DEFERRED captures the error
-        and we have not introduced a new failure mode)
+    No-op when weaviate already imports (a CLI user with the venv activated);
+    when this process already IS that venv (:func:`_is_running_inside_venv`);
+    when ``VCT_INSTALL_RELAUNCHED`` is set (the loop guard: a relaunched child
+    that still cannot import weaviate must not exec again); or when no venv
+    interpreter resolves / exists (soft-fail with a stdout breadcrumb).
     """
     import importlib.util
     if importlib.util.find_spec("weaviate") is not None:
@@ -4832,17 +4821,13 @@ def _ensure_running_under_mcp_venv() -> None:
     # Re-entry guard: avoid exec loops if the relaunch points back at us
     if os.environ.get("VCT_INSTALL_RELAUNCHED") == "1":
         return
-    # v0.2.46 Part-1.5 H1: when any soft-fail path below short-circuits the
-    # relaunch (no MCP venv resolvable, target non-existent, etc.), print a
-    # breadcrumb so step 7d's eventual ModuleNotFoundError on `import weaviate`
-    # points the user at the venv-resolution cause rather than appearing as
-    # an unrelated traceback. Audit finding 2026-06-03 (venv-architecture).
+    # v0.2.46 H1: a soft-fail below prints a breadcrumb naming the cause.
     def _warn_silent_fallback(reason: str) -> None:
         print(
             "[v0.2.45 V45-A] could not relaunch under MCP venv "
-            f"({reason}) — proceeding with system Python; "
-            "step 7d (_migrate_kg_named_vector_slots) may fail with "
-            "ModuleNotFoundError: weaviate."
+            f"({reason}) — proceeding on {sys.executable}; a step that "
+            "imports a venv-only package in-process (weaviate-client, "
+            "model_router) may fail with ModuleNotFoundError."
         )
         sys.stdout.flush()
     try:
@@ -4853,22 +4838,16 @@ def _ensure_running_under_mcp_venv() -> None:
     if not target:
         _warn_silent_fallback("_resolve_venv_python_for_install returned None")
         return
-    # Compare resolved interpreter against sys.executable; skip if same
-    try:
-        if Path(target).resolve() == Path(sys.executable).resolve():
-            return
-    except Exception:
-        # Fallback: string-compare
-        if str(target) == sys.executable:
-            return
+    if _is_running_inside_venv(Path(target)):
+        return
     if not Path(target).is_file():
         _warn_silent_fallback(f"resolved interpreter does not exist: {target}")
         return
     env = os.environ.copy()
-    env["VCT_INSTALL_RELAUNCHED"] = "1"
+    _install_companions.mark_relaunch(env)  # loop guard + the LAUNCHING interpreter
     print(f"[v0.2.45 V45-A] relaunching install.py under MCP venv: {target}")
     sys.stdout.flush()
-    os.execve(str(target), [str(target), *sys.argv], env)
+    _install_companions.hand_off(str(target), [str(target), *sys.argv], env)  # exec; Windows: wait
 
 
 # ---------------------------------------------------------------------------
@@ -5411,7 +5390,24 @@ def _run_root_claude_dir_install(
     return result
 
 
+#: ``--openai-key`` help (kept out of ``main()`` — its line count is ratcheted).
+_OPENAI_KEY_HELP = (
+    "Use OpenAI embeddings (provide API key). Every install, --update and "
+    "--lightweight run stores it in the launcher keychain (shared slot "
+    "`openai_api_key`) when the vct-hub answers — on a first install it does "
+    "not yet, so the key lands in the file store "
+    "~/.vct-secrets/shared/openai_api_key — never in .env (runs that store "
+    "nothing, e.g. --uninstall, refuse the flag). A value on the command line "
+    "is visible to other local "
+    "users and kept in shell history; setting it in the launcher "
+    "(Preferences → Special Secrets) avoids that."
+)
+
+
 def main() -> int:
+    # A relaunch record counts only if THIS run's parent made it (argv token);
+    # then (Windows) a kill of that waiting parent stops this run too.
+    _install_companions.adopt_relaunch(sys.argv)
     # v0.2.53 bootstrap mode (Track B / docs/INSTALL_ARCHITECTURE_v2.md §3):
     # short-circuit BEFORE _ensure_running_under_mcp_venv() so the bootstrap
     # probe is usable on a freshly cloned repo with no .venv. The bootstrap
@@ -5500,8 +5496,7 @@ def main() -> int:
                               f"back to CPU-only even with a discrete GPU "
                               f"present. Default: "
                               f"{_DEFAULT_GPU_VRAM_THRESHOLD_GB}."))
-    parser.add_argument("--openai-key", type=str, default="",
-                        help="Use OpenAI embeddings (provide API key)")
+    parser.add_argument("--openai-key", type=str, default="", help=_OPENAI_KEY_HELP)
     parser.add_argument("--container", type=str, choices=["docker", "podman"],
                         help="Force a specific container runtime")
     parser.add_argument("--dev", action="store_true",
@@ -5735,11 +5730,17 @@ def main() -> int:
     parser.add_argument("--on-conflict",
                         choices=["alt-port", "adopt", "abort"],
                         default=None,
-                        help="Non-interactive resolution when a foreign service is "
-                             "detected on a canonical port. 'alt-port' (default for "
-                             "foreign): pick a free port and write compose.override.yaml. "
-                             "'adopt' (advanced): reuse the foreign service in place — "
-                             "WILL write our collections into it. 'abort': stop install.")
+                        help="Answer for a Weaviate/Ollama found running that VCO did "
+                             "not start and that holds no VCO data. 'adopt': use it "
+                             "(VCO adds its own collections to a Weaviate). 'alt-port': "
+                             "run VCO's own copy on a free port beside it. 'abort': stop. "
+                             "Unset + unattended: an Ollama is used; a Weaviate waits "
+                             "for your choice (UPDATE_DEFERRED.md).")
+    parser.add_argument("--service", action="append", default=[], metavar="SVC=CHOICE",
+                        help="Explicit endpoint for one service (repeatable): "
+                             "weaviate|ollama=adopt:container:<name>, "
+                             "weaviate|ollama=adopt:url:<url>, or <svc>=vco[:<port>] "
+                             "(VCO's own copy). The launcher's setup wizard passes these.")
     # Re-install file-conflict resolution. Mirrors the 4-option modal in
     # the launcher's OnboardingWizard. CLI users running install.py
     # directly against a populated install path get explicit flags
@@ -5779,31 +5780,24 @@ def main() -> int:
     # could be a user's 3rd-party scientific stack"). When the user
     # KNOWS the recreate is correct, `--rebuild-venv` opts in.
     parser.add_argument("--rebuild-venv", action="store_true", default=False,
-                        help="v0.2.46: force-rebuild the project's .venv even "
-                             "when VCO can't prove it owns it (no "
-                             ".vco-manifest.json). By default, the lightweight "
-                             "re-install path refuses to destroy a 3rd-party "
-                             "venv on Python-version drift or when no "
-                             "requirements.txt is present. Pass this flag when "
-                             "you know VCO is correct to rebuild — e.g. you "
-                             "intentionally changed the launcher's Python "
-                             "version and the project's venv needs to follow.")
-    # v0.2.10 (Bug L2 — cross-OS boot-service materialization). The
-    # compose-project working directory may not match the install path
-    # (the canonical example: install at ~/code/orch but compose lives
-    # at ~/code/claude/claude_mcp_servers). When set, this is the highest-
-    # priority signal for _resolve_compose_working_dir; otherwise we
-    # probe a running container's working_dir label, then fall back to
-    # install-path probes.
+                        help="Lightweight re-install: rebuild the .venv from "
+                             "scratch with the interpreter install.py was "
+                             "LAUNCHED with, even when VCO can't prove it owns "
+                             "it (no .vco-manifest.json). Without it, a 3rd-party "
+                             "venv is never destroyed on Python-version drift or "
+                             "when no requirements.txt is present. Use it when "
+                             "you changed the launcher's Python version and the "
+                             "venv needs to follow.")
+    # v0.2.10 (Bug L2 — cross-OS boot-service materialization). When set,
+    # this is the highest-priority signal for _resolve_compose_working_dir;
+    # otherwise <install>/infrastructure/ (v0.2.97: the only other leg).
     parser.add_argument("--compose-working-dir", type=str, default=None,
                         help="Absolute path to the directory containing "
                              "compose.yaml for the Claude MCP stack. Used by "
                              "the boot-service materialization step to record "
                              "WorkingDirectory= in the systemd unit / launchd "
-                             "plist / Task Scheduler XML. When unset, the "
-                             "installer probes a running container's label, "
-                             "then falls back to <install>/claude_mcp_servers/ "
-                             "or <install>/infrastructure/.")
+                             "plist / Task Scheduler XML. When unset: "
+                             "<install>/infrastructure/.")
     parser.add_argument("--preserve-paths",
                         type=str, default=None,
                         help="Comma-separated list of install-relative paths to "
@@ -5921,14 +5915,8 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    # VCT_NON_INTERACTIVE env var: install.ps1 (line ~97) documents that
-    # this env var should trigger non-interactive mode, but install.py
-    # never honored it — only --yes / --quiet / non-TTY did. The .bat ->
-    # .ps1 -> .py chain sets the env var as a fallback when args don't
-    # propagate cleanly; lift it into args.yes here so all downstream
-    # gates (args.yes checks) see a consistent state.
-    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
-        args.yes = True
+    # VCT_NON_INTERACTIVE → args.yes, and the --openai-key mode gate.
+    _normalise_parsed_args(args, parser)
 
     # v0.2.6 Bug C1 — `--desktop-icon-only` short-circuits: run JUST the
     # icon step (post-install-launcher.sh) and exit. Skips Python version
@@ -5976,9 +5964,6 @@ def main() -> int:
             )
     except Exception as exc:  # noqa: BLE001 — seeding is best-effort
         _log_install_event("deferral_report", "warn", f"A-2 disk seed failed: {exc}")
-
-    # One-time machine migrations on every run (helper above; v0.2.92 WP-D).
-    _run_machine_migrations()
 
     # PR-11: warn early when global lean-ctx hooks are present in
     # ~/.claude/settings.json or ~/.claude/hooks/. These caused two
@@ -6107,7 +6092,7 @@ def main() -> int:
         "session", "start",
         f"install.py {mode} mode",
         data={"mode": mode, "resume_enabled": _RESUME_ENABLED,
-              "argv": sys.argv[1:]},
+              "argv": _install_companions.redact_secret_argv(sys.argv[1:])},
     )
 
     # Step 1: Check Python
@@ -6115,7 +6100,7 @@ def main() -> int:
     _check_prerequisites()
 
     # Step 2: Detect system
-    sysinfo = _detect_system(args)
+    sysinfo = _detect_system(args, _deferral_report)
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
@@ -6159,6 +6144,7 @@ def main() -> int:
 
     # Step 5: Install/update Python dependencies
     _install_requirements(venv_python, dev=args.dev)
+    _run_machine_migrations(_deferral_report)  # needs the venv (v0.2.97)
 
     # Step 5b (v0.2.85, PLAN-v0285 D1/D2): install the orchestrator-self runtime
     # .claude/ by DELEGATING to the SAME install-bundle engine the launcher
@@ -6228,16 +6214,12 @@ def main() -> int:
             {"reason": "post-detection (incl. prompt-install if any)"},
         )
 
-        # Step 5b: probe BEFORE compose up. Honors content-based detection
-        # and persists the resolution in ~/.vct/services.toml. Foreign
-        # services on the canonical port either get an alt-port (default)
-        # or, with explicit consent, are adopted in place. We never POST
-        # collections into a service we didn't start.
-        decisions = _resolve_service_safety(args)
-        if any(d["action"] == ACTION_ABORT for d in decisions.values()):
-            for name, d in decisions.items():
-                if d["action"] == ACTION_ABORT:
-                    print(f"  [{name}] aborted: {d['evidence']}")
+        # Step 5b (v0.2.97): detect BEFORE compose up and record the rows in
+        # launcher.db (vco_lib.service_reconcile). VCO's own services are
+        # started/recreated; an adopted Weaviate/Ollama is never touched; a
+        # third-party Weaviate is never written into without consent.
+        decisions = _reconcile_service_endpoints(args, sysinfo, _deferral_report)
+        if decisions is None:
             return 1
 
         _start_services(sysinfo, args, embed_config, decisions,
@@ -6272,17 +6254,11 @@ def main() -> int:
         # Weaviate. Bootstrap any of THIS project's KG/Development collections
         # that aren't there yet — leave existing ones alone.
         #
-        # Pollution guarantee: collection writes only happen when the user
-        # consented. The matrix:
-        #   - ACTION_START / ACTION_ALT_PORT (we run our own Weaviate)
-        #     ⇒ writes to our instance
-        #   - ACTION_ADOPT vct-managed (prior install of ours)
-        #     ⇒ writes to a Weaviate we already populated
-        #   - ACTION_ADOPT foreign (user typed "2" / passed
-        #     --on-conflict adopt)
-        #     ⇒ writes to user-owned Weaviate WITH EXPLICIT CONSENT
-        # No path writes without consent. The default for foreign is
-        # alt-port, so the no-consent case never hits ACTION_ADOPT.
+        # Pollution guarantee: collection writes only happen where the rows
+        # say VCO's Weaviate is — VCO's own, one that already holds VCO data,
+        # or a third-party instance the user confirmed. An unattended run
+        # that found a third-party Weaviate writes nothing anywhere
+        # (_weaviate_awaits_confirmation).
         # Schema-rebuild gate (--update only): if the running KG
         # collection is on an older schema lacking today's invariants
         # (named-vector slots, index_null_state, etc.), prompt to drop
@@ -6572,8 +6548,11 @@ def main() -> int:
             # for known schema drift that requires explicit consent to fix.
             if _is_orchestrator_root_install():
                 _emit_orchestrator_root_schema_deferrals(_deferral_report)
+        _verify_service_endpoints(_deferral_report)  # v0.2.97: every row must answer now
     else:
         print("\n[skip] Container services (--no-containers)")
+        if _reconcile_service_endpoints(args, sysinfo, _deferral_report, runtime=None) is None:
+            return 1  # the rows are owed even with no containers (HTTP-only detection)
         print("[skip] Weaviate seeding (--no-containers)")
 
     # Step 7: Create state directory
@@ -6583,35 +6562,7 @@ def main() -> int:
     if mode == "install":
         _write_env_config(embed_config, args)
     else:
-        print("[skip] .env configuration (preserved during update)")
-        # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
-        # from folder-name derivation. Pure visibility — the existing project
-        # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
-        # Helps surface pre-V47-F installs that pinned a non-canonical
-        # project name while sitting in a folder like "python/".
-        _log_project_name_pin_diff(PROJECT_ROOT, "")
-        # A3 (2026-05-28): reconcile any canonical env keys added since the
-        # user's original install. Additive-only: user-set values preserved,
-        # only missing keys are appended.
-        _env_file = PROJECT_ROOT / ".env"
-        _reconcile_result = _reconcile_env_keys(_env_file)
-        if _reconcile_result["action"] == "appended":
-            _added_keys = _reconcile_result["added"]
-            print(
-                f"  .env: added {len(_added_keys)} new env key(s): "
-                + ", ".join(_added_keys)
-            )
-            _log_install_event(
-                "9/10", "info",
-                f"_reconcile_env_keys: added {len(_added_keys)} key(s)",
-                data={"added": _added_keys, "env_file": str(_env_file)},
-            )
-        elif _reconcile_result["action"] == "noop":
-            _log_install_event(
-                "9/10", "info",
-                "_reconcile_env_keys: no missing keys (noop)",
-                data={"env_file": str(_env_file)},
-            )
+        _update_env_config(args)
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
@@ -6658,11 +6609,8 @@ def main() -> int:
             data=_backfill_result,
         )
 
-        # v0.2.80 GAP-CG-1: re-project ALL projects (name-form lists); the
-        # deferral_report threading is LOAD-BEARING (review B2, None-guarded).
-        from vco_lib.config_projection import run_update_reprojection_step
-        run_update_reprojection_step(print_fn=print, log_event=_log_install_event,
-                                     deferral_report=_deferral_report)
+        # v0.2.80 GAP-CG-1: re-project ALL projects (LOAD-BEARING, review B2).
+        _reproject_all_projects_guarded(_deferral_report)
 
         # PR-22 (v0.2.12, 2026-05-16): rename legacy
         # `docker-compose.override.yml` to `compose.override.yaml` so
@@ -8060,7 +8008,7 @@ def _gpu_vendor_preference_from_env() -> Optional[str]:
     return gpu_vendor_preference_from_env()
 
 
-def _detect_system(args: argparse.Namespace) -> SystemInfo:
+def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> SystemInfo:
     print("[2/10] Detecting system ... ", flush=True)
     _log_install_event("2/10", "start", "detecting system")
     os_name = platform.system()
@@ -8233,12 +8181,16 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     ):
         _print_selinux_bind_mount_hint()
 
-    # Container runtime
+    # Container runtime. R8 G1: reconcile VCO's own runtime.txt record FIRST (a
+    # stale record is rewritten; a runtime that stays down defers containers).
+    _runtime_reconcile.apply_at_install(
+        PROJECT_ROOT, args, deferral_report, log_event=_log_install_event,
+        start_daemon=lambda rt: _try_start_podman_daemon() if rt == "podman" else _try_start_docker_daemon())
     if args.container:
         container_cmd = args.container
         print(f"  Container: {container_cmd} (forced)")
     else:
-        container_cmd = _detect_container_runtime()
+        container_cmd = "" if getattr(args, "containers_deferred", "") else _detect_container_runtime()
         if container_cmd:
             print(f"  Container: {container_cmd}")
         elif not args.no_containers:
@@ -9062,6 +9014,7 @@ def _try_start_docker_daemon() -> tuple[bool, str]:
                 subprocess.Popen(
                     ["cmd", "/c", "start", "", str(exe)],
                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    env=_install_companions.detached_child_env(),
                 )
             )
         except OSError as e:
@@ -9563,22 +9516,11 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
     # `docker version` fails with the same exit code as truly-absent
     # docker, which made our earlier message misleading. Reported
     # 2026-04-28: "PC had docker, but not currently running".
-    installed = _detect_installed_runtime()
-    if installed:
-        print(f"\n[!] {installed} is installed but its daemon isn't responding.")
-        if os_name == "Windows" and installed == "docker":
-            print("    Open Docker Desktop from the Start Menu or system tray,")
-            print("    wait for the whale icon to settle (~30 seconds), then re-run install.")
-        elif os_name == "Darwin" and installed == "docker":
-            print("    Open Docker Desktop from /Applications, wait for the whale")
-            print("    icon to settle (~30 seconds), then re-run install.")
-        elif installed == "podman":
-            print("    Start the Podman machine (Linux: systemctl --user start podman.socket;")
-            print("    macOS / Windows: podman machine start), then re-run install.")
-        else:
-            print("    Start the Docker daemon (`sudo systemctl start docker` on Linux),")
-            print("    then re-run install.")
-        print("    Or re-run with --no-containers to skip container setup.")
+    # R8 G1: under a pin the text names the PINNED runtime, never the other
+    # one as "installed but its daemon isn't responding" (vco_lib owns the text).
+    down = _runtime_reconcile.runtime_down_message(os_name, _detect_installed_runtime())
+    if down:
+        print(down)
         return False
 
     print("\n[!] No container runtime found. The orchestrator needs Podman or Docker.")
@@ -11207,7 +11149,7 @@ def _create_venv(project_root: Path) -> Path:
 
     # Don't use check=True with capture_output — we want to surface stderr on failure.
     result = subprocess.run(
-        [sys.executable, "-m", "venv", str(venv_dir)],
+        [_install_companions.base_python_for_venv(), "-m", "venv", str(venv_dir)],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -11857,92 +11799,24 @@ def _detect_existing_services(weaviate_port: int = DEFAULT_WEAVIATE_PORT,
 
 
 # ---------------------------------------------------------------------------
-# Step 5b: Safe-by-default service detection
+# Step 5b: where the services are reached (v0.2.97)
 # ---------------------------------------------------------------------------
 #
-# Goal: install.py must NOT touch a Weaviate / Ollama / code-embed service
-# that wasn't started by us, EVEN IF it's running on our canonical port. The
-# old behavior — blindly POSTing to localhost:8081 — would pollute a foreign
-# user-owned Weaviate with our collections (`KnowledgeGraph` etc.) and could
-# even bind-conflict the compose `up -d` against it.
-#
-# Detection is content-based, not name-based: we probe the port and
-# fingerprint the response. A container called `weaviate` is irrelevant —
-# what matters is "did WE start whatever's responding here?".
-#
-# Decision matrix:
-#
-#   probe state    | default action             | non-interactive override
-#   ---------------+----------------------------+------------------------
-#   not-running    | start our compose service  | (none — no conflict)
-#   vct-managed    | adopt (skip compose start) | (none — auto-handled)
-#   foreign        | alt-port (free port)       | --on-conflict
-#   incompatible   | abort                      | (cannot override)
-#
-# State persistence: the chosen action is recorded in
-# `~/.vct/services.toml`, the SAME file the launcher's
-# `services::adoption` reads/writes (commit 8b1890f). install.py and the
-# launcher therefore see consistent state. Schema is the launcher's
-# `AdoptionState` (rust serde) but expressed as flat TOML so plain Python
-# can produce it without depending on the `tomli_w` package.
+# Detection, the evidence ranking, the legacy import (services.toml, the
+# app_state port overrides, vct-config.toml, env, the old alt-port override)
+# and consent live in ``vco_lib.service_reconcile`` / ``service_detection``;
+# the rows are written only by ``vco_lib.service_endpoints``. This file keeps
+# the thin shim (``_reconcile_service_endpoints``) and step 5's compose
+# vocabulary below, which the shim derives from the rows.
 
-# Canonical service identifiers used in services.toml. Match the launcher's
-# launcher::services::adoption canonical names.
-_CANONICAL_SERVICES = ("weaviate", "ollama", "code_embed")
+# Step 5's per-service compose decision, in the vocabulary
+# ``_classify_service_compose_action`` / ``code_embed_image.plan_rebuild`` read.
+PROBE_NOT_RUNNING = "not-running"   # VCO's own, not answering → compose starts it
+PROBE_VCT_MANAGED = "vct-managed"   # VCO's own container under the installer's project
+PROBE_FOREIGN = "foreign"           # adopted / awaiting a choice / migrated — never touched
 
-# Default ports per service. Mirrors the DEFAULT_*_PORT constants above but
-# keyed by canonical name for table-driven loops.
-_DEFAULT_PORTS = {
-    "weaviate": DEFAULT_WEAVIATE_PORT,
-    "ollama": DEFAULT_OLLAMA_PORT,
-    "code_embed": DEFAULT_CODE_EMBED_PORT,
-}
-
-# Health-probe paths per service. GET / 2xx-3xx ⇒ "something is listening";
-# we then fingerprint the body to decide vct-managed vs. foreign.
-_HEALTH_PATHS = {
-    "weaviate": "/v1/.well-known/ready",
-    "ollama": "/api/tags",
-    "code_embed": "/health",
-}
-
-
-# ~/.vct/services.toml IO — the ONE home is vco_lib.service_adoption since
-# v0.2.96 WP-4 (the adoption flow must reset rows it makes obsolete, and a
-# second hand-rolled writer would drift from install.py's). These thin
-# wrappers keep install.py's own patch surface (`_services_toml_path` is
-# what tests redirect) and the deferral/adoption semantics unchanged.
-def _services_toml_path() -> Path:
-    """Path to `<VCT_STATE_DIR or ~/.vct>/services.toml` — shared with
-    launcher::services::adoption (Rust). Both sides honour ``VCT_STATE_DIR``
-    so a dev launcher's state stays isolated from production state."""
-    return _service_adoption.services_toml_path()
-
-
-def _read_services_toml() -> dict:
-    """Parse `~/.vct/services.toml` (see the vco_lib home for semantics)."""
-    return _service_adoption.read_services_toml(path=_services_toml_path())
-
-
-def _write_services_toml(state: dict) -> None:
-    """Serialize `{services: [...]}` to `~/.vct/services.toml` atomically
-    (hand-rolled TOML in the vco_lib home — `tomli_w` is not in the
-    install-time venv; schema = the rust launcher's `AdoptionState`)."""
-    _service_adoption.write_services_toml(state, path=_services_toml_path())
-
-
-# ProbeResult and ProbeAction — emulated as string constants for stdlib-only
-# install.py. `enum` would work but adds import noise without buying us
-# anything; the action set is small and string-comparable.
-PROBE_NOT_RUNNING = "not-running"   # port free; we'll start compose
-PROBE_VCT_MANAGED = "vct-managed"   # our prior install — adopt seamlessly
-PROBE_FOREIGN = "foreign"           # someone else's service — DO NOT TOUCH
-PROBE_INCOMPATIBLE = "incompatible" # protocol mismatch — abort
-
-ACTION_START = "start"      # bring up the compose service on default port
-ACTION_ADOPT = "adopt"      # reuse the existing service as-is (skip compose)
-ACTION_ALT_PORT = "alt-port"  # bring up compose on an alternate free port
-ACTION_ABORT = "abort"      # bail the install
+ACTION_START = "start"      # bring up the compose service
+ACTION_ADOPT = "adopt"      # it runs already (recreated only when PROBE_VCT_MANAGED)
 
 
 def _classify_service_compose_action(action: str, probe: str) -> str:
@@ -11956,13 +11830,13 @@ def _classify_service_compose_action(action: str, probe: str) -> str:
         config (the named data volume is preserved). This is the fix for "an
         adopt skips compose, so a changed env never applies on --update."
       * "skip"     — leave the service running untouched. Critically this covers
-        a FOREIGN adopt (probe == foreign, only via explicit --on-conflict
-        adopt): we must NEVER recreate a service we don't own.
+        every ADOPTED service (probe == foreign): we must NEVER recreate a
+        service we don't own.
 
     Keeping this a pure function makes the start-vs-recreate-vs-skip rule
     unit-testable without driving the whole `_start_services` subprocess path.
     """
-    if action in (ACTION_START, ACTION_ALT_PORT):
+    if action == ACTION_START:
         return "start"
     if action == ACTION_ADOPT and probe == PROBE_VCT_MANAGED:
         return "recreate"
@@ -12024,16 +11898,9 @@ def _parse_compose_weaviate_reclaim_env(compose_text: str) -> dict:
     reclaim keys are unique across services so a flat scan is unambiguous.
     Returns a dict of only the keys found, values stripped of quotes/whitespace.
     """
-    found: dict = {}
-    for key in _WEAVIATE_RECLAIM_ENV_KEYS:
-        m = re.search(
-            rf'^\s*{re.escape(key)}\s*:\s*["\']?([^"\'\n#]+?)["\']?\s*(?:#.*)?$',
-            compose_text,
-            re.MULTILINE,
-        )
-        if m:
-            found[key] = m.group(1).strip()
-    return found
+    from vco_lib.service_reconcile import compose_reclaim_env  # noqa: PLC0415
+
+    return compose_reclaim_env(compose_text)
 
 
 def _running_container_reclaim_env(container_cmd: str, container_ref: str) -> "Optional[dict]":
@@ -12094,212 +11961,6 @@ def _weaviate_reclaim_env_drifted(
         if have != want:
             details.append((key, have, want))
     return (len(details) > 0), details
-
-
-def _probe_service_identity(name: str, port: int) -> tuple[str, str]:
-    """Content-fingerprint whatever is listening on `localhost:<port>`.
-
-    Returns (probe_result, evidence) where:
-      - probe_result is one of PROBE_*
-      - evidence is a short human-readable string (URL, schema-class name,
-        etc.) used for log lines and the interactive prompt
-
-    Heuristic per service:
-      - weaviate: GET /v1/.well-known/ready; if 200, GET /v1/schema and
-        look for our canonical collections (KnowledgeGraph,
-        VibeCodedOrchestrator_KnowledgeGraph — the v0.2.23 B1 capital-C
-        casing, plus the lowercase-c v0.2.12–v0.2.22 variant
-        VibecodedOrchestrator_KnowledgeGraph, plus the pre-v0.2.12 PR-26
-        legacy VibeCodedTools_KnowledgeGraph). Any present ⇒ vct-managed.
-        Empty schema + no services.toml record ⇒ foreign (we don't claim
-        bare instances).
-      - ollama: GET /api/tags; if 200, look for our pinned embedding model
-        (qwen3-embedding:0.6b OR snowflake-arctic-embed2:latest) AS WELL AS
-        the services.toml record. Either signal present ⇒ vct-managed.
-        Empty tags or no signal ⇒ foreign.
-      - code_embed: GET /health; if 200 + body matches CodeSage/Ollama
-        backend marker, vct-managed. Otherwise foreign.
-
-    The services.toml lock is the strongest signal — it survives a Weaviate
-    that we previously cleared. Content fingerprints are the secondary
-    signal so we can recognise our own data even when the lock file was
-    deleted (rare; user wiped ~/.vct/).
-    """
-    path = _HEALTH_PATHS.get(name)
-    if path is None:
-        return PROBE_INCOMPATIBLE, f"unknown service '{name}'"
-
-    base = f"http://localhost:{port}"
-
-    # Step 1: liveness probe
-    try:
-        resp = urllib.request.urlopen(f"{base}{path}", timeout=2)
-        if resp.status >= 400:
-            return PROBE_NOT_RUNNING, f"{base}{path} → HTTP {resp.status}"
-    except Exception:
-        return PROBE_NOT_RUNNING, f"{base}{path} unreachable"
-
-    # Step 2: services.toml lookup (strongest signal — explicit prior claim).
-    state = _read_services_toml()
-    locked = next(
-        (s for s in state.get("services", []) if s.get("name") == name),
-        None,
-    )
-    if locked and locked.get("mode") in ("adopt", "parallel", "refuse"):
-        # We previously decided how to handle this port. Consider it
-        # "ours" in the sense that subsequent installs should not re-prompt.
-        return PROBE_VCT_MANAGED, f"prior decision: {locked['mode']}"
-
-    # Step 3: content fingerprint per service.
-    if name == "weaviate":
-        try:
-            schema_resp = urllib.request.urlopen(f"{base}/v1/schema", timeout=3)
-            schema = json.loads(schema_resp.read())
-            classes = _wh.schema_class_names(schema)
-            # Two recognition modes for vct ownership of a Weaviate:
-            # 1. Exact canonical names (single-tenant install).
-            # 2. Suffix-pattern names (multi-project orchestrator setup
-            #    where each project namespaces its collections — e.g.
-            #    `MyProject_CodeFunction`, `ClaudeKnowledgeGraph`,
-            #    `OtherProject_KnowledgeGraph`). The `_KnowledgeGraph` /
-            #    `_CodeFunction` / `_CodeClass` / `_CodeModule` suffixes
-            #    are ours by construction and don't appear in foreign
-            #    Weaviates.
-            # Legacy-detection: the canonical post-v0.2.23-B1 capital-C name,
-            # the lowercase-c v0.2.12–v0.2.22 variant, AND the pre-v0.2.12
-            # "VibeCodedTools_KnowledgeGraph" are markers of a vct-managed
-            # Weaviate (the v0.2.23 B1 case-flip is the canonical-name change
-            # only — install.py's case-insensitive adoption keeps the on-disk
-            # class unchanged so pre-flip installs still have the lowercase-c
-            # class on disk; same applies to pre-v0.2.12 installs with the
-            # VibeCodedTools name).
-            exact_markers = {"KnowledgeGraph",
-                             "VibeCodedOrchestrator_KnowledgeGraph",
-                             # v0.2.12–v0.2.22 lowercase-c variant.
-                             "VibecodedOrchestrator_KnowledgeGraph",
-                             # Pre-v0.2.12 name (PR-26 rename predecessor).
-                             "VibeCodedTools_KnowledgeGraph",
-                             "Development", "CodeFunction", "CodeClass",
-                             "CodeModule", "CodeAPI", "CodeInteraction"}
-            # `_conversations` is a legacy marker (collection deprecated
-            # 2026-04-30) — kept here for detection of old installs only.
-            # New installs do NOT create the conversations collection.
-            suffix_markers = ("_KnowledgeGraph", "_Development",
-                              "_CodeFunction", "_CodeClass", "_CodeModule",
-                              "_conversations", "_development")
-            exact_hits = classes & exact_markers
-            suffix_hits = {c for c in classes if c and any(c.endswith(s) for s in suffix_markers)}
-            hits = exact_hits | suffix_hits
-            if hits:
-                return PROBE_VCT_MANAGED, f"weaviate has vct collections: {sorted(hits)[:3]}"
-            # Weaviate alive but no vct markers — could be empty (fresh user
-            # install) or could be foreign + populated. Either way, not ours.
-            return PROBE_FOREIGN, f"weaviate alive at {base} (classes: {sorted(classes)[:3] or 'none'})"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"weaviate at {base} but /v1/schema failed: {e}"
-
-    if name == "ollama":
-        try:
-            tags_resp = urllib.request.urlopen(f"{base}/api/tags", timeout=3)
-            tags = json.loads(tags_resp.read())
-            model_names = {m.get("name", "") for m in tags.get("models", [])}
-            vct_markers = {"qwen3-embedding:0.6b",
-                           "snowflake-arctic-embed2:latest",
-                           "unclemusclez/jina-embeddings-v2-base-code:latest",
-                           "qwen3.5:0.8b"}
-            if model_names & vct_markers:
-                return PROBE_VCT_MANAGED, f"ollama has vct models: {sorted(model_names & vct_markers)}"
-            return PROBE_FOREIGN, f"ollama alive at {base} (models: {sorted(model_names)[:3] or 'none'})"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"ollama at {base} but /api/tags failed: {e}"
-
-    if name == "code_embed":
-        # Our service responds to /health with JSON {"status": "ok",
-        # "model": "codesage-large-v2", ...}. Foreign FastAPIs may also
-        # respond 200 to /health but not produce that body.
-        try:
-            health_resp = urllib.request.urlopen(f"{base}/health", timeout=3)
-            body = health_resp.read().decode("utf-8", errors="replace")
-            if "codesage" in body.lower() or "code_embed" in body.lower():
-                return PROBE_VCT_MANAGED, "code_embed responds with vct fingerprint"
-            return PROBE_FOREIGN, f"port {port} responds to /health but is not our code_embed"
-        except Exception as e:
-            return PROBE_INCOMPATIBLE, f"code_embed at {base} unrecognised: {e}"
-
-    return PROBE_INCOMPATIBLE, f"no fingerprint logic for '{name}'"
-
-
-def _find_free_port(start: int, end: int = 65000) -> int | None:
-    """Return the first free TCP port in [start, end] on 127.0.0.1.
-
-    Used when a foreign service holds the canonical port and the user
-    chose `alt-port`. We bind-and-close to test, which is racy with a
-    process spawning a millisecond later — but for install-time it's
-    fine; the compose `up -d` happens within the same install run.
-    """
-    import socket  # noqa: PLC0415 — lazy import; rare path
-    for port in range(start, end + 1):
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.bind(("127.0.0.1", port))
-                return port
-        except OSError:
-            continue
-    return None
-
-
-def _decide_action(name: str, probe: str, evidence: str,
-                   args: argparse.Namespace) -> str:
-    """Resolve a probe result into a concrete action.
-
-    Honors:
-      1. `--on-conflict` flag (non-interactive override for `foreign`)
-      2. `--yes` / non-TTY (defaults to alt-port for foreign, abort for incompatible)
-      3. interactive prompt
-    """
-    if probe == PROBE_NOT_RUNNING:
-        return ACTION_START
-    if probe == PROBE_VCT_MANAGED:
-        return ACTION_ADOPT
-    if probe == PROBE_INCOMPATIBLE:
-        return ACTION_ABORT
-
-    # Foreign — the interesting case.
-    if args.on_conflict == "alt-port":
-        return ACTION_ALT_PORT
-    if args.on_conflict == "adopt":
-        return ACTION_ADOPT
-    if args.on_conflict == "abort":
-        return ACTION_ABORT
-
-    # Non-interactive default: alt-port. Prevents pollution; never adopts
-    # someone else's service without explicit consent.
-    if args.yes or not sys.stdin.isatty() or args.quiet:
-        print(f"  [{name}] foreign service detected ({evidence})")
-        print(f"  [{name}] non-interactive mode → using alt-port "
-              f"(override: --on-conflict adopt|abort)")
-        return ACTION_ALT_PORT
-
-    # Interactive prompt
-    print()
-    print(f"  Detected a foreign {name} on port {_DEFAULT_PORTS[name]}.")
-    print(f"  Evidence: {evidence}")
-    print()
-    print("  Options:")
-    print(f"    [1] alt-port  — pick a free port and run our own {name} alongside it (safe, default)")
-    print(f"    [2] adopt     — reuse the existing {name}; WILL write our collections into it")
-    print("    [3] abort     — stop installation")
-    try:
-        ans = input(f"  Choice for {name} [1/2/3, default 1]: ").strip()
-    except (EOFError, KeyboardInterrupt):
-        print()
-        return ACTION_ALT_PORT
-    if ans in ("2", "adopt"):
-        return ACTION_ADOPT
-    if ans in ("3", "abort"):
-        return ACTION_ABORT
-    return ACTION_ALT_PORT
 
 
 def _scan_foreign_compose_files(
@@ -12393,144 +12054,122 @@ def _walk(
             pass
 
 
-def _resolve_service_safety(args: argparse.Namespace) -> dict:
-    """Probe Weaviate / Ollama / code_embed and pick a safe action per service.
+#: Step [5b]'s outcome for the rest of this run: the rows (or, when launcher.db
+#: could not take them, this run's in-memory PINS) and whether Weaviate awaits
+#: the user's adoption choice (owner ruling Q1).
+_SERVICE_ENDPOINTS: dict = {"rows": {}, "pinned": False, "weaviate_pending": False}
 
-    Returns a dict shaped:
-        {
-          "weaviate":  {"action": ACTION_*, "port": int, "probe": PROBE_*, "evidence": str},
-          "ollama":    {...},
-          "code_embed":{...},
-        }
+_STEP5_DECISION: dict = {
+    "start": (ACTION_START, PROBE_NOT_RUNNING),
+    "recreate": (ACTION_ADOPT, PROBE_VCT_MANAGED),
+    "skip": (ACTION_ADOPT, PROBE_FOREIGN),
+}
 
-    Side effects:
-      - When alt-port is chosen: sets the corresponding env var
-        (WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT) for the rest of
-        the install. Compose reads these from the env via
-        `${WEAVIATE_PORT:-8081}` substitutions.
-      - Persists the resolution to `~/.vct/services.toml` so the
-        launcher and subsequent installs see it.
 
-    Design note: probing happens BEFORE compose `up -d`. That's the whole
-    point — we never start a container against an occupied port without
-    explicit consent.
+def _reconcile_service_endpoints(
+    args: argparse.Namespace, sysinfo: "SystemInfo", deferral_report, *, runtime: "str | None" = "auto",
+) -> "dict | None":
+    """Step [5b]: record where Weaviate / Ollama / code-embed are reached.
+
+    A thin shim over :func:`vco_lib.service_reconcile.reconcile` (detection,
+    the evidence ranking, the one-time legacy import, consent). Afterwards this
+    process's env carries the recorded endpoints, so every client leaf the run
+    uses (and every child it spawns) reaches them. Returns step 5's per-service
+    compose decisions, or ``None`` when the run must stop (the user chose
+    abort, or a ``--service`` flag was malformed).
     """
-    print("\n[5b/10] Probing existing services (content-based detection) ...")
+    from vco_lib import service_reconcile as _sr  # noqa: PLC0415
 
+    print("\n[5b/10] Service endpoints (detect → launcher.db) ...")
+    try:
+        choices = [_sr.parse_service_flag(f) for f in (getattr(args, "service", None) or [])]
+    except ValueError as exc:
+        print(f"  {exc}")
+        return None
+    rt = sysinfo.container_cmd if runtime == "auto" else runtime
+    result = _sr.reconcile(
+        phase="update" if getattr(args, "update", False) is True else "install",
+        orchestrator_root=PROJECT_ROOT, runtime=rt or None, has_gpu=bool(sysinfo.has_gpu),
+        interactive=not (args.yes or args.quiet or not sys.stdin.isatty()),
+        on_conflict=getattr(args, "on_conflict", None), choices=choices,
+        ensure_db=lambda: _sr.ensure_registry(PROJECT_ROOT),
+        # This run registers the MCPs from the rows itself (step 11, unless
+        # --skip-mcp-registration): no second `--register-default-mcps` here.
+        apply_kwargs={"register_mcps": lambda _root: True},
+    )
+    for line in result.lines:
+        print(line)
+    if deferral_report is not None:
+        for entry in result.entries:
+            deferral_report.add_entry(entry)
+    _log_install_event("5b/10", "abort" if result.abort else "ok", "service endpoints reconciled",
+                       data={"rows": {s: r.to_json() for s, r in result.rows.items()},
+                             "pinned": result.pinned, "abort": result.abort})
+    if result.abort:
+        print(f"  ABORT: {result.abort}")
+        return None
+    _SERVICE_ENDPOINTS.update(rows=dict(result.rows), pinned=result.pinned,
+                              weaviate_pending=result.weaviate_pending)
+    os.environ.update(_service_endpoints.transport_env(result.rows))
+    if result.migrate_code_embed and rt:
+        _migrate_code_embed_with_cache(result.rows["code_embed"], rt, deferral_report)
     decisions: dict = {}
-    state = _read_services_toml()
-    services_list = state.get("services", []) or []
-    services_by_name = {s.get("name"): s for s in services_list}
-    state_dirty = False
-
-    for name in _CANONICAL_SERVICES:
-        port = _DEFAULT_PORTS[name]
-        # Honor explicit env-var override (advanced users / CI).
-        env_port_name = {
-            "weaviate": "WEAVIATE_PORT",
-            "ollama": "OLLAMA_PORT",
-            "code_embed": "CODE_EMBED_PORT",
-        }[name]
-        explicit_port = os.environ.get(env_port_name)
-        if explicit_port:
-            try:
-                port = int(explicit_port)
-            except ValueError:
-                pass
-
-        probe, evidence = _probe_service_identity(name, port)
-        action = _decide_action(name, probe, evidence, args)
-
-        chosen_port = port
-        if action == ACTION_ALT_PORT:
-            free = _find_free_port(port + 1)
-            if free is None:
-                print(f"  [{name}] FAIL: no free port in [{port + 1}, 65000]; aborting")
-                action = ACTION_ABORT
-            else:
-                chosen_port = free
-                # Propagate to env so all downstream code (compose, env
-                # writers, MCP settings) picks up the override.
-                os.environ[env_port_name] = str(chosen_port)
-                if name == "weaviate":
-                    # gRPC port also moves; offset matches the default gap (50052 vs 8081 → +41971).
-                    # Simpler: just shift by the same delta from default.
-                    delta = chosen_port - DEFAULT_WEAVIATE_PORT
-                    grpc_port = DEFAULT_WEAVIATE_GRPC_PORT + delta
-                    free_grpc = _find_free_port(grpc_port)
-                    if free_grpc is not None:
-                        os.environ["WEAVIATE_GRPC_PORT"] = str(free_grpc)
-
-        decisions[name] = {
-            "action": action,
-            "port": chosen_port,
-            "default_port": port,
-            "probe": probe,
-            "evidence": evidence,
-        }
-
-        # Print the decision summary line
-        if action == ACTION_START:
-            print(f"  [{name}] not running → will start on port {chosen_port}")
-        elif action == ACTION_ADOPT:
-            print(f"  [{name}] adopting existing service on port {chosen_port} ({evidence})")
-        elif action == ACTION_ALT_PORT:
-            print(f"  [{name}] foreign on {port} → starting our copy on alt port {chosen_port}")
-        elif action == ACTION_ABORT:
-            print(f"  [{name}] ABORT: {evidence}")
-            return decisions  # caller must check for any ABORT
-
-        # Persist to services.toml. Mode mapping mirrors the launcher's
-        # AdoptionMode enum exactly (adoption.rs):
-        #   unresolved | adopt | parallel | refuse  (snake_case in TOML)
-        # ACTION_START → "unresolved" because there is no foreign service to
-        # adopt or run parallel to; "unresolved" tells the launcher "no
-        # conflict was seen" so it doesn't re-prompt. ACTION_ABORT also
-        # maps to "unresolved" — the install bailed before persisting a
-        # decision, so the next install should re-probe from scratch.
-        mode_map = {
-            ACTION_START: "unresolved",     # no conflict; launcher won't re-prompt
-            ACTION_ADOPT: "adopt",
-            ACTION_ALT_PORT: "parallel",
-            ACTION_ABORT: "unresolved",
-        }
-        new_entry = {
-            "name": name,
-            "mode": mode_map[action],
-            "external_url": f"http://localhost:{port}" if probe != PROBE_NOT_RUNNING else None,
-            "parallel_port": chosen_port if action == ACTION_ALT_PORT else None,
-        }
-        # Only update if changed (idempotency: re-running install on a fully
-        # adopted machine touches nothing).
-        existing = services_by_name.get(name)
-        if existing != new_entry:
-            services_by_name[name] = new_entry
-            state_dirty = True
-
-    if state_dirty:
-        new_state = {"services": list(services_by_name.values())}
-        try:
-            _write_services_toml(new_state)
-        except OSError as e:
-            print(f"  ! could not persist {_services_toml_path()}: {e}")
-
-    # If any service decision was alt-port, write a compose override.
-    alt_ports = {n: d for n, d in decisions.items()
-                 if d["action"] == ACTION_ALT_PORT}
-    if alt_ports:
-        _write_compose_override(alt_ports)
-
-    # Windows reserved-range check (v0.2.64). The probe loop above classifies
-    # a conflict by "is something listening?" — but a WinNAT/Hyper-V reserved
-    # TCP range INVERTS that: nothing listens (probe → not-running → we'd
-    # `compose up`), yet the OS refuses the host bind. So detect-foreign→
-    # alt-port never fires for this class. Check the *resolved* per-service
-    # ports (after any alt-port shift) against the OS's own excluded ranges and
-    # either auto-reserve (admin) or warn with the exact fix. Clean no-op on
-    # Linux/macOS; soft-fail on any probe error.
+    for svc in ("weaviate", "ollama", "code_embed"):
+        action, probe = _STEP5_DECISION[result.disposition(svc)]
+        row = result.rows.get(svc)
+        decisions[svc] = {"action": action, "probe": probe}
+        if row is not None and row.mode == "vco_managed":
+            decisions[svc]["port"] = row.port  # a host port VCO's compose binds
     _check_windows_reserved_ports(decisions)
-
     return decisions
+
+
+def _migrate_code_embed_with_cache(row, runtime: str, deferral_report) -> None:
+    """code-embed runs under another compose project: re-create it under the
+    installer's, on the SAME cache (plan §4c; ``service_lifecycle``). A
+    refusal leaves it running as it is and records why."""
+    from vco_lib.service_lifecycle import (  # noqa: PLC0415
+        commit_without_mcp_registration, migrate_code_embed)
+
+    result = migrate_code_embed(PROJECT_ROOT, row, runtime=runtime, log=print,
+                                commit=commit_without_mcp_registration(PROJECT_ROOT))
+    _log_install_event("5b/10", "code_embed_migration", result.status,
+                       data={"reason": result.reason})
+    if not result.ok:
+        _svc_guard.emit_code_embed_migration_refused(
+            deferral_report, status=result.status, reason=result.reason,
+            runtime=runtime, infra_dir=PROJECT_ROOT / "infrastructure")
+
+
+def _service_endpoint_urls() -> dict:
+    """This run's endpoints: the launcher.db rows, or step [5b]'s in-memory
+    pins when launcher.db could not take them (``service_registry_unavailable``)."""
+    if _SERVICE_ENDPOINTS["pinned"] and _SERVICE_ENDPOINTS["rows"]:
+        return _service_endpoints.urls_from_rows(_SERVICE_ENDPOINTS["rows"])
+    return _service_endpoints.machine_service_urls()
+
+
+def _weaviate_awaits_confirmation() -> bool:
+    """Unattended run, a third-party Weaviate without VCO data, no answer yet:
+    nothing may be created in (or seeded into) any Weaviate this run."""
+    if not _SERVICE_ENDPOINTS["weaviate_pending"]:
+        return False
+    print("[7b/10] Skipping Weaviate collections + seed: waiting for your choice about the "
+          "Weaviate already running (UPDATE_DEFERRED.md: service_adoption_confirmation_required).")
+    return True
+
+
+def _verify_service_endpoints(deferral_report) -> None:
+    """After VCO started what it starts: stamp the rows that answer, report
+    the ones that do not (``service_endpoint_unreachable``)."""
+    if not _SERVICE_ENDPOINTS["rows"]:
+        return
+    from vco_lib import service_reconcile as _sr  # noqa: PLC0415
+
+    pinned = _SERVICE_ENDPOINTS["pinned"]
+    for entry in _sr.verify(_SERVICE_ENDPOINTS["rows"] if pinned else None, write=not pinned):
+        if deferral_report is not None:
+            deferral_report.add_entry(entry)
 
 
 def _check_windows_reserved_ports(decisions: dict) -> None:
@@ -12563,74 +12202,6 @@ def _check_windows_reserved_ports(decisions: dict) -> None:
         check_ports(ports)
     except Exception as e:  # pragma: no cover - defensive soft-fail
         print(f"  ! reserved-port check skipped ({e})")
-
-
-def _write_compose_override(alt_ports: dict) -> None:
-    """Generate `infrastructure/docker-compose.override.yml` with alternate ports.
-
-    The override is per-machine state (not source-controlled) and is
-    already covered by `.gitignore` (Bug 31 contract). We append rather
-    than overwrite when a previous override exists from the launcher's
-    volume migration — the override file at this path is read-merged by
-    docker compose, so two concurrent override files can't safely coexist
-    on the same path. Strategy: read existing, splice in our port section
-    if absent, write back.
-
-    Rather than YAML-parse without PyYAML in the pre-pip phase, we write
-    a fresh file with both the volume-migration block AND our port
-    overrides. If the launcher had an override there already, we preserve
-    its non-port content via simple text concatenation. In practice, the
-    user paths that hit alt-port (foreign service) and the volume-migration
-    path (existing volumes) are disjoint enough that this is fine — the
-    launcher writes the volume override, and install.py only writes here
-    if no launcher override exists.
-    """
-    infra_dir = PROJECT_ROOT / "infrastructure"
-    override_path = infra_dir / "docker-compose.override.yml"
-
-    if override_path.exists():
-        # Don't clobber a launcher-written volume override. Surface the
-        # collision and rely on env-var port overrides alone — compose
-        # WILL honor the env vars without needing an override file
-        # (infrastructure/docker-compose.yml uses ${WEAVIATE_PORT:-8081}).
-        print(f"  [override] {override_path} already exists; relying on env-var port overrides instead.")
-        return
-
-    # Compose v3 schema. Each alt-port service overrides only its `ports`
-    # mapping; all other config from the base file (image, volumes, env)
-    # is inherited.
-    lines = [
-        "# Auto-generated by install.py — alt-port mappings for foreign-service coexistence",
-        "# Safe to delete + regenerate by re-running `python install.py`.",
-        "# Tracked in ~/.vct/services.toml.",
-        "services:",
-    ]
-    for name, dec in alt_ports.items():
-        host_port = dec["port"]
-        if name == "weaviate":
-            grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-            lines.extend([
-                "  weaviate:",
-                "    ports:",
-                f'      - "{host_port}:8080"',
-                f'      - "{grpc}:50051"',
-            ])
-        elif name == "ollama":
-            lines.extend([
-                "  ollama:",
-                "    ports:",
-                f'      - "{host_port}:11434"',
-            ])
-        elif name == "code_embed":
-            lines.extend([
-                "  code_embed:",
-                "    ports:",
-                f'      - "{host_port}:11440"',
-            ])
-
-    override_path.parent.mkdir(parents=True, exist_ok=True)
-    override_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    print(f"  [override] wrote {override_path}")
 
 
 def _build_orchestrator_volume_names() -> tuple[str, ...]:
@@ -12798,12 +12369,13 @@ def _start_services(
     # one Weaviate / Ollama / code_embed per machine. Per-install isolation
     # comes from KG_COLLECTION namespacing inside the shared Weaviate.
     #
-    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 forces a full `up -d`
-    # regardless of what's already running (advanced — caller is responsible
-    # for resolving port conflicts via WEAVIATE_PORT/OLLAMA_PORT overrides).
-    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
-    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
-    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+    # Escape hatch: VCT_FORCE_SEPARATE_CONTAINERS=1 brings up every service
+    # VCO manages, named. v0.2.97: the ports are the service_endpoints rows'
+    # (or step [5b]'s pins) — never an env var.
+    _urls = _service_endpoint_urls()
+    weaviate_port = int(_urls["weaviate_port"])
+    ollama_port = int(_urls["ollama_port"])
+    code_embed_port = int(_urls["code_embed_port"])
 
     force_separate = os.environ.get("VCT_FORCE_SEPARATE_CONTAINERS") == "1"
     detected = _detect_existing_services(weaviate_port, ollama_port, code_embed_port)
@@ -12839,8 +12411,13 @@ def _start_services(
     # recreated — we must not touch a service we don't own.
     services_to_recreate: list[str] = []
     if force_separate:
-        # No detection — bring everything compose declares up.
-        services_to_start = []  # empty list => `up -d` with no service args
+        # Every service VCO manages, NAMED (I1): a bare `up -d` would also
+        # create compose copies of adopted services.
+        from vco_lib.service_lifecycle import compose_services  # noqa: PLC0415
+        services_to_start = [
+            s for s in compose_services(_SERVICE_ENDPOINTS["rows"])
+            if s != "code_embed" or sysinfo.has_gpu
+        ]
     elif decisions:
         # Decision-driven: only bring up services where the action is start
         # or alt-port. Adopted services (vct-managed reuse, foreign adopt)
@@ -12966,7 +12543,7 @@ def _start_services(
         compose_file=compose_file, deferral_report=deferral_report, log_event=_log_install_event,
     )
     services_to_recreate, recreate_for_rebuild, build_services, _foreign, _guard_rows = _guard
-    if not force_separate and not services_to_start and not services_to_recreate:
+    if not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
@@ -13185,30 +12762,31 @@ def _start_services(
             else:
                 print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
 
-    cmd.extend(["up", "-d"])
-    # v0.2.92 BLOCKER-1: `--build` when (and only when) the code_embed image
-    # is not provably built from this checkout — see the escalation above.
-    # Placed before the service names so it applies to the named set.
-    if build_services:
-        cmd.append("--build")
-    # v0.2.61 (FINDING-1 fix): when a vct-managed service we OWN was adopted
-    # but its compose config changed (e.g. the Weaviate write-amp env tuning),
-    # it lands in services_to_recreate and we add `--force-recreate` + name the
-    # exact services so compose REBUILDS them from the new config. We pass the
-    # explicit service list (start ∪ recreate) so compose touches ONLY those —
-    # `--force-recreate` then recreates the named ones (no-op'ing any already
-    # at the desired config) and leaves every unnamed service (incl. a FOREIGN
-    # adopt we must not touch) running untouched. The named DATA VOLUME is
-    # preserved across `--force-recreate` (it rm's the container, not the
-    # volume) — collections survive. Without naming services, a bare
-    # `--force-recreate` would recreate the WHOLE stack, including foreign
-    # adopts; naming keeps it surgical.
+    # The named set is start ∪ recreate (v0.2.61: naming keeps
+    # `--force-recreate` surgical — every unnamed service, adopted ones above
+    # all, stays untouched; a recreate removes the container, never its named
+    # volume). v0.2.97: the argv comes from the ONE builder
+    # (`service_lifecycle.compose_up_args`) — `--no-deps` always, `--build`
+    # only for a stale code_embed image (v0.2.92 BLOCKER-1), and an empty set
+    # yields NO compose call, never a bare `up -d` (I1).
+    from vco_lib.service_lifecycle import compose_up_args  # noqa: PLC0415
     explicit_services = services_to_start + [
         s for s in services_to_recreate if s not in services_to_start
     ]
+    up_args, _dropped = compose_up_args(
+        explicit_services, build=bool(build_services),
+        force_recreate=bool(services_to_recreate),
+        gpu_mode="gpu" if sysinfo.has_gpu else "unknown",
+        prefix=cmd,  # the GPU overlay may already enable `--profile gpu`: once only
+    )
+    if not up_args:
+        print("  Nothing for compose to start or recreate.")
+        return
+    cmd.extend(up_args)
+    # The printed fallback is the same argv (a printed command is shipped
+    # code: a bare `up -d` would start copies of adopted services).
+    manual_up = " ".join([*compose_cmd, *up_args])
     if services_to_recreate:
-        cmd.append("--force-recreate")
-        cmd.extend(explicit_services)
         config_changed = [
             s for s in services_to_recreate if s not in recreate_for_rebuild
         ]
@@ -13221,9 +12799,6 @@ def _start_services(
             parts.append(f"starting: {', '.join(services_to_start)}")
         print("  Recreating (" + "; ".join(parts) + ")")
     elif services_to_start:
-        # When subset detection said only some services are missing, pass them
-        # explicitly so compose doesn't try to recreate already-running ones.
-        cmd.extend(services_to_start)
         print(f"  Starting only: {', '.join(services_to_start)}")
 
     # 15 min default cap: first-run pulls of weaviate + ollama images can
@@ -13249,7 +12824,7 @@ def _start_services(
         print(f"  FAIL (timed out after {timeout_min} min)")
         print("  Container daemon may be hung. Try manually:")
         print(f"    cd {infra_dir}")
-        print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"    {manual_up}")
         print("  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         _log_install_event(
             "5/10", "error",
@@ -13293,7 +12868,7 @@ def _start_services(
             print(f"  {line}")
         print("\n  Try starting manually:")
         print(f"    cd {infra_dir}")
-        print(f"    {' '.join(compose_cmd)} up -d")
+        print(f"    {manual_up}")
         _svc_guard.print_compose_failure_hints(result.stderr or "", sysinfo.container_cmd)
         _log_install_event(
             "5/10", "error",
@@ -13307,7 +12882,7 @@ def _start_services(
             args=args, detected=detected, has_gpu=sysinfo.has_gpu,
             deferral_report=deferral_report, exit_code=result.returncode,
             stderr=result.stderr or "",
-            manual_cmd=f"cd {infra_dir} && {' '.join(compose_cmd)} up -d",
+            manual_cmd=f"cd {infra_dir} && {manual_up}",
             log_event=_log_install_event, install_root=PROJECT_ROOT, persist_on_hard_stop=_guard_rows,
         ):
             return
@@ -13338,8 +12913,7 @@ def _wait_for_ollama() -> None:
     """Wait for Ollama to be ready."""
     print("[6/10] Waiting for Ollama ... ", end="", flush=True)
     _log_install_event("6/10", "start", "waiting for Ollama")
-    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    url = f"http://localhost:{port}/api/tags"
+    url = f"{_service_endpoint_urls()['ollama_url'].rstrip('/')}/api/tags"
     deadline = time.monotonic() + HEALTH_TIMEOUT
 
     while time.monotonic() < deadline:
@@ -13404,7 +12978,7 @@ def _pull_ollama_models(
         f"pulling {len(models)} Ollama model(s)",
         data={"models": list(models)},
     )
-    port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
+    base = _service_endpoint_urls()["ollama_url"].rstrip("/")  # the row, never env
 
     if embedding_models is None:
         # Heuristic fallback for callers that don't pass the precise set
@@ -13423,7 +12997,7 @@ def _pull_ollama_models(
         try:
             data = json.dumps({"name": model}).encode()
             req = urllib.request.Request(
-                f"http://localhost:{port}/api/pull",
+                f"{base}/api/pull",
                 data=data,
                 headers={"Content-Type": "application/json"},
                 method="POST",
@@ -13438,7 +13012,7 @@ def _pull_ollama_models(
         except (urllib.error.URLError, OSError) as e:
             print(f"WARN ({e})")
             print(f"    Pull manually: curl -X POST "
-                  f"http://localhost:{port}/api/pull "
+                  f"{base}/api/pull "
                   f"-d '{{\"name\": \"{model}\"}}'")
             failed.append(model)
             if model in embedding_models:
@@ -13458,7 +13032,7 @@ def _pull_ollama_models(
             "Load-bearing embedding model pull(s) failed: "
             f"{', '.join(failed_embedding)}. The Knowledge Graph cannot "
             "function without these models — install aborted. Resolve "
-            "manually (curl -X POST http://localhost:" + port + "/api/pull "
+            f"manually (curl -X POST {base}/api/pull "
             "-d '{\"name\": \"<model>\"}') then re-run install."
         )
     if failed:
@@ -13522,7 +13096,7 @@ def _probe_dual_ollama_instances(
 
 def _emit_dual_ollama_deferral(
     deferral_report: "DeferralReport",
-    canonical_port: int = DEFAULT_OLLAMA_PORT,
+    canonical_port: "int | None" = None,
     alternate_port: int = 11434,
     folder: "Path | None" = None,
 ) -> None:
@@ -13540,8 +13114,13 @@ def _emit_dual_ollama_deferral(
     and honours a matching dismissal until the topology changes. ``folder``
     locates that memory; omitted ⇒ emit anyway (failing to suppress is noise,
     failing to emit hides state).
+
+    ``canonical_port`` defaults to the Ollama row's port (v0.2.97): an
+    adopted Ollama on 11434 IS the one VCO uses, not a second daemon.
     """
     try:
+        if canonical_port is None:
+            canonical_port = int(_service_endpoint_urls()["ollama_port"])
         result = _probe_dual_ollama_instances(
             canonical_port=canonical_port,
             alternate_port=alternate_port,
@@ -13595,8 +13174,9 @@ def _emit_dual_ollama_deferral(
             f"# VCO uses :{canon} (the launcher-managed "
             f"container) as canonical.\n"
             f"# If you want VCO to use your personal Ollama "
-            f"instead, set OLLAMA_PORT={alt} in .claude/env and "
-            f"re-run install.\n"
+            f"instead (checked first, then every client follows):\n"
+            f"python -m vco_lib.service_endpoints adopt --service ollama "
+            f"--url http://localhost:{alt}\n"
             f"# If you want to stop the personal instance:\n"
             f"#   systemctl --user stop ollama   # Linux\n"
             f"#   killall ollama                 # macOS / generic\n"
@@ -13779,19 +13359,18 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
         result["action"] = "orchestrator_not_registered"
         return result
 
-    # Imported ABOVE the try, not inside it (v0.2.96: install.py joined the
-    # pyright gate, which flagged the two exception names as possibly
-    # unbound). That is a real hazard, not a typing nit: with the import
-    # inside, a broken `vco_lib` makes the `except DbUnreachable:` clause
-    # itself raise NameError, replacing the ImportError that says what is
-    # actually wrong. A missing shipped dependency must fail loudly AND
-    # legibly ("loud-fail, never silent-fallback").
-    from vco_lib.config_projection import (
-        apply_project_env,
-        project_env_from_db,
-        DbUnreachable,
-        ProjectNotFound,
-    )
+    # v0.2.97: guarded — this process may still be the SYSTEM interpreter
+    # (no re-exec after ``_create_venv``) and the projection chain reaches
+    # ``requests``. The guard wraps ONLY the import, so the except clauses
+    # below keep their names bound (v0.2.96 NameError hazard).
+    try:
+        from vco_lib.config_projection import (
+            apply_project_env, project_env_from_db, DbUnreachable, ProjectNotFound,
+        )
+    except ImportError as exc:
+        # Degrade through the existing failure channel; never crash the update.
+        result["action"] = f"apply_failed:ImportError:{exc}"
+        return result
     try:
         bundle = project_env_from_db(project_id)
         report = apply_project_env(bundle)
@@ -13816,6 +13395,20 @@ def _backfill_code_graph_project_env(settings_file: Path | None = None) -> dict:
     result["action"] = "applied"
     result["added_keys"] = sorted(keys_written)
     return result
+
+
+def _reproject_all_projects_guarded(deferral_report) -> None:
+    """v0.2.80 GAP-CG-1: re-project ALL projects (the deferral_report
+    threading is LOAD-BEARING, review B2). v0.2.97: guarded — this process
+    may still reach ``requests`` on the system python; a skip is reported."""
+    try:
+        from vco_lib.config_projection import run_update_reprojection_step
+    except ImportError as exc:
+        print(f"  [skip] Env reprojection ({exc})")
+        _log_install_event("9/10", "warn", f"env reprojection skipped: {exc}")
+        return
+    run_update_reprojection_step(print_fn=print, log_event=_log_install_event,
+                                 deferral_report=deferral_report)
 
 
 def _emit_orchestrator_root_env_keys(install_root: Path) -> None:
@@ -13987,6 +13580,8 @@ def _ensure_collections(embed_config: dict,
     The resolved per-project / shared names are propagated back to
     `os.environ` so `_write_env_config` writes them into `.env`.
     """
+    if _weaviate_awaits_confirmation():
+        return
     # Honor --skip-seed / --skip-collections: if the user opted out of
     # seeding, they almost certainly don't want us mutating schema either.
     if args is not None and (
@@ -15203,6 +14798,8 @@ def _seed_weaviate(
     cleanup is a no-op in normal operation.
     """
     global _DUAL_CLONE_DETECTED_THIS_RUN
+    if _weaviate_awaits_confirmation():
+        return None
     try:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
         return _seed_weaviate_impl(args, deferral_report=deferral_report)
@@ -15900,6 +15497,15 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
                 "codegraph edges will no-op this pass (A3 reconcile retries)",
             )
 
+        # V52-AG layer 3 (v0.2.97): the root bundle (step 5b) records its own
+        # version BEFORE the runner reads it — the SSOT the launcher's
+        # post-bundle pipeline spawns as `record-bundle-materialization`.
+        if project_id:
+            from vco_lib.artifact_version_registry import record_bundle_materialization
+            _rec = record_bundle_materialization(
+                _launcher_db, project_id=project_id, folder=PROJECT_ROOT)
+            if not _rec.get("ok"):
+                print(f"  [migrate:runner] bundle version NOT recorded: {_rec.get('error')}")
         run_report = smr.run_schema_migrations(
             db_path=_launcher_db,
             project_id=project_id,
@@ -16227,7 +15833,7 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
         "clearly residual" — safe to drop.
       * We NEVER auto-drop. Instead, one deferral entry per qualifying
         collection is emitted to UPDATE_DEFERRED.md with an explicit
-        `python -m vco_lib.project_init drop-collection …` command.
+        single-class `DELETE /v1/schema/<class>` command (no VCO verb drops one).
 
     Idempotent — runs every update; already-absent collections produce no
     entries (the check re-reads the live schema each run).
@@ -16324,8 +15930,8 @@ def _emit_lowercase_codegraph_cleanup_deferrals(
                     "captured in the canonical collection."
                 ),
                 command_to_apply=(
-                    f"python -m vco_lib.project_init drop-collection "
-                    f"--name {cls} --yes"
+                    f"curl -X DELETE {weaviate_url.rstrip('/')}/v1/schema/{cls}"
+                    f"   # drops ONLY this class; confirm its rows first"
                 ),
                 severity="info",
                 kg_node_refs=[],
@@ -17800,29 +17406,10 @@ def _persist_runtime_txt(container_runtime: str | None) -> None:
     Soft-fail: any I/O error is logged and the install continues. The
     wrapper script re-probes PATH if runtime.txt is missing.
     """
-    if not container_runtime:
-        return
-    # The first whitespace-separated token is the binary name; the rest is
-    # the version string. Normalize to lowercase ("Podman" / "Docker"
-    # both seen in the wild on minor versions).
-    runtime_token = container_runtime.split()[0].lower()
-    if runtime_token not in ("podman", "docker"):
-        return
-    state_dir = PROJECT_ROOT / "state"
-    install_subdir = state_dir / "install"
-    runtime_file = install_subdir / "runtime.txt"
+    # The one writer (vco_lib.containers.write_runtime_txt): first token,
+    # lower-cased ("Podman 5.0.1" -> podman), idempotent, unknown tokens skipped.
     try:
-        install_subdir.mkdir(parents=True, exist_ok=True)
-        # Idempotent: only write if content differs (avoids unnecessary
-        # mtime churn that could confuse downstream watchers).
-        existing = ""
-        if runtime_file.is_file():
-            try:
-                existing = runtime_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                existing = ""
-        if existing != runtime_token:
-            runtime_file.write_text(runtime_token + "\n", encoding="utf-8")
+        _containers.write_runtime_txt(PROJECT_ROOT, container_runtime)
     except OSError as exc:
         _log_install_event(
             "manifest", "warn",
@@ -17878,103 +17465,32 @@ _BOOT_SERVICE_TASK_NAME = _boot_service.CONTAINER_STACK_TASK_NAME
 def _resolve_compose_working_dir(
     install_path: Path,
     cli_override: str | None,
-    ps_label_value: str | None,
 ) -> Optional[Path]:
     """Decide which directory the compose-up wrapper should chdir into.
 
-    The compose-project dir may NOT be the install path (canonical
-    example: install at one project dir, but compose.yaml lives in a
-    sibling repo's `claude_mcp_servers/`).
+      1. CLI override (``--compose-working-dir``) — explicit user choice
+         always wins; one that names a missing directory is ``None`` (a user
+         error worth surfacing, never a silent fall-through).
+      2. ``<install_path>/infrastructure/`` — the installer's compose
+         project, the one home VCO composes its own services from.
+      3. ``None`` — the caller skips materialization with a warning.
 
-    Resolution priority (PR-12 Bug C — install_path subdirs now BEAT the
-    ps-label probe, so a stale container from a prior install path can't
-    pin the new install's systemd unit to an obsolete WorkingDirectory):
+    v0.2.97: the ``<install_path>/claude_mcp_servers/`` leg and the
+    ``claude-mcp`` ps-label leg are SUPERSEDED by ``infrastructure/``, which
+    every shipped layout carries. Composing VCO-managed services from the
+    legacy home is how they came to be owned by a foreign compose project; a
+    container that home created is ADOPTED now (``vco_lib.service_reconcile``:
+    started/stopped by name through the ``service_endpoints`` rows, never
+    composed), so no legacy directory is ever a working dir.
 
-      1. CLI override (--compose-working-dir) — explicit user choice.
-      2. `<install_path>/claude_mcp_servers/` if it exists.
-      3. `<install_path>/infrastructure/` if it exists (VCO's own layout
-         where compose.yaml + the overlay both live there).
-      4. `ps_label_value` — the value of the
-         `com.docker.compose.project.working_dir` label on a running
-         claude-mcp container, sniffed by the caller via `<runtime> ps`.
-         Now a LAST RESORT for the rare edge case where the install path
-         has neither subdir locally (e.g. compose.yaml shipped in a
-         sibling repo). Caller passes None if probing failed.
-      5. None — caller skips materialization with a warning.
-
-    Why the priority inversion (Bug C, 2026-05-16): when a user upgrades
-    VCO via the launcher GUI / `install.py --update`, pre-existing
-    containers from a PRIOR install carry the
-    `com.docker.compose.project.working_dir=<old-path>` label. The
-    previous priority-2 ps-label probe would re-use that old path in the
-    fresh systemd unit, pinning the user's boot service to a stale
-    directory across upgrades. Inverting the order so install_path
-    subdirs win means the unit's WorkingDirectory tracks the install
-    location whenever it has a recognisable layout — which is the
-    overwhelmingly common case.
-
-    Pure function: no env reads, no subprocess. Caller supplies the ps
-    probe result (so this function is unit-testable without spawning
-    podman). Tested via tests/test_resolve_compose_working_dir.py.
+    Pure function: no env reads, no subprocess. Tested via
+    tests/test_resolve_compose_working_dir.py.
     """
-    # 1. CLI override — explicit user choice always wins.
     if cli_override:
         candidate = Path(cli_override).expanduser().resolve()
-        if candidate.is_dir():
-            return candidate
-        # Override pointed at a missing dir — that's a user error worth
-        # flagging. Caller logs and falls through.
-        return None
-    # 2. install_path/claude_mcp_servers — the canonical layout.
-    candidate = (install_path / "claude_mcp_servers").resolve()
-    if candidate.is_dir():
-        return candidate
-    # 3. install_path/infrastructure (the VCO-native layout).
+        return candidate if candidate.is_dir() else None
     candidate = (install_path / "infrastructure").resolve()
-    if candidate.is_dir():
-        return candidate
-    # 4. ps_label_value — last-resort fallback (e.g. compose.yaml lives
-    # outside install_path entirely). Pre-PR-12 this was priority 2,
-    # which caused boot-service WorkingDirectory to get pinned to stale
-    # install paths across upgrades.
-    if ps_label_value:
-        candidate = Path(ps_label_value).expanduser().resolve()
-        if candidate.is_dir():
-            return candidate
-    # 5. give up
-    return None
-
-
-def _probe_compose_working_dir_via_ps(container_cmd: str) -> Optional[str]:
-    """Best-effort: ask the running container runtime for the
-    `com.docker.compose.project.working_dir` label of any running
-    `claude-mcp` project container.
-
-    Returns the label value as a string, or None if anything goes wrong
-    (runtime absent, no running containers, label missing, etc.).
-    Soft-fail by design — `_materialize_boot_service` then falls back to
-    install-path probes.
-    """
-    if not container_cmd or not shutil.which(container_cmd):
-        return None
-    try:
-        proc = subprocess.run(
-            [
-                container_cmd, "ps",
-                "--filter", "label=com.docker.compose.project=claude-mcp",
-                "--format", '{{index .Labels "com.docker.compose.project.working_dir"}}',
-            ],
-            capture_output=True, text=True, timeout=5,
-        )
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if proc.returncode != 0:
-        return None
-    for line in proc.stdout.splitlines():
-        line = line.strip()
-        if line:
-            return line
-    return None
+    return candidate if candidate.is_dir() else None
 
 
 def _read_template(template_relpath: str) -> Optional[str]:
@@ -18919,6 +18435,7 @@ def _try_invoke_windows_stage1_updater(
                 stderr=subprocess.DEVNULL,
                 creationflags=creation_flags,
                 close_fds=True,
+                env=_install_companions.detached_child_env(),  # outlives us: no relaunch record
             )
         )
     except OSError as exc:
@@ -20151,46 +19668,18 @@ def _delete_vct_hub_cutover_sentinel() -> None:
 
 
 def _probe_vct_hub_health(timeout: float = 0.5) -> bool:
-    """Probe ``http://localhost:<hub.port>/api/v1/health``. Returns True when
-    the hub responds with status<400, False otherwise.
+    """Thin shim over :func:`vco_lib.hub_ensure.probe_hub_health`.
 
-    Reads the hub port from ``vct_root_dir()/hub.port`` (written by
-    vct-hub on startup). Soft-fail on every error (file missing, port
-    unparseable, connection refused, timeout).
-
-    v0.2.43 V0243-1: corrected endpoint from ``/health`` to
-    ``/api/v1/health`` (the hub's actual health route; ``/health`` 404s
-    on all vct-hub versions shipped since v0.2.21). This endpoint
-    intentionally requires NO auth header — the probe runs before the
-    hub token file is readable.
-
-    On a successful probe, any pre-existing ``~/.vct/v0.2.21-cutover.flag``
-    is unlinked (cleanup of a stale migration sentinel that an interrupted
-    v0.2.21 install may have left behind).
+    The body moved there (v0.2.97 R7b F3) so the probe has one home next to
+    the strict file-only port reader it uses — see that docstring for the
+    full contract (``/api/v1/health``, auth-free, ``status < 400``, the
+    stale v0.2.21-cutover.flag cleanup, soft-fail on every error). Kept
+    under this name for the tests and the twin contract named in
+    ``vco_lib.deferral_probes.hub_answers_health``.
     """
-    try:
-        from vco_lib.paths import vct_root_dir
-        root = vct_root_dir()
-        port_file = root / "hub.port"
-        if not port_file.is_file():
-            return False
-        port_raw = port_file.read_text(encoding="utf-8").strip()
-        if not port_raw.isdigit():
-            return False
-        url = f"http://127.0.0.1:{port_raw}/api/v1/health"
-        resp = urllib.request.urlopen(url, timeout=timeout)
-        healthy = resp.status < 400
-        if healthy:
-            # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
-            legacy_flag = root / "v0.2.21-cutover.flag"
-            try:
-                if legacy_flag.is_file():
-                    legacy_flag.unlink()
-            except OSError:
-                pass  # Best-effort; not critical.
-        return healthy
-    except Exception:
-        return False
+    from vco_lib.hub_ensure import probe_hub_health  # stdlib-only: bootstrap-safe
+
+    return probe_hub_health(timeout=timeout)
 
 
 def _wait_for_vct_hub_health(deadline_seconds: float = 10.0) -> bool:
@@ -20556,7 +20045,7 @@ def _deploy_and_start_vct_hub(
     # the old hub's PWD. Mirrors the v0.2.63 hub-staleness manual-fix
     # recipe (VCT_ORCHESTRATOR_ROOT/VCT_INSTALL_ROOT pinned to the
     # install dir). The hub inherits these via the spawned child's env.
-    hub_env = os.environ.copy()
+    hub_env = _install_companions.detached_child_env()  # the hub outlives us
     hub_env["VCT_ORCHESTRATOR_ROOT"] = str(install_root.resolve())
     hub_env["VCT_INSTALL_ROOT"] = str(install_root.resolve())
     run_kwargs["env"] = hub_env
@@ -20631,7 +20120,7 @@ def _register_mcps(
 
     Mutates ~/.claude.json (or VCT_USER_HOME_OVERRIDE/.claude.json for
     tests). Does NOT touch per-project .claude/settings.json — that's
-    managed separately by the launcher's write_project_env_files.
+    managed separately by the launcher's config_projection apply.
 
     Args:
         install_root: Repository root.
@@ -20645,11 +20134,14 @@ def _register_mcps(
     """
     claude_json = _user_home_for_install() / ".claude.json"
 
-    # Resolve ports the same way Rust does (env-var-first, defaults).
-    weaviate_port = int(os.environ.get("WEAVIATE_PORT", DEFAULT_WEAVIATE_PORT))
-    ollama_port = int(os.environ.get("OLLAMA_PORT", DEFAULT_OLLAMA_PORT))
-    grpc_port = int(os.environ.get("WEAVIATE_GRPC_PORT", DEFAULT_WEAVIATE_GRPC_PORT))
-    code_embed_port = int(os.environ.get("CODE_EMBED_PORT", DEFAULT_CODE_EMBED_PORT))
+    # v0.2.97: the rows (or step [5b]'s pins). A current launcher reads the
+    # rows itself; the env hand-off below reaches an OLDER binary, which is
+    # exactly the case where the registry could not be written.
+    _urls = _service_endpoint_urls()
+    weaviate_port = int(_urls["weaviate_port"])
+    ollama_port = int(_urls["ollama_port"])
+    grpc_port = int(_urls["weaviate_grpc_port"])
+    code_embed_port = int(_urls["code_embed_port"])
 
     print()
     print("Registering bundled MCP servers in ~/.claude.json...")
@@ -21711,7 +21203,7 @@ def _repair_systemd_unit_working_dir(
     present), parses the current ``WorkingDirectory=`` value, and re-renders
     the unit when it doesn't match the correct path. The "correct" path is
     derived via the same priority order as ``_resolve_compose_working_dir``:
-    install_path subdirs (claude_mcp_servers/ then infrastructure/), or the
+    ``<install_path>/infrastructure/``, or the
     explicitly-passed ``correct_working_dir``.
 
     Behaviour:
@@ -21780,8 +21272,6 @@ def _repair_systemd_unit_working_dir(
         correct_working_dir = _resolve_compose_working_dir(
             install_path=install_path,
             cli_override=None,
-            ps_label_value=None,  # don't trust ps labels in repair path —
-                                  # they're literally what caused Bug C
         )
     if correct_working_dir is None:
         # Couldn't resolve a target — punt. _materialize_boot_service
@@ -21935,13 +21425,9 @@ def _materialize_boot_service(
         return
 
     cli_override = getattr(args, "compose_working_dir", None)
-    container_cmd = getattr(sysinfo, "container_cmd", "") if sysinfo else ""
-    ps_label = _probe_compose_working_dir_via_ps(container_cmd) if container_cmd else None
-
     working_dir = _resolve_compose_working_dir(
         install_path=install_path,
         cli_override=cli_override,
-        ps_label_value=ps_label,
     )
     if working_dir is None:
         _log_install_event(
@@ -22047,169 +21533,45 @@ def _reconcile_stale_units_step(
 # Step 8: Write .env
 # ---------------------------------------------------------------------------
 
-# Marker tag inserted on every line ensure_env_template appends to a
-# pre-existing .env. The tag is what makes the operation idempotent —
-# a second run sees the marker and refuses to re-append the same key.
+# (v0.2.97: the retired ``# added by vco YYYY-MM-DD`` append marker has one
+# reader left — ``vco_lib.env_template``'s legacy-section migration, which
+# folds those lines into the managed block. Nothing writes it any more.)
 #
-# Format: `# added by vco YYYY-MM-DD` (date is for forensic value;
-# the *literal* `# added by vco ` substring is what the dedupe check
-# looks for).
-ENV_VCO_MARKER = "# added by vco"
-
-# Module-section delimiters for template-managed .env. When a module
-# is installed via the launcher, append a section bracketed by these
-# markers; when uninstalled (v1.1+), the section can be located and
-# removed cleanly. Keep simple for v1: append-only.
-ENV_MODULE_BLOCK_START = "# >>> module: "
-ENV_MODULE_BLOCK_END = "# <<< module: "
-
-
-def _parse_existing_env_keys(env_path: Path) -> set[str]:
-    """Return the set of KEY names present in an existing .env file
-    (commented or active). Used by `_ensure_env_template` to decide
-    which canonical keys are missing.
-
-    A line is considered to declare KEY iff (after lstrip + optional
-    leading "#") it matches `^KEY=`. We deliberately treat commented
-    keys as PRESENT — the user knows about them, they just chose to
-    leave the value blank. Re-appending would be noisy.
-    """
-    if not env_path.is_file():
-        return set()
-    keys: set[str] = set()
-    try:
-        for raw in env_path.read_text(encoding="utf-8", errors="replace").splitlines():
-            s = raw.strip()
-            if not s:
-                continue
-            # Strip a single leading `#` and any whitespace after it.
-            if s.startswith("#"):
-                s = s[1:].lstrip()
-            # Now s should look like KEY=value (or be a pure comment we
-            # don't care about).
-            eq = s.find("=")
-            if eq <= 0:
-                continue
-            key = s[:eq].strip()
-            # Validate key shape: alnum + underscore, no spaces. Skips
-            # things like "Defaults match the podman-compose.yml ..."
-            # which would otherwise parse as an "added=" key.
-            if key and all(c.isalnum() or c == "_" for c in key) and not key[0].isdigit():
-                keys.add(key)
-    except OSError:
-        return set()
-    return keys
+# (v0.2.97: the ``# >>> module: <name>`` / ``# <<< module: <name>`` .env
+# section markers declared here in 61f33bc4 ("modules can append their
+# section on install") are retired — only the constants ever landed; no
+# writer, no reader. Every key a module section was meant to carry reaches its
+# consumer another way, each pinned by a test:
+#   * RL_SERVER_PORT / RL_SERVER_URL (MCP side): launcher.db ``module_ports``
+#     → the hub's ``/config`` ``rl_server_port`` → the weaviate MCP's
+#     ``_get_rl_client`` base URL (``config_emits_rl_server_port_when_allocated``,
+#     ``tests/test_v52_aa_rl_env_propagation.py``);
+#   * RL_SERVER_PORT / RL_PROJECT_ROOT (container side): the module manifest's
+#     ``runtime.env_fixed`` / ``env_derived`` → ``-e`` flags of the container
+#     run (``build_podman_run_args_delivers_the_rl_module_env``);
+#   * any other module setting / secret: launcher.db ``module_installs`` +
+#     ``module_settings`` / keychain → the hub's ``/env``
+#     (``project_env_delivers_an_installed_modules_setting``).
+# Never ``.env``.)
 
 
-def _ensure_env_template(env_path: Path, project_name: str = "<project>",
-                        project_root: str = "<project_root>") -> dict:
-    """Ensure `.env` carries the canonical managed block.
+def _orchestrator_env_keys(active_embedding: Optional[str] = None) -> dict[str, str]:
+    """The orchestrator root's managed-block keys, from this run's resolved
+    state in ``os.environ`` (one builder for install, re-install and
+    ``--update`` — :func:`vco_lib.install_env.orchestrator_env_template_keys`).
+    The identity keys come from the root's registered row, never the shell."""
+    from vco_lib.install_env import orchestrator_env_template_keys, registered_identity_keys
 
-    PHASE 0.D MIGRATION (2026-05-24): This function used to implement
-    append-only "# added by vco YYYY-MM-DD" semantics in-line. It now
-    delegates to ``vco_lib.env_template.apply_env_template`` — the
-    single-writer contract for the per-project ``<project_root>/.env``
-    surface. See ``knowledge/concepts/config-projection-contract-2026-05-24.md``
-    (extended for Phase 0.D) for the rationale.
-
-    Behaviour after migration:
-      - .env missing → create with just the managed block (BEGIN/END markers
-        + canonical KEY=VALUE pairs derived from the orchestrator's resolved
-        defaults).
-      - .env exists with the BEGIN marker → in-place replace the managed
-        block. Lines outside markers preserved byte-for-byte.
-      - .env exists WITHOUT the BEGIN marker (legacy format from pre-Phase-
-        0.D vco installs, or hand-written file) → append the managed block
-        at EOF. Existing legacy "# added by vco YYYY-MM-DD" annotations stay
-        in place; the next invocation in-place replaces.
-
-    The canonical keys delegated to ``apply_env_template`` are the
-    subset documented at :func:`vco_lib.env_template.list_canonical_env_template_keys`
-    — project identity, KG collections, service URLs, feature flags.
-
-    Args:
-        env_path: Path to the ``.env`` file. The parent directory IS the
-            project_folder passed to apply_env_template.
-        project_name: Used to derive KG_COLLECTION / DEVELOPMENT_COLLECTION
-            when no per-launcher value is available (install.py's case —
-            the launcher's project_init runs later and re-projects via
-            apply_env_template directly).
-        project_root: Reserved for future use (the Phase 0.D apply_env_template
-            contract doesn't render orchestrator-root paths into ``.env``;
-            see the env_template docstring's EXCLUDE rationale).
-
-    Returns:
-        ``{"action": ..., "added_keys": [...], "env_path": str}`` for
-        API back-compat with the pre-migration caller surface.
-    """
-    # Import here (not at module top) so the install.py module can be
-    # imported in environments where vco_lib isn't on sys.path yet
-    # (e.g. fresh first-install before the venv is fully populated).
-    from vco_lib.env_template import (
-        apply_env_template,
-        list_canonical_env_template_keys,
+    name, prefix = registered_identity_keys(PROJECT_ROOT)
+    return orchestrator_env_template_keys(
+        os.environ,
+        default_weaviate_port=DEFAULT_WEAVIATE_PORT,
+        default_ollama_port=DEFAULT_OLLAMA_PORT,
+        default_code_embed_port=DEFAULT_CODE_EMBED_PORT,
+        active_embedding=active_embedding,
+        project_name=name,
+        code_graph_project=prefix,
     )
-
-    # Build the canonical key map. The legacy `_ensure_env_template`
-    # took `project_name` as an explicit arg and derived KG_COLLECTION
-    # / DEVELOPMENT_COLLECTION from it directly — we preserve that
-    # contract. Service URL ports come from environ ONLY (mirrors what
-    # `_write_env_config` already does in its lines[] build above).
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
-
-    sanitized = project_name if project_name != "<project>" else "Project"
-    keys = {
-        "PROJECT_NAME": project_name,
-        "CODE_GRAPH_PROJECT": sanitized,
-        # KG / DEVELOPMENT collections derived from the explicit
-        # project_name arg — matches the pre-Phase-0.D contract where
-        # `_ensure_env_template(env, project_name="Acme")` always
-        # produced `KG_COLLECTION=Acme_KnowledgeGraph`. Reading
-        # os.environ would leak the caller's shell env into the
-        # generated file (observed in tests where the maintainer install's
-        # KG_COLLECTION was active in the shell).
-        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
-        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
-        "SHARED_KG_COLLECTION": os.environ.get(
-            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
-        ),
-        "SHARED_KG_WRITE_DISABLED": "false",
-        "SHARED_KG_OPT_OUT": "false",
-        # v0.2.46 Decision B — symmetric READ gate. No legacy alias
-        # because pre-v0.2.46 the read path was unconditional.
-        "SHARED_KG_READ_DISABLED": "false",
-        # v0.2.61/v0.2.67 (embedding reconcile): os.environ["ACTIVE_EMBEDDING"]
-        # is made authoritative upstream by `_reconcile_install_active_embedding`
-        # (called right after `_choose_embedding_config`). On the stale-qwen3-
-        # on-CPU shape AND on the empty-env GUI-install shape it already holds
-        # the hardware pick (e.g. arctic) here, so this reader no longer
-        # re-cements the value that times out KG sync. A deliberate choice
-        # (CLI flag / launcher.db) is left untouched and flows through verbatim.
-        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "WEAVIATE_PORT": weaviate_port,
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
-        "OLLAMA_PORT": ollama_port,
-        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
-        "CODE_EMBED_PORT": code_embed_port,
-    }
-    # Filter to the canonical subset (defensive — keys is already
-    # constructed as the subset, but the contract source-of-truth is
-    # list_canonical_env_template_keys()).
-    allowed = list_canonical_env_template_keys()
-    keys = {k: v for k, v in keys.items() if k in allowed}
-
-    pre_existed = env_path.exists()
-    project_folder = env_path.parent
-    report = apply_env_template(keys, project_folder=project_folder)
-
-    return {
-        "action": "appended" if pre_existed else "created",
-        "added_keys": report["env"],
-        "env_path": str(env_path),
-    }
 
 
 def _telemetry_consent(args: argparse.Namespace) -> bool:
@@ -22241,7 +21603,115 @@ def _telemetry_consent(args: argparse.Namespace) -> bool:
     return ans in ("y", "yes")
 
 
+def _normalise_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentParser) -> None:
+    """Post-parse normalisation, run once in ``main()``.
+
+    * ``VCT_NON_INTERACTIVE``: install.ps1 documents that this env var should
+      trigger non-interactive mode, but install.py never honored it — only
+      --yes / --quiet / non-TTY did. The .bat -> .ps1 -> .py chain sets it as
+      a fallback when args don't propagate cleanly; lift it into ``args.yes``
+      so all downstream gates see a consistent state.
+    * ``--openai-key`` (review R5 F38): every mode that runs the install
+      stores it (fresh/re-install in step 9, ``--update`` in
+      :func:`_update_env_config`, ``--lightweight`` at its start). A mode
+      that makes no changes, or is not an install, cannot store it — it is
+      REJECTED there, loudly, instead of being accepted and dropped.
+    """
+    if not args.yes and os.environ.get("VCT_NON_INTERACTIVE"):
+        args.yes = True
+    if not getattr(args, "openai_key", ""):
+        return
+    for attr, flag in (
+        ("uninstall", "--uninstall"),
+        ("desktop_icon_only", "--desktop-icon-only"),
+        ("adopt_project_dry_run", "--adopt-project-dry-run"),
+        ("no_adopt_project", "--no-adopt-project"),
+    ):
+        if getattr(args, attr, False):
+            parser.error(
+                f"--openai-key cannot be used with {flag}: that run stores nothing, so "
+                "the key would be dropped. Store it with a normal install / --update, "
+                "in the launcher (Preferences → Special Secrets), or with "
+                "`vct set --shared --key openai_api_key` (value on stdin)."
+            )
+
+
+def _update_env_config(args: argparse.Namespace) -> None:
+    """Step 8 on ``--update``: the ``.env`` is preserved (user changes win);
+    only canonical keys added since the original install are reconciled into
+    its managed block, and ``--openai-key`` is stored (review R5 F38 — it
+    used to be accepted and dropped here)."""
+    print("[skip] .env configuration (preserved during update)")
+    # v0.2.46 V47-F (Gap F): informational log when PROJECT_NAME differs
+    # from folder-name derivation. Pure visibility — the existing project
+    # KEEPS whatever PROJECT_NAME it already has (non-destructive rule).
+    _log_project_name_pin_diff(PROJECT_ROOT, "")
+    if getattr(args, "openai_key", ""):
+        _store_install_openai_key(args.openai_key)
+    # A3 (2026-05-28): reconcile any canonical env keys added since the
+    # user's original install. Additive-only: user-set values preserved.
+    env_file = PROJECT_ROOT / ".env"
+    result = _reconcile_env_keys(env_file)
+    if result["action"] == "appended":
+        added = result["added"]
+        print(f"  .env: added {len(added)} new env key(s): " + ", ".join(added))
+        _log_install_event(
+            "9/10", "info",
+            f"_reconcile_env_keys: added {len(added)} key(s)",
+            data={"added": added, "env_file": str(env_file)},
+        )
+    elif result["action"] == "noop":
+        _log_install_event(
+            "9/10", "info",
+            "_reconcile_env_keys: no missing keys (noop)",
+            data={"env_file": str(env_file)},
+        )
+
+
+def _store_install_openai_key(value: str) -> None:
+    """``--openai-key``: store the key in the launcher keychain (via the hub)
+    or the file store — never in ``.env`` (v0.2.97). Soft-fails with a
+    warning naming where it would have gone; never prints the value."""
+    from vco_lib.openai_key import StoreFailed, describe_store, store_openai_api_key
+
+    try:
+        where = store_openai_api_key(value)
+    except StoreFailed as exc:
+        print(f"\n  WARNING: the OpenAI key was NOT stored ({exc}). Set it in the "
+              "launcher (Preferences → Special Secrets) or with "
+              "`vct set --shared --key openai_api_key` (value on stdin).")
+        _log_install_event("9/10", "warn", f"openai key not stored: {exc}")
+        return
+    print(f"\n  OpenAI key stored in {describe_store(where)} — not in .env.")
+    _log_install_event("9/10", "ok", "openai key stored", data={"store": where})
+
+
+def _migrate_install_dotenv_openai_key(root: Optional[Path] = None) -> None:
+    """Move a pre-v0.2.97 VCO-written ``OPENAI_API_KEY`` line out of
+    ``<root>/.env`` on value evidence; never the value. v0.2.97 fix: it runs
+    as a SUBPROCESS of the install venv's python — in-process, the system
+    interpreter reached ``requests`` (see migrate_dotenv_openai_key_via)."""
+    from vco_lib.openai_key import migrate_dotenv_openai_key_via
+
+    migrate_dotenv_openai_key_via(
+        _resolve_venv_python_for_install(PROJECT_ROOT),
+        root or PROJECT_ROOT,
+        say=print,
+        note=lambda lvl, msg, data=None: _log_install_event("9/10", lvl, msg, data=data),
+    )
+
+
 def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
+    """Step 9: the orchestrator root's ``.env``.
+
+    v0.2.97 — one writer per concern: the canonical keys go into the
+    VCO-managed block through ``vco_lib.env_template.apply_env_template``
+    (via ``vco_lib.install_env.write_orchestrator_env``); the install-time
+    keys (embedding model/dims/backend, ``CODE_EMBED_*``, provider,
+    telemetry) are the text a NEW file starts with
+    (``render_install_env_tail``). An existing file is refreshed fill-only:
+    keys are added to its block, never changed.
+    """
     print("[9/10] Writing configuration ... ", end="", flush=True)
     _log_install_event("9/10", "start", "writing .env")
     env_file = PROJECT_ROOT / ".env"
@@ -22251,262 +21721,85 @@ def _write_env_config(embed_config: dict, args: argparse.Namespace) -> None:
     # there is exactly one Weaviate / Ollama / code_embed per machine; every
     # install — wherever it lives on disk — reaches them via 127.0.0.1 on the
     # default ports. Per-install isolation comes from KG_COLLECTION (set by
-    # the launcher's projects_v2::write_project_env_files), NOT from
+    # the launcher's `config_projection apply` projection), NOT from
     # different host endpoints.
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
+    from vco_lib.install_env import render_install_env_tail, write_orchestrator_env
 
-    lines = [
-        "# VibeCoded Tools — Orchestrator Configuration",
-        "# Generated by install.py — edit as needed",
-        "",
-        "# Weaviate",
-        f"WEAVIATE_URL=http://localhost:{weaviate_port}",
-        f"WEAVIATE_PORT={weaviate_port}",
-        f"WEAVIATE_GRPC_PORT={weaviate_grpc}",
-        "",
-        "# Ollama",
-        f"OLLAMA_URL=http://localhost:{ollama_port}",
-        f"OLLAMA_PORT={ollama_port}",
-        "",
-        "# Embedding models",
-        f"EMBEDDING_MODEL={embed_config['text_model']}",
-        f"EMBEDDING_DIMS={embed_config['text_dims']}",
-        f"CODE_EMBED_BACKEND={embed_config['code_backend']}",
-        f"CODE_EMBED_MODEL={embed_config['code_model']}",
-        f"CODE_EMBED_DIMS={embed_config['code_dims']}",
-        f"CODE_EMBED_SERVICE_URL=http://localhost:{code_embed_port}",
-        # v0.2.77 5c task 2: hardware-derived in-flight cap (honour-explicit).
-        *_code_embed_max_concurrent_env_lines(embed_config),
-        # v0.2.50 audit F1 (2026-06-08): per-arch Dockerfile selection
-        # for the code-embed image build. NVIDIA hosts opt into the CUDA
-        # base image; everyone else (AMD ROCm, Apple Silicon, CPU-only)
-        # uses the multi-arch CPU default. The compose file reads this
-        # via ${CODE_EMBED_DOCKERFILE:-Dockerfile}. Only emitted when
-        # NVIDIA was detected — leaves CPU/AMD/Metal hosts on the default.
-        *(["CODE_EMBED_DOCKERFILE=Dockerfile.cuda"]
-          if embed_config.get("gpu_vendor") == "nvidia" else []),
-        # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
-        # reads/writes. Per-profile so low-resource/openai installs don't
-        # cross-write qwen3 vectors into a slot labelled for a different
-        # model (audit fix 2026-04-30, see kg-embedding-vector-audit-2026-04-30.md).
-        f"ACTIVE_EMBEDDING={embed_config.get('active_embedding', 'qwen3')}",
-        "",
-        "# Knowledge Graph",
-        # Resolved by _ensure_collections (per-install naming on adopt mode,
-        # bare defaults when we own the Weaviate). Defaults pinned here in
-        # case _ensure_collections didn't run (e.g. --no-containers).
-        f"KG_COLLECTION={os.environ.get('KG_COLLECTION', 'KnowledgeGraph')}",
-        f"DEVELOPMENT_COLLECTION={os.environ.get('DEVELOPMENT_COLLECTION', 'Development')}",
-        "",
-        "# Cross-project shared KG (all vco installs on this machine read",
-        "# from it alongside their own KG by default — v0.2.46 added a",
-        "# symmetric per-project READ opt-out gate, asymmetric-by-default).",
-        "# Seeded at install time from vibecoded-orchestrator/knowledge/.",
-        "# Set SHARED_KG_WRITE_DISABLED=true to gate WRITES from this project,",
-        "# SHARED_KG_READ_DISABLED=true to gate READS. SHARED_KG_OPT_OUT is",
-        "# the legacy write alias kept for ~3 releases (target removal:",
-        "# 2026-08); no read alias because the read path was unconditional",
-        "# pre-v0.2.46.",
-        f"SHARED_KG_COLLECTION={os.environ.get('SHARED_KG_COLLECTION', 'VibeCodedOrchestrator_KnowledgeGraph')}",
-        "SHARED_KG_WRITE_DISABLED=false",
-        "SHARED_KG_OPT_OUT=false",
-        "SHARED_KG_READ_DISABLED=false",
-        "",
-    ]
-
+    tail = render_install_env_tail(
+        embed_config,
+        weaviate_grpc_port=str(_service_endpoint_urls()["weaviate_grpc_port"]),
+        code_embed_port=str(_service_endpoint_urls()["code_embed_port"]),
+        telemetry_enabled=telemetry_enabled,
+        concurrency_lines=_code_embed_max_concurrent_env_lines(embed_config),
+    )
+    # ACTIVE_EMBEDDING: maps to the named-vector slot the MCP server
+    # reads/writes; per-profile so low-resource/openai installs don't
+    # cross-write qwen3 vectors into a slot labelled for a different model.
+    keys = _orchestrator_env_keys(embed_config.get("active_embedding", "qwen3"))
     if embed_config.get("openai_key"):
-        lines.extend([
-            "# OpenAI (for embeddings)",
-            f"OPENAI_API_KEY={embed_config['openai_key']}",
-            "EMBEDDING_PROVIDER=openai",
-            "",
-        ])
-    else:
-        lines.extend([
-            "# Embedding provider",
-            "EMBEDDING_PROVIDER=ollama",
-            "",
-        ])
-
-    # Anonymous telemetry consent (default OFF; matches collector/uploader
-    # default-OFF semantics — README promises "no telemetry unless you opt in").
-    # Belt-and-suspenders: the flag is also written explicitly so user / sysadmin
-    # can audit consent state by reading .env, not just by trusting the lib default.
-    lines.extend([
-        "# Anonymous telemetry (default: off — README promise)",
-        "# Set to 'true' to enable; collector + uploader both honour this.",
-        # B7 (2026-05-01): canonical key is VCT_TELEMETRY (matches template at
-        # line ~4986 and Rust). VIBECODED_TELEMETRY remains as a read-time alias
-        # in the telemetry module for ~3 releases of back-compat.
-        f"VCT_TELEMETRY={'true' if telemetry_enabled else 'false'}",
-        "",
-    ])
-
-    # env_template: legacy_caller_pending_migration
-    #
-    # PHASE 0.D NOTE (2026-05-24): the fresh-write branch below at the
-    # ``else`` arm is intentionally allowlisted by
-    # ``tests/test_config_projection_single_writer.py``. install.py
-    # writes a mix of canonical Phase 0.D keys AND non-canonical
-    # install-time-only keys (EMBEDDING_MODEL / EMBEDDING_DIMS /
-    # CODE_EMBED_BACKEND / EMBEDDING_PROVIDER /
-    # VCT_TELEMETRY / banner comments / RL-section placeholders).
-    # Splitting "managed-block keys" from "install-time-only keys" so
-    # the install.py fresh-write fully routes through
-    # ``apply_env_template`` is a follow-up refactor scoped outside
-    # Phase 0.D's brief — the brief's literal directive was migrating
-    # ``_ensure_env_template`` (done above).
-    # The EXISTING-file branch DOES route through apply_env_template
-    # (via _ensure_env_template, now Phase 0.D-migrated).
-    if env_file.exists():
-        report = _ensure_env_template(env_file)
-        if report["action"] == "appended":
-            print(f"already exists — refreshed managed block ({len(report['added_keys'])} canonical keys)")
-            _log_install_event(
-                "9/10", "ok",
-                f".env managed-block refreshed ({len(report['added_keys'])} keys)",
-                data={"env_file": str(env_file),
-                      "added_keys": report["added_keys"]},
-            )
-        else:
-            print("already exists (not overwritten)")
-            _log_install_event(
-                "9/10", "skip",
-                ".env already exists — preserved",
-                data={"env_file": str(env_file)},
-            )
-    else:
-        env_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
-        if telemetry_enabled:
-            print("OK (telemetry: on, opt-in)")
-        else:
-            print("OK (telemetry: off)")
+        _store_install_openai_key(embed_config["openai_key"])
+    report = write_orchestrator_env(PROJECT_ROOT, keys, tail=tail)
+    _migrate_install_dotenv_openai_key()
+    action = report["action"][0]
+    if action == "created":
+        print("OK (telemetry: on, opt-in)" if telemetry_enabled else "OK (telemetry: off)")
         _log_install_event(
             "9/10", "ok",
             ".env written",
-            data={"env_file": str(env_file),
-                  "telemetry_on": telemetry_enabled},
+            data={"env_file": str(env_file), "telemetry_on": telemetry_enabled},
+        )
+    elif action == "updated":
+        print(f"already exists — managed block refreshed "
+              f"({len(report['added'])} canonical key(s) added)")
+        _log_install_event(
+            "9/10", "ok",
+            f".env managed-block refreshed ({len(report['added'])} keys added)",
+            data={"env_file": str(env_file), "added_keys": report["added"],
+                  "migrated_keys": report["migrated"]},
+        )
+    else:
+        print("already exists (not overwritten)")
+        _log_install_event(
+            "9/10", "skip",
+            ".env already exists — preserved",
+            data={"env_file": str(env_file)},
         )
 
 
 def _reconcile_env_keys(env_path: Path) -> dict:
-    """Append canonical env keys missing from an existing .env file.
+    """Add the canonical env keys an existing ``.env`` lacks (``--update``).
 
-    # A3 (2026-05-28): install.py --update skips _write_env_config to
-    # preserve user values, so keys added in newer orchestrator versions
-    # (e.g. DIAGRAMS_COLLECTION added between v0.2.10 and v0.2.34) were
-    # silently absent. This function closes that gap with an additive-only
-    # write: parse existing keys, compare against the canonical list from
-    # vco_lib.env_template, append each missing key with its default value
-    # and a comment marker. User-set values are NEVER overwritten.
-
-    Args:
-        env_path: Path to the project's ``.env`` file. No-op if the file
-            does not exist (fresh install wrote it; nothing to reconcile).
+    A3 (2026-05-28): ``install.py --update`` skips ``_write_env_config`` to
+    preserve user values, so keys added in newer orchestrator versions were
+    silently absent. v0.2.97: they are added to the file's VCO-managed block
+    through the one ``.env`` writer, FILL-ONLY — a key the user assigns, or
+    the block already carries, is never changed (the V47-F non-destructive
+    rule). The retired writers' annotated lines are folded into the block.
 
     Returns:
-        ``{"added": [keys...], "action": "appended"|"noop"|"skipped"}``
+        ``{"added": [keys...], "action": "appended"|"noop"|"skipped"}`` —
+        ``skipped`` when there is no ``.env`` (a fresh install writes it) or
+        it could not be read/written.
     """
     if not env_path.is_file():
         return {"added": [], "action": "skipped"}
-
-    from vco_lib.env_template import list_canonical_env_template_keys
-
-    canonical_keys = list_canonical_env_template_keys()
-    existing_keys = _parse_existing_env_keys(env_path)
-    missing = [k for k in canonical_keys if k not in existing_keys]
-    if not missing:
-        return {"added": [], "action": "noop"}
-
-    # Build a default-value map from the legacy canonical template
-    # (same source _ensure_env_template uses so defaults are consistent).
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
-    sanitized = os.environ.get("PROJECT_NAME", "Project")
-    defaults: dict[str, str] = {
-        "PROJECT_NAME": sanitized,
-        "CODE_GRAPH_PROJECT": sanitized,
-        "KG_COLLECTION": f"{sanitized}_KnowledgeGraph",
-        "DEVELOPMENT_COLLECTION": f"{sanitized}_Development",
-        "SHARED_KG_COLLECTION": os.environ.get(
-            "SHARED_KG_COLLECTION", "VibeCodedOrchestrator_KnowledgeGraph"
-        ),
-        "SHARED_KG_WRITE_DISABLED": "false",
-        "SHARED_KG_OPT_OUT": "false",
-        # v0.2.46 Decision B — symmetric READ gate.
-        "SHARED_KG_READ_DISABLED": "false",
-        # v0.2.61/v0.2.67 (embedding reconcile): see the matching note in
-        # `_ensure_env_template`. os.environ["ACTIVE_EMBEDDING"] is already made
-        # authoritative (hardware pick on the stale-qwen3 OR empty-env shapes;
-        # a deliberate choice flows through verbatim) by
-        # `_reconcile_install_active_embedding` before this additive-write
-        # runs, so a qwen3 default is never re-appended for a CPU host whose
-        # selector chose arctic.
-        "ACTIVE_EMBEDDING": os.environ.get("ACTIVE_EMBEDDING", "qwen3"),
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "WEAVIATE_PORT": weaviate_port,
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
-        "OLLAMA_PORT": ollama_port,
-        "CODE_EMBED_URL": f"http://localhost:{code_embed_port}",
-        "CODE_EMBED_PORT": code_embed_port,
-    }
-
-    date_str = _utc_iso_now()[:10]
-    append_lines: list[str] = [
-        "",
-        f"# --- Added by install.py --update on {date_str} ---",
-    ]
-    added: list[str] = []
-    for key in missing:
-        default = defaults.get(key, "")
-        append_lines.append(
-            f"# Added by install.py --update on {date_str}"
-        )
-        append_lines.append(f"{key}={default}")
-        added.append(key)
+    from vco_lib.install_env import write_orchestrator_env
 
     try:
-        existing_text = env_path.read_text(encoding="utf-8")
-        new_text = existing_text
-        if not existing_text.endswith("\n"):
-            new_text += "\n"
-        new_text += "\n".join(append_lines) + "\n"
-        # Atomic write — same pattern as _atomic_write_text in env_template.
-        import tempfile
-        parent = env_path.parent
-        fd, tmp_path_str = tempfile.mkstemp(
-            prefix=env_path.name + ".",
-            suffix=".tmp",
-            dir=str(parent),
-        )
-        try:
-            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-                f.write(new_text)
-                f.flush()
-                try:
-                    os.fsync(f.fileno())
-                except OSError:
-                    pass
-            os.replace(tmp_path_str, str(env_path))
-        except Exception:
-            try:
-                Path(tmp_path_str).unlink()
-            except OSError:
-                pass
-            raise
-    except OSError as exc:
+        report = write_orchestrator_env(env_path.parent, _orchestrator_env_keys())
+    except (OSError, UnicodeDecodeError) as exc:
         _log_install_event(
             "9/10", "warn",
             f"_reconcile_env_keys: write failed: {exc}",
             data={"env_path": str(env_path), "error": str(exc)},
         )
         return {"added": [], "action": "skipped"}
-
-    return {"added": added, "action": "appended"}
+    # The same --update pass moves a pre-v0.2.97 VCO-written OpenAI key
+    # out of this .env (value evidence only; reported when left).
+    _migrate_install_dotenv_openai_key(env_path.parent)
+    if not report["added"]:
+        return {"added": [], "action": "noop"}
+    return {"added": report["added"], "action": "appended"}
 
 
 # ---------------------------------------------------------------------------
@@ -22539,17 +21832,20 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
     """Return the VCO-default ``settings.json`` contents (refreshed on every call).
 
     Builds the env block + permissions block + ``_vco_managed_keys`` sentinel
-    that V47-A (Gap A) uses for managed-block merge. Pure function — no I/O.
+    that V47-A (Gap A) uses for managed-block merge. Reads machine state
+    (launcher.db's ``service_endpoints`` rows) through
+    ``vco_lib.service_endpoints`` — no other I/O.
     """
-    # Build the env block for weaviate-kg MCP
-    weaviate_port = os.environ.get("WEAVIATE_PORT", str(DEFAULT_WEAVIATE_PORT))
-    weaviate_grpc = os.environ.get("WEAVIATE_GRPC_PORT", str(DEFAULT_WEAVIATE_GRPC_PORT))
-    ollama_port = os.environ.get("OLLAMA_PORT", str(DEFAULT_OLLAMA_PORT))
-    code_embed_port = os.environ.get("CODE_EMBED_PORT", str(DEFAULT_CODE_EMBED_PORT))
+    # v0.2.97: service URLs/ports (gRPC included) from the ONE home — the
+    # launcher.db `service_endpoints` rows (row → compiled default), the same
+    # answer the hub and the projection give; step [5b]'s pins when the
+    # registry could not be written this run.
+    urls = _service_endpoint_urls()
+    weaviate_grpc = urls["weaviate_grpc_port"]
 
     env_block: dict[str, str] = {
-        "WEAVIATE_URL": f"http://localhost:{weaviate_port}",
-        "OLLAMA_URL": f"http://localhost:{ollama_port}",
+        "WEAVIATE_URL": urls["weaviate_url"],
+        "OLLAMA_URL": urls["ollama_url"],
         # B8 (2026-05-01): .claude/settings.json surface uses GRPC_PORT (legacy
         # alias). Canonical key is WEAVIATE_GRPC_PORT (written to .env at line
         # ~5178). weaviate_mcp/server.py reads both, prefers WEAVIATE_GRPC_PORT.
@@ -22588,7 +21884,7 @@ def _build_vco_settings_defaults(embed_config: dict) -> dict:
         "PROJECT_NAME": _derive_orchestrator_project_name(),
         "CODE_GRAPH_PROJECT": _derive_orchestrator_project_name(),
         "CODE_EMBED_BACKEND": embed_config["code_backend"],
-        "CODE_EMBED_SERVICE_URL": f"http://localhost:{code_embed_port}",
+        "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
     }
 
     # 0.2.11: no BASH_ENV wiring here. Lean-ctx output compression flows
@@ -22928,65 +22224,24 @@ def _cleanup_legacy_bash_env_shim(args: argparse.Namespace) -> None:
     later run picks up the rest. Errors are surfaced as warnings, never
     raised.
     """
-    # Path construction split across two assignments so the
-    # single-writer lint (which detects chained `.claude/settings.json`
-    # literals in a single assignment expression) treats this BASH_ENV
-    # cleanup as orthogonal to the canonical-env contract. BASH_ENV is
-    # NOT a canonical key — the cleanup pops one non-canonical key and
-    # re-writes the surrounding JSON verbatim. The Phase 0.B contract
-    # owns CANONICAL key writes; this targeted strip + re-write is a
-    # legitimate orthogonal concern.
-    _claude_root = PROJECT_ROOT / ".claude"
-    settings_file = _claude_root / "settings.json"
-    shim_path = _claude_root / "scripts" / "leanctx-bash-env.sh"
+    shim_path = PROJECT_ROOT / ".claude" / "scripts" / "leanctx-bash-env.sh"
 
     # ----- Part 1: strip BASH_ENV from .claude/settings.json -----
-    if settings_file.exists():
+    # ONE home (v0.2.97): the bundle engine's per-project cleanup reads JSONC
+    # through `settings_refusal.load_for_edit` and edits it in place; a file
+    # it cannot edit is left byte-identical AND recorded
+    # (`legacy_bash_env_cleanup_pending`). Step 5b's bundle already ran it for
+    # the root; this idempotent re-run covers a 5b that did not complete.
+    outcome = _project_init._cleanup_legacy_bash_env_in_project(PROJECT_ROOT)
+    action, detail = outcome.get("action"), outcome.get("detail", "")
+    if action in ("removed", "left-alone"):
+        print(f"  legacy BASH_ENV cleanup: {action}: {detail}")
+    elif action in ("write-failed", "unparseable", "edit-refused"):
+        print(f"  legacy BASH_ENV cleanup deferred ({action}): {detail}")
         try:
-            settings_text = settings_file.read_text(encoding="utf-8")
-            settings = json.loads(settings_text)
-        except (OSError, json.JSONDecodeError) as e:
-            print(
-                f"  legacy BASH_ENV cleanup: settings.json read/parse failed "
-                f"({type(e).__name__}: {e}) — skipping (re-run after fixing)"
-            )
-            settings = None
-
-        if isinstance(settings, dict):
-            env_block = settings.get("env")
-            if isinstance(env_block, dict) and "BASH_ENV" in env_block:
-                raw_val = str(env_block.get("BASH_ENV", ""))
-                # Detect the shim — accept both ${CLAUDE_PROJECT_DIR}-templated
-                # and absolute-path forms (older installs wrote literal paths).
-                points_at_shim = (
-                    "leanctx-bash-env.sh" in raw_val
-                    or raw_val.endswith(str(shim_path))
-                )
-                if points_at_shim:
-                    env_block.pop("BASH_ENV", None)
-                    try:
-                        settings_file.write_text(
-                            json.dumps(settings, indent=2) + "\n",
-                            encoding="utf-8",
-                        )
-                        print(
-                            "  legacy BASH_ENV cleanup: removed BASH_ENV "
-                            "from .claude/settings.json (was wired to "
-                            "leanctx-bash-env.sh shim)"
-                        )
-                    except OSError as e:
-                        print(
-                            f"  legacy BASH_ENV cleanup: settings.json write "
-                            f"failed ({type(e).__name__}: {e}) — re-run after "
-                            f"fixing permissions"
-                        )
-                else:
-                    print(
-                        f"  legacy BASH_ENV cleanup: BASH_ENV present in "
-                        f"settings.json but doesn't point at the shim "
-                        f"({raw_val!r}) — leaving alone (user/other tooling)"
-                    )
-            # else: env_block missing or BASH_ENV already gone — no-op.
+            _project_init._emit_bash_env_cleanup_deferral(PROJECT_ROOT, outcome)
+        except Exception as e:  # noqa: BLE001 — the ledger is observability
+            print(f"  legacy BASH_ENV cleanup: deferral write failed: {e}")
 
     # ----- Part 2: disable the shim file itself -----
     if shim_path.exists():
@@ -23524,8 +22779,7 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
         print()
 
     if args.no_containers:
-        print("  NOTE: You skipped container setup. Start Weaviate and Ollama")
-        print("  manually before using the orchestrator.")
+        print(_runtime_reconcile.containers_skipped_note(args))
         print()
 
     print("  Documentation: docs/")

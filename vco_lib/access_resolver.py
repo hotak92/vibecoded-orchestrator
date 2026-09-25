@@ -81,7 +81,6 @@ import urllib.request
 from pathlib import Path
 
 from vco_lib.atomic import rotate_tail_lines
-from vco_lib.intfile import read_int_line
 from typing import NamedTuple, Optional
 
 logger = logging.getLogger("vco.access_resolver")
@@ -111,22 +110,12 @@ def _state_dir() -> Path:
 
 
 def _hub_port() -> int:
-    """Hub port discovery: env > state file > default."""
-    p = os.environ.get("VCT_HUB_PORT")
-    if p:
-        try:
-            return int(p)
-        except ValueError:
-            pass
-    # The file read goes through the ONE small-state-file reader
-    # (:func:`vco_lib.intfile.read_int_line`), which also brings the range
-    # check this call site never had: a recorded 0 used to be returned as a
-    # port. Missing, unreadable, unparseable and out-of-range all fall
-    # through to the documented default, exactly as before.
-    value = read_int_line(_state_dir() / "hub.port", minimum=1, maximum=65535)
-    if value is not None:
-        return value
-    return 7700
+    """Hub port discovery: env > state file > default — the ONE Python
+    reader, :func:`vco_lib.hub_ensure.resolve_hub_port` (v0.2.97). Silent,
+    as this caller always was."""
+    from vco_lib.hub_ensure import resolve_hub_port
+
+    return resolve_hub_port(_state_dir())
 
 
 def _hub_token() -> Optional[str]:

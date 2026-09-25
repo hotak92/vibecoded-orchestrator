@@ -1,0 +1,318 @@
+{
+  "_comment": [
+    "v0.2.97 R12 SSOT-1 — the `decide` contract: ONE verdict for every surface, driven by",
+    "tests/test_v0297_runtime_decide.py (Python: vco_lib.runtime_reconcile.decide). This is the",
+    "fixture lane SSOT-2 points the Rust surfaces at: each case is a COMPLETE fake machine +",
+    "install root, and `expect` is a SUBSET match on the schema-1 JSON `decide --json` prints",
+    "(`<key>_contains` entries are substring asserts on string fields).",
+    "",
+    "Case shape:",
+    "  mode/purpose   the CLI flags ('read-only' writes nothing; 'install' may re-record).",
+    "  record         state/install/runtime.txt ('null' = no record).",
+    "  confirmed      state/install/runtime.confirmed ('null' = none).",
+    "  env_pin        VCT_CONTAINER_RUNTIME ('null' = unset).",
+    "  infra_env      infrastructure/.env text; '{DATA}' placeholders resolve to a temp dir.",
+    "  folders        directories to create under that temp dir; 'entries' become files.",
+    "  runtimes       per runtime: on_path / version_ok / daemon_ok (the `info` probe) /",
+    "                 compose_subcommand (`<rt> compose version` exits 0) / standalone",
+    "                 (`<rt>-compose` on PATH), the listings ps_a (`ps -a --format {{.Names}}`),",
+    "                 ps (`ps --format {{.Names}}`, the RUNNING ones), volume_ls, the full",
+    "                 container IDs ps_a_ids (`ps -a --no-trunc --format {{.ID}}`) and the raw",
+    "                 version_out text. A runtime absent from the map is not installed.",
+    "",
+    "HOW RUST REPRODUCES A CASE (SSOT-2): build a temp install root with the record/confirmed/",
+    "infrastructure/.env files ({DATA} resolved), put executable stub scripts named `podman` /",
+    "`docker` on a PATH handed to the child (HOME pointed at an empty temp dir so the compose",
+    "standalone leg finds nothing), and have each stub answer the argv grammar above — `version`",
+    "prints version_out and exits version_ok, `info` exits daemon_ok, `compose version` exits",
+    "compose_subcommand, `ps -a --format {{.Names}}` prints ps_a, `ps --format {{.Names}}` prints",
+    "ps, `ps -a --no-trunc --format {{.ID}}` prints ps_a_ids, `volume ls --format {{.Name}}`",
+    "prints volume_ls — then run `python -m vco_lib.runtime_reconcile decide --json --root <root>",
+    "[--mode m] [--purpose p]` with VCT_CONTAINER_RUNTIME set per env_pin, parse the JSON and",
+    "apply the same subset match. Exit code 0 = resolved, 3 = refused (absent or unknown)."
+  ],
+  "cases": [
+    {
+      "name": "auto_no_record",
+      "_why": "No pin anywhere: auto-detection picks the first usable candidate.",
+      "mode": "read-only", "purpose": "infra",
+      "record": null, "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "compose_form": "subcommand",
+                 "requested": null, "requested_via": "auto", "refused": false,
+                 "outcome": "no_record", "same_engine": false}
+    },
+    {
+      "name": "env_pin_honored",
+      "_why": "VCT_CONTAINER_RUNTIME is honoured when the pinned runtime answers.",
+      "mode": "read-only", "purpose": "infra",
+      "record": null, "confirmed": null, "env_pin": "docker",
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "resolved", "runtime": "docker", "requested": "docker",
+                 "requested_via": "env", "refused": false, "outcome": "kept"}
+    },
+    {
+      "name": "env_pin_refused",
+      "_why": "An env pin for a runtime that is not installed is REFUSED, never swapped; the refusal names the knob and the repin target.",
+      "mode": "read-only", "purpose": "infra",
+      "record": null, "confirmed": null, "env_pin": "docker",
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "env", "requested_installed": false,
+                 "alternative_usable": "podman", "refused": true,
+                 "refusal_contains": ["VCT_CONTAINER_RUNTIME=docker", "podman is usable"]}
+    },
+    {
+      "name": "record_kept",
+      "_why": "The recorded runtime answers and nothing suggests a switch: the record stands.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "not_switched_key": null}
+    },
+    {
+      "name": "confirmed_missing_refuses",
+      "_why": "runtime.confirmed matches the record: only the user switches, so the missing runtime is refused with the shared `confirmed` wording.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": "podman", "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "podman",
+                 "requested_via": "confirmed", "refused": true, "outcome": "unusable",
+                 "not_switched_key": "confirmed",
+                 "refusal_contains": ["confirmed choice"]}
+    },
+    {
+      "name": "stale_switches_on_running",
+      "_why": "Case (a) on positive evidence: the recorded docker is gone, podman RUNS VCO's containers — every surface answers podman, the record is reconciled read-only.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"],
+                   "volume_ls": ["vco_weaviate_data"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested": "docker",
+                 "requested_via": "record", "record_reconciled": true, "refused": false,
+                 "outcome": "rewritten", "same_engine": false}
+    },
+    {
+      "name": "stale_no_data_read_only_refuses",
+      "_why": "R9 H1: 'no VCO data anywhere' is install's decision alone — read-only refuses with `no_data`.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "record", "refused": true, "outcome": "unusable",
+                 "not_switched_key": "no_data"}
+    },
+    {
+      "name": "stale_no_data_install_rewrites",
+      "_why": "Same machine at install: the record IS re-recorded (nothing is stranded), so the post-verdict pin already reads podman.",
+      "mode": "install", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested": "podman",
+                 "requested_via": "record", "refused": false, "outcome": "rewritten"}
+    },
+    {
+      "name": "bind_leftover_volume_kept",
+      "_why": "R10 J2: the folder is the data; a leftover volume under the other runtime is not evidence about it — the record stands.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_WEAVIATE_VOLUME_NAME=\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "volume_ls": ["vco_weaviate_data"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "not_switched_key": null}
+    },
+    {
+      "name": "all_bind_nothing_read_only_refuses",
+      "_why": "R12 M1: every service is a folder and NOTHING of VCO's is under podman — absence is not evidence, so read-only refuses with `no_data` (install still switches).",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_OLLAMA_DATA_SOURCE={DATA}/o\nVCT_CODE_EMBED_CACHE_SOURCE={DATA}/c\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]},
+                  {"path": "{DATA}/o", "entries": ["blob"]},
+                  {"path": "{DATA}/c", "entries": ["blob"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "record", "refused": true, "outcome": "unusable",
+                 "not_switched_key": "no_data"}
+    },
+    {
+      "name": "all_bind_stopped_switches",
+      "_why": "R12 M1's positive leg: stopped VCO containers under podman ARE evidence it serves the stack, so the switch goes through even read-only.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_OLLAMA_DATA_SOURCE={DATA}/o\nVCT_CODE_EMBED_CACHE_SOURCE={DATA}/c\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]},
+                  {"path": "{DATA}/o", "entries": ["blob"]},
+                  {"path": "{DATA}/c", "entries": ["blob"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested": "docker",
+                 "requested_via": "record", "record_reconciled": true, "refused": false,
+                 "outcome": "rewritten"}
+    },
+    {
+      "name": "same_engine_version_text",
+      "_why": "R12 M7: docker's `version` output names podman (a podman-docker shim) — one engine under two names, so 'data under both' collapses and the record is KEPT.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_ollama"]},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"],
+                   "version_out": "docker version 24.0 (emulates the docker CLI using podman)\n"}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "same_engine": true,
+                 "not_switched_key": null}
+    },
+    {
+      "name": "same_engine_id_intersection",
+      "_why": "R12 M7, second leg: clean version outputs, but both listings answer the same FULL container ID — one engine read twice.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_ollama"], "ps_a_ids": ["a1b2c3d4e5f6a1b2c3d4e5f6"]},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps_a_ids": ["a1b2c3d4e5f6a1b2c3d4e5f6"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "same_engine": true,
+                 "not_switched_key": null}
+    },
+    {
+      "name": "bind_stopped_read_only_data_under_both",
+      "_why": "R11 L2 (ii), case (a): stopped VCO containers under the other runtime beside the data folder — read-only refuses with `data_under_both` and the bind rationale (never 'SEPARATE named volumes').",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_WEAVIATE_VOLUME_NAME=\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"]}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "record", "refused": true, "outcome": "unusable",
+                 "not_switched_key": "data_under_both",
+                 "refusal_contains": ["either runtime could serve that folder"],
+                 "refusal_not_contains": ["SEPARATE named volumes"]}
+    },
+    {
+      "name": "module_purpose_no_compose",
+      "_why": "The module plane drives single containers: compose is not probed and the compose fields are null.",
+      "mode": "read-only", "purpose": "module",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "compose": null,
+                 "compose_form": null, "refused": false, "outcome": "kept"}
+    },
+    {
+      "name": "two_engines_data_under_both",
+      "_why": "The M7 control: two genuinely distinct engines (clean versions, disjoint IDs) both holding VCO containers stay DATA_UNDER_BOTH.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_ollama"], "ps_a_ids": ["a1b2c3d4e5f6a1b2c3d4e5f6"]},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps_a_ids": ["0123456789abcdef0123456789abcdef"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "data_under_both", "same_engine": false,
+                 "not_switched_key": null}
+    },
+    {
+      "name": "stale_other_unusable_refuses",
+      "_why": "R12bis F3(a): the recorded docker is gone AND podman is unusable (installed, daemon down) — the other_not_usable decline; nothing is driven, the refusal names both runtimes.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": null, "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": false, "compose_subcommand": true}
+      },
+      "expect": {"state": "absent", "runtime": null, "requested": "docker",
+                 "requested_via": "record", "requested_installed": false,
+                 "alternative_usable": null, "refused": true, "outcome": "unusable",
+                 "not_switched_key": "other_not_usable",
+                 "refusal_contains": ["podman is not usable either"]}
+    },
+    {
+      "name": "confirmed_disagrees_record_switch_lands_on_confirmed",
+      "_why": "R12bis F3(b): runtime.confirmed (podman) disagrees with the record (docker) — a switch target is always _other(record), so a switch can only ever land ON the confirmed runtime, never away from one; the data being under podman, the stale-record switch proceeds.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "docker", "confirmed": "podman", "env_pin": null,
+      "infra_env": null, "folders": [],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"],
+                   "volume_ls": ["vco_weaviate_data"]}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "compose_form": "subcommand",
+                 "requested": "docker", "requested_via": "record",
+                 "record_reconciled": true, "refused": false,
+                 "outcome": "rewritten", "same_engine": false}
+    },
+    {
+      "name": "bind_running_both_one_engine_kept",
+      "_why": "R12bis F3(c): the BIND arm's VERDICT_BOTH shape (~the running_both + here_running reconcile arm): the folder holds VCO's data, both runtimes RUN VCO containers — a podman-docker shim collapses it to KEPT, same_engine, no data_under_both.",
+      "mode": "read-only", "purpose": "infra",
+      "record": "podman", "confirmed": null, "env_pin": null,
+      "infra_env": "VCT_WEAVIATE_DATA_SOURCE={DATA}/w\nVCT_WEAVIATE_VOLUME_NAME=\n",
+      "folders": [{"path": "{DATA}/w", "entries": ["classifications.db"]}],
+      "runtimes": {
+        "podman": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_ollama"], "ps": ["vco_ollama"]},
+        "docker": {"on_path": true, "version_ok": true, "daemon_ok": true, "compose_subcommand": true,
+                   "ps_a": ["vco_weaviate"], "ps": ["vco_weaviate"],
+                   "version_out": "docker version 24.0 (emulates the docker CLI using podman)\n"}
+      },
+      "expect": {"state": "resolved", "runtime": "podman", "requested_via": "record",
+                 "refused": false, "outcome": "kept", "same_engine": true,
+                 "not_switched_key": null}
+    }
+  ]
+}

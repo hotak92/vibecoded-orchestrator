@@ -287,6 +287,14 @@ pub(crate) fn bus_is_integrated(pci_bus: &str) -> Option<bool> {
 /// `which <cmd>` then `<cmd> --version` → "<cmd> <version>" or None if not
 /// installed. We swallow parse errors and fall back to just the command
 /// name so the UI never shows "podman " with a trailing space.
+///
+/// v0.2.97 R12 — THE PRE-INSTALL EXCEPTION to tier A: this is the onboarding
+/// wizard's MINIMAL runtime probe (`installer.rs::detect_system`, called
+/// before the clone exists), so it cannot ask `vco_lib.runtime_reconcile`
+/// for the verdict — there is no vco_lib yet. It answers only "is a runtime
+/// binary present, and which version" for the wizard's checklist; every
+/// decision about WHICH runtime to drive is Python's
+/// (`services::runtime_verdict::decide`) on every post-install surface.
 pub(crate) async fn detect_runtime_version(cmd: &str) -> Option<String> {
     if !check_command_exists(cmd).await {
         return None;

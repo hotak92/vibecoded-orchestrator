@@ -76,6 +76,7 @@ from vco_lib import migration_plan_classify as _mpc
 # v0.2.92 W3 (§3 item 11): `.git/info/exclude` computation + append moved to
 # their own module when the project-move engine became a third caller.
 from vco_lib import git_exclude as _git_exclude
+from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
@@ -113,17 +114,17 @@ from vco_lib.hook_retirements import (
     emit_removal_audit_rows, removal_envelope_rows,
     vco_hook_script_identity as _vco_hook_script_identity,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
 )
-# v0.2.95: the settings.json merge ALGORITHM — the user-wins recursive merge
-# and the per-event hooks merge it delegates to — lives in
-# ``vco_lib.settings_merge``. What stays in THIS module is the I/O around it:
-# ``_merge_settings_template_for_bundle`` reads the template, reads the target
-# and writes atomically, and is the thin orchestration shim over the pure
-# decision. Both private names survive as ALIASES (same object-identity rule
-# as the import above) because this module and the merge's test suite reach
-# them here.
+from vco_lib.parked_hooks import ParkedHooksState, read_parked_hooks, report_parked_hooks
+# v0.2.95: the settings.json merge ALGORITHM lives in ``vco_lib.settings_merge``;
+# THIS module keeps only a shim (``_merge_settings_template_for_bundle``) over its
+# I/O half, which moved to ``vco_lib.bundle_settings_io`` in v0.2.97.
+# Both private names survive as ALIASES (object identity, as above) because
+# this module and the merge's test suite reach them here. v0.2.97: which hooks
+# the merge must not put back comes from ``vco_lib.parked_hooks``.
+from vco_lib import user_owned_secrets as _user_owned_secrets
 from vco_lib.settings_merge import (
     merge_hooks_block as _merge_hooks_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
-    smart_merge_settings as _smart_merge_for_bundle,
+    smart_merge_settings as _smart_merge_for_bundle,  # noqa: F401  # pyright: ignore[reportUnusedImport] — deliberate re-export
 )
 
 # Default Weaviate port. Canonical value lives in
@@ -401,16 +402,13 @@ def _resolve_bundle_collection_names_binding_first(
     except Exception:  # noqa: BLE001 — any other seam error → conservative fallthrough
         pass
 
-    # Tier 2: on-disk KG_COLLECTION pin in the project's settings.json env.
+    # Tier 2: on-disk KG_COLLECTION pin in the project's settings.json env (JSONC, v0.2.97).
     try:
-        settings_file = folder / ".claude" / "settings.json"
-        if settings_file.is_file():
-            data = json.loads(settings_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                env = data.get("env")
-                kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
-                if isinstance(kg, str) and kg:
-                    return _apply_primary(kg)
+        loaded = _jsonc_edit.load_object(folder / ".claude" / "settings.json")
+        env = loaded[0].get("env") if loaded is not None else None
+        kg = env.get("KG_COLLECTION") if isinstance(env, dict) else None
+        if isinstance(kg, str) and kg:
+            return _apply_primary(kg)
     except Exception:  # noqa: BLE001 — soft-fail to the last-resort derivation
         pass
 
@@ -2506,7 +2504,7 @@ def _default_restart_container() -> str:
     gracefully with "no such container" if the user has truly nothing).
 
     Called lazily by `_attempt_container_restart` rather than evaluated at
-    module import — `podman container exists` shells out and we don't
+    module import — `podman container inspect` shells out and we don't
     want to pay that on every `import vco_lib.project_init` in test code.
     """
     from vco_lib.containers import canonical_name, find_existing_container
@@ -5976,6 +5974,36 @@ from vco_lib.migrate_deferral import (  # noqa: E402,F401
 from vco_lib import migrate_deferral as _migrate_deferral  # noqa: E402
 
 
+def _points_at_legacy_shim(raw_val: str, folder: Path) -> bool:
+    """Does a ``BASH_ENV`` value name the pre-0.2.11 lean-ctx shim? Accepts
+    the ``${CLAUDE_PROJECT_DIR}``-templated and absolute-path forms."""
+    shim = folder / ".claude" / "scripts" / "leanctx-bash-env.sh"
+    return "leanctx-bash-env.sh" in raw_val or raw_val.endswith(str(shim))
+
+
+def legacy_bash_env_still_owed(folder: Path) -> Optional[bool]:
+    """Clear probe for ``legacy_bash_env_cleanup_pending`` (read-only).
+
+    Keyed on the file's STATE, with the cleanup's own read and shim rule:
+    ``False`` — no settings file, no ``BASH_ENV``, or one that no longer names
+    the shim (nothing left for the cleanup to do); ``True`` — the file cannot
+    be read, or still points at the shim. A cleanup that would now succeed
+    clears the entry by DOING it: every re-probe pass runs after its
+    update's cleanup (bundle engine, install.py), which removes the key first.
+    """
+    from vco_lib import settings_refusal as _refusal
+
+    loaded = _refusal.load_for_edit(Path(folder) / ".claude" / "settings.json")
+    if loaded is None:
+        return False
+    if isinstance(loaded, _refusal.Refusal):
+        return True
+    env_block = loaded[0].get("env")
+    if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
+        return False
+    return _points_at_legacy_shim(str(env_block.get("BASH_ENV", "")), Path(folder))
+
+
 def _cleanup_legacy_bash_env_in_project(
     folder: Path, *, redirect_sink: Optional[list] = None,
 ) -> dict:
@@ -6021,36 +6049,30 @@ def _cleanup_legacy_bash_env_in_project(
     `result["errors"]` without raising.
 
     Returns:
-        ``{"action": "removed"|"absent"|"left-alone"|"unparseable"|"write-failed",
-           "detail": <free text>}``
+        ``{"action": "removed"|"absent"|"left-alone"|"unparseable"|
+           "write-failed"|"edit-refused", "detail": <free text>}``
     """
     settings_file = folder / ".claude" / "settings.json"
-    shim_rel = folder / ".claude" / "scripts" / "leanctx-bash-env.sh"
 
-    if not settings_file.exists():
+    # The ONE settings read-for-edit (v0.2.97): JSONC is read AND edited in
+    # place, comments kept; a file it cannot read is left byte-identical and
+    # the refusal's reason is what the deferral quotes. install.py's root
+    # cleanup calls THIS function, so both paths refuse and record alike.
+    from vco_lib import settings_refusal as _refusal
+
+    loaded = _refusal.load_for_edit(settings_file)
+    if loaded is None:
         return {"action": "absent", "detail": "settings.json not present"}
-
-    try:
-        settings = json.loads(settings_file.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as e:
-        return {
-            "action": "unparseable",
-            "detail": f"{type(e).__name__}: {e}",
-        }
-
-    if not isinstance(settings, dict):
-        return {"action": "unparseable", "detail": "settings.json root not a dict"}
+    if isinstance(loaded, _refusal.Refusal):
+        return {"action": "unparseable", "detail": loaded.reason}
+    settings, raw = loaded
 
     env_block = settings.get("env")
     if not isinstance(env_block, dict) or "BASH_ENV" not in env_block:
         return {"action": "absent", "detail": "no BASH_ENV in settings.env"}
 
     raw_val = str(env_block.get("BASH_ENV", ""))
-    points_at_shim = (
-        "leanctx-bash-env.sh" in raw_val
-        or raw_val.endswith(str(shim_rel))
-    )
-    if not points_at_shim:
+    if not _points_at_legacy_shim(raw_val, folder):
         return {
             "action": "left-alone",
             "detail": (
@@ -6060,11 +6082,13 @@ def _cleanup_legacy_bash_env_in_project(
         }
 
     env_block.pop("BASH_ENV", None)
+    text = _jsonc_edit.dumps_preserving(raw, settings, indent=2)
+    if text is None:  # a JSONC edit that could not be verified: write nothing
+        return {"action": "edit-refused", "detail": "it has comments or trailing "
+                "commas (JSONC) and removing env.BASH_ENV could not be verified "
+                "in place; remove it by hand"}
     try:
-        _redirect = _write_file_atomic(
-            settings_file,
-            (json.dumps(settings, indent=2) + "\n").encode("utf-8"),
-        )
+        _redirect = _write_file_atomic(settings_file, text.encode("utf-8"))
         if _redirect is not None and redirect_sink is not None:
             redirect_sink.append((settings_file, _redirect))
     except OSError as e:
@@ -6085,7 +6109,7 @@ def _cleanup_legacy_bash_env_in_project(
 # ---------------------------------------------------------------------------
 # v0.2.24 RL-defect-2026-05-22 Fix 2 (cleanup hygiene):
 #
-# Pre-v0.2.12 the launcher's Rust `write_project_env_files` wrote a
+# Pre-v0.2.12 the launcher's Rust env writer (retired v0.2.97) wrote a
 # `claude-code.env` sub-object inside `.vscode/settings.json` containing
 # MCP_WEAVIATE_SERVER / MCP_PYTHON / MCP_OLLAMA_SERVER / MCP_PYTHONPATH
 # absolute paths. PR-27 (v0.2.12, 2026-05-16) removed that write because
@@ -6124,6 +6148,7 @@ def _detect_legacy_vscode_mcp_env_keys(folder: Path) -> dict:
         dict with:
           - action: "none" (no .vscode dir / file / parseable JSON / no
                    keys) | "detected" (≥1 legacy key found) | "unparseable"
+                   (not valid JSON or JSONC — a JSONC file is read, v0.2.97)
           - keys: list[str] of detected key names (empty when action != "detected")
           - file: relative path string (for the deferral message)
     """
@@ -6131,18 +6156,13 @@ def _detect_legacy_vscode_mcp_env_keys(folder: Path) -> dict:
     if not settings_file.exists():
         return {"action": "none", "keys": [], "file": ".vscode/settings.json"}
 
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        # Don't surface a deferral on unparseable JSON — the file may
-        # have trailing-comma user edits, and our cleanup logic should
-        # never push the user toward fixing JSON syntax just so we can
-        # check for hygiene-only keys.
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
+        # Don't surface a deferral on a file that is not even JSONC — our
+        # cleanup logic should never push the user toward fixing syntax just
+        # so we can check for hygiene-only keys.
         return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
-
-    if not isinstance(data, dict):
-        return {"action": "unparseable", "keys": [], "file": ".vscode/settings.json"}
+    data = loaded[0]
 
     env_block = data.get("claude-code.env")
     if not isinstance(env_block, dict):
@@ -6261,8 +6281,10 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
     four keys is provably non-destructive to project behaviour, so it is a
     DEFAULT-ON automation (D8): no env gate.
 
-    Guard (D8/B-F4): proceed ONLY when ``settings.json`` parses via
-    ``json.loads`` to a dict AND ``"claude-code.env"`` is a dict. Otherwise
+    Guard (D8/B-F4): proceed ONLY when ``settings.json`` parses — as JSON or
+    JSONC (v0.2.97; a JSONC file is edited in place, comments kept, and an
+    edit that cannot be verified is not written) — to a dict AND
+    ``"claude-code.env"`` is a dict. Otherwise
     return ``False`` (caller falls back to the deferral). An empty
     ``claude-code.env`` dict is LEFT in place (conservative — we prune keys, we
     don't restructure the file). Any write error also returns ``False`` so the
@@ -6283,15 +6305,12 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
         return False
 
     settings_file = folder / settings_rel
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
-        # Unparseable (JSONC / trailing-comma user edits) → keep today's
-        # no-op-detection behaviour; do NOT push the user toward fixing JSON.
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
+        # Not even JSONC → keep today's no-op-detection behaviour; do NOT
+        # push the user toward fixing syntax.
         return False
-    if not isinstance(data, dict):
-        return False
+    data, raw = loaded
     env_block = data.get("claude-code.env")
     if not isinstance(env_block, dict):
         return False
@@ -6306,10 +6325,12 @@ def _autoprune_legacy_vscode_mcp_env_keys(folder: Path, detection: dict) -> bool
         del env_block[k]
     data["claude-code.env"] = env_block  # empty dict left in place if now empty
 
-    # Re-serialise with a stable indent + trailing newline (match VS Code's
-    # 4-space convention used elsewhere for these settings files).
+    # Strict JSON: re-serialise with a stable indent + trailing newline
+    # (VS Code's 4-space convention). JSONC: edited in place, or not at all.
+    serialised = _jsonc_edit.dumps_preserving(raw, data, indent=4)
+    if serialised is None:
+        return False
     try:
-        serialised = json.dumps(data, indent=4) + "\n"
         atomic_write_text(settings_file, serialised)
     except (OSError, TypeError, ValueError):
         # Write / serialisation failure → fall back to the deferral.
@@ -6354,9 +6375,8 @@ def _emit_bash_env_cleanup_deferral(
     if action == "unparseable":
         detected = (
             f"During the 0.2.11 legacy BASH_ENV cleanup, "
-            f"`{settings_rel}` could not be parsed as JSON "
-            f"({detail}). The cleanup was skipped to avoid corrupting "
-            f"user state."
+            f"`{settings_rel}` could not be read: {detail}. The cleanup was "
+            f"skipped and the file left untouched."
         )
         cmd = (
             f"# Inspect / fix the JSON, then re-run the bundle update:\n"
@@ -6376,6 +6396,18 @@ def _emit_bash_env_cleanup_deferral(
             f"#   Windows: attrib -R <path>   (cmd.exe)  |  "
             f"Set-ItemProperty <path> IsReadOnly $false   (PowerShell)\n"
             f"chmod u+w {folder}/{settings_rel}\n"
+            f"python -m vco_lib.project_init install-bundle "
+            f"--folder {str(folder)!r} --update --json"
+        )
+    elif action == "edit-refused":
+        detected = (
+            f"During the 0.2.11 legacy BASH_ENV cleanup, `{settings_rel}` was "
+            f"left untouched: {detail}."
+        )
+        cmd = (
+            f"# Delete the \"BASH_ENV\" line from the env block of\n"
+            f"#   {folder}/{settings_rel}\n"
+            f"# by hand, then re-run the bundle update:\n"
             f"python -m vco_lib.project_init install-bundle "
             f"--folder {str(folder)!r} --update --json"
         )
@@ -9633,179 +9665,80 @@ def _emit_safe_add_skipped_env_merge_deferral(
 
 
 def _has_user_secret_shaped_line(path: Path) -> bool:
-    """v0.2.83 PLAN-v0283 B-F8: does ``path`` carry a secret-shaped
-    managed-block line? Extracted (unchanged semantics) from the closure that
-    used to live inside ``_emit_user_secret_values_retained_deferral`` so the
-    reconciler can RE-DETECT the same state (single home, one concern).
+    """Does ``path`` (one env surface) still hold a pre-v0.2.73 secret VALUE?
+    v0.2.97: the ONE detection lives in
+    :func:`vco_lib.config_projection.retained_secret_keys_in` — the SAME set
+    every env refresh strips, so this deferral cannot promise a removal the
+    refresh does not make. No value is ever read out."""
+    from vco_lib.config_projection import retained_secret_keys_in
+    return bool(retained_secret_keys_in(path, _cp_known_secret_keys(path.parent.parent)))
 
-    - ``.claude/env``: a ``export KEY="..."`` line inside the managed block
-      whose KEY ``is_secret_shaped_env_key`` flags AND whose quoted value is
-      non-empty (v0.2.84 PLAN-v0284 D6 / P4).
-    - ``.claude/settings.json``: an ``env`` key that ``is_secret_shaped_env_key``
-      flags (the SINGLE secret-shape home — never a substring fork).
 
-    No value is ever read/printed — only a pattern/shape + emptiness match.
-    Soft-fails to ``False`` on any read/parse error.
-
-    v0.2.84 PLAN-v0284 D6 (P4): the ``.claude/env`` branch used to match a
-    COARSE regex (``export\\s+[A-Z_][A-Z0-9_]*="``) that flagged EVERY uppercase
-    export in the managed block — so every safe-add project (23/23 pure-config
-    exports, zero secrets) re-emitted the ``user_secret_values_retained_in_tree``
-    deferral forever and the reconciler's re-detect could never self-clear it.
-    Both surfaces now route through the SINGLE secret-shape home
-    (``vco_lib.secrets_audit.is_secret_shaped_env_key``); the ``.claude/env``
-    branch additionally requires a non-empty quoted value (an empty
-    ``export FOO_TOKEN=""`` carries no VALUE to worry about).
-    """
-    if not path.is_file():
-        return False
-    from vco_lib.secrets_audit import is_secret_shaped_env_key
-    # A managed-block export line: `export KEY="value"` (the canonical shape the
-    # config-projection writer emits). Captures KEY and the double-quoted value
-    # so we can shape-check the key and test the value for non-emptiness. We do
-    # NOT retain / log the value — only ``bool(value)`` participates.
-    #
-    # NOTE (v0.2.84 fix-pass): this scan deliberately does NOT route through the
-    # shared `vco_lib.envfile` line parser (which the sibling readers
-    # `install_weaviate._managed_env_value` + `agent_secrets._parse_dotenv_value`
-    # now share). Its parse is a DIFFERENT contract: a start-anchored regex that
-    # (a) REQUIRES the literal `export` keyword, (b) matches ONLY a double-quoted
-    # value, and (c) tolerates trailing content after the closing quote. The
-    # generic line parser widens (a)/(b) and narrows (c), so consolidating here
-    # would change edge behavior for hand-edited managed blocks. The shared home
-    # covers the two byte-identical readers; this stays a distinct policy.
-    _managed_export_re = re.compile(
-        r'^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"([^"]*)"',
-        re.MULTILINE,
-    )
-    try:
-        text = path.read_text(encoding="utf-8")
-        if path.name == "env":
-            from vco_lib.config_projection import (
-                CLAUDE_ENV_MANAGED_BEGIN,
-                CLAUDE_ENV_MANAGED_END,
-            )
-            begin = text.find(CLAUDE_ENV_MANAGED_BEGIN)
-            end = text.find(CLAUDE_ENV_MANAGED_END)
-            if begin == -1 or end == -1:
-                return False
-            managed_block = text[begin:end]
-            # D6 (P4): flag ONLY when a secret-SHAPED key carries a non-empty
-            # value. Pure-config routing keys (KG_COLLECTION, WEAVIATE_URL, ...)
-            # are never secret-shaped, so a config-only managed block reads
-            # clean and the deferral can self-clear.
-            for m in _managed_export_re.finditer(managed_block):
-                key, value = m.group(1), m.group(2)
-                if is_secret_shaped_env_key(key) and value != "":
-                    return True
-            return False
-        elif path.name == "settings.json":
-            # settings.json branch UNCHANGED (v0.2.84 D6): keys already
-            # route through the single secret-shape home. No value check here
-            # (the env-key MAP has no ``export KEY="..."`` quoting to inspect).
-            try:
-                data = json.loads(text)
-                env_block = data.get("env", {})
-                if not isinstance(env_block, dict):
-                    return False
-                for key in env_block:
-                    if is_secret_shaped_env_key(key):
-                        return True
-            except Exception:  # noqa: BLE001 — malformed settings.json → soft no-detection
-                return False
-        return False
-    except Exception:
-        return False
+def _cp_known_secret_keys(folder: Path) -> list[str]:
+    from vco_lib.config_projection import known_user_secret_keys_for_folder
+    return known_user_secret_keys_for_folder(folder)
 
 
 def _scan_user_secret_values_retained(folder: Path) -> bool:
-    """v0.2.83 PLAN-v0283 B-F8: True when a secret-shaped managed-block line
-    survives in EITHER VCO env surface (``.claude/env`` or
-    ``.claude/settings.json``). Shared by the emitter and the reconciler so the
-    self-clear decision uses the SAME detection the emit uses (no drift)."""
-    folder = Path(folder)
-    return (
-        _has_user_secret_shaped_line(folder / ".claude" / "env")
-        or _has_user_secret_shaped_line(folder / ".claude" / "settings.json")
-    )
+    """True when a pre-v0.2.73 secret VALUE survives in any VCO env surface
+    (``.claude/env`` managed block, ``.claude/settings.json`` / ``.vscode/
+    settings.json`` env blocks). Shared by the emitter and the reconciler so
+    the self-clear uses the SAME detection the emit uses (v0.2.83 B-F8).
+    v0.2.97 R2 F18: only values VCO can PROVE it wrote count; an unanswerable
+    check (``None``) keeps the entry — no evidence it is over."""
+    from vco_lib.config_projection import retained_user_secret_state
+    return retained_user_secret_state(Path(folder)) is not False
 
 
 def _emit_user_secret_values_retained_deferral(folder: Path) -> None:
-    """Emit `user_secret_values_retained_in_tree`: pre-v0.2.73 user-secret
-    VALUEs may still reside in committable tree files (.claude/env or
-    .claude/settings.json) from the Rust GUI writer before S-4's strip
-    invariant shipped.
+    """Emit ``user_secret_values_retained_in_tree``: a VALUE VCO can prove a
+    pre-v0.2.73 launcher wrote (it equals the launcher's stored value, or sits
+    in VCO's own ``.claude/env`` managed block) is still in a committable file.
 
-    ONE-TIME scanner that detects a secret-shaped line in the managed block
-    (no value printed — only a pattern match). Self-clearing: once the next
-    env-projection refresh scrubs the value, the deferral is never re-emitted.
-    FOREIGN from install.py's perspective (v0.2.73 S-8): emitted ONLY on the
-    bundle-update path here, NEVER by install.py --update (which doesn't
-    re-detect it). It is therefore deliberately NOT in
-    ``install.py::_INSTALL_OWNED_CONDITION_IDS`` — install.py preserves it
-    verbatim (per ``deferral_report.condition_is_owned``: non-owned == FOREIGN
-    == preserved). If it were OWNED, an ``install.py --update`` run would seed
-    the report, fail to re-detect this bundle-update-only condition, and
-    silently DROP the secret-retention notice while the value may still be in
-    the tree (the exact A-2 clobber class this whole track fixes). It clears
-    the next time THIS bundle-update path runs and finds the value gone.
-
-    Severity is "warning" (not critical) because:
-      * The value IS still a secret until the next refresh (users should rotate
-        if the key was leaked to VCS).
-      * The next refresh will scrub it automatically.
-      * No immediate action required — just awareness + precaution.
+    Runs on the bundle update AFTER its env refresh, which already removes
+    exactly these values (``config_projection.apply_project_env``) — so an
+    entry here means the refresh could not: the settings file was refused
+    (its own ``settings_write_refused_*`` entry names it) or the project is
+    not registered with the launcher (no refresh ran). Key NAMES are listed;
+    a value never is. Cleared by the bundle reconciler, and by the next
+    refresh that leaves nothing behind. FOREIGN to install.py (v0.2.73 S-8):
+    bundle-update-only, so it is deliberately NOT install-owned.
     """
+    from vco_lib.config_projection import retained_launcher_value_names
     from vco_lib.deferral_report import DeferralEntry
     from vco_lib import deferral_emit as _de
 
-    # Cheap scan (no value parsing — never print a value) across BOTH surfaces.
-    # v0.2.83 B-F8: routed through the shared module-level detector so the
-    # reconciler's self-clear uses the SAME logic.
-    if not _scan_user_secret_values_retained(folder):
-        return  # No pre-fix artifacts; don't emit.
-
-    # The rotate advice is CONDITIONAL IN PROSE ("if this project's git has a
-    # push remote…") rather than gated on a probe: the user knows their own
-    # VCS topology, and a git subprocess per bundle-update would be a wasted
-    # call (the advice reads correctly whether or not a remote exists). We also
-    # deliberately do NOT try to discover the user's real repo — it may be
-    # nested anywhere in the tree (see E-two-git-contexts) — so a single
-    # root-level `git config` probe would be unreliable anyway.
-    rotate_advice = (
-        "If this project's git has a push remote and the pre-v0.2.73 value "
-        "was committed or pushed, rotate the affected key now to be safe."
-    )
-
-    entry = DeferralEntry(
+    found = retained_launcher_value_names(Path(folder))
+    if not found:
+        return
+    where = "; ".join(f"{rel}: {', '.join(names)}" for rel, names in found.items())
+    _de.emit(folder, DeferralEntry(
         condition_id="user_secret_values_retained_in_tree",
-        title="Pre-v0.2.73: user-secret VALUES may be in committable tree files",
+        title="Pre-v0.2.73: user-secret VALUES are still in committable env files",
         detected=(
-            "Secret-shaped managed-block lines were found in one or more "
-            "VCO env surfaces (.claude/env or .claude/settings.json). These "
-            "may contain VALUES from the Rust GUI writer before v0.2.73's "
-            "strip-only invariant shipped."
+            "These env surfaces still hold a value a pre-v0.2.73 launcher wrote "
+            "for a user secret — it equals the value the launcher stores (or sits "
+            f"in VCO's own .claude/env block); key names only: {where}."
         ),
         why_deferred=(
-            "Deferred: the value scrubbing happens automatically at the next "
-            "env-projection refresh (which runs on the next project refresh/"
-            "CLI command / launcher restart). This deferral is a ONE-TIME "
-            "notice only; once the refresh scrubs the value from tree files, "
-            "the deferral will NOT re-emit."
+            "Every env refresh removes the values it can prove VCO wrote — the "
+            "secrets themselves stay in your keychain — but this update's refresh "
+            "could not: either a "
+            "settings file could not be edited safely (a settings_write_refused "
+            "entry names it and what to fix) or this folder is not registered "
+            "with the launcher, so there is no refresh to run. This entry clears "
+            "itself once no such value remains."
         ),
         command_to_apply=(
-            f"# The next project env refresh will scrub the values automatically.\n"
-            f"# No manual action required UNLESS the key was committed/pushed:\n"
-            f"# {rotate_advice}\n"
-            f"# Dismiss this deferral once you've reviewed it:\n"
-            f"python -m vco_lib.project_init dismiss-deferral "
-            f"--folder {str(folder)!r} "
-            f"--condition-id user_secret_values_retained_in_tree"
+            "# Fix what the settings_write_refused entry names (if any), then re-run\n"
+            "# the bundle update (or any launcher action on this project) to refresh.\n"
+            "# If this project's git has a push remote and a value was committed or\n"
+            "# pushed, rotate the affected key now to be safe. To dismiss instead:\n"
+            f"python -m vco_lib.project_init dismiss-deferral --folder {str(folder)!r} "
+            "--condition-id user_secret_values_retained_in_tree"
         ),
         severity="warning",
-    )
-    # v0.2.83 PLAN-v0283 WP-B2: emit via the ONE locked emitter home.
-    _de.emit(folder, entry)
+    ))
 
 
 def _emit_safe_add_git_exclude_deferral(
@@ -9986,7 +9919,7 @@ def install_project_bundle(
         # v0.2.85 D6: the sorted list of kinds skipped this run (additive; only
         # present when non-empty, so the default-run envelope is unchanged).
         "skip_kinds": [<kind>...],          # absent when skip_kinds is empty
-        "settings_action": "created"|"merged"|"unchanged"|"unchanged (user file unparseable)"|"" ,
+        "settings_action": "created"|"merged"|"unchanged"|"unchanged (...)"|"" ,
         "manifest_written": bool,
         "vco_version": str,
         "warnings": [...],
@@ -10733,9 +10666,8 @@ def install_project_bundle(
                 f"knowledge-residue cleanup failed (non-fatal): {err}"
             )
 
-    # Smart-merge settings.json template separately. The template carries
-    # the orchestrator's hooks block + permissions defaults. The merge
-    # logic mirrors install.py:_merge_settings_template + _smart_merge_settings.
+    # Smart-merge settings.json template separately (hooks block + permission
+    # defaults); v0.2.97: minus the hooks the user disabled (vco_lib.parked_hooks).
     #
     # v0.2.85 PLAN-v0285 D6 (settings skip): `settings` is the ONLY skip-kind
     # that is not a file-kind — it names this merge step, not an enumerated op.
@@ -10751,11 +10683,18 @@ def install_project_bundle(
             # removed (`vco_lib.hook_retirements`); collected at this level
             # because the audit row needs the FOLDER, not just the hooks.
             retired_removed: list = []
+            parked, kept_out = read_parked_hooks(folder), []
             settings_action, settings_redirect = _merge_settings_template_for_bundle(
-                settings_template, settings_target,
-                dry_run=dry_run, retired_removed=retired_removed,
+                settings_template, settings_target, dry_run=dry_run,
+                retired_removed=retired_removed, parked=parked, kept_out=kept_out,
+                project_root=folder,
             )
             result["settings_action"] = settings_action
+            if settings_action.startswith("unchanged ("):  # v0.2.97: never silent
+                result["warnings"].append(f"settings.json: {settings_action} — newly "
+                                          "shipped hooks NOT added; see UPDATE_DEFERRED.md")
+            report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
+                                settings_action=settings_action, log=_log)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.
@@ -10802,7 +10741,7 @@ def install_project_bundle(
                 _log("4.bundle.bashenv-cleanup", "ok",
                      f"legacy BASH_ENV stripped: {detail}",
                      data=cleanup_result)
-            elif action in ("write-failed", "unparseable"):
+            elif action in ("write-failed", "unparseable", "edit-refused"):
                 # Surfacing via warnings (not errors): the rest of the bundle
                 # install is still useful. The deferral entry below also
                 # tells the operator to re-run after fixing the cause.
@@ -11756,10 +11695,12 @@ def install_project_bundle(
     # v0.2.73 S-8 (ONE-TIME): scan for pre-fix user-secret VALUES in tree files
     # and emit a deferral notice if found. Triggered on every bundle-update run
     # (cheap pattern scan, no value parsing); self-clears once the next env
-    # refresh removes the value.
+    # refresh removes the value. v0.2.97: a secret-shaped key the USER put there
+    # is reported separately (``vco_lib.user_owned_secrets``) — never removed.
     if update_mode:
         try:
             _emit_user_secret_values_retained_deferral(folder)
+            _user_owned_secrets.emit_deferral(folder)
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
             _log("4.bundle.secrets_retention_audit", "warning",
@@ -12145,70 +12086,36 @@ def _find_orchestrator_root_from_module() -> Path:
 def _merge_settings_template_for_bundle(
     template_path: Path, target_path: Path, *, dry_run: bool,
     retired_removed: Optional[list] = None,
+    parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
+    project_root: Optional[Path] = None,
 ) -> tuple[str, Optional[Path]]:
-    """The I/O half of the settings.json merge: read the template, read the
-    target, hand both to :func:`vco_lib.settings_merge.smart_merge_settings`,
-    write the answer atomically.
+    """The I/O half of the settings.json merge — a shim since v0.2.97.
 
-    The DECISION half — what a merge may change, and the per-event hooks
-    merge underneath it — lives in ``vco_lib.settings_merge`` (v0.2.95). The
-    split is deliberate: that half is pure and heavily tested on its own,
-    this half owns the filesystem. The docstring here used to call the pair a
-    "mirror of install.py:_merge_settings_template + _smart_merge_settings",
-    inlined so ``vco_lib`` need not import ``install.py``. Neither name exists
-    in ``install.py`` any more — v0.2.85 (D2) deleted its bespoke Steps 5b/9b
-    and routed the root install through this one engine — so there is no
-    mirror, and the claim is retired rather than carried forward.
+    The body lives in :func:`vco_lib.bundle_settings_io.merge_settings_template`
+    (read template + target, the pure DECISION half in
+    ``vco_lib.settings_merge``, the atomic write through THIS module's
+    ``_write_file_atomic``, resolved at call time). It edits a JSONC file in
+    place and refuses — visibly, as a deferral — one it cannot edit.
 
     Returns ``(status, redirect_target)``:
       * ``status`` — one of ``would-create`` / ``created`` / ``would-merge`` /
-        ``merged`` / ``unchanged`` / ``unchanged (user file unparseable)``.
+        ``merged`` / ``unchanged`` / ``unchanged (user file unparseable)`` /
+        ``unchanged (JSONC edit refused)``.
       * ``redirect_target`` — v0.2.70 (Bug B / W-F1): the ``.vco-new`` Path
-        when the settings.json write was redirected because ``.claude`` (or
-        the file itself) is a symlink VCO refused to write through, else
-        ``None``. The caller (``install_project_bundle``) threads this into
-        the SAME ``symlink_redirect_events`` accumulator as the main file
-        loop so the consolidated symlink deferral also lists settings.json
-        (the symlinked-``.claude`` case would otherwise under-report).
+        when a symlinked ``.claude`` (or file) redirected the write, else
+        ``None``; the caller adds it to ``symlink_redirect_events`` so the
+        consolidated symlink deferral lists settings.json too.
 
-    ``retired_removed`` — v0.2.95: optional accumulator handed to the hooks
-    merge, which appends one record per RETIRED registration it removed (see
-    ``hook_retirements.scrub_retired_registrations``). The caller writes the
-    audit rows; this function only reports. On the fresh-create path (no
-    target file) and on the unparseable-file path nothing is appended,
-    because neither path merges anything.
+    ``retired_removed`` — v0.2.95: accumulator the hooks merge appends one
+    record to per RETIRED registration it removed; the caller writes the audit
+    rows. ``parked`` / ``kept_out`` — v0.2.97 (``vco_lib.parked_hooks``):
+    launcher-disabled hooks stay out on the merge AND create paths.
     """
-    template_data = json.loads(template_path.read_text(encoding="utf-8"))
-
-    if not target_path.exists():
-        if dry_run:
-            return "would-create", None
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        redirect = _write_file_atomic(
-            target_path,
-            (json.dumps(template_data, indent=2) + "\n").encode("utf-8"),
-        )
-        return "created", redirect
-
-    try:
-        existing = json.loads(target_path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return "unchanged (user file unparseable)", None
-
-    merged = _smart_merge_for_bundle(
-        existing, template_data, retired_removed=retired_removed,
-    )
-    if merged == existing:
-        return "unchanged", None
-
-    if dry_run:
-        return "would-merge", None
-
-    redirect = _write_file_atomic(
-        target_path,
-        (json.dumps(merged, indent=2) + "\n").encode("utf-8"),
-    )
-    return "merged", redirect
+    from vco_lib.bundle_settings_io import merge_settings_template
+    return merge_settings_template(
+        template_path, target_path, dry_run=dry_run, write=_write_file_atomic,
+        retired_removed=retired_removed, parked=parked, kept_out=kept_out,
+        project_root=project_root)
 
 
 def _apply_canonical_env_via_config_projection(
@@ -12651,6 +12558,12 @@ def _apply_standalone_env(
     # scaffold-authored generic default SURVIVES adoption and the project's
     # shared-KG searches silently return nothing forever.
     shared_kg = _resolve_shared_kg_name(folder)
+    # v0.2.97: this machine's service endpoints (launcher.db rows → compiled
+    # default when there is no DB / no row) — the same answer the DB-backed
+    # projection and the hub give, never a literal.
+    from vco_lib.service_endpoints import machine_service_urls
+
+    urls = machine_service_urls()
 
     env: dict[str, str] = {
         "PROJECT_NAME": raw_name,
@@ -12662,12 +12575,13 @@ def _apply_standalone_env(
         "SHARED_KG_WRITE_DISABLED": "false",
         "SHARED_KG_OPT_OUT": "false",
         "ACTIVE_EMBEDDING": "qwen3",
-        "WEAVIATE_URL": "http://localhost:8081",
-        "WEAVIATE_PORT": "8081",
-        "OLLAMA_URL": "http://localhost:11435",
-        "OLLAMA_PORT": "11435",
-        "CODE_EMBED_URL": "http://localhost:11440",
-        "CODE_EMBED_PORT": "11440",
+        "WEAVIATE_URL": urls["weaviate_url"],
+        "WEAVIATE_PORT": str(urls["weaviate_port"]),
+        "OLLAMA_URL": urls["ollama_url"],
+        "OLLAMA_PORT": str(urls["ollama_port"]),
+        "CODE_EMBED_URL": urls["code_embed_url"],
+        "CODE_EMBED_SERVICE_URL": urls["code_embed_url"],
+        "CODE_EMBED_PORT": str(urls["code_embed_port"]),
     }
 
     if orchestrator_root is not None:
@@ -12995,7 +12909,7 @@ def _read_codegraph_binding_override(folder: Path) -> dict:
 #     can override per-project.
 #
 # Coordination with the Rust writer:
-#   Pre-PR-27, the launcher's `write_project_env_files` (Rust, at
+#   Pre-PR-27, the launcher's Rust env writer (retired v0.2.97; at
 #   commands/projects_v2.rs) wrote a `claude-code.env` sub-object
 #   inside `.vscode/settings.json`. That write was removed in PR-27
 #   (v0.2.12, 2026-05-16) because the key did NOT propagate to MCP
@@ -13102,9 +13016,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
       - Missing settings file → create it with just the exclude block
         + a marker comment. `_template_origin: "vibecoded-orchestrator
         v0.2.11+ — vscode-excludes backfill"` so the file is identifiable.
-      - File unparseable JSON → action="unparseable" (no-op, preserves
-        user file untouched). Hand-edited JSON with trailing commas is
-        a common case — we don't want to clobber that.
+      - File not valid JSON or JSONC → action="unparseable" (no-op,
+        preserves user file untouched). A JSONC file (comments, trailing
+        commas — the common hand-edited case) is READ and the missing keys
+        are inserted into its text, comments kept (v0.2.97); an insertion
+        that cannot be verified is action="jsonc_edit_refused", untouched.
       - Top-level key already present → user-wins, leave alone (covers
         the "user set `files.watcherExclude: {}` to explicitly disable
         the feature" case the addendum calls out).
@@ -13120,6 +13036,8 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
           - "backfilled"  — file existed; added one or more missing keys
           - "noop"        — file existed; every canonical key already present
           - "unparseable" — file existed but couldn't be parsed; left alone
+          - "jsonc_edit_refused" — JSONC file whose edit could not be
+            verified; left alone
           - "write_failed:<ErrorClass>" — atomic write raised
     """
     settings_file = folder / ".vscode" / "settings.json"
@@ -13135,7 +13053,7 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
         # write of that block from `.vscode/settings.json` because it
         # didn't propagate to MCP subprocesses on Linux. The canonical
         # channel for per-project MCP env is `.claude/settings.json`
-        # env, written by the Rust launcher's `write_project_env_files`.)
+        # env, written by the launcher's config_projection apply.)
         payload: dict = {
             "_template_origin": (
                 "vibecoded-orchestrator v0.2.11+ — vscode-excludes backfill"
@@ -13154,16 +13072,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
         result["added_keys"] = list(_VSCODE_EXCLUDE_DEFAULTS.keys())
         return result
 
-    try:
-        raw = settings_file.read_text(encoding="utf-8")
-        data = json.loads(raw)
-    except (OSError, json.JSONDecodeError):
+    loaded = _jsonc_edit.load_object(settings_file)
+    if loaded is None:
         result["action"] = "unparseable"
         return result
-
-    if not isinstance(data, dict):
-        result["action"] = "unparseable"
-        return result
+    data, raw = loaded
 
     added: list[str] = []
     for key, value in _VSCODE_EXCLUDE_DEFAULTS.items():
@@ -13174,8 +13087,11 @@ def _backfill_vscode_excludes_in_project(folder: Path) -> dict:
     if not added:
         return result  # action stays "noop"
 
+    payload_text = _jsonc_edit.dumps_preserving(raw, data, indent=2)
+    if payload_text is None:
+        result["action"] = "jsonc_edit_refused"
+        return result
     try:
-        payload_text = json.dumps(data, indent=2) + "\n"
         _write_file_atomic(settings_file, payload_text.encode("utf-8"))
     except OSError as e:
         result["action"] = f"write_failed:{type(e).__name__}"
@@ -14895,6 +14811,7 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
                     f"[migrate-schema] deferral write failed (non-fatal): {exc}",
                     file=sys.stderr,
                 )
+        _clear_runner_conditions_not_reemitted(folder, entries, include_wide)
 
     result = {
         "folder": str(folder),
@@ -14914,6 +14831,37 @@ def _cmd_migrate_schema(args: argparse.Namespace) -> int:
     }
     print(json.dumps(result, indent=2))
     return 0
+
+
+def _clear_runner_conditions_not_reemitted(
+    folder: Path, entries: list, include_wide: bool,
+) -> None:
+    """Paired clear for the schema-migration runner's ids in a project ledger.
+
+    install.py OWNS these ids for the root ledger (owned-drop-when-absent);
+    a per-project ledger has no such finalize, so a completed pass that did
+    not re-emit a runner id resolves it here. Skipped for the orchestrator
+    root unless the pass covered the orchestrator-wide artifacts too — the
+    root ledger may hold an install.py finding about one this pass never
+    looked at. Soft-fail: the ledger is observability.
+    """
+    from vco_lib import deferral_emit as _de
+    from vco_lib import schema_migration_runner as smr
+    from vco_lib.deferral_report import DeferralReport
+
+    try:
+        if not include_wide and (
+            Path(folder).resolve() == Path(__file__).resolve().parent.parent
+        ):
+            return
+        present = {e.condition_id for e in DeferralReport.read(folder).entries}
+        stale = smr.runner_conditions_to_clear(
+            present, {e.condition_id for e in entries})
+        if stale:
+            _de.resolve_conditions(folder, stale)
+    except Exception as exc:  # noqa: BLE001 — never block the pass
+        print(f"[migrate-schema] ledger clear failed (non-fatal): {exc}",
+              file=sys.stderr)
 
 
 def _now_ms_safe() -> int:

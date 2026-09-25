@@ -18,11 +18,16 @@
 //! Soft-fail philosophy: a broken or unreadable manifest must NOT break
 //! the sidebar for other modules. We log + skip per-module.
 //!
-//! Storage note: `module_settings.project_id` is `NOT NULL REFERENCES
-//! projects(id)` — there is no "module-global" row possible at the
-//! DB level today. We therefore require a project_id for every
-//! get/set call; module-global state would need a follow-up
-//! migration (out of scope for Stream 2).
+//! Storage note (v0.2.97): migration 034 made `module_settings.project_id`
+//! nullable, and a manifest `settings` entry may declare `"scope": "global"`
+//! (one machine-wide value, e.g. `vct-hub-api`'s `VCT_HUB_PORT`). The two
+//! commands below route by the DECLARATION
+//! (`vct_launcher_core::module_settings_schema`): a declared global setting is
+//! read/written in the project-less row and refuses a project on write; a
+//! declared per-project setting, and any key no manifest declares (a
+//! `gui.config_tab` control's state), needs a project. Every write of a
+//! declared setting is validated against the manifest's type / min / max /
+//! options / validation — the UI checks too, but this is the gate.
 
 use serde::Serialize;
 use std::path::PathBuf;
@@ -30,6 +35,8 @@ use tauri::{command, State};
 
 use crate::db::Db;
 use crate::manifest::{ConfigTab, ModuleManifest};
+use vct_launcher_core::module_setting_bindings::{LiveSource, SettingBinding, BUNDLED_SETTING_BINDINGS};
+use vct_launcher_core::module_settings_schema::{self, DeclOrigin, FoundSetting};
 
 // ─── Wire types ─────────────────────────────────────────────────────────
 
@@ -151,58 +158,245 @@ pub async fn get_module_nav_items(
 
 // ─── Generic per-control state (Part F) ─────────────────────────────────
 
+/// The manifest declaration of `module_id`'s `key`, if any manifest the
+/// launcher knows declares it: the BUNDLED manifests embedded in this binary
+/// first (authoritative for the core modules), then the installed / catalog
+/// manifests on disk ([`manifest_scan_paths`]). `None` = an undeclared key
+/// (a `gui.config_tab` control's state).
+fn declared_setting(db: &Db, module_id: &str, key: &str) -> Option<FoundSetting> {
+    let bundled = module_settings_schema::bundled_module_settings();
+    if let Some(d) = module_settings_schema::find_setting(&bundled, module_id, key) {
+        return Some(FoundSetting::bundled(d.clone()));
+    }
+    // Installed manifests first; a manifest found ONLY under the dev
+    // passthrough is a module under development, not an installed one
+    // (R7b F24). The orchestrator's own `vct-module.json` declares no
+    // settings; it keeps the installed origin it always had.
+    let dev = crate::commands::installed_modules::dev_paid_modules_paths(db);
+    for path in manifest_scan_paths(db) {
+        let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+        let Ok(manifest) = ModuleManifest::from_json(&raw) else { continue };
+        if manifest.id != module_id {
+            continue;
+        }
+        if let Some(d) = manifest.settings.iter().find(|s| s.key == key).cloned() {
+            let origin = if dev.contains(&path) { DeclOrigin::DevPassthrough } else { DeclOrigin::Installed };
+            return Some(FoundSetting::in_manifest(&manifest, d, origin));
+        }
+    }
+    None
+}
+
+/// The parsed manifests of the INSTALLED (catalog) modules — the
+/// post-install copies under `<vct root>/modules/` (the bundled directory is
+/// skipped: the embedded bundled manifests are listed separately). A file
+/// that does not parse is skipped with a warning.
+fn installed_manifests(db: &Db) -> Vec<ModuleManifest> {
+    let bundled_dir = crate::paths::vct_root_dir().join("bundled_manifests");
+    parse_manifests(
+        crate::commands::installed_modules::installed_module_manifest_paths(db)
+            .into_iter()
+            .filter(|p| !p.starts_with(&bundled_dir)),
+    )
+}
+
+/// The parsed manifests of the modules under development the launcher shows
+/// because `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` is set (empty otherwise).
+fn dev_passthrough_manifests(db: &Db) -> Vec<ModuleManifest> {
+    parse_manifests(crate::commands::installed_modules::dev_paid_modules_paths(db).into_iter())
+}
+
+fn parse_manifests(paths: impl Iterator<Item = PathBuf>) -> Vec<ModuleManifest> {
+    paths
+        .filter_map(|p| {
+            let raw = std::fs::read_to_string(&p).ok()?;
+            ModuleManifest::from_json(&raw)
+                .map_err(|e| tracing::warn!("[module_gui] skip {} (parse error): {}", p.display(), e))
+                .ok()
+        })
+        .collect()
+}
+
 /// Read a single setting value from the `module_settings` table. Returns
 /// `Value::Null` when the row doesn't exist (matches the wire contract
 /// the schema renderer expects: "no row" == "use the control's default").
 ///
-/// `project_id` is required because `module_settings` has a non-null
-/// FK to `projects`. Module-global state needs a follow-up migration.
+/// `project_id`: required for a per-project or undeclared key; ignored for a
+/// declared machine-wide (`scope: "global"`) setting, which always reads the
+/// project-less row — the value in effect.
 #[command]
 pub async fn get_module_setting(
     module_id: String,
     control_id: String,
-    project_id: String,
+    project_id: Option<String>,
     db: State<'_, Db>,
 ) -> Result<serde_json::Value, String> {
-    if project_id.is_empty() {
-        return Err(
-            "get_module_setting: project_id required (module_settings table has \
-             a non-null FK to projects). Module-global state not yet supported."
-                .into(),
-        );
-    }
-    match db.get_setting(&project_id, &module_id, &control_id)? {
-        Some(v) => Ok(v),
-        None => Ok(serde_json::Value::Null),
-    }
+    read_setting(&db, &module_id, &control_id, project_id.as_deref())
 }
 
-/// Write a control's current value. Stored as JSON blob in
-/// `module_settings.setting_value`. Upsert via the existing
-/// `Db::set_setting` helper.
+/// Write a control's (or a declared setting's) current value. Stored as a
+/// JSON blob in `module_settings.setting_value`.
 ///
 /// The schema-rendered tab calls this on every control change
 /// regardless of whether the manifest declared an `on_change` Tauri
 /// command — the generic persistence is the source of truth for "what
 /// did the user pick"; module-specific `on_change` hooks are the
 /// SIDE-EFFECT path (containers, files, services).
+///
+/// v0.2.97: when a manifest DECLARES `control_id` in its `settings`, the
+/// value is validated against that declaration and routed by its scope
+/// (machine-wide → the project-less row, and `project_id` must be absent;
+/// per-project → the project's row). A refused value writes nothing.
 #[command]
 pub async fn set_module_setting(
     module_id: String,
     control_id: String,
     value: serde_json::Value,
-    project_id: String,
+    project_id: Option<String>,
     db: State<'_, Db>,
 ) -> Result<(), String> {
-    if project_id.is_empty() {
-        return Err(
-            "set_module_setting: project_id required (module_settings table has \
-             a non-null FK to projects). Module-global state not yet supported."
-                .into(),
-        );
+    write_setting(&db, &module_id, &control_id, project_id.as_deref(), &value)
+}
+
+/// Every module whose manifest `settings` the Preferences → Modules page's
+/// "Module settings" editor lists: the BUNDLED core modules (for every
+/// project), then each INSTALLED catalog module that declares settings (with
+/// the projects it is installed + enabled in). Each setting carries its
+/// binding (`module_setting_bindings`): stored → editable through
+/// [`get_module_setting`] / [`set_module_setting`]; elsewhere → shown
+/// read-only with [`module_setting_live_values`].
+#[command]
+pub async fn list_module_settings(
+    db: State<'_, Db>,
+) -> Result<Vec<module_settings_schema::ListedModuleSettings>, String> {
+    module_settings_schema::list_module_settings(&db, &installed_manifests(&db), &dev_passthrough_manifests(&db))
+}
+
+/// The live value of one setting whose home is not `module_settings`.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiveSettingValue {
+    pub module_id: String,
+    pub key: String,
+    /// `None` when it cannot be resolved (see `note`).
+    pub value: Option<String>,
+    /// Why the value is missing, or where a default came from.
+    pub note: Option<String>,
+}
+
+/// The LIVE values of the bundled settings bound elsewhere
+/// ([`SettingBinding::Elsewhere`]), resolved from their canonical homes —
+/// the panel shows them read-only. `project_id` is needed only for the
+/// per-project KG collection.
+#[command]
+pub async fn module_setting_live_values(
+    project_id: Option<String>,
+    db: State<'_, Db>,
+) -> Result<Vec<LiveSettingValue>, String> {
+    Ok(live_values(&db, project_id.as_deref()))
+}
+
+/// The body of [`module_setting_live_values`].
+fn live_values(db: &Db, project_id: Option<&str>) -> Vec<LiveSettingValue> {
+    BUNDLED_SETTING_BINDINGS
+        .iter()
+        .filter_map(|(module_id, key, binding)| match binding {
+            SettingBinding::Elsewhere { live, .. } => {
+                let (value, note) = resolve_live(db, *live, project_id);
+                Some(LiveSettingValue { module_id: (*module_id).into(), key: (*key).into(), value, note })
+            }
+            SettingBinding::Stored { .. } => None,
+        })
+        .collect()
+}
+
+/// Resolve one [`LiveSource`] through the SAME function its real reader
+/// uses (no re-derivation here).
+fn resolve_live(db: &Db, live: LiveSource, project_id: Option<&str>) -> (Option<String>, Option<String>) {
+    match live {
+        LiveSource::ProjectKgCollection => {
+            let Some(pid) = project_id.filter(|p| !p.is_empty()) else {
+                return (None, Some("Pick a project to see its KG collection.".into()));
+            };
+            match db.get_project(pid) {
+                Ok(Some(row)) => {
+                    let c = crate::collection_naming::resolve_project_collections(
+                        db,
+                        Some(pid),
+                        &row.name,
+                        Some(&row.slug),
+                    );
+                    (Some(c.kg), None)
+                }
+                Ok(None) => (None, Some(format!("No project {pid}."))),
+                Err(e) => (None, Some(format!("Could not read the project: {e}"))),
+            }
+        }
+        LiveSource::SharedKgCollection => {
+            match crate::commands::project_state_populate::shared_kg_binding::resolve_shared_kg_collection(db) {
+                Some(name) => (Some(name), None),
+                None => (None, Some("No shared KG collection is set on this computer.".into())),
+            }
+        }
+        LiveSource::WeaviateUrl => (
+            Some(vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)),
+            None,
+        ),
+        LiveSource::CodeEmbedPort => (
+            Some(crate::commands::project_env_settings::resolve_code_embed_port(db).to_string()),
+            None,
+        ),
+        LiveSource::CodeEmbedBackend => code_embed_backend(db),
+        LiveSource::CodeEmbedDevice => {
+            (Some("auto".into()), Some("Fixed by the service's compose file.".into()))
+        }
     }
-    db.set_setting(&project_id, &module_id, &control_id, &value)?;
-    Ok(())
+}
+
+/// `CODE_EMBED_BACKEND` as docker-compose gives it to the code-embedding
+/// container: the orchestrator's `infrastructure/.env` (written by the
+/// installer, `vco_lib.compose_env`), else the compose default `gpu`.
+fn code_embed_backend(db: &Db) -> (Option<String>, Option<String>) {
+    let Some(root) = crate::commands::installer::resolve_install_root_sync(db) else {
+        return (None, Some("The orchestrator folder could not be located.".into()));
+    };
+    code_embed_backend_from(&root.join("infrastructure").join(".env"))
+}
+
+fn code_embed_backend_from(env_file: &std::path::Path) -> (Option<String>, Option<String>) {
+    match crate::commands::claude_env::read_key(env_file, "CODE_EMBED_BACKEND") {
+        Ok(Some(v)) if !v.trim().is_empty() => (Some(v.trim().trim_matches('"').to_string()), None),
+        Ok(_) => (
+            Some("gpu".into()),
+            Some("Not set in infrastructure/.env — the compose default applies.".into()),
+        ),
+        Err(e) => (None, Some(format!("Could not read infrastructure/.env: {e}"))),
+    }
+}
+
+/// The body of [`get_module_setting`] (no Tauri `State`, so tests call it).
+fn read_setting(
+    db: &Db,
+    module_id: &str,
+    key: &str,
+    project_id: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let found = declared_setting(db, module_id, key);
+    module_settings_schema::read_module_setting(db, found.as_ref(), module_id, key, project_id)
+        .map(|v| v.unwrap_or(serde_json::Value::Null))
+        .map_err(|e| format!("get_module_setting: {e}"))
+}
+
+/// The body of [`set_module_setting`] (no Tauri `State`, so tests call it).
+pub(crate) fn write_setting(
+    db: &Db,
+    module_id: &str,
+    key: &str,
+    project_id: Option<&str>,
+    value: &serde_json::Value,
+) -> Result<(), String> {
+    let found = declared_setting(db, module_id, key);
+    module_settings_schema::write_module_setting(db, found.as_ref(), module_id, key, project_id, value)
+        .map_err(|e| format!("set_module_setting: {e}"))
 }
 
 #[cfg(test)]
@@ -278,6 +472,183 @@ mod tests {
             None => serde_json::Value::Null,
         };
         assert!(body_result.is_null());
+    }
+
+    /// v0.2.97: the COMMAND bodies route a bundled module's declared setting
+    /// by its manifest scope and validate it. The hub port (machine-wide)
+    /// lands in the project-less row the hub reads at start; an out-of-range
+    /// port, or one sent with a project, is refused and writes nothing.
+    #[test]
+    fn set_module_setting_validates_and_routes_the_machine_wide_hub_port() {
+        let (db, project_id) = open_db_with_project();
+        let port = serde_json::json!(8802);
+        write_setting(&db, "vct-hub-api", "VCT_HUB_PORT", None, &port).expect("valid global write");
+        assert_eq!(db.get_global_setting("vct-hub-api", "VCT_HUB_PORT").unwrap(), Some(port.clone()));
+        assert_eq!(
+            read_setting(&db, "vct-hub-api", "VCT_HUB_PORT", Some(&project_id)).unwrap(),
+            port,
+            "any project reads the machine-wide value"
+        );
+
+        let err = write_setting(&db, "vct-hub-api", "VCT_HUB_PORT", None, &serde_json::json!(80)).unwrap_err();
+        assert!(err.contains("at least 1024"), "{err}");
+        let err = write_setting(&db, "vct-hub-api", "VCT_HUB_PORT", None, &serde_json::json!("8803")).unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+        let err = write_setting(&db, "vct-hub-api", "VCT_HUB_PORT", Some(&project_id), &serde_json::json!(8804))
+            .unwrap_err();
+        assert!(err.contains("machine-wide"), "{err}");
+        assert_eq!(db.get_global_setting("vct-hub-api", "VCT_HUB_PORT").unwrap(), Some(port), "unchanged");
+        assert_eq!(db.get_setting(&project_id, "vct-hub-api", "VCT_HUB_PORT").unwrap(), None);
+    }
+
+    /// Round 2: a bundled setting whose live value lives elsewhere (here
+    /// vct-kg's KG_COLLECTION — the project's KG binding) is refused by the
+    /// command: no second stored copy.
+    #[test]
+    fn set_module_setting_refuses_a_setting_that_lives_elsewhere() {
+        let (db, project_id) = open_db_with_project();
+        let err = write_setting(&db, "vct-kg", "KG_COLLECTION", Some(&project_id), &serde_json::json!("X_KnowledgeGraph"))
+            .unwrap_err();
+        assert!(err.contains("not stored in module settings"), "{err}");
+        assert_eq!(db.get_setting(&project_id, "vct-kg", "KG_COLLECTION").unwrap(), None);
+        let err = write_setting(&db, "vct-code-embedding", "CODE_EMBED_BACKEND", None, &serde_json::json!("ollama"))
+            .unwrap_err();
+        assert!(err.contains("infrastructure/.env"), "{err}");
+    }
+
+    /// The live values come from the real homes: the project's KG binding
+    /// rule, the code-embed port resolver, the fixed device — one entry per
+    /// setting bound elsewhere, and none for a stored one.
+    #[test]
+    fn live_values_resolve_from_the_canonical_homes() {
+        let (db, project_id) = open_db_with_project();
+        let values = live_values(&db, Some(&project_id));
+        let keys: Vec<String> = values.iter().map(|v| format!("{}/{}", v.module_id, v.key)).collect();
+        let expected_elsewhere: Vec<String> = BUNDLED_SETTING_BINDINGS
+            .iter()
+            .filter(|(_, _, b)| !b.is_stored())
+            .map(|(m, k, _)| format!("{m}/{k}"))
+            .collect();
+        assert_eq!(keys, expected_elsewhere);
+        assert!(!keys.iter().any(|k| k.ends_with("VCT_HUB_PORT")), "stored settings are edited, not shown live");
+
+        let get = |m: &str, k: &str| values.iter().find(|v| v.module_id == m && v.key == k).unwrap().clone();
+        let row = db.get_project(&project_id).unwrap().unwrap();
+        let expected_kg =
+            crate::collection_naming::resolve_project_collections(&db, Some(&project_id), &row.name, Some(&row.slug)).kg;
+        assert_eq!(get("vct-kg", "KG_COLLECTION").value, Some(expected_kg));
+        assert_eq!(
+            get("vct-code-embedding", "CODE_EMBED_PORT").value,
+            Some(crate::commands::project_env_settings::resolve_code_embed_port(&db).to_string())
+        );
+        assert_eq!(get("vct-code-embedding", "CODE_EMBED_DEVICE").value.as_deref(), Some("auto"));
+        // Without a project the per-project KG collection is not guessed.
+        let no_project = live_values(&db, None);
+        let kg = no_project.iter().find(|v| v.key == "KG_COLLECTION").unwrap();
+        assert!(kg.value.is_none() && kg.note.is_some());
+    }
+
+    /// CODE_EMBED_BACKEND is read from the file compose reads.
+    #[test]
+    fn code_embed_backend_reads_the_infrastructure_env_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join(".env");
+        assert_eq!(code_embed_backend_from(&f).0.as_deref(), Some("gpu"), "absent → compose default");
+        std::fs::write(&f, "# managed\nCODE_EMBED_BACKEND=ollama\n").unwrap();
+        assert_eq!(code_embed_backend_from(&f), (Some("ollama".to_string()), None));
+    }
+
+    /// A per-project bundled setting needs a project, is validated, and
+    /// lands in that project's row (the one the hub's `/env` serves).
+    #[test]
+    fn set_module_setting_validates_a_per_project_bundled_setting() {
+        let (db, project_id) = open_db_with_project();
+        write_setting(&db, "vct-session-state", "MEMORY_MAX_LINES", Some(&project_id), &serde_json::json!(150))
+            .expect("valid");
+        assert_eq!(
+            db.get_setting(&project_id, "vct-session-state", "MEMORY_MAX_LINES").unwrap(),
+            Some(serde_json::json!(150))
+        );
+        assert!(write_setting(&db, "vct-session-state", "MEMORY_MAX_LINES", Some(&project_id), &serde_json::json!(5000))
+            .unwrap_err()
+            .contains("at most 2000"));
+        assert!(write_setting(&db, "vct-session-state", "MEMORY_MAX_LINES", None, &serde_json::json!(150))
+            .unwrap_err()
+            .contains("project is required"));
+        let err = write_setting(&db, "vct-session-state", "MEMORY_MAX_LINES", Some(&project_id), &serde_json::json!("150"))
+            .unwrap_err();
+        assert!(err.contains("whole number"), "{err}");
+        assert_eq!(
+            db.get_setting(&project_id, "vct-session-state", "MEMORY_MAX_LINES").unwrap(),
+            Some(serde_json::json!(150)),
+            "a refused write left the stored value alone"
+        );
+    }
+
+    /// R7b F24: with `VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH` set, a module in
+    /// `<install root>/paid-modules/` (no install row) is found as a module
+    /// under development: its config-tab save of a declared setting is stored
+    /// (validated), and the settings panel lists it for every project.
+    #[test]
+    fn a_dev_passthrough_modules_setting_is_saved_and_listed() {
+        let root = tempfile::tempdir().unwrap();
+        for marker in ["CLAUDE.md", "install.py"] {
+            std::fs::write(root.path().join(marker), "").unwrap();
+        }
+        std::fs::create_dir_all(root.path().join("state")).unwrap();
+        std::fs::write(root.path().join("state/install-manifest.json"), r#"{"installed": true}"#).unwrap();
+        let module_dir = root.path().join("paid-modules").join("vct-dev-probe");
+        std::fs::create_dir_all(&module_dir).unwrap();
+        std::fs::write(
+            module_dir.join("vct-module.json"),
+            r#"{
+              "id": "vct-dev-probe", "name": "Dev probe", "version": "0.0.1", "category": "core",
+              "license": { "required": false },
+              "install": { "method": "local", "install_dir": "{VCT_MODULES}/vct-dev-probe" },
+              "settings": [ { "key": "DEV_LIMIT", "type": "integer", "min": 1, "max": 10 } ],
+              "runtime": { "type": "cli" }
+            }"#,
+        )
+        .unwrap();
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[(
+            crate::commands::installed_modules::DEV_CATALOG_PASSTHROUGH_ENV,
+            Some("1"),
+        )]);
+        let (db, project_id) = open_db_with_project();
+        db.app_state_set(
+            crate::commands::installer::APP_STATE_KEY_INSTALL_PATH,
+            &root.path().to_string_lossy(),
+        )
+        .unwrap();
+
+        write_setting(&db, "vct-dev-probe", "DEV_LIMIT", Some(&project_id), &serde_json::json!(4))
+            .expect("a dev module's save is stored");
+        assert_eq!(db.get_setting(&project_id, "vct-dev-probe", "DEV_LIMIT").unwrap(), Some(serde_json::json!(4)));
+        assert!(write_setting(&db, "vct-dev-probe", "DEV_LIMIT", Some(&project_id), &serde_json::json!(40))
+            .unwrap_err()
+            .contains("at most 10"));
+
+        let listed = module_settings_schema::list_module_settings(
+            &db,
+            &installed_manifests(&db),
+            &dev_passthrough_manifests(&db),
+        )
+        .unwrap();
+        let dev = listed.iter().find(|m| m.module_id == "vct-dev-probe").expect("listed");
+        assert_eq!(dev.origin, DeclOrigin::DevPassthrough);
+        assert_eq!(dev.projects, None);
+    }
+
+    /// An undeclared key (a config_tab control's state) keeps the old
+    /// contract: any JSON, per project, and a project is still required.
+    #[test]
+    fn set_module_setting_leaves_undeclared_config_tab_state_unvalidated() {
+        let (db, project_id) = open_db_with_project();
+        let v = serde_json::json!({ "selected": ["a"] });
+        write_setting(&db, "vct-rl-reranker", "global_train_projects", Some(&project_id), &v).expect("stored");
+        assert_eq!(read_setting(&db, "vct-rl-reranker", "global_train_projects", Some(&project_id)).unwrap(), v);
+        assert!(write_setting(&db, "vct-rl-reranker", "global_train_projects", None, &v).is_err());
+        assert!(read_setting(&db, "vct-rl-reranker", "global_train_projects", Some("")).is_err());
     }
 
     /// set_module_setting + get_module_setting round-trip via the

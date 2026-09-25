@@ -74,18 +74,11 @@ fn detect_linux_pkg_manager() -> Option<(&'static str, Vec<&'static str>)> {
     None
 }
 
-/// Minimal PATH walk — we only need to know if a binary exists on
-/// PATH, not its exact location. Mirrors `services::runtime::which_on_path`
-/// without the Windows-extension cases (Linux only here).
+/// Is `name` on PATH? Through `vct_launcher_core::paths::which_on_path`, the
+/// launcher's one PATH lookup (v0.2.97 review R6: this was a hand-written
+/// copy of that walk).
 fn which_simple(name: &str) -> Option<std::path::PathBuf> {
-    let paths = std::env::var_os("PATH")?;
-    for dir in std::env::split_paths(&paths) {
-        let p = dir.join(name);
-        if p.is_file() {
-            return Some(p);
-        }
-    }
-    None
+    vct_launcher_core::paths::which_on_path(name)
 }
 
 /// Linux-only: install Podman via the system package manager, elevated
@@ -338,6 +331,32 @@ pub async fn runtime_recheck() -> Result<Option<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// v0.2.97 review R6: detection walks the launcher's one PATH lookup, so
+    /// a test decides the PATH per thread — and the order is apt-get, dnf,
+    /// pacman whatever the directory order.
+    #[cfg(unix)]
+    #[test]
+    fn pkg_manager_detection_follows_the_injected_lookup_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        for (dir, name) in [(a.path(), "pacman"), (b.path(), "dnf")] {
+            let bin = dir.join(name);
+            std::fs::write(&bin, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let both = std::env::join_paths([a.path(), b.path()]).unwrap();
+        let found = vct_launcher_core::paths::with_lookup_path(Some(&both), detect_linux_pkg_manager);
+        assert_eq!(found.map(|(m, _)| m), Some("dnf"), "dnf outranks pacman");
+        let found =
+            vct_launcher_core::paths::with_lookup_path(Some(a.path().as_os_str()), detect_linux_pkg_manager);
+        assert_eq!(found.map(|(m, _)| m), Some("pacman"));
+        let empty = tempfile::tempdir().unwrap();
+        let found =
+            vct_launcher_core::paths::with_lookup_path(Some(empty.path().as_os_str()), detect_linux_pkg_manager);
+        assert!(found.is_none());
+    }
 
     #[test]
     fn pkg_manager_detection_returns_known_or_none() {

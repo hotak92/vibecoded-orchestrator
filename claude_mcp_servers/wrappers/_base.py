@@ -98,15 +98,16 @@ except ImportError:  # pragma: no cover — only triggered when sys.path is wron
     if _parent_dir not in sys.path:
         sys.path.insert(0, _parent_dir)
     from vco_lib.paths import vct_root_dir
+from vco_lib.hub_ensure import DEFAULT_HUB_PORT as _HUB_DEFAULT_PORT
+from vco_lib.hub_ensure import resolve_hub_port
 
 
 logger = logging.getLogger(__name__)
 
 # ─── Constants ────────────────────────────────────────────────────────────
 
-#: Default hub port. Matches DEFAULT_HUB_PORT in
-#: ``vco_lib/project_config.py`` and the Rust ``vct-hub::server`` constant.
-DEFAULT_HUB_PORT: int = 7700
+#: Default hub port — :data:`vco_lib.hub_ensure.DEFAULT_HUB_PORT`.
+DEFAULT_HUB_PORT: int = _HUB_DEFAULT_PORT
 
 #: Default allowlist TTL in seconds. 60s is the plan's stated cadence
 #: (§4 Risk 6). When the hub broadcast lands we'll invalidate earlier;
@@ -839,53 +840,17 @@ class WrapperMCP:
         if self._hub_port is not None and self._hub_token is not None:
             return self._hub_port, self._hub_token
 
-        # Port: env > file > default.
-        #
-        # F-8 corrupt-input contract — MUST MATCH the 4th mirror of the
-        # triplet fixed by W2-E:
-        #   * vco_lib/project_config.py::_discover_hub
-        #   * templates/scripts/vct_project_config.sh::hub_port
-        #   * templates/scripts/vct_project_config.ps1::Get-HubPort
-        # A non-integer ``VCT_HUB_PORT``, a non-integer ``hub.port`` file, or
-        # an unreadable ``hub.port`` (perm-denied) must NOT yield ``None`` —
-        # the port has a sane default (7700). Warn once, fall through to the
-        # default. Only a truly ABSENT file is the silent default path (the
-        # normal env-only / dev case). This keeps all FOUR resolvers
-        # identical on corrupt port input: warn + default, never a partial
-        # resolution that silently disables the hub.
-        port_env = os.environ.get("VCT_HUB_PORT", "").strip()
-        if port_env:
-            try:
-                port: int | None = int(port_env)
-            except ValueError:
-                logger.warning(
-                    "wrapper(%s): VCT_HUB_PORT=%r is not an integer; "
-                    "using default %d",
-                    self.mcp_name, port_env, DEFAULT_HUB_PORT,
-                )
-                port = DEFAULT_HUB_PORT
-        else:
-            port_file = vct_root_dir() / "hub.port"
-            try:
-                raw = port_file.read_text(encoding="utf-8").strip()
-            except FileNotFoundError:
-                port = DEFAULT_HUB_PORT
-            except OSError as e:
-                logger.warning(
-                    "wrapper(%s): cannot read %s: %s; using default %d",
-                    self.mcp_name, port_file, e, DEFAULT_HUB_PORT,
-                )
-                port = DEFAULT_HUB_PORT
-            else:
-                try:
-                    port = int(raw) if raw else DEFAULT_HUB_PORT
-                except ValueError:
-                    logger.warning(
-                        "wrapper(%s): %s contains non-integer content; "
-                        "using default %d",
-                        self.mcp_name, port_file, DEFAULT_HUB_PORT,
-                    )
-                    port = DEFAULT_HUB_PORT
+        # Port: env > file > default — the ONE Python reader,
+        # `vco_lib.hub_ensure.resolve_hub_port` (v0.2.97; this was the "4th
+        # mirror" of the F-8 triplet). Corrupt input warns through this
+        # wrapper's logger and never yields None; an invalid VCT_HUB_PORT
+        # falls through to hub.port (owner ruling 2026-09-24).
+        port: int | None = resolve_hub_port(
+            vct_root_dir(),
+            lambda kind, detail: logger.warning(
+                "wrapper(%s): %s: %s", self.mcp_name, kind, detail
+            ),
+        )
 
         # Token: env > file > no-token (hub unreachable).
         #

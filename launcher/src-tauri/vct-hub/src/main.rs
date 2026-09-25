@@ -30,8 +30,27 @@ use vct_hub::lockfile;
 use vct_hub::server;
 use vct_launcher_core::logging;
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    // v0.2.97 R9 H1(b)/H5: the hub is often started with a SHORT PATH (a
+    // boot unit, a `.desktop` / Finder launch, a session hook's detached
+    // spawn), and every container-runtime decision it makes — the module
+    // supervisor, the infra watchdog, `detect_container_runtime` — judges
+    // "installed" by that PATH. A rootless Docker in `~/bin` or a Homebrew
+    // podman in `/opt/homebrew/bin` then read as NOT INSTALLED, which is the
+    // one shape the stale-record reconcile may switch away from. The
+    // launcher already applies the shared table of usual install locations
+    // (`vco_lib/tool_search_dirs.toml`) at startup; the hub now does the
+    // same, HERE — before the tokio runtime exists, so no other thread can
+    // be reading the environment while it changes.
+    vct_launcher_core::services::runtime::augment_path_for_graphical_launch();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("vct-hub: could not build the tokio runtime")
+        .block_on(async_main());
+}
+
+async fn async_main() {
     // FIRST statement: install diagnostics before anything can want to
     // emit one. `resolve_process_log_level` reads VCO_LOG_LEVEL and
     // best-effort probes launcher.db for the stored preference — see
@@ -74,6 +93,18 @@ async fn main() {
         Command::RegisterBoot => exit_with(boot::run_register_boot()),
         Command::UnregisterBoot => exit_with(boot::run_unregister_boot()),
         Command::BootStatus => exit_with(boot::run_boot_status()),
+        Command::EnsureDb => match cli::ensure_db() {
+            Ok(report) => {
+                // [vct-print-contract] stdout is the machine answer install.py
+                // parses; diagnostics stay on the tracing subscriber (stderr).
+                println!(
+                    "{}",
+                    serde_json::to_string(&report).unwrap_or_else(|_| "{}".to_string())
+                );
+                process::exit(0);
+            }
+            Err(e) => exit_with(LifecycleResult::Err(format!("--ensure-db: {}", e))),
+        },
         Command::Foreground => run_foreground().await,
     }
 }
@@ -97,6 +128,9 @@ async fn run_foreground() {
         pid = std::process::id(),
         "[vct-hub] starting"
     );
+    // v0.2.97: the endpoint env vars no resolver reads any more — say so
+    // once, so a user who exported one learns it stopped mattering.
+    vct_launcher_core::services::service_endpoints::warn_retired_endpoint_env("hub");
 
     let bind_result = server::start_hub_server().await;
     let port = match bind_result {

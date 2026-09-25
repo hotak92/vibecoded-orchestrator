@@ -447,27 +447,27 @@ class OverrideFChainTests(unittest.TestCase):
 
 
 class ServicesTomlIOTests(_TempCase):
-    def test_drop_rows_removes_only_named_and_keeps_the_rest(self):
+    """v0.2.97: services.toml is read only by the service_endpoints importer;
+    the adoption writes launcher.db rows instead of dropping these."""
+
+    def test_rows_round_trip_for_the_importer(self):
         path = Path(self._tmp) / "services.toml"
         service_adoption.write_services_toml({"services": [
-            {"name": "weaviate", "mode": "vco-managed"},
-            {"name": "ollama", "mode": "vco-managed"},
+            {"name": "weaviate", "mode": "adopt"},
             {"name": "model_router", "mode": "external",
              "external_url": "http://localhost:11436"},
+            {"name": "ollama", "mode": "parallel", "parallel_port": 18082},
         ]}, path=path)
-        dropped = service_adoption.drop_services_toml_rows(
-            ["weaviate", "ollama"], path=path)
-        self.assertEqual(dropped, 2)
         rows = service_adoption.read_services_toml(path)["services"]
-        self.assertEqual([r["name"] for r in rows], ["model_router"])
-        self.assertEqual(rows[0]["external_url"], "http://localhost:11436")
+        self.assertEqual([r["name"] for r in rows],
+                         ["weaviate", "model_router", "ollama"])
+        self.assertEqual(rows[1]["external_url"], "http://localhost:11436")
+        self.assertEqual(rows[2]["parallel_port"], 18082)
 
-    def test_missing_file_is_empty_and_drop_is_a_noop(self):
+    def test_missing_file_is_empty(self):
         path = Path(self._tmp) / "services.toml"
         self.assertEqual(service_adoption.read_services_toml(path),
                          {"services": []})
-        self.assertEqual(
-            service_adoption.drop_services_toml_rows(["weaviate"], path=path), 0)
 
 
 class MergeComposeSemanticsTests(unittest.TestCase):
@@ -734,8 +734,8 @@ class AdoptionFlowTests(_TempCase):
         world = self.make_world()
         real_render = service_adoption.render_adoption_override
 
-        def buggy_render(plans):
-            doc = yaml.safe_load(real_render(plans))
+        def buggy_render(plans, **kw):
+            doc = yaml.safe_load(real_render(plans, **kw))
             doc["services"]["code_embed"].pop("volumes", None)
             doc["volumes"].pop("code_embed_cache", None)
             return yaml.safe_dump(doc, default_flow_style=False, sort_keys=True)
@@ -815,21 +815,47 @@ class AdoptionFlowTests(_TempCase):
         # the services that STAY keep the owning project
         self.assertEqual(world.projects["vco_model_router"], OWNING_PROJECT)
 
-    def test_services_toml_rows_drop_for_adopted_only(self):
+    def test_adopted_services_are_recorded_as_vco_managed_rows(self):
+        """v0.2.97: the adoption WRITES the adopted services' launcher.db
+        rows (superseding the v0.2.96 services.toml row drop) — the
+        container, the installer's project, the live data mount, and the
+        HTTP/gRPC host ports the container keeps."""
+        world = self.make_world()
+        committed: list = []
+        result, _ = world.adopt(commit_rows=lambda rows: committed.extend(rows))
+        self.assertEqual(len(result.adopted), 3)
+        by = {r.service: r for r in committed}
+        self.assertEqual(set(by), {"weaviate", "ollama", "code_embed"})
+        for row in committed:
+            self.assertEqual(row.mode, "vco_managed")
+            self.assertEqual(row.compose_project, OWN_PROJECT)
+            self.assertEqual(row.container_name, SERVICE_TO_CONTAINER[row.service])
+        self.assertEqual(by["ollama"].data_mount,
+                         {"kind": "bind", "source": OLLAMA_BIND,
+                          "destination": "/root/.ollama"})
+        self.assertEqual(by["weaviate"].data_mount["source"], "vco_weaviate_data")
+        self.assertEqual(by["weaviate"].port, 8081)
+        self.assertEqual(by["ollama"].port, 11435)
+
+    def test_services_toml_is_not_written_by_the_adoption(self):
         world = self.make_world()
         state = service_adoption.services_toml_path()
         state.parent.mkdir(parents=True, exist_ok=True)
         service_adoption.write_services_toml({"services": [
-            {"name": "weaviate", "mode": "vco-managed"},
-            {"name": "ollama", "mode": "vco-managed"},
-            {"name": "code_embed", "mode": "vco-managed"},
+            {"name": "weaviate", "mode": "adopt"},
             {"name": "model_router", "mode": "external",
              "external_url": "http://localhost:11436"},
         ]})
-        result, _ = world.adopt()
+        before = state.read_bytes()
+        result, _ = world.adopt(commit_rows=lambda rows: None)
         self.assertEqual(len(result.adopted), 3)
-        rows = service_adoption.read_services_toml()["services"]
-        self.assertEqual([r["name"] for r in rows], ["model_router"])
+        self.assertEqual(state.read_bytes(), before)
+
+    def test_a_missing_registry_never_fails_the_adoption(self):
+        world = self.make_world()
+        result, lines = world.adopt()  # VCT_STATE_DIR has no launcher.db
+        self.assertEqual(len(result.adopted), 3)
+        self.assertIn("service_endpoints rows could not be written", "\n".join(lines))
 
     def test_dry_run_touches_nothing(self):
         world = self.make_world()
@@ -935,14 +961,8 @@ class AdoptionFlowTests(_TempCase):
     def test_unreadable_live_state_refuses_only_that_service(self):
         world = self.make_world()
         world.fail_mounts_for = {"vco_ollama"}
-        state = service_adoption.services_toml_path()
-        state.parent.mkdir(parents=True, exist_ok=True)
-        service_adoption.write_services_toml({"services": [
-            {"name": "weaviate", "mode": "vco-managed"},
-            {"name": "ollama", "mode": "vco-managed"},
-            {"name": "model_router", "mode": "external"},
-        ]})
-        result, _ = world.adopt()
+        committed: list = []
+        result, _ = world.adopt(commit_rows=lambda rows: committed.extend(rows))
         self.assertEqual(result.adopted, ["weaviate", "code_embed"])
         self.assertIn("could not positively read", result.refused["ollama"])
         # the refused service's container is never touched
@@ -951,10 +971,9 @@ class AdoptionFlowTests(_TempCase):
                 self.assertNotEqual(argv[2], "vco_ollama")
             if argv[-1] == "ollama":
                 self.fail(f"refused service was brought up: {argv}")
-        # its services.toml row SURVIVES (it is still foreign)
-        rows = service_adoption.read_services_toml()["services"]
-        self.assertEqual(sorted(r["name"] for r in rows),
-                         ["model_router", "ollama"])
+        # no row is written for it (it is still foreign)
+        self.assertEqual(sorted(r.service for r in committed),
+                         ["code_embed", "weaviate"])
 
     def test_user_authored_override_is_never_clobbered(self):
         world = self.make_world(user_override=True)
@@ -1096,10 +1115,10 @@ class GuardEntryTests(_TempCase):
                                   return_value=self.IDENTITY):
             identities = {}
             foreign = install_services_guard.foreign_owned_services(
-                ["code_embed"], "podman", infra, compose_file,
+                ["code_embed"], "podman", compose_file,
                 identities=identities)
             foreign_noparam = install_services_guard.foreign_owned_services(
-                ["code_embed"], "podman", infra, compose_file)
+                ["code_embed"], "podman", compose_file)
         self.assertEqual(set(foreign), {"code_embed"})
         self.assertEqual(foreign_noparam, foreign)  # backward compatible
         self.assertEqual(identities["code_embed"], self.IDENTITY)

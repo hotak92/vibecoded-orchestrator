@@ -16,7 +16,9 @@ The Phase 0/1/1.5/2/3 Diagrams Integration feature has many moving parts:
     * A per-project Weaviate ``<Project>_Diagrams`` class bootstrapped on
       project init.
     * ``DIAGRAMS_COLLECTION`` + ``VCT_DIAGRAMS_ACCESS_LIST`` env vars
-      projected to all three on-disk surfaces.
+      projected to the surfaces ``config_projection apply`` writes by
+      default (``.claude/settings.json`` ``env``, ``.claude/env`` — compared
+      by :mod:`vco_lib.env_projection_check`).
     * PreToolUse + PostToolUse hooks registered (path-validation guard
       for ``Write|Edit`` + ``mcp__mermaid__.*|mcp__excalidraw__.*``;
       delete cascade on Bash ``rm``).
@@ -34,7 +36,8 @@ Exit-code policy (mirrors :mod:`vco_lib.cli.verify`):
 * ``0`` — every check returned OK or SKIP.
 * ``1`` — at least one check returned FAIL.
 * ``2`` — environment problem the verifier cannot work around
-  (project not in launcher DB, launcher DB unreadable).
+  (project not in launcher DB, launcher DB unreadable, or a file a check
+  needs exists but cannot be read — status ``cannot_verify``).
 * ``3`` — ``--fix`` ran but failed to repair at least one check.
 
 Flags:
@@ -79,6 +82,13 @@ import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
+# Module-top on purpose: the env check must bind the REAL projection module
+# (tests swap ``vco_lib.config_projection`` in ``sys.modules`` to stub the
+# --fix writer; the comparison must not be stubbed along with it).
+from vco_lib.env_projection_check import check_env_surfaces, surface_label
+from vco_lib.hub_ensure import resolve_hub_port
+from vco_lib.jsonc_edit import read_object
+
 
 # ---------------------------------------------------------------------------
 # Exit-code constants — keep stable; tests assert against these.
@@ -99,6 +109,11 @@ STATUS_FAIL = "fail"
 STATUS_SKIP = "skip"
 STATUS_FIXED = "fixed"   # like OK, but reached via --fix
 STATUS_FIX_FAILED = "fix_failed"
+#: v0.2.97: a file the check needs exists but cannot be read (not JSONC, not
+#: UTF-8, not an object). Neither OK nor FAIL — "cannot look" is not a
+#: verdict — and it maps to exit 2 (an environment problem), like
+#: ``verify-env-projection``'s ``cannot_verify``.
+STATUS_CANNOT_VERIFY = "cannot_verify"
 
 
 # ---------------------------------------------------------------------------
@@ -549,10 +564,13 @@ def _check_mcp_wrappers() -> _CheckResult:
 
 
 def _vct_hub_base_url() -> str:
-    """Resolve the hub base URL. ``$VCT_HUB_PORT`` honoured; fallback to
-    7700 (the default documented in CLAUDE.md)."""
-    port = os.environ.get("VCT_HUB_PORT", "7700").strip() or "7700"
-    return f"http://127.0.0.1:{port}"
+    """Resolve the hub base URL through the ONE client port reader,
+    :func:`vco_lib.hub_ensure.resolve_hub_port` (``$VCT_HUB_PORT`` →
+    ``hub.port`` → 7700). R7b F3: this used to read ``$VCT_HUB_PORT`` else
+    7700 and never ``hub.port`` — so once the hub moved without an env var
+    (Preferences → Modules, or a taken 7700), check 5 probed the wrong port
+    and reported a false failure."""
+    return f"http://127.0.0.1:{resolve_hub_port()}"
 
 
 def _vct_hub_token() -> Optional[str]:
@@ -738,17 +756,18 @@ def _check_hub_allowlist(project_id: str) -> _CheckResult:
 
 
 # ---------------------------------------------------------------------------
-# Check 6: env vars projected to all three surfaces.
+# Check 6: diagrams env vars projected to the surfaces `apply` writes.
 # ---------------------------------------------------------------------------
 
 
-# Keys this verifier checks. ``KG_COLLECTION`` is canonical (always
-# present); ``DIAGRAMS_COLLECTION`` and ``VCT_DIAGRAMS_ACCESS_LIST`` are
-# diagrams-specific. The latter two are NOT yet in
-# ``vco_lib.config_projection._CANONICAL_KEYS`` (Phase 0.B was authored
-# before the diagrams feature gained dedicated env vars); when the
-# projection adds them, this verifier picks them up automatically via
-# :func:`_project_env_from_db`.
+# Keys this verifier checks: ``KG_COLLECTION`` plus the two diagrams keys.
+# All three are canonical projection keys (``config_projection
+# ._CANONICAL_KEYS``) — the "not yet in the projection" gap this list was
+# written around closed when the projection gained them. The projection
+# OMITS a key it has no value for (``VCT_DIAGRAMS_ACCESS_LIST`` when no peer
+# granted diagram read), and ``apply`` then REMOVES it from every surface, so
+# an omitted key is correct when absent — the shared check reports it only if
+# a surface still carries it.
 DIAGRAMS_ENV_KEYS: tuple[str, ...] = (
     "KG_COLLECTION",
     "DIAGRAMS_COLLECTION",
@@ -756,54 +775,36 @@ DIAGRAMS_ENV_KEYS: tuple[str, ...] = (
 )
 
 
-def _read_claude_settings_env(folder: Path) -> dict[str, str]:
-    path = folder / ".claude" / "settings.json"
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = payload.get("env")
-    if not isinstance(env, Mapping):
-        return {}
-    return {str(k): str(v) for k, v in env.items() if isinstance(v, (str, int, float))}
+def _diagrams_drift(project_folder: Path, expected: Mapping[str, str]) -> Any:
+    """``(check, drift lines)`` for :data:`DIAGRAMS_ENV_KEYS`.
+
+    The comparison is the ONE home
+    (:func:`vco_lib.env_projection_check.check_env_surfaces`) — the same one
+    ``vco verify-env-projection`` reports from: JSONC is read, exactly the
+    surfaces ``apply`` writes by default are compared (``.vscode/settings.json``
+    is not one of them), and a file that cannot be read is reported as such.
+    Until v0.2.97 this module carried its own readers (a strict ``json.loads``
+    that read a JSONC settings.json as empty) and compared the VS Code surface.
+    """
+    check = check_env_surfaces(project_folder, expected)
+    lines = [
+        f"{row['key']} on {row['surface']}: expected {row['expected']!r}, "
+        f"got {row['actual']!r}"
+        for row in check.drift
+        if row["key"] in DIAGRAMS_ENV_KEYS
+    ]
+    return check, lines
 
 
-def _read_claude_env(folder: Path) -> dict[str, str]:
-    path = folder / ".claude" / "env"
-    if not path.exists():
-        return {}
-    out: dict[str, str] = {}
-    try:
-        for line in path.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            if line.startswith("export "):
-                line = line[len("export "):].lstrip()
-            key, _, value = line.partition("=")
-            key = key.strip()
-            value = value.strip().strip('"').strip("'")
-            if key:
-                out[key] = value
-    except OSError:
-        return {}
-    return out
-
-
-def _read_vscode_settings_env(folder: Path) -> dict[str, str]:
-    path = folder / ".vscode" / "settings.json"
-    if not path.exists():
-        return {}
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return {}
-    env = payload.get("claude-code.env")
-    if not isinstance(env, Mapping):
-        return {}
-    return {str(k): str(v) for k, v in env.items() if isinstance(v, (str, int, float))}
+def _unreadable_result(check: Any) -> _CheckResult:
+    return _CheckResult(
+        "env_projection",
+        STATUS_CANNOT_VERIFY,
+        "cannot read "
+        + "; ".join(f"{u['surface']}: {u['reason']}" for u in check.unreadable),
+        fix_hint="repair or move aside the named file (VCO does not overwrite a "
+        "settings file it cannot read), then re-run",
+    )
 
 
 def _check_env_projection(
@@ -817,32 +818,15 @@ def _check_env_projection(
             STATUS_FAIL,
             f"cannot project env from DB: {exc}",
         )
-    surfaces = {
-        ".claude/settings.json": _read_claude_settings_env(project_folder),
-        ".claude/env": _read_claude_env(project_folder),
-        ".vscode/settings.json": _read_vscode_settings_env(project_folder),
-    }
-    drift: list[str] = []
-    for key in DIAGRAMS_ENV_KEYS:
-        want = expected.get(key)
-        if want is None:
-            # Key not in canonical projection — the diagrams feature
-            # may not have added it yet (Phase 0.B gap). Report SKIP-
-            # rationale rather than FAIL so users with otherwise-fine
-            # installs don't see a noisy error.
-            drift.append(f"{key}: not in canonical projection (Phase 0.B gap)")
-            continue
-        for surface_name, values in surfaces.items():
-            have = values.get(key)
-            if have != want:
-                drift.append(
-                    f"{key} on {surface_name}: expected {want!r}, got {have!r}"
-                )
+    check, drift = _diagrams_drift(project_folder, expected)
+    if check.unreadable:
+        return _unreadable_result(check)
+    labels = ", ".join(surface_label(s) for s in check.surfaces)
     if not drift:
         return _CheckResult(
             "env_projection",
             STATUS_OK,
-            f"all {len(DIAGRAMS_ENV_KEYS)} keys present on all 3 surfaces",
+            f"all {len(DIAGRAMS_ENV_KEYS)} keys match the projection on {labels}",
         )
     if not fix:
         return _CheckResult(
@@ -888,35 +872,33 @@ def _check_env_projection(
             f"project_env_from_db raised: {exc}",
         )
     try:
-        # Write to all 3 surfaces — the drift-detection above reads all
-        # 3, so a half-write would re-fail on the next verify run.
-        report = apply_project_env(
-            bundle,
-            surfaces=(
-                "claude_settings_json",
-                "claude_env",
-                "vscode_settings_json",
-            ),
-        )
+        # apply's DEFAULT surfaces — exactly the set compared above. v0.2.97:
+        # this used to force `.vscode/settings.json` as well (because the
+        # verifier compared it), creating a VS Code settings file in every
+        # project it repaired.
+        apply_project_env(bundle)
     except Exception as exc:
         return _CheckResult(
             "env_projection",
             STATUS_FIX_FAILED,
             f"apply_project_env raised: {exc}",
         )
-    # apply_project_env signals success by returning without raising;
-    # the dict it returns maps each written surface to the canonical
-    # keys that landed. Defensive: a non-Mapping return (e.g. a mocked-
-    # out test stub) is treated as success since no exception was
-    # raised.
-    surfaces_written = (
-        sorted(report.keys()) if isinstance(report, Mapping) else []
-    )
+    # apply signals success by returning; the surfaces are then re-read, so
+    # FIXED means "verified matching after the write", not "a write ran".
+    after, remaining = _diagrams_drift(project_folder, expected)
+    if after.unreadable:
+        return _unreadable_result(after)
+    if remaining:
+        return _CheckResult(
+            "env_projection",
+            STATUS_FIX_FAILED,
+            f"still {len(remaining)} drift entries after apply: "
+            + "; ".join(remaining[:3]) + ("..." if len(remaining) > 3 else ""),
+        )
     return _CheckResult(
         "env_projection",
         STATUS_FIXED,
-        f"projected {len(expected)} canonical keys to "
-        f"{len(surfaces_written) or 3} surfaces",
+        f"re-projected; all {len(DIAGRAMS_ENV_KEYS)} keys now match on {labels}",
     )
 
 
@@ -1059,6 +1041,28 @@ def _check_weaviate_class(
 # ---------------------------------------------------------------------------
 
 
+def _load_settings(settings_path: Path, check_name: str) -> tuple[dict, Optional[_CheckResult]]:
+    """``(payload, None)``, or ``({}, CANNOT_VERIFY result)`` when the file
+    exists but cannot be read.
+
+    Read with the ONE JSONC reader (:func:`vco_lib.jsonc_edit.read_object`):
+    Claude Code accepts comments and trailing commas in settings.json, and a
+    strict ``json.loads`` here reported such a file as FAIL "cannot parse"
+    (v0.2.97). A file that is genuinely unreadable is not a verdict about the
+    hooks either way.
+    """
+    try:
+        payload, _raw = read_object(settings_path)
+    except (OSError, ValueError) as exc:
+        return {}, _CheckResult(
+            check_name,
+            STATUS_CANNOT_VERIFY,
+            f"cannot read settings.json: {exc}",
+            fix_hint="repair or move aside .claude/settings.json, then re-run",
+        )
+    return payload, None
+
+
 def _check_pretooluse_hooks(project_folder: Path) -> _CheckResult:
     settings_path = project_folder / ".claude" / "settings.json"
     if not settings_path.exists():
@@ -1068,14 +1072,9 @@ def _check_pretooluse_hooks(project_folder: Path) -> _CheckResult:
             f"{settings_path} absent",
             fix_hint="re-run install.py to render .claude/settings.json",
         )
-    try:
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return _CheckResult(
-            "pretooluse_hooks",
-            STATUS_FAIL,
-            f"cannot parse settings.json: {exc}",
-        )
+    payload, unreadable = _load_settings(settings_path, "pretooluse_hooks")
+    if unreadable is not None:
+        return unreadable
     pre = (payload.get("hooks") or {}).get("PreToolUse")
     if not isinstance(pre, list):
         return _CheckResult(
@@ -1136,14 +1135,9 @@ def _check_post_delete_hook(project_folder: Path) -> _CheckResult:
             STATUS_FAIL,
             f"{settings_path} absent",
         )
-    try:
-        payload = json.loads(settings_path.read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        return _CheckResult(
-            "post_delete_hook",
-            STATUS_FAIL,
-            f"cannot parse settings.json: {exc}",
-        )
+    payload, unreadable = _load_settings(settings_path, "post_delete_hook")
+    if unreadable is not None:
+        return unreadable
     post = (payload.get("hooks") or {}).get("PostToolUse")
     if not isinstance(post, list):
         return _CheckResult(
@@ -1379,12 +1373,15 @@ class _ProjectVerifyReport:
         """Worst-of policy.
 
         FIX_FAILED → 3
+        CANNOT_VERIFY → 2 (a file the check needs could not be read)
         FAIL → 1
         SKIP / OK / FIXED → 0
         """
         statuses = {c.status for c in self.checks}
         if STATUS_FIX_FAILED in statuses:
             return EXIT_FIX_FAILED
+        if STATUS_CANNOT_VERIFY in statuses:
+            return EXIT_ENV_PROBLEM
         if STATUS_FAIL in statuses:
             return EXIT_FAIL
         return EXIT_OK
@@ -1494,6 +1491,7 @@ _STATUS_LABELS: dict[str, str] = {
     STATUS_SKIP: "[SKIP]",
     STATUS_FIXED: "[FIX] ",
     STATUS_FIX_FAILED: "[FAIL]",
+    STATUS_CANNOT_VERIFY: "[????]",
 }
 
 
@@ -1507,7 +1505,7 @@ def _format_human(report: _ProjectVerifyReport) -> str:
     for c in report.checks:
         label = _STATUS_LABELS.get(c.status, f"[{c.status.upper()}]")
         lines.append(f"  {label} {c.name} — {c.detail}")
-        if c.fix_hint and c.status in (STATUS_FAIL, STATUS_FIX_FAILED):
+        if c.fix_hint and c.status in (STATUS_FAIL, STATUS_FIX_FAILED, STATUS_CANNOT_VERIFY):
             lines.append(f"         > fix: {c.fix_hint}")
     counts = report.summary_counts()
     summary_parts = [
@@ -1517,6 +1515,8 @@ def _format_human(report: _ProjectVerifyReport) -> str:
     ]
     if counts.get(STATUS_FIXED):
         summary_parts.append(f"{counts[STATUS_FIXED]} FIXED")
+    if counts.get(STATUS_CANNOT_VERIFY):
+        summary_parts.append(f"{counts[STATUS_CANNOT_VERIFY]} CANNOT VERIFY")
     lines.append("")
     lines.append("Summary: " + ", ".join(summary_parts))
     return "\n".join(lines)

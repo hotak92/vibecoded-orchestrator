@@ -1,46 +1,26 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""User-secret STRIP contract (Phase 0.E emit arm retired v0.2.75 P3).
+"""User-secret KEY contract (the value-writing arms are retired).
 
-Phase 0.E (2026-05-25) shipped an emit-capable user-secret writer;
-v0.2.73 abolished value-emission in production (the Rust writer
-projects an always-empty emit set), and v0.2.75 P3 DELETED the Python
-emit arm entirely. The sole surviving contract is: VCO never writes
-secret values into the project tree.
+VCO never writes a secret value into the project tree. Phase 0.E
+(2026-05-25) shipped ``apply-user-secrets``; v0.2.75 P3 cut it down to a
+strip of every launcher-known key NAME, and v0.2.97 retired it: removing a
+value by NAME destroys a key the user typed. It is SUPERSEDED by the
+evidence-gated scrub inside every ``apply_project_env`` (and the launcher's
+unregister, via ``strip-proven-secret-values``) — a value is removed only when
+it equals the launcher's stored value; that behaviour is tested in
+``tests/test_v0297_user_secret_scrub.py``.
 
 This file tests:
 
-  1. :func:`user_secret_known_keys_from_db` — the STRIP set resolver
-     reads the union of three buckets (per-project, shared, global)
-     from ``secret_active_state``, dedups across buckets, sorts.
-
-  2. :func:`apply_user_secrets` — the STRIP-ONLY surface writer:
-     * A non-empty ``user_secret_pairs`` is a HARD
-       ``ConfigProjectionError`` (retired-emit backstop) — on the
-       direct entry point AND the combined ``apply_project_env`` path.
-     * STRIP every known key from the JSON env sub-blocks; rebuild the
-       ``.claude/env`` managed block WITHOUT a user-secret section
-       (legacy sections from pre-v0.2.73 launchers removed).
-     * Preserve canonical env keys, user-added-by-hand keys, and
-       sibling blocks (hooks, permissions, editor config).
-     * Re-runs are idempotent — byte-identical output.
-
-  3. Cross-OS atomicity — no .tmp leaks; tempfile lands in target
-     directory so the rename is on one filesystem.
-
-  4. CLI verbs ``apply-user-secrets`` (strip-only; the retired
-     ``--pairs-json`` flag is rejected by the live argparse parser)
-     and ``user-secret-known-keys`` — happy paths + error envelopes
-     (project_not_found exits 2, db_unreachable exits 3).
-
-  5. The grep-gate: no caller anywhere in the tree references the
-     retired ``--pairs-json`` flag (i.e. nothing can pass a non-empty
-     emit set to the CLI).
-
-The CANONICAL writer's behaviour is regression-tested in
-``tests/test_config_projection.py``; the tree-wide never-writes-values
-invariant lives in ``tests/test_config_projection_byte_identical.py``
-and ``projects_v2.rs``.
+  1. :func:`user_secret_known_keys_from_db` — the resolver of the names the
+     refresh checks: the union of three buckets (per-project, shared,
+     global) from ``secret_active_state``, deduped, sorted.
+  2. The refresh's ``.claude/env`` block carries no user-secret section.
+  3. The ``user-secret-known-keys`` CLI verb (names only).
+  4. The grep-gate: the retired ``--pairs-json`` flag and the retired
+     ``apply-user-secrets`` verb stay retired — no parser registration,
+     no caller anywhere in the tree.
 
 Run: pytest tests/test_config_projection_user_secrets.py -v
 """
@@ -61,13 +41,9 @@ from tests.common.launcher_db_fixture import (
     make_launcher_db,
 )
 from vco_lib.config_projection import (
-    CLAUDE_ENV_MANAGED_BEGIN,
     CLAUDE_ENV_MANAGED_END,
-    ConfigProjectionError,
     DbUnreachable,
-    UserSecretBundle,
     apply_project_env,
-    apply_user_secrets,
     user_secret_known_keys_from_db,
 )
 
@@ -316,381 +292,21 @@ def test_known_keys_db_missing_raises(tmp_path: Path) -> None:
         user_secret_known_keys_from_db("any", db_path=tmp_path / "no.db")
 
 
-# ─── apply_user_secrets — fresh creation (lifecycle 1) ──────────────────
+# ─── the refresh's .claude/env carries no user-secret section ───────────
 
 
-def _make_secret_bundle(
-    project_root: Path,
-    pairs: list[tuple[str, str]],
-    known: list[str],
-    project_id: str = "test-id",
-) -> UserSecretBundle:
-    """Helper: build a UserSecretBundle for the writer tests."""
-    return {
-        "user_secret_pairs": pairs,
-        "user_secret_known_keys": known,
-        "project_id": project_id,
-        "project_root": project_root,
-    }
-
-
-def test_apply_us_rejects_nonempty_pairs(tmp_path: Path) -> None:
-    """v0.2.75 P3: the emit arm is DELETED — a non-empty emit set is a
-    hard error naming the retired contract, and NOTHING is written."""
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[("GITHUB_TOKEN", "ghp_abc123")],
-        known=["GITHUB_TOKEN"],
-    )
-    with pytest.raises(ConfigProjectionError, match="retired"):
-        apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-    assert not (tmp_path / ".claude" / "settings.json").exists()
-    # The value must appear NOWHERE under the tree.
-    for p in tmp_path.rglob("*"):
-        if p.is_file():
-            assert "ghp_abc123" not in p.read_text(encoding="utf-8")
-
-
-def test_apply_project_env_combined_rejects_nonempty_pairs(tmp_path: Path) -> None:
-    """The combined apply path enforces the same retired-emit backstop."""
-    bundle: dict = {
-        "canonical_env": {"KG_COLLECTION": "TestKG"},
-        "project_id": "test-id",
-        "project_root": tmp_path,
-    }
-    secret_bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[("ACTIVE_TOKEN", "active_val")],
-        known=["ACTIVE_TOKEN"],
-    )
-    with pytest.raises(ConfigProjectionError, match="retired"):
-        apply_project_env(
-            bundle, surfaces=["claude_settings_json"],
-            user_secret_bundle=secret_bundle,
-        )
-    assert not (tmp_path / ".claude" / "settings.json").exists()
-
-
-def test_apply_us_strip_only_fresh_files_carry_no_user_secret_section(
-    tmp_path: Path,
-) -> None:
-    """A strip-only apply against a project with NO prior files creates
-    the surface skeletons with EMPTY env content — never a user-secret
-    section, never a value."""
-    bundle = _make_secret_bundle(tmp_path, pairs=[], known=["GITHUB_TOKEN"])
-    report = apply_user_secrets(
-        bundle, surfaces=["claude_settings_json", "claude_env"],
-    )
-
-    data = json.loads((tmp_path / ".claude" / "settings.json").read_text())
-    assert data["env"] == {}
-
-    text = (tmp_path / ".claude" / "env").read_text()
-    assert CLAUDE_ENV_MANAGED_BEGIN in text
-    assert CLAUDE_ENV_MANAGED_END in text
-    assert "# user secrets" not in text
-
-    assert report["claude_settings_json"]["emitted"] == []
-    assert report["claude_env"]["emitted"] == []
-
-
-# ─── apply_user_secrets — STRIP of stale values ─────────────────────────
-
-
-def test_apply_us_strips_stale_value_from_settings_json(tmp_path: Path) -> None:
-    """A stale value written by a pre-fix launcher leaves settings.json;
-    canonical keys, user-added-by-hand keys, and sibling blocks
-    survive verbatim."""
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {
-            "GITHUB_TOKEN": "ghp_stale_value",        # stripped
-            "PAUSED_KEY": "stale_paused_value",       # stripped
-            "OPENAI_API_BASE": "user-added-by-hand",  # preserved
-            "KG_COLLECTION": "PreservedCanonical",    # preserved
-        },
-        "hooks": {"PreToolUse": []},  # sibling block — must survive
-    }, indent=2))
-
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["GITHUB_TOKEN", "PAUSED_KEY"],
-    )
-    report = apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-
-    raw = settings_path.read_text()
-    data = json.loads(raw)
-    assert "GITHUB_TOKEN" not in data["env"]
-    assert "PAUSED_KEY" not in data["env"]
-    assert "ghp_stale_value" not in raw
-    # User-added-by-hand key preserved (NOT in known-keys).
-    assert data["env"]["OPENAI_API_BASE"] == "user-added-by-hand"
-    # Canonical key + sibling block preserved.
-    assert data["env"]["KG_COLLECTION"] == "PreservedCanonical"
-    assert data["hooks"] == {"PreToolUse": []}
-
-    assert report["claude_settings_json"]["stripped"] == [
-        "GITHUB_TOKEN", "PAUSED_KEY",
-    ]
-    assert report["claude_settings_json"]["emitted"] == []
-
-
-def test_apply_us_strips_legacy_user_secret_section_from_claude_env(
-    tmp_path: Path,
-) -> None:
-    """A legacy user-secret section (pre-v0.2.73 launcher) is removed by
-    the BEGIN/END rebuild; canonical exports and lines outside the
-    markers survive verbatim."""
-    env_path = tmp_path / ".claude" / "env"
-    env_path.parent.mkdir()
-    env_path.write_text(
-        f"{CLAUDE_ENV_MANAGED_BEGIN}\n"
-        '# header\n'
-        'export KG_COLLECTION="PreservedCanonical"\n'
-        '\n'
-        '# user secrets (per-project; managed via launcher GUI Secrets panel)\n'
-        'export GITHUB_TOKEN="ghp_OLD"\n'
-        'export PAUSED_KEY="stale"\n'
-        f"{CLAUDE_ENV_MANAGED_END}\n"
-        "# user trailer\n"
-    )
-
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["GITHUB_TOKEN", "PAUSED_KEY"],
-    )
-    apply_user_secrets(bundle, surfaces=["claude_env"])
-
-    text = env_path.read_text()
-    # Every legacy secret line gone — values included.
-    assert "GITHUB_TOKEN" not in text
-    assert "PAUSED_KEY" not in text
-    assert "ghp_OLD" not in text
-    assert "# user secrets" not in text
-    # Canonical export preserved across the rebuild.
-    assert 'export KG_COLLECTION="PreservedCanonical"' in text
-    # User trailer (outside markers) preserved.
-    assert "# user trailer" in text
-
-
-def test_apply_us_full_deletion_empty_pairs_strips_all_known(
-    tmp_path: Path,
-) -> None:
-    """All-deletion case: empty pairs + non-empty known → every known
-    key is stripped from the JSON env block.
-
-    This is the "user unregistered all their secrets" flow — the
-    resolver returns empty pairs, but the strip set still carries
-    the keys until ``forget_user_secret_state_for_project`` runs.
-    """
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {
-            "KEY_A": "valA",
-            "KEY_B": "valB",
-            "USER_ADDED": "preserved",
-        },
-    }, indent=2))
-
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["KEY_A", "KEY_B"],
-    )
-    apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-
-    data = json.loads(settings_path.read_text())
-    assert "KEY_A" not in data["env"]
-    assert "KEY_B" not in data["env"]
-    # User-added-by-hand preserved.
-    assert data["env"]["USER_ADDED"] == "preserved"
-
-
-# ─── apply_user_secrets — invariants and idempotence ────────────────────
-
-
-def test_apply_us_preserves_user_added_by_hand_keys(tmp_path: Path) -> None:
-    """A KEY that's NOT in known-keys is left untouched.
-
-    User-added-by-hand keys (the user edited settings.json directly,
-    bypassing set_secret_v2) are NEVER in the strip set by construction
-    of the Rust resolver — only keys that came through set_secret_v2
-    land in secret_active_state. The writer must not assume "every
-    user-shaped key in the env block is a strip candidate".
-    """
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {
-            "BY_HAND_KEY": "preserved",
-            "ANOTHER_BY_HAND": "also preserved",
-        },
-    }, indent=2))
-
-    # Empty bundle: no pairs, no known-keys.
-    bundle = _make_secret_bundle(tmp_path, pairs=[], known=[])
-    apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-
-    data = json.loads(settings_path.read_text())
-    assert data["env"]["BY_HAND_KEY"] == "preserved"
-    assert data["env"]["ANOTHER_BY_HAND"] == "also preserved"
-
-
-def test_apply_us_idempotent_settings_json(tmp_path: Path) -> None:
-    """Two strip-only apply_user_secrets calls with the same bundle
-    produce byte-identical settings.json output."""
-    # Seed canonical content + stale strippables first.
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {"KG_COLLECTION": "TestKG", "TOKEN_A": "stale"},
-    }, indent=2))
-
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["TOKEN_A", "TOKEN_B"],
-    )
-    apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-    first = settings_path.read_bytes()
-    apply_user_secrets(bundle, surfaces=["claude_settings_json"])
-    second = settings_path.read_bytes()
-    assert first == second
-    assert b"TOKEN_A" not in first
-
-
-def test_apply_us_idempotent_claude_env(tmp_path: Path) -> None:
-    """Two strip-only calls produce byte-identical .claude/env."""
-    env_path = tmp_path / ".claude" / "env"
-    bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["TOKEN_A", "TOKEN_B"],
-    )
-    apply_user_secrets(bundle, surfaces=["claude_env"])
-    first = env_path.read_bytes()
-    apply_user_secrets(bundle, surfaces=["claude_env"])
-    second = env_path.read_bytes()
-    assert first == second
-
-
-def test_apply_us_atomic_no_tempfile_leak(tmp_path: Path) -> None:
-    """After a successful apply, no .tmp files remain in the target dir."""
-    bundle = _make_secret_bundle(
-        tmp_path, pairs=[], known=["KEY"],
-    )
-    apply_user_secrets(
-        bundle, surfaces=["claude_settings_json", "claude_env"],
-    )
-    stragglers = (
-        list((tmp_path / ".claude").glob("*.tmp"))
-        + list((tmp_path / ".claude").glob("*.tmp*"))
-    )
-    assert not stragglers, f"tempfile leak: {stragglers}"
-
-
-def test_apply_us_unknown_surface_raises(tmp_path: Path) -> None:
-    bundle = _make_secret_bundle(tmp_path, pairs=[], known=[])
-    with pytest.raises(ConfigProjectionError, match="unknown surface"):
-        apply_user_secrets(bundle, surfaces=["bogus"])
-
-
-def test_apply_us_vscode_surface_opt_in(tmp_path: Path) -> None:
-    """The .vscode/settings.json surface is opt-in via the ``surfaces``
-    arg — and the strip applies there too."""
-    vscode = tmp_path / ".vscode" / "settings.json"
-    vscode.parent.mkdir()
-    vscode.write_text(json.dumps({
-        "claude-code.env": {"KEY": "stale", "BY_HAND": "kept"},
-    }))
-
-    bundle = _make_secret_bundle(tmp_path, pairs=[], known=["KEY"])
-    # Default surfaces: vscode NOT included — file untouched.
-    apply_user_secrets(bundle)
-    assert json.loads(vscode.read_text())["claude-code.env"]["KEY"] == "stale"
-
-    # Explicit opt-in strips.
-    apply_user_secrets(bundle, surfaces=["vscode_settings_json"])
-    data = json.loads(vscode.read_text())
-    assert "KEY" not in data["claude-code.env"]
-    assert data["claude-code.env"]["BY_HAND"] == "kept"
-
-
-# ─── Combined apply_project_env(user_secret_bundle=...) ─────────────────
-
-
-def test_apply_project_env_with_user_secret_bundle_combined_strip(
-    tmp_path: Path,
-) -> None:
-    """The ``user_secret_bundle`` kwarg on apply_project_env applies the
-    canonical write + the user-secret STRIP in ONE pass per surface
-    (atomic per file). No values are ever emitted."""
-    settings_path = tmp_path / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {
-            "PAUSED_KEY": "should-be-stripped",
-            "OPENAI_API_BASE": "user-canonical-override-preserved",
-        },
-    }, indent=2))
-
-    bundle: dict = {
-        "canonical_env": {
-            "KG_COLLECTION": "TestKG",
-            "PROJECT_NAME": "Test",
-        },
-        "project_id": "test-id",
-        "project_root": tmp_path,
-    }
-    secret_bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["ACTIVE_TOKEN", "PAUSED_KEY"],
-    )
-
+def test_the_refresh_writes_no_user_secret_section_into_claude_env(tmp_path: Path) -> None:
+    """The ``.claude/env`` managed block the refresh writes carries canonical
+    exports ONLY — never a user-secret section, never a secret key."""
     apply_project_env(
-        bundle, surfaces=["claude_settings_json"],
-        user_secret_bundle=secret_bundle,
+        {"canonical_env": {"KG_COLLECTION": "TestKG"}, "project_id": "test-id",
+         "project_root": tmp_path, "user_secret_known_keys": ["GITHUB_TOKEN", "X_TOKEN"]},
+        surfaces=["claude_env"],
     )
-
-    data = json.loads(settings_path.read_text())
-    # Canonical key landed.
-    assert data["env"]["KG_COLLECTION"] == "TestKG"
-    # Every known user-secret key stripped / never written.
-    assert "PAUSED_KEY" not in data["env"]
-    assert "ACTIVE_TOKEN" not in data["env"]
-    # User-canonical override preserved.
-    assert data["env"]["OPENAI_API_BASE"] == "user-canonical-override-preserved"
-
-
-def test_apply_project_env_user_bundle_writes_no_user_secret_section(
-    tmp_path: Path,
-) -> None:
-    """Combined write to .claude/env carries canonical exports ONLY —
-    no user-secret section (the emit arm is retired)."""
-    bundle: dict = {
-        "canonical_env": {"KG_COLLECTION": "TestKG"},
-        "project_id": "test-id",
-        "project_root": tmp_path,
-    }
-    secret_bundle = _make_secret_bundle(
-        tmp_path,
-        pairs=[],
-        known=["GITHUB_TOKEN"],
-    )
-    apply_project_env(
-        bundle, surfaces=["claude_env"],
-        user_secret_bundle=secret_bundle,
-    )
-
     text = (tmp_path / ".claude" / "env").read_text()
     assert 'export KG_COLLECTION="TestKG"' in text
     assert "# user secrets" not in text
-    assert "GITHUB_TOKEN" not in text
+    assert "GITHUB_TOKEN" not in text and "X_TOKEN" not in text
     assert CLAUDE_ENV_MANAGED_END in text
 
 
@@ -735,135 +351,6 @@ def test_cli_user_secret_known_keys_plain(tmp_path: Path) -> None:
     assert result.returncode == 0
     lines = result.stdout.strip().splitlines()
     assert "MY_TOKEN" in lines
-
-
-def test_cli_apply_user_secrets_happy_path_strips_known(tmp_path: Path) -> None:
-    """``apply-user-secrets`` STRIPS every known key from the surfaces.
-
-    Full happy-path round-trip: build a DB with known-keys, pre-seed
-    the surfaces with stale values, invoke the CLI, verify the strip.
-    """
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "myproj"
-    proj.mkdir()
-    _make_launcher_db_with_secrets(
-        db, project_id="proj-1", project_folder=str(proj),
-        per_project_keys=["GITHUB_TOKEN", "PAUSED_KEY"],
-    )
-    settings_path = proj / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {"GITHUB_TOKEN": "ghp_stale", "KEEP_ME": "user-by-hand"},
-    }))
-
-    result = _run_cli(
-        "apply-user-secrets",
-        "--project-id", "proj-1",
-        "--db-path", str(db),
-        "--surfaces", "claude_settings_json,claude_env",
-    )
-    assert result.returncode == 0, result.stderr
-    out = json.loads(result.stdout)
-    assert out["ok"] is True
-
-    raw = settings_path.read_text()
-    settings = json.loads(raw)
-    assert "GITHUB_TOKEN" not in settings["env"]
-    assert "PAUSED_KEY" not in settings["env"]
-    assert "ghp_stale" not in raw
-    assert settings["env"]["KEEP_ME"] == "user-by-hand"
-
-    env_text = (proj / ".claude" / "env").read_text()
-    assert "GITHUB_TOKEN" not in env_text
-    assert "# user secrets" not in env_text
-
-
-def test_cli_apply_user_secrets_rejects_retired_pairs_json_flag(
-    tmp_path: Path,
-) -> None:
-    """The grep-gate's live-CLI twin: the retired ``--pairs-json`` flag
-    is REJECTED by the real argparse parser (a caller that still passes
-    it fails loudly rather than silently emitting values). Live-binary
-    regression per the argv-shape-tests-miss-parser-rejections lesson.
-    """
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db_with_secrets(
-        db, project_id="proj-1", project_folder=str(proj),
-    )
-    pairs_json = tmp_path / "pairs.json"
-    pairs_json.write_text(json.dumps([["KEY", "value"]]))
-
-    result = _run_cli(
-        "apply-user-secrets",
-        "--project-id", "proj-1",
-        "--db-path", str(db),
-        "--pairs-json", str(pairs_json),
-    )
-    assert result.returncode != 0
-    assert "unrecognized arguments" in result.stderr
-    # Nothing written.
-    assert not (proj / ".claude" / "settings.json").exists()
-
-
-def test_cli_apply_user_secrets_project_not_found_exits_2(tmp_path: Path) -> None:
-    """A non-existent project_id exits 2 with a JSON error envelope."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "p"
-    proj.mkdir()
-    _make_launcher_db_with_secrets(
-        db, project_id="real-proj", project_folder=str(proj),
-    )
-
-    result = _run_cli(
-        "apply-user-secrets",
-        "--project-id", "ghost-proj",
-        "--db-path", str(db),
-    )
-    assert result.returncode == 2
-    err = json.loads(result.stderr)
-    assert err["error"] == "project_not_found"
-
-
-def test_cli_apply_user_secrets_db_missing_exits_3(tmp_path: Path) -> None:
-    """A missing launcher DB exits 3 with a JSON error envelope."""
-    result = _run_cli(
-        "apply-user-secrets",
-        "--project-id", "any",
-        "--db-path", str(tmp_path / "no.db"),
-    )
-    assert result.returncode == 3
-    err = json.loads(result.stderr)
-    assert err["error"] == "db_unreachable"
-
-
-def test_cli_apply_user_secrets_purges_all_known(tmp_path: Path) -> None:
-    """The default invocation IS the purge workflow: every known key is
-    stripped from the surfaces (there is no other mode)."""
-    db = tmp_path / "launcher.db"
-    proj = tmp_path / "myproj"
-    proj.mkdir()
-    _make_launcher_db_with_secrets(
-        db, project_id="proj-1", project_folder=str(proj),
-        per_project_keys=["DROP_THIS"],
-    )
-    settings_path = proj / ".claude" / "settings.json"
-    settings_path.parent.mkdir()
-    settings_path.write_text(json.dumps({
-        "env": {"DROP_THIS": "stale"},
-    }))
-
-    result = _run_cli(
-        "apply-user-secrets",
-        "--project-id", "proj-1",
-        "--db-path", str(db),
-        "--surfaces", "claude_settings_json",
-    )
-    assert result.returncode == 0, result.stderr
-
-    data = json.loads(settings_path.read_text())
-    assert "DROP_THIS" not in data["env"]
 
 
 # ─── Grep-gate: the retired emit contract stays retired ─────────────────
@@ -928,7 +415,11 @@ def test_grep_gate_no_pairs_json_callers_tree_wide() -> None:
         "a non-empty emit set"
     )
     assert not verb_offenders, (
-        f"unexpected apply-user-secrets callers: {verb_offenders} — the verb "
-        "is strip-only and currently has no production spawner; a new caller "
-        "must be reviewed against the never-writes-values invariant"
+        f"the retired apply-user-secrets verb is referenced by: {verb_offenders} "
+        "— it was removed in v0.2.97 (superseded by the evidence-gated refresh "
+        "scrub); nothing may call it"
+    )
+    assert '"apply-user-secrets"' not in module_text, (
+        "the apply-user-secrets parser registration was retired in v0.2.97 "
+        "and must not return — a strip by NAME destroys a key the user typed"
     )

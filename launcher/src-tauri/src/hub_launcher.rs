@@ -84,8 +84,62 @@ pub fn find_hub_binary() -> Option<PathBuf> {
         );
         return None;
     };
+    find_hub_binary_with(&python, &HubLookup::from_process())
+}
 
-    let mut cmd = Command::new(&python);
+/// The inputs `vco_lib.hub_ensure resolve` reads its answer from — its
+/// CHILD environment: `$VCT_HUB_BIN` (step 1), `$PATH` (step 3) and the home
+/// directory (step 4, `~/.vct/bin`). `None` = unset in the child.
+///
+/// v0.2.97 review R6: this is the injection point. Production passes this
+/// process's values ([`HubLookup::from_process`]; `PATH` through
+/// `vct_launcher_core::paths::lookup_path`, the launcher's one lookup), so the
+/// child sees exactly what it always inherited. A test builds its own and
+/// never sets the PROCESS `PATH` / `HOME` / `VCT_HUB_BIN` — every concurrent
+/// test and every child another test spawns shares those.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct HubLookup {
+    pub hub_bin: Option<std::ffi::OsString>,
+    pub path: Option<std::ffi::OsString>,
+    pub home: Option<std::ffi::OsString>,
+}
+
+/// The variable the resolver reads the home directory from first
+/// (`find_dist_binary`: `USERPROFILE` on Windows, then `HOME`).
+const HOME_VAR: &str = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+
+impl HubLookup {
+    pub(crate) fn from_process() -> Self {
+        let home = std::env::var_os(HOME_VAR).or_else(|| std::env::var_os("HOME"));
+        Self {
+            hub_bin: std::env::var_os("VCT_HUB_BIN"),
+            path: vct_launcher_core::paths::lookup_path(),
+            home,
+        }
+    }
+
+    fn apply(&self, cmd: &mut Command) {
+        for (key, value) in [("VCT_HUB_BIN", &self.hub_bin), ("PATH", &self.path)] {
+            match value {
+                Some(v) => cmd.env(key, v),
+                None => cmd.env_remove(key),
+            };
+        }
+        match &self.home {
+            Some(home) => {
+                cmd.env(HOME_VAR, home);
+            }
+            None => {
+                cmd.env_remove(HOME_VAR).env_remove("HOME");
+            }
+        }
+    }
+}
+
+/// [`find_hub_binary`] with the interpreter and the lookup inputs given.
+pub(crate) fn find_hub_binary_with(python: &std::path::Path, lookup: &HubLookup) -> Option<PathBuf> {
+    let mut cmd = Command::new(python);
+    lookup.apply(&mut cmd);
     // `--no-repo-dist`: the launcher anchors step 2 on its OWN binary's
     // directory, NOT on the checkout's `launcher/dist/`. In a shipped install
     // those are the same directory; in a dev tree they are not, and letting a
@@ -274,13 +328,23 @@ fn running_hub_is_stale(
 /// is. See its docs for why the check cannot produce a false positive in
 /// production.
 fn launcher_install_dirs() -> Vec<PathBuf> {
-    if std::env::var_os("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY").is_some() {
+    install_dirs_for(
+        std::env::current_exe().ok().as_deref(),
+        std::env::var_os("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY").is_some(),
+    )
+}
+
+/// [`launcher_install_dirs`] over explicit inputs — the running binary and
+/// whether `$VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY` is set — so a test
+/// exercises the gate without setting the process env.
+fn install_dirs_for(exe: Option<&std::path::Path>, discovery_disabled: bool) -> Vec<PathBuf> {
+    if discovery_disabled {
         return Vec::new();
     }
-    let Ok(exe) = std::env::current_exe() else {
+    let Some(exe) = exe else {
         return Vec::new();
     };
-    if exe_is_test_harness(&exe) {
+    if exe_is_test_harness(exe) {
         return Vec::new();
     }
     let Some(parent) = exe.parent() else {
@@ -374,6 +438,13 @@ pub enum SpawnOutcome {
 /// returns Err — the launcher's setup must continue even if the hub
 /// can't start (see module docs for the "degraded mode" contract).
 pub fn ensure_hub_running() -> SpawnOutcome {
+    ensure_hub_running_with(find_hub_binary)
+}
+
+/// [`ensure_hub_running`] with the binary discovery given — production
+/// passes [`find_hub_binary`]; a test passes [`find_hub_binary_with`] over
+/// its own [`HubLookup`] rather than setting the process environment.
+fn ensure_hub_running_with(find: impl FnOnce() -> Option<PathBuf>) -> SpawnOutcome {
     // v0.2.54 Track C (C-7): honour the V52-AI update gate the same way
     // MCP servers do. During the update window the launcher explicitly
     // stops the hub (`ensure_hub_stopped_for_update`) so the binary can
@@ -397,7 +468,7 @@ pub fn ensure_hub_running() -> SpawnOutcome {
         return SpawnOutcome::SkippedUpdateInProgress;
     }
 
-    let Some(bin) = find_hub_binary() else {
+    let Some(bin) = find() else {
         tracing::warn!(
             "[vct] vct-hub binary not found on this machine; \
              launcher will run in hub-unavailable degraded mode. \
@@ -512,68 +583,39 @@ pub fn ensure_hub_running() -> SpawnOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
-    fn with_env<F: FnOnce()>(vars: &[(&str, Option<&str>)], f: F) {
-        let _g = SERIALIZE.lock().unwrap_or_else(|p| p.into_inner());
-        let saved: Vec<(String, Option<std::ffi::OsString>)> = vars
-            .iter()
-            .map(|(k, _)| (k.to_string(), std::env::var_os(k)))
-            .collect();
-        for (k, v) in vars {
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(k, val),
-                    None => std::env::remove_var(k),
-                }
-            }
-        }
-        f();
-        for (k, v) in saved {
-            unsafe {
-                match v {
-                    Some(val) => std::env::set_var(&k, val),
-                    None => std::env::remove_var(&k),
-                }
-            }
-        }
-    }
-
-    /// An ABSOLUTE python interpreter path, resolved from the REAL `$PATH`
-    /// before a test constrains it.
+    /// An ABSOLUTE python interpreter, from the real `$PATH`.
     ///
-    /// Needed because v0.2.92 (R20) made `find_hub_binary` delegate to
-    /// `vco_lib.hub_ensure`, which means `$PATH` now feeds TWO things: step 3
-    /// of the hub-discovery chain (what these tests want to control) and the
-    /// last-resort tier of interpreter discovery (what they must not break).
-    /// Pinning the interpreter through `$VCT_VENV` — tier 1 of the RT-4
-    /// ladder, ahead of `$PATH` — decouples them, so a test can still nuke
-    /// `$PATH` to isolate the chain.
+    /// v0.2.92 (R20) made hub discovery delegate to `vco_lib.hub_ensure`, so
+    /// `$PATH` feeds TWO things: step 3 of the discovery chain (what these
+    /// tests control, through [`HubLookup::path`] — the CHILD's PATH) and
+    /// interpreter discovery (what they must not break). Passing the
+    /// interpreter explicitly to [`find_hub_binary_with`] decouples them; no
+    /// test here sets the process `PATH`, `HOME` or `VCT_HUB_BIN` (v0.2.97
+    /// review R6).
     ///
     /// Panics if no interpreter exists: a machine that cannot run Python
     /// cannot run VCO at all (`install.py` IS the installer), so that is a
     /// broken environment to report loudly, not to skip over.
-    fn absolute_python_for_tests() -> String {
-        let names: &[&str] = if cfg!(windows) {
-            &["python.exe", "py.exe", "python3.exe"]
-        } else {
-            &["python3", "python"]
-        };
-        let path_env = std::env::var_os("PATH").expect("PATH must be set");
-        for dir in std::env::split_paths(&path_env) {
-            for name in names {
-                let candidate = dir.join(name);
-                if candidate.is_file() {
-                    return candidate.to_string_lossy().to_string();
-                }
-            }
+    fn absolute_python_for_tests() -> PathBuf {
+        let names: &[&str] = if cfg!(windows) { &["python", "py", "python3"] } else { &["python3", "python"] };
+        names
+            .iter()
+            .find_map(|name| vct_launcher_core::paths::which_on_path(name))
+            .expect(
+                "no python interpreter on PATH; hub discovery is delegated to \
+                 vco_lib.hub_ensure and cannot be exercised without one",
+            )
+    }
+
+    /// A lookup that finds nothing unless the test adds it: no override, an
+    /// empty PATH directory, a home with no `.vct/bin`.
+    fn clean_lookup() -> HubLookup {
+        HubLookup {
+            hub_bin: None,
+            path: Some("/nonexistent-dir".into()),
+            home: Some("/nonexistent-home".into()),
         }
-        panic!(
-            "no python interpreter on PATH; hub discovery is delegated to \
-             vco_lib.hub_ensure and cannot be exercised without one"
-        );
     }
 
     #[test]
@@ -586,60 +628,38 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-
-        let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", Some(exe.to_str().unwrap())),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                let found = find_hub_binary().expect("override resolves");
-                assert_eq!(found, exe);
-            },
-        );
+        let lookup = HubLookup { hub_bin: Some(exe.clone().into_os_string()), ..clean_lookup() };
+        let found = find_hub_binary_with(&absolute_python_for_tests(), &lookup).expect("override resolves");
+        assert_eq!(found, exe);
     }
 
     #[test]
     fn find_hub_binary_falls_through_when_override_is_not_executable() {
         let tmp = tempfile::tempdir().unwrap();
         let nonexec = tmp.path().join("does-not-exist");
-        let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", Some(nonexec.to_str().unwrap())),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                // v0.2.53: disable current_exe()-based discovery so the
-                // `target/debug/vct-hub` binary other cargo runs leave behind
-                // doesn't poison this test. Production never sets this var.
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                // No legitimate hub anywhere → None.
-                assert_eq!(find_hub_binary(), None);
-            },
-        );
+        // The install-folder anchors are off under the test harness
+        // (`exe_is_test_harness`), so a `target/debug/vct-hub` another cargo
+        // run left behind cannot poison this. No legitimate hub anywhere.
+        let lookup = HubLookup { hub_bin: Some(nonexec.into_os_string()), ..clean_lookup() };
+        assert_eq!(find_hub_binary_with(&absolute_python_for_tests(), &lookup), None);
     }
 
     #[test]
     fn find_hub_binary_returns_none_when_nothing_resolves() {
-        let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                assert_eq!(find_hub_binary(), None);
-            },
-        );
+        assert_eq!(find_hub_binary_with(&absolute_python_for_tests(), &clean_lookup()), None);
+    }
+
+    /// Production hands the child exactly this process's inputs — PATH
+    /// through the launcher's one lookup, so a thread-injected PATH reaches
+    /// the child too.
+    #[test]
+    fn the_production_lookup_is_this_process_and_the_injected_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let lookup = vct_launcher_core::paths::with_lookup_path(Some(dir.path().as_os_str()), HubLookup::from_process);
+        assert_eq!(lookup.path.as_deref(), Some(dir.path().as_os_str()));
+        assert_eq!(lookup.hub_bin, std::env::var_os("VCT_HUB_BIN"));
+        let unset = vct_launcher_core::paths::with_lookup_path(None, HubLookup::from_process);
+        assert_eq!(unset.path, None);
     }
 
     // ─── v0.2.92: the default-on test-harness gate ───────────────────────
@@ -704,42 +724,38 @@ mod tests {
     /// pre-v0.2.92 code returned `Some(target/debug/vct-hub)` here.
     #[test]
     fn launcher_install_dirs_are_empty_under_a_test_harness_without_the_env_gate() {
-        with_env(&[("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", None)], || {
-            assert!(
-                launcher_install_dirs().is_empty(),
-                "install-folder anchors must be OFF by default under cargo \
-                 test, not merely off when a test remembers to set the env var"
-            );
-        });
-    }
-
-    #[test]
-    fn launcher_install_dirs_respect_test_isolation_gate() {
-        // The helper must honour the test-isolation gate the same way the
-        // inlined steps 4+5 did (else cargo-test cross-talk poisons the
-        // "nothing resolves" tests).
-        with_env(
-            &[("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1"))],
-            || {
-                assert!(launcher_install_dirs().is_empty());
-            },
+        let exe = std::env::current_exe().expect("current_exe");
+        assert!(
+            install_dirs_for(Some(&exe), false).is_empty(),
+            "install-folder anchors must be OFF by default under cargo \
+             test, not merely off when a test remembers to set the env var"
         );
     }
 
     #[test]
+    fn launcher_install_dirs_respect_test_isolation_gate() {
+        // The gate turns the anchors off even for a shipped layout, which
+        // has them on without it.
+        let shipped = std::path::Path::new("/opt/vct/launcher/dist/linux-x64/vct-launcher");
+        assert_eq!(
+            install_dirs_for(Some(shipped), false),
+            vec![
+                PathBuf::from("/opt/vct/launcher/dist/linux-x64"),
+                PathBuf::from("/opt/vct/launcher/dist"),
+            ]
+        );
+        assert!(install_dirs_for(Some(shipped), true).is_empty());
+        assert!(install_dirs_for(None, false).is_empty(), "no running exe, no anchors");
+    }
+
+    #[test]
     fn ensure_hub_running_reports_binary_not_found_in_clean_env() {
+        // Scratch state dir: the update gate and the hub probe read it.
+        let _sd = vct_launcher_core::test_env::state_dir_guard();
         let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                assert_eq!(ensure_hub_running(), SpawnOutcome::BinaryNotFound);
-            },
+        assert_eq!(
+            ensure_hub_running_with(|| find_hub_binary_with(&py, &clean_lookup())),
+            SpawnOutcome::BinaryNotFound
         );
     }
 
@@ -748,9 +764,9 @@ mod tests {
     // ensure_hub_running BEFORE any binary discovery happens.
     #[test]
     fn ensure_hub_running_skips_when_update_in_progress() {
-        let tmp = tempfile::tempdir().unwrap();
+        let sd = vct_launcher_core::test_env::state_dir_guard();
         // Write a fresh lockfile into the isolated state dir.
-        let lock = tmp
+        let lock = sd
             .path()
             .join(crate::commands::update_gate::LOCKFILE_BASENAME);
         crate::commands::update_gate::write_lockfile_at(
@@ -760,20 +776,9 @@ mod tests {
         )
         .expect("lockfile write");
 
-        with_env(
-            &[
-                ("VCT_STATE_DIR", Some(tmp.path().to_str().unwrap())),
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-            ],
-            || {
-                assert_eq!(
-                    ensure_hub_running(),
-                    SpawnOutcome::SkippedUpdateInProgress
-                );
-            },
+        assert_eq!(
+            ensure_hub_running_with(|| panic!("discovery must not run while an update is in progress")),
+            SpawnOutcome::SkippedUpdateInProgress
         );
     }
 
@@ -781,8 +786,8 @@ mod tests {
     // it falls through to normal discovery (BinaryNotFound in this env).
     #[test]
     fn ensure_hub_running_ignores_stale_update_lockfile() {
-        let tmp = tempfile::tempdir().unwrap();
-        let lock = tmp
+        let sd = vct_launcher_core::test_env::state_dir_guard();
+        let lock = sd
             .path()
             .join(crate::commands::update_gate::LOCKFILE_BASENAME);
         let past = (chrono::Utc::now() - chrono::Duration::minutes(30))
@@ -796,18 +801,14 @@ mod tests {
         };
         std::fs::write(&lock, serde_json::to_string(&payload).unwrap()).unwrap();
 
-        with_env(
-            &[
-                ("VCT_STATE_DIR", Some(tmp.path().to_str().unwrap())),
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-            ],
-            || {
-                assert_eq!(ensure_hub_running(), SpawnOutcome::BinaryNotFound);
-            },
-        );
+        let py = absolute_python_for_tests();
+        let discovered = std::cell::Cell::new(false);
+        let outcome = ensure_hub_running_with(|| {
+            discovered.set(true);
+            find_hub_binary_with(&py, &clean_lookup())
+        });
+        assert!(discovered.get(), "a stale lockfile must not stop discovery");
+        assert_eq!(outcome, SpawnOutcome::BinaryNotFound);
     }
 
     /// Filename a test FIXTURE must use on this platform. Not a resolution
@@ -882,19 +883,8 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some(dir.to_str().unwrap())),
-                ("HOME", Some("/nonexistent-home")),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                assert_eq!(find_hub_binary(), Some(exe.clone()));
-            },
-        );
+        let lookup = HubLookup { path: Some(dir.into_os_string()), ..clean_lookup() };
+        assert_eq!(find_hub_binary_with(&absolute_python_for_tests(), &lookup), Some(exe));
     }
 
     // ── v0.2.63: running_hub_is_stale (drives the boot-time auto-restart) ─
@@ -947,18 +937,7 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
-        let py = absolute_python_for_tests();
-        with_env(
-            &[
-                ("VCT_HUB_BIN", None),
-                ("PATH", Some("/nonexistent-dir")),
-                ("HOME", Some(tmp.path().to_str().unwrap())),
-                ("VCT_HUB_DISABLE_CURRENT_EXE_DISCOVERY", Some("1")),
-                ("VCT_VENV", Some(&py)),
-            ],
-            || {
-                assert_eq!(find_hub_binary(), Some(exe.clone()));
-            },
-        );
+        let lookup = HubLookup { home: Some(tmp.path().as_os_str().to_owned()), ..clean_lookup() };
+        assert_eq!(find_hub_binary_with(&absolute_python_for_tests(), &lookup), Some(exe));
     }
 }

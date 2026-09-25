@@ -108,6 +108,7 @@ _VCO_LIB_PARENT = Path(__file__).resolve().parent.parent
 if str(_VCO_LIB_PARENT) not in sys.path:
     sys.path.insert(0, str(_VCO_LIB_PARENT))
 
+from vco_lib.child_process import last_json_object  # noqa: E402
 from vco_lib.embedding_service import (  # noqa: E402
     EmbeddingService,
     NoEmbeddingBackendError,
@@ -223,7 +224,7 @@ class CollectionNotFoundError(RuntimeError):
     ``vco_lib.weaviate_schema.migrate_collections_to_v0218_schema``)
     creates collections; enrichment never does. If you see this, the
     project's KG/code graph hasn't been seeded yet — run install.py's
-    seed step or the launcher's "Seed KG" action first.
+    seed step or the project page's "Re-sync KG" action first.
     """
 
 
@@ -529,8 +530,10 @@ def enrich_collection_vectors(
         raise CollectionNotFoundError(
             f"Collection {collection_name!r} not found on Weaviate at "
             f"{base_url}. The KG/code graph hasn't been seeded yet — run "
-            f"the launcher's 'Seed KG' or 'Rebuild code graph' action, or "
-            f"`python -m vco_lib.project_init seed-kg`, before enriching."
+            f"the project page's 'Re-sync KG' or 'Re-build code graph' "
+            f"action, or `.claude/scripts/kg-sync --all` / "
+            f"`.claude/scripts/code-graph-analyze .` in the project, before "
+            f"enriching."
         )
 
     # ── Pre-flight 3: slot must be in the LIVE schema ───────────────────
@@ -1311,7 +1314,7 @@ def enrich_collections_for_slot_change(
                     f"({(stdout or getattr(proc, 'stderr', '') or '').strip()[:200]})"
                 )
                 return False
-            report = _last_json_line(stdout)
+            report = last_json_object(stdout)
             if report is None:
                 log(f"    ! enrichment produced no report for {collection}")
                 return False
@@ -1332,27 +1335,6 @@ def enrich_collections_for_slot_change(
     if audit is not None:
         audit({"slot": target_slot, "collections": targets})
     return True
-
-
-def _last_json_line(stdout: str) -> "Optional[dict]":
-    """Last JSON object on stdout, or None.
-
-    The enrichment CLI's final report is its last line; with
-    ``--stream-progress`` it is preceded by progress lines (not used here, but
-    parsing the LAST line rather than the whole buffer keeps that contract
-    working if a caller ever turns it on).
-    """
-    for line in reversed((stdout or "").strip().splitlines()):
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        try:
-            parsed = json.loads(line)
-        except ValueError:
-            continue
-        if isinstance(parsed, dict):
-            return parsed
-    return None
 
 
 def _build_argparser() -> argparse.ArgumentParser:

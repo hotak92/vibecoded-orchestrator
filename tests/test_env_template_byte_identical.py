@@ -3,8 +3,8 @@
 """Byte-identical regression guard for ``vco_lib.env_template``.
 
 Unlike ``tests/test_config_projection_byte_identical.py`` (which pins
-Python output against the Rust ``write_project_env_files`` reference
-implementation), this file pins the Phase 0.D writer against its OWN
+Python output against the byte layout of the former Rust env writer,
+retired v0.2.97), this file pins the Phase 0.D writer against its OWN
 golden output. There is no pre-existing Rust reference for the
 block-replace marker contract — Phase 0.D is the SOURCE of truth for
 ``.env`` byte layout; the existing Rust ``ensure_project_env_template``

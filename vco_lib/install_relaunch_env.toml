@@ -1,0 +1,40 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# The environment keys of install.py's RELAUNCH RECORD (v0.2.97) — one
+# committed list both languages parse (tier B of the A>B>C rule).
+#
+# install.py sets these on the run it relaunches itself as (the venv relaunch,
+# the venv-rebuild handoff; `vco_lib/install_companions.py::mark_relaunch` /
+# `hand_off`). They describe THAT hop only. A process that merely inherited
+# them — a detached child (vct-updater -> the relaunched launcher -> its next
+# `install.py --update`), a terminal opened from such a launcher — must never
+# act on them: a stale RELAUNCHED skips the venv relaunch, a stale PARENT_WAITS
+# makes the parent-watch open whatever process now owns that pid.
+#
+# Readers:
+#   * Python — `vco_lib/install_companions.py` (`RELAUNCH_ENV_KEYS`):
+#     `scrub_install_relaunch_env` strips them from every long-lived child
+#     install.py starts, and `adopt_relaunch` drops them from a run its direct
+#     parent did not relaunch (the argv token does not match).
+#   * Rust — `launcher/src-tauri/src/commands/installer/relaunch_env.rs`
+#     (`include_str!`): `install_py_command` removes them from every
+#     install.py the launcher spawns.
+#
+# Tier (A), Rust asking Python for the list, was rejected: the launcher is the
+# repair tool and spawns install.py precisely when the Python side may be
+# broken, so building that command must not depend on running Python first.
+#
+# Adding a key: add it here and to the `ENV_*` constants in
+# install_companions.py in the same change — `tests/test_v0297_relaunch_env_scrub.py`
+# fails until both agree.
+
+format_version = 1
+
+keys = [
+    "VCT_INSTALL_RELAUNCHED",
+    "VCT_INSTALL_BASE_PYTHON",
+    "VCT_INSTALL_BASE_PYTHON_VERSION",
+    "VCT_INSTALL_PARENT_WAITS",
+    "VCT_INSTALL_RELAUNCH_TOKEN",
+]

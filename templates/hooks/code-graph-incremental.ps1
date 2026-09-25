@@ -4,7 +4,7 @@
 #   `Split-Path -Leaf` fallback), so the v0.2.23 W1 slug-vs-prefix
 #   resolver-field switch in the .sh has no corresponding change here.
 #   Marking the exemption explicitly so the OS-parity CI gate accepts
-#   the asymmetric modification. See knowledge/concepts/multi-codebase-code-graph-detection.md.
+#   the asymmetric modification.
 # parity-confirmation 2026-05-10: .sh sibling now uses _lib/find-python.sh; this .ps1 already used _lib/find-python.ps1 — true parity, no asymmetric fix.
 # Parity-touch 2026-05-08: bash shebang of sibling .sh switched from #!/bin/bash to #!/usr/bin/env bash for macOS portability. PS1 has no shebang to change; this comment is the parity-required modification.
 # Scrub sensitive env vars before any subprocess spawning
@@ -28,7 +28,8 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   own code-graph collections (auto-detected for sibling repos via
 #   detect-project.ps1). Writes do NOT consult VCT_CODE_GRAPH_ACCESS_LIST
 #   — that env var is read-side only (fan-out across peer codegraphs).
-#   No centralization needed. See knowledge/concepts/multi-source-kg-runtime.md.
+#   No centralization needed: writes always target the project's OWN
+#   collections; the access lists gate reads fanning out to peers only.
 
 # code-graph-incremental.ps1
 # Run incremental code graph analysis on a code file edit.

@@ -390,7 +390,7 @@ sudo netstat -tulpn | grep 8081
 netstat -ano | findstr :8081
 ```
 
-Stop whatever is using the port, or change `WEAVIATE_PORT` in `.env` and re-run `python install.py --update`.
+Stop whatever is using the port, or move VCO's Weaviate with `python -m vco_lib.service_endpoints move --service weaviate --port <free-port>` (the row is the source of truth since v0.2.97; every surface is re-projected by the move).
 
 **Container runtime not running**:
 
@@ -419,7 +419,7 @@ docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi   # verify Docker GP
 
 If the second command fails, install the NVIDIA Container Toolkit: <https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html>
 
-**Port 11435 in use**: same pattern as Weaviate — check with `lsof` / `netstat`, stop the conflicting process, or change `OLLAMA_PORT` in `.env`.
+**Port 11435 in use**: same pattern as Weaviate — check with `lsof` / `netstat`, stop the conflicting process, or move VCO's Ollama with `python -m vco_lib.service_endpoints move --service ollama --port <free-port>`.
 
 **Model pull fails**:
 
@@ -556,7 +556,7 @@ Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` gets `40
 Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <token>` where the token lives in `<vct_root_dir>/hub.token`. The token is **regenerated on every hub startup** — so any client that cached an old token will 401 after a `vct-hub --stop` + restart.
 
 - **Python clients** (`vco_lib.project_config`): auto-recover. The internal `_get_with_401_retry` wrapper catches a single 401, invalidates the 5-second discovery cache, re-reads `hub.token` + `hub.port` from disk, and re-issues the request. Subsequent 401s after the retry are surfaced as `HubUnreachable`. You don't need to do anything in calling code.
-- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, `vco` CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
+- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, the `vct-cli` launcher CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
 - **Custom bash / PowerShell scripts**: re-read `<vct_root_dir>/hub.token` per call (or per failure-and-retry). Don't cache the token across hub restarts. See `templates/scripts/vct_project_config.sh` and `templates/scripts/vct_project_config.ps1` for reference implementations of the discover-and-call pattern.
 - **`hub.token` missing**: the hub hasn't started, or `VCT_STATE_DIR` differs between the hub and your client. `vct-hub --status` first; if `not-running`, start it with `vct-hub --start-if-not-running`.
 
@@ -564,7 +564,7 @@ Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <toke
 
 The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/projects/{id}/config` — accept a **project-scoped** bearer (`hub.token.<project_id>`) in addition to the global `hub.token`. The hub mints one scoped token per registered project at startup (mode `0o600` on Unix; default same-user ACL on Windows), rotates them each start, and removes the file for a deleted project. The bundled resolvers already prefer the scoped token — they read `hub.token.<id>` first and fall back to `hub.token` when it is absent (a project added while the hub runs, or a pre-v0.2.76 hub). `VCT_HUB_TOKEN` (env) overrides both.
 
-- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`), or, only if the hub was started with `VCT_HUB_LEGACY_GLOBAL_ENV=1`, the global `hub.token` (the compat window is closed by default).
+- **`403 forbidden` with `"a token minted for project A cannot read project B"`**: you presented one project's scoped token on a DIFFERENT project's route. A scoped token never crosses the project boundary — use the token for the project in the URL (`hub.token.<that-id>`). The global `hub.token` is never accepted on these two routes (removed in v0.2.97).
 
   ```bash
   # POSIX: read a scoped token for the exact project in the URL
@@ -575,7 +575,7 @@ The two per-project routes — `GET /api/v1/projects/{id}/env` and `GET /api/v1/
   Get-Content "$env:VCT_STATE_DIR\hub.token.<project_id>" -Raw
   ```
 
-- **`403 forbidden` naming `VCT_HUB_LEGACY_GLOBAL_ENV`**: the global-token compat window is **closed by default** on these routes — the hub refuses the coarse global `hub.token` on `/env` + `/config`. Present the per-project token instead (the bundled resolvers do this automatically; the hub also lazy-mints a scoped token for a project added mid-session). If a bespoke caller genuinely cannot migrate yet, set `VCT_HUB_LEGACY_GLOBAL_ENV=1` (or `true`/`TRUE`/`yes`) on the **hub process** and restart it to re-open the window. **Unset, `0`, `false`, `no`, or any typo all DENY** (fail-closed). The escape hatch is scheduled for removal.
+- **`403 forbidden` naming the global `hub.token`**: the hub refuses the coarse global token on `/env` + `/config` — **unconditionally since v0.2.97 removed the `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in** (it existed from v0.2.77 to v0.2.96 as an escape hatch; a hub started with it still set logs one removal notice at startup). Present the per-project token instead (the bundled resolvers do this automatically; the hub also lazy-mints a scoped token for a project added mid-session).
 
 ### Boot autostart not firing
 

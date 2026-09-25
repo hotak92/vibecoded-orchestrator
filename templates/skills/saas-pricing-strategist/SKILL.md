@@ -4,7 +4,7 @@ description: Analyses a SaaS product's pricing page (current and competitor) and
 short_desc: pricing page redesign with tiers, value metric, rollout plan
 keywords: [SaaS pricing, pricing page, tier structure, value metric, pricing anchoring, annual discount, "SaaS metrics", "pricing strategy", "review pricing", "pricing tiers", "raise prices", "compare pricing", "competitor pricing", "pricing page redesign"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # SaaS Pricing Strategist (Opus)

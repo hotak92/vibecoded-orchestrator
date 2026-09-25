@@ -590,20 +590,16 @@ def _spawn(argv: Sequence[str], cwd: Optional[Path]) -> None:
     flashes. stdio goes to ``DEVNULL`` — a GUI writing into the hook's pipe
     would keep the SessionStart hook's stdout open after the hook returns.
     """
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        creationflags = 0x0000_0008 | 0x0800_0000
-    else:
-        start_new_session = True
+    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs
+
     subprocess.Popen(  # noqa: S603 — argv[0] is a resolved absolute path
         list(argv),
         cwd=str(cwd) if cwd else None,
+        env=detached_child_env(),  # the launcher outlives us: no relaunch record
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
-        start_new_session=start_new_session,
-        creationflags=creationflags,
+        **detached_popen_kwargs(),
     )
 
 

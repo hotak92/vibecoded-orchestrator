@@ -54,6 +54,7 @@
     preflightBusy,
     scheduleProceed,
   } from '$lib/components/install-preflight-gate';
+  import { notSwitchedReason } from '$lib/runtime-refusal';
 
   interface RuntimeAvailability {
     available: boolean;
@@ -66,9 +67,15 @@
     // carry that case so this modal stops telling a user to install a runtime
     // they already have.
     pinned?: string | null;
+    // R7b F5: `VCT_CONTAINER_RUNTIME`, or the absolute path of the install's
+    // `state/install/runtime.txt` record — the knob the remedy names.
+    pinned_via?: string | null;
     pinned_unusable?: boolean;
     pinned_installed?: boolean;
     alternative_usable?: string | null;
+    // R11 L6: why the install's stale runtime record was not switched to the
+    // other runtime — the wording every VCO surface shares.
+    not_switched?: string | null;
   }
 
   let {
@@ -117,7 +124,10 @@
   const runtimeInfo = $derived(current ?? availability ?? null);
   const pinnedUnusable = $derived(runtimeInfo?.pinned_unusable === true);
   const pinnedName = $derived(runtimeInfo?.pinned ?? null);
+  const pinnedVia = $derived(runtimeInfo?.pinned_via ?? 'VCT_CONTAINER_RUNTIME');
+  const pinnedByRecord = $derived(pinnedVia !== 'VCT_CONTAINER_RUNTIME');
   const altUsable = $derived(runtimeInfo?.alternative_usable ?? null);
+  const notSwitched = $derived(notSwitchedReason(runtimeInfo));
   // A pinned runtime that IS installed needs starting, not installing. Offering
   // an install link there is the "could not distinguish" defect in the UI.
   const installUrl = $derived(
@@ -215,9 +225,15 @@
     {#snippet body()}
       {#if pinnedUnusable}
         <p class="lead">
-          <code>VCT_CONTAINER_RUNTIME</code> pins VCO to
-          <strong>{pinnedName}</strong>, which is not usable right now
-          ({platformLabel}).
+          {#if pinnedByRecord}
+            The install recorded <strong>{pinnedName}</strong> as this machine's
+            container runtime (<code>{pinnedVia}</code>), and it is not usable
+            right now ({platformLabel}).
+          {:else}
+            <code>VCT_CONTAINER_RUNTIME</code> pins VCO to
+            <strong>{pinnedName}</strong>, which is not usable right now
+            ({platformLabel}).
+          {/if}
           {#if altUsable}
             <strong>{altUsable}</strong> is usable — but VCO will not drive it
             for you: the two runtimes keep <em>separate</em> named volumes, so
@@ -225,10 +241,26 @@
             rather than your knowledge graph.
           {/if}
         </p>
+        {#if notSwitched}
+          <p class="hint" data-testid="preflight-not-switched">
+            Why VCO kept the recorded runtime: {notSwitched}
+          </p>
+        {/if}
         <p class="hint">
-          Start {pinnedName}, or unset <code>VCT_CONTAINER_RUNTIME</code>{altUsable
-            ? ` / set it to ${altUsable}`
-            : ''}.
+          Start {pinnedName} and click "Detect again".
+          {#if altUsable}
+            To use {altUsable} instead: quit the launcher,
+            {#if pinnedByRecord}
+              set <code>VCT_CONTAINER_RUNTIME={altUsable}</code> in the environment
+              the launcher starts from (or write <code>{altUsable}</code> into
+              <code>{pinnedVia}</code>),
+            {:else}
+              unset <code>VCT_CONTAINER_RUNTIME</code> or set it to
+              <code>{altUsable}</code> in the environment the launcher starts from,
+            {/if}
+            then relaunch it — a running launcher keeps the environment it was
+            started with.
+          {/if}
         </p>
       {:else}
         <p class="lead">

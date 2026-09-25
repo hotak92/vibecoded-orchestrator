@@ -16,6 +16,7 @@
   // Docker is detected. Renders nothing when at least one runtime is
   // present, so the home page is unchanged in the happy-path case.
   import RuntimeMissingBanner from '$lib/components/RuntimeMissingBanner.svelte';
+  import SubscriptionUsageCard from '$lib/components/SubscriptionUsageCard.svelte';
   import { auth } from '$lib/stores/auth';
   import { orchestrator } from '$lib/stores/orchestrator';
   import { modules, installedIds } from '$lib/stores/modules';
@@ -313,6 +314,10 @@
            based on `system.has_podman` / `system.has_docker` in the
            orchestrator store. No-op when at least one runtime exists. -->
       <RuntimeMissingBanner />
+
+      <!-- v0.2.97: subscription usage windows from the model gateway.
+           Self-hides when the gateway is not running. -->
+      <SubscriptionUsageCard />
 
       <div class="content-header">
         <div>

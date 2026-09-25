@@ -40,7 +40,6 @@ from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_PORT = 7700
 _DEFAULT_TIMEOUT_S = 2.0
 
 # WP-R (2026-07-22): belt-and-braces hermeticity chokepoint. This module is the
@@ -117,21 +116,12 @@ def _vct_root_dir() -> Path:
 def _read_hub_port() -> int:
     """Resolve hub port: $VCT_HUB_PORT -> <vct_root>/hub.port -> default 7700.
 
-    Any read error falls through to the default. The hub-startup code
-    writes the file on every successful bind so the file presence and
-    its content reflect the actual listening port.
+    The ONE Python reader, ``vco_lib.hub_ensure.resolve_hub_port`` (v0.2.97;
+    this was a private copy). Silent, as this caller always was.
     """
-    env = os.environ.get("VCT_HUB_PORT")
-    if env:
-        try:
-            return int(env.strip())
-        except (ValueError, AttributeError):
-            pass
-    port_file = _vct_root_dir() / "hub.port"
-    try:
-        return int(port_file.read_text().strip())
-    except (OSError, ValueError):
-        return _DEFAULT_PORT
+    from vco_lib.hub_ensure import resolve_hub_port
+
+    return resolve_hub_port(_vct_root_dir())
 
 
 def _read_hub_token() -> str | None:

@@ -1,0 +1,146 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# Where user-installed command-line tools live when the CALLING PROCESS's PATH
+# does not include them — one committed list both languages parse (tier B of
+# the A>B>C rule).
+#
+# Why: a Finder/.desktop-launched launcher, a boot unit (systemd --user,
+# launchd) and the hub inherit a short PATH — macOS LaunchServices gives
+# `/usr/bin:/bin:/usr/sbin:/sbin`. v0.2.53 (M-P0-7 / L-P0-4) added the places a
+# login shell puts user tooling (Homebrew, cargo, pipx, Linuxbrew, snap,
+# flatpak) so the launcher sees what the user's terminal sees. v0.2.97 (review
+# R9 H1/H5) added the places the container runtimes live — rootless Docker in
+# ~/bin, the podman.io installer in /opt/podman/bin, Docker Desktop's bundle,
+# the Windows installers — because a process that judged "installed" by its
+# own PATH alone called such a runtime "not installed", and a runtime judged
+# not installed is exactly the one the record reconcile may switch away from,
+# onto the OTHER runtime's empty volumes.
+#
+# Readers (every one applies the SAME order rule, below):
+#   * Python — `vco_lib/tool_search_dirs.py`: `which()`, `run()`,
+#     `reachable_path()` (the PATH a shell needs to drive a runtime found
+#     through this table) and the `search-path` CLI the boot wrappers
+#     (`scripts/launch-claude-mcp-stack.{sh,ps1}`) call before they probe.
+#     `vco_lib.containers` / `vco_lib.runtime_reconcile` judge "installed"
+#     through it.
+#   * Rust — `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs`
+#     (`include_str!`): `augmented_path` — the launcher's startup PATH augment
+#     (`lib.rs::setup`) and the hub's (`vct-hub/src/main.rs`).
+#   * `tests/fixtures/tool_search_dirs_cases.json` pins the expansion AND the
+#     order rule on both sides.
+#
+# Entry: `{ dir = "...", placement = "..." }`.
+#   dir syntax (the same in both readers):
+#     "~/rest"         -> $HOME + "/rest"; dropped when HOME is unknown
+#     "${NAME}rest"    -> the value of env NAME + "rest"; dropped when NAME is
+#                         unset or empty
+#     anything else    -> taken literally
+#   placement — BOTH apply only to a directory MISSING from the caller's PATH;
+#   a directory already on it is never moved and never duplicated:
+#     "prepend-when-missing" — put AHEAD of the inherited PATH. Only for the
+#         v0.2.53 graphical-launch list: it reproduces the order a login shell
+#         builds (`brew shellenv`, rustup's env, ~/.profile PREPEND these), so
+#         a Finder launch runs Homebrew's `git` / `python3`, not the `/usr/bin`
+#         Xcode Command Line Tools stubs (which can pop the "install the
+#         command line tools" dialog, or run an old Python).
+#     "append" — put AFTER the inherited PATH: it only reaches names nothing
+#         on that PATH provides, and never shadows one. For the v0.2.97
+#         runtime locations.
+#
+# THE ORDER RULE (v0.2.97 R10 J3, split by placement). The looked-up PATH is
+#       [prepend-when-missing entries not on PATH, in table order]
+#     + [the caller's PATH, unchanged]
+#     + [append entries not on PATH, in table order]
+# and a name resolves to the first directory holding it. Python's `which`
+# searches exactly that list and the Rust augment SETS exactly that PATH, so a
+# name resolves to the same binary on every surface.
+#
+# `VCT_TOOL_SEARCH_DIRS`, when SET (even to ""), REPLACES the list for this OS:
+# entries separated by the OS path separator (":" / ";"), same dir syntax, all
+# placed "append" (an override adds reach; it never reorders a PATH). Empty =
+# no extra directories (the test suite's hermetic default).
+#
+# format_version 2 (v0.2.97 R10): entries became `{ dir, placement }` tables;
+# version 1 was a bare list of strings.
+
+format_version = 2
+
+[dirs]
+linux = [
+    # --- v0.2.53 graphical-launch list: prepended when missing (the order a
+    # login shell builds; a systemd --user / .desktop PATH has none of them).
+    # ~/.profile (Debian/Ubuntu; Fedora's ~/.bashrc) prepends ~/.local/bin.
+    { dir = "~/.local/bin", placement = "prepend-when-missing" },
+    # rustup's ~/.cargo/env prepends it.
+    { dir = "~/.cargo/bin", placement = "prepend-when-missing" },
+    # `brew shellenv` prepends it.
+    { dir = "/home/linuxbrew/.linuxbrew/bin", placement = "prepend-when-missing" },
+    # snap / flatpak export wrappers for installed apps (the v0.2.53 list,
+    # kept in its v0.2.53 placement by the R10 ruling).
+    { dir = "/snap/bin", placement = "prepend-when-missing" },
+    { dir = "/var/lib/flatpak/exports/bin", placement = "prepend-when-missing" },
+    # --- v0.2.97 runtime locations: appended when missing.
+    # Rootless Docker's install dir. On a login PATH only when the user's rc
+    # (or Debian's ~/.profile, if the directory exists at login) adds it;
+    # appended, so it reaches a docker nothing else provides and never
+    # shadows a system docker the inherited PATH already runs.
+    { dir = "~/bin", placement = "append" },
+    # Present in EVERY standard Linux PATH (systemd --user's minimal one
+    # included); missing only from a deliberately trimmed PATH, which it must
+    # not reorder.
+    { dir = "/usr/local/bin", placement = "append" },
+    # The system directory: on every standard PATH; appended only so a PATH
+    # that lacks it still reaches a distro-packaged runtime.
+    { dir = "/usr/bin", placement = "append" },
+]
+macos = [
+    # --- v0.2.53 graphical-launch list: prepended when missing. A Finder /
+    # launchd PATH is `/usr/bin:/bin:/usr/sbin:/sbin`; `brew shellenv`
+    # (Apple Silicon Homebrew) prepends these two, so a Finder launch must
+    # too, or `/usr/bin/git` / `/usr/bin/python3` — the Xcode CLT stubs — win.
+    { dir = "/opt/homebrew/bin", placement = "prepend-when-missing" },
+    { dir = "/opt/homebrew/sbin", placement = "prepend-when-missing" },
+    # rustup's ~/.cargo/env prepends it.
+    { dir = "~/.cargo/bin", placement = "prepend-when-missing" },
+    # pipx / user installs (the v0.2.53 list, kept in its v0.2.53 placement by
+    # the R10 ruling).
+    { dir = "~/.local/bin", placement = "prepend-when-missing" },
+    # --- v0.2.97 runtime locations: appended when missing.
+    # Rootless / user-local installs; not on a default login PATH (only a
+    # user's rc adds it).
+    { dir = "~/bin", placement = "append" },
+    # First line of /etc/paths, so every login shell already has it (ahead of
+    # /usr/bin); Intel Homebrew and Docker Desktop's symlinks live here. A
+    # Finder PATH lacks it: appended there, it reaches a runtime nothing else
+    # provides and never shadows an inherited entry. (Not in the v0.2.53
+    # list, so appending is no regression against it.)
+    { dir = "/usr/local/bin", placement = "append" },
+    # The podman.io .pkg installer registers it through /etc/paths.d, which
+    # path_helper APPENDS after /etc/paths — appending matches a login shell.
+    { dir = "/opt/podman/bin", placement = "append" },
+    # Docker Desktop's bundled CLI (system and per-user app locations); never
+    # on a login PATH by default (Docker Desktop symlinks into /usr/local/bin
+    # or ~/.docker/bin instead) — a last-resort reach.
+    { dir = "/Applications/Docker.app/Contents/Resources/bin", placement = "append" },
+    { dir = "~/Applications/Docker.app/Contents/Resources/bin", placement = "append" },
+    # Docker Desktop's "user" CLI location; on a login PATH only after the
+    # user adds it to their rc.
+    { dir = "~/.docker/bin", placement = "append" },
+    # MacPorts: its installer edits the user's shell profile; it is not on a
+    # default login PATH. Not in the v0.2.53 list — appended, so it never
+    # shadows Homebrew or an inherited entry.
+    { dir = "/opt/local/bin", placement = "append" },
+    # The system directory: on every PATH, Finder's included; appended only
+    # for a PATH that lacks it.
+    { dir = "/usr/bin", placement = "append" },
+]
+windows = [
+    # Windows had no augment before v0.2.97 (Explorer-launched apps inherit
+    # the registry PATH). Each installer writes its directory to the machine
+    # or user PATH, so it is normally present already; appended for a
+    # Scheduled Task or service started with a different PATH.
+    { dir = "${ProgramFiles}\\Docker\\Docker\\resources\\bin", placement = "append" },
+    { dir = "${ProgramFiles}\\RedHat\\Podman", placement = "append" },
+    { dir = "${LOCALAPPDATA}\\Programs\\Podman", placement = "append" },
+]

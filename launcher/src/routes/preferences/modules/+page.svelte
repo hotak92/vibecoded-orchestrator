@@ -16,6 +16,9 @@
   import { goto } from '$app/navigation';
   import Toast from '$lib/components/Toast.svelte';
   import GlobalModuleTogglesPanel from '$lib/components/GlobalModuleTogglesPanel.svelte';
+  // v0.2.97: the bundled core modules' manifest `settings` (machine-wide
+  // and per-project), editable — see CoreModuleSettingsPanel.svelte.
+  import CoreModuleSettingsPanel from '$lib/components/CoreModuleSettingsPanel.svelte';
 </script>
 
 <svelte:head>
@@ -30,6 +33,7 @@
 
   <main class="mod-main">
     <GlobalModuleTogglesPanel />
+    <CoreModuleSettingsPanel />
   </main>
 </div>
 

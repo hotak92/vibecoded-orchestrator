@@ -1,4 +1,5 @@
-//! Hub HTTP server — starts alongside Tauri on port 7700.
+//! Hub HTTP server — the vct-hub binary's API, on port 7700 unless configured
+//! (see `resolve_bind_port`).
 //!
 //! The server runs in a background tokio task. It exposes a REST API
 //! that any local app/service can call to register, send messages,
@@ -23,17 +24,101 @@ use super::{
     project_state_api, project_tokens, rl_events_api, secrets_api, weaviate_probe,
 };
 
-const DEFAULT_PORT: u16 = 7700;
+/// The one default, shared with every Rust reader of `hub.port`.
+const DEFAULT_PORT: u16 = vct_launcher_core::services::hub_port::DEFAULT_HUB_PORT;
+
+/// The module whose GLOBAL setting [`HUB_PORT_KEY`] configures the port the
+/// hub binds — `launcher/bundled_manifests/vct-hub-api.json` declares it.
+pub(crate) const HUB_MODULE_ID: &str = "vct-hub-api";
+/// The setting key — the SAME name as the env var that overrides it, so the
+/// manifest names the one knob there is.
+pub(crate) const HUB_PORT_KEY: &str = vct_launcher_core::services::hub_port::HUB_PORT_ENV;
+
+/// The port the hub binds, in precedence order:
+///
+/// 1. `VCT_HUB_PORT` in the hub process's own environment — the explicit
+///    override (scripts, tests, a user's shell); any value that parses as a
+///    port wins, as it always has;
+/// 2. the `vct-hub-api` module's GLOBAL `VCT_HUB_PORT` setting (launcher.db,
+///    `project_id IS NULL` — one hub per machine, so never a project's row),
+///    when it is a whole number in 1024..=65535 (the manifest's bounds);
+///    anything else is ignored with a warning;
+/// 3. 7700.
+///
+/// Chicken-and-egg, and why it does not bite: the hub cannot be ASKED for
+/// its own port, so it reads the setting from launcher.db (a file) before it
+/// binds. Clients never read the setting — they find the running hub through
+/// `<vct root>/hub.port`, which the hub writes after binding (and a client
+/// whose own environment pins `VCT_HUB_PORT` uses that, as it always did).
+/// The hub reads the setting itself rather than each spawner (launcher,
+/// hooks, boot units) passing it in, so the port never depends on who
+/// started it.
+fn resolve_bind_port(env_value: Option<&str>, setting: Option<&serde_json::Value>) -> u16 {
+    // The ONE hub-port value rule (`services::hub_port::parse_hub_port`, the
+    // shared table `tests/fixtures/hub_port_cases.json`): no sign (`+7822`),
+    // no `0`, no `_`, no non-ASCII numerals, no internal whitespace.
+    let parse = vct_launcher_core::services::hub_port::parse_hub_port;
+    if let Some(port) = env_value.and_then(parse) {
+        return port;
+    }
+    let Some(value) = setting else {
+        return DEFAULT_PORT;
+    };
+    let parsed = match value {
+        serde_json::Value::Number(n) => n.as_u64(),
+        serde_json::Value::String(s) => parse(s).map(u64::from),
+        _ => None,
+    };
+    match parsed {
+        Some(p) if (1024..=65535).contains(&p) => p as u16,
+        _ => {
+            tracing::warn!(
+                "[vct-hub] ignoring the {HUB_MODULE_ID} {HUB_PORT_KEY} setting {value} — \
+                 not a port in 1024..=65535; binding the default {DEFAULT_PORT}"
+            );
+            DEFAULT_PORT
+        }
+    }
+}
+
+/// [`resolve_bind_port`] over this process's environment and `launcher_db`.
+/// An unreadable setting row is logged and treated as unset.
+fn bind_port(launcher_db: &vct_launcher_core::db::Db) -> u16 {
+    let setting = launcher_db
+        .get_global_setting(HUB_MODULE_ID, HUB_PORT_KEY)
+        .unwrap_or_else(|e| {
+            tracing::warn!("[vct-hub] cannot read the hub port setting ({e}); treating it as unset");
+            None
+        });
+    resolve_bind_port(std::env::var(HUB_PORT_KEY).ok().as_deref(), setting.as_ref())
+}
 
 /// Start the Hub API server on a background task.
 /// Returns the port it's listening on.
 pub async fn start_hub_server() -> Result<u16, String> {
-    let port = std::env::var("VCT_HUB_PORT")
-        .ok()
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(DEFAULT_PORT);
+    // v0.2.97 (owner ruling 2026-09-24): VCT_HUB_LEGACY_GLOBAL_ENV was
+    // removed — one clear startup line when it is still set, never a
+    // silent accept or a silent ignore.
+    auth::warn_removed_legacy_global_env();
 
     let database = db::open_db().map_err(|e| format!("Failed to open hub database: {}", e))?;
+
+    // v0.2.97: the bundled core-module manifests are materialized here (and at
+    // launcher start) — the documented "copied to ~/.vct/bundled_manifests/"
+    // that nothing did, so `/env` never saw a bundled module's settings.
+    // Soft-fail: every file is attempted; a failed one keeps its previous copy
+    // and all failures are logged together in one warning.
+    let vct_root = vct_launcher_core::paths::vct_root_dir();
+    let sync = vct_launcher_core::bundled_manifests::sync_bundled_manifests(&vct_root);
+    if !sync.written.is_empty() {
+        tracing::info!("[vct-hub] bundled manifests refreshed: {}", sync.written.join(", "));
+    }
+    if !sync.reaped.is_empty() {
+        tracing::info!("[vct-hub] removed orphaned bundled-manifest temp files: {}", sync.reaped.join(", "));
+    }
+    if let Some(warning) = sync.warning() {
+        tracing::warn!("[vct-hub] could not materialize bundled manifests: {}", warning);
+    }
 
     // Open a second connection to launcher.db for the module/project routes.
     // WAL mode lets this coexist with the Tauri-side Db handle.
@@ -54,8 +139,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // still boots and the rest of the routes serve normally.
     match vct_launcher_core::db::Db::open() {
         Ok(probe_db) => {
-            let local_config = vct_launcher_core::config::LocalConfig::load();
-            weaviate_probe::spawn_startup_probe(probe_db, &local_config);
+            weaviate_probe::spawn_startup_probe(probe_db);
         }
         Err(e) => {
             tracing::warn!(
@@ -83,6 +167,7 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // hub-consuming module is installed), never the bind-first
     // sequencing.
     let bind_ip = resolve_hub_bind_ip(&launcher_state.0);
+    let port = bind_port(&launcher_state.0);
     let addr = SocketAddr::from((bind_ip, port));
     let listener = try_bind(addr, 5).await?;
     let actual_port = listener.local_addr().unwrap().port();
@@ -344,6 +429,12 @@ pub async fn start_hub_server() -> Result<u16, String> {
     // point rather than a second copy of the start logic.
     gateway_watchdog::spawn_gateway_watchdog(launcher_state.clone());
 
+    // v0.2.97 (lane V): poll every active module's `runtime.health_check`
+    // (loopback only, bounded, one task per probe) so the module tiles can
+    // show up / down / unknown. Results are served on /modules/catalog and
+    // /modules/{id}/status. `VCT_HUB_MODULE_HEALTH=0` disables it.
+    super::module_health::spawn_module_health_poller(launcher_state.clone());
+
     // E-2: log the ACTUAL bind host, not a hardcoded "127.0.0.1" (the prior
     // string drifted from the real 0.0.0.0 bind). Loopback is always reachable
     // as 127.0.0.1 regardless of the bind IP, so print that for the all-
@@ -545,33 +636,32 @@ fn resolve_hub_bind_ip(db: &vct_launcher_core::db::Db) -> std::net::Ipv4Addr {
     ip
 }
 
-async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::TcpListener, String> {
-    for offset in 0..=retries {
-        let addr = SocketAddr::from((base_addr.ip(), base_addr.port() + offset));
-        match tokio::net::TcpListener::bind(addr).await {
-            Ok(listener) => return Ok(listener),
-            Err(_) if offset < retries => continue,
-            Err(e) => return Err(format!(
-                "Cannot bind to ports {}-{}: {}",
-                base_addr.port(),
-                base_addr.port() + retries,
-                e
-            )),
-        }
-    }
-    unreachable!()
+/// The ports the bind ladder tries: `base`, then up to `retries` more, never
+/// past 65535 (v0.2.97 R7b F10: `base + offset` overflowed `u16` — a panic in
+/// a debug build, a wrap to a low port in release, which the hub would then
+/// have written to `hub.port`). Pure.
+fn bind_ladder(base: u16, retries: u16) -> Vec<u16> {
+    (0..=retries).map_while(|offset| base.checked_add(offset)).collect()
 }
 
-/// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
-///
-/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
-/// A plain truncating write can be observed mid-write (empty / partial) by a
-/// concurrent reader (`module_service::hub_port_for_proxy`,
-/// `module_supervisor::resolve_hub_base_port`) whose `parse::<u16>()` then
-/// fails → wrong VCT_HUB_BASE_URL / a failed readiness probe on a healthy hub.
-/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
-/// semantics, so a reader sees either the old value or the new one, never a
-/// torn one.
+async fn try_bind(base_addr: SocketAddr, retries: u16) -> Result<tokio::net::TcpListener, String> {
+    let ports = bind_ladder(base_addr.port(), retries);
+    let last = ports.last().copied().unwrap_or(base_addr.port());
+    let mut last_err = None;
+    for port in ports {
+        match tokio::net::TcpListener::bind(SocketAddr::from((base_addr.ip(), port))).await {
+            Ok(listener) => return Ok(listener),
+            Err(e) => last_err = Some(e),
+        }
+    }
+    Err(format!(
+        "Cannot bind to ports {}-{}: {}",
+        base_addr.port(),
+        last,
+        last_err.map(|e| e.to_string()).unwrap_or_else(|| "no port tried".into())
+    ))
+}
+
 /// Discovery file recording the hub's ACTUAL bind IP (v0.2.75 P1a).
 /// Sibling of `hub.port`. Readers: the launcher's module-start widen
 /// check (`module_service::widen_restart_action`) and the supervisor's
@@ -595,8 +685,20 @@ async fn write_bind_file(bind_ip: std::net::Ipv4Addr) {
     }
 }
 
+/// Write port to `<VCT_STATE_DIR or ~/.vct>/hub.port` so apps can discover the hub.
+///
+/// v0.2.61 (Option H C-PORT): write atomically via a temp file + rename.
+/// A plain truncating write can be observed mid-write (empty / partial) by a
+/// concurrent reader (`module_service::hub_port_for_proxy`,
+/// `vct_launcher_core::services::hub_port::resolve_hub_port`, which the
+/// supervisor and the manifest placeholder `{hub_port}` both use) whose
+/// `parse::<u16>()` then fails → wrong VCT_HUB_BASE_URL / a failed readiness
+/// probe on a healthy hub.
+/// A same-directory rename is atomic on POSIX and on Windows ReplaceFile
+/// semantics, so a reader sees either the old value or the new one, never a
+/// torn one.
 async fn write_port_file(port: u16) {
-    let path = vct_launcher_core::paths::vct_root_dir().join("hub.port");
+    let path = vct_launcher_core::services::hub_port::hub_port_file();
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.ok();
@@ -618,6 +720,115 @@ async fn write_port_file(port: u16) {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    // ── v0.2.97 R7b F10: the bind ladder stops at 65535 ──────────────
+
+    #[test]
+    fn bind_ladder_never_steps_past_the_last_port() {
+        assert_eq!(bind_ladder(7700, 5), vec![7700, 7701, 7702, 7703, 7704, 7705]);
+        assert_eq!(bind_ladder(65534, 5), vec![65534, 65535]);
+        assert_eq!(bind_ladder(65535, 5), vec![65535]);
+    }
+
+    // ── v0.2.97 review R6: the hub port setting is a real knob ───────
+
+    #[test]
+    fn bind_port_env_override_wins_over_the_setting() {
+        let setting = serde_json::json!(8800);
+        assert_eq!(resolve_bind_port(Some("9"), Some(&setting)), 9);
+        assert_eq!(resolve_bind_port(Some(" 7711 "), None), 7711);
+    }
+
+    #[test]
+    fn bind_port_uses_the_setting_when_the_env_is_absent_or_not_a_port() {
+        let number = serde_json::json!(8800);
+        let text = serde_json::json!("8801");
+        assert_eq!(resolve_bind_port(None, Some(&number)), 8800);
+        assert_eq!(resolve_bind_port(None, Some(&text)), 8801);
+        assert_eq!(resolve_bind_port(Some("not-a-port"), Some(&number)), 8800);
+    }
+
+    /// R7b F9 / review round 7: the hub's own bind-port parse is the one
+    /// hub-port value rule. Runs the env rows of the shared table
+    /// `tests/fixtures/hub_port_cases.json`: a valid `VCT_HUB_PORT` is bound,
+    /// an invalid one (`+7822`, `0`, `7_700`, non-ASCII numerals, `78 11`)
+    /// falls through — for the hub to its setting, else the default (the hub
+    /// never reads `hub.port`: it WRITES it). Red when the env is parsed with
+    /// `str::parse::<u16>`, which accepts `+7822` and `0`.
+    #[test]
+    fn bind_port_env_follows_the_shared_hub_port_table() {
+        let table: serde_json::Value =
+            serde_json::from_str(include_str!("../../../../tests/fixtures/hub_port_cases.json")).unwrap();
+        let setting = serde_json::json!(8800);
+        let mut checked = 0;
+        for case in table["cases"].as_array().unwrap() {
+            let Some(env) = case["env_port"].as_str() else { continue };
+            let name = case["name"].as_str().unwrap();
+            // The client ladder used the env pin iff its answer is not what
+            // the file alone gives (every row's env and file ports differ).
+            let from_file = case["expect_file"].as_u64().unwrap_or(u64::from(DEFAULT_PORT));
+            let expect = case["expect"].as_u64().unwrap();
+            let env_port = (expect != from_file).then_some(expect as u16);
+            assert_eq!(resolve_bind_port(Some(env), None), env_port.unwrap_or(DEFAULT_PORT), "case `{name}`");
+            assert_eq!(
+                resolve_bind_port(Some(env), Some(&setting)),
+                env_port.unwrap_or(8800),
+                "case `{name}` + setting"
+            );
+            checked += 1;
+        }
+        assert!(checked >= 8, "the table's env rows ran ({checked})");
+        for bad in ["+7822", "0", "7_700", "78 11"] {
+            assert_eq!(resolve_bind_port(Some(bad), None), DEFAULT_PORT, "{bad:?}");
+        }
+        // A string setting follows the same rule (and the 1024 floor).
+        for bad in ["+8800", "8_800", "88 00", "0"] {
+            assert_eq!(resolve_bind_port(None, Some(&serde_json::json!(bad))), DEFAULT_PORT, "{bad:?}");
+        }
+        assert_eq!(resolve_bind_port(None, Some(&serde_json::json!(" 8801\n"))), 8801);
+    }
+
+    #[test]
+    fn bind_port_defaults_without_a_usable_setting() {
+        assert_eq!(resolve_bind_port(None, None), DEFAULT_PORT);
+        for bad in [
+            serde_json::json!(80),
+            serde_json::json!(70000),
+            serde_json::json!(-1),
+            serde_json::json!(8800.5),
+            serde_json::json!("eighty"),
+            serde_json::json!(true),
+        ] {
+            assert_eq!(resolve_bind_port(None, Some(&bad)), DEFAULT_PORT, "{bad}");
+        }
+    }
+
+    /// The setting the hub reads is the one its bundled manifest declares,
+    /// stored as a GLOBAL row — a project's row is not the hub's port.
+    #[test]
+    fn bind_port_reads_the_global_row_the_manifest_declares() {
+        let manifest: serde_json::Value =
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-hub-api.json")).unwrap();
+        assert_eq!(manifest["id"], HUB_MODULE_ID);
+        let keys: Vec<&str> = manifest["settings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|s| s["key"].as_str())
+            .collect();
+        assert_eq!(keys, [HUB_PORT_KEY], "the manifest declares exactly the key the hub reads");
+        assert_eq!(manifest["settings"][0]["default"], serde_json::json!(DEFAULT_PORT));
+
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        assert_eq!(db.get_global_setting(HUB_MODULE_ID, HUB_PORT_KEY).unwrap(), None);
+        db.set_global_setting(HUB_MODULE_ID, HUB_PORT_KEY, &serde_json::json!(8802)).unwrap();
+        let setting = db.get_global_setting(HUB_MODULE_ID, HUB_PORT_KEY).unwrap();
+        assert_eq!(resolve_bind_port(None, setting.as_ref()), 8802);
+        // Rewriting replaces the one global row.
+        db.set_global_setting(HUB_MODULE_ID, HUB_PORT_KEY, &serde_json::json!(8803)).unwrap();
+        let setting = db.get_global_setting(HUB_MODULE_ID, HUB_PORT_KEY).unwrap();
+        assert_eq!(resolve_bind_port(None, setting.as_ref()), 8803);
+    }
 
     // ── v0.2.75 P1a: bind decision matrix ─────────────────────────────
 

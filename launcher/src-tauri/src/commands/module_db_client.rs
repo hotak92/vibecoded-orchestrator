@@ -49,14 +49,10 @@ const HUB_READ_TIMEOUT_SECS: u64 = 5;
 /// millisecond. 60 s is generous; tokens have a 1-hour TTL on issue.
 const TOKEN_REFRESH_MARGIN_MS: i64 = 60_000;
 
-/// Read the hub.port file. Same pattern as `commands::hub_proxy::hub_port`.
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path)
-        .map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
 /// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
@@ -204,10 +200,7 @@ async fn module_db_read_row_with_fields_inner(
         }
     }
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HUB_READ_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(HUB_READ_TIMEOUT_SECS))?;
 
     let resp = client
         .get(&url)

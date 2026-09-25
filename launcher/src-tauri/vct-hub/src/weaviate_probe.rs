@@ -28,7 +28,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use vct_launcher_core::config::LocalConfig;
 use vct_launcher_core::db::Db;
 
 /// Side-car file the probe writes after sweeping. Consumed (in v0.2.22+)
@@ -133,7 +132,7 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
 
     // 3. Probe each class via HEAD /v1/schema/{class}. Weaviate
     // returns 200 if the class exists, 404 if not.
-    let client = reqwest::Client::builder()
+    let client = vct_launcher_core::services::loopback_http::builder_for(weaviate_url)
         .timeout(Duration::from_secs(2))
         // A DISCRETE connect timeout, matching the sibling probe
         // (`weaviate_schema_probe.rs`, which gained one in v0.2.75 and
@@ -214,8 +213,9 @@ pub async fn probe_class_existence(db: &Db, weaviate_url: &str) -> Option<ProbeS
             missing = missing_count,
             probed = summary.probed_count,
             "[vct-hub] weaviate_probe: expected Weaviate classes are MISSING. \
-             Run `python -m vco_lib.weaviate_schema bootstrap-collections` (or click \
-             'Update Bundle' in the launcher GUI) to create them."
+             Run `python -m vco_lib.project_init bootstrap-collections --name \
+             <project>` for each affected project (or click 'Update Bundle' in \
+             the launcher GUI) to create them."
         );
     } else if summary.probed_count > 0 {
         tracing::info!(
@@ -275,11 +275,15 @@ fn append_summary_sidecar(summary: &ProbeSummary) -> Result<(), String> {
     Ok(())
 }
 
-/// Convenience entry point used by `start_hub_server`. Builds the
-/// weaviate_url from LocalConfig, kicks off the probe in a detached
+/// Convenience entry point used by `start_hub_server`. Probes the Weaviate
+/// the hub's `/config` serves — the ONE machine resolution
+/// (`service_endpoints::machine_weaviate_url`, v0.2.97 lane W; this read
+/// `LocalConfig` alone and so probed a different instance than `/config`
+/// named on a machine with an adopted or moved Weaviate) — in a detached
 /// task so server startup never blocks on Weaviate's response time.
-pub fn spawn_startup_probe(db_handle: Db, local_config: &LocalConfig) {
-    let weaviate_url = local_config.weaviate_url.clone();
+pub fn spawn_startup_probe(db_handle: Db) {
+    let weaviate_url =
+        vct_launcher_core::services::service_endpoints::machine_weaviate_url(&db_handle);
     tokio::spawn(async move {
         let _ = probe_class_existence(&db_handle, &weaviate_url).await;
     });

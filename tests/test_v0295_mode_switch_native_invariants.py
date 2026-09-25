@@ -37,7 +37,7 @@ comment must never satisfy a check about what gets WRITTEN):
 5. ``remote-control`` twice is idempotent and loses nothing.
 
 Not duplicated from ``tests/test_vscode_settings_mode_switch.py``: the stash
-mechanics, the JSONC refusal, the vendor-Default rule and the exact round
+mechanics, JSONC handling, the vendor-Default rule and the exact round
 trip live there and are not re-asserted here. This file is about the
 NATIVE-mode guarantee, which that file never states.
 

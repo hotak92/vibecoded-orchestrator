@@ -7,6 +7,621 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.97] - 2026-09-25
+
+### Fixed — on Windows, a failed update was reported as a success (v0.2.97)
+
+- `install.py` re-runs itself under the project's virtual environment. It did
+  so with `os.execve`, which on Linux and macOS *replaces* the process. On
+  Windows it does not: Python starts a new process and the original one exits
+  at once with code 0. Because a Windows venv's `python.exe` is a copy rather
+  than a link, the re-run happened on every launcher-driven update since
+  v0.2.45 — so the launcher, `install.ps1` and `first-install.bat` all saw
+  "success" immediately, whatever the update actually did. A failed update
+  cleared the previous failure, and the binary refresh and hub restart went
+  ahead on top of it.
+- On Windows the original process now waits for the re-run and exits with its
+  real exit code. Linux and macOS still use `execve`. If the launcher cancels
+  an install, the re-run notices that its waiting parent is gone and stops,
+  exactly as it would on Linux; services the install started (hub, updater,
+  code-graph analyzer) keep running.
+
+### Fixed — updates ran under the system Python on Linux and macOS (v0.2.97)
+
+- The same re-run was silently skipped on Linux and macOS: the check for "am I
+  already in the venv?" compared the two interpreters' resolved paths, and a
+  venv's `python` is a symlink to the system one, so the answer was always
+  "yes". GUI updates therefore ran on the system interpreter, and any step
+  that needed a venv-only package failed into a log line nobody saw. The most
+  visible casualty: the one-time removal of a leftover `ANTHROPIC_MODEL` pin
+  from VS Code's settings (shipped in v0.2.95) never ran on a Linux or macOS
+  machine updated from the launcher, so that pin kept overriding the model you
+  picked in Claude Code.
+- The check now asks whether this process *is* the venv. The pin removal runs
+  after the venv exists, in the venv, on every install and update (not on
+  `--uninstall`), and a failure now appears in `UPDATE_DEFERRED.md` instead of
+  a log.
+- `install.py --lightweight --rebuild-venv` always rebuilds (the flag applies
+  to the lightweight path, as its help says), the Python-version drift check
+  compares against the interpreter that launched the install, and a rebuild
+  never deletes the environment it is running from.
+
+### Fixed — settings files VCO could not parse were overwritten (v0.2.97)
+
+- Several writers of `.claude/settings.json` replaced a file they could not
+  parse with a new one containing only their own keys, deleting everything
+  else in it. One comment in the file was enough. The worst of these ran
+  unattended every 24 hours for every project with an installed module.
+- VCO now never overwrites a settings file it cannot read. The write is
+  refused, the file is left byte-for-byte as it was, and an entry in
+  `UPDATE_DEFERRED.md` names the file and what to fix. `~/.claude.json` was
+  never affected.
+- Settings files with comments (JSONC — VS Code's own format) are now read and
+  edited in place everywhere VCO touches them, keeping every comment and line
+  ending: VS Code's user settings, `.claude/settings.json`, the Hooks tab,
+  env projection, bundle updates, and the verify commands.
+
+### Fixed — a bundle update turned disabled hooks back on (v0.2.97)
+
+- Disabling a hook in the launcher's Hooks tab removes it from
+  `.claude/settings.json`; the next bundle update added it back while the tab
+  still showed it as disabled. Updates now leave hooks you disabled out, on
+  every update path, including the CLI with the launcher closed. The choice
+  is kept on the machine where you made it; it does not travel with a copied
+  project. A project that was already affected gets an entry naming each hook
+  and the two ways to settle it.
+- A registration of a hook shipped under several matchers is re-added if it
+  goes missing.
+
+### Fixed — moving or renaming a project never updated its env files (v0.2.97)
+
+- Project move and collection rename called the env re-projection with a flag
+  that command does not accept, so every move and rename skipped it (the
+  rename reported this as a warning; the move did not show it at all). Fixed,
+  and a failure is now shown in the move dialog and recorded as an entry that
+  clears itself once the env files match again. A new test checks every
+  `python -m vco_lib …` call VCO builds, in Python and Rust, against the real
+  argument parser; it also found three commands VCO printed (in four places)
+  that did not exist, now corrected.
+
+### Fixed — secret values left in project settings by older launchers (v0.2.97)
+
+- Launchers before v0.2.73 wrote some secret values into project env files.
+  The update notice promised the next refresh would remove them; for
+  `.claude/settings.json` it never did. Every env refresh now removes such a
+  value — but only when it provably came from VCO: it must equal the value the
+  launcher stores for that key (the secret itself stays in the keychain, and
+  only the key name is recorded). A key that merely shares a name with one of
+  the launcher's secrets, including a paused one, is never removed; neither is
+  anything VCO cannot check (for example while the hub is down). Those, and
+  secret-looking keys you added yourself, are reported in a separate entry
+  with the steps to move them into the secrets store. Unregistering a project
+  follows the same rule.
+- `GITHUB_TOKEN` in a project's `.claude/settings.json` is no longer deleted by
+  name on every env refresh (it had been for as long as VCO has managed that
+  file, including a token you typed yourself); it is removed only when it
+  equals the stored GitHub token.
+
+### Security — `install.py --openai-key` no longer writes the key into the project (v0.2.97)
+
+- The key passed with `--openai-key` was written as plain text into the
+  orchestrator's `.env`, and the whole command line — key included — was
+  recorded in the install log under `state/logs/`. VCO's rule is that secret
+  values never live in the project tree. The key is now stored under its
+  existing name `openai_api_key` — in the launcher's keychain when the vct-hub
+  is answering (on a first install it is not yet, so the key lands in the file
+  store under `~/.vct-secrets/`). Every run that takes the flag stores it: a
+  first install, a re-install, `--update` (which used to accept the flag and
+  drop it) and `--lightweight`; a run that stores nothing (`--uninstall`, an
+  adopt dry-run) refuses the flag instead of ignoring it. The install log and
+  the Windows re-run hint show the flag with its value redacted, and the
+  embedding services read the key from the store. A key an older install
+  wrote into `.env` (the line under `# OpenAI (for embeddings)`) is moved into
+  the store and removed from the file once the stored copy is confirmed
+  equal — read the way any `.env` reader reads it, so a quoted value is
+  stored without its quotes, and a value with a trailing comment or a stray
+  quote is left in place and reported; a key you wrote there yourself is left
+  alone. A failed embedding call no longer logs the first characters of the
+  key. A key typed on the command line still ends up in your shell history —
+  the help text now says so.
+
+### Changed — one writer for a project's `.env` (v0.2.97)
+
+- A project's `.env` had two writers — one in the launcher, one in the
+  installer — that appended lines in different formats. Both now go through
+  one: VCO's keys live in a single marked block, a key you set yourself on
+  your own line is never written over, and lines older versions appended
+  (`# added by vco …`, the old template's two key sections, `# --- Added by
+  install.py --update …`) are folded into the block so each key is set once.
+  When such a line held a value different from VCO's — one you edited, for
+  example — VCO's value goes in the block and yours is kept outside it as
+  `<KEY>_old=<value>` (`<KEY>_old2`, … if that name is taken; never
+  overwritten, never duplicated on a re-run), and the project's
+  `.claude/logs/auto-resolutions.jsonl` records the key name. Secret-looking
+  keys are never folded. Values older versions made up (`<project>`,
+  `Project`, `Project_KnowledgeGraph`) are dropped, not kept. Placeholder
+  comments are written only when the file is first created; re-running
+  `install.py` over an existing `.env` only adds missing keys and no longer
+  appends `PROJECT_NAME` / `KG_COLLECTION` lines that overrode your real
+  values, and the root's `PROJECT_NAME` comes from its launcher registration,
+  never from the shell `install.py` runs in. An existing `.env` keeps its
+  file permissions. Unregistering a project removes only what VCO wrote
+  (see "unregistering a project" below). The stale-`KG_COLLECTION` repair, the launcher's "Migrate from .env" and the
+  volumes page's `infrastructure/.env` key now go through the same writers
+  instead of their own rewrites. Safe-add projects still get only
+  `.env.vco.reference`, never a live `.env`.
+
+### Fixed — the bundled core modules' manifests load, and session-state's settings work (v0.2.97)
+
+- The six manifests under `launcher/bundled_manifests/` were documented as
+  "copied to `~/.vct/bundled_manifests/` on first launch", but nothing copied
+  them — and three of them (`vct-code-embedding`, `vct-hub-api`,
+  `vct-session-state`) did not parse, because their manifest-validation CI job
+  only ever checked the paid-module fixture. They are now embedded in the
+  launcher and hub and written there at every start, every one is validated
+  in CI and in `cargo test`, and they count as installed for every project,
+  so their settings reach the project through the hub. `vct-session-state`'s
+  two settings now do something: the `context-size-check` hook takes its
+  CONTEXT_STATE.md threshold from `CONTEXT_STATE_MAX_LINES` (default 500,
+  unchanged) and warns when Claude Code's `MEMORY.md` for the project reaches
+  `MEMORY_MAX_LINES` (default 200 — Claude Code loads only its first 200
+  lines). Each is read from the environment, else the launcher setting, else
+  the project's `.env` — both in one resolver run (the resolver's new
+  `resolve-many` form) that gives the vct-hub at most one second
+  (`VCT_RESOLVE_MAX_TIME`), so an unresponsive hub delays a session start by
+  about a second rather than up to ten. A manifest that cannot be written
+  does not stop the others from being refreshed.
+- A module's `requirements.depends_on` is now enforced. The launcher refuses
+  to install, update or enable a module while a module it depends on is not
+  installed for the project. The message names each missing module, and
+  nothing is installed on your behalf. `validate-manifest` fails a manifest
+  whose `depends_on` names an unknown module. `vct-kg` no longer depends on
+  `vct-ollama`, a module retired in v0.2.11: Ollama is the `ollama` service
+  in `infrastructure/docker-compose.yml`, not a module.
+- Texts that told you to install that retired module from the launcher's
+  Modules tab (two bundled agents, a knowledge node, and the deprecated-MCP
+  notice's "Opt-in" line) now say what exists instead. For images, use
+  Claude's native vision (`Read` on the image path). For local-only
+  inference, call the `ollama` service's REST API directly. Paths in the
+  bundled manifests now point at files that exist, and `vct-session-state`
+  no longer names a `health-check.sh` that never shipped.
+
+### Changed — unregistering a project stops rather than lose track of a secret (v0.2.97)
+
+- If unregister finds a secret value in the project that it can prove VCO
+  wrote, but cannot remove it (for example because the file is read-only), it
+  now stops before removing the project and tells you which key, which file
+  and what to fix. Continuing would have left a value that VCO could never
+  identify again. Fix the cause and unregister again; every step is safe to
+  repeat. If you cannot fix it, the same message offers "Unregister anyway —
+  leave these values": the unregister finishes and VCO writes a note —
+  `.claude/VCO-UNREGISTER-LEFTOVERS.md` in the project, or under the
+  launcher's own state folder when the project cannot be written — listing
+  each key and file to clean by hand (names only, never a value). The
+  project list's quick unregister is now the same unregister as the settings
+  page's defaults: it removes the files VCO put in the folder (it used to
+  skip that step, although its defaults said otherwise), stops the same way,
+  offers the same escape, and its dialog says what it removes. It no longer
+  drops a failure silently.
+- Unregister removes only what VCO wrote to your env files. VCO's marked
+  block goes whole from `.env` and from `.claude/env`; from `.env` also the
+  lines older versions appended under their own headers, the comment above
+  any `<KEY>_old` values, and the header at the top of a `.env` VCO created,
+  while that header is unedited — the current one, or the one every earlier
+  version wrote ("Edit values to override defaults… Created by vco
+  <date>"). In `.env`, a line outside those sections is yours whatever it
+  holds: it stays, and the result names it. In `.claude/env` outside VCO's
+  block, and in the `env` blocks of `.claude/settings.json` and
+  `.vscode/settings.json`, a routing key such as `KG_COLLECTION` is removed
+  only when it holds the value VCO writes for that project. A different value
+  is yours: it stays, and the unregister result names it, as it names your `<KEY>_old` values. When VCO
+  cannot work out its own values for the project, only the marked blocks go,
+  and the result says so. A `# KEY=` comment line is never removed.
+
+### Added — the model gateway tells you when it needs a restart (v0.2.97)
+
+- An update never restarted the model gateway, so it kept serving the previous
+  release's code until you restarted it by hand. The gateway now reports which
+  code it is running; after an update, when it is provably out of date, the
+  launcher asks whether to restart it now (**Continue**) or later
+  (**Dismiss**). It never restarts on its own — a restart ends any chat that
+  is running through it. A CLI-only update prints the restart command.
+
+### Added — real subscription usage instead of estimated costs (v0.2.97)
+
+- With the VS Code panel routed through the gateway, Claude Code's Account &
+  Usage view shows a dollar figure computed at API list prices, which means
+  nothing on a subscription. VCO now shows the real numbers:
+  - on the launcher's home page: Claude's session, weekly and per-model
+    weekly usage, and Z.ai's 5-hour and weekly usage, with reset times;
+    QwenCloud's plan exposes no usage data, so it shows tokens used this month;
+  - in the model picker, on vendor rows (e.g. `… · 5h 10% · wk 72% used`),
+    as of the start of the session — Claude Code uses its own labels for its
+    own models. Turn it off with `VCT_MODEL_GATEWAY_PICKER_USAGE=off`;
+  - in terminal `claude` sessions, through an optional status-line script
+    (`templates/scripts/gateway-usage-statusline.sh` / `.ps1`; see
+    `docs/CONFIGURATION.md`).
+- Usage is refreshed in the background — while chats are flowing, and when
+  the launcher card or a status line asks for it — and never on a chat's
+  request path; the gateway has no timer of its own, so with nothing running
+  and nothing looking it makes no calls. Unknown is shown as unknown, never
+  as 0 %.
+
+### Added — module settings can be edited in the launcher (v0.2.97)
+
+- The module manifest spec promised that a module's settings are editable in
+  the launcher, but no page showed any module's settings. **Preferences →
+  Modules** now lists the settings of the bundled modules and of the modules
+  you installed. Machine-wide settings such as the hub's port are edited
+  directly (the page tells you to restart the hub after a change); per-project
+  ones, such as the `CONTEXT_STATE.md` size warning, for a project you pick —
+  and an installed module's only for projects where it is installed and
+  enabled.
+- Settings whose value lives somewhere else — a project's KG collection, the
+  code-embedding service's backend and port — are shown read-only with their
+  current value, where they are set and a link to where you change them. The
+  launcher never stores a second copy that nothing reads. The code-embedding
+  module's declared default port is corrected to 11440.
+- Every value is checked against the module's declared type and limits,
+  both on the page and by the launcher before it saves, so an invalid value
+  is refused with a reason. A number out of range is refused, not silently
+  clamped.
+
+### Added — module tiles show whether each module is running (v0.2.97)
+
+- Module manifests have always declared a health check, and the spec said it
+  let the launcher show the module's status — but nothing ever ran it. The
+  hub now checks every active module's declared health check, on this
+  machine only (loopback addresses; a container's check goes to its local
+  port mapping), and the module tiles show **Running**, **Down** or **Status
+  unknown**. A check that cannot run — no URL, a service that runs on another
+  machine, or the hub unreachable — reads unknown, never down (until the hub
+  has answered once, no status is shown). `VCT_HUB_MODULE_HEALTH=0` (or
+  `false`/`no`/`off`) turns the checks off.
+- Every launcher, hub and `vct-cli` request to this machine — the hub, the
+  model gateway, module ports, VCO's own services — now bypasses
+  `HTTP_PROXY` and follows no redirects, so the hub's token never reaches a
+  proxy; the install-time hub check does the same. `localhost` counts as this
+  machine, a name that only resolves to it does not. A service adopted on
+  another machine still goes through your proxy.
+- **Preferences → Modules** shows each module's HTTP API address with its
+  live port.
+- Container modules the orchestrator starts now receive the settings their
+  manifest lists in `runtime.env_from_settings`, and the secrets it lists in
+  `runtime.env_from_secrets` — through the same permission checks as the
+  hub's `/env`. A secret paused for the whole machine is not delivered; a
+  pause for one project holds for that project's own container and its
+  `/env`, but not for a machine-wide container that serves every project,
+  which cannot enforce a per-project pause. A secret's value — and a
+  machine-wide container's hub token — never appears on the
+  `podman run`/`docker run` command line; as with any container environment,
+  it is visible to `podman inspect`. A missing secret the manifest marks
+  required, or one whose name cannot be used as an environment variable,
+  stops the start — including a restart — and leaves the running container
+  alone. Before, both lists were ignored.
+- Settings of modules installed machine-wide now reach each project's `/env`
+  (their secrets do not — a module's secrets reach a project only through a
+  per-project install, as before), with the machine-wide value used where no
+  per-project value is set, and the
+  settings page offers only fields something actually delivers. Modules under
+  development (`VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH`) are listed and their
+  settings save. A setting's `validation` pattern must use a portable subset
+  (no `\d`, lookaround or inline flags), and whole-number settings refuse
+  `7700.0`.
+
+### Changed — one record of where Weaviate, Ollama and code-embed run (v0.2.97)
+
+- Where each core service is reached used to be worked out separately by the
+  installer, the launcher, the hub and each project's env files, from up to six
+  inputs (`services.toml`, port overrides, `vct-config.toml`, `VCT_WEAVIATE_URL`,
+  env ports, a compose override file). They could disagree, and an alternate
+  port the installer picked was forgotten after that run. The launcher database
+  now keeps one record per service — VCO-managed, your container, or a URL —
+  and everything reads it: the hub, the launcher, the tray, every project's env
+  files and the MCP registration.
+- Your next update moves whatever earlier versions wrote into that record, with
+  nothing to do by hand. The old files are renamed, not deleted. Anything the
+  update cannot settle on its own is listed in `UPDATE_DEFERRED.md` with the
+  command that settles it. `vco doctor` warns if `VCT_WEAVIATE_URL`,
+  `VCT_OLLAMA_URL` or `VCT_GRPC_PORT` is still exported; nothing reads them
+  any more.
+- **An existing Weaviate or Ollama is used, not duplicated.** VCO now also looks
+  on their standard ports (8080, 11434). An Ollama that is already running is
+  used without asking. A Weaviate that holds none of VCO's data is used only
+  after you choose — in the launcher, the first-install wizard, or with
+  `install.py --service weaviate=…` — and until then VCO starts no second one.
+- **A container VCO uses but did not create is never removed or re-created.**
+  It is only started and stopped by name. Container start-up, the session hook
+  and the watchdog act only on the services VCO manages, and name them
+  explicitly. Before, starting code-embed could also create an Ollama next to
+  the one you use, and recovering a stuck container could re-create it on an
+  empty volume. **Let VCO manage it** on the Services page hands such a
+  container to VCO with its data, when you ask for it.
+- **code-embed keeps its model cache.** When VCO re-creates it (after an update
+  or to move it), the cache mount is checked before anything stops and again
+  after, and a mismatch is refused or rolled back.
+  `python -m vco_lib.service_endpoints move` moves code-embed — or VCO's own
+  Weaviate or Ollama, with the same checks (Weaviate must come back with the
+  same collections) — to a new port; for a Weaviate or Ollama you run, it
+  follows the new address you gave it.
+- **Your data wins over a stranger's service.** A stopped VCO container that
+  holds your knowledge graph or models outranks a running Weaviate or Ollama
+  that someone else runs: VCO starts its own and never switches to the other
+  one. When it cannot tell which of several is yours, it picks one, says
+  which, and the entry in `UPDATE_DEFERRED.md` lets you choose another. A container with no record yet is
+  only ever started by name, never removed and re-created. Interrupting the
+  "use this Weaviate?" question (Ctrl-C) no longer counts as yes. A service
+  that someone else starts on VCO's own port is noticed, not trusted.
+- The session-start check looks only at the recorded services — no port
+  scans, and it reads another Weaviate only when one has appeared on VCO's
+  own recorded port. A container hook stopped at its time limit no longer
+  releases the shared lock while its `compose up` keeps running: the locked
+  work runs in the background, holds the lock until it has really finished,
+  and the hook shows its output within its time limit (and names its log,
+  under `logs/session-hooks/` in VCO's state folder, when the work takes
+  longer). The two container hooks no
+  longer act at the same moment, and the port check removes nothing it could
+  not re-check; it now logs every run to
+  `.claude/logs/container_port_check.jsonl`, as its documentation said it did.
+  Service checks do not follow redirects, only a successful
+  reply counts as the service answering, and addresses with a
+  `user:pass@` part are refused.
+- **Services → Move to another port** moves VCO's own Weaviate, Ollama or
+  code-embed with the same checks as the command; for a service you run
+  yourself, VCO follows your port instead. **Let VCO manage it** takes over
+  exactly the container VCO uses, and only when it carries the name VCO's
+  own setup gives it — the button appears only where that holds; otherwise
+  the command explains why and changes nothing. The Weaviate address setting
+  links to the Services page too.
+- The Services page shows where each service runs and offers these choices;
+  the old "Reset adoption" button and container picker are gone. Module
+  containers reach an Ollama on another machine at its real address, and
+  projects now receive `CODE_EMBED_SERVICE_URL`, the name code-embed clients
+  read.
+
+### Fixed — smaller issues (v0.2.97)
+
+- The bundled `vct-hub-api` module's port setting now sets the hub's port.
+  It was declared as `HUB_PORT`, which nothing read; it is now
+  `VCT_HUB_PORT`, the hub reads it (the module's machine-wide setting) when
+  it starts, and a `VCT_HUB_PORT` in the hub's own environment still wins.
+  Clients keep finding the hub through `hub.port`.
+- The bundled `vct-codegraph` module no longer declares an MCP server of its
+  own (`codegraph`), which nothing provided. Its tools, `search_code_graph`
+  and `query_code_structure`, belong to the `weaviate-kg` MCP that `vct-kg`
+  registers, and uninstalling `vct-codegraph` no longer tries to deregister
+  an MCP.
+- The launcher finds `podman`/`docker`, and the Linux package manager used to
+  install Podman, through its one `PATH` lookup — a copy of that lookup
+  missed `podman.exe` on Windows.
+- Rust tests no longer change the shared process environment behind the back
+  of other tests: none sets `PATH` (hub discovery and the update check take
+  their `PATH`, home directory and `git` as inputs), and every other change
+  holds one workspace lock. A test that unset `VCT_STATE_DIR` without it
+  could send concurrent tests to the real `~/.vct`.
+
+- The Projects page kept showing "N stale project bundles" after **Update all**
+  finished; it now re-checks when the update ends and on **Refresh**.
+- The root `CLAUDE.md` no longer gets a `CLAUDE.md.from-upstream-<sha>` copy
+  on every update, and old ones are removed when git provably holds their
+  contents.
+- On a project that opted out of shared-KG reads (`SHARED_KG_READ_DISABLED`),
+  a settings file with comments made a bundle update miss the opt-out and
+  remove the project's own copies of the bundled knowledge — its only access
+  to them.
+- The search MCP no longer fails to start on a machine without a GitHub token;
+  it never needed one.
+- After renaming a project's collections, the warning about a stale
+  `KG_COLLECTION` in `.env` now tells you the command that actually fixes it
+  (or that the line is your own), instead of suggesting a bundle update, which
+  never touches `.env`.
+- Several update notices that could only be dismissed by hand now clear
+  themselves once the condition is gone, and a failed schema-version record
+  is reported as what it is, with the right fix, instead of "no migration
+  shipped".
+- `infrastructure/docker-compose.yml` accepts overrides for where each service
+  keeps its data — `VCT_WEAVIATE_DATA_SOURCE`, `VCT_OLLAMA_DATA_SOURCE`,
+  `VCT_CODE_EMBED_CACHE_SOURCE` (a folder or an existing volume) and the
+  matching `…_VOLUME_NAME` knobs — so services that already store their data
+  somewhere can adopt it without copying. See `docs/CONFIGURATION.md`.
+- The container runtime is chosen by one rule everywhere — the session
+  hooks, the launcher's services and storage pages, module containers, the
+  hub, the boot wrapper: `VCT_CONTAINER_RUNTIME` if you set it, otherwise the
+  runtime the install recorded (`state/install/runtime.txt`), otherwise
+  auto-detection. A pinned runtime that is down is refused, naming where the
+  pin comes from — never swapped for the other runtime, which could start
+  containers on empty volumes. At boot, the start-up wrapper then logs why
+  and starts nothing. Before, only the pin was honoured, and only
+  in some places; the storage commands always preferred podman.
+- The storage and volume commands refuse any volume that exists only under
+  the other runtime, naming each one, rather than acting on the wrong copy.
+  The message says how to fix it: quit the launcher, set or unset
+  `VCT_CONTAINER_RUNTIME` where it starts (or edit `runtime.txt`), and
+  relaunch. The first-install wizard shows this as a step to resolve instead
+  of failing, and its pre-install check lists the same volumes the install
+  will use.
+- The runtime the install recorded is VCO's own note, so an update keeps it
+  true instead of stopping on it. If the recorded runtime is no longer
+  installed, the update re-records the one your data is on and says so in
+  `UPDATE_DEFERRED.md` (until then, sessions and the boot service already
+  use that runtime). If it is installed but not answering, the update tries
+  to start it; if it still does not answer, the update finishes everything
+  else and leaves an entry naming what to start, which clears once it
+  answers. If podman and docker both hold VCO data, it keeps the recorded one
+  and asks; `install.py --update --container <podman|docker>` records your
+  choice, and a runtime you chose that way is never switched away from.
+  Before, an update whose recorded runtime was gone or not answering exited
+  with an error behind a message that named the wrong runtime. A runtime you
+  pinned with `VCT_CONTAINER_RUNTIME` is never changed.
+- When the recorded runtime cannot be found, a session, the boot service, the
+  launcher or the hub switches to the other runtime only if that one already
+  holds VCO's containers or volumes, and otherwise refuses and says why; it
+  never starts the stack on empty volumes. A volume name you picked with
+  `VCT_*_VOLUME_NAME` counts as VCO's data there only next to a VCO container
+  or with VCO's compose label, so an unrelated volume of the same name cannot
+  move the record. A service whose data lives in a folder
+  (`VCT_*_DATA_SOURCE`) keeps its recorded runtime against a leftover volume
+  under the other runtime, but VCO follows its containers when they are
+  running under the other one; if the other runtime holds stopped VCO
+  containers beside the folder, VCO keeps the recorded runtime when it is
+  still installed, never switches on its own, and asks you in
+  `UPDATE_DEFERRED.md` to pick one with
+  `install.py --update --container <podman|docker>`. When every service's
+  data is in a folder, a runtime that is gone is simply re-recorded, since no
+  volume is left behind. A data folder VCO cannot look into counts as data,
+  instead of stopping sessions, the boot service or an update with an
+  error. A runtime installed outside the calling
+  program's `PATH` (`~/bin`, `~/.local/bin`, `/opt/homebrew/bin`,
+  `/usr/local/bin`, Docker Desktop's folders, the Windows installer folders)
+  is now found instead of being treated as not installed;
+  `VCT_TOOL_SEARCH_DIRS` replaces the list of places searched. These extra
+  places come after your `PATH`, so they never replace a program your `PATH`
+  already finds; a launcher started from Finder or a desktop icon still puts
+  Homebrew, cargo and `~/.local/bin` first, as it has since v0.2.53, and the
+  hub, the session hooks, the boot service and the installer now look tools
+  up in that same order. A `PATH` entry written with a trailing or doubled
+  slash (or, on Windows, in another case or with `/`) is recognised as
+  already present instead of being added again ahead of your `PATH`. When the
+  launcher or the hub refuses the recorded runtime, the install check, the
+  Services page and the hub's log name the pinned runtime, say why VCO did
+  not switch and what to do, instead of "No container runtime found". On macOS, the
+  boot service no longer reports every runtime as unusable.
+- The boot service reads its own install's runtime record, never another
+  copy's, and falls back to its own compose folder when the configured one is
+  gone. When no usable container runtime is found at boot — or a session
+  hook refuses a pinned runtime — the reason appears in
+  `UPDATE_DEFERRED.md`, not only in a log, under one title that keeps the
+  time it was first seen. Recording it gives up after a few seconds if an
+  update is holding the ledger, and the port check records it in the
+  background, so neither boot nor a session is held up.
+- Every VCO client (Python, shell, PowerShell, `vct-cli`, the launcher, and
+  `vco verify-diagrams`) now finds the hub the same way, and agrees on what a
+  valid port is: 1–65535 in plain digits (a sign, `_`, other numerals or
+  spaces make it invalid). An invalid `VCT_HUB_PORT` is skipped — the
+  resolver scripts say so — and the client uses the port the running hub
+  recorded, then 7700. Some clients used to build a broken hub URL from a
+  bad value, one PowerShell script failed on it, `vco verify-diagrams`
+  never looked for the running hub's port, and the hub itself accepted
+  `+7822` or `0` for its own port. The hub itself no longer
+  overflows past port 65535 when every port it tries is taken.
+- `install.py --bootstrap --json` reports the port the running hub is on
+  instead of always 7700, and the hub module's catalog entry names the running hub's
+  port too. The code-embedding module's entry named port 11438; the service
+  runs on 11440.
+- The bash code-embed session hook no longer exits silently when the
+  container runtime is refused: it says why, and leaves no temporary file
+  behind (a problem since v0.2.92).
+- Which container runtime VCO uses is now decided in one place: the launcher,
+  the hub and its supervisor, the storage pages and the install check all
+  ask the same verdict the session hooks and the boot service use
+  (`python -m vco_lib.runtime_reconcile decide --json`), and show its
+  refusal text as is. Before, the launcher and hub kept their own copy of
+  the rules, which could disagree.
+- On Fedora/RHEL with `podman-docker` (where `docker` is podman under
+  another name), VCO no longer reports its data as being under both
+  runtimes; it keeps the recorded one.
+- The code-embed session hook takes the service's port from the recorded
+  endpoint; an exported `CODE_EMBED_PORT` no longer steers it. When it cannot
+  read the record, it changes nothing that session instead of guessing a
+  port (which could restart a healthy service that had moved).
+- The Hooks tab suggests the Windows form of a hook command on Windows.
+- The launcher finds its bundled scripts (code graph, KG sync, KG summary)
+  through one shared lookup instead of two copies that could disagree.
+- On Docker, VCO never found an existing container by name: it asked with
+  a command only podman has, so every lookup answered "not found". It now
+  asks in a way both understand, and a runtime that cannot answer is treated
+  as an error, never as "not found".
+- Moving code-embed during an update no longer registers VCO's MCP servers
+  twice (on a first install that logged two failures and rewrote
+  `~/.claude.json` mid-step); they are registered once, in the update's own
+  step.
+- `install.ps1 -WithMaoAgents` aborted the whole install: it passed a flag
+  `install.py` does not accept. The switch now only warns that it is no
+  longer needed (the specialist agents install unless you pass `-NoAgents`).
+- On Windows, editing a file under `docs/` never re-synced it to the project's
+  development collection: the hook called a script VCO does not ship. It now
+  syncs the same way it does on Linux and macOS.
+- The shipped `.claude/settings.json` pointed every project at a knowledge
+  note that is not shipped; it now explains the Bash-compression setting
+  inline.
+
+### Changed — the launcher's command-line tool is now `vct-cli` (v0.2.97)
+
+- VCO shipped two different programs named `vco`: the launcher's Rust
+  command-line tool (`launcher/tools/vct-cli`: `project list/create/rename/
+  delete/show`, `module`, `audit`, `license`, `hooks`, `telemetry`, `hub`,
+  `kg`, `codegraph`) and the orchestrator's Python CLI (`vco doctor`,
+  `vco verify-pins`, `vco project move`, `vco fix-transcript`, …). Both
+  answered `vco project`, with different subcommands, so whichever came
+  first on `PATH` hid the other and half of the documented commands failed
+  as "invalid choice". The two never implemented the same operation, so
+  nothing is merged: the Rust tool is renamed to `vct-cli`, the name of its
+  crate, like `vct-hub` and `vct-launcher`. Every command keeps its
+  subcommands and flags — `vco hub health` is now `vct-cli hub health`.
+  The Python `vco` is unchanged. The release archives ship `vct-cli`
+  (`vct-cli.exe` on Windows) instead of `vco`.
+- If you installed the launcher tool with `launcher/tools/vct-cli/install.sh`,
+  run it again: it installs `~/.local/bin/vct-cli` and removes the old
+  `~/.local/bin/vco` — only when that file identifies itself as the launcher
+  tool. A Python `vco` there, or anything else, is left alone, and an old
+  copy elsewhere on `PATH` is reported with the command to remove it. The
+  same check now guards the pre-v0.1.0 `~/.local/bin/vct`: the script used to
+  delete any regular file there, including a copied secrets `vct`.
+- If you never re-run that script, the update tells you: `vco doctor` (which
+  every install and update runs) reports an old copy of the tool still on
+  `PATH` under a former name as `former_launcher_cli_on_path`, with the exact
+  command to remove it. It never deletes the file, and the notice clears
+  itself once the copy is gone. The Python `vco` and the secrets `vct` are
+  never reported.
+- New: `vct-cli telemetry pending` prints the events waiting in
+  `~/.vibecoded/telemetry_pending.jsonl`, and works with the launcher closed.
+  `docs/TELEMETRY.md` pointed at the CLI for this, but the command it named
+  (`telemetry status`) only shows consent.
+- Error messages from the tool start with `vct-cli:` (they said `vct:`, the
+  secrets tool's name). A test now fails if two shipped programs share a
+  command name, or if shipped text runs a verb through the wrong one.
+
+### Changed (v0.2.97)
+
+- Hook commands in `.claude/settings.json` no longer start with
+  `[ -n "$VCT_DISABLE_HOOKS" ] ||`; every hook script already checks that
+  variable itself. Existing projects are rewritten in place on their next
+  update. `VCT_DISABLE_HOOKS=1` works exactly as before.
+- Every VCO hook now runs from the project root whatever directory the
+  session has moved to: hook commands start from the project folder Claude
+  Code passes in — `"${CLAUDE_PROJECT_DIR:-.}"` on Linux and macOS (it falls
+  back to the old relative form if Claude Code provides neither the value
+  nor the variable, so it is never worse than before), and the exact
+  `${CLAUDE_PROJECT_DIR}` placeholder on Windows, which Claude Code's
+  documentation says it substitutes into the command before running it (not
+  yet verified on a Windows machine). See `docs/CLAUDE_CODE_COMPATIBILITY.md`.
+  Before, they named `.claude/hooks/…` relative to the current directory, so
+  after a `cd` or inside a worktree every VCO hook failed. Your next bundle
+  update rewrites existing projects' VCO hooks in place and leaves your own
+  hooks alone; re-enabling a hook you had turned off restores the new form.
+- Bundled agents and skills now ask for `medium` reasoning effort instead of
+  `high`, following current guidance for Opus-class models, and the
+  instructions tell Claude to brief ad-hoc subagents at `medium` too. Five
+  roles that genuinely need deeper reasoning (deep research, incident
+  response, the GLM reviewer, equation checking, Terraform plan review) keep
+  `high`, which is now the ceiling: nothing shipped asks for `xhigh` or `max`.
+
+### Removed — `VCT_HUB_LEGACY_GLOBAL_ENV`, the global-token escape hatch (v0.2.97)
+
+- The `VCT_HUB_LEGACY_GLOBAL_ENV=1` opt-in — which re-opened the legacy
+  path where the coarse global `hub.token` authorized the per-project
+  `/api/v1/projects/{id}/env` + `/config` routes — is gone, and so is the
+  global-token path it unlocked. Every bundled resolver
+  (`vct_project_config.sh`/`.ps1`, `vct_secrets_resolve.sh`/`.ps1`,
+  `vco_lib`) has preferred the project-scoped `hub.token.<project_id>`
+  since v0.2.76, and the hub mints one for any project it meets mid-session,
+  so nothing VCO ships needed the hatch; it had also outlived its promised
+  one-release window by twenty releases. If a bespoke caller of your own
+  still presents the global `hub.token` there, present the scoped token
+  instead (`<vct_root_dir>/hub.token.<project_id>`); a hub started with the
+  variable still set logs one line saying it was removed and what to use,
+  and refuses the global token exactly as if it were unset.
+
 ## [0.2.96] - 2026-09-22
 
 ### Fixed — the "your files were preserved" update notice names the real cause (v0.2.96)

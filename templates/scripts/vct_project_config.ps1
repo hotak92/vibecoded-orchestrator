@@ -30,12 +30,12 @@
 #   3  service misconfigured (primary KG binding missing)
 #   4  field not found
 #   5  forbidden (403 — scoped-credential boundary refusal; NOT transient,
-#      so callers must NOT env-fallback. Post-flip the hub returns 403 when
-#      the coarse global hub.token is presented on a per-project /env|/config
-#      route with the compat window closed, or a token minted for a DIFFERENT
+#      so callers must NOT env-fallback. The hub returns 403 when the
+#      coarse global hub.token is presented on a per-project /env|/config
+#      route (refused unconditionally since v0.2.97 removed
+#      VCT_HUB_LEGACY_GLOBAL_ENV), or a token minted for a DIFFERENT
 #      project is presented. Fix: present the scoped hub.token.<id> (this
-#      resolver already prefers it) or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the
-#      hub to reopen the one-release compat window.)
+#      resolver already prefers it; the hub mints one on first request).
 #  64  usage error
 
 [CmdletBinding(DefaultParameterSetName = 'Config')]
@@ -295,43 +295,78 @@ function Emit-Warning {
 # ── Hub port discovery ──────────────────────────────────────────────────
 # CORRUPT-INPUT CONTRACT (F-8) — MUST MATCH the bash sibling
 # `vct_project_config.sh::hub_port` and the python sibling
-# `vco_lib/project_config.py::_discover_hub` (port branch):
-#   * env `VCT_HUB_PORT` or `hub.port` file that is non-numeric / garbage
-#     → emit ONE rate-limited stderr warning (kind `hub_port_invalid`) and
-#     fall through to the default port 7700. NEVER throw (the previous
-#     `[int]$Env:VCT_HUB_PORT` cast raised a TERMINATING error that took
-#     the Windows hook host down — F-8 item #2).
-#   * `hub.port` present but UNREADABLE → warn (`hub_port_unreadable`) +
-#     default. The previous `Get-Content -Raw` inside `Test-Path` had no
-#     try/catch and threw on perm-denied (F-8 item #3).
-# A valid numeric port matches `^\d+$`. ONE conservative contract:
-# invalid content → warn + default, never crash, never emit garbage.
+# `vco_lib/hub_ensure.py::resolve_hub_port` (which `project_config` uses):
+#   * a valid port is an integer in 1..65535 (`ConvertTo-HubPort`);
+#   * env `VCT_HUB_PORT` set but not a valid port → ONE rate-limited stderr
+#     warning (kind `hub_port_invalid`) and FALL THROUGH to `hub.port`, then
+#     7700 (v0.2.97 owner ruling: the file names the running hub). NEVER
+#     throw (a bare `[int]$Env:VCT_HUB_PORT` cast raised a TERMINATING error
+#     that took the Windows hook host down — F-8 item #2).
+#   * `hub.port` non-empty but not a valid port → warn (`hub_port_invalid`)
+#     + default; UNREADABLE → warn (`hub_port_unreadable`) + default (F-8
+#     item #3); absent or empty → silent default.
+
+# The port `$Value` names as an [int], or $null when it is not an integer in
+# 1..65535. Never throws.
+function ConvertTo-HubPort {
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # `\d` is NOT used: .NET matches every Unicode numeral with it, and the
+    # `[long]` cast of such a value then THREW under `$ErrorActionPreference =
+    # 'Stop'` — this function must never throw. `-cmatch` + `\z` pin an
+    # ASCII-only, whole-string match (`$` would also accept a trailing LF).
+    param([string]$Value)
+    if ($null -eq $Value) { return $null }
+    $v = $Value.Trim([char[]]@([char]32, [char]9, [char]10, [char]11, [char]12, [char]13))
+    if ($v -cmatch '\A[0-9]{1,5}\z') {
+        $n = [int]::Parse($v, [System.Globalization.CultureInfo]::InvariantCulture)
+        if ($n -ge 1 -and $n -le 65535) { return $n }
+    }
+    return $null
+}
+
+# A hub-PORT warning, through the same rate-limited emitter. R7b F25(c): the
+# default Emit-Warning line ends "Falling back to env.", which is true for a
+# config-resolution failure and FALSE here — a bad port falls back to
+# hub.port / 7700 (the detail says which) and resolution carries on against
+# the hub. MUST MATCH `_emit_port_warning` in vct_project_config.sh.
+function Emit-PortWarning {
+    param(
+        [Parameter(Mandatory = $true)][string]$ErrorKind,
+        [string]$Detail = ""
+    )
+    Emit-Warning -ErrorKind $ErrorKind -Detail $Detail `
+        -StderrLine "[vct] project_config: ${ErrorKind}: ${Detail}. (rate-limited; set VCO_HOOK_DEBUG=1 to see every occurrence)"
+}
+
 function Get-HubPort {
     if ($Env:VCT_HUB_PORT) {
-        if ($Env:VCT_HUB_PORT -match '^\d+$') {
-            return [int]$Env:VCT_HUB_PORT
-        }
-        Emit-Warning -ErrorKind "hub_port_invalid" `
-            -Detail "VCT_HUB_PORT is not a positive integer; using default 7700"
-        return 7700
+        $fromEnv = ConvertTo-HubPort $Env:VCT_HUB_PORT
+        if ($null -ne $fromEnv) { return $fromEnv }
+        Emit-PortWarning -ErrorKind "hub_port_invalid" `
+            -Detail "VCT_HUB_PORT is not a port (1-65535); falling back to hub.port, then 7700"
     }
     $stateDir = if ($Env:VCT_STATE_DIR) { $Env:VCT_STATE_DIR } else { Join-Path $HOME ".vct" }
     $portFile = Join-Path $stateDir "hub.port"
     if (Test-Path $portFile) {
         $raw = $null
         try {
-            $raw = (Get-Content -Raw -Path $portFile -ErrorAction Stop).Trim()
+            # The WHOLE content, untrimmed here: `ConvertTo-HubPort` trims the
+            # ends only, so `78 11` / a second line stays invalid. An empty
+            # file reads as $null — that is "no port", not "unreadable".
+            $raw = Get-Content -Raw -Path $portFile -ErrorAction Stop
         } catch {
-            Emit-Warning -ErrorKind "hub_port_unreadable" `
+            Emit-PortWarning -ErrorKind "hub_port_unreadable" `
                 -Detail "hub.port is not readable; using default 7700"
             return 7700
         }
-        if ($raw -match '^\d+$') {
-            return [int]$raw
-        }
-        if ($raw.Length -gt 0) {
-            Emit-Warning -ErrorKind "hub_port_invalid" `
-                -Detail "hub.port contains non-integer content; using default 7700"
+        if ($null -eq $raw) { $raw = "" }
+        $fromFile = ConvertTo-HubPort $raw
+        if ($null -ne $fromFile) { return $fromFile }
+        if ($raw.Trim().Length -gt 0) {
+            Emit-PortWarning -ErrorKind "hub_port_invalid" `
+                -Detail "hub.port does not hold a port (1-65535); using default 7700"
         }
         # empty (whitespace-only / truncated write) → silent default.
     }
@@ -711,7 +746,7 @@ function Get-Config {
             # hub.token on a per-project route with the compat window closed,
             # or a per-project token minted for a DIFFERENT project. HARD
             # refusal, NOT transient — do NOT env-fallback.
-            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden for project ${ProjectId}: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.${ProjectId}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub to reopen the one-release compat window. body=$($result.Body)"
+            Emit-Warning -ErrorKind "forbidden" -Detail "403 forbidden for project ${ProjectId}: the global hub.token is refused on /config (per-project token required) or a token for another project was presented. Present the scoped hub.token.${ProjectId} (this resolver already prefers it; the hub mints one on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape hatch was removed in v0.2.97. body=$($result.Body)"
             return 5
         }
         200 {

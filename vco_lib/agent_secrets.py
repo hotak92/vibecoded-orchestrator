@@ -78,6 +78,7 @@ __all__ = [
     "Forbidden",
     "HubUnreachable",
     "KeychainLocked",
+    "lookup_stored",
     "ProjectNotFound",
     "SecretNotFound",
     "exec_with_secrets",
@@ -345,8 +346,9 @@ def _hub_get(key: str, project: Optional[str]) -> str:
             f"hub returned 403 forbidden for {key!r} (project={pid}): the "
             "global hub.token is refused on /env (per-project token required) "
             "or a token for another project was presented. Present the scoped "
-            f"hub.token.{pid}, or set VCT_HUB_LEGACY_GLOBAL_ENV=1 on the hub "
-            "to reopen the one-release compat window"
+            f"hub.token.{pid} (the resolver prefers it; the hub mints one "
+            "on first request). The legacy VCT_HUB_LEGACY_GLOBAL_ENV escape "
+            "hatch was removed in v0.2.97"
         )
     if resp.status_code == 503:
         # v0.2.82 WP-4a: the hub reached its keychain but could not read it.
@@ -538,6 +540,43 @@ def get(
             f"the project's .env"
         ) from hub_error
     raise hub_error
+
+
+#: :func:`lookup_stored` states: where the value was found, or why not.
+STORED_KEYCHAIN = "keychain"      # tier 1 answered with a value
+STORED_FILE = "file_store"        # tier 2 held it
+STORED_ABSENT = "absent"          # the hub answered "not stored" and tier 2 missed
+STORED_HUB_DOWN = "hub_down"      # the hub could not be asked (or knows no such
+                                  # project) and tier 2 missed
+STORED_UNKNOWN = "unknown"        # the hub refused / could not read the keychain
+                                  # (paused key, 403, locked) and tier 2 missed
+
+
+def lookup_stored(key: str, *, project: Optional[str] = None) -> tuple[str, Optional[str]]:
+    """``(state, value)`` for ``key`` in VCO's OWN stores only — the hub's
+    keychain (tier 1), then the file store (tier 2). NEVER the project
+    ``.env`` (tier 3): a caller weighing a ``.env`` value against the store
+    (value evidence) must not compare that value with itself.
+
+    ``value`` is set only for :data:`STORED_KEYCHAIN` / :data:`STORED_FILE`.
+    The miss states tell a writer what it may do: ``absent`` (the hub
+    answered — nothing stored there), ``hub_down`` (no hub answer), and
+    ``unknown`` (the hub answered but could not say — a paused key reads
+    the same as an undeclared one, so it must not be overwritten). Never
+    raises; the value is never logged."""
+    state = STORED_UNKNOWN
+    try:
+        return STORED_KEYCHAIN, _hub_get(key, project)
+    except SecretNotFound:
+        state = STORED_ABSENT
+    except (HubUnreachable, ProjectNotFound):
+        state = STORED_HUB_DOWN
+    except (ResolverError, OSError, ValueError):
+        state = STORED_UNKNOWN
+    value = _file_store_get(key, project)
+    if value is not None:
+        return STORED_FILE, value
+    return state, None
 
 
 def exec_with_secrets(

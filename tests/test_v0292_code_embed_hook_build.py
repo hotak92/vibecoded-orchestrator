@@ -23,11 +23,24 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tests.common.launcher_db_fixture import make_launcher_db
 from tests.common.ports import free_port
+from vco_lib import service_endpoints as _se
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
 IS_WINDOWS = os.name == "nt"
+
+
+def _assert_code_embed_build_up(case: unittest.TestCase, call: str) -> None:
+    """The creating `up` names code_embed ALONE, rebuilds it, and carries
+    `--no-deps` (v0.2.97 I1: its `depends_on: ollama` must never create an
+    Ollama next to an adopted one) plus the gpu profile it lives in."""
+    tokens = call.split()
+    case.assertEqual(tokens[-1], "code_embed", call)
+    for flag in ("up", "-d", "--build", "--no-deps"):
+        case.assertIn(flag, tokens, call)
+    case.assertIn("--profile gpu", call)
 
 
 
@@ -46,12 +59,23 @@ class _Fixture:
         self.bin = tmp / "bin"
         self.bin.mkdir(parents=True, exist_ok=True)
         self.compose_log = tmp / "compose.log"
+        self.runtime_log = tmp / "runtime.log"
         self.marker = tmp / "container.created"
         self.compose_dir = tmp / "compose"
         self.compose_dir.mkdir(exist_ok=True)
+        # v0.2.97: the hook takes its probe PORT from the launcher.db
+        # service_endpoints plan, so the fixture owns the rows it reads —
+        # a temp state dir with a real-schema launcher.db (VCT_STATE_DIR is
+        # how `vco_lib.paths.launcher_db_path` is steered; same shape as
+        # tests/test_v0297_lifecycle_hooks.py's _Machine).
+        self.state = tmp / "state"
+        self.state.mkdir(exist_ok=True)
+        self.db = self.state / "launcher.db"
+        make_launcher_db(self.db)
 
         (self.bin / "podman").write_text(textwrap.dedent(f"""\
             #!/usr/bin/env bash
+            printf '%s\\n' "$*" >> "{self.runtime_log}"
             case "$1" in
               info) exit 0 ;;
               container)
@@ -79,6 +103,13 @@ class _Fixture:
             (self.bin / f).chmod(0o755)
 
     def env(self, port: int) -> dict:
+        # The plan's code_embed row: VCO-managed + enabled (so the compose
+        # gate lists it) on THIS port — the port the hook must probe.
+        _se.write_rows(
+            [_se.EndpointRow(service="code_embed", mode="vco_managed",
+                             port=port, source="install_probe")],
+            db_path=self.db,
+        )
         env = dict(os.environ)
         env.update({
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -86,7 +117,14 @@ class _Fixture:
             "VCT_COMPOSE_CMD": "vco-fake-compose",
             "VCT_COMPOSE_DIR": str(self.compose_dir),
             "VCT_CODE_EMBED_CONTAINER": "vco_code_embed_test",
+            # The PLAN (the launcher.db row above) decides which port the
+            # hook probes. CODE_EMBED_PORT stays exported here only as the
+            # projected transport the staleness-reporter child
+            # (`vco_lib.code_embed_image`) still reads — for the hook itself
+            # it is a retired input (v0.2.97), and the PlanPortProbeTests
+            # prove the hook ignores a value that disagrees with the row.
             "CODE_EMBED_PORT": str(port),
+            "VCT_STATE_DIR": str(self.state),
             "TMPDIR": str(self.tmp),
             # Hermeticity pin (2026-09-07 CI red): the hooks resolve their
             # runtime via `python -m vco_lib.containers resolve`, probing
@@ -108,20 +146,33 @@ class _Fixture:
         # ambient launcher shell cannot steer RUN_PY at a different tree.
         env.pop("VCT_VENV", None)
         env.pop("VCT_INSTALL_ROOT", None)
+        # VCT_LAUNCHER_DB_PATH would outrank VCT_STATE_DIR for the plan's
+        # launcher.db — scrub so an ambient value cannot point the hook at
+        # another tree's rows.
+        env.pop("VCT_LAUNCHER_DB_PATH", None)
         # `CODE_EMBED_PORT` above only decides the URL while nothing OUTRANKS
         # it: `code_embed_image.service_base_url` reads
         # `CODE_EMBED_SERVICE_URL` FIRST. An ambient value therefore points
         # the hook at somebody else's service and the fixture's own
         # `_HealthService` is never probed — which is what a developer with
         # that variable exported has always seen, and what the suite-wide
-        # W-CODE-EMBED pin (conftest) would make universal.
+        # W-CODE-EMBED pin (conftest) would make universal. v0.2.97 (lane Y):
+        # `CODE_EMBED_URL` is the second URL leg, ranked before the port —
+        # popping only the first name let an ambient alias steer the probe at
+        # the developer's live :11440 service.
         env.pop("CODE_EMBED_SERVICE_URL", None)
+        env.pop("CODE_EMBED_URL", None)
         return env
 
     def compose_invocations(self) -> list:
         if not self.compose_log.exists():
             return []
         return [ln for ln in self.compose_log.read_text().splitlines() if ln.strip()]
+
+    def runtime_invocations(self) -> list:
+        if not self.runtime_log.exists():
+            return []
+        return [ln for ln in self.runtime_log.read_text().splitlines() if ln.strip()]
 
 
 @unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
@@ -139,7 +190,7 @@ class BashHookTests(unittest.TestCase):
             proc = self._run(fx, free_port())
             calls = fx.compose_invocations()
             self.assertTrue(calls, f"compose was never invoked:\n{proc.stdout}\n{proc.stderr}")
-            self.assertIn("up -d --build code_embed", calls[0])
+            _assert_code_embed_build_up(self, calls[0])
             # A successful build must NOT trigger the compatibility retry.
             self.assertEqual(len(calls), 1, calls)
             self.assertNotIn("was NOT rebuilt", proc.stdout)
@@ -153,6 +204,234 @@ class BashHookTests(unittest.TestCase):
             self.assertIn("--build", calls[0])
             self.assertNotIn("--build", calls[1])
             self.assertIn("was NOT rebuilt", proc.stdout)
+
+
+#: The plan's code_embed port for the port-provenance tests. A fixed,
+#: non-real port (nothing in VCO or the test fixtures listens on it) so the
+#: fake health service can bind it and the hook's probe can find it.
+PLAN_ROW_PORT = 12440
+
+#: The retired env input's decoy value: port 9 (discard) is unroutable
+#: locally — nothing ever answers there, so a hook that still read
+#: CODE_EMBED_PORT would probe a CLOSED port and fall through to compose.
+RETIRED_ENV_DECOY_PORT = 9
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class BashPlanPortProbeTests(unittest.TestCase):
+    """v0.2.97 — the hook probes the launcher.db plan's port, never env.
+
+    The plan (a code_embed row on port 12440, VCO-managed + enabled) says
+    one port; env CODE_EMBED_PORT says another (unroutable). The container
+    is missing, and a fake health service answers on the PLAN's port — so
+    "Port 12440 already in use" proves which port was probed, and no compose
+    invocation proves the hook stopped there.
+    """
+
+    def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+            fx = _Fixture(Path(tmp))
+            env = fx.env(PLAN_ROW_PORT)
+            env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+                          proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [],
+                             "the plan's port answered - compose must not run")
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class PowerShellPlanPortProbeTests(unittest.TestCase):
+    """R42 + v0.2.97 — the .ps1 port provenance is proven by RUNNING it."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+            fx = _Fixture(Path(tmp))
+            env = fx.env(PLAN_ROW_PORT)
+            env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
+            env["TEMP"] = str(fx.tmp)
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+                          proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [],
+                             "the plan's port answered - compose must not run")
+
+
+def _plan_failing_python(fx: "_Fixture") -> None:
+    """Make the hook's RUN_PY a wrapper that fails ONLY the
+    `service_lifecycle plan` invocation (exit 1) and delegates everything
+    else to the real interpreter — the 'plan unreadable this session' shape
+    (a transient Python error; note a corrupt or locked launcher.db cannot
+    produce it: every read error in `load_rows` soft-fails to empty rows and
+    the plan still exits 0). Steered through VCT_VENV: both venv resolvers
+    accept the interpreter file itself as the last tier-1 candidate."""
+    wrapper = fx.bin / "vco-plan-fail-python"
+    wrapper.write_text(textwrap.dedent(f"""\
+        #!/usr/bin/env bash
+        if [ "$1" = "-m" ] && [ "$2" = "vco_lib.service_lifecycle" ] && [ "$3" = "plan" ]; then
+            exit 1
+        fi
+        exec "{sys.executable}" "$@"
+        """))
+    wrapper.chmod(0o755)
+    fx.env_plan_unreadable = str(wrapper)
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class BashUnreadablePlanTests(unittest.TestCase):
+    """R9 H3 — an unreadable service_endpoints plan means NO action.
+
+    The container IS running (the runtime says so) but lives on a port the
+    hook could not learn (the plan subprocess failed this session). The old
+    behaviour probed the compiled default 11440, found it closed, and
+    RESTARTED the healthy container. The rule now: one line saying the plan
+    was unreadable, and nothing probed, started, restarted or composed.
+    """
+
+    def test_unreadable_plan_takes_no_state_changing_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(Path(tmp))
+            env = fx.env(free_port())
+            _plan_failing_python(fx)
+            env["VCT_VENV"] = fx.env_plan_unreadable
+            fx.marker.touch()  # the container exists and the runtime reports running
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn("plan unreadable", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("nothing probed, started or restarted", proc.stdout,
+                          proc.stdout + proc.stderr)
+            # Read-only inspect is the ONLY runtime command allowed; every
+            # state-changing verb (restart/start/rm/compose) must be absent.
+            for call in fx.runtime_invocations():
+                self.assertTrue(call.startswith("container inspect"), call)
+            self.assertEqual(fx.compose_invocations(), [])
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class PowerShellUnreadablePlanTests(unittest.TestCase):
+    """R9 H3 — the .ps1 sibling is proven by RUNNING it, not by reading it."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def test_unreadable_plan_takes_no_state_changing_action(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _Fixture(Path(tmp))
+            env = fx.env(free_port())
+            _plan_failing_python(fx)
+            env["VCT_VENV"] = fx.env_plan_unreadable
+            env["TEMP"] = str(fx.tmp)
+            fx.marker.touch()
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn("plan unreadable", proc.stdout, proc.stdout + proc.stderr)
+            self.assertIn("nothing probed, started or restarted", proc.stdout,
+                          proc.stdout + proc.stderr)
+            for call in fx.runtime_invocations():
+                self.assertTrue(call.startswith("container inspect"), call)
+            self.assertEqual(fx.compose_invocations(), [])
+
+
+def _refused_runtime_fixture(tmp: Path) -> "_Fixture":
+    """_Fixture's readable plan plus a PINNED runtime the resolver must
+    REFUSE: the fake podman answers ``version`` but its daemon is down
+    (``info`` fails) while ``VCT_CONTAINER_RUNTIME`` pins podman, so
+    ``vco_lib.containers resolve --shell`` exits 3 (state=absent,
+    requested=podman) — the exact NON-ZERO resolver answer R10 J1 is about:
+    under the hook's ``set -euo pipefail`` a bare ``out="$(cmd)" ; rc=$?``
+    aborted the shell at the assignment, so the hook died with the
+    resolver's exit code, empty stdout and a leaked
+    ``$TMPDIR/vco-containers-resolve.<pid>`` instead of reporting the
+    refusal on STDOUT (the R9 H3 contract this hook's plan branch rests
+    on). Same refusal shape as ``_refusal_fixture`` below, but with the
+    launcher.db the plan read needs."""
+    fx = _Fixture(tmp)
+    (fx.bin / "podman").write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        case "$1" in
+          version) exit 0 ;;
+          info) exit 1 ;;
+        esac
+        exit 0
+        """))
+    (fx.bin / "podman").chmod(0o755)
+    return fx
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class BashRefusedRuntimeTests(unittest.TestCase):
+    """R10 J1 — a refused runtime pin (resolver exit 3) is an EXPECTED
+    answer, not a hook failure: exit 0, the refusal line on STDOUT, no
+    leaked resolver temp file."""
+
+    def test_a_refused_pin_is_reported_not_fatal_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _refused_runtime_fixture(Path(tmp))
+            env = fx.env(free_port())
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("skipping", proc.stdout,
+                          "the refusal must be reported on STDOUT "
+                          f"(R9 H3 contract):\n{proc.stdout}\n{proc.stderr}")
+            leftovers = list(Path(tmp).glob("vco-containers-resolve.*"))
+            self.assertEqual(leftovers, [], f"resolver temp files leaked: {leftovers}")
+            # A refused runtime is a skip: compose is never reached.
+            self.assertEqual(fx.compose_invocations(), [])
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class PowerShellRefusedRuntimeTests(unittest.TestCase):
+    """R10 J1, .ps1 parity pin — the sibling already handled rc 3/4
+    (``-in 0, 3, 4``); this proves it stays that way."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def test_a_refused_pin_is_reported_not_fatal_and_cleans_up(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fx = _refused_runtime_fixture(Path(tmp))
+            env = fx.env(free_port())
+            env["TEMP"] = str(fx.tmp)
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("skipping", proc.stdout, proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [])
 
 
 @unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling mirrors it")
@@ -316,6 +595,129 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
         self.assertNotIn("--build", calls[0])
 
 
+def _refusal_fixture(tmp: Path, installed_clone: bool):
+    """A pinned runtime the resolver must REFUSE: `VCT_CONTAINER_RUNTIME`
+    names podman, the fake podman's daemon is down (`info` fails), so
+    `vco_lib.containers resolve` answers state=absent with requested=podman
+    — the refusal shape R9 H4 makes the hook record.
+
+    `installed_clone=True` gives the install root a `state/install/` dir
+    (what install.py creates): the ONE emitter then writes the ledger under
+    it. Without it (a dev checkout) the emitter writes nothing."""
+    bin_dir = tmp / "bin"
+    bin_dir.mkdir(parents=True, exist_ok=True)
+    orch = tmp / "orch"
+    orch.mkdir()
+    if installed_clone:
+        (orch / "state" / "install").mkdir(parents=True)
+        # What every installed clone has, and what makes `VCT_INSTALL_ROOT`
+        # count as one (`vco_lib.paths.looks_like_orchestrator_root`): the
+        # hook's `record-boot-refusal` writes the ledger of the clone the
+        # resolver read (`resolve_install_root`), not a path it guesses.
+        (orch / "vco_lib").mkdir()
+        (orch / ".claude").mkdir()
+    (bin_dir / "podman").write_text(textwrap.dedent("""\
+        #!/usr/bin/env bash
+        case "$1" in
+          version) exit 0 ;;
+          info) exit 1 ;;
+        esac
+        exit 0
+        """))
+    (bin_dir / "podman").chmod(0o755)
+    env = dict(os.environ)
+    env.update({
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
+        "PYTHONPATH": str(REPO_ROOT),
+        "VCT_ORCHESTRATOR_ROOT": str(orch),
+        "VCT_INSTALL_ROOT": str(orch),
+        "VCT_COMPOSE_DIR": str(tmp / "compose"),
+        "VCT_REQUIRED_CONTAINERS": "vco_weaviate",
+        "TMPDIR": str(tmp),
+        "VCT_CONTAINER_RUNTIME": "podman",
+    })
+    env.pop("VCT_DISABLE_HOOKS", None)
+    env.pop("VCT_VENV", None)
+    env.pop("VCO_VENV_PYTHON", None)
+    return env, orch
+
+
+def _ledger_cids(orch: Path) -> list:
+    sidecar = orch / ".claude" / "context" / "UPDATE_DEFERRED.json"
+    if not sidecar.exists():
+        return []
+    return [e.get("condition_id") for e in json.loads(sidecar.read_text())["entries"]]
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class EnsureContainersRefusalLedgerTests(unittest.TestCase):
+    """R9 H4 — a refused runtime pin reaches the deferral ledger from the
+    session path, through the ONE emitter the boot wrapper already uses.
+
+    All assertions run INSIDE the TemporaryDirectory (the ledger lives under
+    the fixture's own temp install root): reading it after the context exits
+    would read a deleted tree.
+    """
+
+    def _run(self, installed_clone: bool):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            env, orch = _refusal_fixture(tmp, installed_clone)
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-containers.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            return (proc.stdout + proc.stderr,
+                    _ledger_cids(orch), (orch / ".claude").exists())
+
+    def test_refused_pin_leaves_the_ledger_entry(self):
+        out, cids, _ = self._run(installed_clone=True)
+        self.assertIn("skipping", out, out)
+        self.assertIn("container_runtime_unusable", cids)
+
+    def test_a_dev_checkout_records_nothing(self):
+        out, cids, claude_exists = self._run(installed_clone=False)
+        self.assertIn("skipping", out, out)
+        self.assertFalse(claude_exists,
+                         "a root without state/install/ must not grow a ledger")
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class EnsureContainersRefusalLedgerPs1Tests(unittest.TestCase):
+    """R9 H4 — the .ps1 sibling is proven by RUNNING it, not by reading it."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def _run(self, installed_clone: bool):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            env, orch = _refusal_fixture(tmp, installed_clone)
+            env["TEMP"] = str(tmp)
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-containers.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            return (proc.stdout + proc.stderr,
+                    _ledger_cids(orch), (orch / ".claude").exists())
+
+    def test_refused_pin_leaves_the_ledger_entry(self):
+        out, cids, _ = self._run(installed_clone=True)
+        self.assertIn("skipping", out, out)
+        self.assertIn("container_runtime_unusable", cids)
+
+    def test_a_dev_checkout_records_nothing(self):
+        out, cids, claude_exists = self._run(installed_clone=False)
+        self.assertIn("skipping", out, out)
+        self.assertFalse(claude_exists,
+                         "a root without state/install/ must not grow a ledger")
+
+
 class _HealthHandler(BaseHTTPRequestHandler):
     payload: dict = {"status": "ok"}
 
@@ -332,9 +734,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 class _HealthService:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, port: int = 0):
         _HealthHandler.payload = payload
-        self.httpd = HTTPServer(("127.0.0.1", 0), _HealthHandler)
+        self.httpd = HTTPServer(("127.0.0.1", port), _HealthHandler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
@@ -405,7 +807,7 @@ class PowerShellHookTests(unittest.TestCase):
             )
             calls = fx.compose_invocations()
             self.assertTrue(calls, f"compose was never invoked:\n{proc.stdout}\n{proc.stderr}")
-            self.assertIn("up -d --build code_embed", calls[0])
+            _assert_code_embed_build_up(self, calls[0])
             self.assertEqual(len(calls), 1, calls)
 
     def test_a_compose_that_rejects_build_still_brings_the_service_up(self):

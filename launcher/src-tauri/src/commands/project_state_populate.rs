@@ -531,6 +531,62 @@ fn populate_skills(
 
 // ─── Hooks ─────────────────────────────────────────────────────────────
 
+/// One inner hook item of `.claude/settings.json`, as the mirror stores it.
+struct SettingsHook {
+    event: String,
+    matcher: String,
+    command: String,
+    /// settings.json `timeout` is in SECONDS (Claude Code convention).
+    timeout_s: Option<i64>,
+    /// The whole inner hook object — stored as the row's config so the GUI
+    /// can show `background`, `type`, etc.
+    item: JsonValue,
+}
+
+/// The strict-JSON walk. Schema (Anthropic): hooks: { Event: [ { matcher?,
+/// hooks: [ { command, type, timeout?, background?, ... } ] } ] }
+fn strict_settings_hooks(parsed: &JsonValue) -> Vec<SettingsHook> {
+    let mut out = Vec::new();
+    let Some(hooks_root) = parsed.get("hooks").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (event, blocks) in hooks_root {
+        for block in blocks.as_array().into_iter().flatten() {
+            let matcher = block.get("matcher").and_then(|v| v.as_str()).unwrap_or("");
+            for h in block.get("hooks").and_then(|v| v.as_array()).into_iter().flatten() {
+                if let Some(command) = h.get("command").and_then(|v| v.as_str()) {
+                    out.push(SettingsHook {
+                        event: event.clone(),
+                        matcher: matcher.to_string(),
+                        command: command.to_string(),
+                        timeout_s: h.get("timeout").and_then(|v| v.as_i64()),
+                        item: h.clone(),
+                    });
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The entries `hooks_settings list --with-items` returned for a JSONC file
+/// (same granularity and matcher normalisation as the strict walk).
+fn listed_settings_hooks(entries: Vec<JsonValue>) -> Vec<SettingsHook> {
+    let text = |e: &JsonValue, k: &str| e.get(k).and_then(|v| v.as_str()).map(str::to_string);
+    entries
+        .into_iter()
+        .filter_map(|e| {
+            Some(SettingsHook {
+                event: text(&e, "event")?,
+                matcher: text(&e, "matcher").unwrap_or_default(),
+                command: text(&e, "command")?,
+                timeout_s: e.get("timeout_seconds").and_then(|v| v.as_i64()),
+                item: e.get("item").cloned().unwrap_or(JsonValue::Null),
+            })
+        })
+        .collect()
+}
+
 fn populate_hooks(
     project_id: &str,
     claude_dir: &Path,
@@ -548,71 +604,48 @@ fn populate_hooks(
             return;
         }
     };
-    let parsed: JsonValue = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            report.warnings.push(format!(
-                "{} parse error: {} (skipping hook population)",
-                settings_path.display(),
-                e
-            ));
-            return;
-        }
-    };
-    let hooks_root = match parsed.get("hooks").and_then(|v| v.as_object()) {
-        Some(o) => o,
-        None => return,
-    };
-
-    // Schema (Anthropic): hooks: { Event: [ { matcher?, hooks: [ { command,
-    // type, timeout?, background?, ... } ] } ] }
-    for (event, blocks) in hooks_root {
-        let blocks = match blocks.as_array() {
-            Some(a) => a,
-            None => continue,
-        };
-        for block in blocks {
-            let matcher = block
-                .get("matcher")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            let hook_arr = match block.get("hooks").and_then(|v| v.as_array()) {
-                Some(a) => a,
-                None => continue,
-            };
-            for h in hook_arr {
-                let command = match h.get("command").and_then(|v| v.as_str()) {
-                    Some(c) => c.to_string(),
-                    None => continue,
-                };
-                // settings.json `timeout` is in SECONDS (Claude Code
-                // convention); the DB column is `timeout_ms`.
-                let timeout_ms = h
-                    .get("timeout")
-                    .and_then(|v| v.as_i64())
-                    .map(|s| s.saturating_mul(1000));
-                // Stash the rest of the hook entry as config so the
-                // launcher GUI can show `background`, `type`, etc.
-                let cfg = h.clone();
-                if let Err(e) = db.register_project_hook(
-                    project_id,
-                    event,
-                    &matcher,
-                    &command,
-                    "project",
-                    None,
-                    timeout_ms,
-                    &cfg,
-                ) {
+    // Strict JSON is the fast path. Anything else goes through the ONE JSONC
+    // reader (v0.2.97, R4 F32h) — the verb the Hooks tab lists through — so a
+    // settings.json with a comment or trailing comma is mirrored, not skipped.
+    let hooks = match serde_json::from_str::<JsonValue>(&raw) {
+        Ok(parsed) => strict_settings_hooks(&parsed),
+        Err(strict_err) => {
+            let folder = claude_dir.parent().unwrap_or(claude_dir);
+            let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db);
+            match crate::services::vco_lib_bridge::list_settings_hooks(root.as_deref(), folder) {
+                Ok(entries) => listed_settings_hooks(entries),
+                Err(e) => {
                     report.warnings.push(format!(
-                        "register_project_hook({}/{}): {}",
-                        event, matcher, e
+                        "{} parse error: {}; the JSONC reader could not read it either: {} \
+                         (skipping hook population)",
+                        settings_path.display(),
+                        strict_err,
+                        e
                     ));
-                } else {
-                    report.hooks_inserted += 1;
+                    return;
                 }
             }
+        }
+    };
+
+    for h in hooks {
+        let timeout_ms = h.timeout_s.map(|s| s.saturating_mul(1000));
+        if let Err(e) = db.register_project_hook(
+            project_id,
+            &h.event,
+            &h.matcher,
+            &h.command,
+            "project",
+            None,
+            timeout_ms,
+            &h.item,
+        ) {
+            report.warnings.push(format!(
+                "register_project_hook({}/{}): {}",
+                h.event, h.matcher, e
+            ));
+        } else {
+            report.hooks_inserted += 1;
         }
     }
 }
@@ -749,7 +782,11 @@ fn populate_kg_bindings(
     db: &Db,
     report: &mut PopulateReport,
 ) {
-    let weaviate_url = "http://localhost:8081";
+    // v0.2.97 (service endpoints plan §1 row 14): a binding records NO
+    // Weaviate URL. Where Weaviate is reached is machine-global — the
+    // launcher.db `service_endpoints` row — and a literal snapshotted here
+    // (it was `http://localhost:8081`) could only drift from it.
+    let weaviate_url: Option<&str> = None;
     let embedding_model = "qwen3-embedding:0.6b";
     let embedding_dim: i64 = 1024;
 
@@ -787,7 +824,7 @@ fn populate_kg_bindings(
             project_name,
             Some(embedding_model),
             Some(embedding_dim),
-            Some(weaviate_url),
+            weaviate_url,
             &JsonValue::Null,
         ) {
             report
@@ -829,7 +866,7 @@ fn populate_kg_bindings(
                     Some(embedding_model),
                     Some(embedding_dim),
                     None,
-                    Some(weaviate_url),
+                    weaviate_url,
                     &JsonValue::Null,
                 ) {
                     report
@@ -1915,6 +1952,48 @@ mod tests {
         std::fs::remove_dir_all(&folder).ok();
     }
 
+    /// v0.2.97 (R4 F32h) ACT. RED before: a comment or trailing comma — valid
+    /// for Claude Code — failed the strict parse and the mirror stayed empty.
+    /// Now the ONE JSONC reader (`hooks_settings list --with-items`) mirrors
+    /// the same rows, timeouts and per-item config as the strict walk.
+    #[test]
+    fn populate_hooks_mirrors_a_jsonc_settings_file() {
+        let folder = scratch_dir("hooks-jsonc");
+        let claude = folder.join(".claude");
+        std::fs::create_dir_all(&claude).unwrap();
+        let jsonc = r#"{
+  // the user's own note
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit(*.py)",
+        "hooks": [
+          {"type": "command", "command": "ruff check --fix", "timeout": 5},
+          {"type": "command", "command": "pyright", "background": true},
+        ]
+      }
+    ],
+    "Stop": [ { "hooks": [ {"type": "command", "command": "bash hooks/notify.sh"} ] } ],
+  },
+}
+"#;
+        std::fs::write(claude.join("settings.json"), jsonc).unwrap();
+        assert!(serde_json::from_str::<JsonValue>(jsonc).is_err(), "fixture must be JSONC");
+
+        let db = make_db_with_project("p1", "P");
+        let report = populate_project_state_from_filesystem("p1", "P", &folder, &db);
+        assert_eq!(report.hooks_inserted, 3, "warnings: {:?}", report.warnings);
+        let rows = db.list_project_hooks("p1").unwrap();
+        let ruff = rows.iter().find(|h| h.command.contains("ruff")).expect("ruff");
+        assert_eq!((ruff.event.as_str(), ruff.matcher.as_str()), ("PostToolUse", "Edit(*.py)"));
+        assert_eq!(ruff.timeout_ms, Some(5_000));
+        let pyright = rows.iter().find(|h| h.command == "pyright").expect("pyright");
+        assert_eq!(pyright.config.get("background"), Some(&serde_json::json!(true)));
+        let stop = rows.iter().find(|h| h.event == "Stop").expect("Stop");
+        assert_eq!(stop.matcher, "");
+        std::fs::remove_dir_all(&folder).ok();
+    }
+
     // ─── KG / codegraph defaults ────────────────────────────────────
 
     #[test]
@@ -1931,12 +2010,13 @@ mod tests {
         assert_eq!(primary.collection_name, "Acme_KnowledgeGraph");
         assert_eq!(primary.embedding_model.as_deref(), Some("qwen3-embedding:0.6b"));
         assert_eq!(primary.embedding_dim, Some(1024));
-        assert_eq!(
-            primary.weaviate_url.as_deref(),
-            Some("http://localhost:8081")
-        );
+        // SE-4 red-proof (7): the binding records no Weaviate URL — the
+        // machine row is where Weaviate is reached. Red against the
+        // `http://localhost:8081` literal this writer snapshotted.
+        assert_eq!(primary.weaviate_url, None);
         let shared = bindings.iter().find(|b| b.role == "shared").unwrap();
         assert_eq!(shared.collection_name, "VibeCodedOrchestrator_KnowledgeGraph");
+        assert_eq!(shared.weaviate_url, None);
 
         std::fs::remove_dir_all(&folder).ok();
     }

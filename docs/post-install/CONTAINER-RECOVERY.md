@@ -37,30 +37,40 @@ If everything is "Exited" or absent, jump to the next section.
 
 ## Restarting the container stack
 
-The canonical compose directory is `<project_root>/infrastructure/`
-(this is what the `ensure-containers.sh` hook prefers — its resolution
-order is `$VCT_COMPOSE_DIR` → `$VCT_INFRASTRUCTURE_DIR` →
-`$VCT_ORCHESTRATOR_ROOT/infrastructure` → `<project>/infrastructure` →
-`<project>/claude_mcp_servers` as a legacy fallback). Works whether
-your project uses Podman or Docker:
+The canonical compose home is `<install_root>/infrastructure/` — the
+boot/GPU wrapper's default. Do **not** run a bare `compose up -d`
+by hand: since v0.2.97 every VCO compose invocation names the
+`vco_managed` services explicitly (with `--no-deps`), because a bare
+`up` would also try to recreate containers VCO adopted from another
+compose project — on the installer's default, empty volumes. The
+supported ways to bring the stack back:
 
 ```bash
-cd <project_root>/infrastructure
-podman-compose up -d 2>/dev/null || docker compose up -d
+# the session hook (same code path every session start uses)
+bash <install_root>/.claude/hooks/ensure-containers.sh
+
+# or a full install/update run — it reconciles the rows and starts
+# everything they allow (VCO-managed through compose, adopted by name)
+python <install_root>/install.py --update
+
+# afterwards, re-check the rows against what is actually running
+python -m vco_lib.service_endpoints plan --json
+python -m vco_lib.service_endpoints reconcile
 ```
 
-Only if your install predates the `infrastructure/` layout (legacy
-orchestrator-clone setups), fall back to:
-
-```bash
-cd <project_root>/claude_mcp_servers
-podman-compose up -d 2>/dev/null || docker compose up -d
-```
-
-The `SessionStart` hook `ensure-containers.sh` runs the same command on
-every Claude Code session start — if containers came up via the hook
-once, they'll come up again. A persistently-failing hook means a
-config issue, not a transient one.
+`reconcile` re-checks the `service_endpoints` rows against the live
+services (and starts ADOPTED containers by name) — it never composes a
+`vco_managed` service itself, so a down VCO-managed container needs the
+hook or the install/update run above, not `reconcile`. The plan reads
+the rows and says what may be started: VCO-managed services through
+compose, adopted containers by
+name only (never removed, never recreated). The legacy
+`claude_mcp_servers/` compose home is no longer composed from — a
+container created there is adopted as it stands. The `SessionStart`
+hook `ensure-containers.sh` runs the same flow on every Claude Code
+session start — if containers came up via the hook once, they'll come
+up again. A persistently-failing hook means a config issue, not a
+transient one.
 
 ---
 
@@ -83,11 +93,32 @@ you when you click "Start" on a red row.
 
 ## Podman vs Docker: which runtime is active
 
-Auto-detected at install. Force a runtime with
-`VCT_CONTAINER_RUNTIME=podman|docker` in `<project>/.claude/env` or
-shell rc — env var wins over auto-probe. Authoritative on-disk source:
-`<install_root>/state/install/runtime.txt` (single word). Don't edit
-by hand; rerun install to regenerate.
+Auto-detected at the first install and recorded in
+`<install_root>/state/install/runtime.txt` (single word). From then on
+that record PINS the runtime everywhere — the session hooks, the
+launcher's services and storage pages, module containers and the hub —
+and a recorded runtime that is down is refused, never swapped for the
+other one (the two keep separate volumes, so a swap starts an empty
+stack). `VCT_CONTAINER_RUNTIME=podman|docker`, in the environment the
+process starts from (shell rc, `<project>/.claude/env`, or the login
+session for the launcher), overrides the record and stays strict: a
+pinned runtime that is down is refused, and the refusal names the pin.
+
+`install.py` (install and `--update`) reconciles the record with the
+machine before using it. A recorded runtime that is no longer installed,
+while the other one answers and holds VCO's containers/volumes (or there
+are none anywhere), is re-recorded, and `UPDATE_DEFERRED.md` says what
+changed. A recorded runtime that is installed but not answering is
+started the documented way; if it still does not answer, the update
+finishes everything that does not need containers and leaves an entry
+naming what to start, which clears by itself once it answers. When both
+runtimes hold VCO data, the record is kept and the entry asks which one is
+current. The boot service (`scripts/launch-claude-mcp-stack.*`) reads its
+OWN clone's record, applies the same decision without rewriting anything,
+and records a refusal in the same ledger. To switch for good: `python
+<install_root>/install.py --update --container podman|docker` (it
+re-records `runtime.txt` and marks the choice as yours). A running launcher
+keeps the environment it started with, so quit and relaunch it afterwards.
 
 **Daemon-vs-binary**: the CLI binary AND the daemon both need to run.
 Symptom: `docker --version` works but `docker ps` errors `Cannot
@@ -128,15 +159,20 @@ Common offenders:
 - **11440**: the code-embed service from a sibling project.
 - **7700**: an old `vct-hub` process that didn't exit cleanly.
 
-Resolution: stop the offender, OR change the orchestrator's port via
-env vars, THEN restart the relevant container. `WEAVIATE_PORT`,
-`OLLAMA_PORT`, `CODE_EMBED_PORT` and `VCT_HUB_PORT` are documented in
-[`../CONFIGURATION.md`](../CONFIGURATION.md) — Weaviate's under
-"Which Weaviate, vs which collection", which also gives the
-`WEAVIATE_URL` > `WEAVIATE_PORT` > `localhost:8081` precedence and the
-one caveat that matters here: the launcher's own resolver reads
-`WEAVIATE_URL`, not `WEAVIATE_PORT`, so set the URL if you want every
-surface to follow the move.
+Resolution: stop the offender, OR move the orchestrator's service to a
+free port, THEN restart it. Since v0.2.97 a VCO-managed service's port
+lives in its `service_endpoints` row — move it with
+`python -m vco_lib.service_endpoints move --service <svc> --port <N>`
+(from the install root; the same action is on the launcher's Services
+page). The move updates the row, rewrites the managed keys in
+`infrastructure/.env`, recreates the container with the data-mount
+identity checks, and re-projects every registered project, so every
+surface follows it — nothing to hand-edit. Adopted services are never
+moved by VCO: if the offender is a container you adopted, either move
+the row to another candidate (`service_endpoints adopt`) or free the
+port at its owner. `VCT_HUB_PORT` (the hub is a native binary, not a
+container service) is documented in
+[`../CONFIGURATION.md`](../CONFIGURATION.md).
 
 ---
 

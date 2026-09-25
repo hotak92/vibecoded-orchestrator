@@ -206,7 +206,91 @@ class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.93: step 5 skipped --force-recreate/--build for running service(s) whose container another compose project created (labels). Human decides: apply there, or hand ownership to install.py's compose."
+notes = """v0.2.93 origin; v0.2.97 NARROWED to code-embed: the automatic recreate-with-cache (service_lifecycle.migrate_code_embed, run by install.py step [5b]) refused (nothing stopped) or failed and rolled back — or step 5's guard met a foreign-owned code_embed. A Weaviate/Ollama another compose project runs is ADOPTED by design (vco_lib.service_reconcile) and never produces this row. Re-detected every run; the run whose move goes through drops it."""
+
+[conditions.service_registry_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: `vct-hub --ensure-db` failed or left launcher.db without the service_endpoints table (a missing or pre-047 hub binary). The run used its detected endpoints as in-memory pins for compose, settings and the MCP registration. Emitted by vco_lib.service_reconcile INSIDE the install.py run (into its report) and re-detected every run, so the first run with a current hub binary drops it."""
+
+[conditions.service_endpoint_unreachable]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_endpoint_still_unreachable"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "endpoint"]
+notes = """v0.2.97: a recorded endpoint does not answer after VCO ran its lifecycle (compose start / start-by-name), an adopted container is gone, or the legacy import kept a previously effective endpoint nothing answers on. VCO never switches to another instance on its own (plan I6). The probe re-checks every named service's row endpoint; all answering ⇒ resolved."""
+
+[conditions.service_endpoint_ambiguous]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_endpoint_still_ambiguous"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "candidates"]
+notes = """v0.2.97: more than one running instance holds VCO data; the ranking picked one (continuity, else the canonical port). Clears once the user confirms a row (`service_endpoints adopt`, confirmed_by_user=1) or at most one candidate still holds VCO data."""
+
+[conditions.legacy_service_statement_unimported]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+dismiss_key = ["source", "value"]
+notes = """v0.2.97: an older endpoint setting (app_state *.port_override, a non-default vct-config.toml weaviate_url, an exported VCT_*_URL, or an import run's services.toml / alt-port override value) names an endpoint that does not answer and did not win. Re-detected every install run for the settings that stay in place, so settling or removing them drops the entry."""
+
+[conditions.container_runtime_record_reconciled]
+class = "informational_record"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97 (R8 G1): install.py rewrote `state/install/runtime.txt` because VCO's own record named a runtime that is not installed (or holds none of VCO's containers/volumes while the other runtime holds them) — `runtime_reconcile.apply_at_install`, called from `_detect_system` INSIDE the install run, into that run's report. The next run finds the record matching the machine, does not re-detect it, and finalize drops it (one-shot record, family A). The auto-resolutions trail carries the same event."""
+
+[conditions.container_runtime_unusable]
+class = "action_required"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "probe:py:container_runtime_still_unusable"
+emit_surfaces = ["ledger"]
+dismiss_key = ["runtime", "via", "root"]
+notes = """v0.2.97 (R8 G1/G6): the pinned runtime (VCT_CONTAINER_RUNTIME, or VCO's record after reconcile could not settle it) cannot be used — install.py tried the documented start, skipped containers and finished the rest of the run; or the boot wrapper `scripts/launch-claude-mcp-stack.{sh,ps1}` exited 3 (`python -m vco_lib.runtime_reconcile record-boot-refusal`). The probe re-runs `containers.resolve()` for the entry's install root as the probing process sees the pin; it clears once that resolves to a runtime with compose (install re-probe pass, doctor, bundle update)."""
+
+[conditions.container_runtime_data_under_both]
+class = "action_required"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "probe:py:container_runtime_data_still_under_both"
+emit_surfaces = ["ledger"]
+dismiss_key = ["recorded", "root"]
+notes = """v0.2.97 (R8 G1 case c): podman AND docker both hold VCO containers/volumes; the recorded runtime was kept. R11 L2: also written when VCO's data is a bind-mounted host folder and the OTHER runtime holds VCO containers that are not running beside it (either runtime could serve the folder) — the recorded runtime is kept when it answers; when it is not installed nothing is started. Clears once the user confirms a runtime (`install.py --update --container <x>` writes `state/install/runtime.confirmed`) or VCO's data is no longer under both (the probe asks the same bind-layout rule the reconcile applies)."""
+
+[conditions.adopted_service_config_drift]
+class = "environmental"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:adopted_service_config_drift_persists"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "drift_keys"]
+notes = """v0.2.97: an adopted container runs without VCO's behaviour-critical env (Weaviate's reclaim tuning, OLLAMA_KEEP_ALIVE). True of the machine while it lasts; VCO never recreates an adopted container. The opt-in fix is `service_endpoints hand-to-vco` (owner ruling Q2)."""
+
+[conditions.service_adopted_without_prompt]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97 (owner ruling Q1): an unattended install found an Ollama VCO did not start and uses it instead of starting a second copy. One-shot record: the next run (rows present) does not re-detect it and drops it."""
+
+[conditions.service_endpoints_migrated]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the one-time legacy import ran (services.toml renamed .migrated-v0297, the alt-port override .retired-v0297, consumed port_override keys deleted, legacy-default binding URLs NULLed). One-shot record."""
+
+[conditions.service_adoption_confirmation_required]
+class = "action_required"
+owner = "vco_lib.service_reconcile"
+clear_probe = "probe:py:service_adoption_confirmation_still_pending"
+emit_surfaces = ["ledger"]
+dismiss_key = ["service", "candidate"]
+notes = """v0.2.97 (owner ruling Q1): an unattended run found a third-party Weaviate without VCO data. VCO adopted nothing and started nothing: its Weaviate row is vco_managed but DISABLED on a free port until the user runs `service_endpoints adopt` or `use-vco-copy`. The probe reads the row: no longer the disabled shape ⇒ resolved."""
 
 [conditions.services_compose_up_failed]
 class = "action_required"
@@ -564,6 +648,26 @@ that is what re-renders the registration, now verifying the argv before it \
 writes. No dismiss_key: an unrunnable registration is a real break, not a \
 description of the machine to acknowledge."""
 
+[conditions.former_launcher_cli_on_path]
+class = "action_required"
+owner = "vco_lib.doctor"
+clear_probe = "probe:py:former_launcher_cli_still_on_path"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97. The launcher's Rust CLI was `vco` until v0.2.96 — the name \
+of the orchestrator's Python console script — and `vct` before v0.1.0 (now the \
+secrets tool); it is `vct-cli` since v0.2.97. A copy left on PATH under an old \
+name hides, or is hidden by, the real program of that name, so "run \
+`vco doctor`" answers "unrecognized subcommand". The doctor's \
+`former_launcher_cli` probe (install root, full scope) identifies each `vco` / \
+`vct` on PATH by what it prints — `--version` = "<name> <digit>" AND `-h` \
+carries the CLI's tagline — through `vco_lib.launcher_cli_identity`, the same \
+rule `launcher/tools/vct-cli/install.sh` uses to remove the copy it installed. \
+The doctor never deletes a binary. The clear probe re-runs the reading: first \
+on the paths the entry names (so a PATH that differs from the user's shell \
+cannot clear it), then on the current PATH. action_required: removing the copy \
+is the user's act. No dismiss_key — keeping it is a dismissal with manual \
+semantics."""
+
 [conditions.code_embed_image_stale]
 class = "action_required"
 owner = "vco_lib.doctor"
@@ -844,7 +948,30 @@ class = "action_required"
 owner = "vco_lib.project_init"
 clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
-notes = "Probed clear (B-F8 re-scan) on every bundle update."
+notes = """Probed clear (B-F8 re-scan) on every bundle update. v0.2.97: the \
+detection is `config_projection.retained_launcher_value_names` — the SAME set \
+every `apply_project_env` removes: a JSON env-block value that EQUALS the \
+launcher's stored value for that key (resolved through the hub, active-gated, \
+compared in constant time; GITHUB_TOKEN against github_pat), and secret-shaped \
+exports in VCO's own .claude/env managed block. A name match alone proves \
+nothing (review R2 F18). The refresh also clears the entry (paired) once \
+nothing remains, trailing each removed key NAME in auto-resolutions.jsonl; an \
+unanswerable check keeps it (reconciler reads None as "keep")."""
+
+[conditions.user_owned_secret_value_in_tree]
+class = "action_required"
+owner = "vco_lib.user_owned_secrets"
+clear_probe = "probe:py:user_owned_secret_values_still_present"
+emit_surfaces = ["ledger"]
+dismiss_key = ["keys"]
+notes = """v0.2.97. An env key with a non-empty value in `.claude/settings.json` \
+env or `.vscode/settings.json` claude-code.env that VCO cannot PROVE it wrote: a \
+secret-shaped name (vco_lib.secrets_audit.is_secret_shaped_env_key) the launcher \
+never stored, or a launcher-known name whose value differs from the stored one or \
+cannot be checked (paused, resolver down) — review R2 F18. Provably VCO-written \
+values are user_secret_values_retained_in_tree's, and every refresh removes them. \
+VCO never removes these; a human moves the value into the secrets store or keeps it. Emitted by the bundle update; cleared by the probe once no such key \
+carries a value; dismissible per set of `file:KEY` names (a new key re-fires)."""
 
 [conditions.template_review_pending]
 class = "informational_record"
@@ -857,9 +984,36 @@ notes = """v0.2.91 decision #7: keeps emitting, but tiers as a record so the \
 content-keyed dismissal (v0.2.83 D9 reference-sidecar hashes) is now ONE \
 instance of the generalized dismiss_key mechanism, not a bespoke path."""
 
+[conditions.parked_hook_live_conflict]
+class = "action_required"
+owner = "vco_lib.parked_hooks"
+clear_probe = "probe:py:parked_hook_conflict_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97. A hook is parked as disabled in launcher.db AND registered \
+in settings.json, so it runs while the Hooks tab keeps a disabled record. Every \
+bundle update before v0.2.97 produced this for each disabled hook (it re-added \
+them); a line restored by hand looks identical, so VCO never removes the running \
+entry — the user picks the state (re-disable, or Enable on the Disabled row, \
+which clears the stale parked row). Emitted by the bundle update; cleared by the \
+probe once no hook is both parked and running (None — keep — when launcher.db \
+or settings.json cannot be read)."""
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Paired-resolution conditions (family C)
 # ═══════════════════════════════════════════════════════════════════════════
+
+[conditions.vscode_default_pin_migration_failed]
+class = "action_required"
+owner = "vco_lib.machine_migrations"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the one-time panel ANTHROPIC_MODEL pin migration could \
+not run (no venv, the venv child failed, or a settings file it could not \
+read). Added to install.py's run report after step 5. Cleared ONLY by \
+positive evidence: `machine_migrations._panel_default_pin` calls \
+mark_resolved on a run whose venv child answers without a refusal \
+(`already-migrated` included) — a run that never reached the leg leaves it \
+standing, which drop-when-absent would not."""
 
 [conditions.kg_summary_no_backend]
 class = "auto_retryable"
@@ -1170,7 +1324,12 @@ notes = """v0.2.91: had NO lifecycle at all (31 days and counting on the \
 maintainer's own install). The entry names its `<path>.from-upstream-<sha>` \
 sidecars; once the user has accepted or deleted every one of them the \
 condition is objectively over, so the probe resolves it. Follows the \
-`stale_codegraph_wrapper_pending` probed-clear precedent."""
+`stale_codegraph_wrapper_pending` probed-clear precedent. v0.2.97: a sidecar of \
+a RENDERED file (`vco_lib/rendered_root_files.toml`, CLAUDE.md today) holds only \
+upstream's placeholder — nothing to adopt — so the launcher writes none, \
+install.py's re-render reaps the stale ones (`rendered_root_files.reap_stale_sidecars`, \
+recorded in `.claude/logs/auto-resolutions.jsonl` under this cid), and the \
+probe does not count them."""
 
 [conditions.rendered_file_upstream_changed]
 class = "informational_record"
@@ -1369,6 +1528,40 @@ class = "action_required"
 owner = "vco_lib.config_projection"
 clear_probe = "manual-dismiss"
 emit_surfaces = ["ledger"]
+notes = """`reproject-all` could not re-project one registered project (its \
+folder unreachable, a write error). v0.2.97: NOT emitted when the cause is a \
+settings file the writer refused to touch — that project gets a `refused` \
+outcome instead, and its own ledger already holds the accurate \
+`settings_write_refused_<surface>` entry (re-running `reproject-all` would not \
+fix an unparseable file, which is what this entry's command says to do)."""
+
+[conditions."settings_write_refused_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.settings_refusal"
+clear_probe = "probe:py:settings_write_refusal_still_applies"
+emit_surfaces = ["ledger"]
+dismiss_key = ["path", "kind", "sha256"]
+notes = """v0.2.97. An env-block writer (the canonical projection, the user-secret \
+strip, or `write-env-block` for the launcher's module-deprecation keys) found \
+`.claude/settings.json` / `.vscode/settings.json` existing but not editable — \
+not JSON(C), not UTF-8, unreadable, a non-object root, or a JSONC edit that could \
+not be verified — and left it byte-identical instead of rewriting it as `{}` plus \
+its block (the pre-v0.2.97 behaviour, which destroyed every other setting). The \
+bundle's settings.json merge (`vco_lib.bundle_settings_io`) records its own \
+surface, `bundle_claude_settings_json`: before v0.2.97 it skipped any \
+non-strict-JSON file SILENTLY, so newly shipped hooks never landed in a JSONC \
+settings.json; it now edits JSONC in place and refuses only what it cannot \
+verify. The Hooks tab (`vco_lib.hooks_settings`) records its own too, \
+`hooks_claude_settings_json` (review F19: sharing the projection's surface let a \
+successful hook edit clear the projection's still-true refusal). ONE surface \
+per WRITER, so each refusal is cleared only by the writer that made it. One \
+entry per surface (`settings_write_refused_<surface>`). Cleared by the next \
+successful write of that surface (paired, `settings_refusal.clear_recorded`) and \
+by the probe: resolved once the file is gone or reads as an object; a refused \
+JSONC edit stays while its bytes are unchanged (None once they change). \
+dismiss_key includes the file's sha256, so a dismissal re-fires if the file \
+changes and is still refused."""
 
 [conditions.code_formats_schema_migration_pending]
 class = "action_required"
@@ -1385,8 +1578,14 @@ emit_surfaces = ["ledger"]
 [conditions.legacy_bash_env_cleanup_pending]
 class = "action_required"
 owner = "vco_lib.project_init"
-clear_probe = "manual-dismiss"
+clear_probe = "probe:py:bash_env_cleanup_still_owed"
 emit_surfaces = ["ledger"]
+notes = """v0.2.97: state-keyed. Cleared once `.claude/settings.json` holds no \
+`BASH_ENV` naming the lean-ctx shim (or is gone); kept while the file is \
+unreadable or still points at the shim. Every re-probe pass runs AFTER its \
+update's cleanup (bundle engine; install.py), so a cleanup that now succeeds \
+removes the key first and the same pass clears the entry. Before v0.2.97 \
+this row was manual-dismiss only."""
 
 [conditions.orphan_code_collections_detected]
 class = "action_required"
@@ -1412,6 +1611,56 @@ pointer, the seed snapshot and the root's shared binding directly — the \
 printed remedy (pick, then re-run install.py --update) is the thing that \
 clears the entry. A pick naming a dead class still defers, with the dead \
 pick named in the reasons."""
+
+# ── schema_migration_runner tagged errors (v0.2.97) ────────────────────────
+# These ids travel as a trailing `[id]` tag inside an error detail and become
+# condition ids in `build_deferral_entries` — which is why a `condition_id=`
+# source scan never saw them. The runner now DECLARES them
+# (`ERROR_CONDITION_IDS`), the decoder refuses an undeclared tag, and the
+# completeness test imports that set. The runner re-evaluates every artifact
+# on every pass, so the lifecycle is "not re-detected ⇒ over": install.py
+# owns them for the root ledger (its finalize drops an id it did not re-emit),
+# and `project_init._clear_runner_conditions_not_reemitted` is the paired
+# clear a per-project `migrate-schema` pass runs on its own ledger.
+
+[conditions.schema_migration_script_missing]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A recorded version is behind canonical and no migration edge \
+ships for the gap (or the shipped ladder has a hole). Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_migration_probe_unreachable]
+class = "auto_retryable"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """Weaviate did not answer the NEVER_MATERIALIZED existence probe, so \
+the runner refused to stamp born-at-canonical; the next pass with Weaviate \
+up re-evaluates and, not re-emitting it, drops the row. Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_migration_classification]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A shipped edge's declared classification disagrees with the \
+artifact's. Per-project clear: _clear_runner_conditions_not_reemitted."""
+
+[conditions.schema_version_unrecorded]
+class = "action_required"
+owner = "vco_lib.schema_migration_runner"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """A SELF-RECORDED artifact (bundle_materialization) has no row, or \
+one behind canonical: the materializer's own record (from the manifest it \
+wrote) did not happen. Remedy: re-run the bundle update (launcher) or \
+install.py --update for the root; the successful record makes the next pass \
+read UP_TO_DATE and the row drops. Per-project clear: \
+_clear_runner_conditions_not_reemitted."""
 
 [conditions.schema_migration_refuse_downgrade]
 class = "action_required"
@@ -1613,6 +1862,31 @@ touches `~/.claude.json` (house rule 4) — so the entry SURFACES the copy \
 command rather than running it, and the command is `cp`, never `mv`. Emitted \
 ONLY when the old slug directory actually exists; a project that never \
 hosted a session gets no entry at all."""
+
+[conditions.project_move_env_reprojection_failed]
+class = "action_required"
+owner = "vco_lib.project_move"
+clear_probe = "probe:py:env_reprojection_still_owed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97: the post-flip `python -m vco_lib.config_projection apply` \
+exited non-zero, so the moved project's `.claude/settings.json` / \
+`.claude/env` were not re-derived from the new row and may still name the \
+old folder. Until v0.2.97 this failed on EVERY move (the mover passed a \
+`--folder` flag `apply` never had) and the only trace was a warning in the \
+post-flip JSON the GUI did not render. The entry quotes the child's stderr \
+and carries the exact re-run command (argv from \
+`config_projection.build_apply_argv`, the builder beside the parser). \
+It ends on EVIDENCE, three ways, all tri-state (only a positive match clears): \
+the probe `env_reprojection_still_owed` (`project_move.env_reprojection_still_owed`, \
+reading the project id the emitter records in `dismiss_fields`) resolves it \
+once both default surfaces hold what `project_env_from_db` derives from the \
+current row — after the printed command, the launcher's re-projection or \
+`reproject-all`; `vco project move --verify` runs the same check; and the \
+next successful `project_move.run_env_reprojection` for that folder (a \
+rename) clears it as a paired resolution. Until v0.2.97's review it was \
+`manual-dismiss` and outlived a successful re-run. A stale path left \
+behind is ALSO reported by `project_move_stale_path_reference`, whose \
+`vco project move --verify` re-scan clears on its own."""
 
 # ── v0.2.92 WP-18 / W14: `vco project rename-collections` ──────────────────
 #

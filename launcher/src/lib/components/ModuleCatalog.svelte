@@ -84,6 +84,13 @@
     type ModuleTriChoice,
   } from '$lib/module-enable';
   import { listen as tauriListen } from '$lib/tauri';
+  // v0.2.97 (lane V): the hub polls each module's `runtime.health_check`;
+  // the tile shows the result as a pill (unknown is never shown as down).
+  import {
+    HEALTH_REFRESH_MS,
+    resolveModuleHealthPill,
+    type HealthSnapshot,
+  } from '$lib/module-health';
 
   type Filter = 'all' | 'free' | 'pro' | 'installed';
 
@@ -332,6 +339,26 @@
   // of the relative-time string once per minute so the user sees the
   // counter advance without having to re-trigger a fetch.
   let now = $state(Date.now());
+
+  // v0.2.97 (lane V): module health from the hub (`module_health_snapshot`),
+  // re-read every HEALTH_REFRESH_MS while the catalog is open. A failed read
+  // keeps the last snapshot but every pill then reads "unknown".
+  let healthSnapshot = $state<HealthSnapshot | null>(null);
+  let healthError = $state<string | null>(null);
+  async function loadHealth() {
+    try {
+      healthSnapshot = await invoke<HealthSnapshot>('module_health_snapshot');
+      healthError = null;
+    } catch (e) {
+      healthError = e instanceof Error ? e.message : String(e);
+    }
+  }
+  $effect(() => {
+    void loadHealth();
+    const handle = setInterval(() => void loadHealth(), HEALTH_REFRESH_MS);
+    return () => clearInterval(handle);
+  });
+
   $effect(() => {
     const handle = setInterval(() => {
       now = Date.now();
@@ -448,11 +475,12 @@
     // v0.2.35 Agent M (2026-05-26): container-runtime preflight. Runs on
     // EVERY install click (not gated behind a "first-time" flag) so that
     // a user who uninstalls their runtime mid-session gets an actionable
-    // modal instead of the cryptic "no container runtime found" error
-    // from `installer_engine::detect_container_runtime` deep inside
-    // `run_install`. The preflight command never returns Err — failures
-    // surface as `available: false` so the modal renders rather than
-    // a generic error toast.
+    // modal instead of a cryptic error deep inside `run_install`.
+    // v0.2.97 R12: every runtime-STATE answer (refused pin, nothing
+    // installed, no compose) comes back as `available: false` so the
+    // modal renders; the command returns Err in exactly ONE case — the
+    // ONE verdict could not run (missing/broken Python = broken install,
+    // loud-fail). That Err is surfaced below, never swallowed.
     try {
       const availability = await invoke<PreflightRuntimeAvailability>(
         'check_container_runtime_available',
@@ -468,12 +496,16 @@
         return;
       }
     } catch (e) {
-      // The Rust command's contract is "never Err", but the IPC
-      // transport itself could fail (Tauri unavailable in dev browser
-      // mode). Fall through to the install attempt — `install_module_
-      // for_project` will surface its own error if the runtime really
-      // is missing.
-      console.warn('[ModuleCatalog] preflight runtime check failed, proceeding without gate:', e);
+      // R12-bis P3-1: Err means broken install — the message carries its
+      // own remedy. Surface it and STOP: falling through to `runInstall`
+      // would attempt the install on the same broken Python and bury
+      // this error inside a generic install failure. (A dev-browser IPC
+      // transport failure shares this path, and stopping is right there
+      // too — there is no runtime gate to bypass.)
+      toast.error(`Install blocked — runtime preflight failed: ${e}`, {
+        key: `module:${m.id}:install`,
+      });
+      return;
     }
 
     await runInstall(m);
@@ -908,6 +940,7 @@
              so the inline `{@const}` is valid (Svelte 5 requires
              const tags to be the immediate child of a block). -->
         {@const ppBadge = resolvePerProjectBadge(m, installRow)}
+        {@const healthPill = resolveModuleHealthPill(healthSnapshot, m.id, project?.id ?? null, healthError)}
         <div class="module-card glass-card" style:--accent="rgb({getColorRgb(color as BrandColor)})">
           <div class="card-head">
             <div class="card-icon" style:background="rgba({getColorRgb(color as BrandColor)}, 0.12)" style:border-color="rgba({getColorRgb(color as BrandColor)}, 0.25)">
@@ -975,6 +1008,17 @@
                 >
                   {ppBadge.label}
                 </span>
+                {#if healthPill}
+                  <!-- v0.2.97 (lane V): runtime.health_check status. -->
+                  <span
+                    class="pp-badge pp-badge-health-{healthPill.state}"
+                    title={healthPill.tooltip}
+                    data-testid="module-health-pill"
+                    data-health={healthPill.state}
+                  >
+                    {healthPill.label}
+                  </span>
+                {/if}
               </div>
               <p class="card-meta">
                 <span class="mono">v{m.version}</span> · {m.category}
@@ -1562,6 +1606,21 @@
   .pp-badge.pp-badge-none {
     background: rgba(255, 255, 255, 0.03);
     color: var(--color-muted);
+  }
+  /* v0.2.97 (lane V): health pills — brand teal (up), brand pink (down),
+     neutral (unknown: nothing observed, never styled like a failure). */
+  .pp-badge.pp-badge-health-up {
+    background: rgba(0, 191, 166, 0.12);
+    color: var(--color-teal);
+  }
+  .pp-badge.pp-badge-health-down {
+    background: rgba(255, 79, 160, 0.12);
+    color: var(--color-pink);
+  }
+  .pp-badge.pp-badge-health-unknown {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--color-mid);
+    border: 1px dashed rgba(255, 255, 255, 0.16);
   }
 
   /* Bug 16: kind-aware status badges. */

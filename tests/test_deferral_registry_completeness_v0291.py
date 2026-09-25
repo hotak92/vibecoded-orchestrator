@@ -244,6 +244,40 @@ _V0295_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.97: the schema-migration runner's tagged-error ids, declared for the
+# first time. The runner re-evaluates every artifact on every pass and its
+# report lands in install.py's run report IN the same run (so the finalize
+# keeps a re-detected id and drops one that is over) — the same lifecycle the
+# `schema_migration_failed_*` family already had. Per-project ledgers get the
+# paired clear in `project_init._clear_runner_conditions_not_reemitted`.
+_V0297_OWNED_ADDITIONS = frozenset({
+    "schema_migration_script_missing",
+    "schema_migration_probe_unreachable",
+    "schema_migration_classification",
+    "schema_version_unrecorded",
+    # v0.2.97 SE-2 (service endpoints). All four are emitted by
+    # `vco_lib.service_reconcile.reconcile`, which install.py step [5b] calls
+    # INSIDE its run and whose entries it adds to THAT run's report — family A
+    # proper, never behind finalize's back. `service_registry_unavailable` and
+    # `legacy_service_statement_unimported` are re-detected on every run (the
+    # hub binary is re-tried; the settings that stay in place are re-checked
+    # against the row), so the run that settles them drops them. The two
+    # records (`service_adopted_without_prompt`, `service_endpoints_migrated`)
+    # describe a completed one-time action: the next run has rows, does not
+    # re-detect them, and the one-shot expiry is the whole lifecycle.
+    "service_registry_unavailable",
+    "legacy_service_statement_unimported",
+    "service_adopted_without_prompt",
+    "service_endpoints_migrated",
+    # v0.2.97 R8 G1: `vco_lib.runtime_reconcile.apply_at_install` runs from
+    # install.py's `_detect_system` INSIDE the run and adds the record to THAT
+    # run's report — family A proper. It records a completed one-time action
+    # (runtime.txt re-recorded); the next run finds the record matching the
+    # machine, does not re-detect it, and the one-shot expiry is the lifecycle.
+    "container_runtime_record_reconciled",
+})
+
+
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
         if not path.is_file() or path.suffix not in suffixes:
@@ -322,6 +356,47 @@ def scan_emitted_condition_ids() -> dict:
             if name in consts:
                 _emit(consts[name], m.start())
 
+    # The tagged-error protocol (v0.2.97): a schema-migration error detail
+    # ends in ``[<id>]`` and ``build_deferral_entries`` files it under that id.
+    # No ``condition_id=`` ever names these, which is how
+    # ``schema_migration_script_missing`` / ``_probe_unreachable`` shipped
+    # undeclared. The decoder only accepts DECLARED ids, so the emittable set
+    # is imported, not guessed; ``test_every_runner_error_tag_is_declared``
+    # pins the declaration against the tags actually written.
+    from vco_lib import schema_migration_runner as smr  # noqa: PLC0415
+
+    where = "vco_lib/schema_migration_runner.py (tagged errors)"
+    for cid in smr.ERROR_CONDITION_IDS | {smr.UNTAGGED_CONDITION_ID}:
+        add(cid, where)
+    for prefix in smr.ERROR_CONDITION_PREFIXES:
+        add(prefix + "*", where)
+
+    return found
+
+
+#: A trailing ``[id]`` inside a string literal (optionally an f-string field),
+#: preceded by a quote or whitespace — the runner's tag grammar in source.
+_RUNNER_TAG = re.compile(
+    r"""(?:["']|\s)\[(?P<val>[a-z][a-z0-9_]*(?:\{[^}]*\}[a-z0-9_]*)*)\]["']"""
+)
+
+
+def scan_runner_error_tags() -> dict:
+    """Every ``[id]`` tag written in a file that produces tagged errors — any
+    shipped module that appends to a ``MigrationRunReport``'s ``errors``
+    (identified structurally: it defines or constructs ``MigrationRunReport``
+    AND appends to ``.errors``)."""
+    found: dict = {}
+    for rel, path in _iter_source_files({".py"}):
+        text = path.read_text(encoding="utf-8", errors="replace")
+        if "MigrationRunReport" not in text or "errors.append(" not in text:
+            continue
+        if "class MigrationRunReport" not in text and "MigrationRunReport(" not in text:
+            continue
+        for m in _RUNNER_TAG.finditer(text):
+            val = re.sub(r"\{[^}]*\}", "*", m.group("val"))
+            line = text[: m.start()].count("\n") + 1
+            found.setdefault(val, []).append(f"{rel}:{line}")
     return found
 
 
@@ -370,12 +445,32 @@ class TestRegistryCompleteness(unittest.TestCase):
             "launcher_binary_stale",            # rust const
             "launcher_update_diverged",         # rust hand-rendered markdown
             "kg_sync_no_embedding_backend",     # the template script
+            "schema_migration_script_missing",  # runner tagged error (v0.2.97)
+            "schema_migration_probe_unreachable",
         ):
             self.assertIn(
                 cid, emitted,
                 f"scanner missed {cid!r} — the completeness gate is only as "
                 f"good as this scan",
             )
+
+    def test_every_runner_error_tag_is_declared(self):
+        """v0.2.97: every ``[id]`` tag the runner WRITES is in its declared
+        emittable set (or a declared non-emitted tag). A tag missing from the
+        declaration would be filed under the untagged fallback at runtime —
+        wrong condition, wrong remedy — and would dodge the gate above."""
+        from vco_lib import schema_migration_runner as smr  # noqa: PLC0415
+
+        tags = scan_runner_error_tags()
+        self.assertIn("schema_migration_script_missing", tags,
+                      "the tag scan matched nothing — fix it before trusting it")
+        undeclared = {
+            tag: sites for tag, sites in tags.items()
+            if tag not in smr.ERROR_CONDITION_IDS
+            and tag not in smr.NOT_EMITTED_TAGS
+            and not any(tag.startswith(p) for p in smr.ERROR_CONDITION_PREFIXES)
+        }
+        self.assertFalse(undeclared, f"undeclared runner error tags: {undeclared}")
 
     def test_lock_exemption_needs_both_structural_signals(self):
         """Self-check for the exemption the scan above grants.
@@ -529,9 +624,24 @@ class TestRegistryCompleteness(unittest.TestCase):
         # `kg_unclaimed_populated_classes` (v0.2.92 item 3): same shape —
         # the doctor's entry builder attaches the unclaimed class set
         # (doctor._kg_unclaimed_entry's dismiss_fields).
+        # `settings_write_refused_*` (v0.2.97): `settings_refusal.record`
+        # attaches path / kind / sha256 of the refused file on every emit
+        # (pinned by tests/test_v0297_settings_write_refusal.py).
         emitter_supplied = {
             "dual_ollama_detected", "kg_binding_evidence_mismatch",
-            "kg_unclaimed_populated_classes",
+            "kg_unclaimed_populated_classes", "settings_write_refused_*",
+            # v0.2.97: user_owned_secrets.emit_deferral attaches the `file:KEY` set.
+            "user_owned_secret_value_in_tree",
+            # v0.2.97 SE-2: vco_lib.service_reconcile's entry builders attach
+            # these on every emit (pinned by tests/test_v0297_service_reconcile.py).
+            "service_endpoint_unreachable", "service_endpoint_ambiguous",
+            "legacy_service_statement_unimported", "adopted_service_config_drift",
+            "service_adoption_confirmation_required",
+            # v0.2.97 R8 G1/G6: vco_lib.runtime_reconcile's entry builders attach
+            # runtime / via / root (and recorded / root) on every emit, the boot
+            # wrapper's record-boot-refusal included (pinned by
+            # tests/test_v0297_runtime_reconcile.py).
+            "container_runtime_unusable", "container_runtime_data_under_both",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
@@ -568,7 +678,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             _V0291_OWNED_ADDITIONS
             | _V0292_OWNED_ADDITIONS
             | _V0293_OWNED_ADDITIONS
-            | _V0295_OWNED_ADDITIONS,
+            | _V0295_OWNED_ADDITIONS
+            | _V0297_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

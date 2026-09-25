@@ -446,33 +446,39 @@ class HubCredentialResolutionTests(unittest.TestCase):
         self.assertEqual(port, 9001)
         self.assertEqual(token, "tok")
 
-    def test_invalid_port_env_warns_and_defaults(self):
-        # F-8 (v0.2.73): the 4th mirror of the corrupt-input contract. A
-        # non-integer VCT_HUB_PORT must NOT yield None (which silently
-        # disabled the hub) — it warns and falls through to DEFAULT_HUB_PORT,
-        # identical to vco_lib/project_config._discover_hub and the
-        # vct_project_config.{sh,ps1} siblings.
+    def test_invalid_port_env_warns_and_falls_through(self):
+        # F-8 (v0.2.73): a non-integer VCT_HUB_PORT must NOT yield None
+        # (which silently disabled the hub). v0.2.97 (owner ruling
+        # 2026-09-24): it warns and falls through to hub.port — the running
+        # hub's port — then the default, through the one reader
+        # `vco_lib.hub_ensure.resolve_hub_port`.
+        import tempfile
+
         from claude_mcp_servers.wrappers._base import DEFAULT_HUB_PORT
 
-        w = WrapperMCP("m", ["x"])
-        with mock.patch.dict(
-            "os.environ",
-            {"VCT_HUB_PORT": "not-a-port", "VCT_HUB_TOKEN": "tok"},
-            clear=False,
-        ):
-            with self.assertLogs(
-                "claude_mcp_servers.wrappers._base", level="WARNING"
-            ) as cm:
-                port, token = w._get_hub_credentials()
-        self.assertEqual(
-            port, DEFAULT_HUB_PORT,
-            "non-integer VCT_HUB_PORT must warn + default 7700, not None",
-        )
-        self.assertEqual(token, "tok")
-        self.assertTrue(
-            any("not an integer" in m for m in cm.output),
-            f"expected an integer-warning log; got {cm.output!r}",
-        )
+        with tempfile.TemporaryDirectory() as state:
+            for file_port, expected in (("7811", 7811), (None, DEFAULT_HUB_PORT)):
+                if file_port is not None:
+                    Path(state, "hub.port").write_text(file_port, encoding="utf-8")
+                else:
+                    Path(state, "hub.port").unlink()
+                w = WrapperMCP("m", ["x"])
+                with mock.patch.dict(
+                    "os.environ",
+                    {"VCT_HUB_PORT": "not-a-port", "VCT_HUB_TOKEN": "tok",
+                     "VCT_STATE_DIR": state},
+                    clear=False,
+                ):
+                    with self.assertLogs(
+                        "claude_mcp_servers.wrappers._base", level="WARNING"
+                    ) as cm:
+                        port, token = w._get_hub_credentials()
+                self.assertEqual(port, expected, file_port)
+                self.assertEqual(token, "tok")
+                self.assertTrue(
+                    any("hub_port_invalid" in m for m in cm.output),
+                    f"expected a hub_port_invalid warning; got {cm.output!r}",
+                )
 
     def test_missing_port_file_uses_default(self, tmp_root=None):
         w = WrapperMCP("m", ["x"])
@@ -600,7 +606,7 @@ class HubCredentialCorruptInputTests(unittest.TestCase):
         )
         self.assertEqual(token, "tok")
         self.assertTrue(
-            any("cannot read" in m for m in cm.output), cm.output
+            any("hub_port_unreadable" in m for m in cm.output), cm.output
         )
 
     def test_unreadable_token_warns_and_none(self) -> None:

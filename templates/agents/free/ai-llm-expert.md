@@ -5,7 +5,7 @@ short_desc: design production LLM pipelines and prompt engineering
 keywords: ["prompt caching", "context window", "multi-model routing", "optimize LLM cost", "semantic caching", "prompt review", "cost optimization", "select the right model", "choose between models"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 skills:
   - ai-prompting
   - ai-model-selector

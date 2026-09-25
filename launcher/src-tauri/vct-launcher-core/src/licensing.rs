@@ -255,12 +255,11 @@ mod tests {
     /// Serialize tests that mutate the `VCT_MACHINE_ID_OVERRIDE` env
     /// var so they don't race against each other (or against
     /// `read_platform_host_id` on the same thread).
-    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
+    ///
+    /// v0.2.97 review R6: THE env lock, not a module-private one — the
+    /// variable is the whole test binary's.
+    fn env_lock() -> crate::test_env::EnvLock {
+        crate::test_env::env_lock()
     }
 
     /// Helper: set the override env var, run `f`, restore previous

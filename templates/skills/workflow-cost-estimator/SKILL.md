@@ -4,7 +4,7 @@ description: Calculates the realistic monthly cost envelope for a workflow desig
 short_desc: monthly cost envelope for workflow + LLM + infrastructure
 keywords: [cost envelope, monthly cost, token budget, vendor pricing, compute cost, "LLM cost", "cost of this workflow", "how much will this cost", "pricing for", "LLM cost estimate", "infra cost"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Workflow Cost Estimator (Opus)

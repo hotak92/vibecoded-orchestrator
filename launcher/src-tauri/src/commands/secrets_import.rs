@@ -70,10 +70,9 @@ use crate::commands::secret_value_shape;
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
 
-/// Must mirror `secrets_cmd.rs::SENTINEL_SHARED`. Duplicated as a private
-/// constant rather than `pub`-exported to keep the secrets_cmd module's
-/// internal contract intact.
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// The shared-scope slot — the one definition in `vct_launcher_core::secrets`
+/// (R7b F15), the same constant the SecretsPanel writer uses.
+use crate::secrets::SENTINEL_SHARED;
 
 /// Fixed module bucket all imported secrets land in. Matches the
 /// "shared per-user" bucket the SecretsPanel reads from.

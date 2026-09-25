@@ -99,7 +99,7 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
     #[cfg(not(windows))]
     let candidates: Vec<String> = vec![name.to_string()];
 
-    let paths = std::env::var_os("PATH")?;
+    let paths = lookup_path()?;
     for dir in std::env::split_paths(&paths) {
         for cand in &candidates {
             let p = dir.join(cand);
@@ -111,14 +111,96 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
     None
 }
 
+/// The directories every launcher PATH lookup walks ([`which_on_path`], the
+/// script ladders): the process `PATH` — unless the calling THREAD injected
+/// one with [`with_lookup_path`] (debug/test builds only).
+pub fn lookup_path() -> Option<std::ffi::OsString> {
+    #[cfg(debug_assertions)]
+    if let Some(injected) = INJECTED_LOOKUP_PATH.with(|cell| cell.borrow().clone()) {
+        return injected;
+    }
+    std::env::var_os("PATH")
+}
+
+/// The program to hand `Command::new` for the bare name `name`.
+///
+/// Production, and any thread that injected nothing: `name` itself — the OS
+/// resolves it on the process `PATH` at spawn time, exactly as
+/// `Command::new(name)` always did. A thread that injected a lookup `PATH`
+/// ([`with_lookup_path`], debug/test builds) gets the resolution done HERE
+/// over that path — the absolute hit, or, when it holds no such program, a
+/// path that cannot exist, so the spawn fails "not found" as it would on a
+/// real `PATH` without it. v0.2.97 review R6: this is how a test puts a fake
+/// `git` first without setting the process `PATH`.
+pub fn spawn_program(name: &str) -> std::ffi::OsString {
+    #[cfg(debug_assertions)]
+    if INJECTED_LOOKUP_PATH.with(|cell| cell.borrow().is_some()) {
+        return match which_on_path(name) {
+            Some(hit) => hit.into_os_string(),
+            None => std::env::temp_dir()
+                .join("vct-injected-lookup-path-has-no")
+                .join(name)
+                .into_os_string(),
+        };
+    }
+    name.into()
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    /// `Some(p)` while a test on this thread injected `p` (`None` = unset).
+    static INJECTED_LOOKUP_PATH: std::cell::RefCell<Option<Option<std::ffi::OsString>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Test hook: run `f` with [`lookup_path`] answering `path` on THIS thread
+/// only (`None` = as if `PATH` were unset). v0.2.97 review R6: a Rust test
+/// never sets the process `PATH` — every concurrently running test, and every
+/// child another test spawns by bare name (`python3`), shares it, and
+/// blanking it made those spawns fail intermittently. Pinned by
+/// `tests/test_rust_tests_never_mutate_process_path.py`.
+#[cfg(debug_assertions)]
+pub fn with_lookup_path<T>(path: Option<&std::ffi::OsStr>, f: impl FnOnce() -> T) -> T {
+    struct Restore(Option<Option<std::ffi::OsString>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            let prior = self.0.take();
+            INJECTED_LOOKUP_PATH.with(|cell| *cell.borrow_mut() = prior);
+        }
+    }
+    let prior = INJECTED_LOOKUP_PATH.with(|cell| cell.replace(Some(path.map(|p| p.to_os_string()))));
+    let _restore = Restore(prior);
+    f()
+}
+
+/// Relative hops from the launcher binary's own directory to a candidate
+/// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
+///
+/// v0.2.92 (field bug 2026-09-05) — the list used to stop at `../..`, and the
+/// SHIPPED layout puts the binary at `<root>/launcher/dist/<target>/vct-launcher`,
+/// whose root is `../../..`. So on a standard install this tier could never
+/// resolve anything: the three probes landed on `dist/<target>/.claude/scripts`,
+/// `dist/.claude/scripts` and `launcher/.claude/scripts`, none of which exist.
+/// With `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` not on `$PATH`
+/// — the default for every user — the whole "fall back to the orchestrator
+/// copy" mechanism was unreachable, and the code-graph build that relied on it
+/// died with "script not found" while a deferral asserted "builds still work".
+///
+/// `../../..` covers the shipped `launcher/dist/<target>/` layout;
+/// `../../../..` covers a cargo dev build at `launcher/src-tauri/target/<profile>/`.
+/// Order is nearest-first: a genuinely adjacent clone still wins.
+pub const ORCHESTRATOR_HOP_SUFFIXES: [&str; 5] =
+    [".", "..", "../..", "../../..", "../../../.."];
+
 /// Resolve a bundled `.claude/scripts/<bin>` helper via the canonical
 /// four-tier ladder, or `None` if it isn't found anywhere.
 ///
 /// v0.2.77 (Part 7c task 3): the ONE home for the "find an installed
 /// script by name" motif. `kg_sync::resolve_kg_sync_script` and
 /// `kg_summary::resolve_summary_script` were byte-for-byte identical
-/// copies of this ladder differing only in the `bin` string; both now
-/// delegate here.
+/// copies of this ladder differing only in the `bin` string. Since v0.2.92
+/// both resolve through the guarded `commands::codegraph::resolve_bundled_script`,
+/// which is built from this ladder's own pieces (see the last paragraph).
 ///
 /// The tiers, in order:
 ///   1. **Project-local** — `<project_folder>/.claude/scripts/<bin>`. The
@@ -139,34 +221,39 @@ pub fn which_on_path(name: &str) -> Option<PathBuf> {
 ///
 /// This is the ladder WITHOUT the codegraph stale-wrapper health guard —
 /// that guard (`analyzer_wrapper_is_resilient`) is codegraph-specific and
-/// deliberately stays in `commands::codegraph`, which layers it on top of
-/// its own tier-1 check before falling through to the shared tiers.
-/// Relative hops from the launcher binary's own directory to a candidate
-/// orchestrator-clone root, probed as `<exe_dir>/<hop>/.claude/scripts/<bin>`.
-///
-/// v0.2.92 (field bug 2026-09-05) — the list used to stop at `../..`, and the
-/// SHIPPED layout puts the binary at `<root>/launcher/dist/<target>/vct-launcher`,
-/// whose root is `../../..`. So on a standard install this tier could never
-/// resolve anything: the three probes landed on `dist/<target>/.claude/scripts`,
-/// `dist/.claude/scripts` and `launcher/.claude/scripts`, none of which exist.
-/// With `$VCT_LAUNCHER_SCRIPTS_DIR` unset and `.claude/scripts` not on `$PATH`
-/// — the default for every user — the whole "fall back to the orchestrator
-/// copy" mechanism was unreachable, and the code-graph build that relied on it
-/// died with "script not found" while a deferral asserted "builds still work".
-///
-/// `../../..` covers the shipped `launcher/dist/<target>/` layout;
-/// `../../../..` covers a cargo dev build at `launcher/src-tauri/target/<profile>/`.
-/// Order is nearest-first: a genuinely adjacent clone still wins.
-pub const ORCHESTRATOR_HOP_SUFFIXES: [&str; 5] =
-    [".", "..", "../..", "../../..", "../../../.."];
-
+/// deliberately stays in `commands::codegraph::resolve_bundled_script`, which
+/// vets [`project_script_path`] and falls through to
+/// [`resolve_orchestrator_script`] — tier 1's candidate and tiers 2-4 of THIS
+/// ladder, so there is one ladder.
 pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> Option<PathBuf> {
     // 1. Project-local.
-    let p1 = project_folder.join(".claude").join("scripts").join(bin);
-    if p1.is_file() {
-        return Some(p1);
+    let local = project_script_path(project_folder, bin);
+    if local.is_file() {
+        return Some(local);
     }
+    // 2-4. The orchestrator copy.
+    resolve_orchestrator_script(bin)
+}
 
+/// Tier 1's candidate: `<project_folder>/.claude/scripts/<bin>` (existence
+/// not checked). Exposed so a caller that must vet the project-local copy
+/// before trusting it (`commands::codegraph::resolve_bundled_script`, the
+/// stale-wrapper guard) builds the SAME path this ladder probes.
+pub fn project_script_path(project_folder: &std::path::Path, bin: &str) -> PathBuf {
+    project_folder.join(".claude").join("scripts").join(bin)
+}
+
+/// Tiers 2-4 of [`resolve_installed_script`]: the ORCHESTRATOR copy of
+/// `<bin>`, via `$VCT_LAUNCHER_SCRIPTS_DIR`, then sibling-of-exe
+/// ([`ORCHESTRATOR_HOP_SUFFIXES`]), then [`lookup_path`]. First `is_file()`
+/// hit wins.
+///
+/// v0.2.97 (lane T): the one home for these tiers. `commands::codegraph`
+/// carried a second copy of them, through which every bundled-wrapper spawn —
+/// code-graph-analyze, kg-sync, kg-duplicates, generate-kg-summary — actually
+/// resolved, so a fix made here reached none of them. Pinned by
+/// `codegraph::build_tests::bundled_script_fallback_tiers_are_the_shared_ladder`.
+pub fn resolve_orchestrator_script(bin: &str) -> Option<PathBuf> {
     // 2. Env override.
     if let Ok(dir) = std::env::var("VCT_LAUNCHER_SCRIPTS_DIR") {
         let p2 = PathBuf::from(dir).join(bin);
@@ -187,8 +274,9 @@ pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> 
         }
     }
 
-    // 4. PATH lookup.
-    if let Ok(path) = std::env::var("PATH") {
+    // 4. PATH lookup (`lookup_path`: tests inject one per thread instead of
+    // setting the shared process PATH — review R6).
+    if let Some(path) = lookup_path() {
         for d in std::env::split_paths(&path) {
             let p4 = d.join(bin);
             if p4.is_file() {
@@ -202,24 +290,12 @@ pub fn resolve_installed_script(project_folder: &std::path::Path, bin: &str) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    // VCT_STATE_DIR is process-wide; serialise tests that mutate it so
-    // parallel runs don't observe each other.
-    static SERIALIZE: Mutex<()> = Mutex::new(());
-
+    // The environment is process-wide: a test that changes it goes through
+    // `test_env` (GLOBAL_ENV_MUTEX + restore-on-drop). v0.2.97 review R6:
+    // this module used its own mutex, which ordered only its own tests.
     fn with_env<F: FnOnce()>(key: &str, val: Option<&str>, f: F) {
-        let _g = SERIALIZE.lock().unwrap();
-        let prev = std::env::var(key).ok();
-        match val {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
-        f();
-        match prev {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
+        crate::test_env::with_env_vars(&[(key, val)], f);
     }
 
     /// v0.2.92 field bug (2026-09-05): the hop list stopped at `../..`, so on
@@ -315,7 +391,6 @@ mod tests {
 
     #[test]
     fn which_on_path_finds_a_binary_placed_on_a_temp_path() {
-        let _g = SERIALIZE.lock().unwrap();
         // Build a temp dir, drop an executable-named file in it, point
         // PATH at ONLY that dir, and confirm the lookup finds it.
         let dir = std::env::temp_dir().join(format!(
@@ -336,14 +411,12 @@ mod tests {
         let bin = dir.join(fname);
         std::fs::write(&bin, b"x").unwrap();
 
-        let prev = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
-        let hit = which_on_path("vct-fake-bin");
-        match prev {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        let hit = with_lookup_path(Some(dir.as_os_str()), || which_on_path("vct-fake-bin"));
         assert_eq!(hit.as_deref(), Some(bin.as_path()));
+        assert!(
+            with_lookup_path(None, || which_on_path("vct-fake-bin")).is_none(),
+            "an unset PATH finds nothing"
+        );
     }
 
     #[test]
@@ -367,7 +440,10 @@ mod tests {
 
     #[test]
     fn resolve_installed_script_none_when_absent() {
-        let _g = SERIALIZE.lock().unwrap();
+        // Neutralise the env-override tier (restored on drop) — and inject
+        // the PATH tier below — so a stray dev VCT_LAUNCHER_SCRIPTS_DIR /
+        // PATH entry can't produce a false hit.
+        let _env = crate::test_env::env_guard(&[("VCT_LAUNCHER_SCRIPTS_DIR", None)]);
         let dir = std::env::temp_dir().join(format!(
             "vct-script-absent-{}-{}",
             std::process::id(),
@@ -377,28 +453,14 @@ mod tests {
                 .unwrap_or(0),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // Neutralise the env-override and PATH tiers so a stray dev
-        // VCT_LAUNCHER_SCRIPTS_DIR / PATH entry can't produce a false hit.
-        let prev_scripts = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
-        let prev_path = std::env::var_os("PATH");
-        std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR");
-        std::env::set_var("PATH", &dir);
-        let resolved =
-            resolve_installed_script(&dir, "vct-nonexistent-script-name-xyz");
-        match prev_scripts {
-            Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
-            None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
-        }
-        match prev_path {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        let resolved = with_lookup_path(Some(dir.as_os_str()), || {
+            resolve_installed_script(&dir, "vct-nonexistent-script-name-xyz")
+        });
         assert!(resolved.is_none());
     }
 
     #[test]
     fn which_on_path_returns_none_for_absent_binary() {
-        let _g = SERIALIZE.lock().unwrap();
         let dir = std::env::temp_dir().join(format!(
             "vct-which-empty-{}-{}",
             std::process::id(),
@@ -408,13 +470,33 @@ mod tests {
                 .unwrap_or(0),
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let prev = std::env::var_os("PATH");
-        std::env::set_var("PATH", &dir);
-        let hit = which_on_path("vct-definitely-absent-binary-xyz");
-        match prev {
-            Some(v) => std::env::set_var("PATH", v),
-            None => std::env::remove_var("PATH"),
-        }
+        let hit = with_lookup_path(Some(dir.as_os_str()), || {
+            which_on_path("vct-definitely-absent-binary-xyz")
+        });
         assert!(hit.is_none());
+    }
+
+    /// v0.2.97 review R6: `spawn_program` is the bare name unless THIS
+    /// thread injected a lookup PATH — then it is that PATH's hit, or a path
+    /// that cannot exist (a spawn fails "not found", never falls back to the
+    /// process PATH's copy).
+    #[test]
+    fn spawn_program_resolves_over_an_injected_lookup_path_only() {
+        assert_eq!(spawn_program("git"), std::ffi::OsString::from("git"));
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("vct-fake-git");
+        std::fs::write(&fake, b"#!/bin/sh\n").unwrap();
+        let hit = with_lookup_path(Some(dir.path().as_os_str()), || spawn_program("vct-fake-git"));
+        assert_eq!(PathBuf::from(hit), fake);
+        let miss = with_lookup_path(Some(dir.path().as_os_str()), || spawn_program("git"));
+        let miss = PathBuf::from(miss);
+        assert!(miss.is_absolute() && !miss.exists(), "{}", miss.display());
+        let unset = with_lookup_path(None, || spawn_program("git"));
+        assert!(!PathBuf::from(unset).exists());
+        // The injection is per thread: another thread sees the bare name.
+        let other = with_lookup_path(Some(dir.path().as_os_str()), || {
+            std::thread::spawn(|| spawn_program("vct-fake-git")).join().unwrap()
+        });
+        assert_eq!(other, std::ffi::OsString::from("vct-fake-git"));
     }
 }

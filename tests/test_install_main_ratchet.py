@@ -60,7 +60,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # (_seed_weaviate_shared_kg_only ~:15171 and _seed_weaviate_impl ~:15703;
 # main() spans ~5471–7157). The original re-pin commit (332e362f)
 # misattributed the growth to the P1 seed pins.
-_MAIN_SPAN_MAX = 1687
+# v0.2.97 review R5 (F38): re-pinned DOWN (1687 → 1652). The --update .env
+# branch moved out of main() into `_update_env_config` (which also stores
+# `--openai-key` there now) and the post-parse normalisation into
+# `_normalise_parsed_args`; main() keeps one call for each.
+# v0.2.97 SE-2: re-pinned DOWN (1652 → 1645) — step [5b] is one shim call
+# (+ the post-start verify and the --no-containers reconcile, one line each),
+# and --compose-working-dir's help lost the superseded legacy legs.
+_MAIN_SPAN_MAX = 1645
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -330,7 +337,31 @@ _MAIN_SPAN_MAX = 1687
 # moved to `vco_lib.embedding_selection`, a pure stdlib leaf since v0.2.68.
 # The -4 is the difference between the deleted mirror and the delegate plus
 # its (now brief) docstring. Measured with `wc -l`, not predicted.
-_TOTAL_LINES_MAX = 23888
+#
+# v0.2.97 SE-2 — re-pinned DOWNWARD 23888 -> 23191 (-697; the file measured
+# 23634 at the lane's base, the rest was slack from earlier waves). Step [5b]
+# became a thin shim over `vco_lib.service_reconcile` / `service_detection`:
+# `_resolve_service_safety`, `_probe_service_identity`, `_decide_action`,
+# `_find_free_port`, `_write_compose_override` and the services.toml wrappers
+# left the file; round 2 retired the superseded legacy legs of
+# `_resolve_compose_working_dir` and `_probe_compose_working_dir_via_ps`.
+# Measured with `wc -l`, not predicted.
+#
+# v0.2.97 gate-fix round — re-pinned DOWNWARD 23191 -> 23168: the R7b/F6
+# lanes (running-hub-port reading, the code-embed migration commit seam,
+# the hub health probe's strict port reader) had grown the file past the
+# pin; the probe body moved to `vco_lib.hub_ensure.probe_hub_health`
+# (install.py keeps a thin `_probe_vct_hub_health` shim) and the
+# migration's no-registrar commit callable to
+# `vco_lib.service_lifecycle.commit_without_mcp_registration`. Measured
+# with `wc -l`, not predicted.
+#
+# v0.2.97 R8 G1 — re-pinned DOWNWARD 23168 -> 23142: the runtime.txt record
+# reconcile landed in `vco_lib.runtime_reconcile` (install.py calls it once
+# from `_detect_system`), the prompt's "installed but not responding" text
+# moved there too, and `_persist_runtime_txt` became a call to the one writer
+# `vco_lib.containers.write_runtime_txt`. Measured with `wc -l`.
+_TOTAL_LINES_MAX = 23142
 
 
 def _measure() -> tuple:

@@ -400,7 +400,7 @@
             <li>
               <code>CollectionNotFoundError</code>: the project’s KG /
               code graph hasn’t been seeded yet. Run the launcher’s
-              “Seed KG” or “Rebuild code graph” action first.
+              “Re-sync KG” or “Re-build code graph” action first.
             </li>
           </ul>
         </div>

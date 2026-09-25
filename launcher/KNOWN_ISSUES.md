@@ -26,7 +26,7 @@ The launcher uses a 5-second poll against an append-only
 
 ## CLI license activation is offline-only
 
-`vco license activate <key>` writes the key to `~/.vct/license.key` and
+`vct-cli license activate <key>` writes the key to `~/.vct/license.key` and
 records an audit event, but does NOT call the remote tier-validation
 service. The launcher GUI performs the actual remote validation on its
 next refresh cycle. To activate a license headlessly, run the GUI once
@@ -34,7 +34,8 @@ on the same machine.
 
 ## CLI module install is GUI-only
 
-`vco module install` is not implemented. Install spawns
+`vct-cli` has no `module install` (only `module list` and
+`module installed`). Install spawns
 subprocesses that are tied to the Tauri app handle (event emission,
 progress streaming). Use the launcher GUI for installs; the CLI can
 list the catalog and the installed modules.

@@ -478,6 +478,12 @@ fn is_wayland_session() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vct_launcher_core::test_env::env_guard;
+
+    // Every env change below goes through `test_env::env_guard`: it holds
+    // GLOBAL_ENV_MUTEX while the test runs and restores the prior values
+    // (set or unset) on drop, panics included. v0.2.97 review R6: these
+    // tests used hand-written restore guards and no lock at all.
 
     /// `is_wayland_session` returns false in an environment that
     /// declares neither WAYLAND_DISPLAY nor XDG_SESSION_TYPE=wayland.
@@ -485,99 +491,33 @@ mod tests {
     /// runner's session state into the assertion.
     #[test]
     fn is_wayland_session_returns_false_when_no_wayland_env() {
-        // SAFETY: tests run in serial within this module by default;
-        // we restore env on drop.
-        struct EnvGuard {
-            saved_wd: Option<std::ffi::OsString>,
-            saved_xs: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(v) = self.saved_wd.take() {
-                    std::env::set_var("WAYLAND_DISPLAY", v);
-                } else {
-                    std::env::remove_var("WAYLAND_DISPLAY");
-                }
-                if let Some(v) = self.saved_xs.take() {
-                    std::env::set_var("XDG_SESSION_TYPE", v);
-                } else {
-                    std::env::remove_var("XDG_SESSION_TYPE");
-                }
-            }
-        }
-        let _guard = EnvGuard {
-            saved_wd: std::env::var_os("WAYLAND_DISPLAY"),
-            saved_xs: std::env::var_os("XDG_SESSION_TYPE"),
-        };
-        std::env::remove_var("WAYLAND_DISPLAY");
-        std::env::set_var("XDG_SESSION_TYPE", "x11");
+        let _env = env_guard(&[("WAYLAND_DISPLAY", None), ("XDG_SESSION_TYPE", Some("x11"))]);
         assert!(!is_wayland_session(), "x11 session should not be detected as Wayland");
     }
 
     /// User-set override is respected — the probe returns
     /// `UserOverrideRespected` without touching env or doing any EGL
-    /// work.
+    /// work. The OFF kill-switch is cleared so we don't short-circuit on
+    /// a different path.
     #[test]
     fn user_override_short_circuits_probe() {
-        struct EnvGuard {
-            saved: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(v) = self.saved.take() {
-                    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", v);
-                } else {
-                    std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER");
-                }
-            }
-        }
-        let _guard = EnvGuard {
-            saved: std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER"),
-        };
-        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
-        // Also need to clear the OFF kill-switch so we don't short-
-        // circuit on a different path.
-        let prev_off = std::env::var_os("VCT_WEBKIT_PREFLIGHT_OFF");
-        std::env::remove_var("VCT_WEBKIT_PREFLIGHT_OFF");
-
+        let _env = env_guard(&[
+            ("WEBKIT_DISABLE_DMABUF_RENDERER", Some("1")),
+            ("VCT_WEBKIT_PREFLIGHT_OFF", None),
+        ]);
         assert_eq!(
             probe_and_apply_workaround_if_needed(),
             ProbeOutcome::UserOverrideRespected
         );
-
-        if let Some(v) = prev_off {
-            std::env::set_var("VCT_WEBKIT_PREFLIGHT_OFF", v);
-        }
     }
 
     /// VCT_WEBKIT_PREFLIGHT_OFF disables the probe entirely.
     #[test]
     fn vct_off_kill_switch_disables_probe() {
-        struct EnvGuard {
-            saved_off: Option<std::ffi::OsString>,
-            saved_render: Option<std::ffi::OsString>,
-        }
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                if let Some(v) = self.saved_off.take() {
-                    std::env::set_var("VCT_WEBKIT_PREFLIGHT_OFF", v);
-                } else {
-                    std::env::remove_var("VCT_WEBKIT_PREFLIGHT_OFF");
-                }
-                if let Some(v) = self.saved_render.take() {
-                    std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", v);
-                } else {
-                    std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER");
-                }
-            }
-        }
-        let _guard = EnvGuard {
-            saved_off: std::env::var_os("VCT_WEBKIT_PREFLIGHT_OFF"),
-            saved_render: std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER"),
-        };
-        std::env::set_var("VCT_WEBKIT_PREFLIGHT_OFF", "1");
-        std::env::remove_var("WEBKIT_DISABLE_DMABUF_RENDERER");
-
+        let _env = env_guard(&[
+            ("VCT_WEBKIT_PREFLIGHT_OFF", Some("1")),
+            ("WEBKIT_DISABLE_DMABUF_RENDERER", None),
+        ]);
         assert_eq!(
             probe_and_apply_workaround_if_needed(),
             ProbeOutcome::DisabledByEnv

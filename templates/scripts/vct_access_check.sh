@@ -74,13 +74,37 @@ collection="$2"
 # ── Hub discovery (mirrors vct_project_config.sh contract) ─────────────
 state_dir="${VCT_STATE_DIR:-$HOME/.vct}"
 
-hub_port=""
-if [[ -n "${VCT_HUB_PORT:-}" ]]; then
-    hub_port="$VCT_HUB_PORT"
-elif [[ -f "$state_dir/hub.port" ]]; then
-    hub_port=$(tr -d '[:space:]' < "$state_dir/hub.port" 2>/dev/null || true)
-fi
-[[ -z "$hub_port" ]] && hub_port=7700
+# A valid hub port is an integer in 1..65535; an invalid VCT_HUB_PORT falls
+# through to hub.port, then 7700 (v0.2.97 owner ruling). MUST MATCH
+# `vct_project_config.sh::_hub_port_value` / `hub_port` (which also warns)
+# and `vco_lib/hub_ensure.py::resolve_hub_port`. Pinned for every client by
+# `tests/test_v0297_hub_port_clients.py`.
+_hub_port_value() {
+    # THE value rule (R7b F9) — MUST MATCH `vco_lib.hub_ensure.parse_hub_port`
+    # and every other hub-port reader (tests/fixtures/hub_port_cases.json):
+    # trim C-locale whitespace at the ends, then ASCII [0-9]{1,5} in 1..65535.
+    # A sign, `_`, a non-ASCII numeral or INTERNAL whitespace is invalid. The
+    # numeral class is spelled out: `[0-9]` follows the collation locale.
+    local v="$1" pad=$' \t\n\v\f\r'
+    v="${v#"${v%%[!$pad]*}"}"
+    v="${v%"${v##*[!$pad]}"}"
+    [[ "$v" =~ ^[0123456789]{1,5}$ ]] || return 1
+    (( 10#$v >= 1 && 10#$v <= 65535 )) || return 1
+    printf '%s\n' "$((10#$v))"
+}
+
+_access_hub_port() {
+    if [[ -n "${VCT_HUB_PORT:-}" ]]; then
+        _hub_port_value "$VCT_HUB_PORT" && return 0
+    fi
+    local p
+    if [[ -f "$state_dir/hub.port" ]]; then
+        p=$(cat -- "$state_dir/hub.port" 2>/dev/null || true)
+        _hub_port_value "$p" && return 0
+    fi
+    printf '7700\n'
+}
+hub_port=$(_access_hub_port)
 
 hub_token=""
 if [[ -n "${VCT_HUB_TOKEN:-}" ]]; then

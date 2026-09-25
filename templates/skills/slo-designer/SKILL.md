@@ -4,7 +4,7 @@ description: Designs SLIs, SLOs, and multi-window multi-burn-rate alerts from a 
 short_desc: SLI/SLO design + Prometheus burn-rate alert rules
 keywords: [SLI, SLO, "error budget", "burn rate", Prometheus, "alerting rules", "monitoring setup", "design an SLO", "set error budgets"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # SLO Designer (Opus)

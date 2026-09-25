@@ -33,7 +33,7 @@ The `projects` store auto-selects a project when exactly one exists, so a freshl
 On `projects.load()`, if the previously selected project id no longer exists, the selection is cleared gracefully rather than leaving the UI broken.
 
 ### Per-project Env File Tri-write
-On project create (and update), `write_project_env_files` writes `KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION` to three surfaces simultaneously. (`CONVERSATION_COLLECTION` removed 2026-04-30 — capture flow deprecated.)
+On project create (and update), the env projection (`python -m vco_lib.config_projection apply`, spawned by `apply_project_env_via_python`) writes `KG_COLLECTION`, `PROJECT_NAME`, `DEVELOPMENT_COLLECTION` to `.claude/settings.json` `env` and `.claude/env`. (`CONVERSATION_COLLECTION` removed 2026-04-30 — capture flow deprecated.)
 
 <details>
 <summary>Details</summary>
@@ -91,12 +91,12 @@ Catalog entries carry a `kind` field controlling how the card renders: `bundled`
 `coming_soon_tier` and `coming_soon_target` fields display the planned tier (e.g. `"pro"`) and shipping window (e.g. `"Q3 2026"`). Reserved for roadmap-committed items only.
 
 ### Bundled Core Manifests
-Six manifest JSON files under `launcher/bundled_manifests/` ship with the launcher binary and are copied to `~/.vct/bundled_manifests/` on first launch: `vct-kg`, `vct-codegraph`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0, all auto-install on first run.
+Six manifest JSON files under `launcher/bundled_manifests/` are embedded in the launcher and hub binaries (`vct_launcher_core::bundled_manifests`) and written to `~/.vct/bundled_manifests/` on every launcher and hub start, so an update refreshes them: `vct-kg`, `vct-codegraph`, `vct-search`, `vct-code-embedding`, `vct-hub-api`, `vct-session-state`. All free/AGPL-3.0. They are installed for every project (the catalog's `bundled` kind): the hub's `/env` serves their settings and secrets with no per-project install row. CI validates each with the real parser (`manifest-validate.yml`), and so does `cargo test` (`every_bundled_manifest_parses_strictly`).
 
 <details>
 <summary>Details</summary>
 
-Manifests contain only metadata + install instructions (git_clone / pip / npm methods). Module binaries are NOT bundled — the launcher fetches them at install time. This keeps the launcher binary small. See `launcher/bundled_manifests/README.md`.
+Manifests contain metadata, settings and install instructions. The components themselves ship with the orchestrator (MCP servers, hooks, the hub); a bundled module's settings reach its consumer through the hub's `/env` — e.g. `vct-session-state`'s `CONTEXT_STATE_MAX_LINES` / `MEMORY_MAX_LINES`, which the `context-size-check` hook resolves (env var → `/env` via `.claude/scripts/vct_secrets_resolve.sh` → default). See `launcher/bundled_manifests/README.md`.
 
 </details>
 
@@ -222,7 +222,7 @@ Seven commands cover the GUI keychain + module settings surface:
 - `is_secret_set(scope, module_id, key)` — boolean presence check (no read). Answers the launcher's **permission** question — true ⇔ the OS keychain holds a value AND the per-`(secret, requester)` active flag is set — so it deliberately ignores the tier-2 file store, which that matrix does not govern. It has no in-tree caller: every launcher surface uses `get_secret_status_v2`, which returns the same `is_set` boolean *plus* the two-store `StoreReport` the GUI badges need. Kept as a stable IPC surface for module authors who want the gate alone. **Do not widen it to consult the file store** — that would silently extend a permission decision over a store the matrix has no authority over; render presence from `StoreReport` instead.
 - `get_secret_preview(scope, module_id, key)` — first 4 + last 4 chars (never the full value); used for "currently set" display.
 - `get_setting_v2(project_id, module_id, setting_key)` — read a non-secret per-(project, module) setting from `module_settings`.
-- `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret setting (JSON value).
+- `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret per-project setting (JSON value) through the one settings write gate (`module_settings_schema::write_module_setting`, as `set_module_setting` does): a declared setting is validated against its manifest declaration, a setting whose value lives elsewhere is refused, and an installed module's setting is stored only for a project it is enabled in (v0.2.97).
 - `list_module_settings_v2(project_id, module_id)` — return all settings for one module.
 
 ---
@@ -299,7 +299,7 @@ A thin shell wrapper that sources `.claude/env` before exec'ing the real `claude
 A user with several VCT projects shouldn't end up with one Weaviate per project. The launcher probes default ports first and offers to reuse anything already running; only if reuse is declined (or impossible) does it spawn fresh containers. Volume migration goes through a single audited code path with rollback.
 
 ### Shared Services Detection
-Installer checks Weaviate, Ollama, and code-embed ports before spawning new containers. If all three respond, reuse is offered. → See [05-install-and-secrets.md](05-install-and-secrets.md#shared-service-reuse) for the full detection flow.
+Before spawning new containers, the installer (via `vco_lib/service_detection.py`) probes Weaviate, Ollama and code-embed — VCO ports and the upstream defaults — and content-fingerprints what answers. A service holding VCO data is adopted; a third-party candidate goes through the adoption choice. → See [05-install-and-secrets.md](05-install-and-secrets.md#shared-service-reuse) for the full detection flow.
 
 ### Volume Configuration Commands (`volumes.rs`)
 Four Tauri commands govern volume layout: `get_volumes_config` (current bind-mount paths or named-volume mode), `set_volumes_config_for_install` (persist new paths and write the compose override), `set_volumes_config_dry_run` (preview the override without writing), `migrate_volumes` (the only function permitted to call `podman volume rm` / `docker volume rm`).
@@ -320,10 +320,10 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 ### Service Lifecycle on Launcher Start/Stop
 `commands/lifecycle.rs` ties the backing services (Weaviate, Ollama, code-embed) to the launcher's own lifecycle:
 
-- **Auto-start on boot**: `services_start_all()` runs `podman compose up -d` (or docker if no podman) at launcher startup. Failure does not block the launcher window — the Services route surfaces the error.
+- **Auto-start on boot**: `services_start_all()` brings up the stack at launcher startup — compose is invoked with the **explicit `vco_managed` service list** from the `service_endpoints` rows (`--no-deps`; there is no bare `up -d` anywhere), and adopted containers are started **by name only**. Failure does not block the launcher window — the Services route surfaces the error.
 - **Per-service controls**: `services_start`, `services_stop`, `services_restart` Tauri commands surface to a Services route + tray submenu. Service names are validated against a hardcoded allowlist (`weaviate`, `ollama`, `code_embed`); arbitrary names refuse.
-- **Runtime detection** (`services/runtime.rs`): podman-first universal preference, with macOS Podman Machine handling (`podman machine list` to detect a started VM and fall through to Docker if not).
-- **Adoption modes** (`services/adoption.rs`): when a foreign service is detected on a default port, `ExternalServicesDialog.svelte` prompts the user with `unresolved | adopt | parallel | refuse` modes. The chosen mode is written to `~/.vct/services.toml` — the same lock file install.py uses, so the launcher and installer never disagree.
+- **Runtime decision** (`services/runtime.rs`): one verdict, asked from Python (`python -m vco_lib.runtime_reconcile decide --json` — the same answer the session hooks and the boot service use): `VCT_CONTAINER_RUNTIME` if set, else the runtime the install recorded (`state/install/runtime.txt`), else podman-first auto-detection; a pinned runtime that is down is refused with Python's refusal text shown as is. The macOS/Windows Podman-Machine check (`podman machine list`) is kept as a prompt hint only.
+- **Service endpoints rows** (v0.2.97): the launcher.db `service_endpoints` table (migration 047) is the one source of truth for where each service runs — mode (`vco_managed` / `adopted_container` / `adopted_external`), host/port, container identity and data mount. When detection finds a foreign Weaviate or Ollama, `ExternalServicesDialog.svelte` prompts with the candidates from `python -m vco_lib.service_endpoints candidates --json` (name, compose project, image, port, whether VCO data was found, compatibility verdict); the actions are **Use this one** and **Run VCO's own copy**, landing in the row via `service_endpoints adopt` / `use-vco-copy`. The Services page shows a "Where it runs" column with the mode badge, a **Change…** action, and — for adopted containers — the opt-in **Let VCO manage it** transfer (`hand-to-vco`, with the data mount named and verified).
 - **Frontend events**: `vct-services-lifecycle` (start/stop/restart progress) and `vct-external-services-detected` (adoption prompt trigger). Lets the UI render real-time state without polling.
 - **Zombie recovery**: when a service's runtime state reports `zombie: true` (a container stuck in a wedged state), the Services route renders a **"stuck"** badge in the Status cell and a **Recover** button (shown only when the service is zombie and has a container name). Recover calls `recover_zombie`; on failure it surfaces a page banner and refreshes the services snapshot.
 
@@ -337,26 +337,26 @@ The Services card reads the registration from the same Python home and renders t
 
 ## Hub API
 
-The Hub is the launcher's local HTTP face — used by the headless `vco` CLI, by ecosystem apps (Ecosystem App 1, Ecosystem App 2), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only, gates every request on a Bearer token, and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
+The Hub is the launcher's local HTTP face — used by the headless `vct-cli` CLI, by ecosystem apps (Ecosystem App 1, Ecosystem App 2), and by other VCT processes that need to talk to the launcher without going through Tauri IPC. It runs on `127.0.0.1` only, gates every request on a Bearer token, and writes its bound port to `~/.vct/hub.port` so consumers don't have to guess.
 
 ### Local HTTP Server (port 7700)
-`hub/server.rs` starts an Axum HTTP server on `127.0.0.1:7700` (or `VCT_HUB_PORT`) as a background tokio task at launcher startup. Uses WAL mode for the SQLite connection so it coexists with the Tauri-side DB handle.
+`hub/server.rs` starts an Axum HTTP server on `127.0.0.1:7700` (or the hub process's `VCT_HUB_PORT`, else the `vct-hub-api` module's global `VCT_HUB_PORT` setting) as a background tokio task at launcher startup. Uses WAL mode for the SQLite connection so it coexists with the Tauri-side DB handle.
 
 ### Port Discovery (`~/.vct/hub.port`)
 After binding, the hub writes the actual port to `~/.vct/hub.port`. Consumers (CLI, MCP servers, other apps) read this file to discover the hub — especially useful when the default 7700 is taken.
 
 ### Auth Token (`~/.vct/hub.token`)
-On every startup the hub generates a fresh 32-byte CSPRNG token and writes it to `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Every `/api/v1/*` request must carry `Authorization: Bearer <token>` — same-user processes that can read `hub.token` authenticate transparently; other-user processes get 401. The token is regenerated on every launcher start to bound the leak window. **v0.2.77:** the two per-project routes `GET /api/v1/projects/{id}/env` and `.../config` require a project-SCOPED token `hub.token.<project_id>` — the global `hub.token` is REFUSED (403) there by default (bundled resolvers prefer the scoped token; the hub lazy-mints one for a mid-session project; `VCT_HUB_LEGACY_GLOBAL_ENV=1` on the hub reopens a one-release compat window). Every other route still accepts the global token. See `launcher/src-tauri/src/hub/auth.rs` for the threat model.
+On every startup the hub generates a fresh 32-byte CSPRNG token and writes it to `<vct_root_dir>/hub.token` (mode `0o600` on Unix). Every `/api/v1/*` request must carry `Authorization: Bearer <token>` — same-user processes that can read `hub.token` authenticate transparently; other-user processes get 401. The token is regenerated on every launcher start to bound the leak window. **v0.2.77:** the two per-project routes `GET /api/v1/projects/{id}/env` and `.../config` require a project-SCOPED token `hub.token.<project_id>` — the global `hub.token` is REFUSED (403) there by default (bundled resolvers prefer the scoped token; the hub lazy-mints one for a mid-session project; the v0.2.76–v0.2.77 one-release compat window that accepted the global `hub.token` here was removed in v0.2.97 together with its `VCT_HUB_LEGACY_GLOBAL_ENV` opt-in — the global token is refused unconditionally on these two routes, and a hub started with the variable still set logs one removal notice at startup). Every other route still accepts the global token. See `launcher/src-tauri/vct-hub/src/auth.rs` for the threat model.
 
 ### Port Retry
 `try_bind` tries the base port and up to 5 increments before failing. Actual bound port is written to `hub.port` regardless of which offset was chosen.
 
 ### Hub API Routes
-Four sub-routers nested under `/api/v1`, each in its own file under `launcher/src-tauri/src/hub/`:
+Four sub-routers nested under `/api/v1`, each in its own file under `launcher/src-tauri/vct-hub/src/`:
 - `api.rs` — core operations: health, app catalog (register/deregister/heartbeat), cross-app messaging (send/poll/ack), data catalog (register/query). 10 routes.
 - `modules_api.rs` — module catalog + installed list + install + project list + project env + project lookup by slug/path. 9 routes.
 - `project_state_api.rs` — full per-project agent/skill/hook/permission/secret-ref/KG-binding/codegraph-binding registry. ~16 method+path combos.
-- `cli_api.rs` — mirror of Tauri commands for headless `vco` CLI access (project CRUD, audit list, license, hooks toggle, telemetry consent, KG/codegraph search). 14 routes.
+- `cli_api.rs` — mirror of Tauri commands for headless `vct-cli` access (project CRUD, audit list, license, hooks toggle, telemetry consent, KG/codegraph search). 14 routes.
 
 For the full route enumeration → see [Hub HTTP API — Routes](#hub-http-api--routes) below.
 
@@ -605,7 +605,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `POST /api/v1/projects/{project_id}/codegraph-binding` — set the code graph binding.
 
 ### CLI-facing endpoints (`hub/cli_api.rs`)
-Mirror of Tauri commands so the headless `vco` CLI can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
+Mirror of Tauri commands so the headless `vct-cli` can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
 - `POST /api/v1/cli/projects` — create a project.
 - `PATCH, DELETE /api/v1/cli/projects/{id_or_slug}` — rename / delete.
 - `GET /api/v1/cli/audit` — read audit log (mirrors `list_audit_events`).
@@ -690,7 +690,7 @@ POSIX hosts no-op: the V52-AH backend probe is Windows-specific; the lock file i
 
 ## InstallHealthGate (v0.2.53 hardening)
 
-`launcher/src/lib/components/InstallHealthGate.svelte` blocks the UI when the launcher is running from inside an orchestrator install root but the install never completed (no `.venv/`, no `state/`, no `.env` with `KG_COLLECTION`, or no `claude_mcp_servers/.venv/`). Backend probe is `check_install_health` in `installer.rs`; developer mode (no install root walked-up from `current_exe()`) returns `all_ok: true` so `cargo run` / `pnpm tauri dev` never trigger the modal.
+`launcher/src/lib/components/InstallHealthGate.svelte` blocks the UI when the launcher is running from inside an orchestrator install root but the install never completed (no `.venv/`, no `state/`, no `.env` with `KG_COLLECTION`, or no `claude_mcp_servers/` directory — the latter counts as satisfied when it coexists with either the modern `.venv/` or the legacy `claude_mcp_servers/.venv/`). Backend probe is `check_install_health` in `installer.rs`; developer mode (no install root walked-up from `current_exe()`) returns `all_ok: true` so `cargo run` / `pnpm tauri dev` never trigger the modal.
 
 ### M-P0-8: refresh on focus + Re-check button
 The gate now re-runs the backend probe whenever the launcher window regains focus AND exposes an explicit "Re-check" button. When the probe is triggered from focus or the manual button, a prior dismissal is IGNORED for an unhealthy install — the user explicitly came back to the launcher, so they want to know if the install is still broken. At mount-time (no `fromFocus`) a prior dismissal still suppresses the modal so the user is not re-prompted on every relaunch. Re-entry is guarded with a `rechecking` flag.
@@ -709,12 +709,11 @@ Inline button on the gate spawns `first-install.{sh,command,bat}` in a terminal 
 
 **Why**: `.app` double-click on macOS Finder, and `.desktop` activation on GNOME/KDE, both inherit a minimal LaunchServices / systemd-user PATH (`/usr/bin:/bin:/usr/sbin:/sbin`). Tooling installed via Homebrew, cargo, pipx, linuxbrew, snap, flatpak is missing, so every subsequent `python3`, `cargo`, `podman`, `git` spawn failed with "command not found" until the user re-launched from a terminal. Cross-OS triage finding `cross-os-triage-2026-06-10.md` §P0-7 confirms macOS + Linux are the same root cause.
 
-**Candidates** (prepended; first wins):
-- macOS: `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`.
-- Linux: `$HOME/.local/bin`, `$HOME/.cargo/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/snap/bin`, `/var/lib/flatpak/exports/bin`.
-- Windows: no-op — Explorer-launched apps inherit user PATH from registry (`HKCU\Environment`).
+**Candidates** — since v0.2.97 one table, `vco_lib/tool_search_dirs.toml`, shared with the Python side and also applied by the hub at startup; each entry is added only when `PATH` lacks it, per its `placement` (see [CONFIGURATION.md](../CONFIGURATION.md#where-vco-looks-for-the-runtime-v0297)):
+- `prepend-when-missing` (the v0.2.53 list above, a login shell's order; first wins): macOS `/opt/homebrew/bin`, `/opt/homebrew/sbin`, `$HOME/.cargo/bin`, `$HOME/.local/bin`; Linux `$HOME/.local/bin`, `$HOME/.cargo/bin`, `/home/linuxbrew/.linuxbrew/bin`, `/snap/bin`, `/var/lib/flatpak/exports/bin`.
+- `append` (the v0.2.97 container-runtime locations — reach only, never shadow): `~/bin`, `/usr/local/bin`, `/usr/bin`, and on macOS `/opt/podman/bin`, Docker Desktop, `~/.docker/bin`, MacPorts; on Windows (where Explorer-launched apps otherwise inherit the registry PATH) the Docker Desktop / Podman installer directories.
 
-Properties: idempotent (`HashSet` dedup), order-preserving (existing PATH stays in original order after the prepend), soft-fail (`HOME` unset → `$HOME`-relative candidates silently dropped), `~` expanded to a real path. Tests at `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs:829–910`.
+Properties: idempotent (`HashSet` dedup), order-preserving (the inherited PATH stays contiguous and in its original order; an entry already on it is never moved), soft-fail (`HOME` unset → `$HOME`-relative candidates silently dropped), `~` expanded to a real path. Tests: the `augment_path_*` / `a_graphical_launch_still_prefers_homebrew_over_the_system_stub` / `tool_search_order_matches_the_shared_fixture` tests in `launcher/src-tauri/vct-launcher-core/src/services/runtime.rs`, and `tests/fixtures/tool_search_dirs_cases.json` (run by both languages).
 
 ---
 
@@ -812,7 +811,7 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 Before v0.2.91 the handler matched `TrayIconEvent::Click { .. }`, i.e. *every* button in *both* states, while the builder also had `show_menu_on_left_click` enabled — so one physical left click both opened the menu and restored the window, and a right click restored it too. One constant (`TRAY_MENU_ON_LEFT_CLICK`) now feeds both the builder flag and the extracted decision fn `tray_click_action(button, state, menu_on_left)`, so the two cannot drift; the decision is unit-tested as a matrix rather than exercised through Tauri.
 
 ### Live Service Status Pill
-The "Running services" line is polled every 5s and updated in-place (`MenuItem::set_text` rather than full menu rebuild — avoids flicker and OS-level menu re-grab). States: `Services: N/M running`, `No services running`, `managed externally`. The probe reads the same port set as install.py (8081 / 11435 / 11440); foreign services on the same ports are counted as "running" for the headline count, with the externally-managed case surfaced when a foreign service is detected with no `~/.vct/services.toml` lock entry.
+The "Running services" line is polled every 5s and updated in-place (`MenuItem::set_text` rather than full menu rebuild — avoids flicker and OS-level menu re-grab). States: `Services: N/M running`, `No services running`, `managed externally`. The probe reads the endpoints from the `service_endpoints` rows (same resolution as install.py); foreign services on those endpoints are counted as "running" for the headline count, with the externally-managed case surfaced when a service's row is `adopted_*`.
 
 ### Window-button semantics (changed in v0.2.91)
 **The X / Cmd+W button reduces the launcher to the tray by default** — it no longer prompts. This is a user-visible behavior change (user decision #2): the `tray_close_to_tray` preference had shipped with default `true` and a Preferences label saying exactly that for months, while nothing consumed the value, so the label was false. Wiring the pref honors the shipped default rather than inventing a new one. Real exit is **tray → Quit**. A one-time native notice fires the first time the window hides this way, so the default is discoverable rather than surprising.
@@ -849,38 +848,38 @@ v0.2.95 removed `StateFlags::VISIBLE` from `tauri-plugin-window-state`'s flag se
 
 ---
 
-## Headless CLI (`vco`)
+## Headless CLI (`vct-cli`)
 
-The launcher CLI binary is named `vco` (not `vct`) to avoid colliding with the `vct` bash secrets tool. Full reference: [`launcher/docs/CLI.md`](../../launcher/docs/CLI.md).
+The launcher CLI binary is named `vct-cli`, after its crate. It was `vco` until v0.2.96 — the name of the orchestrator's Python CLI (`vco doctor`, `vco project move`, …), so whichever of the two came first on `PATH` hid the other — and `vct` before v0.1.0, which is the bash secrets tool. `tests/test_v0297_cli_program_names.py` fails if two shipped programs share a command name, or if shipped text runs a verb through the wrong program. Full reference: [`launcher/docs/CLI.md`](../../launcher/docs/CLI.md).
 
 ### Build & Install
-`tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vco`. Built independently from the Tauri app.
+`launcher/tools/vct-cli/install.sh` runs `cargo build --release` and copies the binary to `~/.local/bin/vct-cli`. It first removes a `~/.local/bin/vco` (or pre-v0.1.0 `~/.local/bin/vct`) that an earlier run installed, but only when that file identifies itself as this CLI (`--version` + `-h`); a Python `vco`, a secrets `vct` or an unknown file is left alone, and an old copy elsewhere on `PATH` is reported with the command to remove it. Built independently from the Tauri app.
 
 ### Hub Port Discovery Order
 CLI resolves the hub port: `--port <N>` flag → `VCT_HUB_PORT` env → `~/.vct/hub.port` file → 7700 default.
 
 ### JSON Output
-Every `vco` command outputs JSON for machine consumption. Pipe through `jq` for human-readable formatting.
+Every `vct-cli` command outputs JSON for machine consumption. Pipe through `jq` for human-readable formatting.
 
-### `vco project` Commands
+### `vct-cli project` Commands
 `list`, `show <id_or_slug>`, `create --name <name> --path <dir> [--host base|mao]`, `rename <id_or_slug> <new_name>`, `delete <id_or_slug>`.
 
-### `vco module` Commands
+### `vct-cli module` Commands
 `list` (full catalog), `installed <project_id_or_slug>`.
 
-### `vco audit list`
+### `vct-cli audit list`
 `--project <id|slug>`, `--since <epoch_ms>`, `--limit <N>`. Suitable for CI audit-pull jobs.
 
-### `vco license` Commands
+### `vct-cli license` Commands
 `status` (reads tier cache), `activate <key>` (persists to keychain + audits), `deactivate`.
 
-### `vco hooks` Commands
-`list <project_id_or_slug>`, `enable <hook_id> [--project]`, `disable <hook_id> [--project]`.
+### `vct-cli hooks` Commands
+`list <project_id_or_slug>`, `enable <hook_id> --project <id|slug>`, `disable <hook_id> --project <id|slug>` (`--project` is required: the toggle edits that project's `.claude/settings.json`).
 
-### `vco hub` Commands
+### `vct-cli hub` Commands
 `health` (ping hub), `url` (print hub URL).
 
-### `vco kg` / `vco codegraph` Commands
+### `vct-cli kg` / `vct-cli codegraph` Commands
 `kg collections`, `kg search <query> --project <id|slug> [--collections c1,c2] [--limit N]`. Same shape for `codegraph`, plus `--scope all|code|interaction`. Wired through the hub at `/cli/kg/{collections,search}` and `/cli/codegraph/{collections,search}` with strict auto-detection of orchestrator-shaped Weaviate collections (must have `title` text + `node_type` text + `tags` text[] + `typed_links` object[]).
 
 ### CLI Limitations

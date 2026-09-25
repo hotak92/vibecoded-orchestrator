@@ -29,6 +29,7 @@ import type {
   BundleStalenessCensus,
   BundleStalenessProject,
   BundleVerdict,
+  ProjectSetupStatus,
 } from '$lib/types/launcher';
 
 /** Synthetic reason for "the census itself could not run". Not a Python
@@ -225,4 +226,202 @@ export function shouldRecensusOnUpdaterEdge(
   updating: boolean,
 ): boolean {
   return prevUpdating && !updating;
+}
+
+// ─── The census controller: every trigger, one ordering rule ────────────
+//
+// The census is a snapshot, and every action that changes a project's
+// bundle makes the snapshot a lie until it is re-taken. It used to be
+// re-taken only on mount and on the orchestrator-update falling edge, so a
+// successful "Update all" left the page reporting "8 stale of 9" over a
+// fleet the census itself reported current. Every trigger now lives here,
+// as a method, so the page's job is only to CALL them — and each trigger is
+// pinned by a test in `bundle-staleness.test.ts` without a DOM runner.
+//
+// The one ordering rule: a response may only replace the census shown if
+// its request was started AFTER the request whose response is currently
+// shown. Each census run is a subprocess taking seconds; a Refresh clicked
+// while the post-update census is still running must not let the slower,
+// older answer land last and paint the pre-update verdicts back.
+
+/** How an "Update all" run ended, as reported by `UpdateAllProjectsModal`.
+ *  `completed` — the run returned a report (which may itself name
+ *  per-project failures: a partial run). `errored` — the run itself threw.
+ *  Both can change bundle state, so both re-take the census. */
+export type UpdateAllOutcome = 'completed' | 'errored';
+
+/** Everything the page renders about the census. */
+export interface CensusView {
+  /** The census currently shown; `null` until the first attempt resolves. */
+  census: BundleStalenessCensus | null;
+  /** True once ANY census attempt has resolved. Gates the summary line so
+   *  "not yet asked" never renders as "asked and could not tell". */
+  attempted: boolean;
+  /** True while at least one census request is in flight — the census on
+   *  screen may be about to change. */
+  checking: boolean;
+  /** Call-out promoted when an orchestrator update completes (the moment
+   *  project bundles fall behind it). Cleared by the user, or by a census
+   *  started after it that proves nothing needs attention — at which point
+   *  "project bundles are not updated with it" is no longer true. */
+  postUpdateNotice: boolean;
+}
+
+/** The slice of the project-setup store the controller reads: which setup,
+ *  and whether it is still in progress. Structural, so this module does not
+ *  depend on the store. */
+export interface SetupSignal {
+  project_id: string;
+  status: ProjectSetupStatus;
+  /** Stable per setup run (the store keeps it across phase events). */
+  observed_at: number;
+}
+
+/** Setup statuses meaning "the bundle install has not finished yet".
+ *  Anything else is terminal — the heavy phase that installs the bundle is
+ *  over, whatever its outcome — so the new project's row is worth reading.
+ *  Listed positively so a future terminal status re-censuses by default. */
+const SETUP_IN_PROGRESS: ReadonlySet<ProjectSetupStatus> = new Set<ProjectSetupStatus>([
+  'pending',
+  'running',
+]);
+
+export interface CensusControllerDeps {
+  /** Run the census. Contracted never to reject; a rejection means the
+   *  command is absent and is reported as an UNDETERMINED census, never
+   *  as an absence of findings. */
+  fetchCensus: () => Promise<BundleStalenessCensus>;
+  /** Receives every new view. The page stores it in a `$state` cell. */
+  onChange: (view: CensusView) => void;
+  /** When present and returning false, no census is taken (no Tauri host). */
+  enabled?: () => boolean;
+}
+
+export interface CensusController {
+  /** Take the census (page mount). Resolves when THIS request settles. */
+  load: () => Promise<void>;
+  /** The Refresh button. */
+  refresh: () => Promise<void>;
+  /** "Update all" reached its done phase — success, partial, or failure. */
+  updateAllFinished: (outcome: UpdateAllOutcome) => Promise<void>;
+  /** Feed every orchestrator-updater tick; fires on the falling edge only. */
+  updaterTick: (updating: boolean) => void;
+  /** Feed every projects-store tick. A change in the SET of registered
+   *  project ids (an add or a delete, from any surface) re-takes the
+   *  census; ticks while the list is loading are ignored. */
+  projectsChanged: (ids: readonly string[], loading: boolean) => void;
+  /** Feed every project-setup-store tick. A setup reaching a terminal
+   *  status (its bundle install is over) re-takes the census. */
+  setupObserved: (setup: SetupSignal | null) => void;
+  /** The user dismissed the post-update call-out. */
+  dismissNotice: () => void;
+  /** The current view (first render + tests). */
+  view: () => CensusView;
+}
+
+/**
+ * Create the page-scoped census controller.
+ *
+ * Baselines: the FIRST observation of the projects list and of the setup
+ * store only records state — the mount census already covers it — so
+ * opening the page costs one census, not three.
+ */
+export function createCensusController(deps: CensusControllerDeps): CensusController {
+  let view: CensusView = {
+    census: null,
+    attempted: false,
+    checking: false,
+    postUpdateNotice: false,
+  };
+  /** Sequence number of the most recently STARTED request. */
+  let started = 0;
+  /** Sequence number of the request whose response is on screen. */
+  let shown = 0;
+  let inFlight = 0;
+  /** A response may clear the post-update call-out only if its request was
+   *  started at or after the one that raised it: an all-current answer to
+   *  an OLDER question says nothing about the post-update state. */
+  let noticeFloor = Number.POSITIVE_INFINITY;
+
+  let prevUpdating = false;
+  let projectsSig: string | null = null;
+  let setupSeen = false;
+  let lastSetupKey: string | null = null;
+  let lastSetupTerminal = false;
+
+  function emit(patch: Partial<CensusView>) {
+    view = { ...view, ...patch };
+    deps.onChange(view);
+  }
+
+  function load(): Promise<void> {
+    if (deps.enabled && !deps.enabled()) return Promise.resolve();
+    const seq = ++started;
+    inFlight += 1;
+    emit({ checking: true });
+    return settle(seq);
+  }
+
+  async function settle(seq: number): Promise<void> {
+    let result: BundleStalenessCensus;
+    try {
+      result = await deps.fetchCensus();
+    } catch (e) {
+      result = undeterminedCensus(e instanceof Error ? e.message : String(e));
+    }
+    inFlight -= 1;
+    const checking = inFlight > 0;
+    if (seq <= shown) {
+      // A newer request's answer is already on screen; this one is older
+      // news and must not overwrite it.
+      emit({ checking });
+      return;
+    }
+    shown = seq;
+    const clearsNotice = seq >= noticeFloor && needsAttentionCount(result) === 0;
+    emit({
+      census: result,
+      attempted: true,
+      checking,
+      postUpdateNotice: clearsNotice ? false : view.postUpdateNotice,
+    });
+  }
+
+  return {
+    load,
+    refresh: load,
+    // The outcome is accepted, not branched on: a partial or failed run
+    // changes bundle state as surely as a clean one.
+    updateAllFinished: (_outcome: UpdateAllOutcome) => load(),
+    updaterTick(updating: boolean) {
+      const fire = shouldRecensusOnUpdaterEdge(prevUpdating, updating);
+      prevUpdating = updating;
+      if (!fire) return;
+      emit({ postUpdateNotice: true });
+      void load();
+      noticeFloor = started;
+    },
+    projectsChanged(ids: readonly string[], loading: boolean) {
+      if (loading) return;
+      const sig = [...ids].sort().join('\n');
+      const fire = projectsSig !== null && sig !== projectsSig;
+      projectsSig = sig;
+      if (fire) void load();
+    },
+    setupObserved(setup: SetupSignal | null) {
+      const key = setup ? `${setup.project_id}@${setup.observed_at}` : null;
+      const terminal = setup !== null && !SETUP_IN_PROGRESS.has(setup.status);
+      const fire =
+        setupSeen && terminal && !(key === lastSetupKey && lastSetupTerminal);
+      setupSeen = true;
+      lastSetupKey = key;
+      lastSetupTerminal = terminal;
+      if (fire) void load();
+    },
+    dismissNotice() {
+      noticeFloor = Number.POSITIVE_INFINITY;
+      emit({ postUpdateNotice: false });
+    },
+    view: () => view,
+  };
 }

@@ -4,7 +4,7 @@ description: Helps a solo founder or small team decide whether to build a featur
 short_desc: "build vs buy vs defer decision for indie founders"
 keywords: [build vs buy, vendor lock-in, should we build, should we integrate, make or buy, "buy or build", "vendor or custom", "integrate vs implement", "worth integrating", "cheapest way to ship"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Build-vs-Buy Decision (Opus)

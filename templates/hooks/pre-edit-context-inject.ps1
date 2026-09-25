@@ -26,8 +26,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   server.py, which read VCT_KG_ACCESS_LIST + VCT_CODE_GRAPH_ACCESS_LIST.
 #   This hook does NOT query Weaviate directly. Env propagation is by
 #   subprocess inheritance (Start-Process / & inherit env by default).
-#   See knowledge/concepts/multi-source-kg-runtime.md and
-#   tests/test_kg_access_list.py for the consumer contract.
+#   See tests/test_kg_access_list.py for the consumer contract.
 
 # pre-edit-context-inject.ps1
 # Pre-edit context injection — KG + code graph context for the file being edited.

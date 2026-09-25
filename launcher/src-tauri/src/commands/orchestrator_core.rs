@@ -545,43 +545,44 @@ pub async fn code_graph_prune_stale(
     })
 }
 
+/// The health-check probe URLs: every one the machine row's
+/// (`service_endpoints`, v0.2.97). No endpoint env var is read — not
+/// `WEAVIATE_URL`, `OLLAMA_URL` or `CODE_EMBED_SERVICE_URL`: the launcher is
+/// machine-scoped, and a project's hook may have started it with that
+/// project's projection (plan §4f). A dev container points VCO elsewhere
+/// with `python -m vco_lib.service_endpoints adopt --url …`.
+fn health_check_urls(db: &Db) -> Vec<(String, String)> {
+    use vct_launcher_core::services::service_endpoints as se;
+    let weaviate_url = se::machine_weaviate_url(db);
+    let ollama_url = se::machine_ollama_url(db);
+    let code_embed_url = se::machine_code_embed_url(db);
+    vec![
+        (
+            "Weaviate".to_string(),
+            format!("{}/v1/.well-known/ready", weaviate_url),
+        ),
+        (
+            "Ollama".to_string(),
+            format!("{}/api/tags", ollama_url),
+        ),
+        (
+            "Code Embedding Service".to_string(),
+            format!("{}/health", code_embed_url),
+        ),
+    ]
+}
+
 /// Probe the three local infrastructure endpoints + emit a per-service
 /// status report. Total budget ~3s (each probe times out at 1s).
 #[command]
 pub async fn orchestrator_health_check(
-    _db: State<'_, Db>,
+    db: State<'_, Db>,
 ) -> Result<HealthReport, String> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(1))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
-
-    // Endpoints match the defaults documented in CLAUDE.md. Override
-    // via env so dev-container probes hit a non-default port.
-    let weaviate_url = std::env::var("WEAVIATE_URL")
-        .unwrap_or_else(|_| "http://localhost:8081".to_string());
-    let ollama_url = std::env::var("OLLAMA_URL")
-        .unwrap_or_else(|_| "http://localhost:11435".to_string());
-    let code_embed_url = std::env::var("CODE_EMBED_SERVICE_URL")
-        .unwrap_or_else(|_| "http://localhost:11440".to_string());
-
-    let checks = vec![
-        (
-            "Weaviate".to_string(),
-            format!("{}/v1/.well-known/ready", weaviate_url.trim_end_matches('/')),
-        ),
-        (
-            "Ollama".to_string(),
-            format!("{}/api/tags", ollama_url.trim_end_matches('/')),
-        ),
-        (
-            "Code Embedding Service".to_string(),
-            format!("{}/health", code_embed_url.trim_end_matches('/')),
-        ),
-    ];
+    let checks = health_check_urls(&db);
 
     let mut services = Vec::with_capacity(checks.len());
     for (name, endpoint) in checks {
+        let client = vct_launcher_core::services::loopback_http::client_for(&endpoint, Duration::from_secs(1))?;
         let started = std::time::Instant::now();
         let result = client.get(&endpoint).send().await;
         let latency_ms = started.elapsed().as_millis() as u64;
@@ -828,6 +829,35 @@ pub async fn validate_clone_manifest(
 mod tests {
     use super::*;
 
+    /// v0.2.97: every health-report URL is the machine row's — the
+    /// projected `WEAVIATE_URL` / `OLLAMA_URL` / `CODE_EMBED_SERVICE_URL` in
+    /// the launcher's own environment are not read.
+    #[test]
+    fn health_check_urls_follow_the_machine_chain() {
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("WEAVIATE_URL", Some("http://transport.invalid:1")),
+            ("OLLAMA_URL", Some("http://transport.invalid:2")),
+            ("CODE_EMBED_SERVICE_URL", Some("http://transport.invalid:3")),
+            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
+        ]);
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let checks = health_check_urls(&db);
+        // No row on this harness DB: the unroutable sentinel.
+        assert_eq!(checks[0].1, "http://127.0.0.1:9/v1/.well-known/ready");
+        assert_eq!(checks[1].1, "http://127.0.0.1:9/api/tags");
+        assert_eq!(checks[2].1, "http://127.0.0.1:9/health");
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        let checks = health_check_urls(&db);
+        assert_eq!(checks[0].1, "http://localhost:18081/v1/.well-known/ready");
+    }
+
     /// `tail_1kb` truncates oversize input, leaves small input alone,
     /// and never panics on multi-byte char boundaries. The boundary
     /// case (truncation point falls inside a UTF-8 multi-byte char)
@@ -879,6 +909,7 @@ mod tests {
     /// scripts.
     #[test]
     fn build_script_command_falls_back_to_orchestrator_copy() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let bin = script_bin("kg-sync");
 
         // Project WITHOUT its own .claude/scripts/.
@@ -934,29 +965,29 @@ mod tests {
     /// errors with a clear message.
     #[test]
     fn build_script_command_errors_when_nothing_resolves() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let proj = std::env::temp_dir().join(format!(
             "vct-bsc-none-{}",
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&proj).unwrap();
 
-        // SAFETY: crate tests run single-threaded by default.
         let saved_override = std::env::var_os("VCT_LAUNCHER_SCRIPTS_DIR");
-        let saved_path = std::env::var_os("PATH");
         unsafe {
             std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", &proj); // empty dir
-            std::env::set_var("PATH", "");
         }
 
-        let built = build_script_command(&proj, "kg-duplicates");
+        // An empty PATH for THIS thread's lookups only — never the shared
+        // process PATH (review R6).
+        let built = vct_launcher_core::paths::with_lookup_path(
+            Some(std::ffi::OsStr::new("")),
+            || build_script_command(&proj, "kg-duplicates"),
+        );
 
         unsafe {
             match saved_override {
                 Some(v) => std::env::set_var("VCT_LAUNCHER_SCRIPTS_DIR", v),
                 None => std::env::remove_var("VCT_LAUNCHER_SCRIPTS_DIR"),
-            }
-            if let Some(p) = saved_path {
-                std::env::set_var("PATH", p);
             }
         }
 
@@ -1101,10 +1132,7 @@ mod tests {
     /// have to time out.
     #[tokio::test]
     async fn health_check_reports_failures_without_panicking() {
-        // Force probe URLs to an unused port to guarantee connect-refused.
-        std::env::set_var("WEAVIATE_URL", "http://127.0.0.1:1");
-        std::env::set_var("OLLAMA_URL", "http://127.0.0.1:1");
-        std::env::set_var("CODE_EMBED_SERVICE_URL", "http://127.0.0.1:1");
+        // Probe URLs on an unused port guarantee connect-refused.
 
         // We can't easily construct a State<'_, Db> outside Tauri; the
         // command body doesn't use the db arg today, so we invoke the
@@ -1122,9 +1150,5 @@ mod tests {
             let res = client.get(ep).send().await;
             assert!(res.is_err(), "connect refused on unused port");
         }
-
-        std::env::remove_var("WEAVIATE_URL");
-        std::env::remove_var("OLLAMA_URL");
-        std::env::remove_var("CODE_EMBED_SERVICE_URL");
     }
 }

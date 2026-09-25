@@ -140,8 +140,10 @@ The installer is safe by default if you already have a Weaviate, Ollama, or othe
 Before bringing up its own containers, `install.py` probes each port and content-fingerprints the response (it does not rely on container names; the probe inspects the `/v1/schema` and `/api/tags` payloads):
 
 - **Nothing on the port** → start our service on the default port.
-- **A prior vco install on the port** → adopt it. No new container, no re-prompt; reuses the running service via the `~/.vct/services.toml` lock file.
-- **A foreign service on the port** (e.g. an unrelated Weaviate, another app's Ollama, a project's own stack) → default action is **alt-port**: pick the next free port, write `infrastructure/docker-compose.override.yml`, and bring our copy up next to the existing service. Your service is never stopped, modified, or written to.
+- **A service holding VCO data** (a prior vco install, or a Weaviate/Ollama with VCO's marker classes/models) → adopt it. No new container, no re-prompt; the running service is recorded as an adopted row in the launcher.db `service_endpoints` table.
+- **A third-party Ollama on the port** → adopted without asking (an informational record names it and gives the one command to switch to a VCO copy).
+- **A third-party Weaviate with no VCO data** → VCO neither adopts nor duplicates it unattended. Interactive runs prompt (default **Use it**); unattended runs record an `action_required` deferral (`service_adoption_confirmation_required`) naming both choices — adopt this instance, or let VCO run its own on another port — until you answer via the launcher dialog, `python -m vco_lib.service_endpoints adopt|use-vco-copy`, or `install.py --service weaviate=…`.
+- **A foreign service you choose not to adopt** → **alt-port**: VCO's own copy runs on the next free port, next to the existing service. Your service is never stopped, modified, or written to.
 
 Override the default with `--on-conflict`:
 
@@ -152,7 +154,7 @@ python install.py --on-conflict adopt      # advanced — reuse the foreign serv
 python install.py --on-conflict abort      # bail if any conflict is detected
 ```
 
-The chosen action per service is recorded in `~/.vct/services.toml` and re-read by both install.py and the launcher, so subsequent runs do not re-prompt.
+The chosen action per service is recorded in its `service_endpoints` row (mode, endpoint, container identity) and read by install.py, the hub, the launcher and the MCP registration alike, so subsequent runs do not re-prompt.
 
 A related but distinct case: the service on our port is one VCO would manage, but the *container* was created by a different compose project. An install refuses to recreate it and says so in the deferral ledger; from v0.2.96 that entry carries a `python -m vco_lib.service_adoption adopt-services` command that brings it under this install without touching its volumes. See [`post-install/CONTAINER-RECOVERY.md`](post-install/CONTAINER-RECOVERY.md).
 
@@ -182,19 +184,18 @@ python install.py --skip-collections      # bootstrap-only opt-out (still seeds)
 
 Set `SHARED_KG_WRITE_DISABLED=true` in `.env` (or in the install environment) to refuse `store_knowledge_node(scope="shared")` calls from this project. Reads of `VibeCodedOrchestrator_KnowledgeGraph` remain on (asymmetric model: every project always reads the shared KG; the gate is write-only). `SHARED_KG_OPT_OUT` is accepted as a legacy alias.
 
-#### Lock file: `~/.vct/services.toml`
+#### Service endpoints: the `service_endpoints` rows (v0.2.97)
 
-Persists each service's resolved action so installer and launcher agree:
+Each service's resolved state — mode (`vco_managed` / `adopted_container` / `adopted_external`), endpoint, container identity, data mount — lives in the `launcher.db` `service_endpoints` table, written only by `vco_lib/service_endpoints.py` and read by everything else. Inspect and change it with:
 
-```toml
-[[services]]
-name = "weaviate"
-mode = "adopt"          # or: "parallel", "unresolved", "refuse"
-external_url = "http://localhost:8081"
-parallel_port = 8082    # only when mode = "parallel"
+```bash
+python -m vco_lib.service_endpoints show         # every service's endpoint (and its row)
+python -m vco_lib.service_endpoints candidates   # every Weaviate/Ollama/code-embed found
+python -m vco_lib.service_endpoints adopt --service weaviate --url http://localhost:8081
+python -m vco_lib.service_endpoints use-vco-copy --service ollama
 ```
 
-Mode mapping mirrors the launcher's `AdoptionMode` enum (`adoption.rs`): `unresolved | adopt | parallel | refuse`. Delete the file to force a fresh probe on the next run.
+(The predecessor of these rows, the `~/.vct/services.toml` lock file with its `unresolved | adopt | parallel | refuse` modes, was retired in v0.2.97: its content was imported into the rows on the first update and the file renamed `services.toml.migrated-v0297`.)
 
 #### Manual cleanup of stray collections
 

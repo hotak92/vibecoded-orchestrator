@@ -4,7 +4,7 @@ description: Writes batch image and video processing scripts (Pillow, ImageMagic
 short_desc: Pillow/ImageMagick/ffmpeg batch processing
 keywords: [Pillow, ImageMagick, ffmpeg, batch image processing, asset pipeline, image resize, "convert images", "resize images", "image batch", "process images", "video processing", "bulk image", "watermark images"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Batch Image Pipeline

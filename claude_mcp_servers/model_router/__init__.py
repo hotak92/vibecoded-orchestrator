@@ -50,6 +50,10 @@ Module map
 * :mod:`model_router.server` — the aiohttp application.
 * :mod:`model_router.config` — path/port resolution.
 * :mod:`model_router.fileperms` — owner-only file permissions, cross-OS.
+* :mod:`model_router.source_identity` — the source digest ``/health`` reports,
+  so an update can PROVE a running gateway is behind its checkout.
+* :mod:`model_router.usage_windows` — subscription usage windows per vendor
+  (``/usage/windows``): cached, refreshed off every request path.
 
 This module deliberately imports nothing beyond the stdlib so that a bare
 ``import model_router`` is a valid post-install smoke check even in an
@@ -64,6 +68,6 @@ from __future__ import annotations
 #: ``scripts/check-version-pins.sh`` — it was neither until v0.2.94, which is
 #: how a 0.2.93 install served ``"version": "0.2.92"`` from /health and made
 #: "which gateway am I talking to?" unanswerable during an incident.
-__version__ = "0.2.96"
+__version__ = "0.2.97"
 
 __all__ = ["__version__"]

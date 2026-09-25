@@ -160,6 +160,7 @@ mod tests {
 
     #[test]
     fn dev_catalog_passthrough_disabled_when_env_var_unset() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let saved = std::env::var(DEV_CATALOG_PASSTHROUGH_ENV).ok();
         std::env::remove_var(DEV_CATALOG_PASSTHROUGH_ENV);
         assert!(!dev_catalog_passthrough_enabled());
@@ -170,6 +171,7 @@ mod tests {
 
     #[test]
     fn dev_catalog_passthrough_enabled_when_env_var_truthy() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         let saved = std::env::var(DEV_CATALOG_PASSTHROUGH_ENV).ok();
         std::env::set_var(DEV_CATALOG_PASSTHROUGH_ENV, "1");
         assert!(dev_catalog_passthrough_enabled());

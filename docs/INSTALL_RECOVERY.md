@@ -215,7 +215,7 @@ the user loses:
 - **License management** (tier display, activation, deactivation)
 - **Per-project URL routes** (`/p/<slug>/...` for bookmarkable views)
 
-The headless `vco` CLI exposes a subset of this via the launcher's local
+The headless `vct-cli` exposes a subset of this via the launcher's local
 hub HTTP API, but most flows (project registration, hook config, KG
 dashboard, code graph viz) are **GUI-only by design** — they require
 direct user interaction with multi-step forms, modals, and visual graph
@@ -399,7 +399,7 @@ shared libraries via `ldd <binary>`) and fix those.
 
 Show them how to register their first project via the wizard (the
 launcher's first-start flow is the canonical UX for that). Don't
-recommend the `vco` CLI as a substitute — it's an escape hatch, not
+recommend the `vct-cli` CLI as a substitute — it's an escape hatch, not
 the primary surface.
 
 ## Use the orchestrator's own tools

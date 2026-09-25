@@ -2136,7 +2136,8 @@ def code_embed_service_healthy(
     """Return True iff the code-embedding service answers ``/health`` < 400.
 
     Resolution order for the base URL: explicit arg → ``CODE_EMBED_SERVICE_URL``
-    env → ``http://localhost:<CODE_EMBED_PORT|11440>``, resolved by the ONE
+    env → ``CODE_EMBED_URL`` (the v0.2.97 client alias) →
+    ``http://localhost:<CODE_EMBED_PORT|11440>``, resolved by the ONE
     shared home ``vco_lib.code_embed_image.service_base_url`` (v0.2.92 R2 —
     this order was previously inlined here and twice in
     ``vco_lib/embedding_service.py``). Never raises — any failure (connection
@@ -2608,24 +2609,11 @@ def _hub_post_codegraph_build(project_name: str, payload: dict,
     from vco_lib.paths import vct_root_dir
 
     root = vct_root_dir()
-    port_raw = os.environ.get("VCT_HUB_PORT") or ""
-    if port_raw:
-        try:
-            port = int(port_raw.strip())
-        except ValueError:
-            port = 7700
-    else:
-        # ONE reader for "the integer in a small state file" — first line,
-        # trimmed, bounds-checked. This module previously parsed the WHOLE file
-        # as an int, so a `hub.port` with any trailing line raised where a
-        # sibling reader answered. `vco_lib.intfile` lands with the gateway lane
-        # (v0.2.94) — the shared reader, imported locally like every other
-        # vco_lib import in this function.
-        from vco_lib.intfile import read_int_line
+    # The ONE Python hub-port reader (v0.2.97), imported locally like every
+    # other vco_lib import in this function.
+    from vco_lib.hub_ensure import resolve_hub_port
 
-        port = read_int_line(
-            root / "hub.port", sentinel=7700, minimum=1, maximum=65535,
-        )
+    port = resolve_hub_port(root)
     token = os.environ.get("VCT_HUB_TOKEN") or ""
     if not token:
         token = (root / "hub.token").read_text(encoding="utf-8").strip()
@@ -3827,11 +3815,14 @@ def spawn_background_resync(
                     pass
             log_handle = None
     child_out = log_handle if log_handle is not None else subprocess.DEVNULL
+    from vco_lib.install_companions import detached_child_env
+
     popen_kwargs = {
         "cwd": str(repo_root),
         "stdout": child_out,
         "stderr": child_out,
         "stdin": subprocess.DEVNULL,
+        "env": detached_child_env(),  # outlives the caller: no relaunch record
     }
     if os.name == "posix":
         popen_kwargs["start_new_session"] = True

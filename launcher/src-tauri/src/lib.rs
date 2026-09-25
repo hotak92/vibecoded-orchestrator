@@ -94,12 +94,12 @@ pub use vct_launcher_core::secrets_file_store;
 pub use vct_launcher_core::state;
 pub use vct_launcher_core::types;
 
-// `services::` is a HYBRID: `runtime` and `picker` live in core, while
-// `adoption`, `settings_json_watcher`, and `watcher` stay in the
-// launcher. The local `mod services;` declares this crate's submodule,
-// which itself re-exports the core halves so `crate::services::runtime`
-// + `crate::services::picker` still resolve from anywhere in the
-// launcher.
+// `services::` is a HYBRID: `runtime` lives in core, while
+// `settings_json_watcher` and `watcher` stay in the launcher. The local
+// `mod services;` declares this crate's submodule, which re-exports the
+// core half so `crate::services::runtime` resolves from anywhere in the
+// launcher. (v0.2.97: the `picker` and `adoption` halves are retired — the
+// `service_endpoints` rows replaced both.)
 mod services;
 
 use state::{AppManager, ProjectState, ProjectStore};
@@ -119,9 +119,9 @@ use std::sync::Mutex;
 //
 //   * `--register-default-mcps <install_root>` (PR-23, Group B): writes the
 //     canonical bundled-orchestrator MCP entries into `~/.claude.json` AND
-//     (when a project row already exists) the launcher.db. Ports forwarded
-//     by install.py via WEAVIATE_PORT / OLLAMA_PORT / CODE_EMBED_PORT /
-//     WEAVIATE_GRPC_PORT env vars.
+//     (when a project row already exists) the launcher.db. Every endpoint
+//     value comes from the launcher.db `service_endpoints` rows (v0.2.97);
+//     no env var is read.
 //
 //   * `--set-storage-config <named|bind|deferred> [--bind-path service=path]...`
 //     (PR-28, Group G): persists the user's storage-mode decision from the
@@ -243,29 +243,10 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
     // JSON write is the primary contract, DB sync is the bonus).
     let db_handle = db::Db::open().ok();
 
-    // No services state available in the CLI path — install.py forwards
-    // the chosen ports via env vars (WEAVIATE_PORT / OLLAMA_PORT /
-    // CODE_EMBED_PORT / WEAVIATE_GRPC_PORT) the same way it does for
-    // the launcher's `install_orchestrator()` invocation. We mirror
-    // that lookup here so a multi-stack adoption stays consistent.
-    let ports = mcp_registration::ServicePorts {
-        weaviate_port: std::env::var("WEAVIATE_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
-        ollama_port: std::env::var("OLLAMA_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
-        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
-        code_embed_port: std::env::var("CODE_EMBED_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
-    };
+    // v0.2.97: the entries land in `~/.claude.json` — a machine-global
+    // surface — so every endpoint value (URLs, ports, gRPC port) is the
+    // machine's `service_endpoints` rows'. No env var is read.
+    let ports = mcp_registration::machine_service_ports();
 
     match mcp_registration::register_default_orchestrator_mcps(
         install_root,
@@ -327,24 +308,8 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
 /// dry-run that prints what WOULD be rewritten and exits 0.
 fn cli_rewrite_stale_mcps(install_root: &std::path::Path, accept_names: &[String]) -> i32 {
     let db_handle = db::Db::open().ok();
-    let ports = mcp_registration::ServicePorts {
-        weaviate_port: std::env::var("WEAVIATE_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_WEAVIATE_PORT),
-        ollama_port: std::env::var("OLLAMA_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_OLLAMA_PORT),
-        grpc_port: std::env::var("WEAVIATE_GRPC_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_GRPC_PORT),
-        code_embed_port: std::env::var("CODE_EMBED_PORT")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(mcp_registration::DEFAULT_CODE_EMBED_PORT),
-    };
+    // v0.2.97 (lane X): same ONE port source as cli_register_default_mcps.
+    let ports = mcp_registration::machine_service_ports();
     match mcp_registration::rewrite_stale_orchestrator_mcps(
         install_root,
         ports,
@@ -934,8 +899,12 @@ pub fn run() {
             // `.desktop`-launched apps under systemd-user inherit a
             // similarly minimal PATH (missing `$HOME/.local/bin`,
             // `$HOME/.cargo/bin`, linuxbrew, snap, flatpak). Windows
-            // Explorer-launched apps inherit the user PATH via registry,
-            // so the call is a no-op there.
+            // Explorer-launched apps inherit the user PATH via registry;
+            // there it only appends the container runtimes' installer dirs
+            // the PATH lacks (v0.2.97). Order rule (R10): the graphical-
+            // launch dirs go AHEAD of the inherited PATH (a login shell's
+            // order), the runtime locations BEHIND it — per entry in
+            // `vco_lib/tool_search_dirs.toml`.
             //
             // Idempotent: candidates already on PATH are skipped, so
             // running again from a terminal that already sourced .zshrc
@@ -1832,13 +1801,12 @@ pub fn run() {
                     else {
                         return;
                     };
-                    // Weaviate URL: honour env override (matches the
-                    // contract in the rest of the launcher), default
-                    // to canonical localhost:8081.
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| {
-                            "http://localhost:8081".to_string()
-                        });
+                    // Weaviate URL: the launcher.db `service_endpoints` row
+                    // (v0.2.97), else the compiled default. No env var.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
+                            db.inner(),
+                        );
 
                     let adopt_report = db
                         .inner()
@@ -1979,8 +1947,14 @@ pub fn run() {
                     else {
                         return;
                     };
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    // v0.2.97: the launcher.db `service_endpoints` row —
+                    // this read only `WEAVIATE_URL`, so on a machine with an
+                    // adopted or moved Weaviate the boot sweep judged the
+                    // wrong instance's schema.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
+                            db.inner(),
+                        );
                     match db
                         .inner()
                         .reconcile_kg_collection_access_at_boot(&weaviate_url)
@@ -2167,6 +2141,17 @@ pub fn run() {
             // Emits `vct-launcher-update-available` event when remote HEAD
             // has new commits — never auto-applies.
             commands::self_update::spawn_daily_check(app.handle().clone());
+
+            // v0.2.97: materialize the bundled core-module manifests into the
+            // state dir (the hub does the same at its own start) — every
+            // manifest reader looks there, and nothing used to write it.
+            if let Some(warning) = vct_launcher_core::bundled_manifests::sync_bundled_manifests(
+                &crate::paths::vct_root_dir(),
+            )
+            .warning()
+            {
+                tracing::warn!("[vct] could not materialize bundled manifests: {}", warning);
+            }
 
             // v0.2.18 Commit 3: OpenAI key startup recovery state machine.
             // Reads the keychain row at
@@ -2510,8 +2495,14 @@ pub fn run() {
                     let Some(db) = repair_handle.try_state::<db::Db>() else {
                         return;
                     };
-                    let weaviate_url = std::env::var("WEAVIATE_URL")
-                        .unwrap_or_else(|_| "http://localhost:8081".to_string());
+                    // v0.2.97: the launcher.db `service_endpoints` row —
+                    // this read only `WEAVIATE_URL`, so on a machine with an
+                    // adopted or moved Weaviate the boot sweep judged the
+                    // wrong instance's schema.
+                    let weaviate_url =
+                        vct_launcher_core::services::service_endpoints::machine_weaviate_url(
+                            db.inner(),
+                        );
                     let report =
                         crate::binding_reconcile::reconcile_half_renamed_bindings_at_boot(
                             db.inner(),
@@ -2697,12 +2688,13 @@ pub fn run() {
             commands::lifecycle::service_start,
             commands::lifecycle::service_stop,
             commands::lifecycle::service_restart,
-            commands::lifecycle::services_set_adoption,
-            commands::lifecycle::services_get_adoption,
-            commands::lifecycle::services_reset_adoption,
-            commands::lifecycle::services_find_free_port,
-            commands::lifecycle::services_enumerate_candidates,
-            commands::lifecycle::services_pick_container,
+            // v0.2.97 (service endpoints SSOT): the rows (read) and the
+            // Python verbs that change them (candidates / adopt /
+            // use-vco-copy / hand-to-vco). The services.toml adoption
+            // commands and the container picker are retired.
+            commands::lifecycle::services_get_endpoints,
+            commands::lifecycle::services_endpoint_candidates,
+            commands::lifecycle::services_endpoint_action,
             // Container-runtime install (no-runtime modal). Linux uses
             // pkexec to elevate apt/dnf/pacman; macOS/Windows just open
             // the canonical install page in the user's default browser.
@@ -2891,6 +2883,8 @@ pub fn run() {
             commands::module_gui::get_module_nav_items,
             commands::module_gui::get_module_setting,
             commands::module_gui::set_module_setting,
+            commands::module_gui::list_module_settings,
+            commands::module_gui::module_setting_live_values,
             // Stream 2 follow-up (v0.2.20, 2026-05-19): orchestrator-core
             // config-tab actions. Backs the controls declared in the
             // repo-root `vct-module.json::gui.config_tab` block.
@@ -3056,6 +3050,9 @@ pub fn run() {
             commands::model_gateway::model_gateway_clear_default_model,
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
+            commands::gateway_freshness::model_gateway_freshness,
+            commands::gateway_freshness::model_gateway_restart_stale,
+            commands::gateway_usage::model_gateway_usage_windows,
             commands::project_state_cmd::add_project_permission,
             commands::project_state_cmd::delete_project_permission,
             // 0.2.x backlog #5: per-project MCP toggle UI.
@@ -3115,6 +3112,7 @@ pub fn run() {
             // `module_clear_global_enabled` is the same way back at the
             // host-wide tier. Same shape as WP-L's dual-flag commands.
             commands::module_enabled::module_enable_state,
+            commands::module_health::module_health_snapshot,
             commands::module_enabled::module_set_enabled_for_project_v2,
             commands::module_enabled::module_clear_global_enabled,
             // v0.2.52 V52-AD: host-wide (global) enable toggle that

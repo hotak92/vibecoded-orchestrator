@@ -5,7 +5,7 @@ short_desc: runtime orchestration, agent coordination, progress
 keywords: ["multi-agent coordination", "dependency tracking", "blocker resolution", "parallel execution", "progress tracking", "coordinate agents", "track progress", "manage multiple agents", "orchestrate work"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 ---
 
 # Project Coordinator Agent (Sonnet)

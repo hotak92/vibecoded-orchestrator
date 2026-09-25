@@ -1,0 +1,432 @@
+{
+  "_comment": [
+    "v0.2.97 R9 H1(b)/H5 + R10 J3 — ONE fixture for the usual-tool-install-locations rule, read by",
+    "tests/test_v0297_r9_runtime_locations.py (Python: vco_lib.tool_search_dirs.search_entries / lookup_entries) AND",
+    "by launcher/src-tauri/vct-launcher-core/src/services/runtime.rs (Rust: tool_search_entries_for /",
+    "augmented_entries, the launcher's and the hub's startup PATH augment). Both read the table",
+    "vco_lib/tool_search_dirs.toml.",
+    "`cases` pin the per-OS lists as [dir, placement] pairs and the expansion rule: `~/rest` needs a home,",
+    "`${NAME}rest` a set non-empty NAME, anything else is literal; duplicates are dropped; VCT_TOOL_SEARCH_DIRS",
+    "(set, even empty) REPLACES the list, split on the OS path separator, every entry placed `append`.",
+    "`order_cases` pin THE ORDER RULE: [prepend-when-missing entries not on `path`] + `path` unchanged +",
+    "[append entries not on `path`] must equal `expect_path`; then `resolve` names the first `expect_path`",
+    "directory D for which D + sep + resolve is in `binaries` (sep `\\` for windows, `/` else) — `expect`,",
+    "or null when none. `home` null = no home; `env` is the whole environment the case sees."
+  ],
+  "cases": [
+    {
+      "name": "linux_table_with_a_home",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "expect": [
+        ["/home/u/.local/bin", "prepend-when-missing"],
+        ["/home/u/.cargo/bin", "prepend-when-missing"],
+        ["/home/linuxbrew/.linuxbrew/bin", "prepend-when-missing"],
+        ["/snap/bin", "prepend-when-missing"],
+        ["/var/lib/flatpak/exports/bin", "prepend-when-missing"],
+        ["/home/u/bin", "append"],
+        ["/usr/local/bin", "append"],
+        ["/usr/bin", "append"]
+      ]
+    },
+    {
+      "name": "linux_without_a_home_drops_the_home_relative_entries",
+      "os": "linux",
+      "home": null,
+      "env": {},
+      "expect": [
+        ["/home/linuxbrew/.linuxbrew/bin", "prepend-when-missing"],
+        ["/snap/bin", "prepend-when-missing"],
+        ["/var/lib/flatpak/exports/bin", "prepend-when-missing"],
+        ["/usr/local/bin", "append"],
+        ["/usr/bin", "append"]
+      ]
+    },
+    {
+      "name": "macos_table_covers_homebrew_podman_and_docker_desktop",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "expect": [
+        ["/opt/homebrew/bin", "prepend-when-missing"],
+        ["/opt/homebrew/sbin", "prepend-when-missing"],
+        ["/Users/u/.cargo/bin", "prepend-when-missing"],
+        ["/Users/u/.local/bin", "prepend-when-missing"],
+        ["/Users/u/bin", "append"],
+        ["/usr/local/bin", "append"],
+        ["/opt/podman/bin", "append"],
+        ["/Applications/Docker.app/Contents/Resources/bin", "append"],
+        ["/Users/u/Applications/Docker.app/Contents/Resources/bin", "append"],
+        ["/Users/u/.docker/bin", "append"],
+        ["/opt/local/bin", "append"],
+        ["/usr/bin", "append"]
+      ]
+    },
+    {
+      "name": "windows_table_expands_the_installer_locations",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": "C:\\Program Files",
+        "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local"
+      },
+      "expect": [
+        ["C:\\Program Files\\Docker\\Docker\\resources\\bin", "append"],
+        ["C:\\Program Files\\RedHat\\Podman", "append"],
+        ["C:\\Users\\u\\AppData\\Local\\Programs\\Podman", "append"]
+      ]
+    },
+    {
+      "name": "windows_entries_whose_variable_is_unset_or_empty_are_dropped",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": ""
+      },
+      "expect": []
+    },
+    {
+      "name": "an_os_without_a_list_has_none",
+      "os": "other",
+      "home": "/home/u",
+      "env": {},
+      "expect": []
+    },
+    {
+      "name": "the_override_set_empty_means_no_directories",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": ""
+      },
+      "expect": []
+    },
+    {
+      "name": "the_override_replaces_the_list_with_the_same_syntax_all_appended",
+      "os": "linux",
+      "home": "/h/",
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "~/bin::/opt/x:~/bin"
+      },
+      "expect": [
+        ["/h/bin", "append"],
+        ["/opt/x", "append"]
+      ]
+    },
+    {
+      "name": "the_windows_override_splits_on_semicolons",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "${ProgramFiles}\\X;C:\\Y",
+        "ProgramFiles": "C:\\PF"
+      },
+      "expect": [
+        ["C:\\PF\\X", "append"],
+        ["C:\\Y", "append"]
+      ]
+    },
+    {
+      "name": "a_malformed_variable_reference_is_literal",
+      "os": "linux",
+      "home": null,
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "${1BAD}/x:${}/y"
+      },
+      "expect": [
+        ["${1BAD}/x", "append"],
+        ["${}/y", "append"]
+      ]
+    }
+  ],
+  "order_cases": [
+    {
+      "name": "a_finder_launch_prefers_homebrew_git_over_the_system_stub",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "path": ["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+      "expect_path": [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/Users/u/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin"
+      ],
+      "binaries": ["/usr/bin/git", "/opt/homebrew/bin/git"],
+      "resolve": "git",
+      "expect": "/opt/homebrew/bin/git"
+    },
+    {
+      "name": "a_linux_desktop_launch_prefers_the_user_local_python_as_a_login_shell_does",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"],
+      "expect_path": [
+        "/home/u/.local/bin",
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/home/u/bin"
+      ],
+      "binaries": ["/usr/bin/python3", "/home/u/.local/bin/python3"],
+      "resolve": "python3",
+      "expect": "/home/u/.local/bin/python3"
+    },
+    {
+      "name": "an_inherited_home_bin_docker_beats_the_tables_usr_local_bin_on_linux",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/home/u/bin", "/usr/bin", "/bin"],
+      "expect_path": [
+        "/home/u/.local/bin",
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/home/u/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/local/bin"
+      ],
+      "binaries": ["/home/u/bin/docker", "/usr/local/bin/docker"],
+      "resolve": "docker",
+      "expect": "/home/u/bin/docker"
+    },
+    {
+      "name": "an_inherited_home_bin_docker_beats_the_tables_usr_local_bin_on_macos",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "path": ["/Users/u/bin", "/usr/bin", "/bin"],
+      "expect_path": [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/Users/u/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin"
+      ],
+      "binaries": ["/Users/u/bin/docker", "/usr/local/bin/docker"],
+      "resolve": "docker",
+      "expect": "/Users/u/bin/docker"
+    },
+    {
+      "name": "a_runtime_only_in_an_appended_location_is_found_on_macos",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "path": ["/usr/bin", "/bin", "/usr/sbin", "/sbin"],
+      "expect_path": [
+        "/opt/homebrew/bin",
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/usr/bin",
+        "/bin",
+        "/usr/sbin",
+        "/sbin",
+        "/Users/u/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin"
+      ],
+      "binaries": ["/opt/podman/bin/podman"],
+      "resolve": "podman",
+      "expect": "/opt/podman/bin/podman"
+    },
+    {
+      "name": "a_rootless_docker_only_in_home_bin_is_found_under_the_systemd_user_path",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin"],
+      "expect_path": [
+        "/home/u/.local/bin",
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/local/sbin",
+        "/usr/local/bin",
+        "/usr/sbin",
+        "/usr/bin",
+        "/sbin",
+        "/bin",
+        "/home/u/bin"
+      ],
+      "binaries": ["/home/u/bin/docker"],
+      "resolve": "docker",
+      "expect": "/home/u/bin/docker"
+    },
+    {
+      "name": "a_windows_task_path_reaches_docker_desktop_after_its_own_entries",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": "C:\\Program Files",
+        "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local"
+      },
+      "path": ["C:\\Windows\\system32", "C:\\Windows"],
+      "expect_path": [
+        "C:\\Windows\\system32",
+        "C:\\Windows",
+        "C:\\Program Files\\Docker\\Docker\\resources\\bin",
+        "C:\\Program Files\\RedHat\\Podman",
+        "C:\\Users\\u\\AppData\\Local\\Programs\\Podman"
+      ],
+      "binaries": ["C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe"],
+      "resolve": "docker.exe",
+      "expect": "C:\\Program Files\\Docker\\Docker\\resources\\bin\\docker.exe"
+    },
+    {
+      "name": "a_graphical_launch_dir_already_on_path_is_never_moved",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/bin", "/home/u/.local/bin"],
+      "expect_path": [
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/bin",
+        "/home/u/.local/bin",
+        "/home/u/bin",
+        "/usr/local/bin"
+      ],
+      "binaries": ["/usr/bin/python3", "/home/u/.local/bin/python3"],
+      "resolve": "python3",
+      "expect": "/usr/bin/python3"
+    },
+    {
+      "name": "the_override_is_appended_and_never_shadows_the_path",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {
+        "VCT_TOOL_SEARCH_DIRS": "~/bin:/opt/x"
+      },
+      "path": ["/usr/bin"],
+      "expect_path": ["/usr/bin", "/home/u/bin", "/opt/x"],
+      "binaries": ["/usr/bin/docker", "/opt/x/docker"],
+      "resolve": "docker",
+      "expect": "/usr/bin/docker"
+    },
+    {
+      "name": "a_name_nowhere_is_not_found",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/bin"],
+      "expect_path": [
+        "/home/u/.local/bin",
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/bin",
+        "/home/u/bin",
+        "/usr/local/bin"
+      ],
+      "binaries": [],
+      "resolve": "podman",
+      "expect": null
+    },
+    {
+      "name": "an_inherited_homebrew_with_a_trailing_slash_is_present",
+      "_why": "R11 L5: a hand-written rc line left `/opt/homebrew/bin/` on PATH. It IS Homebrew's dir, so it is never prepended again ahead of /usr/bin (Python compared raw strings and moved it; Rust compared Paths and did not).",
+      "os": "macos",
+      "home": "/Users/u",
+      "env": {},
+      "path": ["/usr/bin", "/opt/homebrew/bin/"],
+      "expect_path": [
+        "/opt/homebrew/sbin",
+        "/Users/u/.cargo/bin",
+        "/Users/u/.local/bin",
+        "/usr/bin",
+        "/opt/homebrew/bin/",
+        "/Users/u/bin",
+        "/usr/local/bin",
+        "/opt/podman/bin",
+        "/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/Applications/Docker.app/Contents/Resources/bin",
+        "/Users/u/.docker/bin",
+        "/opt/local/bin"
+      ],
+      "binaries": ["/usr/bin/git", "/opt/homebrew/bin/git"],
+      "resolve": "git",
+      "expect": "/usr/bin/git"
+    },
+    {
+      "name": "duplicate_separators_do_not_make_an_entry_missing",
+      "_why": "R11 L5: `//home/u//.local/bin` is ~/.local/bin; it keeps its place and is not added again.",
+      "os": "linux",
+      "home": "/home/u",
+      "env": {},
+      "path": ["/usr/bin", "//home/u//.local/bin"],
+      "expect_path": [
+        "/home/u/.cargo/bin",
+        "/home/linuxbrew/.linuxbrew/bin",
+        "/snap/bin",
+        "/var/lib/flatpak/exports/bin",
+        "/usr/bin",
+        "//home/u//.local/bin",
+        "/home/u/bin",
+        "/usr/local/bin"
+      ],
+      "binaries": ["/usr/bin/python3", "/home/u/.local/bin/python3"],
+      "resolve": "python3",
+      "expect": "/usr/bin/python3"
+    },
+    {
+      "name": "a_windows_entry_matches_regardless_of_case_slashes_and_trailing_separator",
+      "_why": "R11 L5: on Windows `c:/program files/docker/docker/resources/bin/` IS Docker Desktop's dir (case-insensitive, `/` = `\\\\`, trailing separator); it is not appended again.",
+      "os": "windows",
+      "home": null,
+      "env": {
+        "ProgramFiles": "C:\\Program Files",
+        "LOCALAPPDATA": "C:\\Users\\u\\AppData\\Local"
+      },
+      "path": ["C:\\Windows\\system32", "c:/program files/docker/docker/resources/bin/"],
+      "expect_path": [
+        "C:\\Windows\\system32",
+        "c:/program files/docker/docker/resources/bin/",
+        "C:\\Program Files\\RedHat\\Podman",
+        "C:\\Users\\u\\AppData\\Local\\Programs\\Podman"
+      ],
+      "binaries": ["C:\\Program Files\\RedHat\\Podman\\podman.exe"],
+      "resolve": "podman.exe",
+      "expect": "C:\\Program Files\\RedHat\\Podman\\podman.exe"
+    }
+  ]
+}

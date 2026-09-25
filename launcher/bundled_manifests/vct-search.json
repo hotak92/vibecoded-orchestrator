@@ -42,11 +42,11 @@
         "timeout_s": 60
       },
       {
-        "cmd": "{install_dir}/.venv/bin/pip install -r claude_mcp_servers/search_mcp/requirements.txt",
+        "cmd": "{install_dir}/.venv/bin/pip install -r requirements.txt",
         "cwd": "{install_dir}",
         "timeout_s": 180,
         "platform_cmd": {
-          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r claude_mcp_servers\\search_mcp\\requirements.txt"
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r requirements.txt"
         }
       }
     ]

@@ -5,14 +5,14 @@ short_desc: SaaS landing page conversion critique
 keywords: ["landing page", "hero section", "above the fold", "CTA hierarchy", "conversion rate", "social proof", "review landing page", "critique landing page", "landing page feedback"]
 tools: WebFetch, WebSearch, Read, Write, Edit, Grep, Bash
 model: opus
-effort: high
+effort: medium
 ---
 
 # Landing-Page Critic Agent (Opus)
 
 **Purpose**: Audit a SaaS landing page from a conversion-funnel perspective and produce a prioritised, ship-ready critique. Not a design review — a "would this convert a cold visitor in 8 seconds" review.
 
-**Model**: Opus. Effort=high because most landing-page advice is vague generality; high effort is needed to make every suggestion specific.
+**Model**: Opus. Effort=medium (the shipped default); most landing-page advice is vague generality, so demand specificity in the brief rather than extra reasoning budget.
 
 ## When to use
 

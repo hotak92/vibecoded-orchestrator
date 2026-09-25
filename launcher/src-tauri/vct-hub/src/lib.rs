@@ -46,7 +46,7 @@ pub mod gateway_watchdog;
 // v0.2.91 wave 5 residual close — real enforcement for the two hub routes
 // that toggle a project hook (`project_state_api::patch_hook` and
 // `cli_api::set_hook_enabled`, the latter reachable from the shipped
-// `vco hooks enable/disable` CLI). Drives the same `vco_lib.hooks_settings`
+// `vct-cli hooks enable/disable` CLI). Drives the same `vco_lib.hooks_settings`
 // writer decision #27 introduced for the launcher GUI's Hooks tab — see the
 // module doc for why the hub needs its own (documented) caller of it.
 pub mod hooks_enforcement;
@@ -68,6 +68,8 @@ pub mod lifecycle_api;
 pub mod lockfile;
 pub mod mcp_tool_grants_api;
 pub mod module_identity;
+// v0.2.97 (lane V): the `runtime.health_check` poller — module up/down/unknown.
+pub mod module_health;
 pub mod module_supervisor;
 pub mod module_db_api;
 pub mod modules_api;

@@ -1,10 +1,14 @@
 """v0.2.45 V45-A: tests for `install._ensure_running_under_mcp_venv`.
 
-The helper is supposed to relaunch install.py under
-`claude_mcp_servers/.venv/bin/python` when:
+The helper is supposed to relaunch install.py under the install's venv
+interpreter (`_resolve_venv_python_for_install(PROJECT_ROOT)`: `.venv`, then the
+legacy `claude_mcp_servers/.venv`) when:
   - `import weaviate` is unimportable from the current interpreter
-  - AND `_resolve_venv_python_for_install(PROJECT_ROOT)` returns a different,
-    existing interpreter
+  - AND that interpreter exists, and THIS process is not already that venv —
+    decided by VENV identity (`sys.prefix` against the venv root), not by
+    comparing resolved binaries (v0.2.97: a POSIX venv's python is a symlink
+    to the base interpreter, so the binaries always matched and the relaunch
+    never happened; see tests/test_v0297_relaunch_venv_identity.py)
   - AND `VCT_INSTALL_RELAUNCHED` is not already set
 
 In every other case it should be a no-op (return without touching
@@ -135,12 +139,12 @@ def test_skip_when_target_does_not_exist(monkeypatch, execve_recorder):
 
 
 def test_skip_when_already_running_under_target(monkeypatch, execve_recorder):
-    """If the resolver returns the SAME interpreter we're already running,
+    """If the resolver names the interpreter of the venv we are already IN,
     don't exec.
 
-    This is the case where install.py is invoked under the MCP venv directly
-    (e.g. the launcher already routes correctly post-V45-B). Resolver returns
-    `sys.executable`, helper bails out.
+    This is the case where install.py is invoked under the install's venv
+    directly. The resolver returns `sys.executable`, whose venv root (two
+    levels up) is this process's `sys.prefix`, so the helper bails out.
     """
     _force_find_spec(monkeypatch, found=False)
     monkeypatch.delenv("VCT_INSTALL_RELAUNCHED", raising=False)
@@ -155,12 +159,13 @@ def test_skip_when_already_running_under_target(monkeypatch, execve_recorder):
 def test_execve_called_when_all_conditions_met(
     monkeypatch, execve_recorder, tmp_path,
 ):
-    """Happy path: weaviate missing, venv resolves to a DIFFERENT existing
-    interpreter — helper must os.execve into it with the re-entry guard.
+    """Happy path: weaviate missing, the venv resolves to an existing
+    interpreter of a venv this process is NOT — helper must os.execve into it
+    with the re-entry guard.
 
-    We synthesize a fake interpreter on disk (tmp_path/fake-python). Using
-    tmp_path guarantees a real-file path that differs from sys.executable
-    so the same-interpreter short-circuit doesn't fire.
+    We synthesize a fake interpreter on disk (tmp_path/fake-python). Its venv
+    root (two levels up) is not this process's `sys.prefix`, so the
+    already-inside short-circuit doesn't fire.
     """
     _force_find_spec(monkeypatch, found=False)
     monkeypatch.delenv("VCT_INSTALL_RELAUNCHED", raising=False)
@@ -169,8 +174,8 @@ def test_execve_called_when_all_conditions_met(
     fake_python.write_text("#!/bin/sh\nexit 0\n")
     fake_python.chmod(0o755)
 
-    # Sanity: tmp_path is not equal to sys.executable
-    assert Path(fake_python).resolve() != Path(sys.executable).resolve()
+    # Sanity: this process is not the venv that owns fake_python.
+    assert not install._is_running_inside_venv(fake_python)
 
     monkeypatch.setattr(install, "_resolve_venv_python_for_install",
                         lambda root: fake_python)
@@ -190,8 +195,11 @@ def test_execve_called_when_all_conditions_met(
         f"execve path must be the resolved venv interpreter; got {call['path']}"
     )
     # argv[0] must be the same target; remaining argv preserved verbatim
-    assert call["argv"] == [str(fake_python), "/some/path/install.py", "--update"], (
-        f"execve argv must be [target, *sys.argv]; got {call['argv']}"
+    # v0.2.97: plus the per-hop token that proves the record is this run's own.
+    token = call["env"]["VCT_INSTALL_RELAUNCH_TOKEN"]
+    assert call["argv"] == [str(fake_python), "/some/path/install.py", "--update",
+                            f"--vct-relaunch-token={token}"], (
+        f"execve argv must be [target, *sys.argv, token]; got {call['argv']}"
     )
     # Re-entry guard env var must be set in the child env
     assert call["env"].get("VCT_INSTALL_RELAUNCHED") == "1", (

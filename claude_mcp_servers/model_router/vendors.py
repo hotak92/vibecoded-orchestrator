@@ -154,6 +154,19 @@ class Vendor:
             dropped ids as withheld. For a vendor whose endpoint lists ids
             that reroute server-side to other models: the picker must not
             offer an id that answers as something else.
+        quota_url: ABSOLUTE URL of the vendor's subscription-quota endpoint,
+            or ``None`` when the vendor publishes no programmatic quota. Read
+            by :mod:`model_router.usage_windows`, which speaks exactly ONE
+            shape — Z.ai's monitor JSON (``data.limits[]`` with ``unit`` /
+            ``number`` / ``percentage`` / ``nextResetTime``), key presented
+            RAW in ``Authorization`` with no scheme. UNDOCUMENTED by the
+            vendor; it is parsed defensively and every miss reads "unknown".
+            A row with ``None`` gets the honest fallback instead: the
+            gateway's own ledger tokens for the current month, labelled as
+            tokens, never as a percentage.
+        short_name: the compact label the usage status line and the
+            launcher's usage card print for this vendor (``GLM``, ``Qwen``).
+            Falls back to :func:`vendor_display_name` when empty.
     """
 
     vendor_id: str
@@ -177,6 +190,8 @@ class Vendor:
     static_ids: tuple[str, ...] = ()
     display_name: str = ""
     verified_ids: tuple[str, ...] = ()
+    quota_url: Optional[str] = None
+    short_name: str = ""
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -231,6 +246,13 @@ VENDORS: Mapping[str, Vendor] = {
         # (see `verified_ids` on Vendor) — a picker row that answers as a
         # different model is the alias trap wearing a list.
         verified_ids=("glm-5.3", "glm-5.3-flash"),
+        # Probed live 2026-09-23: 5h (unit 3, number 5) and weekly (unit 6,
+        # number 1) windows, both type CREDIT_LIMIT. The endpoint is
+        # undocumented and its schema changed during 2026 (older answers
+        # carried TOKENS_LIMIT and no weekly row) — see
+        # model_router.usage_windows.parse_zai_quota for how both read.
+        quota_url="https://api.z.ai/api/monitor/usage/quota/limit",
+        short_name="GLM",
     ),
     "qwen": Vendor(
         vendor_id="qwen",
@@ -284,6 +306,10 @@ VENDORS: Mapping[str, Vendor] = {
             "qwen3.6-flash", "glm-5.3", "glm-5.2", "deepseek-v4.1-flash",
             "deepseek-v4-pro",
         ),
+        # No quota_url: the Token Plan is monthly credits with no endpoint
+        # and no quota headers (probed 2026-09-23), so usage shows the
+        # gateway ledger's tokens for the month instead of a percentage.
+        short_name="Qwen",
     ),
 }
 
@@ -387,6 +413,13 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "or a failed fetch, the picker would show nothing for "
                     "this vendor",
                 )
+        if vendor.quota_url is not None and not vendor.quota_url.startswith(
+            ("http://", "https://"),
+        ):
+            raise RegistryError(
+                f"vendor {key!r}: quota_url {vendor.quota_url!r} is not an "
+                "absolute http(s) URL",
+            )
         for exclude_prefix in vendor.catalog_exclude_prefixes:
             if not exclude_prefix.strip():
                 raise RegistryError(

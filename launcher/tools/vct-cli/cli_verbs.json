@@ -1,0 +1,16 @@
+{
+  "_comment": "The vct-cli command tree: top-level verb -> its subcommands, exactly as clap builds them (auto `help` included). Proven against the real parser by `verb_table_matches_the_parser` in src/main.rs; read by tests/test_v0297_cli_program_names.py to check every `vct-cli <verb>` and `vco <verb>` in shipped text. Change a verb in src/main.rs and this file must change with it.",
+  "program": "vct-cli",
+  "verbs": {
+    "audit": ["help", "list"],
+    "codegraph": ["collections", "help", "search"],
+    "help": ["audit", "codegraph", "help", "hooks", "hub", "kg", "license", "module", "project", "telemetry"],
+    "hooks": ["disable", "enable", "help", "list"],
+    "hub": ["health", "help", "url"],
+    "kg": ["collections", "help", "search"],
+    "license": ["activate", "deactivate", "help", "status"],
+    "module": ["help", "installed", "list"],
+    "project": ["create", "delete", "help", "list", "rename", "show"],
+    "telemetry": ["help", "off", "on", "pending", "status"]
+  }
+}

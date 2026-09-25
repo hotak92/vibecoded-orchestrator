@@ -32,6 +32,14 @@ with an unexpected trailing line answers with the number somebody wrote rather
 than falling through to a default that, on the machine this was written for,
 is somebody else's service.
 
+``hub.port`` LEFT this reader in v0.2.97 (R7b F9): it is read by Python, bash,
+PowerShell, two Rust crates and the ``vct`` CLI, and those must all give the
+same answer, so its value rule lives in ``vco_lib.hub_ensure.parse_hub_port``
+and a shared case table — the WHOLE value, trimmed, ASCII ``[0-9]{1,5}`` in
+1..65535. A second line is internal whitespace there, i.e. invalid (four of
+the five non-Python readers already refused it; ``int()`` here had accepted a
+sign, ``_`` and non-ASCII numerals that every other reader refused).
+
 Stdlib only, and it must stay that way: ``hub_ensure`` imports it on the path
 the launcher runs during an UPDATE, when the orchestrator venv is precisely
 the thing in flux (``tests/test_v0292_hub_ensure.py::test_resolve_needs_only_the_stdlib``).

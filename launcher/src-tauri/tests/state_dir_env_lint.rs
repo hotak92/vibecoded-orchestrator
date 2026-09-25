@@ -290,11 +290,21 @@ fn the_lint_actually_walks_the_workspace_and_excludes_only_test_env() {
         "exactly one sanctioned file expected, got {sanctioned:?}"
     );
     let body = std::fs::read_to_string(sanctioned[0]).expect("read test_env.rs");
-    for needle in BANNED {
-        assert!(
-            body.contains(needle),
-            "the sanctioned file must actually contain `{needle}` — otherwise \
-             the exclusion is protecting nothing and the ban is untested"
-        );
-    }
+    // The SET is the sanctioned mutation (`state_dir_guard_with`). An UNSET
+    // of the variable happens only through the generic restore
+    // (`EnvRestore`, over a captured name) — since v0.2.97 review R6 not
+    // even test_env's own tests remove it by literal name, because a bare
+    // unset outside the lock sent concurrent tests to the real `~/.vct`.
+    let set_needle = BANNED[0];
+    assert!(
+        body.contains(set_needle),
+        "the sanctioned file must actually contain `{set_needle}` — otherwise \
+         the exclusion is protecting nothing and the ban is untested"
+    );
+    assert!(
+        !strip_line_comments(&body).contains(BANNED[1]),
+        "`{}` by literal name, even in the sanctioned file, is the shape that \
+         leaked the real ~/.vct into concurrent tests; restore through a guard",
+        BANNED[1]
+    );
 }

@@ -70,10 +70,34 @@ use crate::db::models::ProjectRow;
 use crate::manifest::{ModuleManifest, PlaceholderCtx, PortMapping, VolumeMount};
 use crate::services::gpu_mode::GpuMode;
 
-/// Default Ollama port used to resolve `{ollama_port}` in env values when
-/// the manifest doesn't override it. Matches the launcher's well-known
-/// service-port layout.
+/// The compiled-default Ollama port (a string for placeholder maps). The
+/// `{ollama_port}` placeholder itself resolves to the machine's Ollama
+/// `service_endpoints` row ([`ollama_port_placeholder`]); this is only its
+/// absent-row answer. MUST MATCH `service_endpoints::DEFAULT_OLLAMA_PORT`.
 pub const DEFAULT_OLLAMA_PORT: &str = "11435";
+
+/// `{ollama_port}` for the RL placeholder maps: the machine's Ollama row
+/// (v0.2.97) — the same answer `PlaceholderCtx::resolve` gives, so the two
+/// placeholder layers cannot disagree.
+fn ollama_port_placeholder() -> String {
+    crate::services::service_endpoints::machine_port_from_disk(
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
+    .to_string()
+}
+
+/// `{ollama_url}` (v0.2.97, lane Y): the machine's Ollama URL AS SEEN FROM
+/// INSIDE a module container — the ONE container-view helper in
+/// `service_endpoints`. A loopback row renders as the runtime host alias
+/// (`host.containers.internal`, which the `--add-host` below resolves to the
+/// host gateway); a non-loopback `adopted_external` row is the row's host as
+/// is. New manifests write `OLLAMA_URL: "{ollama_url}"` instead of hardcoding
+/// the alias + `{ollama_port}`.
+fn ollama_url_placeholder() -> String {
+    crate::services::service_endpoints::machine_url_from_container_disk(
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
+}
 
 /// Fixed host port the GLOBAL (machine-wide) RL reranker container listens
 /// on, used after a module migrates from per-project to global scope
@@ -110,88 +134,46 @@ pub const DEDUP_SENTINEL: &str = "vct-launcher-core::services::container_runtime
 //
 //   * hardcoded podman-first PATH probing — ignoring the user's
 //     `VCT_CONTAINER_RUNTIME` choice and the install-time
-//     `state/install/runtime.txt` record that install.py + the hooks +
-//     the launcher's infra-stack path (services/runtime.rs) all honor
-//     (C-RT-1: dual-runtime hosts ended up with infra under docker and
-//     paid-module containers under podman, silently); and
+//     `state/install/runtime.txt` record (C-RT-1: dual-runtime hosts ended
+//     up with infra under docker and paid-module containers under podman,
+//     silently). NOTE: until v0.2.97 R7b F5 this comment claimed install.py,
+//     the hooks and services/runtime.rs honoured runtime.txt — they did not
+//     (only this module did, for module containers and storage/volumes).
+//     Since R7b F5 they all do, with the ONE precedence below; and
 //
 //   * probed with `--version`, which only proves the CLIENT BINARY
 //     exists — it never contacts the daemon/machine. A macOS/Windows
 //     host with podman installed-but-machine-stopped and Docker
 //     Desktop running picked the dead podman every time (C-RT-2).
 //
-// This promoted detector applies the canonical v0.2.14 contract
-// (install.py `_runtime_preference_from_env` + `_detect_container_runtime`
-// + `_container_runtime_reachable`), with the v0.2.92 pin discipline
-// (delivery-audit M1 / R35 — the same ruling BLOCKER-4 already applied to
-// the other two surfaces, `vco_lib.containers.resolve` and
-// `services/runtime.rs::candidate_order`):
+// v0.2.97 R12 (owner ruling "Consolidate now"): the precedence contract
+// this block used to present as THIS module's — env pin
+// (`VCT_CONTAINER_RUNTIME`) → the install's `state/install/runtime.txt`
+// → daemon-aware podman-first auto-detect, each refused-never-substituted
+// — is NOT decided here any more (nor anywhere else in Rust). The ONE
+// decision lives in Python (`vco_lib.runtime_reconcile.decide`);
+// `detect_container_runtime` below ASKS it through
+// `runtime_verdict::decide(install_root, ReadOnly, Module)` and renders
+// the answer (runtime + pin source, or Python's refusal text verbatim —
+// M3). The Rust precedence ladder this block documented, and the
+// `runtime_candidate_order` / `pinned_runtime` homes it named, were
+// RETIRED with the rest of the reconcile mirrors
+// (`services/runtime.rs::candidate_order` included); the parity fixture
+// (`tests/fixtures/container_runtime_parity.json`) drives this surface
+// through the client. History the pin discipline still deserves: a
+// pinned runtime whose daemon does not respond is refused, never
+// substituted — pre-v0.2.92 this surface fell through to the other
+// runtime with only a warn, and a pinned-podman user whose machine was
+// stopped got the module image pulled into docker and started against
+// docker's EMPTY copy of every named volume, while the supervisor's
+// next pass re-selected podman — split brain over user data (podman and
+// docker keep separate named volumes). That refusal rule is Python's
+// now too.
 //
-//   1. `VCT_CONTAINER_RUNTIME=podman|docker` — a PIN. When it names a
-//      runtime, that runtime is the ONLY candidate; a pinned runtime
-//      whose daemon does not respond is REFUSED with an error naming
-//      the pin, why it is unusable, and whether the other runtime is
-//      usable — never substituted. Pre-v0.2.92 this surface fell
-//      through to the other runtime with only a warn: a pinned-podman
-//      user whose machine was stopped got the module image pulled into
-//      docker and started against docker's EMPTY copy of every named
-//      volume, while the supervisor's next pass re-selected podman —
-//      split brain over user data (podman and docker keep separate
-//      named volumes).
-//   2. `<install_root>/state/install/runtime.txt` — the runtime
-//      install.py detected and recorded (`_persist_runtime_txt`).
-//      Same pin semantics: the recorded runtime is where the install
-//      put the data, so it is probed ALONE; unusable → refusal that
-//      names the file and the env override that can supersede it.
-//      (Only consulted when the env override is absent — the explicit
-//      env choice wins.)
-//   3. No pin: daemon-aware probe of `["podman", "docker"]`
-//      (podman-first, matching install.py + services/runtime.rs
-//      policy) via `<cmd> info` — the round-trip that exercises the
-//      same code path `run`/`pull` need. `--version` is NOT used as a
-//      selection signal anymore (only to distinguish
-//      "binary present, daemon dead" from "not installed" in the
-//      error message).
-
-/// Read the user's explicit `VCT_CONTAINER_RUNTIME` preference.
-/// Case-insensitive, trimmed; `"auto"` / empty / unset → `None`.
-/// Unknown values log to stderr and return `None` (fall through to
-/// auto-detect) — same contract as install.py
-/// `_runtime_preference_from_env` and services/runtime.rs.
-pub fn runtime_preference_from_env() -> Option<String> {
-    let raw = std::env::var("VCT_CONTAINER_RUNTIME").ok()?;
-    let norm = raw.trim().to_lowercase();
-    if norm.is_empty() || norm == "auto" {
-        return None;
-    }
-    if norm == "podman" || norm == "docker" {
-        return Some(norm);
-    }
-    tracing::warn!(
-        value = ?raw,
-        "[container_runtime] VCT_CONTAINER_RUNTIME unrecognized (expected \
-         'podman' / 'docker' / 'auto'); falling through to auto-detect."
-    );
-    None
-}
-
-/// Read `<install_root>/state/install/runtime.txt` (written by
-/// install.py `_persist_runtime_txt`). Returns `Some("podman")` /
-/// `Some("docker")` when the file exists and parses; `None` otherwise
-/// (missing file, unreadable, or unrecognized token).
-pub fn read_runtime_txt(install_root: &Path) -> Option<String> {
-    let path = install_root
-        .join("state")
-        .join("install")
-        .join("runtime.txt");
-    let raw = std::fs::read_to_string(path).ok()?;
-    let token = raw.trim().to_lowercase();
-    if token == "podman" || token == "docker" {
-        Some(token)
-    } else {
-        None
-    }
-}
+// What REMAINS execution-plane here: `runtime_daemon_responsive`
+// (below — the ownership guard `check_runtime_owns` asks it about a
+// runtime the verdict already chose) and the container spawn/argv
+// builders this module is named for.
 
 /// Daemon-aware liveness probe: `<cmd> info` with a 10s timeout.
 /// Returns true iff the daemon/socket/machine actually responds —
@@ -200,14 +182,17 @@ pub fn read_runtime_txt(install_root: &Path) -> Option<String> {
 /// `info` round-trips to the daemon and exercises the same code path
 /// `run`/`pull`/compose need. Catches stopped Docker Desktop on
 /// macOS, stopped podman.socket on Linux rootless, unstarted podman
-/// machine on macOS/Windows).
+/// machine on macOS/Windows). Kept for the ownership guard
+/// (`check_runtime_owns`), which asks about a runtime the verdict already
+/// chose — the which-runtime decision itself is Python's
+/// (`runtime_verdict::decide`, v0.2.97 R12).
 pub async fn runtime_daemon_responsive(cmd: &str) -> bool {
     use crate::process::CommandExt as _;
     use std::process::Stdio;
 
     let probe = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        tokio::process::Command::new(cmd)
+        tokio::process::Command::new(crate::paths::spawn_program(cmd))
             .silent()
             .args(["info"])
             .stdout(Stdio::null())
@@ -218,65 +203,18 @@ pub async fn runtime_daemon_responsive(cmd: &str) -> bool {
     matches!(probe, Ok(Ok(s)) if s.success())
 }
 
-/// Client-binary-only probe (`<cmd> --version`). NOT a selection
-/// signal — used solely to enrich the no-runtime error message with
-/// "binary present but daemon dead" candidates.
-async fn runtime_binary_present(cmd: &str) -> bool {
-    use crate::process::CommandExt as _;
-    use std::process::Stdio;
 
-    let probe = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::process::Command::new(cmd)
-            .silent()
-            .args(["--version"])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status(),
-    )
-    .await;
-    matches!(probe, Ok(Ok(s)) if s.success())
-}
+/// The vco_/vct_-prefixed subset of `vco_lib.containers.all_known_names`
+/// (canonical + historical aliases): a container with one of these names
+/// under a runtime means VCO's data lives there. MUST MATCH the Python
+/// set built in `vco_lib.runtime_reconcile.vco_data_under`.
+pub const VCO_OUR_CONTAINER_NAMES: &[&str] = &[
+    "vco_weaviate",
+    "vco_ollama",
+    "vco_code_embed",
+    "vct_code_embed",
+];
 
-/// Pure candidate-ordering helper for [`detect_container_runtime`].
-/// Split out so the env→runtime.txt→default precedence is unit-testable
-/// without spawning processes.
-///
-/// A PIN IS THE WHOLE ORDER (v0.2.92 delivery-audit M1 / R35, the same
-/// ruling BLOCKER-4 already applied to `vco_lib.containers.resolve` and
-/// `runtime.rs::candidate_order` — this was the third and last surface
-/// that still fell through). Pre-v0.2.92 a pinned-but-down runtime was
-/// put first and BOTH runtimes followed, so a pinned-podman user whose
-/// machine was stopped got their module image pulled into DOCKER and the
-/// container started there — against docker's EMPTY copy of every named
-/// volume — while the supervisor's next pass re-selected podman. Split
-/// brain over user data. A pinned runtime that is unusable is now
-/// REFUSED by [`decide_module_runtime`] with a message naming the pin,
-/// why it is unusable, and whether the other runtime is usable.
-///
-/// * `env_pref` — the validated `VCT_CONTAINER_RUNTIME` value. When
-///   `Some`, the returned order is exactly `[env_pref]`.
-/// * `runtime_txt` — the validated runtime.txt token. Same pin semantics
-///   (the recorded runtime is where the install put the data); only
-///   consulted when `env_pref` is `None`.
-///
-/// The unpinned arm is byte-identical to `runtime.rs::candidate_order`
-/// and `vco_lib.containers.runtime_candidate_order`; the fixture
-/// `tests/fixtures/container_runtime_parity.json` (read by this module's
-/// `parity_fixture_module_plane_matches_every_scenario` test) pins all
-/// three surfaces to the same answers so they cannot drift again.
-pub fn runtime_candidate_order(
-    env_pref: Option<&str>,
-    runtime_txt: Option<&str>,
-) -> Vec<String> {
-    if let Some(p) = env_pref {
-        return vec![p.to_string()];
-    }
-    if let Some(t) = runtime_txt {
-        return vec![t.to_string()];
-    }
-    vec!["podman".to_string(), "docker".to_string()]
-}
 
 /// Where a pin came from — names the knob the refusal message tells the
 /// user to turn.
@@ -297,207 +235,153 @@ impl RuntimePinSource {
     }
 }
 
-/// The pin, when there is one: the validated env override, else the
-/// validated runtime.txt token, else `None` (auto-detect). `Some(_)`
-/// iff [`runtime_candidate_order`] returns a one-element order.
-pub fn pinned_runtime<'a>(
-    env_pref: Option<&'a str>,
-    runtime_txt: Option<&'a str>,
-) -> Option<(&'a str, RuntimePinSource)> {
-    if let Some(p) = env_pref {
-        return Some((p, RuntimePinSource::EnvOverride));
-    }
-    runtime_txt.map(|t| (t, RuntimePinSource::RuntimeTxt))
-}
-
-/// What one candidate's probes established on the module container
-/// plane: the daemon answered (`<cmd> info`), only the client binary
-/// exists (`<cmd> --version` works but the daemon/machine didn't
-/// answer), or neither.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ModuleRuntimeProbe {
-    Responsive,
-    BinaryOnly,
-    Missing,
-}
-
-/// The refusal message for a pinned-but-unusable runtime. Pure, and
-/// deliberately shaped like `vco_lib.containers._pin_refusal_reason`
-/// (the infra-plane Python refusal): it names what was pinned and via
-/// which channel, why it is unusable ("start it" vs "install it"),
-/// whether the OTHER runtime is usable, and the two things the user can
-/// do about it. Every arm contains the literal "container runtime" so
-/// generic `Err` matchers (the live-probe test) keep working.
-pub fn module_runtime_pin_refusal(
-    pin: &str,
-    source: RuntimePinSource,
-    installed: bool,
-    other_usable: bool,
-) -> String {
-    let other = if pin == "podman" { "docker" } else { "podman" };
-    let state = if installed {
-        format!(
-            "{pin} is installed but its daemon/machine is not responding \
-             to `{pin} info`"
-        )
-    } else {
-        format!("{pin} is not installed (binary not on PATH)")
-    };
-    let head = match source {
-        RuntimePinSource::EnvOverride => {
-            format!("VCT_CONTAINER_RUNTIME={pin} is set but {state}")
-        }
-        RuntimePinSource::RuntimeTxt => {
-            format!(
-                "the recorded container runtime (state/install/runtime.txt) is \
-                 {pin} but {state}"
-            )
-        }
-    };
-    if other_usable {
-        let remedy = match source {
-            RuntimePinSource::EnvOverride => format!(
-                "start {pin}, or unset VCT_CONTAINER_RUNTIME / set it to {other}"
-            ),
-            RuntimePinSource::RuntimeTxt => format!(
-                "start {pin}, or set VCT_CONTAINER_RUNTIME={other} to override \
-                 the recorded runtime"
-            ),
-        };
-        format!(
-            "{head}; {other} is a usable container runtime but VCO will NOT \
-             drive it for you (podman and docker have SEPARATE named volumes, \
-             so the module container would come up against an EMPTY volume) — \
-             {remedy}"
-        )
-    } else {
-        format!(
-            "{head}; {other} is not a usable container runtime either — start \
-             {pin} (or install it), then retry"
-        )
-    }
-}
-
-/// The pure decision half of [`detect_container_runtime`] — the module
-/// container plane's counterpart of `runtime.rs::select_runtime`. Given
-/// the candidate order and what the probes established, pick the
-/// runtime; a PINNED order that cannot be satisfied is REFUSED (never
-/// substituted), and the refusal knows whether the other runtime is
-/// usable. Kept separate from the async probing so the shared parity
-/// fixture (`tests/fixtures/container_runtime_parity.json`, key
-/// `expect_module_plane`) can drive it in this module's tests without
-/// podman or docker — the same shape `runtime.rs` uses for
-/// `candidate_order` + `select_runtime`.
-pub fn decide_module_runtime(
-    order: &[String],
-    probes: &HashMap<String, ModuleRuntimeProbe>,
-    pinned: Option<(&str, RuntimePinSource)>,
-) -> Result<String, String> {
-    for candidate in order {
-        if probes.get(candidate) == Some(&ModuleRuntimeProbe::Responsive) {
-            return Ok(candidate.clone());
-        }
-    }
-    if let Some((pin, source)) = pinned {
-        let installed = probes
-            .get(pin)
-            .map(|p| *p != ModuleRuntimeProbe::Missing)
-            .unwrap_or(false);
-        let other = if pin == "podman" { "docker" } else { "podman" };
-        let other_usable =
-            probes.get(other) == Some(&ModuleRuntimeProbe::Responsive);
-        return Err(module_runtime_pin_refusal(pin, source, installed, other_usable));
-    }
-    let binary_only: Vec<&str> = order
-        .iter()
-        .filter(|c| probes.get(*c) == Some(&ModuleRuntimeProbe::BinaryOnly))
-        .map(|c| c.as_str())
-        .collect();
-    if binary_only.is_empty() {
-        Err("no container runtime found (tried podman, docker)".into())
-    } else {
-        Err(format!(
-            "no responsive container runtime: {} installed but daemon/machine \
-             not responding to `info` (start it: Linux `systemctl --user start \
-             podman.socket` / `sudo systemctl start docker`; macOS+Windows \
-             `podman machine start` / open Docker Desktop)",
-            binary_only.join(", "),
-        ))
-    }
-}
-
 /// v0.2.54: the ONE daemon-aware container-runtime detector shared by
 /// the launcher's module install/start path (`module_service.rs`,
-/// `installer_engine.rs`) and the hub's supervisor
-/// (`module_supervisor.rs`). See the section comment above for the
-/// precedence contract.
+/// `installer_engine.rs`), the storage/volumes commands and the hub's
+/// supervisor (`module_supervisor.rs`).
 ///
-/// v0.2.92 delivery-audit M1: this surface now implements the same pin
-/// discipline as the other two (`vco_lib.containers.resolve`,
-/// `runtime.rs`) — see [`runtime_candidate_order`]. The probe-then-decide
-/// split mirrors `runtime.rs`: this async half only gathers what the
-/// probes established (daemon responsive / binary-only / missing, plus
-/// the OTHER runtime's daemon state on the refusal path so the message
-/// can name the repin target) and hands it to the pure
-/// [`decide_module_runtime`], which the shared parity fixture also
-/// drives.
+/// v0.2.97 R12 (owner ruling "Consolidate now"): the DECISION is not
+/// made here any more. This asks Python for the ONE verdict —
+/// `runtime_verdict::decide(install_root, ReadOnly, Module)` — and
+/// renders it: the runtime to drive, the pin that chose it
+/// (`requested_via`), or Python's refusal text VERBATIM (M3: the Rust
+/// side never re-derives "does not answer info" from PATH state; the
+/// "(not switched: ...)" clause is inside Python's refusal already).
+/// The Rust decision mirror this replaces (probe ladder + pure
+/// `decide_module_runtime` + the stale-record arm) was retired with the
+/// rest of the reconcile mirrors; the parity fixture drives this surface
+/// through the client now.
 ///
-/// `install_root`: the orchestrator clone root, used to locate
-/// `state/install/runtime.txt`. The launcher passes
-/// `find_local_repo_root().ok()`; the hub passes `None` (it has no
-/// clone-root resolver today — env override + daemon-aware probing
-/// still apply, which closes C-RT-2 fully and C-RT-1 for the
-/// env-var channel on the hub path).
-///
-/// Error message names every candidate whose binary exists but whose
-/// daemon didn't respond, so a user debugging "module container won't
-/// start" learns the actual state ("podman installed but machine
-/// stopped") instead of a generic "no runtime found".
+/// `install_root`: the orchestrator clone root (`state/install/` lives
+/// there). A missing or broken Python is a BROKEN INSTALL: the spawn
+/// error surfaces as `Err` and nothing falls back to a Rust copy.
 pub async fn detect_container_runtime(
     install_root: Option<&Path>,
 ) -> Result<String, String> {
-    let env_pref = runtime_preference_from_env();
-    let runtime_txt = install_root.and_then(read_runtime_txt);
+    detect_container_runtime_with_pin(install_root)
+        .await
+        .map(|(runtime, _pin)| runtime)
+}
 
-    let order = runtime_candidate_order(env_pref.as_deref(), runtime_txt.as_deref());
-    let pinned = pinned_runtime(env_pref.as_deref(), runtime_txt.as_deref());
+/// [`detect_container_runtime`], also saying which pin (if any) chose the
+/// runtime — what a caller needs to word a refusal that names the knob
+/// (`wrong_runtime_owner_refusal`).
+pub async fn detect_container_runtime_with_pin(
+    install_root: Option<&Path>,
+) -> Result<(String, Option<RuntimePinSource>), String> {
+    detect_module_runtime_with_opts(super::runtime_verdict::VerdictOpts {
+        install_root,
+        mode: Some(super::runtime_verdict::Mode::ReadOnly),
+        purpose: Some(super::runtime_verdict::Purpose::Module),
+        ..super::runtime_verdict::VerdictOpts::default()
+    })
+    .await
+}
 
-    let mut probes: HashMap<String, ModuleRuntimeProbe> = HashMap::new();
-    let mut resolved = false;
-    for candidate in &order {
-        let outcome = if runtime_daemon_responsive(candidate).await {
-            ModuleRuntimeProbe::Responsive
-        } else if runtime_binary_present(candidate).await {
-            ModuleRuntimeProbe::BinaryOnly
-        } else {
-            ModuleRuntimeProbe::Missing
-        };
-        resolved |= outcome == ModuleRuntimeProbe::Responsive;
-        probes.insert(candidate.clone(), outcome);
-    }
-
-    // Refusal path only: the message must be able to say whether the
-    // OTHER runtime is usable — that is the user's repin target, and the
-    // difference between "start podman" and "install a runtime". With a
-    // pin the order never contained it, so probe it here, once. It is
-    // never probed on the happy path and never becomes the result.
-    if !resolved {
-        if let Some((pin, _source)) = pinned {
-            let other = if pin == "podman" { "docker" } else { "podman" };
-            if !probes.contains_key(other) {
-                let outcome = if runtime_daemon_responsive(other).await {
-                    ModuleRuntimeProbe::Responsive
-                } else if runtime_binary_present(other).await {
-                    ModuleRuntimeProbe::BinaryOnly
-                } else {
-                    ModuleRuntimeProbe::Missing
-                };
-                probes.insert(other.to_string(), outcome);
-            }
+/// The same decision with full opts — the probe-path tests inject the
+/// interpreter, the PATH and the pin env here instead of mutating the
+/// process env.
+pub(crate) async fn detect_module_runtime_with_opts(
+    opts: super::runtime_verdict::VerdictOpts<'_>,
+) -> Result<(String, Option<RuntimePinSource>), String> {
+    let verdict = super::runtime_verdict::decide_cached(opts).await?;
+    if verdict.resolved {
+        if let Some(runtime) = verdict.runtime.clone() {
+            return Ok((runtime, verdict.pin_source().map(|(_, source)| source)));
         }
     }
+    Err(verdict
+        .refusal
+        .clone()
+        .unwrap_or_else(|| verdict.reason.clone()))
+}
 
-    decide_module_runtime(&order, &probes, pinned)
+/// The other of the two runtimes VCO drives.
+pub fn other_runtime(runtime: &str) -> &'static str {
+    if runtime == "docker" {
+        "podman"
+    } else {
+        "docker"
+    }
+}
+
+/// The refusal for acting on `object` with `chosen` when the object exists
+/// only under the OTHER runtime (v0.2.97 owner ruling "Honour the pin").
+/// podman and docker keep separate volumes and containers, so the action
+/// would run against a copy that does not hold the user's data — and a
+/// migration would then remove or rebind the wrong thing. Names both
+/// runtimes, what chose `chosen` (the env pin, the install record, or
+/// auto-detection), and the two ways out: repin to the owner and retry, or
+/// move the data into `chosen` first.
+pub fn wrong_runtime_owner_refusal(
+    action: &str,
+    object: &str,
+    chosen: &str,
+    pin: Option<RuntimePinSource>,
+) -> String {
+    let owner = other_runtime(chosen);
+    let why = match pin {
+        Some(RuntimePinSource::EnvOverride) => {
+            format!("VCT_CONTAINER_RUNTIME={chosen} pins VCO to {chosen}")
+        }
+        Some(RuntimePinSource::RuntimeTxt) => format!(
+            "the install recorded {chosen} as this machine's container runtime \
+             (state/install/runtime.txt)"
+        ),
+        None => format!("{chosen} was auto-detected (podman is preferred when both respond)"),
+    };
+    // R7b F8: the pin is read from the LAUNCHER PROCESS's environment (and
+    // the record file) when it starts; nothing inside the running launcher
+    // changes it, so "set it and retry" could not be followed — a user who
+    // exported the variable in a shell and clicked retry got this same
+    // refusal. Every remedy therefore goes through a quit and a relaunch, and
+    // names WHERE the variable must be set.
+    let record = crate::orchestrator_manifest::orchestrator_install_root()
+        .map(|root| root.join("state").join("install").join("runtime.txt").display().to_string())
+        .unwrap_or_else(|| "<VCO install>/state/install/runtime.txt".to_string());
+    let repin = match pin {
+        Some(RuntimePinSource::EnvOverride) => format!(
+            "quit the launcher, unset VCT_CONTAINER_RUNTIME (or set \
+             VCT_CONTAINER_RUNTIME={owner}) in the environment the launcher starts from \
+             — your login session, or the shell you start it from — then relaunch it"
+        ),
+        Some(RuntimePinSource::RuntimeTxt) => format!(
+            "quit the launcher, then either write `{owner}` into {record} or set \
+             VCT_CONTAINER_RUNTIME={owner} in the environment the launcher starts from \
+             — your login session, or the shell you start it from — then relaunch it"
+        ),
+        None => format!(
+            "quit the launcher, set VCT_CONTAINER_RUNTIME={owner} in the environment \
+             the launcher starts from — your login session, or the shell you start it \
+             from — then relaunch it"
+        ),
+    };
+    format!(
+        "refusing to {action} {object}: it exists only under {owner}, but {why}. \
+         podman and docker keep SEPARATE volumes and containers, so doing this with \
+         {chosen} would act on a copy that does not hold your data. To fix: {repin}, \
+         so it runs under {owner}, which owns the data (a running launcher keeps the \
+         environment it was started with, so setting the variable elsewhere and \
+         retrying changes nothing) — or, to stay on {chosen}, first move the data \
+         from {owner} into {chosen} yourself."
+    )
+}
+
+/// The ownership guard, pure: refuse when `chosen` does not own the object
+/// and the other runtime does. When neither owns it the caller's own
+/// "not found" path applies; when `chosen` owns it there is nothing to guard.
+pub fn check_runtime_owns(
+    action: &str,
+    object: &str,
+    chosen: &str,
+    pin: Option<RuntimePinSource>,
+    owned_by_chosen: bool,
+    owned_by_other: bool,
+) -> Result<(), String> {
+    if !owned_by_chosen && owned_by_other {
+        return Err(wrong_runtime_owner_refusal(action, object, chosen, pin));
+    }
+    Ok(())
 }
 
 // ─── GPU passthrough flags (v0.2.54 P0-4) ──────────────────────────────
@@ -655,7 +539,8 @@ pub fn rl_placeholders_global(rl_port: u16) -> HashMap<String, String> {
     let mut m = HashMap::new();
     m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
     m.insert("{project_slug}".to_string(), "global".to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m.insert("{ollama_port}".to_string(), ollama_port_placeholder());
+    m.insert("{ollama_url}".to_string(), ollama_url_placeholder());
     m
 }
 
@@ -794,8 +679,27 @@ pub fn rl_placeholders(rl_port: u16, project_slug: &str) -> HashMap<String, Stri
     let mut m = HashMap::new();
     m.insert("{RL_SERVER_PORT}".to_string(), rl_port.to_string());
     m.insert("{project_slug}".to_string(), project_slug.to_string());
-    m.insert("{ollama_port}".to_string(), DEFAULT_OLLAMA_PORT.to_string());
+    m.insert("{ollama_port}".to_string(), ollama_port_placeholder());
+    m.insert("{ollama_url}".to_string(), ollama_url_placeholder());
     m
+}
+
+/// Env values are the one place a manifest may name a core-service URL
+/// (`OLLAMA_URL=http://host.containers.internal:{ollama_port}`, the only
+/// form pre-v0.2.97 manifests could write). After placeholder substitution,
+/// apply the container-view host rule (v0.2.97, lane Y): a non-loopback
+/// Ollama row must be reached at its own host, not at the runtime host
+/// alias (which resolves to THIS machine).
+fn resolve_env_value(
+    raw: &str,
+    ctx: &PlaceholderCtx,
+    placeholders: &HashMap<String, String>,
+) -> String {
+    let resolved = resolve_value(raw, ctx, placeholders);
+    crate::services::service_endpoints::rewrite_alias_url_in_env(
+        &resolved,
+        crate::services::service_endpoints::CoreService::Ollama,
+    )
 }
 
 /// Two-layer placeholder resolver:
@@ -881,6 +785,173 @@ pub fn build_podman_run_args(
     engine: &str,
     gpu_mode: Option<GpuMode>,
 ) -> Result<Vec<String>, String> {
+    build_podman_run_args_with_env(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, &[], &[],
+    )
+}
+
+/// Env names the spawn sites pass through to the `podman`/`docker` process
+/// itself (after `env_clear`) — the ONE shared child-env table
+/// (`services::child_env::ALL_CHILD_ENV_KEYS`, R12-bis P2-1), so the
+/// reserved-name check and the actual sandbox cannot drift apart. A secret
+/// with one of these names would replace the runtime's own value, so
+/// [`SpawnArgs::new`] refuses to carry it.
+pub const RESERVED_SPAWN_ENV: &[&str] = super::child_env::ALL_CHILD_ENV_KEYS;
+
+/// Env names VCO itself gives a global module container: its per-spawn
+/// identity token and where the hub is (`vct_hub::module_supervisor`). A
+/// module's secret or setting may not take one of these names.
+pub const MODULE_IDENTITY_ENV: &[&str] = &["VCT_MODULE_TOKEN", "VCT_HUB_BASE_URL"];
+
+/// True when a module secret may not be injected under `name`: the runtime
+/// process's own env ([`RESERVED_SPAWN_ENV`]) or the identity VCO gives a
+/// container ([`MODULE_IDENTITY_ENV`]); case-insensitive (Windows env names
+/// are). `crate::module_secrets_env` refuses the start when such a secret is
+/// `required` (R7b F18).
+pub fn is_reserved_spawn_env(name: &str) -> bool {
+    RESERVED_SPAWN_ENV
+        .iter()
+        .chain(MODULE_IDENTITY_ENV)
+        .any(|r| r.eq_ignore_ascii_case(name))
+}
+
+/// What a container spawn runs: the `podman run` argv and the SECRET values
+/// that must reach the container without appearing in it (v0.2.97, lane V
+/// round 2). Each secret is named in `args` as a bare `-e KEY` — the runtime
+/// then copies `KEY` from ITS OWN environment — and its value lives only in
+/// the secret env, which the spawn site puts on the `podman`/`docker` child
+/// with [`SpawnArgs::apply_secret_env`]. So a value is never in argv (`ps`,
+/// logs) and never on disk. `Debug` is redacted. (The container's own
+/// configuration still holds it: `podman inspect` / `docker inspect` show
+/// every container env value in `Config.Env` — a property of container env,
+/// see docs/VCT_MODULE_MANIFEST_SPEC.md §7.)
+pub struct SpawnArgs {
+    pub args: Vec<String>,
+    secret_env: Vec<(String, String)>,
+}
+
+impl std::fmt::Debug for SpawnArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnArgs")
+            .field("args", &self.args)
+            .field("secret_keys", &self.secret_keys())
+            .finish()
+    }
+}
+
+impl SpawnArgs {
+    /// Keeps the secrets whose names are not [`RESERVED_SPAWN_ENV`] (a
+    /// reserved one is dropped with a warning naming the key).
+    pub fn new(args: Vec<String>, secrets: Vec<(String, String)>) -> Self {
+        let secret_env = secrets
+            .into_iter()
+            .filter(|(k, _)| {
+                let reserved = RESERVED_SPAWN_ENV.iter().any(|r| r.eq_ignore_ascii_case(k));
+                if reserved {
+                    tracing::warn!(key = %k,
+                        "[container_runtime] a module secret may not be named like the runtime's own env; not injected");
+                }
+                !reserved
+            })
+            .collect();
+        Self { args, secret_env }
+    }
+
+    /// The injected secrets' names (never their values).
+    pub fn secret_keys(&self) -> Vec<&str> {
+        self.secret_env.iter().map(|(k, _)| k.as_str()).collect()
+    }
+
+    /// Put the secret values in the spawned runtime process's environment.
+    /// Call AFTER the site's `env_clear()` + base env.
+    pub fn apply_secret_env(&self, cmd: &mut tokio::process::Command) {
+        for (k, v) in &self.secret_env {
+            cmd.env(k, v);
+        }
+    }
+
+    /// Test-only read of one injected value.
+    #[cfg(any(test, debug_assertions))]
+    pub fn secret_value_for_tests(&self, key: &str) -> Option<&str> {
+        self.secret_env.iter().find(|(k, _)| k == key).map(|(_, v)| v.as_str())
+    }
+}
+
+/// What a per-project container/service spawn runs: [`build_podman_run_args`]
+/// plus the module's `runtime.env_from_settings` values for `project`
+/// (`crate::module_settings_env` — project row, else machine-wide row, else
+/// the declared default; unlisted settings never) as `-e KEY=VALUE`, and its
+/// `runtime.env_from_secrets` (`crate::module_secrets_env` — through the
+/// permission gate, THIS project as the requester) as bare `-e KEY` with the
+/// values in [`SpawnArgs`]. `Err` refuses the start: a `required` secret that
+/// did not resolve. v0.2.97 (lane V): the one builder both per-project spawn
+/// paths use — `vct_hub::module_supervisor::start_container_for_module_with_gpu_mode`
+/// and the launcher's `commands::module_service` twin.
+pub fn spawn_args_for_project(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    db: &crate::db::Db,
+) -> Result<SpawnArgs, String> {
+    let settings_env =
+        crate::module_settings_env::resolve_env_from_settings(manifest, Some(&project.id), db);
+    let secret_env =
+        crate::module_secrets_env::resolve_env_from_secrets(manifest, Some(&project.id), db)?;
+    spawn_args_with(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, &settings_env,
+        secret_env,
+    )
+}
+
+/// [`spawn_args_for_project`] with the settings and secrets already
+/// resolved.
+pub fn spawn_args_with(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    settings_env: &[(String, String)],
+    secret_env: Vec<(String, String)>,
+) -> Result<SpawnArgs, String> {
+    let draft = SpawnArgs::new(Vec::new(), secret_env);
+    let keys: Vec<String> = draft.secret_keys().into_iter().map(str::to_string).collect();
+    let args = build_podman_run_args_with_env(
+        manifest, ctx, project, rl_port, container_name, image, engine, gpu_mode, settings_env,
+        &keys,
+    )?;
+    Ok(SpawnArgs { args, ..draft })
+}
+
+/// [`build_podman_run_args`] plus caller-resolved `-e KEY=VALUE` pairs,
+/// appended after the manifest's `env_fixed` / `env_derived` (a later `-e`
+/// wins, so a listed setting overrides an author default of the same name).
+/// v0.2.97 (lane V): the spawn sites pass the module's
+/// `runtime.env_from_settings` values here
+/// (`crate::module_settings_env::resolve_env_from_settings`). Values are
+/// passed verbatim — they are resolved settings, not placeholder templates.
+pub fn build_podman_run_args_with_env(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    // v0.2.97 (lane V round 2): names emitted as a bare `-e KEY` — the
+    // runtime copies the value from its own environment ([`SpawnArgs`]).
+    inherit_env: &[String],
+) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -925,14 +996,22 @@ pub fn build_podman_run_args(
     // then env_derived. HashMap iteration is non-deterministic — tests
     // must assert on set membership, not exact ordering.
     for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
     for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
+    }
+    for (k, v) in extra_env {
+        args.push("-e".into());
+        args.push(format!("{}={}", k, v));
+    }
+    for k in inherit_env {
+        args.push("-e".into());
+        args.push(k.clone());
     }
 
     // Positional: image, then optional command + args (override of image CMD).
@@ -993,15 +1072,12 @@ pub fn build_podman_run_args_global(
     engine: &str,
     gpu_mode: Option<GpuMode>,
     // v0.2.61 (Option H): caller-injected `-e KEY=VALUE` pairs appended
-    // after the manifest's own env. The hub uses this to inject the
-    // per-spawn module-identity token (`VCT_MODULE_TOKEN`) it minted +
-    // registered in its in-memory set — the credential the global
-    // container presents to the hub's `/modules/{id}/projects/{pid}/rl/events`
-    // route. Kept as a caller param (not resolved inside this pure
-    // builder) so the secret never lives in core logic and only the
-    // spawn site — which has the hub's in-memory state — controls it.
-    // SECURITY: values here may be secrets (e.g. the Option-H
-    // `VCT_MODULE_TOKEN`). DO NOT log the returned argv — it contains the
+    // after the manifest's own env — the listed settings and the hub's
+    // `VCT_HUB_BASE_URL`. (Until v0.2.97 R7b F19 the per-spawn module token
+    // `VCT_MODULE_TOKEN` came through here too, on the argv; the hub now
+    // passes it by name through [`spawn_args_global`]'s secret env.)
+    // SECURITY: never put a secret here — a value in these pairs is in the
+    // argv. DO NOT log the returned argv — it contains the
     // `-e KEY=VALUE` pairs verbatim. The current sole caller
     // (`start_global_container_supervisor`) logs only container_name + the
     // run's stderr on failure, never the argv, so the token cannot leak. If
@@ -1009,6 +1085,48 @@ pub fn build_podman_run_args_global(
     // first (no shared redactor helper exists — keep it that way unless a
     // second caller genuinely needs argv logging).
     extra_env: &[(String, String)],
+) -> Result<Vec<String>, String> {
+    build_podman_run_args_global_inheriting(
+        manifest, ctx, rl_port, container_name, image, engine, gpu_mode, extra_env, &[],
+    )
+}
+
+/// What a GLOBAL container spawn runs (v0.2.97, lane V round 2):
+/// [`build_podman_run_args_global`] with `extra_env` (settings, then the
+/// identity pair) and the module's resolved `runtime.env_from_secrets` as
+/// bare `-e KEY`, values carried in [`SpawnArgs`] — never in argv.
+pub fn spawn_args_global(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    secret_env: Vec<(String, String)>,
+) -> Result<SpawnArgs, String> {
+    let draft = SpawnArgs::new(Vec::new(), secret_env);
+    let keys: Vec<String> = draft.secret_keys().into_iter().map(str::to_string).collect();
+    let args = build_podman_run_args_global_inheriting(
+        manifest, ctx, rl_port, container_name, image, engine, gpu_mode, extra_env, &keys,
+    )?;
+    Ok(SpawnArgs { args, ..draft })
+}
+
+/// [`build_podman_run_args_global`] plus `inherit_env`: names emitted as a
+/// bare `-e KEY` after `extra_env`, the value copied by the runtime from its
+/// own environment ([`SpawnArgs`]).
+pub fn build_podman_run_args_global_inheriting(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    engine: &str,
+    gpu_mode: Option<GpuMode>,
+    extra_env: &[(String, String)],
+    inherit_env: &[String],
 ) -> Result<Vec<String>, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
@@ -1064,12 +1182,12 @@ pub fn build_podman_run_args_global(
     }
 
     for (k, v) in &runtime.env_fixed {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
     for (k, v) in &runtime.env_derived {
-        let resolved = resolve_value(v, ctx, &placeholders);
+        let resolved = resolve_env_value(v, ctx, &placeholders);
         args.push("-e".into());
         args.push(format!("{}={}", k, resolved));
     }
@@ -1082,6 +1200,10 @@ pub fn build_podman_run_args_global(
     for (k, v) in extra_env {
         args.push("-e".into());
         args.push(format!("{}={}", k, v));
+    }
+    for k in inherit_env {
+        args.push("-e".into());
+        args.push(k.clone());
     }
 
     args.push(image.to_string());
@@ -2960,6 +3082,324 @@ mod tests {
         assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
     }
 
+    /// v0.2.97 (owner ruling on review R5 F43 — the retired `# >>> module:`
+    /// `.env` sections): the RL keys those sections were meant to carry reach
+    /// the module's container through its manifest — `env_fixed`
+    /// (`RL_SERVER_PORT`) and `env_derived` (`RL_PROJECT_ROOT`) become `-e`
+    /// flags of the run, with the host port from `module_ports`. No `.env`
+    /// is involved.
+    #[test]
+    fn build_podman_run_args_delivers_the_rl_module_env() {
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest,
+            &ctx,
+            &project,
+            11533,
+            "vct-rl-reranker-acme-corp",
+            "ghcr.io/hotak92/vct-rl-reranker:0.2.8",
+            "podman",
+            None,
+        )
+        .expect("build args");
+        let env_flags: Vec<&str> = args
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        assert!(env_flags.contains(&"RL_PROJECT_ROOT=/data"), "{env_flags:?}");
+        assert!(env_flags.contains(&"RL_SERVER_PORT=11438"), "{env_flags:?}");
+        assert!(args.iter().any(|a| a == "127.0.0.1:11533:11438"));
+    }
+
+    // ─── the Ollama URL a module container receives (v0.2.97, lane Y) ────
+    //
+    // The pre-v0.2.97 manifest form is
+    // `OLLAMA_URL=http://host.containers.internal:{ollama_port}` — correct
+    // ONLY for a loopback row. An `adopted_external` row on a non-loopback
+    // host must be named AS IS: the alias resolves to THIS machine, where
+    // that Ollama does not run. Same rule for podman and docker (the
+    // `--add-host` alias the builders emit is runtime-independent).
+
+    fn manifest_with_legacy_ollama_url() -> ModuleManifest {
+        let mut m = make_manifest(true, true);
+        m.runtime
+            .env_derived
+            .insert("OLLAMA_URL".to_string(), "http://host.containers.internal:{ollama_port}".to_string());
+        m
+    }
+
+    fn seed_ollama_row(mode: crate::db::service_endpoints::EndpointMode, host: &str, port: u16) {
+        crate::db::Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&crate::db::service_endpoints::ServiceEndpointRow::new(
+                "ollama", mode, host, port,
+            ))
+            .unwrap();
+    }
+
+    fn ollama_env_flag(args: &[String]) -> String {
+        args.windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .find(|e| e.starts_with("OLLAMA_URL="))
+            .expect("OLLAMA_URL env flag")
+            .to_string()
+    }
+
+    #[test]
+    fn module_container_ollama_url_keeps_the_alias_for_a_loopback_row() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(crate::db::service_endpoints::EndpointMode::VcoManaged, "localhost", 21435);
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://host.containers.internal:21435");
+    }
+
+    #[test]
+    fn module_container_ollama_url_names_a_remote_row_host_podman() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+    }
+
+    /// Same rule under docker — the alias the runtime maps is the same, so
+    /// the rewrite must not be podman-only.
+    #[test]
+    fn module_container_ollama_url_names_a_remote_row_host_docker() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let manifest = manifest_with_legacy_ollama_url();
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "docker", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+    }
+
+    /// The global builder follows the same rule (one container-view helper,
+    /// every spawn site).
+    #[test]
+    fn global_module_container_ollama_url_names_a_remote_row_host() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(
+            crate::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "ollama.lan",
+            31434,
+        );
+        let mut manifest = make_rl_manifest_global_for_test();
+        manifest.runtime.env_derived.insert(
+            "OLLAMA_URL".to_string(),
+            "http://host.containers.internal:{ollama_port}".to_string(),
+        );
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(
+            &manifest, &ctx, 11443, "vct-rl-reranker", "img:tag", "podman", None, &[],
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://ollama.lan:31434");
+        // The alias itself still maps to the host gateway for everything else
+        // (the hub's VCT_HUB_BASE_URL) — only the Ollama pair was rewritten.
+        assert!(args.iter().any(|a| a == "--add-host=host.containers.internal:host-gateway"));
+    }
+
+    /// New manifests write `OLLAMA_URL: "{ollama_url}"` — the token resolves
+    /// to the container-view URL for both loopback and remote rows.
+    #[test]
+    fn ollama_url_placeholder_token_resolves_to_the_container_view_url() {
+        let _g = crate::test_env::state_dir_guard();
+        seed_ollama_row(crate::db::service_endpoints::EndpointMode::VcoManaged, "127.0.0.1", 21435);
+        let mut manifest = make_manifest(true, true);
+        manifest.runtime.env_derived.insert("OLLAMA_URL".to_string(), "{ollama_url}".to_string());
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None,
+        )
+        .expect("build args");
+        assert_eq!(ollama_env_flag(&args), "OLLAMA_URL=http://host.containers.internal:21435");
+    }
+
+    /// v0.2.97 (lane V): the caller's resolved `env_from_settings` pairs
+    /// become `-e` flags AFTER the manifest's own env (so a setting wins over
+    /// an author default of the same name) and BEFORE the image positional
+    /// (anything after it would be the container's CMD). With no pairs the
+    /// argv equals `build_podman_run_args`'s.
+    #[test]
+    fn build_podman_run_args_with_env_appends_the_settings_before_the_image() {
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let image = "ghcr.io/hotak92/vct-rl-reranker:0.2.8";
+        let settings = vec![
+            ("ACTIVE_EMBEDDING".to_string(), "qwen3".to_string()),
+            ("RL_SERVER_PORT".to_string(), "12000".to_string()),
+        ];
+        let args = build_podman_run_args_with_env(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &settings, &[],
+        )
+        .expect("build args");
+        let image_at = args.iter().position(|a| a == image).expect("image positional");
+        let env_flags: Vec<&str> = args[..image_at]
+            .windows(2)
+            .filter(|w| w[0] == "-e")
+            .map(|w| w[1].as_str())
+            .collect();
+        let n = env_flags.len();
+        assert_eq!(&env_flags[n - 2..], &["ACTIVE_EMBEDDING=qwen3", "RL_SERVER_PORT=12000"]);
+        assert!(env_flags[..n - 2].contains(&"RL_SERVER_PORT=11438"), "{env_flags:?}");
+
+        let plain = build_podman_run_args(&manifest, &ctx, &project, 11533, "c", image, "podman", None)
+            .expect("build args");
+        let no_extra = build_podman_run_args_with_env(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &[], &[],
+        )
+        .expect("build args");
+        assert_eq!(plain, no_extra);
+    }
+
+    /// v0.2.97 (lane V): the per-project spawn argv carries the module's
+    /// LISTED settings — the project's stored value, else the declared
+    /// default — and never a declared setting the list leaves out.
+    #[test]
+    fn spawn_args_for_project_injects_only_the_listed_settings() {
+        let mut manifest = make_manifest(true, true);
+        manifest.settings = serde_json::from_value(serde_json::json!([
+            { "key": "ACTIVE_EMBEDDING", "type": "string", "default": "qwen3" },
+            { "key": "RL_BATCH", "type": "integer", "default": 8 },
+            { "key": "NOT_LISTED", "type": "string", "default": "never" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_settings = vec!["ACTIVE_EMBEDDING".into(), "RL_BATCH".into()];
+        let project = make_project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.insert_project(
+            &project.id, &project.name, &project.folder_path, project.host.clone(), &project.slug,
+        )
+        .unwrap();
+        db.set_setting(&project.id, &manifest.id, "ACTIVE_EMBEDDING", &serde_json::json!("arctic"))
+            .unwrap();
+        db.set_setting(&project.id, &manifest.id, "NOT_LISTED", &serde_json::json!("leak"))
+            .unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", "img:tag", "podman", None, &db,
+        )
+        .expect("build args")
+        .args;
+        let env_flags: Vec<&str> =
+            args.windows(2).filter(|w| w[0] == "-e").map(|w| w[1].as_str()).collect();
+        assert!(env_flags.contains(&"ACTIVE_EMBEDDING=arctic"), "{env_flags:?}");
+        assert!(env_flags.contains(&"RL_BATCH=8"), "{env_flags:?}");
+        assert!(!env_flags.iter().any(|e| e.starts_with("NOT_LISTED=")), "{env_flags:?}");
+    }
+
+    /// v0.2.97 (lane V round 2): a listed secret reaches the spawn as a bare
+    /// `-e KEY` — its VALUE is nowhere in the argv, only in the runtime
+    /// process env the spawn site applies — resolved through the real gate
+    /// with THIS project as the requester. An unlisted secret is not looked
+    /// up; a paused required secret refuses the start.
+    #[test]
+    fn spawn_args_for_project_passes_secrets_by_name_never_by_value() {
+        let _state = crate::test_env::state_dir_guard_with(&[]);
+        let _mock = crate::secrets::for_tests::MockGuard::new();
+        let mut manifest = make_manifest(true, true);
+        manifest.secrets = serde_json::from_value(serde_json::json!([
+            { "key": "RL_API_TOKEN", "scope": "per-project" },
+            { "key": "NOT_LISTED_TOKEN", "scope": "global", "required": false }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_secrets = vec!["RL_API_TOKEN".into()];
+        let project = make_project();
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let value = "s3cr3t-value-7d1f";
+        crate::secrets::set(
+            crate::secrets::SecretScope::PerProject { project_id: &project.id },
+            &manifest.id,
+            "RL_API_TOKEN",
+            value,
+        )
+        .unwrap();
+        crate::secrets::set(crate::secrets::SecretScope::Global, &manifest.id, "NOT_LISTED_TOKEN", "x9")
+            .unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let image = "img:tag";
+        let spawn = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &db,
+        )
+        .expect("spawn args");
+
+        assert!(!spawn.args.iter().any(|a| a.contains(value)), "value leaked into argv");
+        let image_at = spawn.args.iter().position(|a| a == image).unwrap();
+        let bare: Vec<&str> = spawn.args[..image_at]
+            .windows(2)
+            .filter(|w| w[0] == "-e" && !w[1].contains('='))
+            .map(|w| w[1].as_str())
+            .collect();
+        assert_eq!(bare, vec!["RL_API_TOKEN"]);
+        assert_eq!(spawn.secret_keys(), vec!["RL_API_TOKEN"]);
+        assert_eq!(spawn.secret_value_for_tests("RL_API_TOKEN"), Some(value));
+        assert!(!format!("{spawn:?}").contains(value), "Debug leaked the value");
+
+        db.mark_secret_inactive_for_requester(
+            "per_project", &project.id, &manifest.id, "RL_API_TOKEN", &project.id,
+        )
+        .unwrap();
+        let err = spawn_args_for_project(
+            &manifest, &ctx, &project, 11533, "c", image, "podman", None, &db,
+        )
+        .unwrap_err();
+        assert!(err.contains("RL_API_TOKEN") && !err.contains(value), "{err}");
+    }
+
+    /// The global builder names inherited secrets the same way, after the
+    /// identity env, and a secret named like the runtime's own env is refused.
+    #[test]
+    fn spawn_args_global_passes_secrets_by_name_and_refuses_reserved_names() {
+        let manifest = make_manifest(true, true);
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let spawn = spawn_args_global(
+            &manifest,
+            &ctx,
+            GLOBAL_RL_PORT,
+            "c",
+            "img:tag",
+            "podman",
+            None,
+            &[("VCT_MODULE_TOKEN".to_string(), "tok".to_string())],
+            vec![("G_TOKEN".into(), "g-val-91".into()), ("PATH".into(), "/evil".into())],
+        )
+        .unwrap();
+        assert!(!spawn.args.iter().any(|a| a.contains("g-val-91") || a.contains("/evil")));
+        let token_at = spawn.args.iter().position(|a| a == "VCT_MODULE_TOKEN=tok").unwrap();
+        assert_eq!(spawn.args[token_at + 1..token_at + 3], ["-e", "G_TOKEN"]);
+        assert_eq!(spawn.secret_keys(), vec!["G_TOKEN"]);
+    }
+
     #[test]
     fn build_podman_run_args_rejects_non_container_runtime() {
         let mut manifest = make_manifest(true, true);
@@ -3260,64 +3700,14 @@ mod tests {
         );
     }
 
-    // ─── v0.2.54 C-RT-1 / C-RT-2: promoted runtime detection ─────────
-
-    /// Candidate ordering (v0.2.92 pin discipline, delivery-audit M1):
-    /// a pin — env override OR runtime.txt — IS the whole order; no pin
-    /// means the canonical podman-first pair. The env override wins when
-    /// both name a runtime. Byte-identical to `runtime.rs::candidate_order`
-    /// and `vco_lib.containers.runtime_candidate_order` on the arms they
-    /// share; the fixture test below pins all three surfaces together.
-    #[test]
-    fn v0254_runtime_candidate_order_precedence() {
-        assert_eq!(
-            runtime_candidate_order(None, None),
-            vec!["podman".to_string(), "docker".to_string()],
-        );
-        // A pin is the WHOLE order — no tail, no second candidate to
-        // fall through to.
-        assert_eq!(
-            runtime_candidate_order(Some("docker"), None),
-            vec!["docker".to_string()],
-        );
-        assert_eq!(
-            runtime_candidate_order(Some("podman"), None),
-            vec!["podman".to_string()],
-        );
-        assert_eq!(
-            runtime_candidate_order(None, Some("docker")),
-            vec!["docker".to_string()],
-        );
-        assert_eq!(
-            runtime_candidate_order(None, Some("podman")),
-            vec!["podman".to_string()],
-        );
-        // env wins over runtime.txt when they disagree.
-        assert_eq!(
-            runtime_candidate_order(Some("podman"), Some("docker")),
-            vec!["podman".to_string()],
-        );
-        assert_eq!(
-            runtime_candidate_order(Some("docker"), Some("docker")),
-            vec!["docker".to_string()],
-        );
-        assert_eq!(
-            pinned_runtime(Some("podman").as_deref(), Some("docker")),
-            Some(("podman", RuntimePinSource::EnvOverride)),
-        );
-        assert_eq!(
-            pinned_runtime(None, Some("docker").as_deref()),
-            Some(("docker", RuntimePinSource::RuntimeTxt)),
-        );
-        assert_eq!(pinned_runtime(None, None), None);
-    }
-
     // -----------------------------------------------------------------
     // Parity fixture (v0.2.92 delivery-audit M1) — the SAME JSON drives
-    // tests/test_container_runtime_ssot.py (Python resolve) and
-    // runtime.rs's tests (candidate_order + select_runtime). The
+    // tests/test_container_runtime_ssot.py (Python resolve) and this
+    // surface's + runtime.rs's tests, through the ONE client
+    // (`runtime_verdict::decide`, v0.2.97 R12 — the Rust decision half
+    // these tests used to call directly is retired). The
     // `expect_module_plane` key is THIS surface's answer: what
-    // detect_container_runtime's decision half picks for the MODULE
+    // detect_container_runtime's verdict says for the MODULE
     // CONTAINER plane (no compose gating — module containers don't need
     // compose; a runtime the infra plane rejects for lacking compose is
     // still fine here).
@@ -3331,50 +3721,6 @@ mod tests {
         serde_json::from_str(&text).expect("fixture parses")
     }
 
-    fn fixture_names(v: &serde_json::Value, key: &str) -> Vec<String> {
-        v[key]
-            .as_array()
-            .unwrap_or_else(|| panic!("fixture scenario lacks `{}`", key))
-            .iter()
-            .map(|s| s.as_str().unwrap().to_string())
-            .collect()
-    }
-
-    /// Fixture scenario → the validated pin pair this surface derives
-    /// from `env` (+ `runtime_txt` when the scenario declares one).
-    /// Unrecognised / `auto` / unset env is no pin, mirroring
-    /// `runtime_preference_from_env`.
-    fn fixture_pin(sc: &serde_json::Value) -> Option<(&str, RuntimePinSource)> {
-        let env = sc["env"].as_str().filter(|e| *e == "podman" || *e == "docker");
-        let txt = sc
-            .get("runtime_txt")
-            .and_then(|v| v.as_str())
-            .filter(|t| *t == "podman" || *t == "docker");
-        pinned_runtime(env, txt)
-    }
-
-    /// Build the probe ledger a scenario describes: `daemon_ok` →
-    /// Responsive; else `version_ok` → BinaryOnly; else Missing.
-    /// (`probe_unknown` rows collapse to Missing here: this surface is
-    /// two-state over its Err — the Python resolver's UNKNOWN tri-state
-    /// has no module-plane counterpart, which the fixture comment
-    /// records.)
-    fn fixture_probes(sc: &serde_json::Value) -> HashMap<String, ModuleRuntimeProbe> {
-        let daemon_ok = fixture_names(sc, "daemon_ok");
-        let version_ok = fixture_names(sc, "version_ok");
-        let mut probes = HashMap::new();
-        for rt in ["podman", "docker"] {
-            let outcome = if daemon_ok.iter().any(|c| c == rt) {
-                ModuleRuntimeProbe::Responsive
-            } else if version_ok.iter().any(|c| c == rt) {
-                ModuleRuntimeProbe::BinaryOnly
-            } else {
-                ModuleRuntimeProbe::Missing
-            };
-            probes.insert(rt.to_string(), outcome);
-        }
-        probes
-    }
 
     #[test]
     fn parity_fixture_every_scenario_names_a_module_plane_expectation() {
@@ -3391,159 +3737,416 @@ mod tests {
         }
     }
 
-    /// The three runtime-selection surfaces read ONE fixture, so they
-    /// cannot drift: Python `vco_lib.containers.resolve`,
-    /// `runtime.rs::candidate_order` + `select_runtime`, and this
-    /// module's `runtime_candidate_order` + `decide_module_runtime`.
-    /// The load-bearing rows are the refusals — reverting this surface
-    /// to a fall-through (pin first, then both) turns them into
-    /// `Ok(other)` and fails here.
-    #[test]
-    fn parity_fixture_module_plane_matches_every_scenario() {
+    /// The module-plane leg of the parity fixture, THROUGH THE ONE CLIENT
+    /// (R12): each scenario is a real `decide --purpose module` spawn over
+    /// stub podman/docker scripts — the same fixture
+    /// `tests/test_container_runtime_ssot.py` drives in-process on the
+    /// Python side, so the two planes cannot drift. The Rust decision
+    /// mirrors this file used to keep are gone.
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn parity_fixture_module_plane_matches_every_scenario() {
+        use super::super::runtime_verdict::contract_support::{
+            isolation_env, make_executable, test_python,
+        };
         let fx = parity_fixture();
         for sc in fx["scenarios"].as_array().unwrap() {
             let name = sc["name"].as_str().unwrap();
-            let pin = fixture_pin(sc);
-            // Derive the order exactly the way `detect_container_runtime`
-            // does, so both pin arms of `runtime_candidate_order` are
-            // exercised by the fixture (env pin and runtime_txt pin).
-            let (env_arg, txt_arg) = match pin {
-                Some((p, RuntimePinSource::EnvOverride)) => (Some(p), None),
-                Some((p, RuntimePinSource::RuntimeTxt)) => (None, Some(p)),
-                None => (None, None),
-            };
-            let order = runtime_candidate_order(env_arg, txt_arg);
-            let probes = fixture_probes(sc);
-            let got = decide_module_runtime(&order, &probes, pin);
+            let dir = tempfile::tempdir().unwrap();
+            let root = parity_fixture::parity_root(dir.path(), sc);
+            let bin_dir = dir.path().join("bin");
+            std::fs::create_dir_all(&bin_dir).unwrap();
+            for rt in ["podman", "docker"] {
+                parity_fixture::write_parity_stub(&bin_dir, rt, sc);
+            }
+            for standalone in sc["standalone_on_path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+            {
+                let p = bin_dir.join(standalone);
+                std::fs::write(&p, "#!/bin/sh\nexit 0\n").unwrap();
+                make_executable(&p);
+            }
+            let home = dir.path().join("home");
+            std::fs::create_dir_all(&home).unwrap();
+            let mut env_pairs = isolation_env(&bin_dir, &home);
+            let mut unset_keys = Vec::new();
+            match sc["env"].as_str() {
+                // The env value goes to Python verbatim — "auto"/"bogus" are
+                // ITS non-pins to interpret, not ours.
+                Some(pin) => env_pairs.push(("VCT_CONTAINER_RUNTIME".to_string(), pin.to_string())),
+                None => unset_keys.push("VCT_CONTAINER_RUNTIME".to_string()),
+            }
+            let got = detect_module_runtime_with_opts(super::super::runtime_verdict::VerdictOpts {
+                install_root: Some(root.as_path()),
+                mode: Some(super::super::runtime_verdict::Mode::ReadOnly),
+                purpose: Some(super::super::runtime_verdict::Purpose::Module),
+                python: Some(test_python().as_path()),
+                path_env: None,
+                env_pairs,
+                unset_keys,
+            })
+            .await;
             let want = &sc["expect_module_plane"];
-            match want["ok"].as_str() {
-                Some(rt) => assert_eq!(
-                    got.as_deref(),
+            if let Some(rt) = want["ok"].as_str() {
+                assert_eq!(
+                    got.as_ref().map(|(r, _)| r.as_str()),
                     Ok(rt),
-                    "scenario {}: module plane must resolve {}",
-                    name,
-                    rt
-                ),
-                None => {
-                    let err = got.expect_err(&format!(
-                        "scenario {}: fixture expects a refusal, module plane \
-                         resolved instead",
-                        name
-                    ));
-                    if let Some(pin_name) = want["refused"]["pinned"].as_str() {
-                        assert_eq!(pin.unwrap().0, pin_name, "scenario {}", name);
-                        assert!(
-                            err.contains(pin_name),
-                            "scenario {}: refusal must name the pin {:?}: {}",
-                            name,
-                            pin_name,
-                            err
-                        );
-                        assert!(
-                            err.contains("container runtime"),
-                            "scenario {}: refusal must say 'container runtime': {}",
-                            name, err
-                        );
-                        assert!(
-                            err.contains("SEPARATE named volumes"),
-                            "scenario {}: refusal must say why it will not \
-                             substitute: {}",
-                            name, err
-                        );
-                        let alt_usable =
-                            want["refused"]["alternative_usable"].as_bool().unwrap();
-                        assert_eq!(
-                            err.contains("is a usable container runtime but VCO will NOT drive it"),
-                            alt_usable,
-                            "scenario {}: alternative_usable={} but message: {}",
-                            name, alt_usable, err
-                        );
-                        if let Some(via) = want["refused"]["via"].as_str() {
-                            assert!(
-                                err.contains(via),
-                                "scenario {}: refusal must name the source \
-                                 {:?}: {}",
-                                name, via, err
-                            );
-                        }
-                    }
+                    "scenario {name}: module plane must resolve {rt}"
+                );
+            } else if want["no_responsive"].as_bool() == Some(true) {
+                got.expect_err(&format!("scenario {name}: nothing responsive must be refused"));
+            } else if let Some(pinned) = want["refused"]["pinned"].as_str() {
+                let err = got.expect_err(&format!(
+                    "scenario {name}: fixture expects a refusal, module plane resolved instead"
+                ));
+                assert!(
+                    err.contains(pinned),
+                    "scenario {name}: refusal must name the pin {pinned:?}: {err}"
+                );
+                // The why-not-substitute clause appears only in the
+                // other-usable arm — same split as the Python refusal.
+                let alt_usable = want["refused"]["alternative_usable"].as_bool().unwrap();
+                assert_eq!(
+                    err.contains("VCO will NOT drive it"),
+                    alt_usable,
+                    "scenario {name}: alternative_usable={alt_usable} but message: {err}"
+                );
+                if let Some(via) = want["refused"]["via"].as_str() {
+                    assert!(
+                        err.contains(via),
+                        "scenario {name}: refusal must name the source {via:?}: {err}"
+                    );
                 }
+                // R10 J6: the "(not switched: …)" clause rides Python's
+                // refusal exactly when the fixture declares a decline.
+                let declined = sc
+                    .get("expect_not_switched")
+                    .and_then(|v| v.as_str())
+                    .is_some();
+                assert_eq!(
+                    err.contains("(not switched:"),
+                    declined,
+                    "scenario {name}: refusal {err}"
+                );
+            } else {
+                panic!("scenario {name}: unknown expect_module_plane shape {want}");
             }
         }
     }
 
-    /// The refusal message splits the two remedies the way the Python
-    /// surface does (`_pin_refusal_reason`): an installed-but-down pin
-    /// says "start it"; a pin whose binary is absent says "install it".
-    #[test]
-    fn module_plane_pin_refusal_names_state_and_remedy() {
-        let m = module_runtime_pin_refusal(
-            "podman",
-            RuntimePinSource::EnvOverride,
-            true,
-            true,
-        );
-        assert!(m.contains("VCT_CONTAINER_RUNTIME=podman is set but"));
-        assert!(m.contains("not responding to `podman info`"));
-        assert!(m.contains("docker is a usable container runtime but VCO will NOT drive it"));
-        assert!(m.contains("start podman, or unset VCT_CONTAINER_RUNTIME"));
-        assert!(m.contains("container runtime"));
-
-        let not_installed = module_runtime_pin_refusal(
-            "docker",
-            RuntimePinSource::EnvOverride,
-            false,
-            true,
-        );
-        assert!(not_installed.contains("docker is not installed"));
-        assert!(not_installed.contains("set it to podman"));
-
-        let no_alt = module_runtime_pin_refusal(
-            "podman",
-            RuntimePinSource::RuntimeTxt,
-            true,
-            false,
-        );
-        assert!(no_alt.contains("state/install/runtime.txt"));
-        assert!(no_alt.contains("docker is not a usable container runtime either"));
-        assert!(no_alt.contains("start podman (or install it), then retry"));
-        // The runtime.txt remedy must NOT tell the user to unset the env
-        // var — the pin does not come from there.
-        assert!(!no_alt.contains("unset VCT_CONTAINER_RUNTIME"));
+    /// R10 J6, through the real client: a stale docker record (docker not
+    /// installed) with a fake podman that answers and lists `ps_out`
+    /// (`ps -a`, the running+stopped containers) / `volumes_out`. The stubs
+    /// and the pin env are handed to the CHILD (never the process env).
+    #[cfg(unix)]
+    fn detect_with_fake_podman(
+        root: &Path,
+        ps_out: &str,
+        volumes_out: &str,
+    ) -> Result<(String, Option<RuntimePinSource>), String> {
+        detect_with_fake_podman_running(
+            root,
+            ps_out,
+            ps_out,
+            volumes_out,
+            super::super::runtime_verdict::Mode::ReadOnly,
+        )
     }
 
-    /// The auto arm still falls through — podman down + docker up with
-    /// NO pin resolves docker. R35 refuses PINS, not auto-detection;
-    /// this pins the distinction so the fix cannot overreach.
+    /// [`detect_with_fake_podman`] with a separate `ps` (running) listing —
+    /// R11 L2's discriminator between a stack that RUNS under the other
+    /// runtime and one merely stopped there — and an explicit `mode` (the
+    /// read-only module-plane rule and install's re-record rule answer the
+    /// same shape differently, R12 M1).
+    #[cfg(unix)]
+    fn detect_with_fake_podman_running(
+        root: &Path,
+        ps_out: &str,
+        running_out: &str,
+        volumes_out: &str,
+        mode: super::super::runtime_verdict::Mode,
+    ) -> Result<(String, Option<RuntimePinSource>), String> {
+        use super::super::runtime_verdict::contract_support::{isolation_env, sh_quote};
+        // These tests ask twice about ONE root (a control, then the changed
+        // layout): the TTL cache would replay the control's verdict, so each
+        // ask starts from a cleared cache — what `invalidate_cache()` does
+        // for the user's Re-detect.
+        super::super::runtime_verdict::invalidate();
+        let bins = tempfile::tempdir().unwrap();
+        let podman = bins.path().join("podman");
+        let ps_a = sh_quote(ps_out);
+        let ps_r = sh_quote(running_out);
+        let vols = sh_quote(volumes_out);
+        // `echo` appends the newline itself (`printf %s 'x\n' would emit
+        // a literal backslash-n and fuse the listing into one name).
+        std::fs::write(
+            &podman,
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  version) exit 0 ;;\n  info) exit 0 \\
+                 ;;\nesac\ncase \"$1 $2\" in\n  \"compose version\") exit 0 ;;\n  \
+                 \"volume ls\") echo {vols}; exit 0 ;;\n  \"ps -a\") echo {ps_a}; exit 0 \\
+                 ;;\n  \"ps --format\") echo {ps_r}; exit 0 ;;\nesac\ncase \"$1 $2 $3\" \
+                 in \"ps -a --no-trunc\") echo {ps_a}; exit 0 ;; esac\nexit 0\n"
+            ),
+        )
+        .unwrap();
+        super::super::runtime_verdict::contract_support::make_executable(&podman);
+        std::fs::create_dir_all(root.join("state").join("install")).unwrap();
+        std::fs::write(root.join("state").join("install").join("runtime.txt"), "docker\n").unwrap();
+        let home = bins.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        rt.block_on(detect_module_runtime_with_opts(super::super::runtime_verdict::VerdictOpts {
+            install_root: Some(root),
+            mode: Some(mode),
+            purpose: Some(super::super::runtime_verdict::Purpose::Module),
+            python: Some(
+                super::super::runtime_verdict::contract_support::test_python().as_path(),
+            ),
+            path_env: None,
+            env_pairs: isolation_env(bins.path(), &home),
+            unset_keys: vec!["VCT_CONTAINER_RUNTIME".to_string()],
+        }))
+    }
+
+    /// R10 J2 / R11 L2 (iii), through the real client: the same stale
+    /// record, podman answering with a LEFTOVER `vco_weaviate_data` volume
+    /// (the shape that switches without a folder) — but Weaviate's data is a
+    /// bind-mounted host folder and no VCO container exists under podman.
+    /// Not switched; Python's refusal says so (M3: verbatim, never
+    /// re-derived here).
+    #[cfg(unix)]
     #[test]
-    fn module_plane_auto_arm_still_falls_through() {
-        let order = runtime_candidate_order(None, None);
-        let mut probes = HashMap::new();
-        probes.insert("podman".into(), ModuleRuntimeProbe::BinaryOnly);
-        probes.insert("docker".into(), ModuleRuntimeProbe::Responsive);
+    #[serial_test::serial]
+    fn a_bind_mount_layout_is_never_switched_by_the_module_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        let folder = dir.path().join("srv-weaviate");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("classifications.db"), "x").unwrap();
+        // Control: without the bind layout this shape DOES switch to podman.
         assert_eq!(
-            decide_module_runtime(&order, &probes, None),
-            Ok("docker".to_string())
+            detect_with_fake_podman(&root, "someone_elses_ollama", "vco_weaviate_data")
+                .map(|(rt, _)| rt),
+            Ok("podman".to_string())
+        );
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("VCT_WEAVIATE_DATA_SOURCE={}\nVCT_WEAVIATE_VOLUME_NAME=\n", folder.display()),
+        )
+        .unwrap();
+        let err = detect_with_fake_podman(&root, "someone_elses_ollama", "vco_weaviate_data")
+            .expect_err("a bind-mount layout keeps the record");
+        // Python's bind decline wording (runtime_reconcile_messages.toml):
+        // the folder, not "SEPARATE named volumes", is why it did not switch.
+        assert!(err.contains("(not switched: "), "{err}");
+        assert!(err.contains("bind-mounted folder"), "{err}");
+    }
+
+    /// R11 L2 (i)/(ii), through the real client: Weaviate's data is a host
+    /// folder and the stale docker record is not installed. podman RUNNING
+    /// VCO's containers → the stack lives there: driven. podman holding them
+    /// STOPPED → data under both: refused with Python's reason why.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn vco_containers_under_the_other_runtime_outrank_the_bind_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        let folder = dir.path().join("srv-weaviate");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(folder.join("classifications.db"), "x").unwrap();
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("VCT_WEAVIATE_DATA_SOURCE={}\n", folder.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            detect_with_fake_podman_running(
+            &root,
+            "vco_weaviate",
+            "vco_weaviate",
+            "someone_elses",
+            super::super::runtime_verdict::Mode::ReadOnly,
+        )
+                .map(|(rt, _)| rt),
+            Ok("podman".to_string()),
+            "running VCO containers are where the stack lives"
+        );
+        let err = detect_with_fake_podman_running(
+            &root,
+            "vco_weaviate",
+            "someone_elses",
+            "someone_elses",
+            super::super::runtime_verdict::Mode::ReadOnly,
+        )
+            .expect_err("stopped VCO containers beside the folder are data under both");
+        assert!(err.contains("(not switched: "), "{err}");
+        // The shared data-under-both wording beside a bind folder (R11 L2):
+        // either runtime could serve it.
+        assert!(err.contains("either runtime could serve"), "{err}");
+    }
+
+    /// R11 L3 + R12 M1, through the real client: EVERY service's data is a
+    /// non-empty host folder and the stale docker record is not installed;
+    /// podman answers holding nothing of VCO's. READ-ONLY (the module
+    /// plane's mode) needs positive evidence that podman serves VCO and
+    /// "nothing found anywhere" is not it — refused with the `no_data`
+    /// wording (the flipped fixture row pins this same shape). INSTALL may
+    /// still re-record podman: a switch strands no named volume.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn every_service_in_a_folder_switches_the_module_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        let mut env_text = String::new();
+        for (key, name) in [
+            ("VCT_WEAVIATE_DATA_SOURCE", "w"),
+            ("VCT_OLLAMA_DATA_SOURCE", "o"),
+        ] {
+            let folder = dir.path().join(name);
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("blob"), "x").unwrap();
+            env_text += &format!("{}={}\n", key, folder.display());
+        }
+        std::fs::write(root.join("infrastructure").join(".env"), &env_text).unwrap();
+        assert!(
+            detect_with_fake_podman(&root, "someone_elses", "someone_elses").is_err(),
+            "control: the code_embed cache is still a named volume"
+        );
+        let code_folder = dir.path().join("c");
+        std::fs::create_dir_all(&code_folder).unwrap();
+        std::fs::write(code_folder.join("blob"), "x").unwrap();
+        std::fs::write(
+            root.join("infrastructure").join(".env"),
+            format!("{env_text}VCT_CODE_EMBED_CACHE_SOURCE={}\n", code_folder.display()),
+        )
+        .unwrap();
+        let err = detect_with_fake_podman(&root, "someone_elses", "someone_elses")
+            .expect_err("read-only needs positive evidence, not 'nothing anywhere'");
+        assert!(err.contains("(not switched: "), "{err}");
+        assert!(err.contains("holds none of VCO's containers or volumes"), "{err}");
+        // Install re-records: nothing is stranded, so the record is answered
+        // with podman (R11 L3's original rule, now install-only).
+        assert_eq!(
+            detect_with_fake_podman_running(
+                &root,
+                "someone_elses",
+                "someone_elses",
+                "someone_elses",
+                super::super::runtime_verdict::Mode::Install,
+            )
+            .map(|(rt, _)| rt),
+            Ok("podman".to_string())
         );
     }
 
-    /// runtime.txt reader: valid token round-trips; junk / missing → None.
+    /// R10 J8, through the real client: the install adopted a volume
+    /// named `ollama` (`VCT_OLLAMA_VOLUME_NAME=ollama`); podman — the runtime
+    /// a stale docker record would switch TO — has an unrelated `ollama` of
+    /// its own (no VCO container, not labelled by VCO's compose project).
+    /// Before R10 the name alone switched the module plane and the hub to
+    /// podman; now it is not evidence, so the record's refusal stands.
+    #[cfg(unix)]
     #[test]
-    fn v0254_read_runtime_txt_parses_valid_token() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let sub = dir.path().join("state").join("install");
-        std::fs::create_dir_all(&sub).expect("mkdir");
-        std::fs::write(sub.join("runtime.txt"), "docker\n").expect("write");
-        assert_eq!(read_runtime_txt(dir.path()), Some("docker".to_string()));
+    #[serial_test::serial]
+    fn a_user_named_volume_alone_never_switches_the_module_plane() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("clone");
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::write(root.join("infrastructure").join(".env"), "VCT_OLLAMA_VOLUME_NAME=ollama\n")
+            .unwrap();
+        let err = detect_with_fake_podman(&root, "someone_elses_ollama", "ollama")
+            .expect_err("an uncorroborated user-picked name is not VCO's data");
+        assert!(err.contains("(not switched: "), "{err}");
+        assert!(err.contains("holds none of VCO's containers or volumes"), "{err}");
+    }
 
-        std::fs::write(sub.join("runtime.txt"), "  PODMAN  \n").expect("write");
-        assert_eq!(read_runtime_txt(dir.path()), Some("podman".to_string()));
+    /// R10 J6, through the real client: the decline's rendered wording rides
+    /// Python's refusal verbatim — the Rust renderer that used to rebuild it
+    /// is retired with the other mirrors.
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn a_declined_stale_record_says_why_in_the_refusal() {
+        let root = tempfile::tempdir().unwrap();
+        let got = detect_with_fake_podman(root.path(), "someone_elses_ollama", "someone_elses_data");
+        let err = got.expect_err("a stale record with no data under podman is refused");
+        assert!(
+            err.contains("(not switched: "),
+            "the refusal must say why it did not switch: {err}"
+        );
+        assert!(err.contains("holds none of VCO's containers or volumes"), "{err}");
+        assert!(err.contains("VCO will NOT drive it"), "{err}");
+    }
 
-        std::fs::write(sub.join("runtime.txt"), "containerd\n").expect("write");
-        assert_eq!(read_runtime_txt(dir.path()), None);
+    /// v0.2.97 owner ruling "Honour the pin": an object that only the OTHER
+    /// runtime owns is refused, naming both runtimes, what chose the runtime,
+    /// and both fixes; the chosen runtime owning it (or nobody owning it)
+    /// passes through.
+    #[test]
+    fn ownership_guard_refuses_only_when_the_other_runtime_owns_it() {
+        let env = check_runtime_owns(
+            "migrate",
+            "volume `weaviate_data`",
+            "docker",
+            Some(RuntimePinSource::EnvOverride),
+            false,
+            true,
+        )
+        .unwrap_err();
+        for needle in [
+            "refusing to migrate volume `weaviate_data`",
+            "exists only under podman",
+            "VCT_CONTAINER_RUNTIME=docker pins VCO to docker",
+            "unset VCT_CONTAINER_RUNTIME (or set VCT_CONTAINER_RUNTIME=podman)",
+            "first move the data from podman into docker",
+        ] {
+            assert!(env.contains(needle), "{needle:?} missing from {env:?}");
+        }
+        // R7b F8: every remedy is one the user can follow — the pin is read
+        // when the launcher STARTS, so each one goes through quit + relaunch
+        // and says where the variable must be set; "set it and retry" is gone.
+        let recorded =
+            check_runtime_owns("inspect", "x", "podman", Some(RuntimePinSource::RuntimeTxt), false, true)
+                .unwrap_err();
+        let auto = check_runtime_owns("inspect", "x", "podman", None, false, true).unwrap_err();
+        for refusal in [&env, &recorded, &auto] {
+            for needle in [
+                "quit the launcher",
+                "in the environment the launcher starts from",
+                "then relaunch it",
+            ] {
+                assert!(refusal.contains(needle), "{needle:?} missing from {refusal:?}");
+            }
+            assert!(!refusal.contains("and retry,"), "an unfollowable remedy: {refusal}");
+        }
+        // The record case names the FILE to edit, as an absolute path.
+        let record_file = crate::orchestrator_manifest::orchestrator_install_root()
+            .expect("tests run from inside the clone")
+            .join("state")
+            .join("install")
+            .join("runtime.txt");
+        assert!(
+            recorded.contains(&format!("write `docker` into {}", record_file.display())),
+            "{recorded}"
+        );
+        assert!(recorded.contains("set VCT_CONTAINER_RUNTIME=docker"), "{recorded}");
+        assert!(auto.contains("auto-detected"), "{auto}");
 
-        let empty = tempfile::tempdir().expect("tempdir");
-        assert_eq!(read_runtime_txt(empty.path()), None);
+        assert!(check_runtime_owns("migrate", "x", "docker", None, true, true).is_ok());
+        assert!(check_runtime_owns("migrate", "x", "docker", None, true, false).is_ok());
+        assert!(check_runtime_owns("migrate", "x", "docker", None, false, false).is_ok());
+        assert_eq!(other_runtime("podman"), "docker");
+        assert_eq!(other_runtime("docker"), "podman");
     }
 
     /// Live daemon-aware probe sanity: a nonexistent binary is never
@@ -3556,10 +4159,18 @@ mod tests {
             !runtime_daemon_responsive("definitely-not-a-container-runtime-binary").await
         );
         // Detection must never panic; an Err on runtime-less CI hosts is
-        // a valid outcome and carries the candidate diagnosis.
+        // a valid outcome and carries either the Python refusal or the
+        // client's loud-fail diagnosis (missing/broken Python = broken
+        // install) — the days of a Rust-built "container runtime" message
+        // ended with the mirrors (2026-09-25 consolidation).
         match detect_container_runtime(None).await {
             Ok(rt) => assert!(rt == "podman" || rt == "docker"),
-            Err(msg) => assert!(msg.contains("container runtime")),
+            Err(msg) => assert!(
+                msg.contains("container runtime")
+                    || msg.contains("runtime_reconcile")
+                    || msg.contains("broken install"),
+                "{msg}"
+            ),
         }
     }
 
@@ -4467,6 +5078,7 @@ mod tests {
     /// v0.2.67 extraction — the installer-engine copy now delegates here.
     #[test]
     fn module_pull_timeout_honours_env_override_and_rejects_garbage() {
+        let _env_lock = crate::test_env::env_lock();
         use std::time::Duration;
         let prev = std::env::var("VCT_MODULE_PULL_TIMEOUT_SECS").ok();
 
@@ -4516,6 +5128,7 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn bounded_authed_pull_times_out_and_does_not_hang() {
+        let _env_lock = crate::test_env::env_lock();
         use std::io::Write as _;
         use std::os::unix::fs::PermissionsExt as _;
         use std::time::Duration;
@@ -4621,5 +5234,143 @@ mod tests {
         let json = r#"{"9000/tcp":[{"HostPort":"22000"}],"11438/tcp":[{"HostPort":"11450"}]}"#;
         // Keys sort lexicographically: "11438/tcp" < "9000/tcp".
         assert_eq!(parse_published_host_port(json), Some(11450));
+    }
+}
+
+/// The parity fixture's data fields, read ONE way by both Rust legs of
+/// `tests/fixtures/container_runtime_parity.json` (this module's tests and
+/// `runtime.rs`'s) — they carried a copy each before R11.
+#[cfg(test)]
+pub(crate) mod parity_fixture {
+    use std::path::{Path, PathBuf};
+
+    /// One runtime's stub for a `container_runtime_parity.json` scenario,
+    /// serving the SAME argv grammar the Python harness `_probes` doubles:
+    /// version / info / compose rc by list membership, the listings by
+    /// `vco_data_kind` (R11 L2), unlistable listings exit 1, and a
+    /// `probe_unknown` runtime sleeps past every probe timeout (the probes
+    /// themselves bound the wait). No file at all when the runtime is not
+    /// `on_path` — the child's PATH holds only the stub dir, so absence IS
+    /// "not found". MUST MATCH `tests/test_container_runtime_ssot.py::_probes`.
+    pub(crate) fn write_parity_stub(bin_dir: &Path, rt: &str, sc: &serde_json::Value) {
+        let in_list = |key: &str| {
+            sc.get(key)
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().any(|n| n.as_str() == Some(rt)))
+                .unwrap_or(false)
+        };
+        let path = bin_dir.join(rt);
+        if !in_list("on_path") {
+            return; // not installed as far as the child can tell
+        }
+        let body = if in_list("probe_unknown") {
+            // The stall must survive the child's stub-only PATH (`sleep`
+            // itself would not be found there — and a failed `sleep`
+            // falls through to `exit 0`, silently "answering" the probe).
+            "#!/bin/sh\n/bin/sleep 25 || /usr/bin/sleep 25\nexit 0\n".to_string()
+        } else {
+            let rc = |key: &str| if in_list(key) { 0 } else { 1 };
+            // `kind` (the Python harness's own derivation): the scenario's
+            // explicit `vco_data_kind`, else `running` for `vco_data_under`.
+            let kind = sc
+                .get("vco_data_kind")
+                .and_then(|v| v.get(rt))
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    let under = sc
+                        .get("vco_data_under")
+                        .and_then(|v| v.get(rt))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    if under { "running".to_string() } else { "none".to_string() }
+                });
+            let unlistable = in_list("vco_data_unlistable");
+            let listing = |out: &str| {
+                if unlistable {
+                    "exit 1".to_string()
+                } else {
+                    format!("echo '{}'; exit 0", out)
+                }
+            };
+            let ps_a = if kind == "running" || kind == "stopped" {
+                "vco_weaviate"
+            } else {
+                "someone_elses_ollama"
+            };
+            let ps_r = if kind == "running" { "vco_weaviate" } else { "" };
+            let vols = if kind != "none" {
+                "vco_weaviate_data"
+            } else {
+                "someone_elses_data"
+            };
+            // `ps -a` covers the `--no-trunc` full-ID form too (the harness
+            // treats every `ps -a*` alike); `echo` supplies the newline a
+            // `printf %s 'x\n'` would leave literal.
+            format!(
+                "#!/bin/sh\ncase \"$1\" in\n  version) exit {version_rc} ;;\n  info) exit \
+                 {daemon_rc} ;;\nesac\ncase \"$1 $2\" in\n  \"compose version\") exit \
+                 {compose_rc} ;;\n  \"ps -a\") {ps_a} ;;\n  \"ps --format\") {ps_r} ;;\n  \
+                 \"volume ls\") {vols} ;;\nesac\nexit 0\n",
+                version_rc = rc("version_ok"),
+                daemon_rc = rc("daemon_ok"),
+                compose_rc = rc("compose_subcommand_ok"),
+                ps_a = listing(ps_a),
+                ps_r = listing(ps_r),
+                vols = listing(vols),
+            )
+        };
+        std::fs::write(&path, body).expect("stub written");
+        super::super::runtime_verdict::contract_support::make_executable(&path);
+    }
+
+    /// The scenario's install root — the same layout the Python harness's
+    /// `_install_root` builds: `state/install/runtime.txt`,
+    /// `state/install/runtime.confirmed`, and (for `bind_data`) an
+    /// `infrastructure/.env` relocating Weaviate's data to a non-empty host
+    /// folder (`"all"` relocates Ollama's and the code_embed cache's too).
+    pub(crate) fn parity_root(dir: &Path, sc: &serde_json::Value) -> PathBuf {
+        let root = dir.join("install-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let bind = match sc.get("bind_data") {
+            None | Some(serde_json::Value::Null) => false,
+            Some(serde_json::Value::Bool(b)) => *b,
+            Some(serde_json::Value::String(s)) => !s.is_empty(),
+            Some(_) => true,
+        };
+        let bind_all = sc.get("bind_data").and_then(|v| v.as_str()) == Some("all");
+        if bind {
+            let folder = root.join("weaviate-folder");
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("classifications.db"), "x").unwrap();
+            std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+            let mut lines = format!(
+                "VCT_WEAVIATE_DATA_SOURCE={}\nVCT_WEAVIATE_VOLUME_NAME=\n",
+                folder.display()
+            );
+            if bind_all {
+                for (key, name) in [
+                    ("VCT_OLLAMA_DATA_SOURCE", "ollama-folder"),
+                    ("VCT_CODE_EMBED_CACHE_SOURCE", "code-embed-folder"),
+                ] {
+                    let d = root.join(name);
+                    std::fs::create_dir_all(&d).unwrap();
+                    std::fs::write(d.join("blob"), "x").unwrap();
+                    lines += &format!("{}={}\n", key, d.display());
+                }
+            }
+            std::fs::write(root.join("infrastructure").join(".env"), lines).unwrap();
+        }
+        if let Some(txt) = sc.get("runtime_txt").and_then(|v| v.as_str()) {
+            let d = root.join("state").join("install");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("runtime.txt"), format!("{}\n", txt)).unwrap();
+        }
+        if let Some(c) = sc.get("runtime_confirmed").and_then(|v| v.as_str()) {
+            let d = root.join("state").join("install");
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("runtime.confirmed"), format!("{}\n", c)).unwrap();
+        }
+        root
     }
 }

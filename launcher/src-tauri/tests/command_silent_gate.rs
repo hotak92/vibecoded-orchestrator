@@ -343,6 +343,47 @@ fn strip_comments_and_strings(src: &str) -> Vec<String> {
     lines
 }
 
+/// Whether an attribute line gates its item to test builds: `#[cfg(test)]`,
+/// `#[cfg(any(test, debug_assertions))]`, or `#[cfg(all(..., test, ...))]`
+/// where `test` is one of `all`'s top-level arguments (so the item exists
+/// only when compiling tests). `#[cfg(any(test, feature = "x"))]` and
+/// `not(test)` are NOT test-only and do not match.
+fn is_test_cfg_attr(s: &str) -> bool {
+    let t = s.replace(char::is_whitespace, "");
+    if t.contains("#[cfg(test)]") {
+        return true;
+    }
+    if t.contains("#[cfg(") && t.contains("test") && t.contains("debug_assertions") {
+        return true;
+    }
+    if let Some(start) = t.find("#[cfg(all(") {
+        let inner = &t[start + "#[cfg(all(".len()..];
+        let mut depth = 0i32;
+        let mut arg = String::new();
+        for c in inner.chars() {
+            match c {
+                '(' => {
+                    depth += 1;
+                    arg.push(c);
+                }
+                ')' if depth == 0 => return arg == "test",
+                ')' => {
+                    depth -= 1;
+                    arg.push(c);
+                }
+                ',' if depth == 0 => {
+                    if arg == "test" {
+                        return true;
+                    }
+                    arg.clear();
+                }
+                _ => arg.push(c),
+            }
+        }
+    }
+    false
+}
+
 /// Compute, for each line index, whether it sits inside a `#[cfg(test)]`
 /// or `#[cfg(any(test, debug_assertions))]` item. We find the attribute,
 /// skip to the item's first `{`, then brace-balance to its matching `}`.
@@ -352,13 +393,7 @@ fn test_gated_lines(stripped: &[String]) -> Vec<bool> {
     let n = stripped.len();
     let mut gated = vec![false; n];
 
-    let is_test_cfg = |s: &str| -> bool {
-        let t = s.replace(char::is_whitespace, "");
-        // Matches #[cfg(test)] and #[cfg(any(test,debug_assertions))] and
-        // #[cfg(any(test,...))] variants, plus #[cfg(all(test,...))].
-        t.contains("#[cfg(test)]")
-            || (t.contains("#[cfg(") && t.contains("test") && t.contains("debug_assertions"))
-    };
+    let is_test_cfg = |s: &str| is_test_cfg_attr(s);
 
     let mut i = 0usize;
     while i < n {
@@ -666,4 +701,17 @@ let out = std::process::Command::new(\"ioreg\").output();"
         !has_allow_marker(&no_reason, 1),
         "empty-reason marker must NOT be honoured"
     );
+}
+
+#[test]
+fn test_cfg_attribute_recognition() {
+    assert!(is_test_cfg_attr("#[cfg(test)]"));
+    assert!(is_test_cfg_attr("#[cfg(any(test, debug_assertions))]"));
+    assert!(is_test_cfg_attr("#[cfg(all(test, unix))]"));
+    assert!(is_test_cfg_attr("#[cfg(all(unix, test))]"));
+    assert!(is_test_cfg_attr("#[cfg(all(target_os = \"linux\", test))]"));
+    assert!(!is_test_cfg_attr("#[cfg(all(not(test), unix))]"));
+    assert!(!is_test_cfg_attr("#[cfg(all(unix, feature = \"test\"))]"));
+    assert!(!is_test_cfg_attr("#[cfg(any(test, feature = \"x\"))]"));
+    assert!(!is_test_cfg_attr("#[cfg(unix)]"));
 }

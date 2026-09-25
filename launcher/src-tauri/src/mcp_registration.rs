@@ -117,7 +117,7 @@ pub fn deregister_mcp(target: &Path, mcp_name: &str) -> Result<(), String> {
 /// the secret-leak rationale. Per-project keys (KG_COLLECTION, PROJECT_NAME,
 /// DEVELOPMENT_COLLECTION, SHARED_KG_COLLECTION, CODE_GRAPH_PROJECT,
 /// KG_BASE_DIR) live in each project's `.claude/settings.json env` instead
-/// (launcher writes them via `write_project_env_files`); they are
+/// (launcher writes them via `vco_lib.config_projection apply`); they are
 /// intentionally absent from this allowlist.
 ///
 /// CRITICAL CONTRACT (Issue H.1 from mcp-instability audit 2026-05-16):
@@ -163,14 +163,22 @@ pub const DEFAULT_GRPC_PORT: u16 = 50052;
 /// Default code-embedding service port (mirrors install.py:211).
 pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
 
-/// Ports passed in from the caller (launcher GUI's adopted-services state
-/// or install.py's env). Defaults match the canonical-port constants.
-#[derive(Debug, Clone, Copy)]
+/// Where the registered MCPs reach the core services. Built by
+/// [`machine_service_ports`] from the launcher.db `service_endpoints` rows;
+/// the default is the compiled defaults on localhost.
+///
+/// v0.2.97: carries the rendered URLs too — the row's HOST, not only its
+/// port. Before, the entries were `http://localhost:<port>`, so an adopted
+/// Ollama on another machine was registered as a local port.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServicePorts {
     pub weaviate_port: u16,
     pub ollama_port: u16,
     pub grpc_port: u16,
     pub code_embed_port: u16,
+    pub weaviate_url: String,
+    pub ollama_url: String,
+    pub code_embed_url: String,
 }
 
 impl Default for ServicePorts {
@@ -180,7 +188,36 @@ impl Default for ServicePorts {
             ollama_port: DEFAULT_OLLAMA_PORT,
             grpc_port: DEFAULT_GRPC_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
+            weaviate_url: format!("http://localhost:{}", DEFAULT_WEAVIATE_PORT),
+            ollama_url: format!("http://localhost:{}", DEFAULT_OLLAMA_PORT),
+            code_embed_url: format!("http://localhost:{}", DEFAULT_CODE_EMBED_PORT),
         }
+    }
+}
+
+/// The ONE endpoint source for MCP registration (v0.2.97).
+///
+/// The entries `build_default_mcp_entries` writes land in `~/.claude.json` —
+/// a MACHINE-GLOBAL surface every project on this machine shares — so every
+/// value baked into them is the machine row's (`service_endpoints`: the
+/// launcher.db row, else the compiled default), gRPC port included. No env
+/// var is read: not `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT` (the old
+/// installer hand-off), not `WEAVIATE_GRPC_PORT`.
+pub fn machine_service_ports() -> ServicePorts {
+    use vct_launcher_core::services::service_endpoints::{
+        machine_row_from_disk, render_grpc_port, render_port, render_url, CoreService,
+    };
+    let w = machine_row_from_disk(CoreService::Weaviate);
+    let o = machine_row_from_disk(CoreService::Ollama);
+    let c = machine_row_from_disk(CoreService::CodeEmbed);
+    ServicePorts {
+        weaviate_port: render_port(CoreService::Weaviate, w.as_ref()),
+        ollama_port: render_port(CoreService::Ollama, o.as_ref()),
+        grpc_port: render_grpc_port(w.as_ref()),
+        code_embed_port: render_port(CoreService::CodeEmbed, c.as_ref()),
+        weaviate_url: render_url(CoreService::Weaviate, w.as_ref()),
+        ollama_url: render_url(CoreService::Ollama, o.as_ref()),
+        code_embed_url: render_url(CoreService::CodeEmbed, c.as_ref()),
     }
 }
 
@@ -307,9 +344,9 @@ pub fn build_default_mcp_entries(
     venv_python: &Path,
     ports: ServicePorts,
 ) -> Vec<(String, serde_json::Value, Vec<String>)> {
-    let weaviate_url = format!("http://localhost:{}", ports.weaviate_port);
-    let ollama_url = format!("http://localhost:{}", ports.ollama_port);
-    let code_embed_url = format!("http://localhost:{}", ports.code_embed_port);
+    let weaviate_url = ports.weaviate_url.clone();
+    let ollama_url = ports.ollama_url.clone();
+    let code_embed_url = ports.code_embed_url.clone();
     let mcp_root = install_root.join("claude_mcp_servers");
     let pythonpath = mcp_root.display().to_string();
     // v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
@@ -349,7 +386,7 @@ pub fn build_default_mcp_entries(
     // per-project may override" but Claude Code's actual env precedence
     // makes ~/.claude.json mcpServers.*.env WIN against
     // .claude/settings.json env — so the override goes the wrong direction.
-    // The launcher's write_project_env_files puts these in
+    // The launcher's env projection (config_projection apply) puts these in
     // .claude/settings.json env where they reach MCP subprocesses
     // correctly. Don't shadow them here.
     let mut weaviate_env = serde_json::Map::new();
@@ -887,6 +924,55 @@ fn find_project_id_for_folder(db: &crate::db::Db, target: &Path) -> Option<Strin
 mod tests {
     use super::*;
     use std::fs;
+
+    /// v0.2.97: registration values are the machine rows' — host, port and
+    /// the gRPC port — and no env var (`WEAVIATE_PORT` & co., the old
+    /// installer hand-off; `WEAVIATE_GRPC_PORT`) is read. Red against the
+    /// pre-SE-4 env-read gRPC port and the `localhost:<port>` URLs.
+    #[test]
+    fn machine_service_ports_reads_the_rows_only() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            ("WEAVIATE_PORT", Some("19999")),
+            ("OLLAMA_PORT", Some("19998")),
+            ("CODE_EMBED_PORT", Some("19997")),
+            ("WEAVIATE_GRPC_PORT", Some("50999")),
+        ]);
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18083").unwrap();
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::VcoManaged, "localhost", 18081);
+        row.grpc_port = Some(50061);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
+            "ollama",
+            EndpointMode::AdoptedExternal,
+            "gpu.lan",
+            21435,
+        ))
+        .unwrap();
+        let ports = machine_service_ports();
+        assert_eq!(ports.weaviate_port, 18081);
+        assert_eq!(ports.grpc_port, 50061);
+        assert_eq!(ports.ollama_port, 21435);
+        assert_eq!(ports.ollama_url, "http://gpu.lan:21435", "the row's host reaches the entry");
+        // No code_embed row on this harness state dir: the sentinel.
+        assert_eq!(ports.code_embed_url, "http://127.0.0.1:9");
+    }
+
+    /// The entries carry the URLs as rendered — an adopted remote Ollama is
+    /// registered at its host.
+    #[test]
+    fn entries_carry_the_rendered_urls() {
+        let root = tempfile::tempdir().unwrap();
+        let py = root.path().join("python");
+        let mut ports = ServicePorts::default();
+        ports.ollama_url = "http://gpu.lan:11434".into();
+        ports.grpc_port = 50061;
+        let entries = build_default_mcp_entries(root.path(), &py, ports);
+        let weaviate = &entries.iter().find(|(n, _, _)| n == "weaviate-kg").unwrap().1;
+        assert_eq!(weaviate["env"]["OLLAMA_URL"], "http://gpu.lan:11434");
+        assert_eq!(weaviate["env"]["GRPC_PORT"], "50061");
+    }
 
     fn tmp_target() -> PathBuf {
         let p = std::env::temp_dir().join(format!(

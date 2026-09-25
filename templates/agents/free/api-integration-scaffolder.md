@@ -5,7 +5,7 @@ short_desc: generates typed API clients from specs with retries
 keywords: [OpenAPI, "rate limit handling", "retry with backoff", "integrate with API", "wrap external API", "generate client from spec", "scaffold API client", "build from OpenAPI spec"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: opus
-effort: high
+effort: medium
 isolation: worktree
 skills:
   - api-designer

@@ -4,7 +4,7 @@ description: Audits a design system for token drift, contrast violations, type-s
 short_desc: "design system audit: tokens, contrast, parity"
 keywords: [design system audit, Figma to code, token drift, design tokens, spacing system, "color contrast", "typography system", "audit design system", "Figma sync", "colors don't match", "design parity", "inherited design system"]
 model: opus
-effort: high
+effort: medium
 ---
 
 # Design System Auditor

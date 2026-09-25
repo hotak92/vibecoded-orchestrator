@@ -125,6 +125,7 @@ mod tests {
 
     #[test]
     fn set_returns_value() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Set a one-off env var so the test is hermetic.
         std::env::set_var("VCT_TEST_READ_ENV_VAR_OK", "hello-world");
         let r = read_env_var("VCT_TEST_READ_ENV_VAR_OK".into()).unwrap();
@@ -134,6 +135,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_token_suffix() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("VCT_TEST_BLOCKED_TOKEN", "supersecret");
         let r = read_env_var("VCT_TEST_BLOCKED_TOKEN".into()).unwrap();
         assert_eq!(r, "", "_TOKEN suffix must be redacted");
@@ -142,6 +144,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_key_suffix() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("VCT_TEST_BLOCKED_KEY", "supersecret");
         let r = read_env_var("VCT_TEST_BLOCKED_KEY".into()).unwrap();
         assert_eq!(r, "");
@@ -150,6 +153,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_password_suffix() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("VCT_TEST_DB_PASSWORD", "hunter2");
         let r = read_env_var("VCT_TEST_DB_PASSWORD".into()).unwrap();
         assert_eq!(r, "");
@@ -158,6 +162,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_secret_suffix() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("VCT_TEST_FOO_SECRET", "shh");
         let r = read_env_var("VCT_TEST_FOO_SECRET".into()).unwrap();
         assert_eq!(r, "");
@@ -166,6 +171,7 @@ mod tests {
 
     #[test]
     fn blocklist_is_case_insensitive() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         std::env::set_var("vct_test_lowercase_token", "shh");
         let r = read_env_var("vct_test_lowercase_token".into()).unwrap();
         assert_eq!(r, "");
@@ -174,6 +180,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_exact_named_secrets() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // GITHUB_TOKEN is in the EXACT list; it should be redacted even
         // though the suffix-only match would also catch it (defence-
         // in-depth). The exact-list path covers names that don't carry
@@ -186,6 +193,7 @@ mod tests {
 
     #[test]
     fn non_secret_names_pass_through() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Verify the blocklist doesn't over-block legitimate non-secret
         // names. The intended consumer (XDG_SESSION_TYPE) is the
         // canonical case — must NOT be blocked.
@@ -197,6 +205,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_segment_shapes_previously_missed() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // v0.2.54 regression (S-4 sibling): GH_PAT / DB_PASS /
         // AUTH_HEADER round-tripped cleartext under the old
         // suffix-only classifier while mcp_registration flagged them.
@@ -210,6 +219,7 @@ mod tests {
 
     #[test]
     fn blocklist_redacts_extra_segments_passwd_credential() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         for name in ["VCT_TEST_PASSWD_X", "VCT_TEST_CREDENTIAL_BLOB"] {
             std::env::set_var(name, "shh");
             let r = read_env_var(name.to_string()).unwrap();
@@ -239,6 +249,7 @@ mod tests {
 
     #[test]
     fn non_secret_names_substring_does_not_over_block() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Names that CONTAIN secret-shaped substrings but don't END
         // with the suffix should pass through. "KEY_FILE_PATH" is not
         // a key; "PASSWORD_RESET_URL" is not a password.

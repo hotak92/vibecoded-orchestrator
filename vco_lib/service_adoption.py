@@ -56,10 +56,20 @@ and every HTTP probe through ``fetch``; nothing in this module runs at
 import time, and the whole flow is unit-testable without a container
 runtime (tests/test_v0296_service_adoption.py).
 
-Also the ONE home for ``~/.vct/services.toml`` IO (moved from install.py in
-the same change — the adoption must reset rows it made obsolete, and a
-second hand-rolled writer would drift from install.py's; the Rust schema
-owner stays ``vct-launcher-core/src/services/adoption.rs``).
+v0.2.97 (service endpoints, plan §4c): the launcher.db ``service_endpoints``
+rows replace ``services.toml``. A successful adoption WRITES the adopted
+services' rows (``vco_managed``, the container, its compose project and its
+observed data mount) through ``vco_lib.service_endpoints`` — it no longer
+drops ``services.toml`` rows. ``services=`` limits the flow to named
+services: it is automatic for code_embed only
+(``service_lifecycle.migrate_code_embed``) and an explicit opt-in ("Let VCO
+manage this container") for Weaviate/Ollama. A service whose data-source knob
+(``compose_env.DATA_KNOBS``) is set in ``infrastructure/.env`` gets NO mount
+fragment in the generated override: the knob is the one home for its data
+identity, and the verification gates check the config it produces.
+
+The ``services.toml`` IO kept here serves only the v0.2.97 importer (and the
+install.py wrappers it replaces); nothing resolves an endpoint from it.
 """
 from __future__ import annotations
 
@@ -70,10 +80,9 @@ import re
 import subprocess
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 # PyYAML is NOT imported at module scope. This module's own comment used to
 # say it was "a hard dep of the orchestrator venv (not the install path)" —
@@ -97,7 +106,11 @@ __all__ = [
     "LiveServiceState",
     "MountSpec",
     "adopt_services",
+    "adopted_row",
+    "existing_managed_override",
     "gpu_overlay_for_form",
+    "knob_owned_services",
+    "live_http_host_port",
     "merge_compose",
     "owning_config_files",
     "read_services_toml",
@@ -118,6 +131,17 @@ CONTAINER_MOUNT_TARGETS: dict[str, str] = {
     "ollama": "/root/.ollama",
     "code_embed": "/cache",
 }
+
+#: The container port each service answers HTTP on (the compose stanzas'
+#: right-hand side). Weaviate also publishes gRPC 50051, so "the first
+#: published port" is NOT the health port — inspect lists ``50051/tcp``
+#: before ``8080/tcp``.
+HTTP_CONTAINER_PORTS: dict[str, str] = {
+    "weaviate": "8080",
+    "ollama": "11434",
+    "code_embed": "11440",
+}
+WEAVIATE_GRPC_CONTAINER_PORT = "50051"
 
 #: Canonical compose volume KEY per service (the base file's ``volumes:``
 #: key whose ``name:`` the installer pins — storage_ux.rs
@@ -278,24 +302,6 @@ def write_services_toml(state: dict, *, path: Optional[Path] = None) -> None:
     atomic_write_text(target, body)
 
 
-def drop_services_toml_rows(service_names: Sequence[str], *,
-                             path: Optional[Path] = None) -> int:
-    """Remove the adopted services' rows (constraint #12, decided: after
-    ownership transfer the services are VCO-managed — the launcher/hub
-    watchdog's no-op-adopt semantics are stale, and the fresh-install shape
-    for a VCO-managed service is NO row = ``Unresolved``).  Preserves every
-    other row.  Returns the number of rows dropped.  Soft: an unreadable
-    file drops nothing."""
-    names = set(service_names)
-    state = read_services_toml(path)
-    rows = state.get("services") or []
-    kept = [r for r in rows if str(r.get("name", "")) not in names]
-    dropped = len(rows) - len(kept)
-    if dropped and kept != rows:
-        write_services_toml({"services": kept}, path=path)
-    return dropped
-
-
 # ===========================================================================
 # Owning invocation helpers
 # ===========================================================================
@@ -395,7 +401,15 @@ def _inspect_json(ref: str, fmt: str, runtime: str, run: RunFn) -> Optional[Any]
         return None
 
 
-def _normalize_mount(entry: dict) -> Optional[MountSpec]:
+def mount_from_inspect(entry: Any) -> Optional[MountSpec]:
+    """ONE ``inspect .Mounts`` entry (podman or docker shape) →
+    :class:`MountSpec`; ``None`` for anything that is not a bind or a named
+    volume with a source and a destination. The one parser of that shape —
+    ``service_detection`` (the candidate detector) projects it to its
+    row-shaped ``Mount`` (the SELinux relabel option is not part of a data
+    source's identity: :meth:`MountSpec.key`)."""
+    if not isinstance(entry, dict):
+        return None
     kind = str(entry.get("Type", "") or "").lower()
     if kind not in ("bind", "volume"):
         return None
@@ -429,7 +443,7 @@ def live_service_state(ref: str, runtime: str, run: RunFn) -> Optional[LiveServi
         return None
 
     mounts = tuple(
-        m for m in (_normalize_mount(e) for e in raw_mounts if isinstance(e, dict))
+        m for m in (mount_from_inspect(e) for e in raw_mounts)
         if m is not None
     )
     env: dict[str, str] = {}
@@ -486,8 +500,14 @@ def _substitute_tree(node: Any, env: dict) -> Any:
 
 def load_compose_doc(path: Path, env: dict) -> Optional[dict]:
     """Parse one compose file with ``${VAR}`` / ``${VAR:-default}``
-    substitution.  ``None`` when unreadable/unparseable."""
-    import yaml  # local: see the module header — not available at bootstrap
+    substitution.  ``None`` when unreadable/unparseable — or when PyYAML is
+    not importable in this interpreter (v0.2.97: install.py reaches this on
+    the SYSTEM python, post-venv; the degradation is the caller's existing
+    "compose chain unusable" refusal, never a crash)."""
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError:
+        return None
 
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
@@ -705,10 +725,27 @@ def _fragment_volume_key(dest: str, service: str) -> str:
     return f"adopted_{service}_{stem or 'data'}"
 
 
+def knob_owned_services(env: dict) -> set[str]:
+    """Services whose data source a ``compose_env.DATA_KNOBS`` key sets in
+    the substitution *env* (``infrastructure/.env`` + process env). For
+    them the knob — projected from the service_endpoints row — is the ONE
+    home of the data identity, so adoption carries no mount fragment."""
+    return {
+        service for service, pair in _compose_env.DATA_KNOBS.items()
+        if any(str(env.get(key, "") or "").strip() for key in pair)
+    }
+
+
 def reconcile_service(service: str, live: LiveServiceState, cfg_service: dict,
-                      top_volumes: dict) -> tuple[dict, list[str]]:
+                      top_volumes: dict, *, knob_owned: bool = False,
+                      ) -> tuple[dict, list[str]]:
     """Plan the override fragments that make the installer's EFFECTIVE
     config match the live container on every compared axis.
+
+    ``knob_owned``: the service's data-source knob is set, so its mounts are
+    NOT carried as a fragment (plan §4c.6 — one concern, one home: a mount
+    stated in two files could disagree). The verification gates then judge
+    the knob's config as-is, and refuse if it differs from the live mounts.
 
     Returns ``(fragments, refusals)``.  ``refusals`` is ALWAYS EMPTY as of
     WP-4 review MINOR-2 — reconciliation here is total by construction
@@ -761,6 +798,9 @@ def reconcile_service(service: str, live: LiveServiceState, cfg_service: dict,
     if set(config_mounts_by_dest) - live_dests:
         mounts_differ = True
 
+    if knob_owned:
+        mounts_differ = False
+        aliases = {}
     if mounts_differ:
         fragments["mounts"] = sorted(final_entries)
 
@@ -864,12 +904,16 @@ def _mount_problems(final_service: dict, final_top_volumes: dict,
 
 
 def _verify_final_mounts(fragments: dict, cfg_service: dict, top_volumes: dict,
-                         live: LiveServiceState, service: str) -> list[str]:
+                         live: LiveServiceState, service: str, *,
+                         knob_owned: bool = False) -> list[str]:
     """The hard data-plane gate, fragments side: recompute the effective
     config WITH the planned fragments and require the mounts to match the
     live ones exactly.  This is one gate the plan's red-proof mutates —
     accepting a mismatch here must fail the refusal test, not pass
-    silently."""
+    silently.  A ``knob_owned`` service has no mount fragment: its config
+    is judged exactly as the knob renders it."""
+    if knob_owned:
+        return _mount_problems(cfg_service, top_volumes, live, service)
     simulated = dict(cfg_service)
     volume_entries = []
     for m in live.mounts:
@@ -889,13 +933,63 @@ def _verify_final_mounts(fragments: dict, cfg_service: dict, top_volumes: dict,
 # Override rendering (storage_ux.rs shapes)
 # ===========================================================================
 
-def render_adoption_override(plans: Sequence[ServicePlan]) -> str:
+def existing_managed_override(infra_dir: Path) -> Optional[dict]:
+    """The parsed managed override already in *infra_dir* (the first of the
+    two auto-load names that exists and carries the managed marker), or
+    ``None``. A user-authored file is never read as ours."""
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError:
+        return None  # same degradation as "no managed override readable"
+
+    for name in _OVERRIDE_FILES:
+        target = infra_dir / name
+        if not target.is_file():
+            continue
+        try:
+            text = target.read_text(encoding="utf-8")
+        except OSError:
+            return None
+        if _OVERRIDE_MANAGED_MARKER not in text:
+            return None
+        try:
+            doc = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
+        return doc if isinstance(doc, dict) else None
+    return None
+
+
+def render_adoption_override(plans: Sequence[ServicePlan], *,
+                             preserve: Optional[dict] = None,
+                             replacing: Sequence[str] = ()) -> str:
     """Render ``infrastructure/compose.override.yaml`` for the adoptable
     plans — bind/external-alias/healthcheck/env stanzas per service in the
-    storage_ux.rs generator shapes, plus the network-preservation block."""
-    services_block = {}
+    storage_ux.rs generator shapes, plus the network-preservation block.
+
+    ``preserve`` (the existing managed override) keeps the stanzas of every
+    service NOT in ``replacing`` — a ``services=``-limited run (the
+    code_embed migration) must not erase what an earlier adoption carried
+    for the others. A replaced service's stanza and its canonical volume
+    alias come only from this run's plan."""
+    services_block: dict[str, Any] = {}
     networks_block: dict[str, Any] = {}
     volumes_block: dict[str, Any] = {}
+    if isinstance(preserve, dict):
+        replaced = set(replacing)
+        replaced_keys = {CANONICAL_VOLUME_KEYS[s] for s in replaced if s in CANONICAL_VOLUME_KEYS}
+        kept_services: dict[str, Any] = preserve.get("services") or {}
+        kept_networks: dict[str, Any] = preserve.get("networks") or {}
+        kept_volumes: dict[str, Any] = preserve.get("volumes") or {}
+        for kept_name, stanza in kept_services.items():
+            if kept_name not in replaced and isinstance(stanza, dict) and stanza:
+                services_block[str(kept_name)] = stanza
+        for net, spec in kept_networks.items():
+            networks_block[str(net)] = spec
+        for key, spec in kept_volumes.items():
+            if key not in replaced_keys and not str(key).startswith(
+                    tuple(f"adopted_{s}_" for s in replaced)):
+                volumes_block[key] = spec
     for plan in plans:
         if not plan.adoptable or plan.live is None:
             continue
@@ -927,7 +1021,17 @@ def render_adoption_override(plans: Sequence[ServicePlan]) -> str:
     body = {"services": services_block or {}}
     body["networks"] = networks_block or {}
     body["volumes"] = volumes_block or {}
-    import yaml  # local: see the module header — not available at bootstrap
+    try:
+        import yaml  # local: see the module header — not available at bootstrap
+    except ImportError as exc:
+        # Loud, never silent: the override cannot be rendered without PyYAML.
+        # The install path never gets here (load_compose_doc's guard already
+        # refused the chain); a direct caller learns the reason, not a
+        # ModuleNotFoundError from an unrelated frame.
+        raise RuntimeError(
+            "PyYAML is not importable in this interpreter — the adoption "
+            "override cannot be rendered (re-run install.py)"
+        ) from exc
 
     text = yaml.safe_dump(body, default_flow_style=False, sort_keys=True)
     return _OVERRIDE_HEADER + "\n" + text
@@ -965,11 +1069,28 @@ HEALTH_PATHS: dict[str, str] = {
 
 
 def _default_fetch(url: str, timeout: float) -> Optional[int]:
+    from vco_lib.service_probe_http import open_probe  # noqa: PLC0415
+
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp:
+        with open_probe(url, timeout) as resp:  # a redirect is an error, never followed
             return int(resp.status)
     except Exception:  # noqa: BLE001 — every failure is "not answering (yet)"
         return None
+
+
+def live_http_host_port(service: str, live: Optional[LiveServiceState]) -> str:
+    """The host port *live* publishes for *service*'s HTTP container port,
+    else its first published port that is not Weaviate's gRPC one, else
+    ``""``."""
+    if live is None:
+        return ""
+    wanted = live.host_ports.get(HTTP_CONTAINER_PORTS.get(service, ""))
+    if wanted:
+        return str(wanted)
+    for cont, host in live.host_ports.items():
+        if not (service == "weaviate" and cont == WEAVIATE_GRPC_CONTAINER_PORT):
+            return str(host)
+    return ""
 
 
 def host_port_for(service: str, plans: Sequence[ServicePlan],
@@ -979,8 +1100,9 @@ def host_port_for(service: str, plans: Sequence[ServicePlan],
     default."""
     for plan in plans:
         if plan.service == service and plan.live is not None:
-            for cont, host in plan.live.host_ports.items():
-                return str(host)
+            port = live_http_host_port(service, plan.live)
+            if port:
+                return port
     defaults = defaults or {"weaviate": 8081, "ollama": 11435, "code_embed": 11440}
     return str(defaults.get(service, 0))
 
@@ -1141,15 +1263,24 @@ def _declares_devices(service_cfg: dict) -> bool:
 
 
 def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
-              resolution: Optional[Any] = None) -> tuple[list[ServicePlan], list[Path]]:
-    """Read-only phase: per-service verdicts.  Nothing is stopped here."""
+              resolution: Optional[Any] = None,
+              services: Sequence[str] = ADOPTION_ORDER,
+              container_refs: Optional[Mapping[str, str]] = None,
+              ) -> tuple[list[ServicePlan], list[Path]]:
+    """Read-only phase: per-service verdicts for *services* (in
+    :data:`ADOPTION_ORDER`; a service not named is not planned, so it can
+    never be touched).  Nothing is stopped here.
+
+    ``container_refs``: service → the EXACT container to plan (``hand-to-vco``
+    passes the adopted row's ``container_name``). A named container is never
+    substituted by a canonically-named one — a stale ``vco_weaviate`` from an
+    earlier install must not be taken over in place of the container the row
+    says VCO uses — and a named container that does not exist refuses."""
+    unknown = [s for s in services if s not in ADOPTION_ORDER]
+    if unknown:
+        raise ValueError(f"not adoptable services: {unknown} (known: {ADOPTION_ORDER})")
     infra_dir = root / "infrastructure"
-    compose_file = infra_dir / "docker-compose.yml"
-    try:
-        compose_text = compose_file.read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own_project = _containers.compose_project_name(infra_dir, compose_text)
+    own_project = _containers.own_compose_project(root)
 
     compose_argv: list[str] = [runtime, "compose"]
     compose_form: Optional[str] = None
@@ -1159,14 +1290,25 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
         compose_form = getattr(resolution, "compose_form", None)
 
     env = infrastructure_env_for_substitution(infra_dir)
+    knob_owned = knob_owned_services(env)
     plans: list[ServicePlan] = []
-    for service in ADOPTION_ORDER:
+    for service in (s for s in ADOPTION_ORDER if s in services):
         plan = ServicePlan(service=service)
         plans.append(plan)
-        try:
-            ref = _containers.find_existing_container(service, runtime)
-        except Exception:  # noqa: BLE001 — probe failure → nothing to adopt
-            ref = None
+        if container_refs is not None and service in container_refs:
+            ref = container_refs[service] or None
+            if not ref:
+                plan.reason = "no container named — nothing to adopt"
+                continue
+            container_id = _inspect_json(ref, "{{json .Id}}", runtime, run)
+            if not (isinstance(container_id, str) and container_id):
+                plan.reason = f"container '{ref}' does not exist (or could not be inspected)"
+                continue
+        else:
+            try:
+                ref = _containers.find_existing_container(service, runtime)
+            except Exception:  # noqa: BLE001 — probe failure → nothing to adopt
+                ref = None
         if not ref:
             plan.reason = "no existing container — nothing to adopt"
             continue
@@ -1251,11 +1393,14 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
         if plan.live is None:
             continue
         cfg_service = services_cfg.get(plan.service) or {}
+        owned_by_knob = plan.service in knob_owned
         fragments, refusals = reconcile_service(
             plan.service, plan.live, cfg_service, top_volumes,
+            knob_owned=owned_by_knob,
         )
         mount_problems = _verify_final_mounts(fragments, cfg_service, top_volumes,
-                                              plan.live, plan.service)
+                                              plan.live, plan.service,
+                                              knob_owned=owned_by_knob)
         refusals.extend(mount_problems)
         if refusals:
             plan.reason = "; ".join(sorted(set(refusals)))
@@ -1267,14 +1412,20 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
 
 def _up_under_installer(compose_argv: list[str], files: Sequence[Path],
                         project: str, service: str, runtime: str, run: RunFn,
-                        result: AdoptionResult, timeout: int = 900) -> tuple[bool, str]:
-    """``compose up -d --no-deps <service>`` under the installer's project,
-    with the generated override in the -f chain.  Handles the mixed-provider
-    stale-network-label refusal (empty network → rm → ONE retry)."""
+                        result: AdoptionResult, timeout: int = 900,
+                        build: bool = False) -> tuple[bool, str]:
+    """``compose up -d [--build] --no-deps <service>`` under the installer's
+    project, with the generated override in the -f chain.  Handles the
+    mixed-provider stale-network-label refusal (empty network → rm → ONE
+    retry).  ``build``: rebuild the image (code_embed, whose image is built
+    from the checkout — a stale one is one reason to migrate it)."""
     argv = list(compose_argv)
     for path in files:
         argv.extend(["-f", str(path)])
-    argv.extend(["-p", project, "--profile", "gpu", "up", "-d", "--no-deps", service])
+    argv.extend(["-p", project, "--profile", "gpu", "up", "-d"])
+    if build:
+        argv.append("--build")
+    argv.extend(["--no-deps", service])
     try:
         res = _run_logged(argv, run, result, capture_output=True, text=True,
                           timeout=timeout)
@@ -1319,10 +1470,15 @@ def _rollback_under_owner(plan: ServicePlan, compose_argv: Sequence[str],
     return ""
 
 
+ExtraVerifyFn = Callable[[str, str], str]
+
+
 def _post_verify(plan: ServicePlan, own_project: str, runtime: str, run: RunFn,
-                 fetch: FetchFn) -> str:
+                 fetch: FetchFn, extra_verify: Optional[ExtraVerifyFn] = None) -> str:
     """Constraint #10: containers now labeled OUR project; mounts identical
-    to the pre-adoption live mounts; the health endpoint answering."""
+    to the pre-adoption live mounts; the health endpoint answering; and
+    ``extra_verify(service, host_port)`` (a caller's stricter check — the
+    code_embed migration's "model loaded") returning no problem."""
     ref = plan.container
     try:
         identity = _containers.compose_identity_of(ref, runtime, run=run)
@@ -1337,11 +1493,7 @@ def _post_verify(plan: ServicePlan, own_project: str, runtime: str, run: RunFn,
     after = {m.destination: m.key() for m in live.mounts}
     if before != after:
         return f"mounts changed across the adoption: {before} → {after}"
-    host_port = ""
-    if plan.live is not None:
-        for cont, host in plan.live.host_ports.items():
-            host_port = str(host)
-            break
+    host_port = live_http_host_port(plan.service, plan.live)
     if host_port and not wait_healthy(plan.service, host_port, fetch,
                                       timeout_s=90.0, interval_s=2.0):
         # WP-4 review MINOR-1: the verification gate's job is to REFUSE a
@@ -1355,9 +1507,78 @@ def _post_verify(plan: ServicePlan, own_project: str, runtime: str, run: RunFn,
     return ""
 
 
+CommitRowsFn = Callable[[Sequence[Any]], Any]
+
+
+def adopted_row(service: str, plan: ServicePlan, own_project: str, *,
+                prior: Optional[Any], source: str, now_ms: int) -> Any:
+    """The ``service_endpoints`` row an adoption leaves: ``vco_managed``,
+    the container it now owns, the installer's compose project, the live
+    data mount, and the ports the container keeps. A prior row keeps its
+    scheme/enabled/autostart/confirmation."""
+    from vco_lib import service_endpoints as _se  # noqa: PLC0415
+
+    live = plan.live
+    port_text = live_http_host_port(service, live)
+    port = int(port_text) if port_text.isdigit() else (
+        prior.port if prior is not None else _se.DEFAULT_PORTS[service])
+    grpc: Optional[int] = None
+    if service == "weaviate":
+        grpc_text = (live.host_ports.get(WEAVIATE_GRPC_CONTAINER_PORT) if live else None) or ""
+        grpc = int(grpc_text) if grpc_text.isdigit() else _se.render_grpc_port(prior)
+    mount = None
+    for m in (live.mounts if live is not None else ()):
+        if m.destination == CONTAINER_MOUNT_TARGETS.get(service):
+            mount = {"kind": m.kind, "source": m.source, "destination": m.destination}
+    return _se.EndpointRow(
+        service=service, mode="vco_managed", port=port, grpc_port=grpc,
+        scheme=prior.scheme if prior is not None else _se.DEFAULT_SCHEME,
+        host=prior.host if prior is not None and prior.host in ("localhost", "127.0.0.1")
+        else _se.DEFAULT_HOST,
+        container_name=plan.container, compose_project=own_project, data_mount=mount,
+        enabled=prior.enabled if prior is not None else True,
+        autostart=prior.autostart if prior is not None else True,
+        confirmed_by_user=prior.confirmed_by_user if prior is not None else False,
+        source=source, verified_at=now_ms,
+    )
+
+
+def _record_adopted_rows(root: Path, plans: Sequence[ServicePlan], adopted: Sequence[str],
+                         own_project: str, *, commit_rows: Optional[CommitRowsFn],
+                         db_path: Optional[Path], source: str, log: LogFn) -> None:
+    """Write the adopted services' rows (the one writer,
+    ``vco_lib.service_endpoints``), which runs the follow-up chain. A
+    registry that is not there is a WARNING, never a failed adoption: the
+    containers are already moved and verified, and the next install run
+    re-derives the rows from them."""
+    from vco_lib import service_endpoints as _se  # noqa: PLC0415
+
+    try:
+        prior = _se.load_rows(db_path)
+    except Exception:  # noqa: BLE001 — unreadable ⇒ no prior row
+        prior = {}
+    now_ms = int(time.time() * 1000)
+    rows = [adopted_row(p.service, p, own_project, prior=prior.get(p.service),
+                        source=source, now_ms=now_ms)
+            for p in plans if p.service in adopted]
+    if not rows:
+        return
+    try:
+        if commit_rows is not None:
+            commit_rows(rows)
+        else:
+            _se.commit_rows(rows, orchestrator_root=root, db_path=db_path, out=log)
+        log(f"  [adopt] recorded {', '.join(r.service for r in rows)} as VCO-managed "
+            "in launcher.db (service_endpoints).")
+    except (_se.ServiceRegistryUnavailable, _se.InvalidEndpointRow, OSError) as exc:
+        log(f"  [adopt] WARNING: the service_endpoints rows could not be written ({exc}); "
+            "the next `python install.py --update` records them from the running containers.")
+
+
 def adopt_services(
     root: Path,
     *,
+    services: Sequence[str] = ADOPTION_ORDER,
     runtime: str = "podman",
     run: Optional[RunFn] = None,
     fetch: Optional[FetchFn] = None,
@@ -1365,19 +1586,38 @@ def adopt_services(
     log: Optional[LogFn] = None,
     dry_run: bool = False,
     adopt_outcome_cb=None,
+    build_services: Sequence[str] = (),
+    extra_verify: Optional[ExtraVerifyFn] = None,
+    commit_rows: Optional[CommitRowsFn] = None,
+    db_path: Optional[Path] = None,
+    row_source: str = "user_cli",
+    container_refs: Optional[Mapping[str, str]] = None,
 ) -> AdoptionResult:
     """The whole guarded adoption.  See the module docstring for the flow
     and the constraint map.  ``run``/``fetch``/``resolution`` are injection
     seams (tests drive the entire flow without a container runtime);
     ``adopt_outcome_cb(plans, override_body)`` lets a caller observe the
-    plan before execution (the CLI's --dry-run prints from it)."""
+    plan before execution (the CLI's --dry-run prints from it).
+
+    ``services``: which services to adopt (default: all three, the explicit
+    opt-in). Services not named are never planned, stopped or re-created,
+    and their stanzas in an existing managed override are preserved.
+    ``build_services``: rebuild these images at the up (code_embed).
+    ``extra_verify(service, host_port)``: a stricter post-check whose
+    problem triggers the same rollback. On success the adopted services'
+    ``service_endpoints`` rows are written through ``commit_rows`` (default
+    ``service_endpoints.commit_rows`` on ``db_path``) with ``row_source``.
+    ``container_refs``: service → the exact container to adopt (see
+    :func:`_plan_all`); without it the canonical/historical names are
+    searched (the v0.2.96 bulk adoption)."""
     run = run or subprocess.run  # type: ignore[assignment]
     fetch = fetch or _default_fetch
     log = log or (lambda msg: print(msg))
     root = Path(root)
     result = AdoptionResult()
 
-    plans, files = _plan_all(root, runtime, run, log, resolution=resolution)
+    plans, files = _plan_all(root, runtime, run, log, resolution=resolution,
+                             services=services, container_refs=container_refs)
     if not files:
         result.refused = {p.service: p.reason or "unknown" for p in plans
                           if p.reason}
@@ -1397,35 +1637,45 @@ def adopt_services(
     _collateral_warning(plans, runtime, run, log)
 
     infra_dir = root / "infrastructure"
-    override_body = render_adoption_override(plans)
+    override_body = render_adoption_override(
+        plans, preserve=existing_managed_override(infra_dir),
+        replacing=[p.service for p in plans],
+    )
     if adopt_outcome_cb is not None:
         adopt_outcome_cb(plans, override_body)
 
     # The docstring's verification promise, RENDERED side: recompute the
-    # effective config exactly as the up's -f chain will see it (base +
-    # existing overrides + the GENERATED override text) and re-run the hard
-    # data-plane gate against THAT — not just against the plan fragments.
-    # A renderer bug (or an alias that cannot survive rendering) refuses
-    # the service here, before anything is written or stopped, instead of
-    # silently replacing a live mount at the up.
+    # effective config exactly as the up's -f chain will see it (base + the
+    # GENERATED override text, which REPLACES the managed override files)
+    # and re-run the hard data-plane gate against THAT — not just against
+    # the plan fragments. A renderer bug (or an alias that cannot survive
+    # rendering) refuses the service here, before anything is written or
+    # stopped, instead of silently replacing a live mount at the up.
     env = infrastructure_env_for_substitution(infra_dir)
     cfg = None
+    managed_names = set(_OVERRIDE_FILES)
     for path in files:
+        if path.name in managed_names and path.parent == infra_dir:
+            continue  # replaced by override_body below
         doc = load_compose_doc(path, env)
         if doc is None:
             continue
         cfg = doc if cfg is None else merge_compose(cfg, doc)
-    # ABOVE the try, not inside it: the `except` clause names `yaml`, so an
-    # import that failed in the try would leave the handler referencing an
-    # unbound name and raise NameError instead of the error it exists to
-    # catch. (pyright: reportPossiblyUnbound — the same shape this cycle
-    # already fixed twice in install.py.)
-    import yaml  # local: see the module header
-
+    # v0.2.97: PyYAML is a venv-time package (module header) — an
+    # interpreter without it (install.py on the SYSTEM python, post-venv)
+    # degrades to "override unreadable" (rendered=None), never a crash.
+    # The try/except-ImportError sits AROUND the import only: the YAMLError
+    # handler below must not reference a name the failed import left
+    # unbound (pyright reportPossiblyUnbound).
     try:
-        rendered = yaml.safe_load(override_body)
-    except yaml.YAMLError:
+        import yaml  # local: see the module header
+    except ImportError:
         rendered = None
+    else:
+        try:
+            rendered = yaml.safe_load(override_body)
+        except yaml.YAMLError:
+            rendered = None
     cfg = merge_compose(cfg or {}, rendered if isinstance(rendered, dict) else {})
     rendered_top = cfg.get("volumes") or {}
     for plan in list(adoptable):
@@ -1475,11 +1725,7 @@ def adopt_services(
     except Exception as exc:  # noqa: BLE001 — never block adoption on env write
         log(f"  [adopt] WARNING: infrastructure/.env refresh failed: {exc}")
 
-    try:
-        compose_text = (infra_dir / "docker-compose.yml").read_text(encoding="utf-8")
-    except OSError:
-        compose_text = ""
-    own_project = _containers.compose_project_name(infra_dir, compose_text)
+    own_project = _containers.own_compose_project(root)
     compose_argv = [runtime, "compose"]
     if resolution is not None and getattr(resolution, "compose", None):
         compose_argv = [str(p) for p in resolution.compose]
@@ -1507,7 +1753,8 @@ def adopt_services(
                 f"owning project; later services untouched.")
             break
         ok, err = _up_under_installer(compose_argv, files, own_project, service,
-                                      runtime, run, result)
+                                      runtime, run, result,
+                                      build=service in build_services)
         if not ok:
             rollback_msg = _rollback_under_owner(plan, compose_argv, runtime, run, result)
             detail = err + (f"; {rollback_msg}" if rollback_msg else "")
@@ -1515,8 +1762,16 @@ def adopt_services(
             log(f"  [adopt:{service}] FAILED ({detail}) — rolled back under the "
                 f"owning project; later services untouched.")
             break
-        problem = _post_verify(plan, own_project, runtime, run, fetch)
+        problem = _post_verify(plan, own_project, runtime, run, fetch, extra_verify)
         if problem:
+            # The installer's container now holds the pinned name: remove
+            # IT (the container only — its mount lives outside it) so the
+            # owning invocation can re-create the original.
+            for step in ([runtime, "stop", ref], [runtime, "rm", ref]):
+                try:
+                    _run_logged(step, run, result, capture_output=True, text=True, timeout=120)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
             rollback_msg = _rollback_under_owner(plan, compose_argv, runtime, run, result)
             detail = problem + (f"; {rollback_msg}" if rollback_msg else "")
             result.failed[service] = detail
@@ -1527,16 +1782,12 @@ def adopt_services(
         log(f"  [adopt:{service}] adopted.")
 
     if result.adopted:
-        # Constraint #12 (decided): drop the adopted rows so the launcher /
-        # hub watchdog re-probes them as VCO-managed (Unresolved), instead of
-        # keeping lifecycle no-ops for services we now own.
-        try:
-            dropped = drop_services_toml_rows(result.adopted)
-            if dropped:
-                log(f"  [adopt] dropped {dropped} services.toml adoption row(s) "
-                    f"— services are VCO-managed again.")
-        except Exception as exc:  # noqa: BLE001 — state file must not fail adoption
-            log(f"  [adopt] WARNING: could not update services.toml: {exc}")
+        # v0.2.97: the adopted services are VCO-managed now — say so in the
+        # one store every lifecycle surface reads (superseding the v0.2.96
+        # services.toml row drop, constraint #12).
+        _record_adopted_rows(root, plans, result.adopted, own_project,
+                             commit_rows=commit_rows, db_path=db_path,
+                             source=row_source, log=log)
         result.lines.append(
             "  [adopt] done. The next `python install.py --update` now reaches "
             "these services (and rebuilds code_embed under the installer's "
@@ -1579,6 +1830,9 @@ def _main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — CLI
                         help="container runtime (default: podman)")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the plan + override, touch nothing")
+    parser.add_argument("--service", action="append", choices=list(ADOPTION_ORDER),
+                        default=None,
+                        help="adopt only this service (repeatable; default: all three)")
     args = parser.parse_args(argv)
 
     root = Path(args.root) if args.root else Path(__file__).resolve().parent.parent
@@ -1589,7 +1843,8 @@ def _main(argv: Optional[list[str]] = None) -> int:  # pragma: no cover — CLI
         resolution = _c.resolve()
     except Exception:  # noqa: BLE001 — probe never fails the command
         resolution = None
-    result = adopt_services(root, runtime=args.runtime, resolution=resolution,
+    result = adopt_services(root, services=tuple(args.service or ADOPTION_ORDER),
+                            runtime=args.runtime, resolution=resolution,
                             dry_run=args.dry_run)
     for line in result.lines:
         print(line)

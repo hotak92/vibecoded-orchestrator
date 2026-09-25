@@ -4,7 +4,7 @@ description: Generates HPC job-submission scripts (SLURM, PBS/Torque, SGE/UGE, L
 short_desc: "HPC job script: SLURM/PBS/SGE/LSF generators"
 keywords: [SLURM, sbatch, PBS, Torque, LSF, SGE, srun, qsub]
 model: opus
-effort: high
+effort: medium
 allowed-tools: Read, Write, Bash, Glob
 ---
 

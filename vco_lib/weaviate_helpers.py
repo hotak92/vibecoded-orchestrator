@@ -390,7 +390,9 @@ def weaviate_url_default() -> str:
     the layers above are silent. Those layers are, and must stay, above it:
 
     * The Weaviate **instance** is machine-global, not per-project. The hub
-      serves ``LocalConfig::load().weaviate_url``. ``launcher.db`` does carry
+      serves, and the env projection writes, ONE machine resolution
+      (:mod:`vco_lib.service_endpoints`, mirrored in Rust — v0.2.97).
+      ``launcher.db`` does carry
       a per-row ``project_kg_bindings.weaviate_url`` ("override; NULL = use
       launcher default"), but **no resolver reads it** — it is only ever
       PRESERVED across rewrites. That is stated in
@@ -400,11 +402,19 @@ def weaviate_url_default() -> str:
       ``vco_lib/config_projection.py`` projects the DB-resolved port into
       ``.claude/settings.json`` and ``.claude/env`` as ``WEAVIATE_URL`` AND
       ``WEAVIATE_PORT`` together, and ``install.py``'s two env writers emit
-      the same pair from one port. So these variables are the *transport* of
+      the same pair from one port. The resolver that produces them never
+      reads them back. So these variables are the *transport* of
       the DB value, which is why reading them here cannot invert it.
-    * Every peer resolver already ranks env above config-file:
-      ``vct-launcher-core/src/config.rs`` resolves default → ``vct-config.toml``
-      → ``VCT_WEAVIATE_URL`` → ``WEAVIATE_URL``.
+    * The MACHINE resolvers read no env at all (v0.2.97): Python
+      :mod:`vco_lib.service_endpoints` and its Rust mirror
+      ``vct-launcher-core/src/services/service_endpoints.rs`` resolve the
+      launcher.db ``service_endpoints`` row → compiled default.
+      ``vct-launcher-core/src/config.rs`` carries no endpoint any more and
+      reads neither ``vct-config.toml``'s ``weaviate_url`` nor
+      ``VCT_WEAVIATE_URL``; it only WARNS at startup when the retired
+      ``VCT_WEAVIATE_URL`` is still exported. ``WEAVIATE_URL`` /
+      ``WEAVIATE_PORT`` are therefore purely the client-side transport of
+      the row, which is the only thing this function reads.
 
     Do NOT make this function reach into ``launcher.db`` or the hub. It is
     ``vco_lib``'s stdlib-only leaf and is called from hooks and shipped

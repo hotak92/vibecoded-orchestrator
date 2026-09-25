@@ -6663,8 +6663,7 @@ def main():
             # the analyzer's `_sanitize_collection_prefix` re-canonicalised
             # it and produced a prefix that diverged from the binding row,
             # silently writing to zombie collections. Always prefer the
-            # explicit prefix field here. See knowledge/concepts/
-            # multi-codebase-code-graph-detection.md for the diagnosis.
+            # explicit prefix field here.
             project_name = cfg.code_graph_collection_prefix
             if not project_name:
                 # Resolver returned an empty prefix; fall back.
@@ -7102,8 +7101,8 @@ def main():
                 "This is upstream shard state, not a VCO logic bug. To clear it, "
                 "rebuild the affected collection from scratch via the launcher's "
                 "Reanalyze (drop-and-rebuild) consent flow, e.g.:\n"
-                "   python -m vco_lib.project_init drop-collection "
-                "--name <project> --suffix CodeFunction   # then re-run analysis\n"
+                "   curl -X DELETE \"${WEAVIATE_URL:-http://localhost:8081}"
+                "/v1/schema/<Prefix>_CodeFunction\"   # then re-run analysis\n"
                 "   .claude/scripts/code-graph-analyze . --project <name> --prune-stale\n"
                 "The code graph is derived data, so a rebuild is cheap and "
                 "definitive — but it is NEVER done automatically.",

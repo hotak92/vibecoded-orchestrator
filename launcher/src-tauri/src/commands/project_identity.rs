@@ -22,11 +22,8 @@ use std::path::{Path, PathBuf};
 use tauri::{command, State};
 
 use crate::commands::installer::find_local_repo_root;
-use crate::commands::project_env_settings::{self, ProjectEnvSettings};
-use crate::commands::projects_v2::{
-    refresh_project_env_with_db, sanitize_kg_collection, write_project_env_files,
-};
-use crate::config::LocalConfig;
+use crate::commands::project_env_settings;
+use crate::commands::projects_v2::{refresh_project_env_with_db, sanitize_kg_collection};
 use crate::db::Db;
 use crate::project_naming::canonical_class_prefix;
 
@@ -257,10 +254,10 @@ pub fn update_project_identity_with_db(
             .and_then(|b| b.embedding_model.clone())
             .unwrap_or_else(|| "qwen3-embedding:0.6b".to_string());
         let embedding_dim = existing.as_ref().and_then(|b| b.embedding_dim).unwrap_or(1024);
-        let weaviate_url = existing
-            .as_ref()
-            .and_then(|b| b.weaviate_url.clone())
-            .unwrap_or_else(|| "http://localhost:8081".to_string());
+        // v0.2.97: carry an existing value through the rename, never invent
+        // one — a binding's Weaviate URL is not read (the machine row is), and
+        // the literal this wrote could only drift from it.
+        let weaviate_url = existing.as_ref().and_then(|b| b.weaviate_url.clone());
 
         if let Err(e) = db.set_project_kg_binding(
             project_id,
@@ -269,7 +266,7 @@ pub fn update_project_identity_with_db(
             Some(&embedding_model),
             Some(embedding_dim),
             existing.as_ref().and_then(|b| b.kg_dir_path.as_deref()),
-            Some(&weaviate_url),
+            weaviate_url.as_deref(),
             &existing
                 .as_ref()
                 .map(|b| b.config.clone())
@@ -400,7 +397,8 @@ pub async fn redetect_project_identity(
     let is_root = is_orchestrator_root_row(&row.slug, &host_str);
 
     let mut warnings: Vec<String> = Vec::new();
-    let disk_env = read_on_disk_env(&folder, is_root, &mut warnings);
+    let orchestrator_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+    let disk_env = read_on_disk_env(orchestrator_root.as_deref(), &folder, is_root, &mut warnings);
 
     // Read identity-relevant keys.
     let new_kg = disk_env.get("KG_COLLECTION").cloned();
@@ -564,15 +562,11 @@ pub struct OrphanCollectionGroup {
 #[command]
 pub async fn list_legacy_codegraph_collections(
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
     include_untracked_projects: Option<bool>,
 ) -> Result<LegacyCodegraphReport, String> {
     let include_untracked = include_untracked_projects.unwrap_or(false);
-    let base = resolve_weaviate_url(&cfg);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
+    let base = resolve_weaviate_url(&db);
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => return Err(format!("http client: {}", e)),
     };
@@ -955,13 +949,9 @@ pub struct CleanupFailure {
 pub async fn cleanup_legacy_codegraph_collections(
     req: CleanupLegacyReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CleanupLegacyReport, String> {
-    let base = resolve_weaviate_url(&cfg);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let base = resolve_weaviate_url(&db);
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10))?;
 
     let mut deleted: Vec<String> = Vec::new();
     let mut failed: Vec<CleanupFailure> = Vec::new();
@@ -1093,13 +1083,9 @@ pub struct CleanupOrphanReq {
 pub async fn cleanup_orphan_codegraph_collections(
     req: CleanupOrphanReq,
     db: State<'_, Db>,
-    cfg: State<'_, LocalConfig>,
 ) -> Result<CleanupLegacyReport, String> {
-    let base = resolve_weaviate_url(&cfg);
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let base = resolve_weaviate_url(&db);
+    let client = vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10))?;
 
     let mut deleted: Vec<String> = Vec::new();
     let mut failed: Vec<CleanupFailure> = Vec::new();
@@ -1497,13 +1483,10 @@ fn extract_orchestrator_shaped_classes(schema: &serde_json::Value) -> Vec<String
 /// hides its picker button on empty.
 #[command]
 pub async fn list_orchestrator_kg_collections(
-    cfg: State<'_, LocalConfig>,
+    db: State<'_, Db>,
 ) -> Result<Vec<String>, String> {
-    let base = resolve_weaviate_url(&cfg);
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-    {
+    let base = resolve_weaviate_url(&db);
+    let client = match vct_launcher_core::services::loopback_http::client_for(&base, std::time::Duration::from_secs(10)) {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!("[vct] list_orchestrator_kg_collections http client: {}", e);
@@ -1638,18 +1621,11 @@ pub async fn set_shared_kg_collection_name(
     .await?
 }
 
-fn resolve_weaviate_url(cfg: &LocalConfig) -> String {
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    if let Ok(v) = std::env::var("WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    cfg.weaviate_url.clone()
+/// The machine row (`service_endpoints::machine_weaviate_url`, v0.2.97) —
+/// this was a private copy that never saw an adopted external Weaviate. No
+/// endpoint env var is read (the launcher is machine-scoped).
+fn resolve_weaviate_url(db: &Db) -> String {
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
 async fn fetch_class_count(
@@ -1699,72 +1675,54 @@ fn is_valid_collection_name(name: &str) -> bool {
 /// then `.claude/settings.json::env` (vscode wins on duplicates). For the
 /// orchestrator root only `.claude/settings.json::env` is consulted.
 ///
-/// Soft-fail throughout: read / parse errors push a warning and return an
-/// empty (partial) map.
+/// The files are read by the ONE JSONC reader through the Python bridge
+/// (`vco_lib_bridge::read_settings_env_blocks`, v0.2.97): both are JSONC in
+/// the field — VS Code's own format, and a settings.json Claude Code accepts
+/// with comments — and the strict serde parse this used to do turned such a
+/// file into a "parse" warning and no values at all.
+///
+/// Soft-fail throughout: a file that cannot be read pushes a `parse <path>:`
+/// warning, a bridge failure pushes one warning, and the (partial) map is
+/// returned. A missing file is silent (the common case for a fresh project).
 fn read_on_disk_env(
+    root: Option<&Path>,
     folder: &Path,
     is_root: bool,
     warnings: &mut Vec<String>,
 ) -> std::collections::HashMap<String, String> {
+    use crate::services::vco_lib_bridge::{env_block_of, read_settings_env_blocks};
+
     let mut out = std::collections::HashMap::new();
-
-    // .claude/settings.json::env — both surfaces consult this.
-    let claude_path = folder.join(".claude").join("settings.json");
-    if let Some(env_obj) = read_json_object_at(&claude_path, "env", warnings) {
-        for (k, v) in env_obj {
-            if let Some(s) = v.as_str() {
-                out.insert(k, s.to_string());
-            }
+    let blocks = match read_settings_env_blocks(root, &[folder]) {
+        Ok(b) => b,
+        Err(e) => {
+            warnings.push(format!("read env settings of {}: {}", folder.display(), e));
+            return out;
         }
-    }
-
-    // .vscode/settings.json::claude-code.env — user projects only.
-    if !is_root {
-        let vscode_path = folder.join(".vscode").join("settings.json");
-        if let Some(env_obj) = read_json_object_at(&vscode_path, "claude-code.env", warnings) {
-            for (k, v) in env_obj {
-                if let Some(s) = v.as_str() {
-                    // vscode wins on duplicates — overwrite.
-                    out.insert(k, s.to_string());
+    };
+    // `.claude/settings.json::env` first; `.vscode` (user projects only) wins.
+    let surfaces: &[(&str, &str)] = if is_root {
+        &[("claude_settings_json", ".claude/settings.json")]
+    } else {
+        &[
+            ("claude_settings_json", ".claude/settings.json"),
+            ("vscode_settings_json", ".vscode/settings.json"),
+        ]
+    };
+    for (surface, rel) in surfaces {
+        match env_block_of(&blocks, folder, surface) {
+            Ok(Some(env_obj)) => {
+                for (k, v) in env_obj {
+                    if let Some(s) = v.as_str() {
+                        out.insert(k, s.to_string());
+                    }
                 }
             }
+            Ok(None) => {}
+            Err(e) => warnings.push(format!("parse {}: {}", folder.join(rel).display(), e)),
         }
     }
-
     out
-}
-
-/// Read a JSON file and return the inner object stored under `key`. None
-/// when the file doesn't exist, isn't readable, isn't JSON, the value at
-/// `key` isn't an object, or `key` is missing. Errors go to `warnings`
-/// (read + parse only — missing-file is silent because that's the
-/// common case for a fresh project).
-fn read_json_object_at(
-    path: &Path,
-    key: &str,
-    warnings: &mut Vec<String>,
-) -> Option<serde_json::Map<String, serde_json::Value>> {
-    if !path.is_file() {
-        return None;
-    }
-    let raw = match std::fs::read_to_string(path) {
-        Ok(s) => s,
-        Err(e) => {
-            warnings.push(format!("read {}: {}", path.display(), e));
-            return None;
-        }
-    };
-    let v: serde_json::Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(e) => {
-            warnings.push(format!("parse {}: {}", path.display(), e));
-            return None;
-        }
-    };
-    v.as_object()
-        .and_then(|o| o.get(key))
-        .and_then(|v| v.as_object())
-        .cloned()
 }
 
 /// Pull `name` from `<folder>/vct-module.json`. Empty/missing → None.
@@ -1791,14 +1749,12 @@ fn read_vct_module_version(folder: &Path) -> Option<String> {
 }
 
 // Suppress unused-warning when the platform layer doesn't pull
-// `find_local_repo_root` / `write_project_env_files` / `ProjectEnvSettings`
-// transitively. These are kept in the import block because they document
+// `find_local_repo_root` / `project_env_settings::populate` transitively. These are kept in the import block because they document
 // the implicit contract this file participates in (see the comment above
 // `update_project_identity` re: env-surface plumbing).
 #[allow(dead_code)]
 fn _doc_imports() {
     let _: fn() -> Result<PathBuf, String> = find_local_repo_root;
-    let _: fn(&Path, &ProjectEnvSettings) -> Result<(), String> = write_project_env_files;
     let _ = project_env_settings::populate;
 }
 
@@ -1846,7 +1802,7 @@ mod tests {
     fn read_on_disk_env_returns_empty_for_missing_files() {
         let tmp = tempfile::tempdir().expect("mkdir tmp");
         let mut warnings = Vec::new();
-        let env = read_on_disk_env(tmp.path(), false, &mut warnings);
+        let env = read_on_disk_env(None, tmp.path(), false, &mut warnings);
         assert!(env.is_empty());
         assert!(warnings.is_empty());
     }
@@ -1862,7 +1818,7 @@ mod tests {
         )
         .unwrap();
         let mut warnings = Vec::new();
-        let env = read_on_disk_env(tmp.path(), false, &mut warnings);
+        let env = read_on_disk_env(None, tmp.path(), false, &mut warnings);
         assert_eq!(env.get("KG_COLLECTION"), Some(&"MyKG".to_string()));
         assert_eq!(env.get("PROJECT_NAME"), Some(&"Demo".to_string()));
         assert!(warnings.is_empty());
@@ -1884,7 +1840,7 @@ mod tests {
         )
         .unwrap();
         let mut warnings = Vec::new();
-        let env = read_on_disk_env(tmp.path(), /* is_root */ true, &mut warnings);
+        let env = read_on_disk_env(None, tmp.path(), /* is_root */ true, &mut warnings);
         // Root must consume `.claude/settings.json` only.
         assert_eq!(env.get("KG_COLLECTION"), Some(&"CLAUDE".to_string()));
         assert!(warnings.is_empty());
@@ -1906,7 +1862,7 @@ mod tests {
         )
         .unwrap();
         let mut warnings = Vec::new();
-        let env = read_on_disk_env(tmp.path(), /* is_root */ false, &mut warnings);
+        let env = read_on_disk_env(None, tmp.path(), /* is_root */ false, &mut warnings);
         // VS Code value wins.
         assert_eq!(env.get("KG_COLLECTION"), Some(&"FROM_VSCODE".to_string()));
     }
@@ -1921,10 +1877,35 @@ mod tests {
         )
         .unwrap();
         let mut warnings = Vec::new();
-        let env = read_on_disk_env(tmp.path(), false, &mut warnings);
+        let env = read_on_disk_env(None, tmp.path(), false, &mut warnings);
         assert!(env.is_empty());
         assert_eq!(warnings.len(), 1);
         assert!(warnings[0].starts_with("parse "));
+    }
+
+    /// v0.2.97: both surfaces are JSONC in the field (VS Code's own format;
+    /// a settings.json Claude Code accepts with comments). RED before: the
+    /// strict serde parse turned each into a `parse` warning and no values.
+    #[test]
+    fn read_on_disk_env_reads_jsonc_surfaces() {
+        let tmp = tempfile::tempdir().expect("mkdir tmp");
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        std::fs::create_dir_all(tmp.path().join(".vscode")).unwrap();
+        std::fs::write(
+            tmp.path().join(".claude").join("settings.json"),
+            "// team settings\n{ \"env\": { \"CODE_GRAPH_PROJECT\": \"Cg\", }, }\n",
+        )
+        .unwrap();
+        std::fs::write(
+            tmp.path().join(".vscode").join("settings.json"),
+            "{\n  // editor\n  \"claude-code.env\": { \"KG_COLLECTION\": \"FromVscode\", },\n}\n",
+        )
+        .unwrap();
+        let mut warnings = Vec::new();
+        let env = read_on_disk_env(None, tmp.path(), false, &mut warnings);
+        assert!(warnings.is_empty(), "{:?}", warnings);
+        assert_eq!(env.get("KG_COLLECTION"), Some(&"FromVscode".to_string()));
+        assert_eq!(env.get("CODE_GRAPH_PROJECT"), Some(&"Cg".to_string()));
     }
 
     #[test]

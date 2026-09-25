@@ -199,14 +199,11 @@ pub fn resolve_python_for_vco_lib() -> Option<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
-    use std::sync::{Mutex, OnceLock};
-
-    // Env-var mutation is process-global; serialize these tests so parallel
-    // runs don't clobber each other's $VCT_VENV / $VCT_INSTALL_ROOT.
-    fn env_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
+    // Env-var mutation is process-global; these tests hold THE env lock
+    // (`test_env::env_lock`) so no test in the binary sees another's
+    // $VCT_VENV / $VCT_INSTALL_ROOT. v0.2.97 review R6: a module-private
+    // mutex of the same name ordered only this module's tests.
+    use crate::test_env::env_lock;
 
     fn tmpdir(label: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -243,7 +240,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn vct_venv_override_wins() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let d = tmpdir("override");
         // $VCT_VENV points at the venv DIR.
         let bin = d.join("bin");
@@ -274,7 +271,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn install_root_venv_resolves() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let d = tmpdir("root");
         let py = make_venv(&d);
 
@@ -307,7 +304,7 @@ mod tests {
     /// comes back is a real interpreter FILE, never a bare program name.
     #[test]
     fn never_returns_a_bare_program_name() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let d = tmpdir("nofallback");
         let saved_venv = std::env::var_os("VCT_VENV");
         let saved_root = std::env::var_os("VCT_INSTALL_ROOT");
@@ -349,7 +346,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn orchestrator_root_env_var_resolves() {
-        let _g = env_lock().lock().unwrap();
+        let _g = env_lock();
         let d = tmpdir("orchroot");
         let py = make_venv(&d);
 

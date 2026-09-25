@@ -270,3 +270,59 @@ def test_orphan_condition_id_stays_install_owned():
         "orphan_orchestrator_development_collection"
         in install._INSTALL_OWNED_CONDITION_IDS
     )
+
+
+# ── v0.2.97: JSONC settings.json, and a surface that cannot be read ───────────
+def _as_jsonc(path: Path) -> None:
+    text = path.read_text(encoding="utf-8").rstrip()
+    path.write_text("// my note\n" + text[:-1].rstrip() + ",\n}\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        json.loads(path.read_text(encoding="utf-8"))
+
+
+def test_jsonc_settings_json_reference_is_seen(non_root):
+    """ACT. RED before: a strict json.loads read a commented settings.json as
+    "no env", so a collection it names looked unreferenced."""
+    _write_settings_json(non_root, {"DEVELOPMENT_COLLECTION": _CANDIDATE})
+    _as_jsonc(non_root / ".claude" / "settings.json")
+    assert iw.dev_collection_is_referenced(_CANDIDATE, non_root) == (
+        True, ".claude/settings.json::env")
+
+
+def test_jsonc_settings_json_without_a_reference_stays_unreferenced(non_root):
+    """LEAVE-ALONE: JSONC that names another collection is still no reference."""
+    _write_settings_json(non_root, {"DEVELOPMENT_COLLECTION": "ClientAlpha_Development"})
+    _as_jsonc(non_root / ".claude" / "settings.json")
+    assert iw.dev_collection_is_referenced(_CANDIDATE, non_root) == (False, "")
+
+
+@pytest.mark.parametrize("rel,raw", [
+    (".claude/settings.json", b"{ not jsonc at all"),
+    (".claude/settings.json", b"\xff\xfe{\"env\": {}}"),
+    (".claude/env", b"# vco-managed-begin\nexport X=\"\xff\xfe\"\n# vco-managed-end\n"),
+])
+def test_an_unreadable_surface_counts_as_referenced(non_root, rel, raw):
+    """UNREADABLE ⇒ cannot rule out a reference ⇒ no drop deferral. RED
+    before: the surface soft-failed to "no reference"."""
+    (non_root / rel).write_bytes(raw)
+    referenced, surface = iw.dev_collection_is_referenced(_CANDIDATE, non_root)
+    assert referenced is True
+    assert "unreadable" in surface
+    assert iw.build_orphan_dev_deferral(
+        _CANDIDATE, non_root, "http://localhost:8081",
+        class_map={_CANDIDATE: {}},
+        count_fn=_count_fn_factory({_CANDIDATE: 0}),
+    ) is None
+
+
+def test_mcp_json_staleness_reads_a_jsonc_settings_file(non_root):
+    """``.mcp.json`` staleness is judged against settings.json env — read as
+    JSONC (RED before: None, so a stale ``.mcp.json`` could never be proven
+    stale in such a project). Unreadable stays None (leave ``.mcp.json`` alone)."""
+    _write_settings_json(non_root, {"KG_COLLECTION": "ClientAlpha_KnowledgeGraph",
+                                    "WEAVIATE_URL": "http://localhost:8081"})
+    _as_jsonc(non_root / ".claude" / "settings.json")
+    got = iw.resolve_settings_weaviate_env(non_root)
+    assert got is not None and got["KG_COLLECTION"] == "ClientAlpha_KnowledgeGraph"
+    (non_root / ".claude" / "settings.json").write_bytes(b"{ broken")
+    assert iw.resolve_settings_weaviate_env(non_root) is None

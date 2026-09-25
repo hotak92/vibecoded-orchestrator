@@ -14,8 +14,10 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # from the JSON payload — session_id is the canonical per-conversation key.
 # Falling back to "default" only on malformed JSON keeps concurrent
 # Claude Code sessions on the same project from sharing state files
-# (PR #176 cross-OS sweep — see knowledge/concepts/
-# hook-session-id-stdin-pattern.md).
+# (PR #176 cross-OS sweep: hooks read session_id from the stdin JSON
+# payload, never $env:CLAUDE_SESSION_ID — the hook runner does not
+# populate it, so an env-var read silently collapses every session
+# onto "default").
 # UserPromptSubmit hooks don't see tool_name in the payload either, so
 # per-tool accounting is moot under v2.1.x — kept as a defensive default
 # in case a future runtime ever populates the env var. Today
@@ -89,7 +91,8 @@ if ($TotalWords -ge 200000) {
 # The staleness marker file is keyed by both ProjectName and SessionId
 # so concurrent Claude Code sessions on the same project don't stomp on
 # each other's counter (the same concurrency fix as PR #176 applied to
-# 11 other hooks — see knowledge/concepts/hook-session-id-stdin-pattern.md).
+# 11 other hooks: key per-session state by the session_id parsed from
+# the stdin JSON payload, not by project alone).
 $StalenessMarker = Join-Path $Tmp "claude-ctx-staleness-$ProjectName-$SessionId"
 $LastFireWords = 0
 if (Test-Path $StalenessMarker) {

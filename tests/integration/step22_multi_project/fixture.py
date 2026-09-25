@@ -474,8 +474,9 @@ def start_hub(
     /health will respond).
 
     ``extra_env`` merges extra environment variables into the hub
-    subprocess env (e.g. ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` to reopen the
-    one-release global-token compat window for the flip test).
+    subprocess env (e.g. ``VCT_HUB_LEGACY_GLOBAL_ENV=1`` — dead since
+    v0.2.97 removed the opt-in, still passed by the removal-pin test to
+    prove the variable changes nothing).
     """
     if not hub_binary.exists():
         raise FileNotFoundError(

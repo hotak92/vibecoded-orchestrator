@@ -83,16 +83,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Tuple
 
-from vco_lib.hooks_settings import invoked_script_tokens
+from vco_lib.hooks_settings import anchor_hook_command, invoked_script_tokens
 
 #: Matcher kinds. See the module docstring for what each one is safe for.
 KIND_HOOK_SCRIPT = "hook_script"
 KIND_COMMAND = "command"
 
-#: VCO's own "the user switched hooks off" guard, which prefixes most shipped
-#: hook commands. Stripped before comparison so a registration is recognised
-#: whether or not the era that wrote it carried the guard (the `.sh` family
-#: gained it in v0.2.x; a pre-public-repo install has the bare form).
+#: VCO's own "the user switched hooks off" guard, which prefixed most
+#: shipped hook commands until v0.2.97. KEPT, not deleted: matching here is
+#: state-keyed — retirements and command-identity comparisons run against
+#: settings.json files written by EARLIER releases, and a pre-v0.2.97 install
+#: still carries the prefixed form for as long as it never runs a bundle
+#: update (and launcher-parked disabled entries restore it verbatim). Strip
+#: it here so both eras of the same registration compare equal.
 _DISABLE_GUARD_RE = re.compile(
     r"""^\[\s*-n\s+["']?\$\{?VCT_DISABLE_HOOKS(?::-)?\}?["']?\s*\]\s*\|\|\s*"""
 )
@@ -107,8 +110,9 @@ def normalize_command(command: str) -> str:
       * internal whitespace runs collapsed to one space (a re-indented or
         re-wrapped settings.json must not defeat the match);
       * a leading ``[ -n "$VCT_DISABLE_HOOKS" ] || `` guard dropped — the
-        guard is VCO's own, and the same registration exists in the wild both
-        with and without it.
+        guard stopped shipping in v0.2.97, but installs written before that
+        release carry it (see ``_DISABLE_GUARD_RE``), so both eras of one
+        registration must compare equal.
 
     Does NOT touch path separators or quoting: those are meaningful inside a
     ``python -c`` payload, and the ``KIND_HOOK_SCRIPT`` matcher (not this one)
@@ -120,6 +124,26 @@ def normalize_command(command: str) -> str:
         return ""
     collapsed = " ".join(command.split())
     return _DISABLE_GUARD_RE.sub("", collapsed).strip()
+
+
+def hook_command_key(command: str) -> str:
+    """The key under which two spellings of ONE hook registration compare
+    equal: :func:`normalize_command` of the command with its project hook
+    scripts anchored (:func:`vco_lib.hooks_settings.anchor_hook_command`).
+
+    v0.2.97: the relative ``bash .claude/hooks/x.sh`` a pre-v0.2.97 install
+    (or a launcher-parked entry, or the launcher DB's mirror row) still holds
+    and the anchored form a bundle update now writes
+    (``bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"`` on Linux/macOS,
+    ``powershell … -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"`` on
+    Windows) are the same hook; so are the guard-prefixed and bare forms, and
+    every anchored spelling the cycle wrote.
+    Narrower than ``parked_hooks.same_hook_command`` (script basename): it is
+    what the hooks editor matches a named entry by, and what the launcher's
+    Hooks tab keys rows by, so it must not merge two DIFFERENT commands that
+    happen to run the same script.
+    """
+    return normalize_command(anchor_hook_command(command))
 
 
 @dataclass(frozen=True)
@@ -497,7 +521,7 @@ def emit_removal_audit_rows(
 #
 # The refusal half of that is already closed Python-side
 # (``hooks_settings.insert_hook`` raises ``hook_retired``, so every restore
-# path — the Hooks tab, the hub's two PATCH routes, the ``vco hooks enable``
+# path — the Hooks tab, the hub's two PATCH routes, the ``vct-cli hooks enable``
 # CLI — refuses through ONE decision). This CLI closes the EAGER half: the
 # launcher asks, at Hooks-tab load, which of its parked rows are dead, and
 # releases those bytes before the user clicks anything.
@@ -634,6 +658,7 @@ __all__ = [
     "RetiredRegistration",
     "build_parser",
     "emit_removal_audit_rows",
+    "hook_command_key",
     "main",
     "match_retired_registration",
     "normalize_command",

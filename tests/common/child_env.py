@@ -44,6 +44,14 @@ not the other — nothing raises, and the test simply measures the wrong tree.
 An audit read a stale 13 500-token chunk budget through this leak and nearly
 filed a defect against code that was already fixed.
 
+**``$VCT_INSTALL_ROOT`` is pinned to the same value** (v0.2.97 review round
+7). It is the first rung of every install-root reader — ahead of
+``$VCT_ORCHESTRATOR_ROOT`` — and it also picks the child's venv
+(``<root>/.venv`` in ``vco_lib.python_exe`` and ``resolve-vco-venv.{sh,ps1}``).
+A launcher-started shell exports it, CI never does; unpinned, the same test ran
+children against another checkout and ITS venv locally and against this one on
+CI. Pinned, the child's ladder is CI's everywhere.
+
 A test that deliberately wants the inherited value passes it explicitly:
 ``child_env(VCT_ORCHESTRATOR_ROOT=os.environ["VCT_ORCHESTRATOR_ROOT"])`` —
 overrides are applied last, so opting out is possible but must be written down.
@@ -131,6 +139,17 @@ def child_env(
     # Beats PYTHONPATH in the shipped scripts that read it — see the module
     # docstring. Set BEFORE `overrides` so a caller can still opt out.
     env["VCT_ORCHESTRATOR_ROOT"] = root
+    # Its twin, pinned the same way (review round 7): `VCT_INSTALL_ROOT` is
+    # the FIRST rung of every install-root reader (`vco_lib.python_exe`,
+    # `resolve-vco-venv.{sh,ps1}`, `project_move`, `boot_service`,
+    # `maintain_knowledge_graph.py`) — ahead of `VCT_ORCHESTRATOR_ROOT` — so a
+    # developer shell that exports it (a launcher-started session does) made
+    # children read ANOTHER checkout while CI, which never sets it, read this
+    # one. With both pinned here the child's venv ladder is CI's: this
+    # checkout has no `.venv`, so the Python ladder settles on the running
+    # interpreter (its `sys.executable` rung) and the shell ladder on
+    # `find-python`, exactly as on the hosted runner.
+    env["VCT_INSTALL_ROOT"] = root
     # Keeps the child's project-root answer (and so its deferral-ledger writes,
     # and so this checkout's tracked CLAUDE.md) out of the working tree — see
     # the module docstring. Only for the inherited-environment case: a caller

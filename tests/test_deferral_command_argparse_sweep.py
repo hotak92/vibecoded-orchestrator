@@ -151,6 +151,9 @@ def cli_registry() -> dict:
     # flag the CLI rejects is caught here.
     codegraph_naming = importlib.import_module("vco_lib.codegraph_naming")
     naming_flags = _parser_option_strings(codegraph_naming._build_arg_parser())
+    # v0.2.97 SE-2: the service-endpoint verbs every service_* deferral prints.
+    service_endpoints = importlib.import_module("vco_lib.service_endpoints")
+    endpoint_flags = _parser_option_strings(service_endpoints._build_arg_parser())
     return {
         "code-graph-analyze": analyzer_flags,
         "analyze_code_graph.py": analyzer_flags,
@@ -158,6 +161,7 @@ def cli_registry() -> dict:
         "sync_knowledge_graph.py": kg_sync_flags,
         "vco_lib.project_init": project_init_flags,
         "vco_lib.codegraph_naming": naming_flags,
+        "vco_lib.service_endpoints": endpoint_flags,
         "install.py": install_flags,
     }
 

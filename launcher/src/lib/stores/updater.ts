@@ -21,6 +21,10 @@ import { orchestrator, cancelScheduledRetry, renderCheck, checkError } from './o
 // from HERE (beginOp / endOp) so every update-class operation — not only the
 // badge's four — drives the one live indicator.
 import { ui } from './ui';
+// v0.2.97: an update that finishes WITHOUT restarting the launcher still left
+// the running model gateway on the old code — ask, the same way the layout
+// asks at launcher start. Read-only; the modal restarts nothing by itself.
+import { gatewayFreshness } from './gateway-freshness';
 import {
   parseTaggedErrorPayload,
   parseOrchestratorConflictError,
@@ -707,6 +711,7 @@ function createUpdaterStore() {
         endOp();
         // Re-check to refresh the new install/binary state.
         await orchestrator.checkStatus();
+        void gatewayFreshness.check();
       } catch (e) {
         // v0.2.23 (B4 / D19): detect divergence. The error string is
         // the raw Tauri Err payload; the orchestrator store wraps it as
@@ -829,6 +834,7 @@ function createUpdaterStore() {
         endOp();
         // Re-check so install_stale clears + any new flags surface.
         await orchestrator.checkStatus();
+        void gatewayFreshness.check();
       } catch (e) {
         endOp(e);
       }

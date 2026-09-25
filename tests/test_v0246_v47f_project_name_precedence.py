@@ -322,7 +322,7 @@ def test_argparse_project_name_flag_parses():
 # ---------------------------------------------------------------------------
 
 
-def test_existing_project_name_preserved_on_update(tmp_path):
+def test_existing_project_name_preserved_on_update(tmp_path, monkeypatch):
     """CRITICAL non-destructiveness gate: existing project with manifest +
     .env PROJECT_NAME=Foo MUST keep PROJECT_NAME=Foo after _reconcile_env_keys
     runs (the --update code path's env-handling).
@@ -378,24 +378,37 @@ def test_existing_project_name_preserved_on_update(tmp_path):
     )
     env_path.write_text(env_text_before)
 
+    # The update run resolves DIFFERENT values than the user pinned (what an
+    # --update from another shell, or a re-derived name, looks like): any
+    # line the reconcile appended for these keys would shadow the user's.
+    monkeypatch.setenv("PROJECT_NAME", "InstallTimeName")
+    monkeypatch.setenv("KG_COLLECTION", "Foo_KnowledgeGraph")
+
     # Simulate --update flow's reconcile pass.
     result = install_py._reconcile_env_keys(env_path)
 
     env_text_after = env_path.read_text()
 
     # The gate assertions: PROJECT_NAME + KG_COLLECTION byte-identical
-    # in env_text_after vs env_text_before for the active assignments.
+    # in env_text_after vs env_text_before for the EFFECTIVE assignment.
+    # Shell sourcing (and python-dotenv's override order) makes the LAST
+    # active assignment win, so that is the one read here: a later line
+    # appended by the update would shadow the user's value while a
+    # first-match reader still saw it unchanged.
     def _extract(text: str, key: str) -> str | None:
+        found: str | None = None
         for line in text.splitlines():
-            s = line.lstrip()
+            s = line.strip()
             if s.startswith("#"):
                 continue
+            if s.startswith("export "):
+                s = s[len("export "):].lstrip()
             if "=" not in s:
                 continue
             k, v = s.split("=", 1)
             if k.strip() == key:
-                return v.strip()
-        return None
+                found = v.strip()
+        return found
 
     project_name_before = _extract(env_text_before, "PROJECT_NAME")
     project_name_after = _extract(env_text_after, "PROJECT_NAME")

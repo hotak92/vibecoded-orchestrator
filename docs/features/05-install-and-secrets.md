@@ -85,7 +85,7 @@ PowerShell 5.1+ script with the same interpreter probe (`python3.12`, …, `py -
 
 `install.ps1` supports the flags the Python installer accepts: `-NoContainers`, `-Gpu`, `-CpuOnly`, `-LowResource`, `-OpenaiKey`, `-Container`, `-Dev`, `-Update`, `-SkipModels`, `-Quiet`, `-NoAgents`, `-NoSkills`. The Windows `py` launcher with version pinning (`py -3.12`) is tried as a secondary probe to handle Windows Store Python stubs.
 
-> The `-WithMaoAgents` switch is also present in `install.ps1` and forwards `--with-mao-agents` to `install.py`, but `install.py` doesn't define that flag and `templates/agents/mao/` doesn't exist in the OSS bundle — the switch is effectively a no-op until those land. Tracked as a code-doc gap, not a documented flag.
+> `install.ps1` also carries a `-WithMaoAgents` switch that is **obsolete and ignored**: the MAO-tier specialist agents were folded into the standard agent set before v0.2.0 (commit 79c2635b) and install unconditionally unless `-NoAgents` is given. The switch prints a warning and is never forwarded to `install.py` (whose argparse would reject `--with-mao-agents`), so an old invocation keeps installing instead of aborting.
 >
 
 </details>
@@ -104,13 +104,13 @@ Both `install.sh` and `install.py` enforce Python ≥ 3.11 (`MIN_PYTHON = (3, 11
 Three embedding-mode overrides. `--gpu` forces CodeSage-Large-v2 (GPU) for code and qwen3-embedding for text. `--cpu-only` forces both via Ollama. `--low-resource` selects snowflake-arctic-embed2 text + Jina V2 code — both via Ollama. Without any flag: NVIDIA GPU detected → `gpu`; else → `cpu`.
 
 ### `--openai-key KEY`
-Switches the entire embedding stack to OpenAI `text-embedding-3-small` (1536-dim). Skips GPU detection. Key written into `.env` as `OPENAI_API_KEY`.
+Switches the entire embedding stack to OpenAI `text-embedding-3-small` (1536-dim). Skips GPU detection. The key is stored — never written to `.env` (v0.2.97) — in the launcher keychain's shared `openai_api_key` slot when the vct-hub answers (on a first install it does not yet, so the key lands in the file store `~/.vct-secrets/shared/openai_api_key`); every consumer resolves it from there (`vco_lib.openai_key`). Every run that accepts the flag stores it — install, re-install, `--update`, `--lightweight`; runs that store nothing (`--uninstall`, `--desktop-icon-only`, `--adopt-project-dry-run`, `--no-adopt-project`) refuse it with an error. A value given on the command line is visible to other local users and kept in shell history — setting it in the launcher (Preferences → Special Secrets) avoids that. An older root `.env` whose `OPENAI_API_KEY=` line VCO wrote (under `# OpenAI (for embeddings)`) has that line removed on the next install/update once the stored value provably equals it (the value is read with the one `.env` grammar — `export`, one quote pair, CRLF); a value that does not parse as one clean token, or differs from the store, is left and reported.
 
 ### `--no-containers`
 Skips all Docker/Podman service setup. Useful for CI or when services are managed externally. `.env` is still written; agents/skills are still installed.
 
 ### `--container docker|podman`
-Forces a specific container runtime instead of auto-detecting (Linux prefers Podman; macOS/Windows prefers Docker).
+Forces a specific container runtime instead of auto-detecting, and records it as your choice (`state/install/runtime.confirmed` — VCO never switches away from a runtime chosen this way). Without it, auto-detection prefers Podman on every OS; Docker is the fallback.
 
 ### `--skip-models`
 Skips pulling Ollama models after containers start. Models can be pulled manually later via `ollama pull`.
@@ -131,7 +131,7 @@ Default-on. Copies skill directories from `templates/skills/` into `~/.claude/sk
 Skips Step 11b (bytecode pre-compile of orchestrator Python modules). Default is to run `python -m compileall` against `VCThelpers/`, `claude_mcp_servers/`, `tools/`, `vco_lib/`, and `.claude/scripts/` so first-import is ~50-200ms faster per cold module. Best-effort: per-directory failures warn but never abort. Cross-OS via stdlib `compileall`. Skip in dev/CI runs where the speedup doesn't matter.
 
 ### `--telemetry on|off`
-Explicit telemetry consent for the generated `.env`. Default is prompt-on-TTY; non-interactive defaults to `off`. The generated `.env` always contains an explicit `VIBECODED_TELEMETRY=true|false` line so consent state is auditable.
+Explicit telemetry consent for the generated `.env`. Default is prompt-on-TTY; non-interactive defaults to `off`. The generated `.env` always contains an explicit `VCT_TELEMETRY=true|false` line so consent state is auditable (`VIBECODED_TELEMETRY` is only a read-time alias in the telemetry module).
 
 ### `--yes`
 Non-interactive mode: accept all defaults (telemetry=off, confirm all uninstall prompts).
@@ -156,7 +156,7 @@ Each step checks before acting. Venv creation is skipped if `.venv/bin/python` e
 `_install_agents_and_skills()` replaces `{{ORCHESTRATOR_ROOT}}`, `{{PROJECTS_ROOT}}`, and `{{HOME}}` in all `.md` files before copying. This embeds absolute paths into agent definitions at install time so they work regardless of how the CLI invokes them.
 
 ### `.env` generation
-`_write_env_config()` writes a fully-populated `.env` including `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`, `KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `VIBECODED_TELEMETRY`, and (if `--openai-key` was given) `OPENAI_API_KEY`. File is only written if `.env` does not already exist.
+`_write_env_config()` writes the orchestrator root's `.env` through the one `.env` writer (`vco_lib.install_env.write_orchestrator_env` → `vco_lib.env_template.apply_env_template`). A new file starts with the install-time keys (`WEAVIATE_GRPC_PORT`, `EMBEDDING_MODEL`, `EMBEDDING_DIMS`, `CODE_EMBED_BACKEND`, `CODE_EMBED_MODEL`, `CODE_EMBED_DIMS`, `CODE_EMBED_SERVICE_URL`, `EMBEDDING_PROVIDER`, `VCT_TELEMETRY` — the OpenAI key is never among them, see `--openai-key`), followed by the VCO-managed block with the canonical keys (`WEAVIATE_URL`, `OLLAMA_URL`, `ACTIVE_EMBEDDING`, `KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `SHARED_KG_*`, …). An existing file only gets keys ADDED to its block (fill-only); `--update` does the same through `_reconcile_env_keys`.
 
 ### `.claude/settings.json` generation
 `_configure_claude_settings()` creates `.claude/settings.json` with base `permissions.allow` rules and an `env` block that injects all service URLs and embedding config into every Claude Code session in this project folder. Skipped if the file already exists.
@@ -166,10 +166,10 @@ Each step checks before acting. Venv creation is skipped if `.venv/bin/python` e
 ## Container Start
 
 ### Shared-service reuse
-Before running `compose up -d`, install.py probes `http://localhost:<port>/v1/.well-known/ready` (Weaviate), `/api/tags` (Ollama), and `/health` (code_embed) with a 2s timeout. Services already up are reused; only missing ones are started. Multiple installs on the same machine share one Weaviate / Ollama; isolation is by KG collection namespace, not separate containers.
+Before starting anything, install.py (through `vco_lib/service_detection.py` and `service_reconcile.py`) probes the VCO ports **and** the upstream defaults (Weaviate 8081/8080, Ollama 11435/11434), content-fingerprints what answers (VCO marker classes / models), and reconciles the launcher.db `service_endpoints` rows against the live evidence. A Weaviate or Ollama that already holds VCO data is adopted. A third-party **Ollama** is adopted without asking (an informational record names it and gives the one command to switch to a VCO copy). A third-party **Weaviate** with no VCO data is never adopted or duplicated unattended: the install waits for an explicit choice — the launcher's adoption dialog, the onboarding wizard, `python -m vco_lib.service_endpoints adopt|use-vco-copy`, or `install.py --service weaviate=…` — and records the `service_adoption_confirmation_required` deferral until then. Compose invocations name only the `vco_managed` services (`--no-deps`); adopted containers are started by name only and never removed or recreated. Multiple installs on the same machine share one Weaviate / Ollama; isolation is by KG collection namespace, not separate containers.
 
 ### `VCT_FORCE_SEPARATE_CONTAINERS=1` escape hatch
-Bypasses the service-reuse check and runs `compose up -d` for everything. The caller is responsible for setting `WEAVIATE_PORT` / `OLLAMA_PORT` / `CODE_EMBED_PORT` to avoid bind conflicts.
+Bypasses the service-reuse check and brings up every service under this install. Give each stack its own ports through the rows — `install.py --service <svc>=vco:<port>` or `python -m vco_lib.service_endpoints move` — not by hand-editing env files.
 
 ### compose command resolution
 `_get_compose_command()` tries `podman-compose` → `podman compose` → falls back on Podman. For Docker it tries `docker compose` (v2 plugin) → `docker-compose` (standalone).
@@ -333,7 +333,7 @@ A file placed at the project root (one line = project name) used by `vct detect-
 ### Search MCP wrapper (`claude_mcp_servers/search_mcp/wrapper.sh`)
 **Interpreter resolution (post-`0541dcf7`)**: the wrapper probes, in order, `$SEARCH_MCP_PYTHON` → `$REPO_ROOT/claude_mcp_servers/.venv/bin/python` (the legacy pre-unification layout) → `$REPO_ROOT/.venv/bin/python` (canonical since the venv unification), and only then falls back to the legacy path for its error message. Before that fix it hardcoded the legacy path alone, so on a root-venv install the MCP simply never started — `claude mcp list` said "Failed to connect" with no visible cause. The lesson generalises beyond this wrapper: a layout fact copied into a script is an assumption frozen at authoring time, and nothing re-verified it when the layout moved. v0.2.91's doctor phase (`vco doctor`) exists to be the thing that re-verifies such assumptions after install — the same probe engine that catches an unresolvable `npx`, a stale launcher binary, and drifted npm pins.
 
-Two-stage `GITHUB_TOKEN` resolution as of v0.1.7: (1) env-first — `$GITHUB_TOKEN` already exported by the launcher's `write_project_env_files` (which sources from the keychain); (2) resolver helper — `vct_secrets_resolve.sh <project_path> github_pat`, which calls the launcher's hub HTTP API (`GET /api/v1/projects/{id}/env?key=github_pat`). The legacy `~/.vct-secrets/shared/github_pat` file fallback (gated behind `VCT_LEGACY_FILE_FALLBACK=1`) was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
+Two-stage `GITHUB_TOKEN` resolution as of v0.1.7: (1) env-first — `$GITHUB_TOKEN` already exported in the wrapper's environment (by the user or `vct exec`; the launcher writes no secret values into project files since v0.2.73); (2) resolver helper — `vct_secrets_resolve.sh <project_path> github_pat`, which calls the launcher's hub HTTP API (`GET /api/v1/projects/{id}/env?key=github_pat`). The legacy `~/.vct-secrets/shared/github_pat` file fallback (gated behind `VCT_LEGACY_FILE_FALLBACK=1`) was removed in the 0.1.7 fork-readiness sweep. Either way the token never appears in `~/.claude.json`.
 
 ### `git-credential-vct` — GitHub credential helper
 At `tools/vct-secrets/git-credential-vct`. Registered via `git config --global credential.https://github.com.helper '!<path>'`. Only responds to the `get` operation (never stores). Resolution order for `github_pat`: (1) walk `$PWD` upward for `.vct-project` → use `projects/<name>/github_pat`; (2) fallback to `VCT_PROJECT_ROOT_PATTERN/<segment>/` heuristic; (3) `shared/github_pat`. Refuses to read files with perms other than 600 or 400.
@@ -358,7 +358,7 @@ Three services: `weaviate` (pinned `cr.weaviate.io/semitechnologies/weaviate:1.2
 <details>
 <summary>Details</summary>
 
-All three services use named volumes with default container-engine paths. Port numbers are configurable via env vars (`WEAVIATE_PORT`, `WEAVIATE_GRPC_PORT`, `OLLAMA_PORT`, `CODE_EMBED_PORT`). Image tags: Weaviate and ollama are pinned for supply-chain reproducibility. `check-install.sh` warns on any `:latest` tags it finds in compose files.
+All three services use named volumes with default container-engine paths. Host ports come from the `service_endpoints` rows: `vco_lib/compose_env.py` writes them (plus the data-source knobs) into `infrastructure/.env`, which the compose file substitutes — the file is VCO-written, never hand-edited. Move a service with `python -m vco_lib.service_endpoints move` or the launcher's Services page. Image tags: Weaviate and ollama are pinned for supply-chain reproducibility. `check-install.sh` warns on any `:latest` tags it finds in compose files.
 
 </details>
 
@@ -379,10 +379,10 @@ Compose override that adds NVIDIA device reservations to both `ollama` and `code
 ## Environment Configuration
 
 ### `.env` generated by installer
-The repo does not ship a top-level `.env.example`. `install.py::_write_env_config` writes a fully-populated `.env` at install time covering: infrastructure URLs (`WEAVIATE_URL`, `OLLAMA_URL`, `GRPC_PORT`, `CODE_EMBED_SERVICE_URL`), KG collection names (`KG_COLLECTION`, `SHARED_KG_COLLECTION`), embedding settings (`ACTIVE_EMBEDDING`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`), telemetry opt-in (`VIBECODED_TELEMETRY=false`), and OpenAI key (only if `--openai-key`). The launcher subtree ships its own `launcher/.env.example` for the SvelteKit / Supabase auth client.
+The repo does not ship a top-level `.env.example`. `install.py::_write_env_config` writes the `.env` at install time: the install-time keys (`WEAVIATE_GRPC_PORT`, `CODE_EMBED_SERVICE_URL`, `EMBEDDING_MODEL`, `CODE_EMBED_BACKEND`, `CODE_EMBED_DIMS`, `EMBEDDING_PROVIDER`, telemetry opt-in `VCT_TELEMETRY=false`; the OpenAI key is stored in the secrets store, never here), then the VCO-managed block with infrastructure URLs (`WEAVIATE_URL`, `OLLAMA_URL`), KG collection names (`KG_COLLECTION`, `SHARED_KG_COLLECTION`) and `ACTIVE_EMBEDDING`. See `docs/CONFIGURATION.md` → "`.env` template management". The launcher subtree ships its own `launcher/.env.example` for the SvelteKit / Supabase auth client.
 
-### `VIBECODED_TELEMETRY` env var
-Explicit opt-in flag (default `false`). Written by `install.py` based on the telemetry consent prompt.
+### `VCT_TELEMETRY` env var
+Explicit opt-in flag (default `false`). Written by `install.py` based on the telemetry consent prompt. `VIBECODED_TELEMETRY` is still read as an alias; nothing writes it.
 
 ### `ACTIVE_EMBEDDING` env var
 Controls which named vector is used for KG searches. Recognized values in `claude_mcp_servers/weaviate_mcp/server.py`: `qwen3` (default → `qwen3_embed` slot), `openai` (→ `openai_embed`), and any other value (treated as legacy → `ollama_embed` for KG / `ollama_code_embed` for code). For the `--low-resource` install profile `install.py` writes `ACTIVE_EMBEDDING=arctic`; the MCP's branch-by-negation mapping routes it to the legacy slot. Switch without reindexing as long as the target slot is populated.

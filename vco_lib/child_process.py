@@ -71,6 +71,7 @@ WP-1 review NOTEs — dispositions (v0.2.96 WP-8; do not silently re-litigate):
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -85,7 +86,7 @@ from typing import IO, Optional
 from vco_lib import progress_event
 from vco_lib.paths import vct_root_dir
 
-__all__ = ["run_child_logged"]
+__all__ = ["last_json_object", "run_child_logged"]
 
 logger = logging.getLogger(__name__)
 
@@ -100,6 +101,35 @@ logger = logging.getLogger(__name__)
 #: and the drop looks exactly like "the child produced no progress", which
 #: is the state the launcher's stall watchdog warns about.
 _EVENT_LINE_RE = re.compile("^" + re.escape(progress_event.EVENT_PREFIX.rstrip()))
+
+
+def last_json_object(stdout: Optional[str]) -> Optional[dict]:
+    """The JSON object a ``--json`` child prints as its LAST ``{`` line, or ``None``.
+
+    The ONE parser for "a vco_lib CLI's final report on stdout" (v0.2.97; it
+    replaced ``machine_migrations._last_json_object``, which a second module
+    was importing privately, and ``embedding_enrichment._last_json_line``).
+    Stray non-JSON lines above the report — warnings, a venv banner — are
+    tolerated.
+
+    STRICT on the last candidate: the last line that starts with ``{`` IS the
+    report. If it does not parse (a child killed mid-write) or is not an
+    object, the answer is ``None`` — never an EARLIER ``{`` line. A child that
+    streams JSON progress lines before its report (``embedding_enrichment
+    --stream-progress``) would otherwise have a progress line read back as the
+    report, and a caller checking ``report["failed"]`` would see success where
+    there was a truncated failure.
+    """
+    for line in reversed((stdout or "").splitlines()):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            parsed = json.loads(line)
+        except ValueError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+    return None
 
 
 def _open_log(

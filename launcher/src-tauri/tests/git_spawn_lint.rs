@@ -74,15 +74,42 @@ fn strip_line_comments(src: &str) -> String {
 }
 
 /// Split comment-stripped `src` into `(production, tests)` at the first
-/// COLUMN-ZERO `#[cfg(test)]`. When the marker is absent the whole file is
-/// production — the safe direction, because the fixtures would then trip the
-/// lint loudly rather than the lint silently scanning nothing.
+/// COLUMN-ZERO `#[cfg(test)]` whose item is a `mod` — the file's test
+/// MODULE. A `#[cfg(test)]` can also gate a single item (a `use`, a fn,
+/// a const), and `installer.rs` does exactly that near the top for
+/// `CommandExt`; a splitter that stopped at the FIRST cfg(test) handed
+/// the lint a 23-line "production region" and the fixtures were never
+/// scanned. When no test module is found the whole file is production —
+/// the safe direction, because the fixtures would then trip the lint
+/// loudly rather than the lint silently scanning nothing.
 fn split_at_test_module(src: &str) -> (&str, &str) {
-    match src.find(TEST_MOD_MARKER) {
-        // +1 to keep the newline with the production side.
-        Some(i) => (&src[..i + 1], &src[i + 1..]),
-        None => (src, ""),
+    let mut from = 0;
+    while let Some(rel) = src[from..].find(TEST_MOD_MARKER) {
+        let i = from + rel;
+        if opens_test_module(&src[i + TEST_MOD_MARKER.len()..]) {
+            // +1 to keep the newline with the production side.
+            return (&src[..i + 1], &src[i + 1..]);
+        }
+        from = i + TEST_MOD_MARKER.len();
     }
+    (&src, "")
+}
+
+/// Does the item this `#[cfg(test)]` attribute gates open a test module?
+///
+/// Skips blank lines and any FURTHER attribute lines (`#[allow(...)]`
+/// between the cfg and the item is legal Rust) and then asks whether the
+/// gated item is a `mod`. Anything else — a gated `use`, fn, const — is a
+/// production-region item as far as this lint is concerned.
+fn opens_test_module(after_attr: &str) -> bool {
+    for line in after_attr.lines() {
+        let l = line.trim();
+        if l.is_empty() || l.starts_with("#[") {
+            continue;
+        }
+        return l.starts_with("mod ") || l.starts_with("pub mod ");
+    }
+    false
 }
 
 /// Report every `Command::new("git")` in `region`, as `line N: <source>`.
@@ -194,6 +221,47 @@ fn scan_finds_a_planted_raw_spawn_and_ignores_the_allowed_ones() {
         !findings.iter().any(|f| f.contains("mod tests")),
         "fixtures below `#[cfg(test)]` are allowed: {findings:?}"
     );
+}
+
+/// RED-PROOF for the splitter's item-awareness: a `#[cfg(test)]` gating a
+/// bare `use` (installer.rs carries one near the top, for `CommandExt`)
+/// must NOT end the production region — only a cfg(test) whose item is a
+/// `mod` does. The first-version splitter stopped at the FIRST cfg(test)
+/// and handed the lint a 23-line "production region", making every scan a
+/// vacuous pass.
+#[test]
+fn a_gated_use_at_the_top_does_not_truncate_production() {
+    let synthetic = concat!(
+        "use vct_launcher_core::process::pid_is_alive;\n",
+        "#[cfg(test)]\n",
+        "use vct_launcher_core::process::CommandExt as _;\n",
+        "\n",
+        "pub async fn check_for_updates() {\n",
+        "    let out = StdCommand::new(\"git\").status();\n",
+        "}\n",
+        "#[cfg(test)]\n",
+        "mod tests {\n",
+        "    fn git() { StdCommand::new(\"git\").status(); }\n",
+        "}\n",
+    );
+    let stripped = strip_line_comments(synthetic);
+    let (production, tests) = split_at_test_module(&stripped);
+
+    assert!(
+        production.contains("pub async fn check_for_updates"),
+        "a `#[cfg(test)]`-gated `use` at the top must not end the \
+         production region — the splitter split at the wrong cfg(test)"
+    );
+    assert_eq!(
+        find_raw_spawns(production, 1).len(),
+        1,
+        "the planted production spawn must be INSIDE the production region"
+    );
+    assert!(
+        !production.contains("mod tests"),
+        "the production region must stop AT the test module"
+    );
+    assert!(!tests.is_empty());
 }
 
 /// Guard for the guard, half 1: the splitter must hand the lint a real

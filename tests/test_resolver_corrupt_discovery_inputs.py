@@ -69,6 +69,13 @@ KIND_PORT_UNREADABLE = "hub_port_unreadable"
 KIND_TOKEN_UNREADABLE = "hub_token_unreadable"
 
 
+# v0.2.97 (owner ruling 2026-09-24): an INVALID `VCT_HUB_PORT` warns and
+# falls through to `hub.port` — the file names the running hub — before the
+# default. A valid port is an integer in 1..65535, for env and file alike.
+FILE_PORT = "7811"
+OUT_OF_RANGE_PORTS = ("0", "70000")
+
+
 def _fresh_state_dir() -> str:
     return tempfile.mkdtemp(prefix="vct-corrupt-test-")
 
@@ -189,6 +196,27 @@ class BashCorruptDiscoveryTest(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), VALID_PORT, r.stdout)
         self.assertNotIn(KIND_PORT_INVALID, r.stderr, r.stderr)
 
+    def test_bash_invalid_env_port_falls_through_to_the_file(self) -> None:
+        state = _fresh_state_dir()
+        (Path(state) / "hub.port").write_text(FILE_PORT, encoding="utf-8")
+        r = _run_bash_fn(
+            "hub_port", env_extra={"VCT_HUB_PORT": NON_NUMERIC_PORT}, state_dir=state
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), FILE_PORT, r.stdout)
+        self.assertIn(KIND_PORT_INVALID, r.stderr, r.stderr)
+
+    def test_bash_out_of_range_ports_are_invalid(self) -> None:
+        for bad in OUT_OF_RANGE_PORTS:
+            with self.subTest(bad=bad):
+                state = _fresh_state_dir()
+                (Path(state) / "hub.port").write_text(bad, encoding="utf-8")
+                r = _run_bash_fn(
+                    "hub_port", env_extra={"VCT_HUB_PORT": bad}, state_dir=state
+                )
+                self.assertEqual(r.stdout.strip(), DEFAULT_PORT, r.stdout)
+                self.assertIn(KIND_PORT_INVALID, r.stderr, r.stderr)
+
     def test_bash_unreadable_port_warns_and_defaults(self) -> None:
         if os.geteuid() == 0:
             self.skipTest("running as root: perm bits don't gate reads")
@@ -302,6 +330,27 @@ class PowerShellCorruptDiscoveryTest(unittest.TestCase):
         self.assertIn(VALID_PORT, r.stdout, r.stdout)
         self.assertNotIn(KIND_PORT_INVALID, r.stderr, r.stderr)
 
+    def test_ps1_invalid_env_port_falls_through_to_the_file(self) -> None:
+        state = _fresh_state_dir()
+        (Path(state) / "hub.port").write_text(FILE_PORT, encoding="utf-8")
+        r = self._run_ps1_fn(
+            "Get-HubPort", env_extra={"VCT_HUB_PORT": NON_NUMERIC_PORT}, state_dir=state
+        )
+        self.assertEqual(r.returncode, 0, f"stderr={r.stderr!r}")
+        self.assertEqual(r.stdout.strip(), FILE_PORT, r.stdout)
+        self.assertIn(KIND_PORT_INVALID, r.stderr, r.stderr)
+
+    def test_ps1_out_of_range_ports_are_invalid(self) -> None:
+        for bad in OUT_OF_RANGE_PORTS:
+            with self.subTest(bad=bad):
+                state = _fresh_state_dir()
+                (Path(state) / "hub.port").write_text(bad, encoding="utf-8")
+                r = self._run_ps1_fn(
+                    "Get-HubPort", env_extra={"VCT_HUB_PORT": bad}, state_dir=state
+                )
+                self.assertEqual(r.stdout.strip(), DEFAULT_PORT, r.stdout)
+                self.assertIn(KIND_PORT_INVALID, r.stderr, r.stderr)
+
     def test_ps1_unreadable_token_warns_no_throw(self) -> None:
         if os.name != "nt" and os.geteuid() == 0:
             self.skipTest("running as root: perm bits don't gate reads")
@@ -395,6 +444,28 @@ class PythonCorruptDiscoveryTest(unittest.TestCase):
         self.assertIsNone(exc, exc)
         self.assertEqual(port, int(VALID_PORT), port)
         self.assertNotIn(KIND_PORT_INVALID, stderr, stderr)
+
+    def test_py_invalid_env_port_falls_through_to_the_file(self) -> None:
+        os.environ["VCT_HUB_PORT"] = NON_NUMERIC_PORT
+        (Path(self.state) / "hub.port").write_text(FILE_PORT, encoding="utf-8")
+        (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
+        port, exc, stderr = self._capture_discover()
+        self.assertIsNone(exc, exc)
+        self.assertEqual(port, int(FILE_PORT), port)
+        self.assertIn(KIND_PORT_INVALID, stderr, stderr)
+
+    def test_py_out_of_range_ports_are_invalid(self) -> None:
+        (Path(self.state) / "hub.token").write_text("t", encoding="utf-8")
+        for bad in OUT_OF_RANGE_PORTS:
+            with self.subTest(bad=bad):
+                self.pc._test_clear_cache()
+                with mock.patch.object(self.pc, "_discovery_warned_kinds", set()):
+                    os.environ["VCT_HUB_PORT"] = bad
+                    (Path(self.state) / "hub.port").write_text(bad, encoding="utf-8")
+                    port, exc, stderr = self._capture_discover()
+                self.assertIsNone(exc, exc)
+                self.assertEqual(port, int(DEFAULT_PORT), port)
+                self.assertIn(KIND_PORT_INVALID, stderr, stderr)
 
     def test_py_unreadable_port_warns_and_defaults(self) -> None:
         if os.geteuid() == 0:

@@ -106,7 +106,7 @@ def test_no_op_when_working_dir_already_correct(fake_home: Path, force_linux,
                                                  tmp_path: Path):
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     correct = str(cms.resolve())
     unit_path = _write_unit(fake_home, working_dir=correct,
@@ -132,7 +132,7 @@ def test_no_op_when_working_dir_already_correct(fake_home: Path, force_linux,
 def test_no_op_when_unit_missing(fake_home: Path, force_linux, tmp_path: Path):
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     # Unit file absent — _write_unit not called.
 
     deferral = DeferralReport()
@@ -150,7 +150,7 @@ def test_no_op_on_non_linux(fake_home: Path, monkeypatch, tmp_path: Path):
     monkeypatch.setattr(install.platform, "system", lambda: "Darwin")
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     # Even with a stale unit on disk, the helper must short-circuit.
     _write_unit(fake_home, working_dir="/totally/stale/path")
 
@@ -167,10 +167,10 @@ def test_repair_rewrites_stale_working_dir(fake_home: Path, force_linux,
                                            tmp_path: Path):
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     correct = str(cms.resolve())
-    stale = "/old/install/claude_mcp_servers"
+    stale = "/old/install/infrastructure"
     unit_path = _write_unit(fake_home, working_dir=stale, env_working_dir=stale)
 
     deferral = DeferralReport()
@@ -211,7 +211,7 @@ def test_repair_preserves_user_customisations(fake_home: Path, force_linux,
     not a from-template re-render."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     custom = "After=multi-user.target\nRequires=network-online.target\n"
     unit_path = _write_unit(
@@ -234,7 +234,7 @@ def test_repair_skipped_when_no_working_dir_line(fake_home: Path, force_linux,
     treated as "not ours" — leave it alone, return None, no deferral."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     unit_dir = fake_home / ".config" / "systemd" / "user"
     unit_dir.mkdir(parents=True)
     unit_path = unit_dir / install._BOOT_SERVICE_UNIT_NAME
@@ -260,7 +260,7 @@ def test_repair_handles_correct_working_dir_param(fake_home: Path, force_linux,
     helper must use that and skip its own resolution path."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    # Note: NO claude_mcp_servers/ subdir — would cause auto-resolution
+    # Note: NO infrastructure/ subdir — would cause auto-resolution
     # to fall through to None. The explicit param keeps it unambiguous.
     explicit = tmp_path / "explicit-compose-dir"
     explicit.mkdir()
@@ -299,7 +299,7 @@ def test_repair_soft_fail_on_unreadable_unit(fake_home: Path, force_linux,
     log + return None."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    (install_path / "claude_mcp_servers").mkdir()
+    (install_path / "infrastructure").mkdir()
     unit_path = _write_unit(fake_home, working_dir="/stale")
 
     real_read = Path.read_text
@@ -321,7 +321,7 @@ def test_repair_no_deferral_when_report_is_none(fake_home: Path, force_linux,
     happens; just no deferral entry is appended."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     unit_path = _write_unit(fake_home, working_dir="/stale",
                             env_working_dir="/stale")
@@ -340,7 +340,7 @@ def test_repair_does_not_inject_env_line_if_absent(fake_home: Path, force_linux,
     line — only existing matches get rewritten."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     # env_working_dir=None → no Environment= line in the unit.
     unit_path = _write_unit(fake_home, working_dir="/stale", env_working_dir=None)
@@ -364,7 +364,7 @@ def test_dispatcher_invokes_repair_with_deferral(fake_home: Path, force_linux,
     with the deferral_report it was given, BEFORE the renderer runs."""
     install_path = tmp_path / "install"
     install_path.mkdir()
-    cms = install_path / "claude_mcp_servers"
+    cms = install_path / "infrastructure"
     cms.mkdir()
     monkeypatch.setattr(install, "PROJECT_ROOT", install_path)
     # Stub out the OS-specific renderer so the test doesn't actually

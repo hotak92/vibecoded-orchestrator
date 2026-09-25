@@ -161,15 +161,49 @@ def project_settings_env(folder: Path) -> dict:
     channel that propagates to MCP subprocesses on every Claude Code
     surface).
     """
+    from vco_lib.jsonc_edit import load_object
+
+    # JSONC through the ONE reader (v0.2.97): Claude Code accepts comments and
+    # trailing commas here, and a strict ``json.loads`` read such a file as
+    # "no env" for every caller. The sharpest case is the residue cleanup's
+    # accept-loss gate (``shared_read_disabled_for``): a project that set
+    # ``SHARED_KG_READ_DISABLED`` in a commented settings.json looked opted
+    # IN, so a bundle update could delete its on-disk curated copies — its
+    # only curated access. (The MCP's read gate reads its process env, which
+    # Claude Code builds from the JSONC file itself; it was never affected.)
     try:
-        settings_file = Path(folder) / ".claude" / "settings.json"
-        if not settings_file.is_file():
-            return {}
-        data = json.loads(settings_file.read_text(encoding="utf-8"))
-        env = data.get("env") if isinstance(data, dict) else None
-        return env if isinstance(env, dict) else {}
+        loaded = load_object(Path(folder) / ".claude" / "settings.json")
     except Exception:  # noqa: BLE001 — settings read is best-effort
         return {}
+    env = loaded[0].get("env") if loaded is not None else None
+    return env if isinstance(env, dict) else {}
+
+
+def project_env_value(folder: Path, key: str) -> Optional[str]:
+    """``key`` from the project's own env, LOCALLY (no hub, no DB): the
+    ``.claude/settings.json`` ``env`` block, then the shell-sourced
+    ``.claude/env`` (whole file, first assignment wins — a user's own export
+    counts here, as it does when the file is sourced). ``None`` when neither
+    carries a non-empty string. Never raises.
+
+    One home for the "settings.json, then .claude/env" lookup the
+    ``SHARED_KG_READ_DISABLED`` gate and ``kg_sync_drift``'s KG_COLLECTION
+    hint each carried as a private regex (v0.2.97).
+    """
+    from vco_lib.envfile import env_value
+
+    val = project_settings_env(folder).get(key)
+    if isinstance(val, str) and val.strip():
+        return val.strip()
+    try:
+        env_file = Path(folder) / ".claude" / "env"
+        if env_file.is_file():
+            got = env_value(env_file.read_text(encoding="utf-8", errors="replace"), key)
+            if got is not None and got.strip():
+                return got.strip()
+    except Exception:  # noqa: BLE001 — env read is best-effort
+        pass
+    return None
 
 
 _TRUTHY = frozenset({"1", "true", "yes"})
@@ -182,25 +216,8 @@ def shared_read_disabled_for(folder: Path) -> bool:
     shell-sourced ``.claude/env``. Absent everywhere ⇒ False (shared reads
     are unconditional by default).
     """
-    env = project_settings_env(folder)
-    val = env.get("SHARED_KG_READ_DISABLED")
-    if isinstance(val, str) and val.strip():
-        return val.strip().lower() in _TRUTHY
-    # Fallback: the shell-sourced .claude/env (export KEY="value" lines).
-    try:
-        env_file = Path(folder) / ".claude" / "env"
-        if env_file.is_file():
-            text = env_file.read_text(encoding="utf-8", errors="replace")
-            m = re.search(
-                r'^\s*(?:export\s+)?SHARED_KG_READ_DISABLED=["\']?([^"\'\s]+)',
-                text,
-                flags=re.MULTILINE,
-            )
-            if m:
-                return m.group(1).strip().lower() in _TRUTHY
-    except Exception:  # noqa: BLE001 — env read is best-effort
-        pass
-    return False
+    val = project_env_value(folder, "SHARED_KG_READ_DISABLED")
+    return val is not None and val.lower() in _TRUTHY
 
 
 def load_curated_registry(registry_path: Path) -> Optional[dict[str, set]]:

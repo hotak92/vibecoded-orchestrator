@@ -141,19 +141,9 @@ impl Db {
         &self,
         module_id: &str,
     ) -> Result<Option<bool>, String> {
-        let guard = self.lock();
-        let row: Option<String> = guard
-            .query_row(
-                "SELECT setting_value FROM module_settings
-                  WHERE project_id IS NULL
-                    AND module_id = ?1
-                    AND setting_key = ?2",
-                params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY],
-                |r| r.get(0),
-            )
-            .optional()
+        let row = self
+            .global_setting_raw(module_id, MODULE_ENABLED_FOR_PROJECT_KEY)
             .map_err(|e| format!("module_global_enabled read: {}", e))?;
-
         match row {
             None => Ok(None),
             Some(s) => match serde_json::from_str::<Value>(&s) {
@@ -165,45 +155,81 @@ impl Db {
         }
     }
 
-    /// Write the GLOBAL (host-wide) enable flag for a module. Idempotent
-    /// upsert. Always writes a JSON boolean. The conflict target is the
-    /// partial unique index `idx_ms_unique_global` (migration 034) so
-    /// the standard `ON CONFLICT(project_id, module_id, setting_key)`
-    /// shape used by `set_setting` would NOT trigger here — we use an
-    /// explicit DELETE + INSERT to keep the upsert semantics clear and
-    /// independent of the partial-index conflict target.
-    pub fn module_set_global_enabled(
-        &self,
-        module_id: &str,
-        enabled: bool,
-    ) -> Result<(), String> {
-        let encoded = serde_json::to_string(&Value::Bool(enabled))
-            .map_err(|e| format!("module_set_global_enabled encode: {}", e))?;
+    /// The raw JSON text of a module's GLOBAL (host-wide, `project_id IS
+    /// NULL`) setting row, or `None` when no such row exists. The one
+    /// reader of global rows: the enable flag above and
+    /// [`Db::get_global_setting`] parse it their own way.
+    fn global_setting_raw(&self, module_id: &str, key: &str) -> Result<Option<String>, String> {
+        let guard = self.lock();
+        guard
+            .query_row(
+                "SELECT setting_value FROM module_settings
+                  WHERE project_id IS NULL
+                    AND module_id = ?1
+                    AND setting_key = ?2",
+                params![module_id, key],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| e.to_string())
+    }
+
+    /// A module's GLOBAL (host-wide) setting — the value that is not any
+    /// one project's, e.g. `vct-hub-api`'s `VCT_HUB_PORT` (there is one hub
+    /// per machine). `Ok(None)` when no row exists; `Err` when the row is
+    /// not JSON (a caller decides whether that fails open).
+    pub fn get_global_setting(&self, module_id: &str, key: &str) -> Result<Option<Value>, String> {
+        match self.global_setting_raw(module_id, key) {
+            Ok(None) => Ok(None),
+            Ok(Some(s)) => serde_json::from_str(&s)
+                .map(Some)
+                .map_err(|e| format!("parse global setting {module_id}/{key}: {e}")),
+            Err(e) => Err(format!("get global setting {module_id}/{key}: {e}")),
+        }
+    }
+
+    /// Write a module's GLOBAL (host-wide) setting. Idempotent upsert.
+    pub fn set_global_setting(&self, module_id: &str, key: &str, value: &Value) -> Result<(), String> {
+        let encoded = serde_json::to_string(value)
+            .map_err(|e| format!("set global setting {module_id}/{key} encode: {e}"))?;
         let guard = self.lock();
         // Single transaction: delete any pre-existing global row, then
         // insert the new one. Cheaper than reasoning about partial-
-        // index ON CONFLICT semantics, and the partial unique index
-        // still enforces correctness if a concurrent writer races.
+        // index ON CONFLICT semantics (the conflict target would be
+        // `idx_ms_unique_global`, migration 034, not the per-project
+        // shape `set_setting` uses), and the partial unique index still
+        // enforces correctness if a concurrent writer races.
         let tx = guard
             .unchecked_transaction()
-            .map_err(|e| format!("module_set_global_enabled txn: {}", e))?;
+            .map_err(|e| format!("set global setting {module_id}/{key} txn: {e}"))?;
         tx.execute(
             "DELETE FROM module_settings
               WHERE project_id IS NULL
                 AND module_id = ?1
                 AND setting_key = ?2",
-            params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY],
+            params![module_id, key],
         )
-        .map_err(|e| format!("module_set_global_enabled delete: {}", e))?;
+        .map_err(|e| format!("set global setting {module_id}/{key} delete: {e}"))?;
         tx.execute(
             "INSERT INTO module_settings (project_id, module_id, setting_key, setting_value)
              VALUES (NULL, ?1, ?2, ?3)",
-            params![module_id, MODULE_ENABLED_FOR_PROJECT_KEY, encoded],
+            params![module_id, key, encoded],
         )
-        .map_err(|e| format!("module_set_global_enabled insert: {}", e))?;
+        .map_err(|e| format!("set global setting {module_id}/{key} insert: {e}"))?;
         tx.commit()
-            .map_err(|e| format!("module_set_global_enabled commit: {}", e))?;
-        Ok(())
+            .map_err(|e| format!("set global setting {module_id}/{key} commit: {e}"))
+    }
+
+    /// Write the GLOBAL (host-wide) enable flag for a module. Idempotent
+    /// upsert. Always writes a JSON boolean, through
+    /// [`Db::set_global_setting`] (the one global-row writer).
+    pub fn module_set_global_enabled(
+        &self,
+        module_id: &str,
+        enabled: bool,
+    ) -> Result<(), String> {
+        self.set_global_setting(module_id, MODULE_ENABLED_FOR_PROJECT_KEY, &Value::Bool(enabled))
+            .map_err(|e| format!("module_set_global_enabled: {}", e))
     }
 
     /// Delete the GLOBAL (host-wide) enable row for a module, returning the

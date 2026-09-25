@@ -94,7 +94,6 @@ see ``tests/test_v0292_kg_sync_drift.py``):
 """
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -462,26 +461,9 @@ def _local_kg_collection_hint(folder: Path) -> str:
     no ``.claude/`` bundle at all (the exact "registered but unbundled"
     case) or neither file carries the key. Never raises.
     """
-    from vco_lib.knowledge_residue import project_settings_env
+    from vco_lib.knowledge_residue import project_env_value
 
-    env = project_settings_env(folder)
-    val = env.get("KG_COLLECTION")
-    if isinstance(val, str) and val.strip():
-        return val.strip()
-    try:
-        env_file = Path(folder) / ".claude" / "env"
-        if env_file.is_file():
-            text = env_file.read_text(encoding="utf-8", errors="replace")
-            m = re.search(
-                r'^\s*(?:export\s+)?KG_COLLECTION=["\']?([^"\'\s]+)',
-                text,
-                flags=re.MULTILINE,
-            )
-            if m:
-                return m.group(1).strip()
-    except Exception:  # noqa: BLE001 — local config read is best-effort
-        pass
-    return ""
+    return project_env_value(folder, "KG_COLLECTION") or ""
 
 
 def check_kg_binding(

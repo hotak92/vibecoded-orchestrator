@@ -5,7 +5,7 @@ short_desc: validate KG + code-graph integrity (read-only maintenance audit)
 keywords: ["graph integrity", "KG validation", "consistency check", "orphaned nodes", "broken WikiLinks", "validate KG", "check KG health", "audit knowledge graph", "dangling references"]
 tools: Read, Bash, Grep, Glob
 model: haiku
-effort: high
+effort: medium
 ---
 
 # Graph Health Checker Agent

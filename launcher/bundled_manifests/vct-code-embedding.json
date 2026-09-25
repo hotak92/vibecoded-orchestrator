@@ -5,7 +5,7 @@
   "id": "vct-code-embedding",
   "name": "Code Embedding Service",
   "version": "0.3.1",
-  "description": "GPU/CPU code embedding service (HTTP on port 11438). Wraps CodeSage-Large-v2 (2048-dim, Apache-2.0) via sentence-transformers. Falls back to Ollama jina-v2-base-code on CPU-only setups.",
+  "description": "GPU/CPU code embedding service (HTTP on port 11440 unless its CODE_EMBED_PORT setting says otherwise). Wraps CodeSage-Large-v2 (2048-dim, Apache-2.0) via sentence-transformers. Falls back to Ollama jina-v2-base-code on CPU-only setups.",
   "publisher": "VibeCoded Tools",
   "repository": "https://github.com/VibeCoded-Tools/orchestrator",
 
@@ -62,7 +62,8 @@
       "type": "string",
       "default": "gpu",
       "options": ["gpu", "ollama"],
-      "required": true
+      "required": true,
+      "scope": "global"
     },
     {
       "key": "CODE_EMBED_DEVICE",
@@ -70,16 +71,18 @@
       "description": "cuda / mps / cpu. Leave empty for auto-detect.",
       "type": "string",
       "default": "",
-      "required": false
+      "required": false,
+      "scope": "global"
     },
     {
       "key": "CODE_EMBED_PORT",
       "prompt": "HTTP port",
       "type": "integer",
-      "default": 11438,
+      "default": 11440,
       "min": 1024,
       "max": 65535,
-      "required": true
+      "required": true,
+      "scope": "global"
     }
   ],
 
@@ -98,18 +101,16 @@
     },
     "health_check": {
       "type": "http_get",
-      "url": "http://localhost:11438/health",
+      "url": "http://localhost:{code_embed_port}/health",
       "timeout_s": 10,
-      "interval_s": 60
+      "interval_s": 60,
+      "_note": "{code_embed_port} is the port the launcher resolves for the service (docs/VCT_MODULE_MANIFEST_SPEC.md section 15): its row in the launcher.db service_endpoints table, else 11440 - CODE_EMBED_PORT's default in claude_mcp_servers/code_embedding_service/server.py, infrastructure/docker-compose.yml and the setting above. The same row feeds CODE_EMBED_PORT in every project's env, so the hub's health poller (vct-hub src/module_health.rs) probes the port the service was moved to (Services page, Move to another port). Pinned by bundled_manifests::tests::code_embedding_manifest_names_the_services_real_default_port and project_env_settings::tests::code_embedding_health_url_is_the_resolvers_default. It once said 11438, a port nothing serves."
     },
     "auto_restart": true,
     "log_file": "{VCT_LOGS}/vct-code-embedding.log"
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally."
-  },
+  "_mcp_note": "Not an MCP — it's an HTTP service the weaviate-kg MCP calls internally.",
 
   "upgrade": {
     "strategy": "git_pull"

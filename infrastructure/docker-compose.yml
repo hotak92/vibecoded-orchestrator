@@ -10,7 +10,19 @@ services:
       - "${WEAVIATE_PORT:-8081}:8080"
       - "${WEAVIATE_GRPC_PORT:-50052}:50051"
     volumes:
-      - weaviate_data:/var/lib/weaviate
+      # v0.2.97: the volume SOURCE is env-overridable (the
+      # VCT_CODE_EMBED_BUILD_CONTEXT pattern) so a machine whose weaviate
+      # data lives at a HOST PATH (bind layout) can adopt this compose
+      # without copying data — and a blind `--force-recreate` can no longer
+      # silently re-point the service at the EMPTY default volume. Compose
+      # classifies the short-syntax source as a BIND when it starts with
+      # `/`, `./` or `~`, and as a named volume otherwise (verified: docker
+      # compose v2.40.3 + podman-compose 1.5.0, `config` renders). A plain
+      # volume NAME here would be an UNDECLARED volume (docker compose:
+      # "service refers to undefined volume") — to reuse an existing named
+      # volume set VCT_WEAVIATE_VOLUME_NAME in the top-level `volumes:`
+      # block below instead.
+      - ${VCT_WEAVIATE_DATA_SOURCE:-weaviate_data}:/var/lib/weaviate
     environment:
       QUERY_DEFAULTS_LIMIT: 25
       AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: "true"
@@ -178,7 +190,14 @@ services:
     ports:
       - "${OLLAMA_PORT:-11435}:11434"
     volumes:
-      - ollama_data:/root/.ollama
+      # v0.2.97: env-overridable volume SOURCE — see the weaviate note.
+      # The field case this fixes: Ollama models on a host path (110 GB)
+      # shared with other containers' bind mounts; the default named
+      # volume vco_ollama_data is EMPTY on such machines, so adopting this
+      # compose without the override would orphan the models (not delete —
+      # but invisible to the service). To reuse an existing named volume
+      # instead, set VCT_OLLAMA_VOLUME_NAME below.
+      - ${VCT_OLLAMA_DATA_SOURCE:-ollama_data}:/root/.ollama
     environment:
       OLLAMA_ORIGINS: "*"
       OLLAMA_FLASH_ATTENTION: "1"
@@ -248,18 +267,40 @@ services:
       # (11434, NOT the host-mapped 11435). The gpu/codesage default backend
       # never reads OLLAMA_URL, so this is a no-op there. Power users can
       # override (e.g. an Ollama running on the host) via CODE_EMBED_OLLAMA_URL.
+      # v0.2.97: when Ollama is NOT VCO's compose service (an adopted
+      # container or a native/remote Ollama — launcher.db service_endpoints),
+      # vco_ollama does not exist on this network; `compose_env.
+      # write_service_keys` then writes CODE_EMBED_OLLAMA_URL into
+      # infrastructure/.env from the Ollama row.
       OLLAMA_URL: "${CODE_EMBED_OLLAMA_URL:-http://vco_ollama:11434}"
       HF_HOME: "/cache"
       HF_HUB_CACHE: "/cache"
       TRANSFORMERS_CACHE: "/cache"
+    # v0.2.97: the name an adopted Ollama ON THIS HOST is reached by under
+    # Docker (CODE_EMBED_OLLAMA_URL=http://vco-host-gateway:<port>). Docker
+    # resolves the literal `host-gateway` to the host; `compose_env` writes
+    # VCT_CODE_EMBED_HOST_GATEWAY=host-gateway only for Docker. Podman reaches
+    # the host as `host.containers.internal` natively and podman 4.x rejects
+    # `host-gateway`, so there the entry keeps the inert default and nothing
+    # uses it. A dedicated name (not host.docker.internal) so Docker Desktop's
+    # own host.docker.internal is never shadowed.
+    extra_hosts:
+      - "vco-host-gateway:${VCT_CODE_EMBED_HOST_GATEWAY:-127.0.0.1}"
     # Start after Ollama so its in-network DNS name resolves when the ollama
     # backend probes it. Short-form (start-order only) — the ollama service
     # has no healthcheck to gate on, and this must not change the gpu profile
     # gating (the gpu overlay only merges a `deploy.resources` block here).
+    # v0.2.97: every VCO compose invocation passes `--no-deps` with an
+    # explicit service list, so this never creates an Ollama when Ollama is
+    # adopted (plan invariant I1) — it only orders a joint start.
     depends_on:
       - ollama
     volumes:
-      - code_embed_cache:/cache
+      # v0.2.97: env-overridable volume SOURCE — see the weaviate note.
+      # The field case: a 7.4 GB HF/transformers cache on a host bind
+      # while the default named volume is empty. To reuse an existing
+      # named volume instead, set VCT_CODE_EMBED_VOLUME_NAME below.
+      - ${VCT_CODE_EMBED_CACHE_SOURCE:-code_embed_cache}:/cache
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:11440/health')\""]
       interval: 30s
@@ -280,10 +321,23 @@ services:
 #     <name_above>:
 #       external: true
 #       name: <pre-existing-volume-name>
+#
+# v0.2.97: the resolved volume NAME is also env-overridable in place
+# (${VCT_<SERVICE>_VOLUME_NAME:-<today's name>}), so a machine that
+# already has its data in a DIFFERENTLY-NAMED volume can point the
+# service at it without an override file. This is the second knob of
+# the per-service pair documented in the service stanzas above: a HOST
+# PATH goes in the stanza's SOURCE knob — VCT_WEAVIATE_DATA_SOURCE,
+# VCT_OLLAMA_DATA_SOURCE, VCT_CODE_EMBED_CACHE_SOURCE (it becomes a
+# bind); an EXISTING VOLUME NAME goes here (a plain name in the service
+# stanza would be an undeclared volume — a hard compose error). Set
+# these in infrastructure/.env (compose auto-reads it; the installer's
+# managed lines there are preserved on re-runs) or export them in the
+# shell that drives compose. Unset → today's exact behaviour.
 volumes:
   weaviate_data:
-    name: vco_weaviate_data
+    name: ${VCT_WEAVIATE_VOLUME_NAME:-vco_weaviate_data}
   ollama_data:
-    name: vco_ollama_data
+    name: ${VCT_OLLAMA_VOLUME_NAME:-vco_ollama_data}
   code_embed_cache:
-    name: vco_code_embed_cache
+    name: ${VCT_CODE_EMBED_VOLUME_NAME:-vco_code_embed_cache}

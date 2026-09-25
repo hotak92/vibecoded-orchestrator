@@ -595,11 +595,11 @@ struct HookEnabledReq {
     enabled: bool,
 }
 
-/// Toggle a hook's enforcement from the `vco hooks enable/disable` CLI
+/// Toggle a hook's enforcement from the `vct-cli hooks enable/disable` CLI
 /// (v0.2.91 wave 5 residual close).
 ///
 /// Pre-fix this called `Db::set_project_hook_enabled(hook_id, enabled)` — a
-/// bare mirror-table `UPDATE` that nothing downstream reads, so `vco hooks
+/// bare mirror-table `UPDATE` that nothing downstream reads, so `vct-cli hooks
 /// disable <id>` silently did not stop the hook firing. Real enforcement
 /// (`hooks_enforcement::enforce_hook_toggle`) edits the owning project's
 /// `.claude/settings.json`, which means the owning project must be known:
@@ -621,7 +621,7 @@ async fn set_hook_enabled(
                 StatusCode::BAD_REQUEST,
                 "project_id_required",
                 "toggling a hook edits .claude/settings.json, which needs the owning \
-                 project. Pass `--project <id-or-slug>` (`vco hooks list <project>` to \
+                 project. Pass `--project <id-or-slug>` (`vct-cli hooks list <project>` to \
                  find it).",
             );
         }
@@ -735,34 +735,19 @@ const CODEGRAPH_CLASSES: &[&str] = &[
     "CodeInteraction",
 ];
 
-fn weaviate_url() -> String {
-    // Env-var precedence mirrors `commands::kg::weaviate_url` — see
-    // `config.rs` for the full externalization policy. The hub server
-    // doesn't have access to Tauri's managed `LocalConfig` state because
-    // it runs in a parallel axum runtime with its own handle struct
-    // (`LauncherDbHandle`); plumbing the config through every handler
-    // here would balloon the diff. So we honour the same env-var keys
-    // and fall through to `config::DEFAULT_WEAVIATE_URL` when neither
-    // is set. Operators editing `vct-config.toml` see the change in the
-    // Tauri command path immediately; the hub picks it up on next
-    // restart only if they also export `VCT_WEAVIATE_URL`. Acceptable
-    // for 0.2.x since the hub-only KG endpoints are CLI-tools-only.
-    if let Ok(v) = std::env::var("VCT_WEAVIATE_URL") {
-        if !v.is_empty() {
-            return v;
-        }
-    }
-    std::env::var("WEAVIATE_URL")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| vct_launcher_core::config::DEFAULT_WEAVIATE_URL.to_string())
+fn weaviate_url(db: &Db) -> String {
+    // v0.2.97: the machine row (`service_endpoints::machine_weaviate_url`),
+    // like every other hub surface. The hub reads NO endpoint env var — no
+    // `WEAVIATE_URL`, no `VCT_WEAVIATE_URL`: it is a machine-scoped process a
+    // project's hook may have started with that project's projected env
+    // (service-endpoints plan §4f).
+    vct_launcher_core::services::service_endpoints::machine_weaviate_url(db)
 }
 
-fn weaviate_client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("http client: {}", e))
+/// A client for `wurl` (the machine's Weaviate — loopback unless adopted
+/// elsewhere): `vct_launcher_core::services::loopback_http::client_for`.
+fn weaviate_client(wurl: &str) -> Result<reqwest::Client, String> {
+    vct_launcher_core::services::loopback_http::client_for(wurl, std::time::Duration::from_secs(15))
 }
 
 /// Hub-side mirror of `commands::kg::require_kg_read`. Same DB table,
@@ -791,9 +776,10 @@ fn require_kg_read(db: &Db, project_id: &str, collection: &str) -> Result<(), St
 /// even one marker is dropped.
 async fn detect_orchestrator_kg_collections(
     client: &reqwest::Client,
+    weaviate_url: &str,
 ) -> Result<Vec<String>, String> {
     let resp = client
-        .get(format!("{}/v1/schema", weaviate_url()))
+        .get(format!("{}/v1/schema", weaviate_url))
         .send()
         .await
         .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
@@ -862,9 +848,10 @@ async fn detect_orchestrator_kg_collections(
 /// and any prefixed variant so callers can search across all projects.
 async fn detect_codegraph_collections(
     client: &reqwest::Client,
+    weaviate_url: &str,
 ) -> Result<Vec<String>, String> {
     let resp = client
-        .get(format!("{}/v1/schema", weaviate_url()))
+        .get(format!("{}/v1/schema", weaviate_url))
         .send()
         .await
         .map_err(|e| format!("weaviate /v1/schema: {}", e))?;
@@ -918,7 +905,7 @@ fn filter_codegraph_by_scope(all: Vec<String>, scope: &str) -> Vec<String> {
         .collect()
 }
 
-async fn fetch_class_count(client: &reqwest::Client, class: &str) -> u32 {
+async fn fetch_class_count(client: &reqwest::Client, class: &str, weaviate_url: &str) -> u32 {
     // Same shape as commands::kg::fetch_class_count. No quoting needed
     // for class names — Weaviate class names are restricted to
     // [A-Za-z][A-Za-z0-9_]*.
@@ -926,7 +913,7 @@ async fn fetch_class_count(client: &reqwest::Client, class: &str) -> u32 {
         "query": format!("{{ Aggregate {{ {cls} {{ meta {{ count }} }} }} }}", cls = class)
     });
     let resp = client
-        .post(format!("{}/v1/graphql", weaviate_url()))
+        .post(format!("{}/v1/graphql", weaviate_url))
         .json(&body)
         .send()
         .await;
@@ -947,12 +934,13 @@ struct CollectionSummary {
     node_count: u32,
 }
 
-async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Response {
-    let client = match weaviate_client() {
+async fn kg_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
+    let wurl = weaviate_url(&state.0.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let names = match detect_orchestrator_kg_collections(&client).await {
+    let names = match detect_orchestrator_kg_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -964,7 +952,7 @@ async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Resp
     };
     let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
     for n in names {
-        let count = fetch_class_count(&client, &n).await;
+        let count = fetch_class_count(&client, &n, &wurl).await;
         out.push(CollectionSummary {
             name: n,
             node_count: count,
@@ -974,12 +962,13 @@ async fn kg_collections(_state: State<LauncherDbHandle>) -> axum::response::Resp
     Json(serde_json::json!({ "collections": out, "count": count })).into_response()
 }
 
-async fn codegraph_collections(_state: State<LauncherDbHandle>) -> axum::response::Response {
-    let client = match weaviate_client() {
+async fn codegraph_collections(state: State<LauncherDbHandle>) -> axum::response::Response {
+    let wurl = weaviate_url(&state.0.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
-    let names = match detect_codegraph_collections(&client).await {
+    let names = match detect_codegraph_collections(&client, &wurl).await {
         Ok(v) => v,
         Err(e) => {
             return (
@@ -991,7 +980,7 @@ async fn codegraph_collections(_state: State<LauncherDbHandle>) -> axum::respons
     };
     let mut out: Vec<CollectionSummary> = Vec::with_capacity(names.len());
     for n in names {
-        let count = fetch_class_count(&client, &n).await;
+        let count = fetch_class_count(&client, &n, &wurl).await;
         out.push(CollectionSummary {
             name: n,
             node_count: count,
@@ -1040,14 +1029,15 @@ async fn kg_search(
     }
     let limit = req.limit.unwrap_or(20).min(100);
 
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&h.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (v, false),
-        _ => match detect_orchestrator_kg_collections(&client).await {
+        _ => match detect_orchestrator_kg_collections(&client, &wurl).await {
             Ok(v) => (v, true),
             Err(e) => {
                 return (
@@ -1101,7 +1091,7 @@ async fn kg_search(
             lim = limit,
         );
         let resp = client
-            .post(format!("{}/v1/graphql", weaviate_url()))
+            .post(format!("{}/v1/graphql", wurl))
             .json(&serde_json::json!({ "query": q }))
             .send()
             .await;
@@ -1236,14 +1226,15 @@ async fn codegraph_search(
             .into_response();
     }
 
-    let client = match weaviate_client() {
+    let wurl = weaviate_url(&h.0);
+    let client = match weaviate_client(&wurl) {
         Ok(c) => c,
         Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
     };
 
     let (collections, auto_detected) = match req.collections.clone() {
         Some(v) if !v.is_empty() => (filter_codegraph_by_scope(v, &scope), false),
-        _ => match detect_codegraph_collections(&client).await {
+        _ => match detect_codegraph_collections(&client, &wurl).await {
             Ok(v) => (filter_codegraph_by_scope(v, &scope), true),
             Err(e) => {
                 return (
@@ -1288,7 +1279,7 @@ async fn codegraph_search(
             label = label_field,
         );
         let resp = client
-            .post(format!("{}/v1/graphql", weaviate_url()))
+            .post(format!("{}/v1/graphql", wurl))
             .json(&serde_json::json!({ "query": q }))
             .send()
             .await;
@@ -1392,6 +1383,29 @@ fn is_valid_class_name(s: &str) -> bool {
 mod cli_kg_tests {
     use super::*;
 
+    /// v0.2.97: the CLI's Weaviate URL is the machine row and nothing else —
+    /// not `WEAVIATE_URL`, not `VCT_WEAVIATE_URL`, not a retired
+    /// `weaviate.port_override`. With no row on this in-memory harness DB
+    /// the resolver's harness guard answers the unroutable sentinel.
+    #[test]
+    fn weaviate_url_resolver_is_the_machine_row() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
+            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, Some("http://statement.invalid:1")),
+            ("WEAVIATE_URL", Some("http://transport.invalid:2")),
+        ]);
+        let db = vct_launcher_core::db::Db::open_in_memory().unwrap();
+        assert_eq!(weaviate_url(&db), "http://127.0.0.1:9");
+
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedExternal, "weaviate.lan", 8090);
+        row.grpc_port = Some(50051);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        assert_eq!(weaviate_url(&db), "http://weaviate.lan:8090");
+
+        db.app_state_set("weaviate.port_override", "18081").unwrap();
+        assert_eq!(weaviate_url(&db), "http://weaviate.lan:8090");
+    }
+
     #[test]
     fn class_name_validation_accepts_canonical_and_namespaced() {
         assert!(is_valid_class_name("CodeFunction"));
@@ -1476,16 +1490,13 @@ mod cli_kg_tests {
 // ─── Integration tests: real hub + real local Weaviate ──────────────────
 //
 // These tests spawn the axum router (cli_api + a stubbed-but-real
-// `LauncherDbHandle`) on a random port and hit it with reqwest. They
-// also talk to the user's local Weaviate at http://localhost:8081.
-//
-// Per the task brief, NO MOCKS. If localhost:8081 is unreachable the
-// test prints a skip message and returns Ok — same as `#[ignore]` would
-// give us, but without losing the ability to run the rest of the suite
-// when Weaviate IS up.
-//
-// Tests labelled `_real_weaviate` require Weaviate to be reachable; they
-// are best-effort skipped otherwise so CI / fresh checkouts don't fail.
+// `LauncherDbHandle`) on a random port and hit it with reqwest. The
+// default harness (`spawn_test_hub`) points every service at the
+// unroutable sentinel; a test that needs a Weaviate stands up a fake one
+// and seeds its row. Only the tests marked
+// `#[ignore = "requires local Weaviate at localhost:8081"]` talk to a real
+// local Weaviate, through `spawn_real_weaviate_hub` — an explicit opt-in
+// that `cargo test -- --ignored` runs and the default run never does.
 
 #[cfg(test)]
 mod cli_kg_integration_tests {
@@ -1497,6 +1508,11 @@ mod cli_kg_integration_tests {
     /// (base_url, db_handle). The DB is in-memory and isolated per test.
     async fn spawn_test_hub() -> (String, LauncherDbHandle) {
         let db = Db::open_in_memory().expect("in-memory db");
+        // Every service at the unroutable sentinel: no harness request can
+        // reach a real local Weaviate. A test that needs a (fake) Weaviate
+        // seeds its row; the `#[ignore]`d real-Weaviate tests opt in by name
+        // through `spawn_real_weaviate_hub`.
+        db.seed_sentinel_service_endpoints_for_tests().expect("seed sentinel rows");
         let handle = LauncherDbHandle(Arc::new(db));
         let app: Router = Router::new()
             .nest("/api/v1", super::router().with_state(handle.clone()));
@@ -1510,16 +1526,35 @@ mod cli_kg_integration_tests {
         (format!("http://{}/api/v1", addr), handle)
     }
 
-    /// RAII guard returned by `lock_real_weaviate`. While this guard is
-    /// alive, no env-var-mutating test can run (they take the write
-    /// lock). Drop it to release.
-    type WeaviateReadGuard<'a> = std::sync::RwLockReadGuard<'a, ()>;
-
-    /// Acquire the shared read lock so a test can safely talk to the
-    /// real local Weaviate without racing against env-var mutators.
-    fn lock_real_weaviate() -> WeaviateReadGuard<'static> {
-        TEST_ENV_LOCK.read().unwrap()
+    /// Point this harness's Weaviate row at `url` (`http://host:port`).
+    fn seed_weaviate_row(handle: &LauncherDbHandle, url: &str) {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let authority = url.trim_start_matches("http://");
+        let (host, port) = authority.rsplit_once(':').expect("http://host:port");
+        let mut row = ServiceEndpointRow::new(
+            "weaviate",
+            EndpointMode::AdoptedExternal,
+            host,
+            port.parse().expect("port"),
+        );
+        row.grpc_port = Some(50051);
+        handle.0.service_endpoint_seed_for_tests(&row).expect("seed weaviate row");
     }
+
+    /// The `#[ignore = "requires local Weaviate at localhost:8081"]` tests
+    /// only: a harness whose Weaviate row names the REAL local instance. An
+    /// explicit opt-in by name — the default harness can never reach it.
+    async fn spawn_real_weaviate_hub() -> (String, LauncherDbHandle) {
+        let (base, handle) = spawn_test_hub().await;
+        seed_weaviate_row(&handle, "http://localhost:8081");
+        (base, handle)
+    }
+
+    // v0.2.97: `lock_real_weaviate` / `TEST_ENV_LOCK` are gone. They
+    // ordered the real-Weaviate tests against tests that re-pointed the
+    // hub by mutating `WEAVIATE_URL`; the hub reads no endpoint env var
+    // now, and each harness states its Weaviate in its own in-memory DB, so
+    // there is nothing left to order.
 
     // v0.2.96 (L-15): `weaviate_reachable()` lived here — a runtime probe
     // whose docstring said "tests use this to short-circuit when running in
@@ -1549,8 +1584,9 @@ mod cli_kg_integration_tests {
             .expect("insert project");
 
         // Grant read on every detected orchestrator-shaped collection.
-        let client = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&client).await.unwrap_or_default();
+        let client = weaviate_client(&weaviate_url(&handle.0)).unwrap();
+        let cols =
+            detect_orchestrator_kg_collections(&client, &weaviate_url(&handle.0)).await.unwrap_or_default();
         for c in &cols {
             handle.0.kg_set_access(&pid, c, "read").expect("grant read");
         }
@@ -1560,8 +1596,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_collections_endpoint_returns_only_orchestrator_shaped() {
-        let _env_guard = lock_real_weaviate();
-        let (base, _h) = spawn_test_hub().await;
+        let (base, _h) = spawn_real_weaviate_hub().await;
         let client = reqwest::Client::new();
         let resp = client
             .get(format!("{}/cli/kg/collections", base))
@@ -1617,8 +1652,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_rejects_invalid_collection_name() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         // Need a project row + at least one valid grant so we get past
         // ACL gating BEFORE the validity check fires. Actually, the
         // ACL gate runs first, so we'd hit "no read access" not "invalid
@@ -1658,8 +1692,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_returns_403_on_missing_grant() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
             &pid,
@@ -1671,8 +1704,8 @@ mod cli_kg_integration_tests {
         .unwrap();
 
         // Pick a real orchestrator-shaped collection but DON'T grant it.
-        let wclient = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
+        let wclient = weaviate_client(&weaviate_url(&h.0)).unwrap();
+        let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
@@ -1693,8 +1726,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_with_auto_detect_returns_collections_searched() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
         let client = reqwest::Client::new();
@@ -1731,12 +1763,11 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_with_explicit_collections_skips_auto_detect() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
-        let wclient = weaviate_client().unwrap();
-        let cols = detect_orchestrator_kg_collections(&wclient).await.unwrap();
+        let wclient = weaviate_client(&weaviate_url(&h.0)).unwrap();
+        let cols = detect_orchestrator_kg_collections(&wclient, &weaviate_url(&h.0)).await.unwrap();
         assert!(!cols.is_empty(), "no orchestrator collections found on dev Weaviate — test requires at least one");
         let target = &cols[0];
 
@@ -1768,8 +1799,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_audit_row_is_written_with_truncated_query() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
         // 250-char query, verifies 200-char truncation in the audit row.
@@ -1804,8 +1834,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn kg_search_handles_quote_in_query_safely() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = seed_project_with_kg_grants(&h).await;
 
         // A query that, if not escaped, would close the GraphQL string
@@ -1840,11 +1869,6 @@ mod cli_kg_integration_tests {
         // test stands up a fake /v1/schema returning a mix and verifies
         // only the marker-complete class is returned.
         //
-        // SAFETY: WEAVIATE_URL is process-global; the test save+restore
-        // pattern matches what `kg_collections_returns_500_*` does. To
-        // avoid races with siblings that read the var, we serialise
-        // through a parking_lot mutex via the TEST_ENV_LOCK below.
-        let _g = TEST_ENV_LOCK.write().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1893,26 +1917,17 @@ mod cli_kg_integration_tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let saved = std::env::var_os("WEAVIATE_URL");
-        unsafe { std::env::set_var("WEAVIATE_URL", format!("http://{}", addr)); }
+        let wurl = format!("http://{}", addr);
 
-        let client = weaviate_client().unwrap();
-        let detected = detect_orchestrator_kg_collections(&client).await.unwrap();
-
-        unsafe {
-            if let Some(v) = saved {
-                std::env::set_var("WEAVIATE_URL", v);
-            } else {
-                std::env::remove_var("WEAVIATE_URL");
-            }
-        }
+        let client = weaviate_client(&wurl).unwrap();
+        let detected =
+            detect_orchestrator_kg_collections(&client, &wurl).await.unwrap();
 
         assert_eq!(detected, vec!["GoodKG".to_string()]);
     }
 
     #[tokio::test]
     async fn kg_collections_returns_empty_list_when_no_orchestrator_classes() {
-        let _g = TEST_ENV_LOCK.write().unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind");
@@ -1927,49 +1942,22 @@ mod cli_kg_integration_tests {
             let _ = axum::serve(listener, app).await;
         });
 
-        let saved = std::env::var_os("WEAVIATE_URL");
-        unsafe { std::env::set_var("WEAVIATE_URL", format!("http://{}", addr)); }
+        let wurl = format!("http://{}", addr);
 
-        let client = weaviate_client().unwrap();
-        let detected = detect_orchestrator_kg_collections(&client).await;
-
-        unsafe {
-            if let Some(v) = saved {
-                std::env::set_var("WEAVIATE_URL", v);
-            } else {
-                std::env::remove_var("WEAVIATE_URL");
-            }
-        }
+        let client = weaviate_client(&wurl).unwrap();
+        let detected =
+            detect_orchestrator_kg_collections(&client, &wurl).await;
 
         // Empty-but-Ok, NOT an error.
         let detected = detected.expect("empty schema is not an error");
         assert!(detected.is_empty());
     }
 
-    /// Process-global lock for env-var-mutating tests.
-    ///
-    /// Cargo runs unit tests in parallel by default. Tests that *mutate*
-    /// `WEAVIATE_URL` take a write lock; tests that *read* it (i.e. every
-    /// test that calls real Weaviate — all of them via `lock_real_weaviate`
-    /// above) take a read lock. The pattern protects readers from seeing a
-    /// transient "broken" URL set by a writer that hasn't restored the env
-    /// yet. (v0.2.96: this sentence used to also name `weaviate_reachable`,
-    /// a helper nothing called; it is gone, and naming a retired mechanism
-    /// here would keep instructing readers to look for it.)
-    static TEST_ENV_LOCK: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
     #[tokio::test]
     async fn kg_collections_returns_503_when_weaviate_unreachable() {
-        // Point the hub at a port that is known not to be running a
-        // server. We stand up the hub on its own random port, but
-        // override the WEAVIATE_URL for the duration of this test so
-        // detection fails cleanly.
-        let _g = TEST_ENV_LOCK.write().unwrap();
-        let saved = std::env::var_os("WEAVIATE_URL");
-        // Pick an almost-certainly-closed local port. 1 = privileged on
-        // Linux and unreachable for our process.
-        unsafe { std::env::set_var("WEAVIATE_URL", "http://127.0.0.1:1"); }
-
+        // The harness's Weaviate row is the unroutable sentinel
+        // (`127.0.0.1:9`): detection fails cleanly.
         let (base, _h) = spawn_test_hub().await;
         let client = reqwest::Client::new();
         let resp = client
@@ -1978,16 +1966,6 @@ mod cli_kg_integration_tests {
             .await
             .expect("send");
 
-        // Restore env BEFORE asserting so a failed assertion doesn't
-        // poison the rest of the suite.
-        unsafe {
-            if let Some(v) = saved {
-                std::env::set_var("WEAVIATE_URL", v);
-            } else {
-                std::env::remove_var("WEAVIATE_URL");
-            }
-        }
-
         // 503 (Service Unavailable) is what we return when Weaviate's
         // /v1/schema can't be fetched. NOT 500 (panic) and NOT 200.
         assert_eq!(resp.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
@@ -1995,11 +1973,62 @@ mod cli_kg_integration_tests {
         assert!(body.get("error").is_some());
     }
 
+    /// SE-4 red-proof (1): the CLI proxy follows the machine ROW, not the
+    /// hub's environment. `WEAVIATE_URL` (and the retired `VCT_WEAVIATE_URL`)
+    /// name a dead port; the row names a live (fake) Weaviate; the proxy
+    /// answers from the live one. Red against the pre-SE-4
+    /// `client_weaviate_url` (deleted in v0.2.97), whose env legs outranked
+    /// the row (503).
+    #[tokio::test]
+    async fn kg_collections_follow_the_row_not_the_hubs_env() {
+        let _env = vct_launcher_core::test_env::env_guard(&[
+            ("WEAVIATE_URL", Some("http://127.0.0.1:1")),
+            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, Some("http://127.0.0.1:1")),
+        ]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let app = axum::Router::new().route(
+                "/v1/schema",
+                axum::routing::get(|| async {
+                    axum::Json(serde_json::json!({
+                        "classes": [{
+                            "class": "GoodKG",
+                            "properties": [
+                                {"name": "title", "dataType": ["text"]},
+                                {"name": "node_type", "dataType": ["text"]},
+                                {"name": "tags", "dataType": ["text[]"]},
+                                {"name": "typed_links", "dataType": ["object[]"]},
+                            ]
+                        }]
+                    }))
+                }),
+            );
+            let _ = axum::serve(listener, app).await;
+        });
+        let (base, h) = spawn_test_hub().await;
+        seed_weaviate_row(&h, &format!("http://{}", addr));
+
+        let resp = reqwest::Client::new()
+            .get(format!("{}/cli/kg/collections", base))
+            .send()
+            .await
+            .expect("send");
+        assert_eq!(resp.status(), reqwest::StatusCode::OK, "the row's live Weaviate answers");
+        let body: serde_json::Value = resp.json().await.expect("json");
+        let names: Vec<&str> = body["collections"]
+            .as_array()
+            .expect("collections")
+            .iter()
+            .filter_map(|c| c["name"].as_str())
+            .collect();
+        assert_eq!(names, vec!["GoodKG"]);
+    }
+
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_collections_endpoint_returns_canonical_set() {
-        let _env_guard = lock_real_weaviate();
-        let (base, _h) = spawn_test_hub().await;
+        let (base, _h) = spawn_real_weaviate_hub().await;
         let client = reqwest::Client::new();
         let resp = client
             .get(format!("{}/cli/codegraph/collections", base))
@@ -2029,8 +2058,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_scope_code_excludes_api_and_interaction() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
             &pid,
@@ -2079,8 +2107,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_scope_interaction_keeps_only_api_and_interaction() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
             &pid,
@@ -2144,8 +2171,7 @@ mod cli_kg_integration_tests {
     #[tokio::test]
     #[ignore = "requires local Weaviate at localhost:8081"]
     async fn codegraph_search_audit_row_uses_cli_codegraph_search_op() {
-        let _env_guard = lock_real_weaviate();
-        let (base, h) = spawn_test_hub().await;
+        let (base, h) = spawn_real_weaviate_hub().await;
         let pid = uuid::Uuid::new_v4().to_string();
         h.0.insert_project(
             &pid,
@@ -2961,10 +2987,10 @@ mod hub_access_matrix_wiring_tests {
     // ─── PATCH /cli/hooks/{hook_id}/enabled — real enforcement ──────────
     //
     // v0.2.91 wave 5 residual close. This is the route the shipped
-    // `vco hooks enable/disable <id> --project <p>` CLI hits
+    // `vct-cli hooks enable/disable <id> --project <p>` CLI hits
     // (`launcher/tools/vct-cli/src/main.rs::hooks`). Pre-fix it called
     // `Db::set_project_hook_enabled(hook_id, enabled)` — a bare mirror
-    // `UPDATE` — so `vco hooks disable <id>` silently did not stop the
+    // `UPDATE` — so `vct-cli hooks disable <id>` silently did not stop the
     // hook firing. These tests exercise the real HTTP surface.
 
     const CLI_HOOK_SETTINGS_JSON: &str = r#"{
@@ -3052,7 +3078,7 @@ mod hub_access_matrix_wiring_tests {
 
     #[tokio::test]
     async fn cli_hooks_disable_accepts_a_project_slug_not_only_the_id() {
-        // `vco hooks disable <id> --project <slug>` is the documented
+        // `vct-cli hooks disable <id> --project <slug>` is the documented
         // shape (`HooksCmd::List` already accepts "id or slug"; the
         // enforcement path must match, not silently require the UUID).
         let (base, handle) = spawn_test_hub_with_state_api().await;

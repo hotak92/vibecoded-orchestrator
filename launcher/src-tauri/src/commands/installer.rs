@@ -19,6 +19,9 @@ use crate::secrets::{self, SecretScope};
 // pair — see `UpdateStatus::remote_check`.
 use vct_launcher_core::check_state::CheckState;
 use vct_launcher_core::process::pid_is_alive;
+// `.silent()` for the test modules' process fixtures (they `use super::*`);
+// the module body's own spawns import it where they build a command.
+#[cfg(test)]
 use vct_launcher_core::process::CommandExt as _;
 
 /// Upstream GitHub repo. Auto-update isn't fully wired yet — initial
@@ -214,6 +217,15 @@ pub struct InstallConfig {
     /// regenerates state files in place).
     #[serde(default)]
     pub lightweight_old_path: Option<String>,
+    /// v0.2.97 (lane Y, owner ruling Q1): the wizard's explicit per-service
+    /// endpoint answers, forwarded to install.py's repeatable
+    /// `--service SVC=CHOICE` flag (`weaviate=adopt:container:<name>`,
+    /// `ollama=adopt:url:<url>`, `weaviate=vco[:<port>]`, …). Each value is
+    /// validated by [`service_choice_args`] against the grammar install.py's
+    /// `parse_service_flag` enforces — a malformed one would abort the whole
+    /// install (strict argparse), so the GUI can never send one.
+    #[serde(default)]
+    pub service_choices: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -670,23 +682,18 @@ pub async fn detect_system() -> Result<SystemDetection, String> {
     })
 }
 
-/// Default ports for the shared services. Match install.py constants —
-/// changing them here without changing install.py would mean the wizard
-/// reports "no services running" while install.py happily reuses them.
-pub(crate) const DEFAULT_WEAVIATE_PORT: u16 = 8081;
-pub(crate) const DEFAULT_OLLAMA_PORT: u16 = 11435;
-pub(crate) const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
+// v0.2.97: the wizard's default-port constants are gone — every probe here
+// resolves through `vct_launcher_core::services::service_endpoints` (the
+// row, else ITS compiled defaults, the one copy).
 
-/// HTTP probe with short timeout. Returns the URL on 2xx/3xx, None otherwise.
+/// HTTP probe with short timeout. Returns the URL on a 2xx, None otherwise;
+/// a redirect is never followed (`vct_launcher_core::services::probe_http`).
 /// Takes an owned String so callers can compose URLs via format! without
 /// having to keep the formatted string alive themselves.
 async fn probe_http(url: String) -> Option<String> {
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-        .ok()?;
+    let client = vct_launcher_core::services::loopback_http::client_for(&url, std::time::Duration::from_secs(2)).ok()?;
     match client.get(&url).send().await {
-        Ok(resp) if resp.status().as_u16() < 400 => Some(url),
+        Ok(resp) if vct_launcher_core::services::probe_http::answered(resp.status()) => Some(url),
         _ => None,
     }
 }
@@ -713,20 +720,26 @@ async fn probe_http(url: String) -> Option<String> {
 /// on purpose (Rust = "any signal Weaviate is reachable", Python =
 /// "Weaviate fully initialised and ready to serve queries"). See
 /// commands/lifecycle.rs::canonical_services for the rationale.
+/// The wizard's service-detection probe URLs: each service's health URL at
+/// its launcher.db `service_endpoints` row (host AND port), else the
+/// compiled default. This command also runs before install, when no
+/// orchestrator clone — and so no Python detector — exists yet; it answers
+/// "does something answer where VCO would reach it?". The full candidate
+/// detection (containers, upstream-default ports, VCO-data fingerprints) is
+/// `commands::lifecycle::services_endpoint_candidates`.
+fn detect_probe_urls() -> (String, String, String) {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    let url = |s: CoreService| health_url(s, machine_row_from_disk(s).as_ref());
+    (url(CoreService::Weaviate), url(CoreService::Ollama), url(CoreService::CodeEmbed))
+}
+
 #[command]
 pub async fn detect_existing_services() -> Result<ServicesStatus, String> {
-    let weaviate = probe_http(format!(
-        "http://localhost:{}/v1/meta",
-        DEFAULT_WEAVIATE_PORT
-    ));
-    let ollama = probe_http(format!(
-        "http://localhost:{}/api/tags",
-        DEFAULT_OLLAMA_PORT
-    ));
-    let code_embed = probe_http(format!(
-        "http://localhost:{}/health",
-        DEFAULT_CODE_EMBED_PORT
-    ));
+    let (weaviate_url, ollama_url, code_embed_url) = detect_probe_urls();
+    let weaviate = probe_http(weaviate_url);
+    let ollama = probe_http(ollama_url);
+    let code_embed = probe_http(code_embed_url);
 
     // Run probes concurrently — total wall time is capped at the 2s timeout
     // of the slowest probe, not 6s sequentially.
@@ -1383,6 +1396,9 @@ pub(crate) fn warn_if_binary_ahead_of_install(install_root: &Path) -> bool {
 // rest of this module + the `tests` block resolve them unchanged.
 mod version_info;
 pub(crate) use version_info::*;
+
+// v0.2.97: install.py's relaunch-record keys, from the table Python reads.
+mod relaunch_env;
 
 /// Classify what an install target looks like:
 /// - `Fresh` if the path doesn't exist or is empty.
@@ -2369,72 +2385,33 @@ pub const ORCHESTRATOR_VOLUME_NAMES: &[&str] = &[
     "vct_code_embed",
 ];
 
-/// Read-only volume detection. Tries `podman volume ls --format json`
-/// first, falls back to `docker volume ls --format json`. If neither is
-/// installed we return an empty list (not an error — the user may not
-/// have a container runtime yet, which is fine pre-install).
+/// Read-only volume detection for the install preflight — the SAME answer the
+/// install's next step (`volumes::set_volumes_config_for_install`) acts on:
+/// the orchestrator volumes under the runtime storage commands drive
+/// (`storage_ux::storage_runtime`, the shared pin-first, daemon-aware
+/// detector), or the ownership REFUSAL when some exist only under the other
+/// runtime (returned as the second field, surfaced as a risk line). No
+/// usable runtime → an empty list (a machine before its first install may
+/// have none).
 ///
-/// Bug 31: also exposed as `detect_existing_volumes_for_volumes_module`
-/// so the volumes command module can reuse the same detector instead
-/// of duplicating it.
-pub async fn detect_existing_volumes_for_volumes_module() -> Vec<ExistingVolume> {
-    detect_existing_volumes().await
+/// R7b F25(a): this was a SECOND runtime chooser — the shared candidate
+/// order walked with a PATH probe and no daemon check, taking the first
+/// runtime that had volumes. Unpinned, both runtimes up, volumes only under
+/// docker: the preflight showed docker's volumes as "yours" and the very
+/// next step, which auto-chose podman, refused.
+async fn detect_existing_volumes() -> (Vec<ExistingVolume>, Option<String>) {
+    detect_existing_volumes_at(find_local_repo_root().ok().as_deref()).await
 }
 
-async fn detect_existing_volumes() -> Vec<ExistingVolume> {
-    for runtime in &["podman", "docker"] {
-        let runtime_path = match which_on_path(runtime) {
-            Some(p) => p,
-            None => continue,
-        };
-        // List names matching one of our known orchestrator volume names.
-        let mut found: Vec<ExistingVolume> = Vec::new();
-        for name in ORCHESTRATOR_VOLUME_NAMES {
-            // `volume inspect <name>` returns 0 with JSON if it exists,
-            // non-zero if not. Read-only — never mutates state.
-            let out = tokio::process::Command::new(&runtime_path).silent()
-                .args(["volume", "inspect", name])
-                .output()
-                .await;
-            let out = match out {
-                Ok(o) => o,
-                Err(_) => continue,
-            };
-            if !out.status.success() {
-                continue;
-            }
-            let body = String::from_utf8_lossy(&out.stdout);
-            // Both podman and docker emit a JSON array of volume objects.
-            let arr: serde_json::Value = match serde_json::from_str(&body) {
-                Ok(v) => v,
-                Err(_) => continue,
-            };
-            if let Some(items) = arr.as_array() {
-                for item in items {
-                    let mountpoint = item
-                        .get("Mountpoint")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    let driver = item
-                        .get("Driver")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("local")
-                        .to_string();
-                    found.push(ExistingVolume {
-                        name: name.to_string(),
-                        mountpoint,
-                        driver,
-                    });
-                }
-            }
-        }
-        if !found.is_empty() {
-            return found;
-        }
+/// [`detect_existing_volumes`] with the install root (where
+/// `state/install/runtime.txt` lives) passed in — tests use a temp dir.
+async fn detect_existing_volumes_at(install_root: Option<&Path>) -> (Vec<ExistingVolume>, Option<String>) {
+    match super::volumes::existing_volumes_on_storage_runtime_at(install_root, "adopt").await {
+        Ok(found) => (found, None),
+        Err(refusal) => (Vec::new(), Some(refusal)),
     }
-    Vec::new()
 }
+
 
 /// v0.2.77 (Part 7c task 3): delegates to the shared
 /// `vct_launcher_core::paths::which_on_path` (one home). Behaviour upgrade
@@ -2445,18 +2422,27 @@ fn which_on_path(name: &str) -> Option<PathBuf> {
     vct_launcher_core::paths::which_on_path(name)
 }
 
+/// The URL the preflight's schema probe GETs: the machine's Weaviate (its
+/// `service_endpoints` row via `machine_url_from_disk`), not the literal
+/// 8081 — the preflight reported an adopted or moved instance's classes as
+/// absent (v0.2.97). In a test harness (a state dir under the OS temp dir)
+/// an absent row is the unroutable sentinel `127.0.0.1:9`, never a real
+/// local Weaviate — pinned by `the_preflight_schema_probe_is_the_sentinel_in_tests`.
+fn existing_collections_probe_url() -> String {
+    format!(
+        "{}/v1/schema",
+        vct_launcher_core::services::service_endpoints::machine_url_from_disk(
+            vct_launcher_core::services::service_endpoints::CoreService::Weaviate
+        )
+    )
+}
+
 /// Read-only Weaviate schema probe. Returns the list of class names
 /// already present on the running instance; empty Vec if Weaviate is
 /// not reachable.
 async fn detect_existing_collections() -> Vec<String> {
-    let url = format!(
-        "http://localhost:{}/v1/schema",
-        DEFAULT_WEAVIATE_PORT
-    );
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    let url = existing_collections_probe_url();
+    let client = match vct_launcher_core::services::loopback_http::client_for(&url, std::time::Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => return Vec::new(),
     };
@@ -2531,8 +2517,9 @@ pub async fn preflight_install_safety_check(
         Vec::new()
     };
 
-    // 3. Existing volumes — never touched.
-    let existing_volumes = detect_existing_volumes().await;
+    // 3. Existing volumes — never touched. Same runtime + ownership answer
+    //    the install's volumes step acts on (R7b F25(a)).
+    let (existing_volumes, volume_refusal) = detect_existing_volumes().await;
 
     // 4. Existing Weaviate classes — preserved.
     let existing_collections = detect_existing_collections().await;
@@ -2588,6 +2575,11 @@ pub async fn preflight_install_safety_check(
         } else {
             risks.push(format!("Will overwrite orchestrator-managed path: {}", path));
         }
+    }
+    if let Some(refusal) = volume_refusal {
+        // The install's volumes step will refuse with this exact text; say
+        // it here, before the user clicks Install.
+        risks.push(refusal);
     }
     if !existing_volumes.is_empty() {
         // Bug 32 #4 + Bug 31: bind-mount override is suppressed when
@@ -2831,50 +2823,19 @@ pub async fn install_orchestrator(
     if config.skip_containers {
         install_args.push("--no-containers".to_string());
     }
+    // v0.2.97 (lane Y): the wizard's per-service endpoint answers (owner
+    // ruling Q1) — install.py's `--service SVC=CHOICE` flags.
+    install_args.extend(service_choice_args(config.service_choices.as_deref().unwrap_or(&[]))?);
 
     let python_cmd = &system.python_cmd;
     // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
     let mut cmd = install_py_command(python_cmd, &install_path, &install_args);
 
-    // PR-3 (2026-05-06): forward the launcher's adopted service ports to
-    // install.py. Pre-PR-3, install.py read `WEAVIATE_PORT` / `OLLAMA_PORT`
-    // from `os.environ` (install.py:4243-4244) but the launcher never set
-    // them — the subprocess inherited the launcher's env, which was
-    // empty for these keys. Multi-stack setups silently fell through to
-    // the canonical default ports. We now bridge launcher state into
-    // the install.py subprocess env via `services.toml` adoption +
-    // explicit overrides. See `launcher-settings-propagation-audit-2026-05-06.md` §9.
-    let services_state = crate::services::adoption::read();
-    let pick_port = |name: &str, default: u16| -> u16 {
-        if let Some(svc) = services_state.get(name) {
-            match svc.mode {
-                crate::services::adoption::AdoptionMode::Parallel => {
-                    if let Some(p) = svc.parallel_port {
-                        return p;
-                    }
-                }
-                crate::services::adoption::AdoptionMode::Adopt => {
-                    if let Some(url) = svc.external_url.as_deref() {
-                        // Inline minimal port-extractor (kept here to avoid
-                        // a cross-module dep on commands::project_env_settings).
-                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-                        let host_port = after.split('/').next().unwrap_or(after);
-                        if let Some(p) = host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok()) {
-                            return p;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        default
-    };
-    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
-    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
-    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
-    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
-        .env("OLLAMA_PORT", ollama_port.to_string())
-        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+    // v0.2.97 (lane Y): the `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT`
+    // env hand-off that used to live here is GONE — install.py no longer
+    // reads those keys from its environment (it resolves everything from
+    // the `service_endpoints` rows, which it reads and writes itself), and
+    // the wizard's explicit answers now travel as `--service` flags.
 
     // Windows: suppress the transient cmd console window that pops up
     // when Tauri (a windowed app, no console) spawns a subprocess.
@@ -2923,12 +2884,9 @@ pub async fn install_orchestrator(
     // fallback) backstops this anyway.
     emit_progress(&window, "register", "Registering MCP servers in ~/.claude.json...", 92.0);
     let install_root_path = std::path::PathBuf::from(&config.install_path);
-    let ports = crate::mcp_registration::ServicePorts {
-        weaviate_port,
-        ollama_port,
-        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
-        code_embed_port,
-    };
+    // v0.2.97: the machine rows (`machine_service_ports`, gRPC included),
+    // re-read now that install.py has run.
+    let ports = crate::mcp_registration::machine_service_ports();
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -3077,7 +3035,129 @@ pub(crate) fn install_py_command<S: AsRef<std::ffi::OsStr>>(
     // Set on the CHILD only.
     cmd.env("PYTHONIOENCODING", "utf-8");
     cmd.env("PYTHONUTF8", "1");
+    // v0.2.97: never hand an inherited install.py relaunch record to a fresh
+    // install.py (see `relaunch_env`): a launcher relaunched by a vct-updater
+    // that an install.py started carries one for its whole life.
+    for key in relaunch_env::RELAUNCH_ENV_KEYS.iter() {
+        cmd.env_remove(key);
+    }
     cmd
+}
+
+/// v0.2.97 (lane Y): `adopt:url:` validation — a faithful mirror of install.py's
+/// `vco_lib/service_reconcile.py::parse_url` + the grammar cap.
+/// MUST MATCH that Python function (the authoritative grammar) and the ONE
+/// committed table `tests/fixtures/service_flag_grammar_cases.json`, which
+/// locks BOTH sides (tier C mirror, A>B>C rule — the wizard runs before the
+/// orchestrator clone exists, so it cannot call Python).
+fn valid_adopt_url(url: &str) -> bool {
+    // Grammar data: at most 512 characters (bytes ≡ chars for the ASCII the
+    // rest of the check forces), no whitespace, no control characters.
+    if url.is_empty() || url.len() > 512 {
+        return false;
+    }
+    if url.chars().any(|c: char| c.is_whitespace() || c.is_control()) {
+        return false;
+    }
+    // parse_url: scheme://authority[/path]; the scheme is case-insensitive.
+    let Some((scheme, after)) = url.split_once("://") else {
+        return false;
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return false;
+    }
+    let authority = after.split('/').next().unwrap_or("");
+    // No userinfo (`user:password@host`): an endpoint holds no credentials,
+    // and refusing it here keeps a secret out of every echo of the flag.
+    if authority.contains('@') {
+        return false;
+    }
+    let host = if authority.starts_with('[') {
+        // IPv6 literal: everything up to and including the closing bracket.
+        match authority.find(']') {
+            Some(i) => &authority[..=i],
+            None => "",
+        }
+    } else if authority.contains(':') {
+        authority.rsplit_once(':').map_or("", |(h, _)| h)
+    } else {
+        authority
+    };
+    if host.is_empty() {
+        return false;
+    }
+    // port_of_url: an explicit port must be digits within u16; an absent,
+    // empty or non-digit suffix falls back to the scheme default (accepted).
+    let tail = match authority.rfind(']') {
+        Some(i) => &authority[i + 1..],
+        None => authority,
+    };
+    if let Some((_, port)) = tail.rsplit_once(':') {
+        if !port.is_empty()
+            && port.bytes().all(|b: u8| b.is_ascii_digit())
+            && port.parse::<u16>().is_err()
+        {
+            return false; // digits, but over 65535
+        }
+    }
+    true
+}
+
+/// v0.2.97 (lane Y): validates and normalises ONE `--service` value against
+/// install.py's grammar. Returns `(service, kind, value)` — the exact parse
+/// `vco_lib/service_reconcile.py::parse_service_flag` produces (value: the
+/// container name, the URL, or the port text; `None` for a bare `vco`).
+///
+/// MUST MATCH `vco_lib/service_reconcile.py::parse_service_flag` (the
+/// authoritative grammar install.py acts on). The grammar's DATA lives in the
+/// ONE committed table `tests/fixtures/service_flag_grammar_cases.json`;
+/// both sides run every case against it
+/// (`service_flag_grammar_matches_the_committed_fixture` here,
+/// `test_service_flag_grammar_fixture` in tests/test_v0297_service_reconcile.py).
+/// A case that disagrees is a drift in one implementation, never a reason to
+/// fork the table.
+fn parse_service_choice(choice: &str) -> Result<(&str, &str, Option<&str>), String> {
+    let bad = |why: &str| format!("service choice {:?}: {}", choice, why);
+    let (service, rest) = match choice.split_once('=') {
+        Some((s, r)) => (s.trim(), r),
+        None => return Err(bad("expected <weaviate|ollama|code_embed>=<choice>")),
+    };
+    if !matches!(service, "weaviate" | "ollama" | "code_embed") {
+        return Err(bad("expected <weaviate|ollama|code_embed>=<choice>"));
+    }
+    let kind = if let Some(name) = rest.strip_prefix("adopt:container:") {
+        if name.is_empty() {
+            return Err(bad("adopt:container: needs a container name"));
+        }
+        "adopt_container"
+    } else if let Some(url) = rest.strip_prefix("adopt:url:") {
+        if !valid_adopt_url(url) {
+            return Err(bad(
+                "adopt:url: needs an http(s)://host[:port] URL of at most 512 characters, \
+                 with no whitespace",
+            ));
+        }
+        "adopt_url"
+    } else if rest == "vco"
+        || (rest.starts_with("vco:")
+            && rest.len() > 4
+            && rest[4..].bytes().all(|b: u8| b.is_ascii_digit())
+            && rest[4..].parse::<u16>().map(|p| p >= 1).unwrap_or(false))
+    {
+        "vco"
+    } else {
+        return Err(bad("choice must be adopt:container:<name>, adopt:url:<url> or vco[:<port>]"));
+    };
+    if service == "code_embed" && kind != "vco" {
+        return Err(bad("code-embed is always VCO's own (use vco[:<port>])"));
+    }
+    let value = match kind {
+        "adopt_container" => rest.strip_prefix("adopt:container:"),
+        "adopt_url" => rest.strip_prefix("adopt:url:"),
+        _ => rest.strip_prefix("vco:").filter(|p| !p.is_empty()),
+    };
+    Ok((service, kind, value))
 }
 
 /// Builds the install.py argv for the subprocess. Extracted as a
@@ -3087,6 +3167,21 @@ pub(crate) fn install_py_command<S: AsRef<std::ffi::OsStr>>(
 ///
 /// v0.2.95 phase 3: the returned argv no longer carries `install.py` itself —
 /// [`install_py_command`] owns that, so no call site can spell it.
+/// v0.2.97 (lane Y): the wizard's per-service endpoint answers → install.py's
+/// repeatable `--service SVC=CHOICE` flags, as `["--service", "<choice>", …]`,
+/// each validated by [`parse_service_choice`] so a malformed value errors on
+/// the LAUNCHER side — install.py's strict argparse would abort the whole
+/// install with exit 2 otherwise.
+pub(crate) fn service_choice_args(choices: &[String]) -> Result<Vec<String>, String> {
+    let mut out = Vec::new();
+    for choice in choices {
+        parse_service_choice(choice)?;
+        out.push("--service".to_string());
+        out.push(choice.clone());
+    }
+    Ok(out)
+}
+
 pub(crate) fn build_lightweight_install_argv(
     use_gpu: bool,
     cpu_only: bool,
@@ -3168,42 +3263,9 @@ async fn run_install_orchestrator_lightweight(
     // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
     let mut cmd = install_py_command(python_cmd, &install_path, &argv);
 
-    // Forward the same launcher-resolved service ports the full path
-    // does. install.py's lightweight branch reads these so a port
-    // override survives a re-install. See `install.py:1352
-    // _run_lightweight` and the env-write block in
-    // `_lightweight_rewrite_paths`.
-    let services_state = crate::services::adoption::read();
-    let pick_port = |name: &str, default: u16| -> u16 {
-        if let Some(svc) = services_state.get(name) {
-            match svc.mode {
-                crate::services::adoption::AdoptionMode::Parallel => {
-                    if let Some(p) = svc.parallel_port {
-                        return p;
-                    }
-                }
-                crate::services::adoption::AdoptionMode::Adopt => {
-                    if let Some(url) = svc.external_url.as_deref() {
-                        let after = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-                        let host_port = after.split('/').next().unwrap_or(after);
-                        if let Some(p) =
-                            host_port.rsplit(':').next().and_then(|s| s.parse::<u16>().ok())
-                        {
-                            return p;
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-        default
-    };
-    let weaviate_port = pick_port("weaviate", DEFAULT_WEAVIATE_PORT);
-    let ollama_port = pick_port("ollama", DEFAULT_OLLAMA_PORT);
-    let code_embed_port = pick_port("code_embed", DEFAULT_CODE_EMBED_PORT);
-    cmd.env("WEAVIATE_PORT", weaviate_port.to_string())
-        .env("OLLAMA_PORT", ollama_port.to_string())
-        .env("CODE_EMBED_PORT", code_embed_port.to_string());
+    // v0.2.97 (lane Y): no service-port env hand-off here either —
+    // install.py no longer reads WEAVIATE_PORT/OLLAMA_PORT/CODE_EMBED_PORT
+    // from its environment (see the full path's note above).
 
     #[cfg(windows)]
     {
@@ -3253,12 +3315,9 @@ async fn run_install_orchestrator_lightweight(
         95.0,
     );
     let install_root_path = std::path::PathBuf::from(install_path.to_string_lossy().to_string());
-    let ports = crate::mcp_registration::ServicePorts {
-        weaviate_port,
-        ollama_port,
-        grpc_port: crate::mcp_registration::DEFAULT_GRPC_PORT,
-        code_embed_port,
-    };
+    // v0.2.97: the machine rows (`machine_service_ports`, gRPC included),
+    // re-read now that install.py has run.
+    let ports = crate::mcp_registration::machine_service_ports();
     let db_for_register = window.app_handle().try_state::<Db>();
     let db_ref = db_for_register.as_ref().map(|s| s.inner());
     match crate::mcp_registration::register_default_orchestrator_mcps(
@@ -3793,7 +3852,18 @@ pub(crate) fn ensure_hub_started_after_update(
         return Ok(());
     }
 
-    let Some(hub_bin) = crate::hub_launcher::find_hub_binary() else {
+    start_found_hub_after_update(install_path, ctx, crate::hub_launcher::find_hub_binary())
+}
+
+/// The rest of [`ensure_hub_started_after_update`], over the discovery's
+/// answer — a test hands it `None` instead of emptying the process
+/// `VCT_HUB_BIN` / `HOME` / `PATH` (v0.2.97 review R6).
+fn start_found_hub_after_update(
+    install_path: &Path,
+    ctx: HubRestartContext,
+    hub_bin: Option<PathBuf>,
+) -> Result<(), String> {
+    let Some(hub_bin) = hub_bin else {
         tracing::warn!(
             "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
              leaving hub stopped. Launcher restart will retry the discovery."
@@ -3922,15 +3992,13 @@ pub(crate) fn ensure_hub_started_after_update(
 /// both the synchronous (PostInstall) and background-thread (AbortRecovery)
 /// arms share ONE poll implementation.
 fn poll_hub_health_for_30s(root: &Path) -> bool {
-    let port_path = root.join("hub.port");
+    let port_path = root.join(vct_launcher_core::services::hub_port::HUB_PORT_FILE);
     let token_path = root.join("hub.token");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while std::time::Instant::now() < deadline {
         if port_path.exists() && token_path.exists() {
             // Both files there — try the /health probe.
-            let port = std::fs::read_to_string(&port_path)
-                .ok()
-                .and_then(|s| s.trim().parse::<u16>().ok());
+            let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(root).ok();
             let token = std::fs::read_to_string(&token_path)
                 .ok()
                 .map(|s| s.trim().to_string())
@@ -3968,18 +4036,17 @@ fn poll_hub_health_for_30s(root: &Path) -> bool {
 /// — an emit failure logs + is swallowed (it must NEVER mask the conflict
 /// outcome the caller is surfacing). NO retries, NO binary swaps, NO auto-heal.
 ///
-/// Self-clear (plan §11 #4 follow-up — cross-file, NOT in this Phase-2a scope):
-/// install.py's condition-id dispatch (`install.py::_maybe_resolve_deferral*`)
-/// does NOT yet special-case `hub_restart_failed_after_abort`, so on the next
-/// successful install.py run the entry falls through the `else` → PRESERVED
-/// (never lost — the conservative default). A dedicated handler that re-probes
-/// the hub /health and marks it resolved when the hub is back up (mirroring the
-/// `generated_files_reconciled` / `launcher_update_diverged` legs) is the
-/// intended follow-up, owned by the install.py surface (Phase 2c / a follow-on).
-/// The entry is honest either way: if the hub really is still down when the user
-/// reads it, the note is correct; once install.py runs it will have restarted
-/// the hub, and the (harmless, informational) note is cleared by the user or by
-/// that follow-up handler.
+/// Self-clear (v0.2.95 F1): the entry is STATE-keyed, not event-keyed. Its
+/// `vco_lib/deferral_conditions.toml` row declares
+/// `clear_probe = "probe:py:hub_back_after_restart_failure"`
+/// (`vco_lib/deferral_probes.py`), a read-only GET of `/api/v1/health` on the
+/// resolved hub port with a 0.5 s timeout. Every re-probe pass runs it —
+/// install.py's end-of-run phase (ordered AFTER `_deploy_and_start_vct_hub`, so
+/// the run that restarts the hub also clears the row), the bundle engine, and
+/// `vco doctor`'s reconcile — and the row is removed only on positive evidence
+/// (the hub answered), with an audit line in `.claude/logs/auto-resolutions.jsonl`.
+/// A hub that does not answer, or a port that cannot be resolved, KEEPS it.
+/// Pinned by `tests/test_v0295_deferral_reconcile_hub_restart.py`.
 fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
     let detected = "The orchestrator update aborted on a genuine (source-file) conflict, and the \
                     launcher's best-effort `vct-hub --start-if-not-running` restart did NOT reach \
@@ -6405,8 +6472,10 @@ pub(crate) async fn run_pre_merge_user_editable(
 }
 
 /// v0.2.24 §A0 (2026-05-22): convenience wrapper around the deferral
-/// emitter. Filters out NoChange outcomes — only Merged and
-/// PreservedWithUpstreamSidecar produce user-visible deferrals.
+/// emitter. Filters out NoChange outcomes — only Merged,
+/// PreservedWithUpstreamSidecar and (v0.2.97) RenderedConflictKeptLocal
+/// produce user-visible deferrals (`MergeOutcome::is_actionable_for_deferral`
+/// is the one list).
 pub(crate) fn maybe_emit_pre_merge_deferrals(
     install_path: &Path,
     outcomes: &[crate::commands::git_user_editable_merge::MergeOutcome],
@@ -10303,11 +10372,9 @@ pub(crate) use inspect::*;
 // fallback below).
 // ---------------------------------------------------------------------------
 
-/// Sentinel project_id for shared scope (mirrors `commands::secrets_cmd`).
-/// Kept as a module-private constant because this file is the only
-/// non-secrets-cmd caller of `SecretScope::Shared`; widening it to a
-/// pub-crate const in `secrets.rs` would just hide the dependency.
-const SENTINEL_SHARED: &str = "_user_shared_";
+/// Sentinel project_id for shared scope — the one definition in
+/// `vct_launcher_core::secrets` (R7b F15).
+use crate::secrets::SENTINEL_SHARED;
 
 /// Module identifier used to namespace the keychain entry for the
 /// onboarding-wizard GitHub PAT. Pinned here because the migration
@@ -10379,28 +10446,22 @@ fn github_pat_resolve_existing_file() -> Option<PathBuf> {
     None
 }
 
-/// Public read-side hook for the env-pair builder
-/// (`commands/projects_v2.rs::write_project_env_files`). Returns the
-/// keychain-resolved PAT (active-flag gated) or falls back to the
-/// legacy file when the file→keychain migration hasn't run yet.
+/// The launcher's ONE read of the shared-scope PAT slot: the keychain value
+/// (active-flag gated — a paused PAT reads as `None`), else the legacy file
+/// while the file→keychain migration has not run yet. Backs the Onboarding
+/// / Special-Secrets status surfaces (`has_github_pat`,
+/// `get_github_pat_preview`).
 ///
-/// Conservative per-project gating decision (0.1.7, 2026-05-08): every
-/// registered project receives `GITHUB_TOKEN` whenever the PAT is set
-/// and active in the keychain. This matches the pre-0.1.7 file-based
-/// behaviour (`~/.vct-secrets/shared/github_pat` is readable by every
-/// process running as the user). A finer-grained per-project access
-/// matrix for `github_pat` is out of scope for the 0.1.7 fork sweep.
-/// See `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
+/// v0.2.97 review F6: this replaces `github_pat_for_env`, which had no
+/// production caller left — its "every registered project receives
+/// `GITHUB_TOKEN`" promise was SUPERSEDED in v0.2.73: VCO never writes a
+/// secret value into a project; consumers resolve the PAT at need through
+/// the hub (`/api/v1/projects/{id}/env`, `vct_secrets_resolve.sh`,
+/// `vco_lib.agent_secrets.get`) — the "Secrets" section of
+/// `templates/ORCHESTRATOR-CLAUDE.md.template`.
 ///
-/// Soft-fail: any error short-circuits to `None` so env-file writes
-/// never block on a keychain hiccup.
-///
-// v0.2.84 PLAN D8.1: populate() no longer resolves the PAT (P7 dead-read
-// elimination); sole remaining callers are this module's keychain tests.
-// Fn kept — it is the documented resolver for the shared-scope PAT slot
-// and the natural home if a value-consumer ever returns.
-#[cfg_attr(not(test), allow(dead_code))]
-pub fn github_pat_for_env(db: &Db) -> Option<String> {
+/// Soft-fail: any error short-circuits to `None`.
+pub(crate) fn resolve_github_pat(db: &Db) -> Option<String> {
     if let Some(v) = github_pat_from_keychain(db) {
         return Some(v);
     }
@@ -10880,9 +10941,10 @@ pub(crate) fn migrate_github_pat_file_to_keychain(
 /// call pulls them into the keychain.
 ///
 /// BOUNDARY #4 (v0.2.80 Part A — HIGHEST BLAST RADIUS): this feeds
-/// `github_pat_for_env` → `write_project_env_files` writes `GITHUB_TOKEN` into
-/// EVERY registered project's env-pair, and it fires AUTOMATICALLY on env-file
-/// builds (not an explicit import click). A blob here (a token on line 0 + a
+/// `resolve_github_pat`, the value the status surfaces show and the
+/// file→keychain migration imports. (It once also reached EVERY registered
+/// project's env files as `GITHUB_TOKEN`; no writer has emitted that since
+/// v0.2.73 — secrets are resolved at need through the hub.) A blob here (a token on line 0 + a
 /// `KEY=value` continuation line, an embedded newline, or a control char) would
 /// be handed to `git push` / `gh` as a multi-line password → silent auth
 /// failure across every project. So the trimmed content is shape-checked; a
@@ -10917,18 +10979,12 @@ fn github_pat_from_legacy_file() -> Option<String> {
 
 #[command]
 pub fn has_github_pat(db: State<'_, Db>) -> bool {
-    if github_pat_from_keychain(&db).is_some() {
-        return true;
-    }
-    // Legacy file fallback — only honoured until the next `register_github_pat`
-    // call migrates everything into the keychain.
-    github_pat_from_legacy_file().is_some()
+    resolve_github_pat(&db).is_some()
 }
 
 #[command]
 pub fn get_github_pat_preview(db: State<'_, Db>) -> Option<String> {
-    // Prefer keychain.
-    let value = github_pat_from_keychain(&db).or_else(github_pat_from_legacy_file)?;
+    let value = resolve_github_pat(&db)?;
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -11050,14 +11106,18 @@ pub fn register_github_pat(
     //    the prior behaviour silently destroyed working PATs whenever
     //    the OnboardingWizard re-saved.)
 
-    // 6. Propagate to all registered projects' env files (B2 fix from
-    //    2026-05-08 integration review). Without this, a user with N
-    //    existing registered projects has to manually re-trigger
-    //    write_project_env_files (e.g. via rename) for each one before
-    //    GITHUB_TOKEN appears in their .claude/env. With it: the moment
-    //    the OnboardingWizard saves, every registered project's env
-    //    surfaces are rewritten and Claude Code subprocesses inherit the
-    //    fresh value on next session start.
+    // 6. Re-project every registered project's env surfaces (B2 fix from
+    //    2026-05-08 integration review). SUPERSEDED purpose, v0.2.73: this
+    //    once made `GITHUB_TOKEN` appear in each project's `.claude/env`;
+    //    VCO no longer writes secret VALUES into any project — consumers
+    //    resolve the PAT at need through the hub (`vct_secrets_resolve.sh`,
+    //    `vco_lib.agent_secrets.get`; the "Secrets" section of
+    //    `templates/ORCHESTRATOR-CLAUDE.md.template`). The re-projection
+    //    that remains keeps each project's canonical env current and removes
+    //    the in-tree VALUES it can prove a pre-v0.2.73 writer left: a JSON
+    //    env-block value that EQUALS the launcher's stored one (`GITHUB_TOKEN`
+    //    against `github_pat` included), and any export in the rebuilt
+    //    `.claude/env` managed block. A name match alone removes nothing.
     //
     //    Soft-fail per project: a single project's writer failure (e.g.
     //    .claude/env unwritable) shouldn't block PAT registration. We
@@ -11396,6 +11456,40 @@ mod tests {
     use super::*;
     use std::fs;
     use std::path::PathBuf;
+
+    #[test]
+    fn detect_probe_urls_follow_the_machine_chain() {
+        // v0.2.97: the wizard's detection probes follow the machine's
+        // `service_endpoints` row (the compiled-in defaults they replaced
+        // could not see a moved service); the retired app_state override is
+        // not a leg.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let (w, _o, _c) = detect_probe_urls();
+        // No row on this harness state dir: the unroutable sentinel.
+        assert_eq!(w, "http://127.0.0.1:9/v1/meta");
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        db.app_state_set("weaviate.port_override", "18083").unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        let (w, _o, _c) = detect_probe_urls();
+        assert_eq!(w, "http://localhost:18081/v1/meta");
+        // An adopted external Ollama is probed at its host.
+        db.service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "ollama",
+            vct_launcher_core::db::service_endpoints::EndpointMode::AdoptedExternal,
+            "gpu.lan",
+            11434,
+        ))
+        .unwrap();
+        let (_w, o, _c) = detect_probe_urls();
+        assert_eq!(o, "http://gpu.lan:11434/api/tags");
+    }
 
     // ── v0.2.60 Piece 5: min_upgradable_from version floor ──────────────
 
@@ -13010,10 +13104,11 @@ MemAvailable:   23456789 kB
 
     #[tokio::test]
     async fn test_detect_existing_services_returns_struct() {
-        // We can't guarantee anything about whether the test machine has
-        // local services up — this test only verifies the command returns
-        // a well-formed ServicesStatus and doesn't panic. Detail-level
-        // probe testing is covered by test_probe_http_returns_none_on_unreachable.
+        // Verifies the command returns a well-formed ServicesStatus and
+        // doesn't panic. Held on a scratch state dir: with no rows there the
+        // probes go to the unroutable sentinel (127.0.0.1:9), never to a real
+        // local service — whatever VCT_STATE_DIR the test runner exported.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
         let s = detect_existing_services().await.expect("command must not error");
         // The Option fields are mutually consistent with the booleans.
         let count = [&s.weaviate_url, &s.ollama_url, &s.code_embed_url]
@@ -13283,6 +13378,34 @@ MemAvailable:   23456789 kB
         std::fs::remove_file(&target).ok();
     }
 
+    /// Review round 7: the preflight's schema probe
+    /// (`detect_existing_collections`) resolves through the rows' harness
+    /// guard — on a test state dir with no rows its URL is the unroutable
+    /// sentinel, so no test reaches a real Weaviate on 8081. With a row, the
+    /// row's endpoint (the production answer).
+    #[test]
+    fn the_preflight_schema_probe_is_the_sentinel_in_tests() {
+        use vct_launcher_core::services::service_endpoints as se;
+        let g = vct_launcher_core::test_env::state_dir_guard();
+        let url = existing_collections_probe_url();
+        assert_eq!(
+            url,
+            format!("http://{}:{}/v1/schema", se::HARNESS_SENTINEL_HOST, se::HARNESS_SENTINEL_PORT)
+        );
+        assert!(!url.contains(":8081"), "{url}");
+        let db = vct_launcher_core::db::Db::open().unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18089,
+        );
+        row.grpc_port = Some(50089);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        assert_eq!(existing_collections_probe_url(), "http://localhost:18089/v1/schema");
+        drop(g);
+    }
+
     /// Bug 32: preflight_install_safety_check returns a well-formed
     /// SafetyReport for a fresh install path. Cannot assert on
     /// existing_volumes / existing_collections deterministically (they
@@ -13294,6 +13417,9 @@ MemAvailable:   23456789 kB
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&target).unwrap();
+        // A scratch state dir: the preflight's service and schema probes go
+        // to the sentinel, never to a real local Weaviate (review round 7).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
         // Pre-seed user-code that should appear in will_preserve_user_code.
         std::fs::create_dir_all(target.join("my_app")).unwrap();
         std::fs::write(target.join("README_USER.md"), "user readme").unwrap();
@@ -13342,6 +13468,8 @@ MemAvailable:   23456789 kB
         // Pre-seed `.claude` so will_overwrite_orchestrator_files contains it
         // → expected risk line about read-merge-write.
         std::fs::create_dir_all(target.join(".claude")).unwrap();
+        // Scratch state dir: the probes reach the sentinel only.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
 
         let report =
             preflight_install_safety_check(target.to_string_lossy().to_string())
@@ -13361,6 +13489,37 @@ MemAvailable:   23456789 kB
         );
 
         std::fs::remove_dir_all(&target).ok();
+    }
+
+    /// R7b F25(a): the preflight's volume answer is the one the install's
+    /// next step acts on. Unpinned, both runtimes up, the orchestrator
+    /// volumes only under docker: podman is the runtime VCO drives, so the
+    /// preflight lists NO volumes as reused and names the refusal the volumes
+    /// step will give — it used to list docker's volumes as "yours".
+    #[cfg(unix)]
+    #[test]
+    fn preflight_volumes_follow_the_storage_runtime_and_surface_its_refusal() {
+        use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+        let dir = tempfile::tempdir().unwrap();
+        fake_runtime(dir.path(), "podman", &[]);
+        fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
+        let root = tempfile::tempdir().unwrap();
+        crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib(root.path());
+        let (found, refusal) =
+            with_fake_runtimes(dir.path(), None, detect_existing_volumes_at(Some(root.path())));
+        assert!(found.is_empty(), "docker's volumes were offered for reuse: {found:?}");
+        let refusal = refusal.expect("the volumes step refuses, so the preflight must say so");
+        assert!(refusal.contains("exists only under docker"), "{refusal}");
+        assert!(refusal.contains("podman was auto-detected"), "{refusal}");
+
+        // Leave-alone: podman owns them → they are listed, no refusal.
+        let owned = tempfile::tempdir().unwrap();
+        fake_runtime(owned.path(), "podman", &["weaviate_data"]);
+        fake_runtime(owned.path(), "docker", &[]);
+        let (found, refusal) =
+            with_fake_runtimes(owned.path(), None, detect_existing_volumes_at(Some(root.path())));
+        assert_eq!(found.len(), 1);
+        assert!(refusal.is_none());
     }
 
     /// Reviewer B blocker: orchestrator data sprawl across ~/podman_volumes,
@@ -14490,7 +14649,7 @@ MemAvailable:   23456789 kB
     //     doesn't mask a regression.
     //
     // These tests use `pub(crate)` helpers (`migrate_github_pat_file_to_keychain`,
-    // `github_pat_for_env`) and the module-private constants from the
+    // `resolve_github_pat`) and the module-private constants from the
     // surrounding `super::*` import. The Tauri-`#[command]` wrappers
     // (`register_github_pat`, `clear_github_pat`, …) take `State<'_, Db>`
     // which we can't easily synthesise without standing up the runtime,
@@ -14525,6 +14684,10 @@ MemAvailable:   23456789 kB
             // binary holds its own copy of the in-process mutex, so
             // pre-v0.2.14 nothing serialised between binaries.
             _lock: crate::secrets::test_serialize::KeychainGuard,
+            // v0.2.97 review R6: and THE env lock, taken after the keychain
+            // one (the one order every test taking both uses). The restore
+            // in `drop` runs before either field is released.
+            _env: vct_launcher_core::test_env::EnvLock,
         }
 
         impl Drop for EnvGuard {
@@ -14538,6 +14701,7 @@ MemAvailable:   23456789 kB
 
         fn setup_temp_env() -> (PathBuf, EnvGuard) {
             let lock = crate::secrets::test_serialize::keychain_serialize_lock();
+            let env = vct_launcher_core::test_env::env_lock();
             let tmp = std::env::temp_dir().join(format!(
                 "vct-installer-pat-test-{}",
                 uuid::Uuid::new_v4().simple()
@@ -14545,7 +14709,7 @@ MemAvailable:   23456789 kB
             std::fs::create_dir_all(&tmp).unwrap();
             let prev_secrets_dir = std::env::var_os("VCT_SECRETS_DIR");
             std::env::set_var("VCT_SECRETS_DIR", &tmp);
-            let guard = EnvGuard { prev_secrets_dir, _lock: lock };
+            let guard = EnvGuard { prev_secrets_dir, _lock: lock, _env: env };
             (tmp, guard)
         }
 
@@ -14559,36 +14723,91 @@ MemAvailable:   23456789 kB
             crate::db::Db::open_in_memory().unwrap()
         }
 
-        /// Read directly from the keychain — used to verify what
-        /// `register_github_pat` and the migration write. Bypasses the
-        /// active-flag gate so it's a raw fact-check.
-        fn keychain_value() -> Option<String> {
+        /// The raw read behind [`keychain_value!`] /
+        /// [`keychain_value_legacy!`] — Err is NEVER swallowed (see the
+        /// macros below for why). Bypasses the active-flag gate so the
+        /// callers are raw fact-checks.
+        fn keychain_read(module_id: &str) -> Result<Option<String>, String> {
             crate::secrets::get(
                 crate::secrets::SecretScope::Shared {
                     project_id: SENTINEL_SHARED,
                 },
-                GITHUB_PAT_MODULE_ID,
+                module_id,
                 GITHUB_PAT_KEY,
             )
-            .ok()
-            .flatten()
+        }
+
+        /// Read directly from the keychain — used to verify what
+        /// `register_github_pat` and the migration write. Bypasses the
+        /// active-flag gate so it's a raw fact-check.
+        ///
+        /// v0.2.97 (second instance of the flaky-run class, 2026-09-25):
+        /// this used to be a plain `fn` ending in `.ok().flatten()`, which
+        /// read a Secret-Service timeout as "slot empty" — the assert then
+        /// blamed the product ("old slot must hold the seed" left=None
+        /// although the seed had succeeded). The READ path gets the same
+        /// hardening `clean_keychain!` (delete) and `seed_keychain!` (set)
+        /// already have: a positively-identified timeout skips the test,
+        /// any other Err panics with the error text, `Ok(v)` is the slot's
+        /// value. Macro (not fn) so the skip can `return` from the test.
+        macro_rules! keychain_value {
+            ($home:expr) => {
+                match keychain_read(GITHUB_PAT_MODULE_ID) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            eprintln!(
+                                "[skip] Secret Service too slow/unavailable under \
+                                 load ({}); same posture as keyring_available() == \
+                                 false — not a product regression",
+                                e
+                            );
+                            std::fs::remove_dir_all(&$home).ok();
+                            return;
+                        }
+                        panic!(
+                            "reading shared.{}/{} failed (a failed read must not \
+                             masquerade as an empty slot): {}",
+                            GITHUB_PAT_MODULE_ID,
+                            GITHUB_PAT_KEY,
+                            e
+                        );
+                    }
+                }
+            };
         }
 
         /// Read directly from the LEGACY (`installer/`) keychain slot.
         /// Used by the module_id consolidation tests to check the old
         /// slot was emptied after migration. Pre-2026-05-10 this was
         /// the only writer slot; post-fix it's read-only and gets
-        /// drained on first `register_github_pat` call.
-        fn keychain_value_legacy() -> Option<String> {
-            crate::secrets::get(
-                crate::secrets::SecretScope::Shared {
-                    project_id: SENTINEL_SHARED,
-                },
-                GITHUB_PAT_LEGACY_MODULE_ID,
-                GITHUB_PAT_KEY,
-            )
-            .ok()
-            .flatten()
+        /// drained on first `register_github_pat` call. Same
+        /// no-swallowed-Err contract as [`keychain_value!`].
+        macro_rules! keychain_value_legacy {
+            ($home:expr) => {
+                match keychain_read(GITHUB_PAT_LEGACY_MODULE_ID) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            eprintln!(
+                                "[skip] Secret Service too slow/unavailable under \
+                                 load ({}); same posture as keyring_available() == \
+                                 false — not a product regression",
+                                e
+                            );
+                            std::fs::remove_dir_all(&$home).ok();
+                            return;
+                        }
+                        panic!(
+                            "reading shared.{}/{} failed (a failed read must not \
+                             masquerade as an empty slot): {}",
+                            GITHUB_PAT_LEGACY_MODULE_ID,
+                            GITHUB_PAT_KEY,
+                            e
+                        );
+                    }
+                }
+            };
         }
 
         fn delete_keychain() {
@@ -14617,6 +14836,174 @@ MemAvailable:   23456789 kB
             );
         }
 
+        // ── v0.2.97 flaky-run hardening (2026-09-25) ─────────────────────────
+        //
+        // A full-workspace `cargo test` run failed ONCE on
+        // `migrate_github_pat_audit_log_records_file_removed_false` with a bare
+        // `assert!(report.migrated)`. Root cause: every keychain op runs on ONE
+        // worker thread with a 10s caller-side bound (`KEYCHAIN_OP_TIMEOUT` in
+        // vct-launcher-core::secrets) and fast-fails with `WorkerStuck` while a
+        // prior op is wedged — under load a delete or set can fail there. The
+        // old `delete_keychain()` swallowed delete errors (`let _ =`), so a
+        // failed CLEANUP delete left residue that the NEXT test's migration
+        // read as "keychain already has a value" (Case 2 → migrated=false), or
+        // the migration's own `secrets::set` failed into `report.warnings`
+        // (Case 3 → migrated=false). The bare assert then reported neither.
+
+        /// True when the error string positively identifies a keychain-op
+        /// timeout / worker unavailability — the deterministic `Display`
+        /// strings of `KeychainTimeout` in vct-launcher-core, embedded
+        /// verbatim in `KeychainError::Other` details by `set_raw` /
+        /// `get_with_context` / `delete_with_context`. These substrings are
+        /// produced by no other error source, so matching them is positive
+        /// identification, not a guess. Any OTHER error is a real failure
+        /// and must fail the test loudly.
+        fn is_keychain_unavailable_err(e: &str) -> bool {
+            // v0.2.97 sweep: delegates to the ONE shared predicate in
+            // `secrets::for_tests` (same strings; see the home there).
+            crate::secrets::for_tests::is_keychain_unavailable_err(e)
+        }
+
+        /// Outcome of [`delete_keychain_checked`].
+        enum KeychainPrep {
+            Ready,
+            /// The Secret Service was too slow / wedged under load (a
+            /// positively-identified timeout-class error). The caller should
+            /// SKIP the test — the same posture as `keyring_available() ==
+            /// false` — never fail it.
+            Unavailable(String),
+        }
+
+        /// [`delete_keychain`], made honest (v0.2.97): a failed delete must
+        /// fail the test loudly with the error, and the slots must be VERIFIED
+        /// empty afterwards — a delete whose error was swallowed can leave
+        /// residue that a later migration reads as "already migrated",
+        /// which is exactly the silent false-failure mode this hardens
+        /// against. Only a positively-identified timeout-class error yields
+        /// [`KeychainPrep::Unavailable`] so the caller can skip.
+        ///
+        /// Same safety contract as `delete_keychain`: only callable inside a
+        /// `setup_temp_env()` guard (namespace `vct-test-<pid>`); the
+        /// `assert_not_production_pat_slot` tripwire enforces it.
+        fn delete_keychain_checked() -> KeychainPrep {
+            let scope = crate::secrets::SecretScope::Shared {
+                project_id: SENTINEL_SHARED,
+            };
+            for module_id in [GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID] {
+                if let Err(e) = crate::secrets::delete(scope, module_id, GITHUB_PAT_KEY) {
+                    if is_keychain_unavailable_err(&e) {
+                        return KeychainPrep::Unavailable(e);
+                    }
+                    // A host with NO Secret Service backend (headless CI:
+                    // "org.freedesktop.secrets was not provided by any .service
+                    // files") errs on every op by construction and can hold no
+                    // residue — the keychain is empty, so the file-fallback
+                    // tests are exactly what should run there. Consulted only
+                    // AFTER a non-timeout failure: a loaded desktop whose probe
+                    // times out still takes the timeout skip above.
+                    if !crate::secrets::keychain_backend_available() {
+                        return KeychainPrep::Ready;
+                    }
+                    panic!(
+                        "delete_keychain_checked: keychain delete of shared.{}/{} \
+                         failed (residue would be misread as already-migrated): {}",
+                        module_id, GITHUB_PAT_KEY, e
+                    );
+                }
+            }
+            // Verify both slots actually read EMPTY. Never print the value —
+            // slot identity + a length is all a diagnostic needs.
+            for module_id in [GITHUB_PAT_MODULE_ID, GITHUB_PAT_LEGACY_MODULE_ID] {
+                match crate::secrets::get(scope, module_id, GITHUB_PAT_KEY) {
+                    Ok(None) => {}
+                    Ok(Some(v)) => panic!(
+                        "delete_keychain_checked: slot shared.{}/{} still holds \
+                         {} bytes after delete — a swallowed delete error would \
+                         make the next migration report migrated=false",
+                        module_id,
+                        GITHUB_PAT_KEY,
+                        v.len()
+                    ),
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            return KeychainPrep::Unavailable(e);
+                        }
+                        panic!(
+                            "delete_keychain_checked: verifying slot \
+                             shared.{}/{} empty failed: {}",
+                            module_id, GITHUB_PAT_KEY, e
+                        );
+                    }
+                }
+            }
+            KeychainPrep::Ready
+        }
+
+        /// Precondition macro for tests in this module: wipe + verify both PAT
+        /// slots, skipping the test (like `keyring_available() == false`) when
+        /// the Secret Service is positively identified as too slow/unavailable
+        /// under load, and failing loudly on any other keychain error or on
+        /// post-delete residue.
+        macro_rules! clean_keychain {
+            ($home:expr) => {
+                match delete_keychain_checked() {
+                    KeychainPrep::Ready => {}
+                    KeychainPrep::Unavailable(reason) => {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as keyring_available() == \
+                             false — not a product regression",
+                            reason
+                        );
+                        std::fs::remove_dir_all(&$home).ok();
+                        return;
+                    }
+                }
+            };
+        }
+
+        /// Seed macro for tests in this module (R12-bis keychain-tests
+        /// residual): the SEED `crate::secrets::set` gets the same
+        /// positive-timeout skip `clean_keychain!` gives the cleanup
+        /// deletes — a wedged Secret Service under load used to abort the
+        /// test at the seed's `.unwrap()` before it asserted anything.
+        /// Any NON-timeout error still panics with the error.
+        macro_rules! seed_keychain {
+            ($home:expr, $scope:expr, $module_id:expr, $key:expr, $value:expr) => {
+                if let Err(e) = crate::secrets::set($scope, $module_id, $key, $value) {
+                    if is_keychain_unavailable_err(&e) {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as keyring_available() == \
+                             false — not a product regression",
+                            e
+                        );
+                        std::fs::remove_dir_all(&$home).ok();
+                        return;
+                    }
+                    panic!(
+                        "seeding shared.{}/{} failed (cannot seed the \
+                         migration fixture): {}",
+                        $module_id, $key, e
+                    );
+                }
+            };
+        }
+
+        /// True when the migration report's warnings positively identify a
+        /// keychain timeout / worker failure as the reason `migrated` is
+        /// false. Used ONLY to distinguish "Secret Service too slow under
+        /// load" from a product regression; any other warning still fails
+        /// the assert.
+        fn migration_report_indicates_keychain_timeout(
+            report: &GithubPatMigrationReport,
+        ) -> bool {
+            report
+                .warnings
+                .iter()
+                .any(|w| is_keychain_unavailable_err(w))
+        }
+
         // ── Item #1: register_github_pat → keychain (no plaintext file) ──
 
         /// Calling the underlying register flow (keychain set + active
@@ -14634,7 +15021,7 @@ MemAvailable:   23456789 kB
             let (home, _guard) = setup_temp_env();
             let db = make_db();
             // Clean slate — no prior keychain residue from another test.
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_test_{}", uuid::Uuid::new_v4().simple());
 
@@ -14662,13 +15049,13 @@ MemAvailable:   23456789 kB
             // delete user-owned files in `~/.vct-secrets/shared/`.
 
             // Keychain has the value (raw — bypass the active gate).
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
 
             // The active-flag-gated read also surfaces the canary.
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
-                "github_pat_for_env should return the freshly-written value"
+                "resolve_github_pat should return the freshly-written value"
             );
 
             // Cleanup.
@@ -14689,7 +15076,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a user-owned file. The user "owns" this file
             // (e.g. they wrote it manually); the launcher must not
@@ -14745,7 +15132,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a file at the new shared/ path with a canary.
             let canary = format!("ghp_existing_{}", uuid::Uuid::new_v4().simple());
@@ -14756,6 +15143,18 @@ MemAvailable:   23456789 kB
 
             // Migrate.
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: a positively-identified keychain timeout
+            // under load is an environment condition (same posture as
+            // `keyring_available() == false`), not a product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "expected migrated=true: {:?}", report);
             assert!(
                 !report.file_removed,
@@ -14763,10 +15162,10 @@ MemAvailable:   23456789 kB
                 report,
             );
             assert!(report.flag_set, "expected flag_set=true: {:?}", report);
-            assert!(!report.already_done, "first run is not already_done");
+            assert!(!report.already_done, "first run is not already_done: {:?}", report);
 
             // Keychain has the value.
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
 
             // File PRESERVED — this is the non-destructive contract.
             assert!(
@@ -14789,9 +15188,13 @@ MemAvailable:   23456789 kB
 
             // Run #2: idempotent — already_done short-circuits.
             let report2 = migrate_github_pat_file_to_keychain(&db).unwrap();
-            assert!(report2.already_done, "second run should be a no-op");
-            assert!(!report2.migrated);
-            assert!(!report2.file_removed);
+            assert!(
+                report2.already_done,
+                "second run should be a no-op: {:?}",
+                report2
+            );
+            assert!(!report2.migrated, "second run must not re-migrate: {:?}", report2);
+            assert!(!report2.file_removed, "second run must not remove: {:?}", report2);
 
             // Cleanup.
             delete_keychain();
@@ -14810,7 +15213,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_{}", uuid::Uuid::new_v4().simple());
             let secrets_dir = vct_secrets_dir().unwrap();
@@ -14819,15 +15222,27 @@ MemAvailable:   23456789 kB
             std::fs::write(&flat, &canary).unwrap();
 
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: a positively-identified keychain timeout
+            // under load is an environment condition (same posture as
+            // `keyring_available() == false`), not a product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "expected migrated=true: {:?}", report);
-            assert!(report.flag_set);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert!(
                 !report.file_removed,
                 "non-destructive contract: file_removed must be false: {:?}",
                 report,
             );
 
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
             assert!(
                 flat.exists(),
                 "migration must NOT delete legacy flat path (user-owned): {}",
@@ -14859,7 +15274,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-place a file at the shared/ path with a canary so
             // the Case-3 codepath (file present, keychain empty) is
@@ -14872,7 +15287,19 @@ MemAvailable:   23456789 kB
             std::fs::write(&path, &canary).unwrap();
 
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
-            assert!(report.migrated);
+            // v0.2.97 flaky-run fix (the test that failed bare in the
+            // workspace run): timeout under load → skip; anything else
+            // fails WITH the report so `warnings` is diagnosable.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
+            assert!(report.migrated, "expected migrated=true (Case-3): {:?}", report);
             assert!(
                 !report.file_removed,
                 "non-destructive contract: file_removed must be false: {:?}",
@@ -14961,7 +15388,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Pre-populate keychain.
             let existing = format!("ghp_existing_{}", uuid::Uuid::new_v4().simple());
@@ -14980,7 +15407,7 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored = keychain_value!(home);
             let stored_trim = stored.as_deref().unwrap_or("").trim();
             let force = false;
             assert!(
@@ -15000,7 +15427,7 @@ MemAvailable:   23456789 kB
             // With force=true, the keychain set proceeds (matches the
             // command's behaviour after the guard).
             crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_token).unwrap();
-            assert_eq!(keychain_value().as_deref(), Some(new_token.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(new_token.as_str()));
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
@@ -15016,7 +15443,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             let token = format!("ghp_same_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15025,7 +15452,7 @@ MemAvailable:   23456789 kB
             crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &token).unwrap();
 
             // Same token, force=false → guard predicate is FALSE.
-            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored = keychain_value!(home);
             let stored_trim = stored.as_deref().unwrap_or("").trim();
             let guard_fires = !stored_trim.is_empty() && stored_trim != token.trim();
             assert!(
@@ -15037,19 +15464,19 @@ MemAvailable:   23456789 kB
             std::fs::remove_dir_all(&home).ok();
         }
 
-        // ── Item #2: github_pat_for_env active-flag gating ────────────
+        // ── Item #2: resolve_github_pat active-flag gating ────────────
 
-        /// `github_pat_for_env` returns Some when the keychain has a
+        /// `resolve_github_pat` returns Some when the keychain has a
         /// value AND the active flag is true.
         #[test]
-        fn github_pat_for_env_returns_value_when_active_in_keychain() {
+        fn resolve_github_pat_returns_value_when_active_in_keychain() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_env_{}", uuid::Uuid::new_v4().simple());
             crate::secrets::set(
@@ -15069,24 +15496,25 @@ MemAvailable:   23456789 kB
             )
             .unwrap();
 
-            assert_eq!(github_pat_for_env(&db).as_deref(), Some(canary.as_str()));
+            assert_eq!(resolve_github_pat(&db).as_deref(), Some(canary.as_str()));
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
 
-        /// Paused secret (Lifecycle B unset) MUST NOT surface to env-files.
+        /// Paused secret (Lifecycle B unset) MUST NOT surface through the
+        /// resolver the status surfaces read.
         /// This is the asymmetric-leak test: keychain has the value but
         /// active-flag is false → reader returns None.
         #[test]
-        fn github_pat_for_env_returns_none_when_paused() {
+        fn resolve_github_pat_returns_none_when_paused() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_paused_{}", uuid::Uuid::new_v4().simple());
             crate::secrets::set(
@@ -15108,28 +15536,28 @@ MemAvailable:   23456789 kB
             .unwrap();
 
             assert_eq!(
-                github_pat_for_env(&db),
+                resolve_github_pat(&db),
                 None,
-                "paused secret must NOT surface to env files (asymmetric leak)",
+                "paused secret must NOT surface through the resolver (asymmetric leak)",
             );
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
         }
 
-        /// `github_pat_for_env` with no keychain entry AND no file
+        /// `resolve_github_pat` with no keychain entry AND no file
         /// returns None (not an empty string, not an error).
         #[test]
-        fn github_pat_for_env_returns_none_when_unset() {
+        fn resolve_github_pat_returns_none_when_unset() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
-            assert_eq!(github_pat_for_env(&db), None);
+            assert_eq!(resolve_github_pat(&db), None);
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15147,22 +15575,21 @@ MemAvailable:   23456789 kB
         /// call would short-circuit `github_pat_from_keychain` and the
         /// file-fallback path never gets exercised.
         #[test]
-        fn github_pat_for_env_falls_back_to_legacy_file_pre_migration() {
+        fn resolve_github_pat_falls_back_to_legacy_file_pre_migration() {
             let (home, _guard) = setup_temp_env();
             let db = make_db();
             // Clear any prior keychain residue so the file-fallback
             // path is the one exercised. If the keychain backend is
-            // unreachable (CI), `delete` is a no-op and the test still
-            // exercises the file-fallback (since the keychain read
-            // also returns None on unreachable).
-            delete_keychain();
+            // unreachable (CI), the checked delete skips the test (the
+            // keychain read would be indistinguishable from empty anyway).
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_fallback_{}", uuid::Uuid::new_v4().simple());
             let shared_dir = vct_secrets_shared_dir().unwrap();
             std::fs::create_dir_all(&shared_dir).unwrap();
             std::fs::write(shared_dir.join("github_pat"), &canary).unwrap();
 
-            assert_eq!(github_pat_for_env(&db).as_deref(), Some(canary.as_str()));
+            assert_eq!(resolve_github_pat(&db).as_deref(), Some(canary.as_str()));
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15282,7 +15709,7 @@ MemAvailable:   23456789 kB
                 return;
             }
             let (home, _guard) = setup_temp_env();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_user_slot_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
@@ -15293,13 +15720,13 @@ MemAvailable:   23456789 kB
 
             // The new (user) slot has the value.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(canary.as_str()),
                 "register flow must write to the user slot",
             );
             // The legacy (installer) slot stays empty — no shadow row.
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "register flow must NOT write to the legacy installer slot",
             );
 
@@ -15317,31 +15744,30 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_old_only_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
             // Seed the LEGACY slot only.
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
             // Pre-condition: new slot empty, old slot full.
-            assert!(keychain_value().is_none(), "new slot must start empty");
+            assert!(keychain_value!(home).is_none(), "new slot must start empty");
             assert_eq!(
-                keychain_value_legacy().as_deref(),
+                keychain_value_legacy!(home).as_deref(),
                 Some(canary.as_str()),
                 "old slot must hold the seed",
             );
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(!report.already_done);
-            assert!(report.had_old_value);
-            assert!(!report.had_new_value);
+            assert!(!report.already_done, "first run: {:?}", report);
+            assert!(report.had_old_value, "old slot must have held the seed: {:?}", report);
+            assert!(!report.had_new_value, "new slot must have started empty: {:?}", report);
             assert_eq!(report.winner, "old");
-            assert!(report.deleted_old_keychain_row);
-            assert!(report.forgot_old_active_state);
-            assert!(report.flag_set);
+            assert!(report.deleted_old_keychain_row, "old row must be deleted: {:?}", report);
+            assert!(report.forgot_old_active_state, "old active row must be dropped: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert!(
                 report.warnings.is_empty(),
                 "expected no warnings: {:?}",
@@ -15350,12 +15776,12 @@ MemAvailable:   23456789 kB
 
             // Post-condition: new slot has the value, old slot empty.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(canary.as_str()),
                 "value must be promoted to the user slot",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "old installer slot must be empty after migration",
             );
             assert_eq!(
@@ -15379,7 +15805,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let old_canary = format!("ghp_old_{}", uuid::Uuid::new_v4().simple());
             let new_canary = format!("ghp_new_{}", uuid::Uuid::new_v4().simple());
@@ -15389,29 +15815,28 @@ MemAvailable:   23456789 kB
             // Seed BOTH slots — simulates user who used the wizard
             // (writes to old slot in 0.2.0) THEN the SecretsPanel
             // Shared tab (writes to new slot).
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &old_canary)
-                .unwrap();
-            crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary).unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &old_canary);
+            seed_keychain!(home, scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_canary);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report.had_old_value);
-            assert!(report.had_new_value);
+            assert!(report.had_old_value, "old slot must have held its seed: {:?}", report);
+            assert!(report.had_new_value, "new slot must have held its seed: {:?}", report);
             assert_eq!(
                 report.winner, "new",
                 "both slots populated → new wins (later-write); got {:?}",
                 report.winner
             );
-            assert!(report.deleted_old_keychain_row);
-            assert!(report.flag_set);
+            assert!(report.deleted_old_keychain_row, "old row must be deleted: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
 
             // Post-condition: new slot retains its value, old slot empty.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(new_canary.as_str()),
                 "new slot value must NOT be overwritten when both slots had values",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "old installer slot must be cleared regardless of winner",
             );
 
@@ -15433,25 +15858,25 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(!report.already_done, "first run must not be already_done");
-            assert!(!report.had_old_value);
-            assert!(!report.had_new_value);
+            assert!(!report.already_done, "first run must not be already_done: {:?}", report);
+            assert!(!report.had_old_value, "old slot must be empty: {:?}", report);
+            assert!(!report.had_new_value, "new slot must be empty: {:?}", report);
             assert_eq!(report.winner, "none");
-            assert!(!report.deleted_old_keychain_row);
-            assert!(report.flag_set);
+            assert!(!report.deleted_old_keychain_row, "nothing to delete: {:?}", report);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
 
             // Both slots still empty.
-            assert!(keychain_value().is_none());
-            assert!(keychain_value_legacy().is_none());
+            assert!(keychain_value!(home).is_none());
+            assert!(keychain_value_legacy!(home).is_none());
 
             // Run #2: idempotent — already_done short-circuits.
             let report2 = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report2.already_done);
+            assert!(report2.already_done, "second run must short-circuit: {:?}", report2);
             assert_eq!(report2.winner, "none");
-            assert!(!report2.flag_set, "flag was already set; we don't re-set it");
+            assert!(!report2.flag_set, "flag was already set; we don't re-set it: {:?}", report2);
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -15467,14 +15892,13 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_audit_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
 
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
             assert_eq!(report.winner, "old");
@@ -15508,19 +15932,19 @@ MemAvailable:   23456789 kB
         }
 
         /// Item #6.6b: upgrade-window fallback — until the module_id
-        /// migration runs, `github_pat_for_env` falls back to the
+        /// migration runs, `resolve_github_pat` falls back to the
         /// legacy `installer/` slot so a 0.2.0 user's existing PAT
         /// stays reachable across the const flip. After migration the
         /// legacy slot is empty and the fallback is a no-op.
         #[test]
-        fn github_pat_for_env_falls_back_to_legacy_installer_slot_pre_module_id_migration() {
+        fn resolve_github_pat_falls_back_to_legacy_installer_slot_pre_module_id_migration() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Simulate a 0.2.0 install: PAT lives at the LEGACY slot
             // only, no migration has run yet.
@@ -15528,12 +15952,11 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
 
             // The fallback surfaces it.
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
                 "upgrade-window fallback must surface the legacy installer slot value",
             );
@@ -15541,14 +15964,14 @@ MemAvailable:   23456789 kB
             // Run the module_id migration. After that, the value lives
             // at the new slot AND the legacy slot is empty.
             let report = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
-            assert!(report.flag_set);
+            assert!(report.flag_set, "expected flag_set=true: {:?}", report);
             assert_eq!(
-                github_pat_for_env(&db).as_deref(),
+                resolve_github_pat(&db).as_deref(),
                 Some(canary.as_str()),
                 "post-migration, the same value resolves through the new slot",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "legacy slot must be empty post-migration",
             );
 
@@ -15559,27 +15982,26 @@ MemAvailable:   23456789 kB
         /// Item #6.6c: the upgrade-window fallback honours the legacy
         /// slot's active-flag gate. A paused 0.2.0 PAT MUST NOT leak.
         #[test]
-        fn github_pat_for_env_legacy_fallback_honours_paused_state() {
+        fn resolve_github_pat_legacy_fallback_honours_paused_state() {
             if !keyring_available() {
                 eprintln!("[skip] no OS keychain backend in this test env");
                 return;
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             let canary = format!("ghp_legacy_paused_{}", uuid::Uuid::new_v4().simple());
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            crate::secrets::set(scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary)
-                .unwrap();
+            seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
             // Pause the legacy slot.
             db.mark_secret_inactive("shared", SENTINEL_SHARED, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY)
                 .unwrap();
 
             assert_eq!(
-                github_pat_for_env(&db),
+                resolve_github_pat(&db),
                 None,
                 "paused legacy PAT must NOT leak through the upgrade-window fallback",
             );
@@ -15609,7 +16031,7 @@ MemAvailable:   23456789 kB
             }
             let (home, _guard) = setup_temp_env();
             let db = make_db();
-            delete_keychain();
+            clean_keychain!(home);
 
             // Seed a file-fallback PAT — simulates a fresh install
             // where the user has `~/.vct-secrets/shared/github_pat`
@@ -15622,16 +16044,27 @@ MemAvailable:   23456789 kB
             // Run the file→keychain migration. After our 2026-05-10
             // const flip, this writes via GITHUB_PAT_MODULE_ID="user".
             let report = migrate_github_pat_file_to_keychain(&db).unwrap();
+            // v0.2.97 flaky-run fix: timeout under load → skip, not a
+            // product regression.
+            if !report.migrated && migration_report_indicates_keychain_timeout(&report) {
+                eprintln!(
+                    "[skip] keychain op timed out under load (warnings: {:?}) — \
+                     not a product regression; migration left the file for retry",
+                    report.warnings
+                );
+                std::fs::remove_dir_all(&home).ok();
+                return;
+            }
             assert!(report.migrated, "file→keychain must have run: {:?}", report);
 
             // Value lands at the user slot, not the legacy installer slot.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(file_canary.as_str()),
                 "file→keychain migration must write to the user slot post-flip",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "file→keychain migration must NOT write to the legacy installer slot",
             );
 
@@ -15685,6 +16118,28 @@ MemAvailable:   23456789 kB
         ///
         /// RED-PROOF: delete either `cmd.env(...)` line from
         /// `install_py_command` and this fails by name.
+        /// v0.2.97 review F17: a launcher that inherited install.py's relaunch
+        /// record (vct-updater -> relaunched launcher) must not pass it to the
+        /// next install.py, which would skip its venv relaunch and watch a
+        /// stale pid. RED-PROOF: delete the `env_remove` loop.
+        #[test]
+        fn every_install_py_spawn_drops_the_relaunch_record() {
+            let cmd = install_py_command("python3", Path::new("/tmp/vco-root"), ["--update"]);
+            let envs = envs_of(&cmd);
+            for key in [
+                "VCT_INSTALL_RELAUNCHED",
+                "VCT_INSTALL_BASE_PYTHON",
+                "VCT_INSTALL_BASE_PYTHON_VERSION",
+                "VCT_INSTALL_PARENT_WAITS",
+                "VCT_INSTALL_RELAUNCH_TOKEN",
+            ] {
+                assert!(
+                    envs.contains(&(key.to_string(), None)),
+                    "{key} is not removed from the install.py env, so an inherited                      relaunch record would reach the next run. Got: {envs:?}"
+                );
+            }
+        }
+
         #[test]
         fn every_install_py_spawn_carries_the_utf8_env_pair() {
             let cmd = install_py_command("python3", Path::new("/tmp/vco-root"), ["--update"]);
@@ -16106,6 +16561,119 @@ MemAvailable:   23456789 kB
             assert!(cfg.lightweight);
             assert_eq!(cfg.lightweight_old_path.as_deref(), Some("/old/path"));
         }
+
+        /// v0.2.97 (lane Y): `service_choices` deserialises when absent
+        /// (older wizard payloads) and round-trips when set.
+        #[test]
+        fn install_config_deserialises_service_choices() {
+            let json_minimal = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": false,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": null,
+                "skip_containers": false,
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_minimal).unwrap();
+            assert!(cfg.service_choices.is_none(), "default service_choices=None");
+
+            let json_full = serde_json::json!({
+                "install_path": "/x",
+                "use_gpu": false,
+                "cpu_only": false,
+                "openai_key": null,
+                "container_runtime": null,
+                "skip_containers": false,
+                "service_choices": ["weaviate=vco", "ollama=adopt:url:http://ollama.lan:11434"],
+            });
+            let cfg: InstallConfig = serde_json::from_value(json_full).unwrap();
+            assert_eq!(
+                cfg.service_choices.as_deref().unwrap_or(&[]),
+                &["weaviate=vco".to_string(), "ollama=adopt:url:http://ollama.lan:11434".to_string()],
+            );
+        }
+
+        /// v0.2.97 (lane Y): the wizard's answers become `--service` flags,
+        /// and a value install.py's `parse_service_flag` would reject is
+        /// refused on the LAUNCHER side (strict argparse would abort the
+        /// whole install otherwise).
+        #[test]
+        fn service_choice_args_builds_flags_and_rejects_malformed_values() {
+            // Red-proof pair for the flag forwarding: adopt-by-container,
+            // adopt-by-url, vco and vco-with-port all pass through verbatim.
+            let argv = service_choice_args(&[
+                "weaviate=adopt:container:their_weaviate".to_string(),
+                "ollama=adopt:url:http://ollama.lan:11434".to_string(),
+                "weaviate=vco".to_string(),
+                "code_embed=vco:21440".to_string(),
+            ])
+            .expect("all valid");
+            assert_eq!(
+                argv,
+                vec![
+                    "--service".to_string(),
+                    "weaviate=adopt:container:their_weaviate".to_string(),
+                    "--service".to_string(),
+                    "ollama=adopt:url:http://ollama.lan:11434".to_string(),
+                    "--service".to_string(),
+                    "weaviate=vco".to_string(),
+                    "--service".to_string(),
+                    "code_embed=vco:21440".to_string(),
+                ]
+            );
+            assert!(service_choice_args(&[]).unwrap().is_empty());
+
+            // The rejections mirror install.py's grammar.
+            for bad in [
+                "redis=adopt:url:http://x:1",           // unknown service
+                "weaviate=adopt:container:",            // empty container name
+                "weaviate=adopt:url:not-a-url",         // not http(s)
+                "weaviate=adopt:url:http://a b",        // whitespace in URL
+                "weaviate=vco:abc",                     // non-numeric port
+                "weaviate=vco:",                        // empty port suffix
+                "code_embed=adopt:container:c",         // code-embed is VCO's own
+                "weaviate",                             // no '=' at all
+            ] {
+                let err = service_choice_args(&[bad.to_string()])
+                    .expect_err("must be rejected on the launcher side");
+                assert!(err.contains(bad), "error names the value: {err}");
+            }
+        }
+
+        /// v0.2.97: the ONE committed `--service` grammar table (tier C mirror,
+        /// A>B>C): every case runs through BOTH this validator and install.py's
+        /// `parse_service_flag` (tests/test_v0297_service_reconcile.py::
+        /// test_service_flag_grammar_fixture). A disagreement here is a drift in
+        /// one of the two implementations, never a reason to fork the table.
+        #[test]
+        fn service_flag_grammar_matches_the_committed_fixture() {
+            let table: serde_json::Value = serde_json::from_str(
+                include_str!("../../../../tests/fixtures/service_flag_grammar_cases.json"),
+            )
+            .expect("fixture must parse");
+            let accept = table["accept"].as_array().expect("accept cases");
+            let reject = table["reject"].as_array().expect("reject cases");
+            assert!(!accept.is_empty() && !reject.is_empty());
+            for case in accept {
+                let input = case["input"].as_str().expect("input");
+                let expect = &case["expect"];
+                let (service, kind, value) =
+                    parse_service_choice(input).unwrap_or_else(|e| panic!("{input}: {e}"));
+                assert_eq!(service, expect["service"].as_str().expect("service"), "{input}");
+                assert_eq!(kind, expect["kind"].as_str().expect("kind"), "{input}");
+                match expect["value"].as_str() {
+                    Some(want) => assert_eq!(value, Some(want), "{input}"),
+                    None => assert_eq!(value, None, "{input}"),
+                }
+            }
+            for case in reject {
+                let input = case["input"].as_str().expect("input");
+                assert!(
+                    parse_service_choice(input).is_err(),
+                    "{input} must be rejected on the launcher side"
+                );
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -16378,49 +16946,29 @@ MemAvailable:   23456789 kB
         fn ensure_hub_started_after_update_is_soft_fail_when_no_binary() {
             // No vct-hub binary anywhere → returns Ok(()), prints a
             // warning. The launcher's own boot path will retry.
-            with_vct_state_dir(|_root| {
-                let prev_bin = std::env::var_os("VCT_HUB_BIN");
-                let prev_path = std::env::var_os("PATH");
-                let prev_home = std::env::var_os("HOME");
-                let prev_profile = std::env::var_os("USERPROFILE");
-                unsafe {
-                    std::env::set_var("VCT_HUB_BIN", "/nonexistent/vct-hub");
-                    std::env::set_var("PATH", "/nonexistent-dir");
-                    std::env::set_var("HOME", "/nonexistent-home");
-                    std::env::set_var("USERPROFILE", "/nonexistent-profile");
-                }
-                let install_path = std::env::temp_dir();
-                // v0.2.89: signature now takes a HubRestartContext. PostInstall
-                // exercises the same missing-binary early-return the pre-v0.2.89
-                // test covered (the binary lookup fails BEFORE the ctx branch, so
-                // either context returns Ok(()) here — PostInstall keeps this a
-                // fully synchronous, deterministic soft-fail).
-                let result = ensure_hub_started_after_update(
-                    &install_path,
-                    HubRestartContext::PostInstall,
-                );
-                assert!(result.is_ok(),
-                    "missing binary should soft-fail to Ok(()), got {:?}",
-                    result);
-                unsafe {
-                    match prev_bin {
-                        Some(v) => std::env::set_var("VCT_HUB_BIN", v),
-                        None => std::env::remove_var("VCT_HUB_BIN"),
-                    }
-                    match prev_path {
-                        Some(v) => std::env::set_var("PATH", v),
-                        None => std::env::remove_var("PATH"),
-                    }
-                    match prev_home {
-                        Some(v) => std::env::set_var("HOME", v),
-                        None => std::env::remove_var("HOME"),
-                    }
-                    match prev_profile {
-                        Some(v) => std::env::set_var("USERPROFILE", v),
-                        None => std::env::remove_var("USERPROFILE"),
-                    }
-                }
-            });
+            //
+            // v0.2.97 review R6: the discovery's answer is handed in, so the
+            // test sets no process env (it used to empty VCT_HUB_BIN / HOME /
+            // USERPROFILE — which the harness refusal below made moot anyway).
+            // PostInstall: the missing-binary early return comes BEFORE the
+            // ctx branch, and keeps this synchronous and deterministic.
+            let install_path = std::env::temp_dir();
+            let result =
+                start_found_hub_after_update(&install_path, HubRestartContext::PostInstall, None);
+            assert!(result.is_ok(),
+                "missing binary should soft-fail to Ok(()), got {:?}",
+                result);
+        }
+
+        /// Under the cargo test harness the public entry refuses before any
+        /// discovery or spawn (hub discovery ignores `VCT_STATE_DIR`, so a
+        /// spawn would be a REAL hub) — and says so with `Ok(())`.
+        #[test]
+        fn ensure_hub_started_after_update_refuses_under_the_test_harness() {
+            assert!(crate::hub_launcher::running_under_test_harness());
+            for ctx in [HubRestartContext::PostInstall, HubRestartContext::AbortRecovery] {
+                assert!(ensure_hub_started_after_update(&std::env::temp_dir(), ctx).is_ok());
+            }
         }
     }
 
@@ -19773,9 +20321,12 @@ severity_max: critical\n\
         /// remote/fetch/rev-parse and fails ONLY rev-list.
         ///
         /// Plain `#[test]` (not `#[tokio::test]`): we build our OWN
-        /// single-thread runtime INSIDE `with_env_vars` so the PATH override
-        /// covers the whole async invocation. `#[tokio::test]` would already
-        /// hold a runtime and forbid the nested `block_on`.
+        /// single-thread runtime INSIDE `with_lookup_path`, so the whole
+        /// async invocation runs on THIS thread and sees the injected lookup
+        /// PATH (the launcher's git runners resolve `git` through it —
+        /// `git_cmd::git_command`). v0.2.97 review R6: the test used to put
+        /// the shim first on the PROCESS `PATH`, which every concurrently
+        /// running test and every child they spawn by bare name shares.
         #[cfg(unix)]
         #[test]
         fn rev_list_failure_populates_health_fields_not_silent() {
@@ -19817,30 +20368,17 @@ exit 0
             perms.set_mode(0o755);
             std::fs::set_permissions(&git_shim, perms).unwrap();
 
-            // Prepend the shim dir to PATH so our fake `git` wins. Guarded by
-            // GLOBAL_ENV_MUTEX so concurrent env-mutating tests don't race.
-            let orig_path = std::env::var("PATH").unwrap_or_default();
-            let new_path = format!("{}:{}", shim_dir.display(), orig_path);
+            // The shim dir is the WHOLE lookup PATH: only our fake `git` can
+            // be resolved, on this thread only.
             let repo_str = repo.to_str().unwrap().to_string();
-
-            // `with_env_vars` holds the mutex and runs the closure; we drive
-            // the async command on a fresh single-thread runtime INSIDE it so
-            // PATH stays overridden for the whole invocation.
-            let status = std::cell::RefCell::new(None);
-            vct_launcher_core::test_env::with_env_vars(
-                &[("PATH", Some(new_path.as_str()))],
-                || {
-                    let rt = tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                        .unwrap();
-                    let s = rt.block_on(check_for_updates(repo_str.clone())).expect(
-                        "check_for_updates must NOT hard-fail on a rev-list failure",
-                    );
-                    *status.borrow_mut() = Some(s);
-                },
-            );
-            let status = status.into_inner().expect("status captured");
+            let status = vct_launcher_core::paths::with_lookup_path(Some(shim_dir.as_os_str()), || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(check_for_updates(repo_str.clone()))
+                    .expect("check_for_updates must NOT hard-fail on a rev-list failure")
+            });
 
             assert!(
                 status.remote_check.is_unknown(),

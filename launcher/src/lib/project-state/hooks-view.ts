@@ -92,7 +92,9 @@ export function settingsErrorBanner(
     case 'missing':
       return `${settingsPath} does not exist yet, so there is nothing to wire hooks into. Run the project's bundle install (Settings → Update bundle) first.`;
     case 'unparseable':
-      return `${settingsPath} is not valid JSON, so the launcher will not edit it — a rewrite could destroy what is there. Fix the file by hand and reload. Nothing was written.`;
+      return `${settingsPath} is not valid JSON or JSONC, so the launcher will not edit it — a rewrite could destroy what is there. Fix the file by hand and reload. Nothing was written.`;
+    case 'jsonc_edit_refused':
+      return `${settingsPath} has comments or trailing commas, and this change could not be made in place without risking them — a rewrite could destroy what is there. Edit it by hand, or remove the comments, and reload. Nothing was written; the project's UPDATE_DEFERRED.md names the file too.`;
     case 'hooks_block_malformed':
       return `The \`hooks\` block in ${settingsPath} has a shape the launcher cannot edit safely. Fix it by hand and reload. Nothing was written.`;
     case 'no_python':
@@ -176,4 +178,36 @@ export function registerBlockedReason(
   const t = parseTimeoutSeconds(timeoutRaw);
   if (!t.ok) return t.error;
   return null;
+}
+
+/**
+ * Which OS the new-hook Command hint must fit.
+ *
+ * `'windows'` | `'other'` — the hint only has two shapes, so the granular
+ * linux/macos split other surfaces need would be detail this one cannot use.
+ */
+export type HintOs = 'windows' | 'other';
+
+/**
+ * Classify a `navigator.userAgent` for the new-hook hint.
+ *
+ * The launcher is a Tauri webview, so `navigator.userAgent` is the one OS
+ * fact available on every platform without a backend round trip; the
+ * WebView2/WebKitGTK/WKWebView strings all carry the OS name.
+ */
+export function detectHintOs(userAgent: string): HintOs {
+  return /Windows/i.test(userAgent) ? 'windows' : 'other';
+}
+
+/**
+ * The placeholder for the new-hook Command field, in the form the HOST OS
+ * can actually run (R9 H8: the tab used to show the Linux bash form on
+ * Windows too, and a user copying it for a `.ps1` hook got a command the
+ * compatibility doc says breaks under the PowerShell fallback — a user's
+ * own hook is never rewritten, so the mistake stays).
+ */
+export function newHookCommandPlaceholder(os: HintOs): string {
+  return os === 'windows'
+    ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.ps1"'
+    : 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"';
 }

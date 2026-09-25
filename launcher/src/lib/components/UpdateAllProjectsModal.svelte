@@ -45,7 +45,24 @@
     UpdateAllProjectEntry,
   } from '$lib/types/launcher';
 
-  let { open = $bindable<boolean>(false) }: { open: boolean } = $props();
+  import type { UpdateAllOutcome } from '$lib/bundle-staleness';
+
+  // `onFinished` fires exactly once per run, when the modal reaches its
+  // `done` phase — on success, on a partial run, and when the run itself
+  // throws — and NEVER for a dialog closed or cancelled from `confirm`,
+  // where nothing ran. The host re-takes the bundle-staleness census from
+  // it: a run changes bundle state, and the Projects page used to keep
+  // reporting "8 stale of 9" after a successful run because nothing told
+  // it the run had happened. Every `phase = 'done'` goes through
+  // `finishRun`, which is what makes "reaches done ⇒ host is told" hold
+  // by construction (pinned by `$lib/bundle-staleness.wiring.test.ts`).
+  let {
+    open = $bindable<boolean>(false),
+    onFinished,
+  }: {
+    open: boolean;
+    onFinished?: (outcome: UpdateAllOutcome) => void;
+  } = $props();
 
   // v0.2.71 Track T-C-modal / Gap A: a model-switch (or any schema change with
   // no data-preserving migration) during Update-all silently leaves stale
@@ -256,7 +273,7 @@
     try {
       const r = await projects.updateAll({ stop_on_error: stopOnError });
       report = r;
-      phase = 'done';
+      finishRun('completed');
       // MAJOR-2: only the BOUNDARY listener is done (no more started/finished
       // events will come). The two sub-event listeners stay ALIVE — kg-sync /
       // codegraph embeds are fire-and-forget backend spawns that keep
@@ -285,11 +302,25 @@
       void probeStaleForReport(r);
     } catch (e) {
       runError = e instanceof Error ? e.message : String(e);
-      phase = 'done';
+      finishRun('errored');
       // Same split as the success path: sub-event listeners stay alive so
       // any in-flight background embeds remain visible in the done phase.
       teardownBoundaryListener();
       toast.error(`Update all failed: ${runError}`);
+    }
+  }
+
+  /**
+   * The ONLY place the modal enters `done`. Tells the host the run is over
+   * (see `onFinished` above). A throwing host callback is logged and
+   * contained: the report is already on screen and must stay reachable.
+   */
+  function finishRun(outcome: UpdateAllOutcome) {
+    phase = 'done';
+    try {
+      onFinished?.(outcome);
+    } catch (hostErr) {
+      console.warn('UpdateAllProjectsModal onFinished handler failed:', hostErr);
     }
   }
 

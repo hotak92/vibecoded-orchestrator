@@ -22,6 +22,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from vco_lib.hub_ensure import running_hub_port
+
 # Soft probe timeout for the git-credential-helper detection.
 # Matches install.py's BOOTSTRAP_PROBE_TIMEOUT_S default.
 DEFAULT_PROBE_TIMEOUT_S = 10
@@ -87,7 +89,11 @@ def detect_secrets_envelope(
         ),
         "credential_helper_registered": helper_registered,
         # Launcher-managed slots resolve via vct-hub, not the file store.
-        "hub_env_endpoint": "http://127.0.0.1:7700/api/v1/projects/{id}/env",
+        # Part of the `--bootstrap --json` envelope, which DESCRIBES the
+        # running hub: file-first (R7b F7), like `vct_hub_endpoints`.
+        "hub_env_endpoint": (
+            f"http://127.0.0.1:{running_hub_port()}/api/v1/projects/{{id}}/env"
+        ),
         "hub_resolver_clients": [
             "templates/scripts/vct_secrets_resolve.sh",
             "templates/scripts/vct_secrets_resolve.ps1",

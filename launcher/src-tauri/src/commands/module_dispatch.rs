@@ -1597,10 +1597,9 @@ pub async fn module_dispatch_action(
     if project_id.is_empty() {
         return Err("module_dispatch_action: project_id required".into());
     }
-    let http_client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(HTTP_TIMEOUT_SECS))
-        .build()
-        .map_err(|e| format!("module_dispatch_action: build HTTP client: {}", e))?;
+    // Every dispatch target is 127.0.0.1:<port> (module header above).
+    let http_client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(HTTP_TIMEOUT_SECS))
+        .map_err(|e| format!("module_dispatch_action: {}", e))?;
 
     // v0.2.27: load the module's manifest (best-effort) to extract
     // `runtime.log_path_template`. Used by the dispatcher's
@@ -2072,11 +2071,9 @@ mod tests {
     use axum::{routing, Json, Router};
     use std::collections::HashMap;
 
+    /// The client production dispatch builds (`services::loopback_http`).
     fn build_http_client() -> reqwest::Client {
-        reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .expect("build http client")
+        vct_launcher_core::services::loopback_http::client(Duration::from_secs(5)).expect("build http client")
     }
 
     /// Start a server with a single route + return the bound port.

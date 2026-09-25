@@ -5,7 +5,7 @@
   "id": "vct-hub-api",
   "name": "Hub API Server",
   "version": "1.0.0",
-  "description": "Inter-app message hub. Apps register with the hub on startup, exchange async messages, and declare data they expose. Runs as part of the launcher binary on localhost:7700; this manifest enables the UI to show its status in the module dashboard.",
+  "description": "Inter-app message hub. Apps register with the hub on startup, exchange async messages, and declare data they expose. Runs as its own binary, vct-hub, on localhost (port 7700 unless configured — see the VCT_HUB_PORT setting); this manifest enables the UI to show its status in the module dashboard.",
   "publisher": "VibeCoded Tools",
   "repository": "https://github.com/hotak92/vibecoded-orchestrator",
 
@@ -31,20 +31,21 @@
   "install": {
     "method": "local",
     "install_dir": "{VCT_MODULES}/vct-hub-api",
-    "_note": "The Hub server ships with the launcher binary (src-tauri/src/hub/). This module entry exists so the launcher UI can surface its health in the dashboard and so future Hub upgrades can be delivered through the manifest."
+    "_note": "The hub is its own binary, vct-hub (source: launcher/src-tauri/vct-hub/), shipped and updated with the launcher — not installed from this manifest. This entry describes the hub to the module catalog; the manifest's install block is not executed for it."
   },
 
   "secrets": [],
   "settings": [
     {
-      "key": "HUB_PORT",
+      "key": "VCT_HUB_PORT",
       "prompt": "Hub HTTP port",
-      "description": "Default 7700. Change if you have a port conflict.",
+      "description": "Default 7700. Change if you have a port conflict, then restart the hub. Machine-wide: the hub reads this module's GLOBAL setting row (launcher.db, no project) when it starts; a VCT_HUB_PORT in the hub process's own environment overrides it. Clients find the running hub through <vct root>/hub.port, which the hub writes after binding.",
       "type": "integer",
       "default": 7700,
       "min": 1024,
       "max": 65535,
-      "required": true
+      "required": true,
+      "scope": "global"
     }
   ],
 
@@ -52,21 +53,18 @@
     "type": "service",
     "command": "builtin:hub",
     "args": [],
-    "env_from_settings": ["HUB_PORT"],
+    "env_from_settings": [],
     "health_check": {
       "type": "http_get",
-      "url": "http://localhost:7700/api/v1/health",
+      "url": "http://127.0.0.1:{hub_port}/api/v1/health",
       "timeout_s": 3,
       "interval_s": 30
     },
     "auto_restart": false,
-    "_note": "command=builtin:hub is a sentinel — the launcher never spawns an external process; it already owns the hub."
+    "_note": "command=builtin:hub is a sentinel — nothing spawns the hub from this manifest (the launcher, the session hooks and the boot units each start the vct-hub binary). So the VCT_HUB_PORT setting is not passed through env_from_settings: the hub reads it itself at start (vct-hub server.rs resolve_bind_port), so its port never depends on which of those started it. health_check.url names the port as {hub_port}, which the launcher's placeholder expander (vct_launcher_core::manifest::PlaceholderCtx::resolve) replaces with the RUNNING hub's port: <vct root>/hub.port, else VCT_HUB_PORT, else 7700 (vct_launcher_core::services::hub_port, the same ladder the module supervisor uses for a container's VCT_HUB_BASE_URL). The file wins because the hub walks past a taken port. provides[].base_url names {hub_port} the same way and is resolved the same way: the launcher shows it, with the running hub's port, under this module in Preferences -> Modules (vct_launcher_core::module_settings_schema::list_module_settings, ModuleManifest::provided_http_apis; docs/VCT_MODULE_MANIFEST_SPEC.md section 1). It tells a person where the API answers; programs do not read it - every client locates the running hub through <vct root>/hub.port (vct_launcher_core::services::hub_port, vco_lib.hub_ensure.resolve_hub_port, the resolver scripts), a mechanism older than this field. 127.0.0.1, not localhost: the hub binds IPv4 and localhost can resolve to ::1. The hub's module health poller (vct-hub src/module_health.rs) probes this URL as it does every module's runtime.health_check, and the launcher's module tile shows the result; the launcher's own reachability probe and the session hook's pid check are separate liveness checks."
   },
 
-  "mcp_registration": {
-    "enabled_by_default": false,
-    "_note": "Hub is HTTP, not MCP."
-  },
+  "_mcp_note": "Hub is HTTP, not MCP.",
 
   "uninstall": {
     "remove_install_dir": false,
@@ -76,7 +74,7 @@
   "provides": [
     {
       "kind": "http_api",
-      "base_url": "http://localhost:7700/api/v1",
+      "base_url": "http://127.0.0.1:{hub_port}/api/v1",
       "description": "POST /apps/register, GET /apps, POST /messages, GET /messages/{app_id}, POST /data/register, GET /data/catalog, GET /health"
     }
   ]

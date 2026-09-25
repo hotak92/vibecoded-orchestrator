@@ -11,10 +11,9 @@ codegraphs. Pre-fix the matrix had no runtime effect — pure UI feature.
 These tests pin the consumption side (the env-vars → collections-list
 mapping) without spinning up a real Weaviate.
 
-The Rust side (write_project_env_files emits these vars to the 3
-install surfaces) is covered in `launcher/src-tauri` cargo tests:
-- test_write_project_env_files_includes_access_list_when_peers_granted
-- test_write_project_env_files_omits_access_list_when_no_peers
+The writer side (``vco_lib.config_projection`` emits these vars to the
+env surfaces; the Rust writer and its two cargo tests were retired in
+v0.2.97) is covered by ``tests/test_config_projection.py``.
 - populate_resolves_kg_access_peers_from_matrix
 - populate_resolves_code_graph_access_peers_from_matrix
 """

@@ -2,7 +2,7 @@
   "_comment": [
     "v0.2.92 PLAN-EXTENSION §3.5 / R13 — ONE fixture for the container-runtime + compose decision,",
     "read by tests/test_container_runtime_ssot.py (Python: vco_lib.containers.resolve) AND by",
-    "launcher/src-tauri/vct-launcher-core/src/services/runtime.rs tests (Rust: candidate_order + select_runtime).",
+    "launcher/src-tauri/vct-launcher-core/src/services/runtime.rs tests (Rust: through the ONE verdict client, runtime_verdict::decide; the Rust candidate_order/select_runtime mirror was retired in v0.2.97 R12).",
     "Each scenario describes a host: `env` (VCT_CONTAINER_RUNTIME), `on_path` (binaries shutil.which finds),",
     "`version_ok` / `daemon_ok` (which `<rt> version` / `<rt> info` exit 0; a runtime listed in `probe_unknown`",
     "times out instead), `compose_subcommand_ok` (`<rt> compose version` exits 0), `standalone_on_path`.",
@@ -17,15 +17,53 @@
     "resolver still COMPUTES it (`pref is not None and candidate != pref`) so reintroducing a fall-through fails here.",
     "v0.2.92 delivery-audit M1 added the THIRD leg: `expect_module_plane` is what",
     "launcher/.../services/container_runtime.rs (module containers: install, pull,",
-    "start, supervise) decides for the same host via runtime_candidate_order +",
-    "decide_module_runtime. It differs from `expect_rust` where compose is the",
-    "question (module containers need no compose: `usable_runtime_but_no_compose_anywhere`",
-    "is ok=podman here and null there) and it is the only surface that reads",
-    "`runtime_txt` (install.py's recorded runtime — a pin channel that exists only",
-    "on the module plane; see the runtime_txt_* scenarios). The module plane is",
+    "start, supervise; since v0.2.97 also the storage / volumes commands) decides for",
+    "the same host, since v0.2.97 R12 through runtime_verdict::decide as well (the Rust runtime_candidate_order + decide_module_runtime mirror was retired). It differs from",
+    "`expect_rust` where compose is the question (module containers need no compose:",
+    "`usable_runtime_but_no_compose_anywhere` is ok=podman here and null there).",
+    "v0.2.97 R7b F5 (owner ruling): `runtime_txt` — install.py's recorded runtime,",
+    "state/install/runtime.txt — is a PIN on EVERY surface with ONE precedence,",
+    "VCT_CONTAINER_RUNTIME -> runtime.txt -> auto: Python reads it through",
+    "`containers.runtime_pin` (the test hands `resolve` an install root holding the",
+    "file), runtime.rs and the module plane through the Python verdict (runtime_verdict::decide).",
+    "Before v0.2.97 only the module plane read it, and the fixture RECORDED the",
+    "split (`runtime_txt_pin_unusable_*` expected docker from the other two) — the hooks",
+    "brought the stack up under one runtime while storage migrated the other's copies.",
+    "`expect.requested_via` names the pin channel (`VCT_CONTAINER_RUNTIME` /",
+    "`state/install/runtime.txt`, the labels of RuntimePinSource). The module plane is",
     "two-state over its Err: a probe that times out collapses into the same refusal",
     "arm as a dead daemon (`probe_timeout_is_unknown_not_absent` stays unknown ONLY",
-    "on the Python side)."
+    "v0.2.97 R8 follow-up (owner rule \"users never need a manual step\"): the RECORD pin — and only",
+    "it — is reconciled read-only inside the resolver. When runtime.txt names a runtime that is NOT",
+    "installed and the read-only record reconcile decides case (a) — the other runtime answers AND holds",
+    "VCO's containers/volumes (`vco_data_under`: {<rt>: true}) — every surface ANSWERS the other runtime: expect.runtime is",
+    "the other one, expect.substituted is TRUE and (Python) expect.record_reconciled is true, with",
+    "requested/requested_via still naming the stale record. A runtime listed in `vco_data_unlistable`",
+    "cannot have its containers/volumes listed, so the reconcile refuses and the strict pin stands.",
+    "The env pin is NEVER reconciled (`env_pin_is_never_reconciled`), a recorded runtime that is",
+    "installed but down stays refused (`runtime_txt_pin_unusable_is_refused_not_substituted`), and",
+    "`expect.substituted` stays false on every other row.",
+    "v0.2.97 R9 H1/H2: a READ-ONLY surface substitutes on POSITIVE evidence only. \"No VCO data anywhere\"",
+    "(`vco_data_under` absent/false for the other runtime) is install.py's decision alone (rewrite=True, run",
+    "under the user's PATH, recorded in the ledger): every surface here REFUSES it",
+    "(`runtime_txt_stale_record_no_data_anywhere`) — \"not installed\" may only mean \"not on THIS process's PATH\".",
+    "`runtime_confirmed` names the runtime in state/install/runtime.confirmed (the user's `install.py --container`",
+    "choice): a record that matches it is NEVER substituted, on any surface",
+    "(`runtime_txt_confirmed_record_is_never_switched`). \"Installed\" itself is judged on PATH AND in the usual",
+    "install locations (vco_lib/tool_search_dirs.toml) — `on_path` here stands for that combined answer.",
+    "v0.2.97 R10 J6: `expect_not_switched` names WHY a stale record was not switched on a refused reconcile row — a",
+    "key of vco_lib/runtime_reconcile_messages.toml `[not_switched]`. Python's refusal carries",
+    "\"(not switched: <that detail>)\" and so does the Rust refusal (module plane + hub supervisor), rendered from the",
+    "same table. R10 J2: `bind_data: true` = the install's infrastructure/.env relocates a service's data to a",
+    "non-empty host folder (VCT_*_DATA_SOURCE=<dir>): the data is under neither runtime, so no surface switches the",
+    "record away — even when the other runtime lists VCO's volumes.",
+    "v0.2.97 R11 L2/L3: `vco_data_kind` refines `vco_data_under` for a runtime - `running` (a VCO container `ps` lists),",
+    "`stopped` (only `ps -a` lists it) or `volumes` (no VCO container, a VCO volume); a `vco_data_under: true` without it",
+    "means `running`. `bind_data` may also be `all`: EVERY service's data (Weaviate, Ollama, the code_embed cache) is a",
+    "non-empty host folder. Under a bind layout the other runtime's listing is read in this order: RUNNING VCO containers",
+    "switch (the stack lives there); every service a folder with the recorded runtime NOT installed switches (no named",
+    "volume is stranded); STOPPED VCO containers are data under both (`expect_not_switched: data_under_both`); a leftover",
+    "volume alone never switches (`bind_data`)."
   ],
   "scenarios": [
     {
@@ -43,6 +81,7 @@
         "compose_form": null,
         "installed": null,
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -73,6 +112,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -106,6 +146,7 @@
         "compose_form": "standalone",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -141,6 +182,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -178,6 +220,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -215,6 +258,7 @@
         "compose_form": "subcommand",
         "installed": "docker",
         "requested": "docker",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
         "substituted": false
       },
       "expect_rust": {
@@ -252,6 +296,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -285,6 +330,7 @@
         "compose_form": "subcommand",
         "installed": "docker",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -320,6 +366,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -356,6 +403,7 @@
         "compose_form": "subcommand",
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": {
@@ -387,6 +435,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -415,6 +464,7 @@
         "compose_form": null,
         "installed": "docker",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -441,6 +491,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": null,
+        "requested_via": null,
         "substituted": false
       },
       "expect_rust": null,
@@ -473,6 +524,7 @@
         "compose_form": null,
         "installed": "podman",
         "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
         "substituted": false
       },
       "expect_rust": null,
@@ -485,8 +537,8 @@
       }
     },
     {
-      "name": "runtime_txt_pin_usable_resolves_it_on_the_module_plane",
-      "_why": "install.py recorded podman in state/install/runtime.txt at install time; the module plane pins on that record (the module's named volumes live under the recorded runtime). The env-var-free surfaces (Python resolve + runtime.rs) never read the file, so they auto-detect — a deliberate, documented asymmetry: the pin channel that exists only on the module plane pins only there.",
+      "name": "runtime_txt_pin_usable_resolves_it_everywhere",
+      "_why": "install.py recorded podman in state/install/runtime.txt; with both runtimes usable every surface drives podman because the record PINS it (R7b F5).",
       "env": null,
       "runtime_txt": "podman",
       "on_path": [
@@ -512,7 +564,8 @@
         "runtime": "podman",
         "compose_form": "subcommand",
         "installed": "podman",
-        "requested": null,
+        "requested": "podman",
+        "requested_via": "state/install/runtime.txt",
         "substituted": false
       },
       "expect_rust": {
@@ -525,7 +578,7 @@
     },
     {
       "name": "runtime_txt_pin_unusable_is_refused_not_substituted",
-      "_why": "Delivery-audit v0.2.92 M1, the runtime.txt arm: install recorded podman, the podman machine is stopped after a reboot, Docker Desktop is running, no env var set. Pre-M1 the module plane fell through to docker and pulled/started the module image against docker's EMPTY copy of every named volume; the supervisor's next pass re-selected podman. The refusal names the file the pin came from and the env override that supersedes it. The env-free surfaces auto-detect docker for the INFRA stack (no pin exists for them) — recorded here so the asymmetry is a ruled fact, not an accident.",
+      "_why": "Delivery-audit v0.2.92 M1 + R7b F5: install recorded podman, the podman machine is stopped after a reboot, Docker Desktop is running, no env var set. Pre-M1 the module plane fell through to docker (docker's EMPTY volumes); until R7b F5 the hooks and the launcher's infra stack still auto-detected docker. Now EVERY surface refuses, naming the file the pin came from and the env override that supersedes it.",
       "env": null,
       "runtime_txt": "podman",
       "on_path": [
@@ -545,11 +598,53 @@
       ],
       "standalone_on_path": [],
       "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "podman",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "podman",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_docker_beats_podman_first",
+      "_why": "R7b F5's live scenario: both runtimes installed and up, no env pin, the install recorded docker (podman was down that day). Podman-first auto-detect used to bring the infra stack up under podman while storage/volumes (runtime.txt-aware) migrated the docker copies. The record is a pin everywhere now: docker on every surface.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
         "state": "resolved",
         "runtime": "docker",
         "compose_form": "subcommand",
-        "installed": "podman",
-        "requested": null,
+        "installed": "docker",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
         "substituted": false
       },
       "expect_rust": {
@@ -557,9 +652,590 @@
         "compose_form": "subcommand"
       },
       "expect_module_plane": {
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "env_pin_beats_runtime_txt",
+      "_why": "One precedence everywhere: the explicit env choice wins over the install's record.",
+      "env": "podman",
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "env_auto_defers_to_runtime_txt",
+      "_why": "`auto` is no preference, so the install's record still pins.",
+      "env": "auto",
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman",
+        "docker"
+      ],
+      "version_ok": [
+        "podman",
+        "docker"
+      ],
+      "daemon_ok": [
+        "podman",
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman",
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "resolved",
+        "runtime": "docker",
+        "compose_form": "subcommand",
+        "installed": "docker",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false
+      },
+      "expect_rust": {
+        "runtime": "docker",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "docker"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_other_holds_data",
+      "_why": "runtime.txt records docker but docker is gone; only podman is installed, it answers and holds VCO's containers/volumes. Case (a) of the record reconcile: every surface drives podman (writing nothing — the next update re-records it) instead of refusing every session until then.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_no_data_anywhere",
+      "_why": "runtime.txt records docker but docker is not found; podman answers and NO VCO data exists under it. R9 H1: a read-only surface switches on POSITIVE evidence only — docker may merely be off this process's PATH (a rootless ~/bin docker under a boot unit), and starting podman here would bring the stack up on EMPTY volumes. Refused everywhere; install.py (rewrite=True, the user's PATH) is the one that re-records it (tests/test_v0297_runtime_reconcile.py).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "no_data"
+    },
+    {
+      "name": "runtime_txt_confirmed_record_is_never_switched",
+      "_why": "R9 H2: the user moved to docker with `install.py --container docker` (runtime.txt AND runtime.confirmed say docker); the old podman volumes are still there. On a process that cannot find docker, podman answers holding VCO's data — positive evidence — yet the confirmed choice is never overridden: refused everywhere, the refusal says why. Only another `--container` switches.",
+      "env": null,
+      "runtime_txt": "docker",
+      "runtime_confirmed": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "confirmed"
+    },
+    {
+      "name": "runtime_txt_confirmed_other_runtime_does_not_protect_the_record",
+      "_why": "runtime.confirmed says podman but runtime.txt says docker (the record was re-made without --container, or hand-edited): the confirmation is of a DIFFERENT runtime and protects nothing — the stale docker record reconciles to podman, which holds VCO's data, exactly as without it.",
+      "env": null,
+      "runtime_txt": "docker",
+      "runtime_confirmed": "podman",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_bind_data_is_never_switched",
+      "_why": "R10 J2 / R11 L2 (iii): the launcher relocated Weaviate's data to a host folder (VCT_WEAVIATE_DATA_SOURCE=<dir>, non-empty); runtime.txt records docker, which this process cannot find; podman answers and lists only a LEFTOVER vco_weaviate_data volume (an earlier trial) - no VCO container. The data is on the HOST, and a volume is not evidence about it: refused everywhere, the refusal says why; install keeps the record (action_required).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "vco_data_kind": {
+        "podman": "volumes"
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "bind_data"
+    },
+    {
+      "name": "runtime_txt_stale_record_bind_data_running_containers_switch",
+      "_why": "R11 L2 (i): Weaviate's data is a host folder; runtime.txt records docker (not found); podman answers and is RUNNING VCO's containers. A running VCO container is positive evidence that the stack lives under podman - it outranks the folder rule, and no volume is created for containers that already run: every surface drives podman (read-only), install re-records it (informational).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "vco_data_kind": {
+        "podman": "running"
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_bind_data_stopped_containers_is_data_under_both",
+      "_why": "R11 L2 (ii): Weaviate's data is a host folder; runtime.txt records docker (not found); podman answers and holds VCO containers that are NOT running. Either runtime could serve that folder - data under both: refused everywhere with the reason; install records container_runtime_data_under_both (action_required).",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": true,
+      "vco_data_kind": {
+        "podman": "stopped"
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "data_under_both"
+    },
+    {
+      "name": "runtime_txt_stale_record_all_bind_nothing_read_only_refuses",
+      "_why": "R12 M1 (Python side; the 2026-09-25 consolidation retired the Rust mirrors): EVERY service's data (Weaviate, Ollama, the code_embed cache) is a host folder, so no named volume is in play; runtime.txt records docker (not installed) and podman answers holding NONE of VCO's containers or volumes. Read-only rule (ii) needs positive evidence that the other runtime serves VCO — a stopped container or a VCO volume — and 'nothing found anywhere' is not it, so the record pin is REFUSED with the shared `no_data` wording (install still re-records podman: a switch strands no named volume). Both Rust planes ask Python for the verdict, so `expect_rust` (null) and `expect_module_plane` now match Python's own answer.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "bind_data": "all",
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false
+      },
+      "expect_not_switched": "no_data",
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_all_bind_switches_over_stopped_containers",
+      "_why": "R11 L3 over L2 (ii): every service's data is a host folder and the recorded docker is NOT installed, so it cannot serve that folder; podman holds stopped VCO containers. Nothing can run under both and no named volume is stranded: switched to podman.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "bind_data": "all",
+      "vco_data_kind": {
+        "podman": "stopped"
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_other_unlistable",
+      "_why": "runtime.txt records docker (gone); podman answers but its containers/volumes could not be listed. The reconcile cannot establish where the data is, so the strict pin stands: refused.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "vco_data_unlistable": [
+        "podman"
+      ],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      },
+      "expect_not_switched": "unlistable"
+    },
+    {
+      "name": "runtime_txt_record_missing_other_down_is_refused",
+      "_why": "runtime.txt records docker (gone) and podman is installed but its daemon does not answer: nothing to reconcile TO — the refusal stands and names no usable alternative.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": false
+        }
+      },
+      "expect_not_switched": "other_not_usable"
+    },
+    {
+      "name": "env_pin_is_never_reconciled",
+      "_why": "VCT_CONTAINER_RUNTIME=podman on a host where podman is gone and the record names docker (installed, answering, even holding VCO's data): the env pin is the USER's and is never reconciled — refused, exactly as before the record reconcile existed.",
+      "env": "podman",
+      "runtime_txt": "docker",
+      "on_path": [
+        "docker"
+      ],
+      "version_ok": [
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "docker": true
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "docker",
+        "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
         "refused": {
           "pinned": "podman",
-          "via": "state/install/runtime.txt",
+          "via": "VCT_CONTAINER_RUNTIME",
           "alternative_usable": true
         }
       }

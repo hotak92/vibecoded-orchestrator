@@ -1,0 +1,30 @@
+{
+  "_comment": "B-tier shared case table for EVERY hub-port reader (owner ruling 2026-09-24; value rule R7b F9). A valid value — the VCT_HUB_PORT env and the WHOLE content of <state dir>/hub.port alike — is, after trimming leading/trailing whitespace, ASCII [0-9]{1,5} in 1..65535: no sign, no `_`, no non-ASCII numerals, no internal whitespace (which includes a second line). Anything else is invalid and falls through to the next source. `expect` is the CLIENT ladder (env pin → file → 7700): vco_lib.hub_ensure.resolve_hub_port, the sh/ps1 clients (tests/test_v0297_hub_port_clients.py) and launcher/tools/vct-cli/src/main.rs's table-loaded test (include_str!). `expect_running` is the DESCRIBE-the-running-hub ladder (file → env → 7700): vco_lib.hub_ensure.running_hub_port and vct_launcher_core::services::hub_port::resolve_hub_port. `expect_file` is the STRICT file-only read (null = no port): vco_lib.hub_ensure.read_hub_port_file and hub_port::read_hub_port_file_in. The env rows also drive the hub's own bind port (vct-hub server.rs resolve_bind_port: a valid env pin is bound, an invalid one falls through to the hub's setting, else 7700). MUST stay in lockstep with every consumer named here.",
+  "cases": [
+    {"name": "invalid env falls through to the file", "env_port": "not-a-port", "file_port": "7811", "expect": 7811, "expect_running": 7811, "expect_file": 7811},
+    {"name": "out-of-range env is invalid too", "env_port": "0", "file_port": "7812", "expect": 7812, "expect_running": 7812, "expect_file": 7812},
+    {"name": "a valid env pin wins", "env_port": "7813", "file_port": "7899", "expect": 7813, "expect_running": 7899, "expect_file": 7899},
+    {"name": "the file", "env_port": null, "file_port": "7814\n", "expect": 7814, "expect_running": 7814, "expect_file": 7814},
+    {"name": "an out-of-range file yields the default", "env_port": null, "file_port": "70000", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a garbage file yields the default", "env_port": null, "file_port": "garbage", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "nothing usable yields the default", "env_port": "junk", "file_port": null, "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "nothing set at all", "env_port": null, "file_port": null, "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a signed env value is invalid", "env_port": "+7822", "file_port": "7815", "expect": 7815, "expect_running": 7815, "expect_file": 7815},
+    {"name": "an env value with a digit separator is invalid", "env_port": "7_700", "file_port": "7816", "expect": 7816, "expect_running": 7816, "expect_file": 7816},
+    {"name": "an env value in non-ASCII numerals is invalid", "env_port": "٧٨٢٢", "file_port": "7817", "expect": 7817, "expect_running": 7817, "expect_file": 7817},
+    {"name": "an env value with internal whitespace is invalid", "env_port": "78 11", "file_port": "7818", "expect": 7818, "expect_running": 7818, "expect_file": 7818},
+    {"name": "a padded env value is trimmed", "env_port": " 7820\t", "file_port": null, "expect": 7820, "expect_running": 7820, "expect_file": null},
+    {"name": "a file with internal whitespace is invalid", "env_port": null, "file_port": "78 11", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a signed file is invalid", "env_port": null, "file_port": "+7822", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a file with a digit separator is invalid", "env_port": null, "file_port": "7_700", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a file in non-ASCII numerals is invalid", "env_port": null, "file_port": "٧٨٢٢\n", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a two-line file is invalid", "env_port": null, "file_port": "7814\n9999\n", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "an invalid file falls through to the env on the running ladder", "env_port": "7819", "file_port": "+7822", "expect": 7819, "expect_running": 7819, "expect_file": null},
+    {"name": "a signed env value with no file is the default", "env_port": "+7822", "file_port": null, "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "the top of the range", "env_port": null, "file_port": "65535", "expect": 65535, "expect_running": 65535, "expect_file": 65535},
+    {"name": "one past the top of the range", "env_port": null, "file_port": "65536", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a leading zero inside five places is a port", "env_port": null, "file_port": "07702", "expect": 7702, "expect_running": 7702, "expect_file": 7702},
+    {"name": "more than five places is invalid", "env_port": null, "file_port": "007701", "expect": 7700, "expect_running": 7700, "expect_file": null},
+    {"name": "a whitespace-only env value is unset", "env_port": "   ", "file_port": "7821", "expect": 7821, "expect_running": 7821, "expect_file": 7821}
+  ]
+}

@@ -27,7 +27,8 @@
     "python": ">=3.11",
     "memory_mb": 256,
     "disk_mb": 50,
-    "depends_on": ["vct-ollama"]
+    "depends_on": [],
+    "_ollama_note": "Embeddings come from Ollama (OLLAMA_URL below), which is infrastructure — the ollama service of infrastructure/docker-compose.yml, started by the ensure-containers hook — not a module, so it is not a depends_on entry. The vct-ollama module was retired in v0.2.11 with the Ollama MCP server it installed."
   },
 
   "install": {
@@ -42,11 +43,11 @@
         "timeout_s": 60
       },
       {
-        "cmd": "{install_dir}/.venv/bin/pip install -r claude_mcp_servers/weaviate_mcp/requirements.txt",
+        "cmd": "{install_dir}/.venv/bin/pip install -r requirements.txt",
         "cwd": "{install_dir}",
         "timeout_s": 300,
         "platform_cmd": {
-          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r claude_mcp_servers\\weaviate_mcp\\requirements.txt"
+          "windows": "{install_dir}\\.venv\\Scripts\\pip.exe install -r requirements.txt"
         }
       }
     ]
@@ -69,7 +70,8 @@
       "description": "Name of the cross-project KG collection. Leave empty to disable cross-project KG access.",
       "type": "string",
       "default": "",
-      "required": false
+      "required": false,
+      "scope": "global"
     },
     {
       "key": "WEAVIATE_URL",
@@ -77,7 +79,8 @@
       "description": "Auto-configured by the launcher when Weaviate container starts.",
       "type": "string",
       "default": "http://localhost:8081",
-      "required": true
+      "required": true,
+      "scope": "global"
     }
   ],
 

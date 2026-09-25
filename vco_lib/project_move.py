@@ -158,6 +158,7 @@ CID_EXTRA_CODEGRAPH_PREFIX = "project_move_extra_codegraph_path_"
 CID_CODEGRAPH_REANALYZE = "project_move_codegraph_reanalyze_pending"
 CID_OLD_FOLDER_RETAINED = "project_move_old_folder_retained"
 CID_HARNESS_STATE_REVIEW = "project_move_harness_state_review"
+CID_ENV_REPROJECTION_FAILED = "project_move_env_reprojection_failed"
 
 #: Every refusal the preflight can produce, with the wording that reaches the
 #: user. Each is DISTINCT: "that path is inside another project" and "that
@@ -1574,9 +1575,11 @@ def execute_post_flip(
     write_sentinel(dst, _sentinel_payload(plan, "post-flip", move_id))
 
     # Env projection at D, derived from the NEW row.
+    env_reprojection_error: Optional[str] = None
     try:
-        _reproject_env(plan, dst, runner=runner)
+        run_env_reprojection(plan.project_id, dst, runner=runner, db_path=db_path)
     except Exception as exc:  # noqa: BLE001 — surfaced, never fatal
+        env_reprojection_error = str(exc)
         result.warnings.append(f"env re-projection failed: {exc}")
 
     # kg-sync parity pass. Embeddings are reused via content_hash and stored
@@ -1610,6 +1613,7 @@ def execute_post_flip(
         stale_db_hits=result.stale_db_hits,
         harness=result.harness,
         codegraph_enqueued=codegraph_enqueued,
+        env_reprojection_error=env_reprojection_error,
     )
 
     clear_sentinel(src)
@@ -1617,41 +1621,111 @@ def execute_post_flip(
     return result
 
 
-def _reproject_env(
-    plan: MovePlan,
-    dst: Path,
+def run_env_reprojection(
+    project_id: str,
+    folder: Path,
     *,
-    runner: Optional[Callable[[Sequence[str], Mapping[str, str]], subprocess.CompletedProcess]],
+    runner: Optional[Callable[[Sequence[str], Mapping[str, str]], subprocess.CompletedProcess]] = None,
+    db_path: Optional[Path] = None,
 ) -> None:
-    """Re-run the canonical env projection against the NEW row.
+    """Re-run the canonical env projection against the project's CURRENT row.
 
-    The projection derives every value from DB state, so a re-run after the
+    The projection derives every value from DB state, so a re-run after a
     flip rewrites ``KG_BASE_DIR`` and friends without this module ever owning
     a sed list. That is why :data:`PATH_BEARING_ENV_KEYS` is a drift GATE
-    rather than a rewrite driver.
+    rather than a rewrite driver. Shared by the move and the collection
+    rename (one home, v0.2.97); the argv comes from the builder that sits
+    beside ``apply``'s parser, so it cannot name a flag the verb lacks again.
+    Raises :class:`MoveError` carrying the child's stderr tail on failure.
     """
+    from vco_lib.config_projection import build_apply_argv
     from vco_lib.python_exe import resolve_or_current  # v0.2.94: ONE resolver
 
-    argv = [
-        resolve_or_current(),
-        "-m",
-        "vco_lib.config_projection",
-        "apply",
-        "--project-id",
-        plan.project_id,
-        "--folder",
-        str(dst),
-    ]
+    argv = build_apply_argv(resolve_or_current(), project_id, db_path=db_path)
     env = build_child_env(
-        {"CLAUDE_PROJECT_DIR": str(dst), "KG_BASE_DIR": str(dst)}
+        {"CLAUDE_PROJECT_DIR": str(folder), "KG_BASE_DIR": str(folder)}
     )
     proc = (
         runner(argv, env)
         if runner is not None
         else subprocess.run(argv, env=env, capture_output=True, text=True, check=False)
     )
-    if proc.returncode != 0:
-        raise MoveError((proc.stderr or "").strip()[-400:] or f"exit {proc.returncode}")
+    if getattr(proc, "returncode", 1) != 0:
+        tail = (getattr(proc, "stderr", "") or "").strip()[-400:]
+        raise MoveError(tail or f"exit {getattr(proc, 'returncode', '?')}")
+    _clear_env_reprojection_failure(folder, "the env re-projection just succeeded")
+
+
+def _clear_env_reprojection_failure(folder: Path, why: str) -> None:
+    """Paired clear of :data:`CID_ENV_REPROJECTION_FAILED` at ``folder``.
+
+    The same record/clear shape as ``settings_refusal.clear_recorded``: the
+    ledger is read first, so the common case (nothing recorded) writes
+    nothing; a clear leaves an ``auto-resolutions.jsonl`` line (B-F9). Never
+    raises — the ledger is observability, and the re-projection it describes
+    has already happened.
+    """
+    from vco_lib.deferral_emit import record_auto_resolution, resolve_conditions
+    from vco_lib.deferral_report import DeferralReport
+
+    try:
+        if not DeferralReport.read(folder).has_condition(CID_ENV_REPROJECTION_FAILED):
+            return
+    except Exception:  # noqa: BLE001 — an unreadable ledger is not ours to fix here
+        return
+    if resolve_conditions(folder, [CID_ENV_REPROJECTION_FAILED]):
+        record_auto_resolution(
+            folder, CID_ENV_REPROJECTION_FAILED, "env_reprojection_confirmed", why)
+
+
+def env_reprojection_still_owed(
+    folder: Path,
+    entry: Any = None,
+    *,
+    project_id: Optional[str] = None,
+    db_path: Optional[Path] = None,
+) -> Optional[bool]:
+    """Clear probe for :data:`CID_ENV_REPROJECTION_FAILED` (tri-state, read-only).
+
+    The entry says "``config_projection apply`` failed, so the env surfaces
+    may still carry values from the previous folder". It is over once the
+    surfaces ``apply`` writes by default hold what it would write NOW, derived
+    from the project's current launcher.db row by the projection's own
+    resolver (:func:`vco_lib.config_projection.project_env_from_db`). The
+    comparison is :func:`vco_lib.env_projection_check.check_env_surfaces` —
+    the one ``vco verify-env-projection`` reports from, so the probe and the
+    verifier cannot disagree about what "re-derived" means.
+
+    So the entry clears after the user runs the printed ``apply`` command, or
+    after any later re-projection (the launcher's, ``reproject-all``, a
+    rename) — whichever wrote the surfaces. Non-canonical keys are never
+    looked at: they are the user's.
+
+    Returns:
+        True  — a surface is missing or a canonical value differs.
+        False — every surface was read and matches the projection.
+        None  — could not look: no project id (from ``project_id`` or the
+                entry's ``dismiss_fields``), launcher.db unreadable or the row
+                gone, the row now points at a DIFFERENT folder, or a surface
+                that exists cannot be read (an unparseable settings.json has
+                its own ``settings_write_refused_*`` entry). Unknown never
+                reads as repaired.
+    """
+    from vco_lib.config_projection import project_env_from_db
+    from vco_lib.env_projection_check import check_env_surfaces
+
+    pid = project_id or (getattr(entry, "dismiss_fields", None) or {}).get("project_id")
+    if not pid:
+        return None
+    folder = Path(folder)
+    try:
+        bundle = project_env_from_db(str(pid), db_path=db_path)
+        if not paths_equal(bundle["project_root"], folder):
+            return None
+        verdict = check_env_surfaces(folder, bundle["canonical_env"]).verdict
+    except Exception:  # noqa: BLE001 — could not ask the projection: unknown
+        return None
+    return None if verdict is None else not verdict
 
 
 def _run_kg_sync(
@@ -1720,16 +1794,18 @@ def _dismiss_command(folder: Path, cid: str) -> str:
 def _codegraph_wrapper(folder: Path) -> str:
     """The code-graph analyzer command for ``folder``, as a real path.
 
-    There is no ``vco codegraph`` verb — the `vco` CLI ships
+    No CLI verb analyzes a code graph — the Python `vco` CLI ships
     ``verify-pins``, ``verify-env-projection``, ``verify-diagrams``,
-    ``rebuild-diagram-index``, ``codegraph-diagram``, ``doctor`` and
-    ``project``. The analyzer ships as the BUNDLED wrapper in the project's
-    own ``.claude/scripts/``, so that is what the remediation names.
+    ``rebuild-diagram-index``, ``codegraph-diagram``, ``doctor``,
+    ``project`` and ``fix-transcript``, and the launcher's `vct-cli`
+    ``codegraph`` only lists and searches. The analyzer ships as the BUNDLED
+    wrapper in the project's own ``.claude/scripts/``, so that is what the
+    remediation names.
 
     A printed command is shipped code. An earlier draft of this module
-    emitted ``vco codegraph analyze <path>``, which parses as an unknown
-    subcommand and exits 2 — a remediation that cannot work is worse than
-    none, because the user spends their attention discovering that.
+    emitted a `vco` "codegraph analyze <path>" command, which parses as an
+    unknown subcommand and exits 2 — a remediation that cannot work is worse
+    than none, because the user spends their attention discovering that.
     """
     name = "code-graph-analyze.ps1" if os.name == "nt" else "code-graph-analyze"
     return str(folder / ".claude" / "scripts" / name)
@@ -1743,8 +1819,10 @@ def _emit_move_deferrals(
     stale_db_hits: Sequence[Mapping[str, Any]],
     harness: Mapping[str, Any],
     codegraph_enqueued: bool,
+    env_reprojection_error: Optional[str] = None,
 ) -> list[str]:
     """Emit every ledger entry the move owes, at D. Returns the condition ids."""
+    from vco_lib.config_projection import build_apply_argv
     from vco_lib.deferral_emit import emit_entries
     from vco_lib.deferral_report import DeferralEntry
 
@@ -1776,6 +1854,45 @@ def _emit_move_deferrals(
                 ),
                 command_to_apply=_dismiss_command(dst, cid),
                 severity="warning",
+            )
+        )
+
+    # The env re-projection itself failed: every stale hit below is then its
+    # consequence, not a rewrite pass missing an entry class, and the reader
+    # needs the command that re-runs it rather than a scan that re-reports it.
+    if env_reprojection_error:
+        reproject_cmd = " ".join(
+            build_apply_argv("python", plan.project_id)
+        )
+        entries.append(
+            DeferralEntry(
+                condition_id=CID_ENV_REPROJECTION_FAILED,
+                title="The project's env files were not re-derived after the move",
+                detected=(
+                    "`python -m vco_lib.config_projection apply` failed after "
+                    "the database flip, so `.claude/settings.json` and "
+                    "`.claude/env` may still carry values derived from the "
+                    f"previous folder `{plan.src}`. The child reported: "
+                    f"{env_reprojection_error}"
+                ),
+                why_deferred=(
+                    "The move is committed and the project works from the new "
+                    "folder; the env surfaces are reconciliation. VCO does not "
+                    "hand-edit them — it re-derives them from the database, "
+                    "which is the command below."
+                ),
+                command_to_apply=(
+                    f"{reproject_cmd}\n"
+                    "# This entry clears itself once `.claude/settings.json` and "
+                    "`.claude/env` hold what the projection derives from the "
+                    "database (checked on the next update and by "
+                    "`vco project move --verify`)."
+                ),
+                severity="warning",
+                # The clear probe's input (`env_reprojection_still_owed`), the
+                # `settings_refusal` precedent. Not a dismiss_key: the
+                # registry declares none, so it cannot perturb a dismissal.
+                dismiss_fields={"project_id": plan.project_id},
             )
         )
 
@@ -2053,6 +2170,10 @@ def verify_move(
     # deferral disappears while its work never ran.
     if outstanding is False:
         to_resolve.append(CID_CODEGRAPH_REANALYZE)
+    # Same tri-state rule, same probe the registry pass runs: only a positive
+    # "the surfaces match the projection" clears the re-projection entry.
+    if pid and env_reprojection_still_owed(folder, project_id=pid, db_path=db_path) is False:
+        to_resolve.append(CID_ENV_REPROJECTION_FAILED)
     if to_resolve:
         resolve_conditions(folder, to_resolve)
         report["resolved"] = to_resolve

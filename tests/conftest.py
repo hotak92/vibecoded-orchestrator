@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import json
 import os
 import sqlite3
 import subprocess
@@ -364,10 +365,160 @@ os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
 # Set at IMPORT time (module-scope readers resolve it during COLLECTION —
 # `weaviate_mcp/embeddings.py` and `templates/scripts/query_code_graph.py` both
 # read it into a module constant) and RE-ESTABLISHED per test below.
+#
+# BOTH URL names the resolver reads are pinned (v0.2.97): lane Y added the
+# `CODE_EMBED_URL` leg after `CODE_EMBED_SERVICE_URL`, so a test that pops the
+# first name to exercise the `CODE_EMBED_PORT` leg would otherwise fall through
+# to an AMBIENT `CODE_EMBED_URL` — on a developer's machine, the live service
+# (measured: a hook test read the live :11440 `/health` and reported
+# "predates v0.2.92").
+_CODE_EMBED_URL_KEYS: tuple[str, ...] = ("CODE_EMBED_SERVICE_URL", "CODE_EMBED_URL")
 _AMBIENT_CODE_EMBED_URL = os.environ.get("CODE_EMBED_SERVICE_URL")
 
 if not _ALLOW_REAL_STATE:
-    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    for _key in _CODE_EMBED_URL_KEYS:
+        os.environ[_key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+
+
+# ─── W-SESSION-RECONCILE (v0.2.97 SE-3): no hook test probes live ports ─────
+#
+# `ensure-containers.{sh,ps1}` runs `service_endpoints reconcile --phase
+# session` (via `vco_lib.service_lifecycle session-reconcile`), and its
+# detection PROBES the canonical/upstream ports (8081, 8080, 11434, 11435, …)
+# regardless of any env — a hook test would touch whatever listens there on
+# the developer's machine. Every subprocess the suite spawns inherits this
+# pin: the runner executes this harmless stand-in instead (a test that needs
+# another stand-in sets its own). Import-time, like the pins above.
+if not _ALLOW_REAL_STATE:
+    os.environ["VCO_SESSION_RECONCILE_ARGV"] = json.dumps(
+        [sys.executable, "-c", 'print(\'{"schema": 1, "rows": {}, "entries": []}\')'])
+
+
+# ─── W-ENDPOINTS (v0.2.97): the machine resolvers answer an unroutable port ──
+#
+# The two pins above cover CLIENTS (they read `WEAVIATE_URL` /
+# `CODE_EMBED_SERVICE_URL`). Since v0.2.97 the MACHINE resolvers
+# (`vco_lib.service_endpoints`: the projection, `project_init`'s standalone
+# env, install.py's settings defaults) read no env at all — they read the
+# launcher.db `service_endpoints` rows, and with no row they answer the
+# compiled default, `http://localhost:8081` / `:11435` / `:11440`: on a
+# developer's machine, the LIVE services. So the redirected state dir gets a
+# launcher.db (the real schema, every migration applied) whose three rows point
+# at the unroutable sentinel port. A test that needs other endpoints seeds its
+# own DB (`VCT_LAUNCHER_DB_PATH` / `db_path=`), exactly as before.
+#
+# Written through `vco_lib.service_endpoints.write_rows` — the one writer — so
+# the seed is also a standing check that the writer accepts the rows it must.
+# Re-established per test below when a suite removed it.
+_UNROUTABLE_PORT = int(_fixture_guard.UNROUTABLE_SENTINEL_URL.rsplit(":", 1)[1])
+
+
+def _seed_unroutable_service_endpoints(state_dir: Path) -> None:
+    """Create ``<state_dir>/launcher.db`` (real schema) with all three
+    ``service_endpoints`` rows at ``127.0.0.1:9``. No-op when it exists."""
+    db = state_dir / "launcher.db"
+    if db.is_file():
+        return
+    from tests.common.launcher_db_fixture import make_launcher_db
+    from vco_lib import service_endpoints as _se
+
+    make_launcher_db(db)
+    _se.write_rows(
+        [
+            _se.EndpointRow(
+                service=service, mode="vco_managed", host="127.0.0.1",
+                port=_UNROUTABLE_PORT, source="install_probe",
+                grpc_port=_UNROUTABLE_PORT if service == "weaviate" else None,
+            )
+            for service in _se.SERVICES
+        ],
+        db_path=db,
+    )
+
+
+if not _ALLOW_REAL_STATE:
+    _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
+
+
+# ─── W-TRANSPORT (v0.2.97 R7): the gRPC leg cannot bypass the URL pins ──────
+#
+# W-WEAVIATE pins the HTTP transport (`WEAVIATE_URL` → 127.0.0.1:9), but the
+# weaviate-client v4 channel takes its gRPC port from `GRPC_PORT` /
+# `WEAVIATE_GRPC_PORT` (`vco_lib/weaviate_helpers.py`, and
+# `claude_mcp_servers/weaviate_mcp/server.py` the same way) — defaulting to
+# 50052, the LIVE Weaviate gRPC on a developer's machine. A test whose code
+# path opened a v4 connection would read real counts / write real data through
+# gRPC while its HTTP assertions said "unroutable". Both keys are pinned to
+# the same discard port, at import (module-scope readers snapshot during
+# COLLECTION) and per test below — the same two moments W-WEAVIATE uses.
+#
+# ─── W-OLLAMA / W-HUB-PORT (v0.2.97 R7): the remaining localhost defaults ───
+#
+# Two more resolvers a shipped reader consults were the only localhost-default
+# backends without a pin:
+#
+#   * `OLLAMA_URL` — `vco_lib/embedding_service.py` (and the KG-summary
+#     fallbacks) default to `http://localhost:11435`, the live Ollama
+#     container. Pinned to the unroutable sentinel like the other two
+#     backends (W-WEAVIATE / W-CODE-EMBED).
+#   * `VCT_HUB_PORT` — `vco_lib/hub_ensure.resolve_hub_port`'s 7700 default
+#     is the LIVE hub. Every hub client that mattered already pinned it per
+#     test; this is cheap suite-wide insurance so one forgotten pin cannot
+#     reach the real hub (an unauthenticated 401 at worst, but still contact).
+#     The state-dir redirect already moves `hub.token`, so a leaked request
+#     carries no credential.
+#
+# A test that needs another value sets it itself (`monkeypatch.setenv`
+# restores after); a child-process harness that builds an explicit env dict
+# (`tests/integration/step22_multi_project/fixture.py`) overrides the pin in
+# the dict, exactly as it does for `VCT_STATE_DIR`.
+_UNROUTABLE_PORT_STR = str(_UNROUTABLE_PORT)
+_PINNED_LOCALHOST_KEYS: tuple[tuple[str, str], ...] = (
+    ("GRPC_PORT", _UNROUTABLE_PORT_STR),
+    ("WEAVIATE_GRPC_PORT", _UNROUTABLE_PORT_STR),
+    ("OLLAMA_URL", _fixture_guard.UNROUTABLE_SENTINEL_URL),
+    ("VCT_HUB_PORT", _UNROUTABLE_PORT_STR),
+)
+
+if not _ALLOW_REAL_STATE:
+    for _key, _value in _PINNED_LOCALHOST_KEYS:
+        os.environ[_key] = _value
+
+# ─── W-INSTALL-ROOT (v0.2.97): in-process install-root readers see THIS checkout.
+#
+# `tests/common/child_env.py` has pinned `VCT_INSTALL_ROOT` for CHILD
+# processes since review round 7 (see its docstring); the IN-PROCESS side was
+# missing. `vco_lib.python_exe.resolve_install_root()` puts the env var FIRST
+# on its ladder, and everything that rides it — `vco_lib.containers.
+# runtime_pin()` reading `<root>/state/install/runtime.txt` foremost —
+# followed an ambient `$VCT_INSTALL_ROOT` exported by a launcher-started
+# shell (a session inside a real install is exactly how this suite runs on
+# the dev box; measured: `runtime_pin()` answered the REAL install's `podman`
+# pin locally and `None` on CI, where the var is unset and the ladder settles
+# on `vco_lib/..` = this checkout). Pinned to the CHECKOUT — the same value
+# child_env pins children to, and the same OUTCOME CI gets (the checkout has
+# no `state/install/runtime.txt`, so no runtime pin) — so local and CI agree.
+# A neutral temp root would NOT give that: it fails
+# `looks_like_orchestrator_root`, the ladder skips it, and the var would point
+# at a directory no rung ever uses. A test that sets its own value still wins
+# (`monkeypatch.setenv` / `patch.dict` run after this fixture's setup, below).
+# Set at import (module-scope readers resolve during COLLECTION) and
+# RE-ESTABLISHED per test below, like the other W-* pins.
+if not _ALLOW_REAL_STATE:
+    os.environ["VCT_INSTALL_ROOT"] = str(_REPO_ROOT)
+
+# ─── W-TOOL-DIRS (v0.2.97 R9 H1(b)): the suite never discovers this machine's
+# container runtimes OUTSIDE PATH. `vco_lib.tool_search_dirs` makes "is podman
+# installed?" look in the usual install locations too (`/usr/bin`, `~/bin`,
+# `/opt/homebrew/bin`, ... — `vco_lib/tool_search_dirs.toml`), and a test that
+# runs with `PATH=<fake bin>` to hide the host's runtimes would otherwise find
+# the REAL `/usr/bin/podman` there and talk to it. Empty = no extra directories
+# (the knob REPLACES the table's list). A test exercising the table sets its own
+# value (`monkeypatch.setenv` / `delenv` run after this fixture's setup), and a
+# child started with an explicit env must carry it (see the boot-wrapper tests).
+# Set at import and RE-ESTABLISHED per test below, like the other W-* pins.
+TOOL_SEARCH_DIRS_ENV = "VCT_TOOL_SEARCH_DIRS"
+os.environ[TOOL_SEARCH_DIRS_ENV] = ""
 
 # ─── W-PROJECT-DIR (v0.2.94): the suite never resolves THIS CHECKOUT as a project.
 #
@@ -476,10 +627,21 @@ def _redirect_user_state_dir(request):
         "VCT_CLAUDE_DIR": str(_VCO_CLAUDE_REDIRECT),
         "VCT_USER_HOME_OVERRIDE": str(_VCO_USER_HOME_REDIRECT),
     }
+    # W-INSTALL-ROOT: re-established UNCONDITIONALLY. It is deliberately NOT
+    # part of the self-isolated stand-aside below — that list exists because
+    # `VCT_STATE_DIR` is an earlier TIER of the launcher-db resolver those
+    # files test, which says nothing about the install-root ladder. A test
+    # that sets its own `VCT_INSTALL_ROOT` still wins: it runs after this
+    # setup, and the `finally` below only restores what was there at setup.
+    install_root_keys = {"VCT_INSTALL_ROOT": str(_REPO_ROOT)}
+    # W-TOOL-DIRS: unconditional, like W-INSTALL-ROOT (see the block above).
+    install_root_keys[TOOL_SEARCH_DIRS_ENV] = ""
     self_isolated = (
         request.node.fspath.basename in _SELF_ISOLATED_STATE_DIR_FILES
     )
-    prev = {k: os.environ.get(k) for k in (*keys, *claude_keys)}
+    prev = {
+        k: os.environ.get(k) for k in (*keys, *claude_keys, *install_root_keys)
+    }
     if self_isolated:
         # Stand aside DETERMINISTICALLY (pop, don't restore the ambient value)
         # so the file's own isolation is what governs on every machine —
@@ -488,7 +650,11 @@ def _redirect_user_state_dir(request):
             os.environ.pop(key, None)
     else:
         os.environ.update(keys)
+        # W-ENDPOINTS: a suite that wiped the redirected state dir must not
+        # leave the next test's machine resolvers on the live default ports.
+        _seed_unroutable_service_endpoints(_VCO_STATE_REDIRECT)
     os.environ.update(claude_keys)
+    os.environ.update(install_root_keys)
     try:
         yield
     finally:
@@ -712,6 +878,236 @@ def _open_is_write(mode, flags) -> bool:
     return False
 
 
+# ─── W-CHECKOUT-STATE (v0.2.97): no test may write a checkout's own state/ ──
+#
+# 2026-09-22 incident. `install._log_install_event` appends to
+# `<PROJECT_ROOT>/state/logs/install.jsonl`, and `PROJECT_ROOT` is the
+# directory install.py was imported from — the checkout the suite runs in.
+# In the public clone that directory has no `state/logs/`, so an unpatched
+# call only BUFFERS (`_PENDING_EVENTS`) and nothing is written. In an INSTALLED
+# orchestrator root (the maintainer's dogfood tree) the directory exists, and
+# two tests in `test_v0284_identity_sweep.py` wrote "codegraph identity sweep
+# raised: boom" into that install's REAL install log — where it reads as a
+# field failure. The suite's behaviour depended on which tree it ran in.
+#
+# Two layers, the W-STATE shape:
+#   1. Containment (`_contain_install_logs` below): every loaded copy of
+#      install.py gets an `_install_log_path` that answers None — "no log dir
+#      yet", exactly the public clone's answer — while `PROJECT_ROOT` is still
+#      that copy's own checkout. A test that points `PROJECT_ROOT` at a tmp
+#      dir gets the real function, so every log-asserting test is unchanged.
+#   2. Tripwire (the audit-hook leg): a WRITE under `<checkout>/state/` is
+#      refused and recorded, whatever the door — a copy of install.py loaded
+#      after the fixture ran, a hard-coded path, a `mkdir` of `state/`.
+
+def _install_checkouts() -> tuple:
+    """The checkout(s) whose install.py this suite can import: this tree, plus
+    wherever `import install` would resolve if `PYTHONPATH` names another."""
+    roots = {_REPO_ROOT}
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec("install")
+        if spec is not None and spec.origin:
+            roots.add(Path(spec.origin).resolve().parent)
+    except (ImportError, ValueError):
+        pass
+    return tuple(sorted(roots))
+
+
+_CHECKOUT_STATE_DIRS: tuple = tuple(root / "state" for root in _install_checkouts())
+
+
+def _under_checkout_state(raw) -> "Path | None":
+    """Resolved path if ``raw`` is inside a checkout's ``state/``, else None.
+    Never raises (it runs inside an audit hook); same fast path as its siblings."""
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or "state" not in text:
+        return None
+    # ABSOLUTE paths only. install.py reaches its state through the absolute
+    # PROJECT_ROOT; a relative name is ambiguous here — `shutil.rmtree` walks
+    # with `os.rmdir("state", dir_fd=...)`, relative to a directory fd the
+    # hook cannot see, and resolving it against the cwd flagged pytest's own
+    # tmp-dir cleanup as a write into this checkout.
+    if not os.path.isabs(text):
+        return None
+    try:
+        resolved = Path(os.path.normpath(text))
+    except (OSError, ValueError):
+        return None
+    for state_dir in _CHECKOUT_STATE_DIRS:
+        if _is_inside(state_dir, resolved):
+            return resolved
+    return None
+
+
+# ─── W-CHECKOUT-LEDGER (v0.2.97): no test renders a deferral ledger into a checkout
+#
+# 2026-09-24 incident. A checkout is a repository, not an install root and
+# not a project — yet mid-suite something wrote `<checkout>/.claude/context/
+# UPDATE_DEFERRED.{json,md}` and spliced the "Pending VCO action" reminder into
+# the TRACKED `<checkout>/CLAUDE.md` (the v0.2.92 release shipped exactly that
+# block). Every ledger writer goes through `vco_lib.deferral_emit.locked_report`
+# → `DeferralReport.write`, which opens, in order: the lock
+# `.claude/context/.update-deferred.lock`, the ledger's mkstemp siblings
+# (`UPDATE_DEFERRED.json.<rand>.tmp` …), and `CLAUDE.md.<rand>.tmp`. The lock
+# is watched too, deliberately: with no ledger on disk a writer that resolves
+# the checkout renders NOTHING (empty report ⇒ no files), so it stays invisible
+# until some stale JSON happens to be there — which is how this incident hid.
+# The lock open is the one write every such writer makes, ledger or not.
+#
+# Same door as W-CHECKOUT-STATE (the audit hook below): refused AND recorded,
+# because the deferral writers soft-fail on `Exception`.
+_CHECKOUT_ROOTS: tuple = _install_checkouts()
+_LEDGER_NAME_MARKERS = ("CLAUDE.md", "UPDATE_DEFERRED", ".update-deferred.lock")
+#: Set ONLY while `_guard_repo_tracked_files_against_install_pollution` puts a
+#: checkout back the way the session found it — the one legitimate writer.
+_checkout_ledger_restoring: list = [False]
+
+
+def _checkout_ledger_write(raw) -> "Path | None":
+    """Resolved path if ``raw`` is a checkout's CLAUDE.md, deferral ledger
+    (or one of their atomic-write temp files) or the ledger lock; else None.
+    Never raises (runs inside an audit hook); absolute paths only, like
+    :func:`_under_checkout_state`."""
+    try:
+        text = os.fspath(raw)
+    except (TypeError, ValueError):
+        return None
+    if isinstance(text, bytes):
+        text = text.decode("utf-8", "replace")
+    if not isinstance(text, str) or not any(m in text for m in _LEDGER_NAME_MARKERS):
+        return None
+    if not os.path.isabs(text):
+        return None
+    try:
+        resolved = Path(os.path.normpath(text))
+        parent, name = resolved.parent, resolved.name
+    except (OSError, ValueError):
+        return None
+    for root in _CHECKOUT_ROOTS:
+        if parent == root and (name == "CLAUDE.md" or name.startswith("CLAUDE.md.")):
+            return resolved
+        if parent == root / ".claude" / "context" and (
+            name.startswith("UPDATE_DEFERRED.") or name == ".update-deferred.lock"
+        ):
+            return resolved
+    return None
+
+
+# The audit hook sees only THIS process. The 2026-09-24 writer was a
+# SUBPROCESS (a shell wrapper whose venv ladder found a real interpreter and
+# ran a real sync with the wrapper's script-relative root — the checkout), so
+# the second leg compares the files themselves before and after every test.
+# (inode, mtime_ns, size): an atomic replace changes the inode, an in-place
+# write the mtime/size. Stats only — cheap enough for every test.
+_CHECKOUT_LEDGER_FILES: tuple = tuple(
+    path
+    for root in _CHECKOUT_ROOTS
+    for path in (
+        root / "CLAUDE.md",
+        root / ".claude" / "context" / "UPDATE_DEFERRED.md",
+        root / ".claude" / "context" / "UPDATE_DEFERRED.json",
+    )
+)
+
+
+def _ledger_fingerprint(path: Path) -> "tuple | None":
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    return (st.st_ino, st.st_mtime_ns, st.st_size)
+
+
+@pytest.fixture(autouse=True)
+def _checkout_ledger_untouched():
+    """W-CHECKOUT-LEDGER, subprocess leg: red the test during which a
+    checkout's CLAUDE.md or deferral ledger changed, whoever changed it."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    before = {path: _ledger_fingerprint(path) for path in _CHECKOUT_LEDGER_FILES}
+    yield
+    changed = [str(p) for p in _CHECKOUT_LEDGER_FILES if _ledger_fingerprint(p) != before[p]]
+    if changed:
+        raise AssertionError(
+            "W-CHECKOUT-LEDGER: this test (or a process it spawned) changed "
+            + ", ".join(changed)
+            + " — something resolved the checkout as its project/install root "
+            "and rendered a deferral ledger / CLAUDE.md reminder into it. Give "
+            "the writer a fixture root (see tests/conftest.py W-CHECKOUT-LEDGER)."
+        )
+
+
+_CONTAINED_MARK = "_vco_contained_install_log"
+
+
+def contain_install_module(module) -> bool:
+    """Wrap ``module._install_log_path`` so its OWN checkout's log is invisible.
+
+    Returns True when it wrapped, False when there was nothing to wrap or it
+    already was. Public for the guard's own test.
+    """
+    original = getattr(module, "_install_log_path", None)
+    if original is None or getattr(original, _CONTAINED_MARK, False):
+        return False
+    home = Path(module.__file__).resolve().parent
+
+    def _contained_install_log_path():
+        try:
+            if Path(module.PROJECT_ROOT).resolve() == home:
+                return None
+        except (OSError, TypeError, ValueError):
+            return None
+        return original()
+
+    setattr(_contained_install_log_path, _CONTAINED_MARK, True)
+    _contained_install_log_path.__wrapped__ = original  # type: ignore[attr-defined]
+    module._install_log_path = _contained_install_log_path
+    return True
+
+
+def _loaded_install_modules() -> list:
+    """Every loaded copy of install.py — `install` and the spec-loaded aliases
+    (`install_under_test`, `install_py_v47c`, …) several suites use."""
+    found = []
+    for name, module in list(sys.modules.items()):
+        if module is None or not name.startswith("install"):
+            continue
+        origin = str(getattr(module, "__file__", "") or "")
+        if origin.endswith("install.py") and hasattr(module, "_install_log_path"):
+            found.append(module)
+    return found
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _preload_install_for_containment():
+    """Import install.py once, up front, so the first test that uses it is
+    contained too (a module first imported inside a test body would otherwise
+    only meet the tripwire)."""
+    if not _ALLOW_REAL_STATE:
+        try:
+            import install  # noqa: F401
+        except Exception:  # noqa: BLE001 — a suite that cannot import it has nothing to contain
+            pass
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _contain_install_logs(_preload_install_for_containment):
+    """Layer 1 of W-CHECKOUT-STATE, re-applied per test for newly loaded copies."""
+    if not _ALLOW_REAL_STATE:
+        for module in _loaded_install_modules():
+            contain_install_module(module)
+    yield
+
+
 def _user_state_audit_hook(event: str, args) -> None:
     """Refuse WRITES into the real `~/.claude` or `~/.vct`; record reads of
     the former.
@@ -819,6 +1215,31 @@ def _user_state_audit_hook(event: str, args) -> None:
     # `hub.token` at import to decide a module-level skip, and the sqlite
     # guard already lets read-only DB handles through for the same reason.
     # Recording them would red dozens of tests for no incident.
+    if is_write:
+        # os.rename's destination is args[1]; the mkstemp source already
+        # matches for the ledger writers, the destination covers a plain
+        # rename onto CLAUDE.md.
+        for raw in (args[:2] if event == "os.rename" else args[:1]):
+            ledger = None if _checkout_ledger_restoring[0] else _checkout_ledger_write(raw)
+            if ledger is not None:
+                _state_write_attempts.append(str(ledger))
+                raise RealUserStateWriteBlocked(
+                    f"test tried to write {ledger}; the suite must never render "
+                    f"a deferral ledger or CLAUDE.md reminder into a checkout "
+                    f"(see tests/conftest.py W-CHECKOUT-LEDGER — the writer "
+                    f"resolved the checkout as its project/install root; give "
+                    f"it a fixture root)"
+                )
+        in_checkout = _under_checkout_state(args[0])
+        if in_checkout is not None:
+            _state_write_attempts.append(str(in_checkout))
+            raise RealUserStateWriteBlocked(
+                f"test tried to write {in_checkout}; the suite must never write "
+                f"a checkout's own install state (see tests/conftest.py "
+                f"W-CHECKOUT-STATE — the install log is contained by "
+                f"_contain_install_logs; anything else under state/ needs "
+                f"install.PROJECT_ROOT pointed at tmp_path)"
+            )
     resolved = _under_real_vct(args[0])
     if resolved is None or not is_write:
         return
@@ -1091,35 +1512,49 @@ def _guard_repo_tracked_files_against_install_pollution():
     the public repo (which is NOT an installed clone and must carry no install
     artifacts).
 
-    This session-scoped guard snapshots both at session start and restores /
-    removes them at session end, so the suite never leaves the repo dirty —
-    independent of WHICH test pollutes (current or future). Best practice for
-    new tests remains: run install.py with ``--skip-materialize-claude-dir`` or
-    target a tmp install root. Soft-fail: cleanup errors never fail the session.
+    Since v0.2.97 such a write no longer passes silently: W-CHECKOUT-LEDGER
+    refuses it in-process at the write and reds the test during which a
+    subprocess made it. This session-scoped fixture remains the clean-up
+    behind those reds: it snapshots at session start and restores / removes at
+    session end, so even a red run never leaves the tracked file dirty. Best
+    practice for new tests remains: run install.py with
+    ``--skip-materialize-claude-dir`` or target a tmp install root. Soft-fail:
+    cleanup errors never fail the session.
+
+    The ledger is removed as a PAIR (``UPDATE_DEFERRED.md`` AND its ``.json``
+    source of truth). Removing only the Markdown is how a 2026-09-10 row
+    survived for two weeks: the next writer that read the ledger re-rendered
+    the ``.md`` — and the CLAUDE.md reminder — from the leftover ``.json``.
     """
     repo_root = Path(__file__).resolve().parent.parent
     claude_md = repo_root / "CLAUDE.md"
-    deferred = repo_root / ".claude" / "context" / "UPDATE_DEFERRED.md"
+    context_dir = repo_root / ".claude" / "context"
+    ledger_files = (context_dir / "UPDATE_DEFERRED.md", context_dir / "UPDATE_DEFERRED.json")
 
     claude_before = claude_md.read_bytes() if claude_md.is_file() else None
-    deferred_existed = deferred.is_file()
+    ledger_existed = {path: path.is_file() for path in ledger_files}
 
     try:
         yield
     finally:
+        _checkout_ledger_restoring[0] = True
         try:
-            if claude_before is not None:
-                if not claude_md.is_file() or claude_md.read_bytes() != claude_before:
-                    claude_md.write_bytes(claude_before)
-            elif claude_md.is_file():
-                claude_md.unlink()  # didn't exist before the session
-        except OSError:
-            pass
-        try:
-            if not deferred_existed and deferred.is_file():
-                deferred.unlink()
-        except OSError:
-            pass
+            try:
+                if claude_before is not None:
+                    if not claude_md.is_file() or claude_md.read_bytes() != claude_before:
+                        claude_md.write_bytes(claude_before)
+                elif claude_md.is_file():
+                    claude_md.unlink()  # didn't exist before the session
+            except OSError:
+                pass
+            for path, existed in ledger_existed.items():
+                try:
+                    if not existed and path.is_file():
+                        path.unlink()
+                except OSError:
+                    pass
+        finally:
+            _checkout_ledger_restoring[0] = False
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -1472,15 +1907,40 @@ def _pin_code_embed_url():
     if _ALLOW_REAL_STATE:
         yield
         return
-    prev = os.environ.get("CODE_EMBED_SERVICE_URL")
-    os.environ["CODE_EMBED_SERVICE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    prev = {k: os.environ.get(k) for k in _CODE_EMBED_URL_KEYS}
+    for key in _CODE_EMBED_URL_KEYS:
+        os.environ[key] = _fixture_guard.UNROUTABLE_SENTINEL_URL
     try:
         yield
     finally:
-        if prev is None:
-            os.environ.pop("CODE_EMBED_SERVICE_URL", None)
-        else:
-            os.environ["CODE_EMBED_SERVICE_URL"] = prev
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@pytest.fixture(autouse=True)
+def _pin_localhost_default_backends():
+    """W-TRANSPORT / W-OLLAMA / W-HUB-PORT: re-establish the pins for EVERY
+    test (see the import-time block). Same reason as the Weaviate pin: a test
+    that sets one of these keys itself and restores by
+    ``os.environ.update(backup)`` cannot remove a key the backup lacked, so
+    one such test would un-pin everything after it."""
+    if _ALLOW_REAL_STATE:
+        yield
+        return
+    prev = {k: os.environ.get(k) for k, _ in _PINNED_LOCALHOST_KEYS}
+    for key, value in _PINNED_LOCALHOST_KEYS:
+        os.environ[key] = value
+    try:
+        yield
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
 
 
 @pytest.fixture(autouse=True)

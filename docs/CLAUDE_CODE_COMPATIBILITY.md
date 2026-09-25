@@ -95,6 +95,49 @@ Then run `direnv allow` once per project.
 Run `source .claude/env` in the shell before launching `claude`. Lowest
 ceremony, easiest to forget.
 
+## Hook command anchoring (`${CLAUDE_PROJECT_DIR}`)
+
+A hook command runs in the session's CURRENT directory, and that directory
+follows `cd` and worktrees — a relative hook path (`.claude/hooks/x.sh`,
+the form every VCO release before v0.2.97 wrote) fails with "No such file
+or directory" as soon as the cwd moves. VCO therefore anchors every shipped
+hook command at the project root through Claude Code's
+`${CLAUDE_PROJECT_DIR}` "project root where the session started"
+placeholder. The mechanism, per OS:
+
+- **Linux/macOS** — `bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"`.
+  Claude Code substitutes the placeholder in the command where it supports
+  that, and exports `CLAUDE_PROJECT_DIR` as an environment variable where
+  it does not (shell-form hooks run through `sh -c`, so the double-quoted
+  `${CLAUDE_PROJECT_DIR}` expands there). The POSIX `:-` default covers the
+  remaining case — a client that provides NEITHER — by degrading to `.`,
+  i.e. the session's starting directory, which is exactly what the
+  pre-v0.2.97 relative form resolved against. It is never worse than the
+  old behaviour and fixes the moved-cwd failure.
+- **Windows** — `powershell -NoProfile -ExecutionPolicy Bypass -File
+  "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"` with the EXACT placeholder.
+  Placeholder substitution is Claude Code's documented mechanism and works
+  whichever shell the command is spawned through (Git Bash, or PowerShell
+  when Git Bash is absent). A `:-` default is deliberately NOT used here:
+  it is POSIX-only parameter expansion and would break under the
+  PowerShell shell fallback.
+
+**Windows caveat** ([claude-code#71924](https://github.com/anthropics/claude-code/issues/71924)):
+on Windows / Claude Desktop there are reports of `CLAUDE_PROJECT_DIR` being
+absent from hook subprocess environments. VCO's Windows form relies on the
+placeholder SUBSTITUTION, not the env var, so it is not affected by that
+bug; the exported-variable path is only load-bearing on Linux/macOS, where
+the `:-.` fallback additionally covers its absence. The shipped `.ps1`
+hooks themselves read `$env:CLAUDE_PROJECT_DIR` (falling back to the
+project cwd) when they need the project root at runtime.
+
+Every spelling of one registration — the pre-v0.2.97 relative form, the
+exact-placeholder form, and the `:-.` fallback form — is treated as the
+same hook by the bundle update and the launcher's Hooks tab (registration
+identity in `vco_lib/hook_retirements.py::hook_command_key`), so a project
+migrated by an earlier v0.2.97 build is rewritten in place, never
+duplicated.
+
 ## Known caveats
 
 - **Stop-event hooks**: `Stop`, `StopFailure`, `SessionEnd` are

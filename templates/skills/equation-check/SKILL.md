@@ -4,7 +4,7 @@ description: Audits a mathematical equation or derivation for dimensional consis
 short_desc: "validate equations: dimensions, limits, signs"
 keywords: [equation, derivation, dimensional analysis, LaTeX, unit check, check the units, "check derivation", "verify equation", "audit derivation", "LaTeX equation", "math check", "limiting behavior"]
 model: opus
-effort: xhigh
+effort: high
 allowed-tools: Read, Write, WebSearch, Bash
 ---
 

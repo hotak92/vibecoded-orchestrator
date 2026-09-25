@@ -85,8 +85,7 @@ if (-not (Test-Path -LiteralPath $metricsFile -PathType Leaf)) {
 
 # Find a Python launcher via the shared `_lib/find-python.ps1`.
 # (Pre-0.2.11 this hook tried to read a venv path from BASH_ENV set by
-# the legacy lean-ctx shim — that shim is gone, see lean-ctx-shim-disabled
-# KG node.)
+# the legacy lean-ctx shim — that shim was removed in v0.2.11.)
 #
 # v0.2.92 W7 (R23, pre-existing defect fixed in place): the header comment at
 # the top of this file has claimed since 2026-05-10 that this hook "already

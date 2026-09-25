@@ -3,8 +3,10 @@
 # declared in agents'/skills' `keywords:` frontmatter and emits a short
 # additionalContext envelope when any keyword matches.
 #
-# Filesystem contract: globs `.claude/agents/*.md` and
-# `.claude/skills/*/SKILL.md`. The launcher's disable mechanism moves
+# Filesystem contract: globs `.claude/agents/*.md`,
+# `.claude/skills/*/SKILL.md`, and — on main-loop invocations, which do not
+# pass --skills-only — `.claude/workflows/*.mjs` / `*.js`. The launcher's
+# disable mechanism moves
 # files into sibling `.claude/agents.disabled/` / `.claude/skills.disabled/`
 # directories, so disabled entries naturally fall outside these globs —
 # no DB lookup needed.

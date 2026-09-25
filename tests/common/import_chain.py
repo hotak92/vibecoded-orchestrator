@@ -25,9 +25,12 @@ from pathlib import Path
 
 __all__ = [
     "REPO_ROOT",
+    "CallImportIndex",
+    "guarded_import_ranges",
     "module_scope_imports",
     "resolve_vco_lib_module",
     "third_party_reachable_from",
+    "third_party_reachable_from_call",
     "requirements_import_roots",
 ]
 
@@ -182,3 +185,245 @@ def third_party_reachable_from(
                 if child is not None and dotted not in seen:
                     pending.append((dotted, child))
     return found
+
+
+# ─── interprocedural walk: what executes when a SYMBOL is called ─────────
+#
+# v0.2.97: the walkers above are MODULE-SCOPE-only, which is exactly right
+# for their question ("does IMPORTING this module need the package?") and
+# exactly blind to the failure install-smoke shipped that cycle: install.py
+# imported ``vco_lib.openai_key`` (clean module scope) and called
+# ``migrate_dotenv_openai_key``, whose BODY did ``from vco_lib import
+# agent_secrets`` — and agent_secrets' MODULE scope imports
+# ``vco_lib.project_config``, which imports ``requests`` unguarded. The
+# module-scope walk never descends into a called symbol's body, so the gate
+# was green while every fresh install crashed at step 9.
+#
+# The machinery below answers the sharper question the post-venv gate needs:
+# "when THIS callable runs, which third-party imports actually execute?" —
+# following the called symbol's body, the same-module functions it calls, and
+# the vco_lib symbols its imports bind.
+
+
+def _handler_catches_imports(handler: ast.ExceptHandler) -> bool:
+    """Does this except-clause absorb an ImportError?
+
+    ``ImportError``/``ModuleNotFoundError`` name it; ``Exception``/bare
+    covers it; anything else (``OSError`` alone, ``RuntimeError``…) does not.
+    """
+    if handler.type is None:
+        return True
+    names: list[str] = []
+    node = handler.type
+    if isinstance(node, ast.Name):
+        names = [node.id]
+    elif isinstance(node, ast.Tuple):
+        names = [e.id for e in node.elts if isinstance(e, ast.Name)]
+    return any(
+        n in ("ImportError", "ModuleNotFoundError", "Exception", "BaseException")
+        for n in names
+    )
+
+
+def guarded_import_ranges(tree: ast.AST) -> list[tuple[int, int]]:
+    """``(first_line, last_line)`` of every statement whose imports sit in a
+    ``try`` an ImportError-catching handler can absorb.
+
+    An import on one of these lines is GUARDED — the callable survives the
+    package being absent, which is the post-venv rule's "working fallback"
+    criterion. (What the handler does next is the callable's business; the
+    pre-venv gate remains the one that forbids the import outright.)"""
+    out: list[tuple[int, int]] = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Try) and any(_handler_catches_imports(h) for h in node.handlers):
+            for stmt in node.body:
+                out.append((stmt.lineno, stmt.end_lineno or stmt.lineno))
+    return out
+
+
+def _attr_names_on(root: ast.AST, base: str) -> set[str]:
+    """Attribute names accessed on the NAME ``base`` anywhere under *root*."""
+    return {
+        n.attr
+        for n in ast.walk(root)
+        if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name) and n.value.id == base
+    }
+
+
+class CallImportIndex:
+    """One Python file's toplevel-def index for interprocedural import walks.
+
+    ``third_party_from_call(symbol)`` walks a callable (or the module scope,
+    with ``None``) and reports third-party packages that would EXECUTE when
+    it runs:
+
+    * the module scope of every ``vco_lib`` module the chain imports
+      (importing runs it) — but NOT the entry file's own module scope, which
+      ran at import time, long before the callable, and is the
+      bootstrap/pre-venv gates' question;
+    * the bodies of the symbols actually called — resolved through
+      ``from vco_lib.X import f`` bindings, ``from vco_lib import X`` +
+      ``X.attr`` uses, and same-module calls by name — transitively.
+
+    Known limits, deliberate: calls on RETURNED objects and injected
+    callables are not followed (nothing in install.py's flow imports through
+    them); an import wrapped in a try whose handler catches but then
+    re-raises still counts as guarded — the runtime behaviour of each
+    guarded site is pinned by behavioural tests, not by this static walk.
+    """
+
+    def __init__(self, path: Path, *, name: str) -> None:
+        self.path = path
+        self.name = name  # how violations name this file
+        self.tree = ast.parse(path.read_text(encoding="utf-8"))
+        self.toplevel: dict[str, ast.AST] = {}
+        for node in self.tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                self.toplevel[node.name] = node
+        self.guarded = guarded_import_ranges(self.tree)
+
+    def third_party_from_call(self, symbol: str | None) -> dict[str, str]:
+        """Third-party package -> where it executes, for a call of *symbol*.
+
+        Guarded imports (see :func:`guarded_import_ranges`) are NOT reported:
+        they are the sanctioned post-venv fallback shape."""
+        found: dict[str, str] = {}
+        seen: set[tuple[str, str | None]] = set()
+        # (module, symbol, reached_by_import) — the last flag says the MODULE
+        # SCOPE executes too (the import that bound it ran inside the walk).
+        pending: list[tuple[str, str | None, bool]] = [(self.name, symbol, False)]
+        while pending:
+            mod_name, sym, reached_by_import = pending.pop()
+            if (mod_name, sym) in seen:
+                continue
+            seen.add((mod_name, sym))
+            index = _index_for(mod_name)
+            if index is None:
+                continue
+            if reached_by_import or sym is None:
+                for node in module_scope_imports(index.tree):
+                    external, internal = _targets_of(node, mod_name)
+                    for root in external:
+                        if root and root not in sys.stdlib_module_names and root != "vco_lib":
+                            found.setdefault(
+                                root, f"vco_lib.{mod_name} imports it at module scope"
+                            )
+                    for dotted in internal:
+                        pending.append((dotted, None, True))
+            if sym is None:
+                continue
+            node = index.toplevel.get(sym)
+            if node is None:
+                index._follow_reexport(sym, pending)
+                continue
+            bodies: list[ast.AST] = [node]
+            if isinstance(node, ast.ClassDef):
+                bodies += [m for m in node.body if isinstance(m, ast.FunctionDef)]
+            for body in bodies:
+                index._walk_body(mod_name, body, found, pending)
+
+        return found
+
+    def _follow_reexport(
+        self, sym: str, pending: list[tuple[str, str | None, bool]]
+    ) -> None:
+        """``from vco_lib.X import sym`` at module scope: follow it there."""
+        for node in module_scope_imports(self.tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if node.module == "vco_lib":
+                for alias in node.names:
+                    if (alias.asname or alias.name) == sym:
+                        pending.append((alias.name, None, True))
+            elif node.module.startswith("vco_lib."):
+                for alias in node.names:
+                    if (alias.asname or alias.name) == sym:
+                        pending.append((node.module.split(".", 1)[1], sym, True))
+
+    def _walk_body(
+        self,
+        mod_name: str,
+        body: ast.AST,
+        found: dict[str, str],
+        pending: list[tuple[str, str | None, bool]],
+    ) -> None:
+        def _is_guarded(node: ast.stmt) -> bool:
+            return any(lo <= node.lineno <= hi for lo, hi in self.guarded)
+
+        for sub in ast.walk(body):
+            if isinstance(sub, ast.ImportFrom):
+                if _is_guarded(sub):
+                    continue  # the failure is absorbed: nothing executes
+                module = sub.module or ""
+                if sub.level:  # relative import inside a vco_lib package
+                    _external, internal = _targets_of(sub, mod_name)
+                    for dotted in internal:
+                        pending.append((dotted, None, True))
+                    continue
+                if module == "vco_lib":
+                    for alias in sub.names:
+                        attrs = _attr_names_on(body, alias.asname or alias.name)
+                        for attr in sorted(attrs) or [None]:
+                            pending.append((alias.name, attr, True))
+                elif module.startswith("vco_lib."):
+                    for alias in sub.names:
+                        pending.append((module.split(".", 1)[1], alias.asname or alias.name, True))
+                else:
+                    self._note_external(sub, module.split(".")[0], found)
+            elif isinstance(sub, ast.Import):
+                if _is_guarded(sub):
+                    continue
+                for alias in sub.names:
+                    if alias.name.startswith("vco_lib."):
+                        alias_name = alias.asname or alias.name.split(".", 1)[1]
+                        attrs = _attr_names_on(body, alias_name)
+                        for attr in sorted(attrs) or [None]:
+                            pending.append((alias.name.split(".", 1)[1], attr, True))
+                    else:
+                        self._note_external(sub, alias.name.split(".")[0], found)
+            elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Name):
+                target = self.toplevel.get(sub.func.id)
+                if isinstance(target, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    pending.append((mod_name, sub.func.id, False))
+
+    def _note_external(self, node: ast.stmt, root: str, found: dict[str, str]) -> None:
+        if not root or root in sys.stdlib_module_names:
+            return
+        if any(lo <= node.lineno <= hi for lo, hi in self.guarded):
+            return  # guarded: the sanctioned fallback shape
+        found.setdefault(root, f"{self.name} imports it in a function body, unguarded")
+
+
+_INDEX_CACHE: dict[str, CallImportIndex | None] = {}
+
+
+def _index_for(mod_name: str) -> CallImportIndex | None:
+    """The :class:`CallImportIndex` for ``install.py`` or a ``vco_lib``
+    submodule (cached per session — the gates read source, never write it).
+
+    ``mod_name`` may carry a leading ``vco_lib.`` (an index's ``name`` is
+    prefixed for its violation messages); it is normalised here so the seen
+    set stays consistent."""
+    if mod_name.startswith("vco_lib."):
+        mod_name = mod_name.split(".", 1)[1]
+    if mod_name == "install.py":
+        if "install.py" not in _INDEX_CACHE:
+            _INDEX_CACHE["install.py"] = CallImportIndex(
+                REPO_ROOT / "install.py", name="install.py"
+            )
+        return _INDEX_CACHE["install.py"]
+    path = resolve_vco_lib_module(mod_name)
+    if path is None:
+        return None
+    if mod_name not in _INDEX_CACHE:
+        _INDEX_CACHE[mod_name] = CallImportIndex(path, name=f"vco_lib.{mod_name}")
+    return _INDEX_CACHE[mod_name]
+
+
+def third_party_reachable_from_call(module_dotted: str, symbol: str | None) -> dict[str, str]:
+    """Single-shot form of :class:`CallImportIndex` for a ``vco_lib``
+    module's symbol — the walker's own regression tests use it."""
+    index = _index_for(module_dotted)
+    if index is None:
+        return {}
+    return index.third_party_from_call(symbol)

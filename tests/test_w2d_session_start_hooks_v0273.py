@@ -337,9 +337,17 @@ class KgSyncOnEditTests(unittest.TestCase):
 
 
 class NudgeGuardRegistrationTests(unittest.TestCase):
-    """HK-5 — the PostToolUse(*) nudge registration carries the guard."""
+    """HK-5 — the PostToolUse(*) nudge registration is present and current.
 
-    def test_posttooluse_star_nudge_is_guarded(self) -> None:
+    v0.2.97: the registration no longer carries the settings-level
+    ``[ -n "$VCT_DISABLE_HOOKS" ] || `` prefix. The IN-SCRIPT guard is the
+    one mechanism (every ``templates/hooks/*.{sh,ps1}`` exits 0 on the
+    variable — pinned by ``tests/test_hooks_disable_guard.py``, which also
+    covers kg-update-nudge.sh itself). What HK-5 still pins here is that
+    the nudge is REGISTERED at all on the PostToolUse(*) matcher, with the
+    plain shipped command form."""
+
+    def test_posttooluse_star_nudge_is_registered_without_legacy_prefix(self) -> None:
         linux = REPO_ROOT / "templates" / "settings.json.linux.template"
         data = json.loads(linux.read_text(encoding="utf-8"))
         found = False
@@ -349,13 +357,13 @@ class NudgeGuardRegistrationTests(unittest.TestCase):
                     cmd = hook.get("command", "")
                     if "kg-update-nudge.sh" in cmd:
                         found = True
-                        self.assertIn(
+                        self.assertNotIn(
                             'VCT_DISABLE_HOOKS',
                             cmd,
-                            "HK-5: PostToolUse(*) kg-update-nudge "
-                            "registration must carry the settings-level "
-                            "VCT_DISABLE_HOOKS guard (outer net for the "
-                            "internal guard).",
+                            "HK-5 (v0.2.97): the settings-level guard prefix "
+                            "was retired; the in-script guard "
+                            "(tests/test_hooks_disable_guard.py) owns the "
+                            "VCT_DISABLE_HOOKS opt-out.",
                         )
         self.assertTrue(found, "PostToolUse(*) nudge registration not found")
 

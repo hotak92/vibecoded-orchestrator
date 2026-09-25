@@ -17,9 +17,10 @@
 //!
 //! Cross-OS: spawns podman OR docker via the local `detect_container_runtime`
 //! helper. Paths via PathBuf throughout; never assumes Unix separators.
-//! Subprocess invocations use `env_clear()` + selective env pass-through
-//! (PATH/HOME/USER/TMPDIR/LANG/LC_ALL, plus SYSTEMROOT/APPDATA/
-//! LOCALAPPDATA/USERPROFILE/TEMP/TMP on Windows).
+//! Subprocess invocations use `env_clear()` + the ONE shared child-env
+//! table (`vct-launcher-core services::child_env`: PATH + temp/locale
+//! keys + HOME on POSIX / the USERPROFILE family with SYSTEMROOT/
+//! COMSPEC on Windows).
 //!
 //! Cross-embedding: reads `ACTIVE_EMBEDDING` from the project's
 //! `.claude/env` (qwen3 / arctic / openai / future). Never hardcodes the
@@ -45,9 +46,12 @@ use vct_launcher_core::process::CommandExt as _;
 // `vct-launcher-core::services::container_runtime` for the canonical
 // source; the previous local copies have been deleted to close the
 // drift gap that caused the supervisor-image-resolution-variant bug.
+// `build_podman_run_args` left this list in v0.2.97: the start path now calls
+// `spawn_args_for_project` (settings + secrets env), and only this file's tests
+// still use the plain form — they import it themselves.
 pub use vct_launcher_core::services::container_runtime::{
-    build_podman_run_args, container_weights_path, ensure_volume_host_dirs,
-    resolve_container_name, resolve_image_ref, sanitize_path_component,
+    container_weights_path, ensure_volume_host_dirs, resolve_container_name, resolve_image_ref,
+    sanitize_path_component,
 };
 
 // Re-exports kept available for downstream callers / tests even though
@@ -258,6 +262,10 @@ pub async fn start_container_for_module(
     ctx: &PlaceholderCtx,
     project: &ProjectRow,
     rl_port: u16,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // values for this project (`module_settings_env`), which the container
+    // is started with.
+    db: &Db,
 ) -> Result<String, String> {
     // v0.2.47: resolve the persisted GpuMode for this host. Soft-fail
     // to None if no snapshot exists — `start_container_for_module_with_gpu_mode`
@@ -269,7 +277,7 @@ pub async fn start_container_for_module(
     // current state (still better than substituting bare version on
     // private images — the pull-fallback below covers that).
     let gpu_mode = read_persisted_gpu_mode();
-    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode).await
+    start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode, db).await
 }
 
 /// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
@@ -293,7 +301,39 @@ pub async fn start_container_for_module_with_gpu_mode(
     project: &ProjectRow,
     rl_port: u16,
     gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    // v0.2.97 (lane V): source of the module's `runtime.env_from_settings`
+    // and `runtime.env_from_secrets` values
+    // (`container_runtime::spawn_args_for_project`).
+    db: &Db,
 ) -> Result<String, String> {
+    let podman = detect_container_runtime().await?;
+    let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    launch_prepared_start(manifest, ctx, project, rl_port, prepared, &SystemContainerCli).await
+}
+
+/// A per-project start that passed every check that can refuse it: the
+/// container name, the image, and the run argv with the module's listed
+/// settings and secrets resolved. Built BEFORE anything is stopped or
+/// removed, so a refused start leaves the running container alone.
+pub(crate) struct PreparedStart {
+    podman: String,
+    container_name: String,
+    image: String,
+    spawn: vct_launcher_core::services::container_runtime::SpawnArgs,
+}
+
+/// Everything in a per-project start that can refuse it, with no container
+/// touched. `Err`: not a container/service module, a name/image that does not
+/// resolve, or a required secret that does not (`spawn_args_for_project`).
+pub(crate) fn prepare_container_start(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    podman: String,
+    db: &Db,
+) -> Result<PreparedStart, String> {
     let runtime = &manifest.runtime;
     if !matches!(runtime.r#type.as_str(), "container" | "service") {
         return Err(format!(
@@ -317,7 +357,84 @@ pub async fn start_container_for_module_with_gpu_mode(
     // bearing manifests get the right `-cuda` / `-rocm` / `-cpu` suffix.
     let image = resolve_image_ref(&image_template, manifest, gpu_mode)?;
 
-    let podman = detect_container_runtime().await?;
+    // v0.2.97 (lane V): the run argv with the module's listed settings
+    // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
+    // in this spawn's env, below). Built before the pre-pull and the `rm -f`
+    // so a refused start — a required secret that did not resolve — leaves
+    // the running container alone.
+    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
+    )?;
+    Ok(PreparedStart { podman, container_name, image, spawn })
+}
+
+/// The container CLI's fire-and-forget subcommands (`stop`, `rm`) — output
+/// discarded, exit status ignored (both are idempotent cleanups). A trait so a
+/// test can record them without a container runtime on the machine.
+pub(crate) trait ContainerCli: Sync {
+    fn run_quiet<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [&'a str],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+}
+
+/// The real [`ContainerCli`]: the runtime binary, output discarded.
+pub(crate) struct SystemContainerCli;
+
+impl ContainerCli for SystemContainerCli {
+    fn run_quiet<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [&'a str],
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+        Box::pin(async move {
+            let _ = Command::new(program)
+                .silent()
+                .args(args)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .await;
+        })
+    }
+}
+
+/// Build the `podman run` child — argv + the scrubbed env. Extracted
+/// from `launch_prepared_start` (v0.2.97 R12-bis N4) as the wiring-test
+/// seam: the test inspects the EXACT env the spawned runtime child
+/// would receive via `get_envs()`, so reverting this site to a
+/// hand-rolled key list goes red instead of silently drifting from
+/// `services::child_env`. Behaviour-identical to the pre-extraction
+/// inline block.
+fn build_container_run_command(
+    podman: &str,
+    spawn: &vct_launcher_core::services::container_runtime::SpawnArgs,
+) -> Command {
+    let mut cmd = Command::new(podman).silent();
+    cmd.args(&spawn.args);
+    cmd.env_clear();
+    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
+    // family, per-OS — the same keys the decide child and the vco_lib
+    // sandbox receive.
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
+    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
+    // in this child's environment, never in its argv.
+    spawn.apply_secret_env(&mut cmd);
+    cmd
+}
+
+/// Run a [`PreparedStart`]: pre-pull, `rm -f` any same-named container,
+/// create the volume dirs, `podman run`. Returns the container name.
+async fn launch_prepared_start(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    prepared: PreparedStart,
+    cli: &dyn ContainerCli,
+) -> Result<String, String> {
+    let PreparedStart { podman, container_name, image, spawn } = prepared;
 
     // v0.2.47: pre-pull the variant-correct image with auth context
     // attached, so a cache-evicted host doesn't fall through to
@@ -347,37 +464,15 @@ pub async fn start_container_for_module_with_gpu_mode(
     }
 
     // Idempotency: force-remove any prior container with the same name.
-    let _ = Command::new(&podman).silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    cli.run_quiet(&podman, &["rm", "-f", &container_name]).await;
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
-    // v0.2.54 (P0-4): thread detected engine + gpu_mode so variant-
-    // declaring manifests get runtime-appropriate GPU device flags.
-    let args = build_podman_run_args(
-        manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode,
-    )?;
-
-    let mut cmd = Command::new(&podman).silent();
-    cmd.args(&args);
-    cmd.env_clear();
-    for key in ["PATH", "HOME", "USER", "TMPDIR", "LANG", "LC_ALL", "XDG_RUNTIME_DIR"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    #[cfg(target_os = "windows")]
-    for key in ["SYSTEMROOT", "APPDATA", "LOCALAPPDATA", "USERPROFILE", "TEMP", "TMP"] {
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
+    // v0.2.54 (P0-4): `spawn` (built above) threads the detected engine +
+    // gpu_mode so variant-declaring manifests get the right GPU flags.
+    let mut cmd = build_container_run_command(&podman, &spawn);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below.
@@ -470,7 +565,7 @@ pub async fn start_container_after_install(
 ) -> Result<String, String> {
     let rl_port = ensure_project_rl_port(db, project)?;
     let ctx = PlaceholderCtx::new(&manifest.id);
-    let container_name = start_container_for_module(manifest, &ctx, project, rl_port).await?;
+    let container_name = start_container_for_module(manifest, &ctx, project, rl_port, db).await?;
     db.set_module_container_name(&project.id, &manifest.id, &container_name)?;
     // TODO(paid-modules, v0.2.40 R2): the RL container should fetch
     // `rl_use_global` / `rl_online_training_disabled` /
@@ -1162,22 +1257,36 @@ fn allocate_random_rl_port() -> u16 {
 /// available (no podman / docker on PATH).
 pub async fn stop_container_for_project(container_name: &str) -> Result<(), String> {
     let podman = detect_container_runtime().await?;
-
-    let _ = Command::new(&podman).silent()
-        .args(["stop", "-t", "10", container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
-    let _ = Command::new(&podman).silent()
-        .args(["rm", container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
-
+    stop_container_with(&SystemContainerCli, &podman, container_name).await;
     Ok(())
+}
+
+/// `stop -t 10` then `rm` through `cli` (both idempotent; failures ignored).
+async fn stop_container_with(cli: &dyn ContainerCli, podman: &str, container_name: &str) {
+    cli.run_quiet(podman, &["stop", "-t", "10", container_name]).await;
+    cli.run_quiet(podman, &["rm", container_name]).await;
+}
+
+/// Restart one project's container: resolve EVERYTHING that can refuse the
+/// start first ([`prepare_container_start`] — a required secret that is
+/// paused or unset refuses here), and only then stop + remove the running
+/// container and start the new one. R7b F1: the restart used to stop first,
+/// so a refused start left the module stopped.
+#[allow(clippy::too_many_arguments)]
+async fn restart_container_with(
+    cli: &dyn ContainerCli,
+    podman: String,
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    container_name: &str,
+    rl_port: u16,
+    gpu_mode: Option<crate::commands::gpu_policy::GpuMode>,
+    db: &Db,
+) -> Result<String, String> {
+    let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    stop_container_with(cli, &prepared.podman, container_name).await;
+    launch_prepared_start(manifest, ctx, project, rl_port, prepared, cli).await
 }
 
 /// Is a container with this name currently running? Returns Ok(false)
@@ -1279,9 +1388,20 @@ pub async fn restart_rl_container(
 
     let rl_port = ensure_project_rl_port(&db, &project)?;
 
-    stop_container_for_project(&container_name).await?;
+    let podman = detect_container_runtime().await?;
     let ctx = PlaceholderCtx::new(RL_RERANKER_MODULE_ID);
-    let _ = start_container_for_module(&manifest, &ctx, &project, rl_port).await?;
+    restart_container_with(
+        &SystemContainerCli,
+        podman,
+        &manifest,
+        &ctx,
+        &project,
+        &container_name,
+        rl_port,
+        read_persisted_gpu_mode(),
+        &db,
+    )
+    .await?;
     Ok(())
 }
 
@@ -1319,22 +1439,17 @@ pub async fn start_module_container(
 // `Authorization: Bearer <token>`. Soft-fails (returns Err) when the
 // hub is unreachable so callers can fall back to the in-process path.
 
+/// The running hub's port, strictly from `hub.port` (the one reader:
+/// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port_for_proxy() -> Result<u16, String> {
-    let path = crate::paths::vct_root_dir().join("hub.port");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.port: {}", e))?;
-    raw.trim()
-        .parse::<u16>()
-        .map_err(|e| format!("parse hub.port: {}", e))
+    vct_launcher_core::services::hub_port::read_hub_port_file()
 }
 
+/// The hub bearer, re-read per call (core `read_nonempty_token_file`).
 fn hub_token_for_proxy() -> Result<String, String> {
-    let path = crate::paths::vct_root_dir().join("hub.token");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("read hub.token: {}", e))?;
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(format!("hub.token at {} is empty", path.display()));
-    }
-    Ok(trimmed.to_string())
+    vct_launcher_core::services::boot_token::read_nonempty_token_file(
+        &crate::paths::vct_root_dir().join("hub.token"),
+    )
 }
 
 /// Proxy for `GET /projects/{project_id}/modules/{module_id}/status`.
@@ -1342,10 +1457,7 @@ fn hub_token_for_proxy() -> Result<String, String> {
 async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bool, String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(5))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/status",
         port, project_id, module_id
@@ -1376,10 +1488,7 @@ async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bo
 async fn hub_proxy_module_stop(project_id: &str, module_id: &str) -> Result<(), String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(30))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/stop",
         port, project_id, module_id
@@ -1419,10 +1528,7 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     // loaded machine without making a genuinely-down hub hang the caller.
     const ATTEMPTS: u32 = 10;
     const DELAY_MS: u64 = 300;
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(2))?;
     // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
     // is restarting (update flow / crash-restart) it may bind a different port
     // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
@@ -1462,13 +1568,10 @@ async fn wait_for_hub_ready() -> Result<(), String> {
 async fn hub_proxy_global_module_start(module_id: &str) -> Result<String, String> {
     let port = hub_port_for_proxy()?;
     let token = hub_token_for_proxy()?;
-    let client = reqwest::Client::builder()
-        // Generous timeout: the hub-side start does an (optionally authed)
-        // image pre-pull + `podman run` before responding, matching the
-        // 60s ceiling the old launcher-side direct spawn used.
-        .timeout(Duration::from_secs(90))
-        .build()
-        .map_err(|e| format!("http client: {}", e))?;
+    // Generous timeout: the hub-side start does an (optionally authed)
+    // image pre-pull + `podman run` before responding, matching the
+    // 60s ceiling the old launcher-side direct spawn used.
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(90))?;
     let url = format!(
         "http://127.0.0.1:{}/api/v1/modules/{}/start",
         port, module_id
@@ -1740,10 +1843,7 @@ pub async fn signal_rotate_weights(
     project_id: &str,
 ) -> Result<(), String> {
     let url = format!("http://127.0.0.1:{}/rotate_weights", rl_port);
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(15))
-        .build()
-        .map_err(|e| format!("build http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(15))?;
 
     let resp = client
         .post(&url)
@@ -2007,10 +2107,7 @@ async fn run_finetune_then_rotate_async(
     let finetune_url = format!("http://127.0.0.1:{}/finetune", rl_port);
     let status_url = format!("http://127.0.0.1:{}/finetune_status", rl_port);
 
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(30))
-        .build()
-        .map_err(|e| format!("build http client: {}", e))?;
+    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(30))?;
 
     let project = db
         .get_project(&project_id)?
@@ -2464,10 +2561,7 @@ pub async fn get_rl_dashboard_state(
 /// failure. 2s timeout matches the existing per-call timeouts in this
 /// file (see `signal_rotate_weights`, `apply_weights_update`, etc.).
 async fn probe_state_summary(port: u16) -> (Option<u32>, Option<bool>) {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(2))
-        .build()
-    {
+    let client = match vct_launcher_core::services::loopback_http::client(std::time::Duration::from_secs(2)) {
         Ok(c) => c,
         Err(_) => return (None, None),
     };
@@ -2900,7 +2994,7 @@ where
                             }
                         };
                         let ctx = PlaceholderCtx::new(&module_id);
-                        match start_container_for_module(&manifest, &ctx, &project, rl_port).await
+                        match start_container_for_module(&manifest, &ctx, &project, rl_port, db).await
                         {
                             Ok(resolved_name) => {
                                 // V52-D: when the manifest's template
@@ -3559,6 +3653,8 @@ pub async fn retry_failed_module_installs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vct_launcher_core::services::container_runtime::build_podman_run_args;
+    use vct_launcher_core::services::container_runtime::SpawnArgs;
     use crate::db::models::ProjectHost;
     use crate::manifest::{
         Compatibility, ContainerInstallBlock, HealthCheck, InstallBlock, InstallMethod,
@@ -3566,6 +3662,69 @@ mod tests {
         VolumeMount,
     };
     use std::collections::HashMap;
+
+    /// R12-bis N4 wiring test (module_service spawn call-site): the
+    /// `podman run` child's env is EXACTLY the ONE child-env table's
+    /// present pairs plus this site's documented extras (the injected
+    /// secret env — empty here, so no extras) — nothing else. Runs the
+    /// REAL builder (`build_container_run_command`) and inspects the
+    /// resulting `Command`'s envs via `get_envs()`, so reverting the
+    /// `child_env::reinject_tokio` call inside it to a hand-rolled key
+    /// list goes RED here instead of drifting silently. NOT a
+    /// source-text grep.
+    ///
+    /// Every table key is seeded in the parent env first, so an
+    /// omitting revert cannot hide behind "the key was absent anyway".
+    #[test]
+    fn container_run_child_env_is_exactly_the_child_env_table() {
+        let table_keys = ["PATH", "TEMP", "TMP", "TMPDIR", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "COMSPEC"];
+        let vars: Vec<(String, Option<String>)> = table_keys
+            .iter()
+            .map(|k| (k.to_string(), Some(format!("sentinel-{k}"))))
+            .chain(std::iter::once((
+                "KG_COLLECTION".to_string(),
+                Some("leaky-decoy".to_string()),
+            )))
+            .collect();
+        let vars: Vec<(&str, Option<&str>)> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+
+        vct_launcher_core::test_env::with_env_vars(&vars, || {
+            // No secrets → the child env is exactly the table.
+            let spawn = SpawnArgs::new(
+                vec!["run".into(), "--name".into(), "wire-test".into()],
+                vec![],
+            );
+            let cmd = build_container_run_command("/nonexistent/podman", &spawn);
+
+            let expected: std::collections::BTreeMap<String, String> =
+                vct_launcher_core::services::child_env::present_pairs()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+
+            let envs: std::collections::BTreeMap<String, String> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.expect("env_clear leaves no removed-key entries")
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                envs, expected,
+                "container-run child env must be EXACTLY the child_env \
+                 table's present pairs (+ injected secrets, empty here) — a \
+                 hand-rolled list at this site has drifted"
+            );
+            assert!(!envs.contains_key("KG_COLLECTION"));
+        });
+    }
 
     fn make_project() -> ProjectRow {
         ProjectRow {
@@ -3690,6 +3849,61 @@ mod tests {
         }
     }
 
+    // ─── restart ordering (R7b F1) ────────────────────────────────────
+
+    /// Records every container-CLI call instead of running it.
+    #[derive(Default)]
+    struct RecordingCli(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl ContainerCli for RecordingCli {
+        fn run_quiet<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [&'a str],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            let mut call = vec![program.to_string()];
+            call.extend(args.iter().map(|a| a.to_string()));
+            self.0.lock().unwrap().push(call);
+            Box::pin(async {})
+        }
+    }
+
+    /// A restart whose start is refused — a REQUIRED listed secret that is
+    /// not set — issues neither `stop` nor `rm`: the running container is
+    /// left alone, and the error names the secret.
+    #[tokio::test]
+    async fn a_refused_restart_stops_and_removes_nothing() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let mut manifest = make_manifest(true, true);
+        manifest.secrets = serde_json::from_value(serde_json::json!([
+            { "key": "RL_API_TOKEN", "scope": "per-project" }
+        ]))
+        .unwrap();
+        manifest.runtime.env_from_secrets = vec!["RL_API_TOKEN".into()];
+        let project = make_project();
+        let db = Db::open_in_memory().unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let cli = RecordingCli::default();
+
+        let err = restart_container_with(
+            &cli,
+            "podman".into(),
+            &manifest,
+            &ctx,
+            &project,
+            "vct-rl-reranker-acme-corp",
+            11533,
+            None,
+            &db,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("RL_API_TOKEN"), "{err}");
+        assert!(cli.0.lock().unwrap().is_empty(), "calls: {:?}", cli.0.lock().unwrap());
+    }
+
     // ─── resolve_container_name ──────────────────────────────────────
 
     #[test]
@@ -3783,6 +3997,18 @@ mod tests {
         // both flow through to the argv unaltered. The RL container reads
         // ACTIVE_EMBEDDING at startup from its env; the launcher's job is
         // just to pass it.
+        // `{ollama_port}` is the machine's Ollama row (v0.2.97) — seeded
+        // here, so the answer is this test's, not the developer's machine's.
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        crate::db::Db::open()
+            .unwrap()
+            .service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+                "ollama",
+                vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+                "localhost",
+                21435,
+            ))
+            .unwrap();
         let manifest = make_manifest(true, true);
         let project = make_project();
         let ctx = PlaceholderCtx::new(&manifest.id);
@@ -3798,7 +4024,7 @@ mod tests {
         // env_derived OLLAMA_URL with {ollama_port} substituted.
         assert!(
             args.iter()
-                .any(|a| a == "OLLAMA_URL=http://host.containers.internal:11435"),
+                .any(|a| a == "OLLAMA_URL=http://host.containers.internal:21435"),
             "expected env_derived OLLAMA_URL with resolved {{ollama_port}} in {:?}",
             args
         );

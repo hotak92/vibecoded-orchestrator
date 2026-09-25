@@ -457,6 +457,7 @@ mod tests {
     #[test]
     fn footprint_env_override_and_fallback() {
         let _g = GATE_TEST_LOCK.lock().unwrap();
+        let _env_lock = vct_launcher_core::test_env::env_lock();
         // Explicit override honoured.
         std::env::set_var("VCT_EMBED_MODEL_FOOTPRINT_MB", "2048");
         assert_eq!(model_footprint_mb(), 2048);

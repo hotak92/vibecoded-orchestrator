@@ -5,7 +5,7 @@ short_desc: implement backend APIs and database operations
 keywords: ["REST API", microservice, ORM, "SQL migration", "auth middleware", FastAPI, SQLAlchemy, "API authentication", Django, Flask, Express, "Node.js backend", "business logic"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 skills:
   - api-designer

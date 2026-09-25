@@ -2793,12 +2793,16 @@
       <h2 class="pr-section-title">Module defaults (host-wide)</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Toggle which modules are on by default</strong>
+          <strong>Toggle which modules are on by default, and edit module settings</strong>
           <span class="pr-onboarding-hint">
             Controls the host-wide default enable state for global-scope modules
             (e.g. RL Reranker). Per-project overrides — set from each project's
             Modules panel — always take precedence. New installs ship with the
-            RL Reranker disabled until enough training data accumulates.
+            RL Reranker disabled until enough training data accumulates. The same
+            page edits the settings that bundled and installed modules declare,
+            both machine-wide ones such as the hub's port and per-project ones such
+            as the CONTEXT_STATE.md size warning. It also shows the current value of
+            settings that are edited somewhere else.
           </span>
         </div>
         <button class="pr-btn" onclick={() => goto('/preferences/modules')}>

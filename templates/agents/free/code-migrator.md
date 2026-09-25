@@ -5,7 +5,7 @@ short_desc: migrate code across languages or framework versions
 keywords: ["migrate code", "framework upgrade", "breaking changes", "strangler pattern", "legacy code", codemod, "port to", "upgrade framework", "language migration"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
-effort: high
+effort: medium
 isolation: worktree
 skills:
   - architecture-consultant

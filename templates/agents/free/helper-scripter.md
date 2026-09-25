@@ -5,7 +5,7 @@ short_desc: creates agents, skills, hooks, and automation scripts
 keywords: ["bash script", "shell script", "automation script", "helper script", "create a script", "write a hook", "create agent", "create skill", "slash command", "Claude Code hook"]
 tools: Read, Write, Edit, Grep, Glob, Bash
 model: haiku
-effort: high
+effort: medium
 isolation: worktree
 ---
 

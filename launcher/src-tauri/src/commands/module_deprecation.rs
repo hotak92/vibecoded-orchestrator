@@ -246,7 +246,7 @@ pub fn apply_deprecation_state_impl(
             Vec::new()
         };
 
-        match write_or_strip_deprecation_env(folder_path, &pairs) {
+        match write_or_strip_deprecation_env(db, folder_path, &pairs) {
             Ok(()) => {
                 result.env_written = true;
             }
@@ -263,83 +263,42 @@ pub fn apply_deprecation_state_impl(
 
 /// Surgical writer for the four `VCT_RL_MODULE_*` keys in
 /// `<folder>/.claude/settings.json` `env`. Out-of-band of the canonical
-/// `write_project_env_files` pipeline (see module docstring rationale).
+/// env projection (see module docstring rationale).
 ///
 /// Behaviour:
-///   * `pairs` non-empty → insert/overwrite the keys, leave all other env
-///     keys verbatim.
+///   * `pairs` non-empty → insert/overwrite the keys, remove the
+///     [`DEPRECATION_ENV_KEYS`] not in `pairs`, leave all other env keys
+///     verbatim.
 ///   * `pairs` empty → remove all four [`DEPRECATION_ENV_KEYS`] from the
 ///     env block; non-deprecation keys survive.
+///
+/// v0.2.97: the read-merge-write is the ONE Python implementation
+/// (`vco_lib.config_projection write-env-block`, via
+/// [`crate::services::vco_lib_bridge::write_settings_env_block`]). The Rust
+/// copy that lived here replaced an unparseable settings.json with `{}` plus
+/// these keys — on the 24 h poll, unattended, for every project with an
+/// installed module. A file that cannot be read as an object is now left
+/// byte-identical and the refusal comes back as `Err` (and as a
+/// `settings_write_refused_claude_settings_json` deferral in the project).
 ///
 /// The `.claude/env` shell file is intentionally NOT touched — Claude-side
 /// consumers read `.claude/settings.json env` (the canonical channel per
 /// CLAUDE.md). The shell file is for the user's manual `source` flows and
 /// they wouldn't reach the rerank path anyway.
 fn write_or_strip_deprecation_env(
+    db: &Db,
     folder: &Path,
     pairs: &[(&str, String)],
 ) -> Result<(), String> {
-    let claude_dir = folder.join(".claude");
-    std::fs::create_dir_all(&claude_dir)
-        .map_err(|e| format!("mkdir {}: {}", claude_dir.display(), e))?;
-    let settings_path = claude_dir.join("settings.json");
-
-    let mut root: serde_json::Value = if settings_path.exists() {
-        match std::fs::read_to_string(&settings_path) {
-            Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
-                tracing::warn!(
-                    "[vct] warning: {} is not valid JSON ({}); replacing with minimal env block",
-                    settings_path.display(),
-                    e
-                );
-                serde_json::json!({})
-            }),
-            Err(e) => {
-                tracing::warn!(
-                    "[vct] warning: could not read {} ({}); creating fresh",
-                    settings_path.display(),
-                    e
-                );
-                serde_json::json!({})
-            }
-        }
-    } else {
-        serde_json::json!({})
-    };
-    if !root.is_object() {
-        root = serde_json::json!({});
-    }
-
-    if let Some(obj) = root.as_object_mut() {
-        let mut env_obj = obj
-            .get("env")
-            .filter(|v| v.is_object())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
-
-        // Strip our managed keys first so a deprecated=false call truly
-        // removes them, and a deprecated=true call removes any stale
-        // value before the canonical overwrite below.
-        //
-        // `shift_remove`, never `remove`: under `preserve_order` (v0.2.92)
-        // `Map::remove` is `swap_remove`, which would pull the user's LAST
-        // env key into the slot of each key we strip. This block rewrites a
-        // user-owned `.claude/settings.json`; it must not move their keys.
-        for k in DEPRECATION_ENV_KEYS {
-            env_obj.shift_remove(*k);
-        }
-        for (k, v) in pairs {
-            env_obj.insert((*k).to_string(), serde_json::Value::String(v.clone()));
-        }
-
-        obj.insert("env".to_string(), serde_json::Value::Object(env_obj));
-    }
-
-    let pretty = serde_json::to_string_pretty(&root)
-        .map_err(|e| format!("serialize .claude/settings.json: {}", e))?;
-    std::fs::write(&settings_path, pretty)
-        .map_err(|e| format!("write {}: {}", settings_path.display(), e))?;
-    Ok(())
+    let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db);
+    crate::services::vco_lib_bridge::write_settings_env_block(
+        root.as_deref(),
+        folder,
+        "claude_settings_json",
+        pairs,
+        DEPRECATION_ENV_KEYS,
+    )
+    .map(|_| ())
 }
 
 /// Tauri command surface for [`apply_deprecation_state_impl`]. Callers
@@ -839,6 +798,46 @@ mod tests {
         );
         // Non-env top-level keys untouched.
         assert!(parsed.get("hooks").is_some());
+    }
+
+    /// v0.2.97 leave-alone: an unparseable `.claude/settings.json` is NOT
+    /// rewritten. Pre-fix the Rust writer here replaced it with `{}` plus the
+    /// deprecation keys — every hook and permission gone, on the 24 h poll,
+    /// with only a log line. Now the ONE Python writer refuses, the file is
+    /// byte-identical, the refusal is a warning on the result, and the
+    /// project's deferral ledger names the file.
+    #[test]
+    fn apply_refuses_an_unparseable_settings_json_and_leaves_it_untouched() {
+        let (db, pid, tmp) = open_db_with_project();
+        let claude_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&claude_dir).unwrap();
+        let original = r#"{"hooks": {"SessionStart": []},, "permissions": {"allow": ["Bash"]}}"#;
+        std::fs::write(claude_dir.join("settings.json"), original).unwrap();
+
+        let res = apply_deprecation_state_impl(
+            &db,
+            &pid,
+            "vct-rl-reranker",
+            true,
+            Some("m"),
+            None,
+            None,
+        );
+
+        assert!(!res.env_written, "a refused write is not a written env");
+        assert!(
+            res.warnings.iter().any(|w| w.contains("NOT updated")),
+            "the refusal must surface as a warning: {:?}",
+            res.warnings
+        );
+        assert_eq!(
+            std::fs::read_to_string(claude_dir.join("settings.json")).unwrap(),
+            original,
+            "byte-identical"
+        );
+        let ledger = std::fs::read_to_string(tmp.path().join(".claude/context/UPDATE_DEFERRED.json"))
+            .expect("the refusal is recorded in the project's deferral ledger");
+        assert!(ledger.contains("settings_write_refused_claude_settings_json"));
     }
 
     #[test]

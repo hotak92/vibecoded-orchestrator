@@ -214,7 +214,7 @@ describe('describeMode', () => {
   it('lights NO pill for an unparseable file and guesses nothing', () => {
     const d = describeMode('unparseable');
     expect(d.active).toBeNull();
-    expect(d.tooltip).toContain('not strict JSON');
+    expect(d.tooltip).toContain('not valid JSON or JSONC');
   });
 
   it('is neutral before the first load', () => {
@@ -276,9 +276,9 @@ describe('modeSwitchDisabledReason', () => {
   it('disables both pills for an unparseable file rather than letting the writer refuse', () => {
     const s = makeStatus({ token_present: true });
     const r = makeReport({ mode: 'unparseable' });
-    expect(modeSwitchDisabledReason('multimodel', s, [TARGET], r)).toContain('not strict JSON');
+    expect(modeSwitchDisabledReason('multimodel', s, [TARGET], r)).toContain('not valid JSON or JSONC');
     expect(modeSwitchDisabledReason('remote-control', s, [TARGET], r)).toContain(
-      'not strict JSON',
+      'not valid JSON or JSONC',
     );
   });
 

@@ -7,11 +7,21 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Ensure the code embedding service container is running.
 # Mirror of ensure-code-embed-service.sh. No flock on Windows; we use a
 # best-effort lockfile (sentinel) instead.
+#
+# Optional service: whether compose may create the code_embed container is
+# decided by the launcher.db `service_endpoints` plan (v0.2.97) - the
+# launcher's Services page or `python -m vco_lib.service_endpoints show` /
+# `plan --json` - never by editing a compose file (it ships active in
+# infrastructure/docker-compose.yml). When the plan does not list code_embed
+# as a VCO-managed, enabled service, this hook silently no-ops (a CPU host
+# falls back to Ollama for code embeddings). The probe PORT likewise comes
+# from the plan (`services.code_embed.port`), never from env
+# `CODE_EMBED_PORT` - a retired input; env `*_PORT` values are projected
+# outputs only.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/compose-invocation.ps1"
 
-$Port = if ($env:CODE_EMBED_PORT) { $env:CODE_EMBED_PORT } else { "11440" }
 $ContainerName = if ($env:VCT_CODE_EMBED_CONTAINER) { $env:VCT_CODE_EMBED_CONTAINER } else { "code_embed" }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $LockFile = Join-Path $Tmp "code_embed_service.lock"
@@ -55,6 +65,38 @@ if (-not $RunPy) {
     Write-Output "ensure-code-embed-service: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
     exit 0
 }
+
+# v0.2.97 (parity with the .sh sibling): the probe PORT comes from the
+# launcher.db service_endpoints plan (`services.code_embed.port`), never
+# from env `CODE_EMBED_PORT` - a retired input; env `*_PORT` values are
+# projected outputs only and `vco doctor` treats retired inputs as retired.
+# ONE plan read serves both the port and the compose gate in
+# Get-CodeEmbedUpArgs below. R9 H3 (parity with the .sh sibling): when the
+# plan CANNOT be read, this hook takes NO state-changing action - a
+# guess-port probe that finds 11440 closed on a container that was
+# deliberately moved to another port used to RESTART a healthy service
+# every session the plan was unreadable. One line, exit 0. 11440 stays only
+# the default for a plan that READS but carries no code_embed row - never
+# to env.
+$Port = 11440
+$SePlan = $null
+$PlanRaw = ""
+$PlanRc = 1
+try {
+    $PlanRaw = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String)
+    $PlanRc = $LASTEXITCODE
+} catch { $PlanRc = 1 }
+if ($PlanRc -ne 0 -or -not $PlanRaw.Trim()) {
+    Write-Output "[code_embed] service_endpoints plan unreadable; nothing probed, started or restarted this session"
+    exit 0
+}
+try { $SePlan = $PlanRaw | ConvertFrom-Json } catch {
+    Write-Output "[code_embed] service_endpoints plan unreadable; nothing probed, started or restarted this session"
+    exit 0
+}
+if ($SePlan -and $SePlan.services.code_embed.port) {
+    $Port = [int]$SePlan.services.code_embed.port
+}
 $VcoRt = $null
 $VcoRtRc = $null
 # Capture the resolver's stderr instead of discarding it (v0.2.92 MAJOR-6):
@@ -67,6 +109,8 @@ try {
     $VcoRtRc = $LASTEXITCODE
     if ($VcoRtRc -in 0, 3, 4) { $VcoRt = ($VcoRtJson | Out-String) | ConvertFrom-Json }
 } catch { $VcoRt = $null }
+# A runtime found in the usual install locations but not on this PATH: run it by name.
+if ($VcoRt -and $VcoRt.search_path) { $env:PATH = [string]$VcoRt.search_path }
 if (-not $VcoRt) {
     $VcoRtWhy = ""
     if (Test-Path $VcoRtErr) { $VcoRtWhy = ((Get-Content $VcoRtErr -Tail 3) -join " ").Trim() }
@@ -148,7 +192,32 @@ try {
         exit 0
     }
 
+    # v0.2.97 (plan invariant I1, parity with the .sh sibling): compose may
+    # create code_embed only while the launcher.db service_endpoints plan
+    # lists it as VCO-managed and enabled, and only with the argv
+    # `vco_lib.service_lifecycle compose-args` builds (`--no-deps`: its
+    # `depends_on: ollama` must never create an Ollama next to an ADOPTED
+    # one; plus the gpu profile it lives in). $null = compose must not run.
+    function Get-CodeEmbedUpArgs {
+        param([bool]$Build)
+        # The plan itself was already read once above (one read, two
+        # consumers); its compose_services list is the gate.
+        if (-not $SePlan -or (@($SePlan.compose_services) -notcontains 'code_embed')) { return $null }
+        $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'compose-args', '--json', '--services', 'code_embed')
+        if ($Build) { $pyArgs += '--build' }
+        try {
+            $parsed = (& $RunPy @pyArgs 2>$null | Out-String) | ConvertFrom-Json
+            if ($LASTEXITCODE -ne 0) { return $null }
+            return ,@($parsed.args)
+        } catch { return $null }
+    }
+
     if ($ComposeCmd -and (Test-Path $ComposeDir)) {
+        $upArgs = Get-CodeEmbedUpArgs -Build $true
+        if (-not $upArgs -or $upArgs.Count -eq 0) {
+            Write-Output "[code_embed] not created: launcher.db service_endpoints does not list code_embed as a VCO-managed, enabled service (see ``python -m vco_lib.service_endpoints show``)"
+            exit 0
+        }
         Write-Output "[code_embed] Starting code embedding service via $ComposeCmd..."
         Push-Location $ComposeDir
         try {
@@ -160,7 +229,7 @@ try {
             $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
             $cmdHead = $composeInvocation.Head
             $cmdRest = @($composeInvocation.Rest)
-            $output = & $cmdHead @cmdRest up -d --build code_embed 2>&1
+            $output = & $cmdHead @cmdRest @upArgs 2>&1
             $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
         } finally { Pop-Location }
         # The runtime, not an exit code, decides whether the retry is needed.
@@ -175,11 +244,14 @@ try {
             # stays stale, which Report-VcoCodeEmbedStaleness and `vco doctor`
             # both surface.
             Write-Output "[code_embed] compose up --build did not create the container - retrying without --build"
-            Push-Location $ComposeDir
-            try {
-                $output = & $cmdHead @cmdRest up -d code_embed 2>&1
-                $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
-            } finally { Pop-Location }
+            $plainArgs = Get-CodeEmbedUpArgs -Build $false
+            if ($plainArgs -and $plainArgs.Count -gt 0) {
+                Push-Location $ComposeDir
+                try {
+                    $output = & $cmdHead @cmdRest @plainArgs 2>&1
+                    $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
+                } finally { Pop-Location }
+            }
             Write-Output "[code_embed] NOTE: the image was NOT rebuilt from source; run 'python install.py --update' from the orchestrator root to refresh it."
         }
         Write-Output "[code_embed] Started container $ContainerName on port $Port"

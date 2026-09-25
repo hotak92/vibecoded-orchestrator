@@ -26,14 +26,6 @@ use tauri::{
 use crate::commands::self_update::{self, UpdateStatus};
 use crate::db::Db;
 
-/// Default ports for the shared services. Mirror
-/// `commands::installer::DEFAULT_*_PORT` — kept inline here to avoid
-/// exposing the constants publicly. If install.py changes a port, both
-/// sides must follow.
-const WEAVIATE_PORT: u16 = 8081;
-const OLLAMA_PORT: u16 = 11435;
-const CODE_EMBED_PORT: u16 = 11440;
-
 /// Per-probe timeout for the tray refresh loop. The wizard probes use 2s
 /// because they only fire once during onboarding; the tray fires every
 /// 5s and must not stall on a slow service.
@@ -349,15 +341,11 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     // the runtime shuts down at app exit.
     let label_for_task = services_label.clone();
     tauri::async_runtime::spawn(async move {
-        // Snapshot the very first probe to decide whether services
-        // already existed before the launcher had a chance to start
-        // anything. If yes → "managed externally". The launcher does
-        // not currently track who started a given container, so this
-        // is the cleanest signal we have without parsing podman labels.
+        // "Managed externally" is what the `service_endpoints` rows say
+        // (v0.2.97) — re-read every tick, so an adoption made on the
+        // Services page shows without a restart.
         let initial = probe_services().await;
-        let externally_managed = initial.running_count() == initial.total();
-
-        let _ = label_for_task.set_text(format_label(&initial, externally_managed));
+        let _ = label_for_task.set_text(format_label(&initial, tray_all_externally_managed()));
 
         let mut ticker = tokio::time::interval(REFRESH_INTERVAL);
         // First tick fires immediately by default — burn it so we wait a
@@ -366,7 +354,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         loop {
             ticker.tick().await;
             let snapshot = probe_services().await;
-            let _ = label_for_task.set_text(format_label(&snapshot, externally_managed));
+            let _ = label_for_task.set_text(format_label(&snapshot, tray_all_externally_managed()));
         }
     });
 
@@ -428,27 +416,42 @@ impl ServiceSnapshot {
     }
 }
 
-/// Fast HTTP probe: short-timeout GET, treats 2xx/3xx as up. Returns
-/// `false` on timeout, connection refused, DNS error, etc.
+/// Fast HTTP probe: short-timeout GET, a 2xx is up; a redirect is never
+/// followed (`vct_launcher_core::services::probe_http`). Returns `false` on timeout, connection refused, DNS
+/// error, etc.
 async fn probe_one(url: &str) -> bool {
-    let client = match reqwest::Client::builder().timeout(PROBE_TIMEOUT).build() {
+    let client = match vct_launcher_core::services::loopback_http::client_for(url, PROBE_TIMEOUT) {
         Ok(c) => c,
         Err(_) => return false,
     };
-    matches!(client.get(url).send().await, Ok(r) if r.status().as_u16() < 400)
+    matches!(client.get(url).send().await, Ok(r) if vct_launcher_core::services::probe_http::answered(r.status()))
+}
+
+/// The tray's probe URLs: each service's health URL at its launcher.db
+/// `service_endpoints` row — host AND port (v0.2.97; an adopted Ollama on
+/// another machine is probed there, not on a local port).
+fn tray_probe_urls() -> (String, String, String) {
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
+    use vct_launcher_core::services::service_status::health_url;
+    let url = |s: CoreService| health_url(s, machine_row_from_disk(s).as_ref());
+    (url(CoreService::Weaviate), url(CoreService::Ollama), url(CoreService::CodeEmbed))
+}
+
+/// "Services: managed externally" — true when NO core service is VCO's own
+/// (every row adopted). From the rows, not from "everything was already up
+/// when the tray started", which is what this used to infer.
+fn tray_all_externally_managed() -> bool {
+    use vct_launcher_core::db::service_endpoints::EndpointMode;
+    use vct_launcher_core::services::service_endpoints::{machine_rows_from_disk, mode_of};
+    machine_rows_from_disk()
+        .iter()
+        .all(|(_, row)| mode_of(row.as_ref()) != EndpointMode::VcoManaged)
 }
 
 /// Probe all shared services concurrently. Wall time bounded by
 /// `PROBE_TIMEOUT`, not the sum.
 async fn probe_services() -> ServiceSnapshot {
-    // /v1/meta is more reliable than /v1/.well-known/ready for "is
-    // Weaviate usable?" — see commands/lifecycle.rs::canonical_services.
-    let weaviate_url = format!(
-        "http://localhost:{}/v1/meta",
-        WEAVIATE_PORT
-    );
-    let ollama_url = format!("http://localhost:{}/api/tags", OLLAMA_PORT);
-    let code_embed_url = format!("http://localhost:{}/health", CODE_EMBED_PORT);
+    let (weaviate_url, ollama_url, code_embed_url) = tray_probe_urls();
 
     let (w, o, c) = tokio::join!(
         probe_one(&weaviate_url),
@@ -519,6 +522,27 @@ fn format_update_label(status: &UpdateStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tray_probe_urls_follow_the_machine_chain() {
+        // v0.2.97: the machine's `service_endpoints` row reaches the tray's
+        // probe URLs (the compiled-in ports it replaced could not).
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let (w, _o, _c) = tray_probe_urls();
+        // No row on a harness state dir: the unroutable sentinel.
+        assert_eq!(w, "http://127.0.0.1:9/v1/meta");
+        let db = crate::db::Db::open().unwrap();
+        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "weaviate",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            18081,
+        );
+        row.grpc_port = Some(50052);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        let (w, _o, _c) = tray_probe_urls();
+        assert_eq!(w, "http://localhost:18081/v1/meta");
+    }
 
     fn snap(states: &[(&'static str, bool)]) -> ServiceSnapshot {
         ServiceSnapshot {

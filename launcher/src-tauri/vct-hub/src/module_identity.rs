@@ -17,7 +17,9 @@
 //
 // Option H (the chosen design): separate IDENTITY from SCOPE.
 //   * IDENTITY — a per-MODULE bearer minted HERE at container spawn, held
-//     in-memory, injected as `-e VCT_MODULE_TOKEN=…`. Proves "I am module
+//     in-memory, injected as a bare `-e VCT_MODULE_TOKEN` with the value in
+//     the `podman`/`docker` process's env only (v0.2.97 R7b F19 — until then
+//     it was `-e VCT_MODULE_TOKEN=…` on the argv). Proves "I am module
 //     X". Never persisted (no keychain, no DB) — mirrors `hub.token`
 //     (CSPRNG, per-process, not user-managed).
 //   * SCOPE — the per-request `{project_id}` in the URL path, authorized

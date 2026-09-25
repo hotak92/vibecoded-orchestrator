@@ -35,10 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::services::runtime::{
-    detect_runtime, invalidate_cache as invalidate_runtime_cache, pinned_runtime, probe_runtime,
-    runtime_on_path,
-};
+use vct_launcher_core::services::runtime_verdict::{self, RuntimeVerdict};
 
 /// Result of the install-pipeline preflight check.
 ///
@@ -65,12 +62,16 @@ pub struct RuntimeAvailability {
     /// unknown platforms or when a runtime IS already available (no link
     /// needed in the success case).
     pub install_url: Option<String>,
-    /// `VCT_CONTAINER_RUNTIME`, when it names a runtime (`auto` / empty /
-    /// unrecognised → `None`). v0.2.92 BLOCKER-4: a pin is honoured or
-    /// REFUSED, never swapped for the other runtime — podman and docker have
-    /// per-runtime named volumes, so driving the other one would bring the
-    /// stack up on an empty data plane.
+    /// The pinned runtime — `VCT_CONTAINER_RUNTIME` when it names one, else
+    /// the install's `state/install/runtime.txt` record (R7b F5). v0.2.92
+    /// BLOCKER-4: a pin is honoured or REFUSED, never swapped for the other
+    /// runtime — podman and docker have per-runtime named volumes, so
+    /// driving the other one would bring the stack up on an empty data plane.
     pub pinned: Option<String>,
+    /// WHERE the pin came from, so the modal names the knob to turn:
+    /// `"VCT_CONTAINER_RUNTIME"`, or the ABSOLUTE path of the runtime.txt
+    /// record. `None` when nothing is pinned.
+    pub pinned_via: Option<String>,
     /// True when a pin is set and nothing resolved — i.e. the runtime the
     /// user pinned is the one that is unusable. Lets the modal say "podman is
     /// pinned but unusable" instead of the false "no container runtime is
@@ -83,6 +84,13 @@ pub struct RuntimeAvailability {
     /// not — the user's repin target. The launcher does NOT switch to it on
     /// its own, for the same volume reason.
     pub alternative_usable: Option<String>,
+    /// Why the install's STALE runtime record was not switched to the other
+    /// runtime (v0.2.97 R11 L6) — the shared table's wording
+    /// (`vco_lib/runtime_reconcile_messages.toml`), the same reason every
+    /// other surface gives. `None` unless the pin is refused AND the
+    /// stale-record reconcile declined.
+    #[serde(default)]
+    pub not_switched: Option<String>,
 }
 
 /// Resolve the canonical install URL for the current OS. Mirrors the
@@ -137,56 +145,78 @@ fn current_platform() -> String {
 /// detection here also unblocks the cached value for the rest of the
 /// session.
 ///
-/// Never returns `Err`: the function's contract is "tell the frontend
-/// what's on PATH right now". Even on probe failure we return
-/// `available: false` so the frontend renders the install-instructions
-/// modal; we don't surface internal probe errors as command-level Err
-/// because that would route through the FE's generic error toast and
-/// hide the structured `RuntimeAvailability` shape that drives the
-/// modal's branches.
+/// Returns `Err` in exactly ONE case (v0.2.97 R12 loud-fail): the ONE
+/// verdict itself could not run — a missing or broken Python is a broken
+/// install and is surfaced, never papered over with `available: false`.
+/// Every runtime-state answer (refused pin, nothing installed, no
+/// compose) is the structured `RuntimeAvailability` shape that drives
+/// the modal's branches.
 #[tauri::command]
 pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, String> {
     // Always re-probe — the user may have installed/uninstalled a
-    // runtime since the launcher booted. The cache exists to avoid
-    // re-probing on hot paths (services watcher polls every few
-    // seconds); for an explicit user-driven preflight, freshness wins
-    // over the ~50ms probe cost.
-    invalidate_runtime_cache();
+    // runtime since the launcher booted. Both the session detection
+    // cache and the ONE verdict cache are dropped, and the surfaces that
+    // share the verdict cache (boot, hub watchdog) re-probe with the
+    // fresh answer too.
+    crate::services::runtime::invalidate_cache();
+    runtime_verdict::invalidate();
 
-    let info = detect_runtime().await;
-    let platform = current_platform();
-    let install_url = if info.is_none() {
-        install_url_for(&platform)
-    } else {
-        None
-    };
+    // v0.2.97 R12: the modal's every field is a rendering of the ONE
+    // Python verdict (`vco_lib.runtime_reconcile decide --json`) —
+    // pinned / pinned_installed / alternative_usable / not_switched
+    // come from the verdict instead of re-derived by Rust probes.
+    let root = vct_launcher_core::orchestrator_manifest::orchestrator_install_root();
+    let verdict = runtime_verdict::decide(
+        root.as_deref(),
+        runtime_verdict::Mode::ReadOnly,
+        runtime_verdict::Purpose::Infra,
+    )
+    .await?;
 
-    // v0.2.92 BLOCKER-4: `detect_runtime` is strict about a pin, so `None`
-    // under a pin means "the runtime you pinned is unusable" — NOT "no
-    // container runtime is installed". Those are different sentences and
-    // different user actions, and the modal could not tell them apart.
-    let pinned = if info.is_none() { pinned_runtime() } else { None };
-    let pinned_installed = pinned.map(runtime_on_path).unwrap_or(false);
-    let alternative_usable = match pinned {
-        // Probe the runtime the user did NOT pin, so the modal can name the
-        // repin target. Only reached on the failure path, so no cost to the
-        // happy one.
-        Some(p) => probe_runtime(p.other())
-            .await
-            .map(|i| i.runtime.binary().to_string()),
-        None => None,
-    };
+    Ok(availability(&verdict, current_platform()))
+}
 
-    Ok(RuntimeAvailability {
-        available: info.is_some(),
-        detected: info.map(|i| i.runtime.binary().to_string()),
+/// The modal's shape from the ONE verdict — pure, so every branch is
+/// testable without a runtime (or a Python) on the machine. A resolved
+/// verdict with compose is "available"; everything else renders the pin
+/// fields from the verdict (`requested`, `requested_via`,
+/// `requested_installed`, `alternative_usable`) and the stale-record
+/// reason (`not_switched`) — Python's wording, verbatim (M3).
+fn availability(verdict: &RuntimeVerdict, platform: String) -> RuntimeAvailability {
+    let available = verdict.resolved
+        && verdict.runtime.is_some()
+        && verdict.compose_form.is_some();
+    let detected = if available { verdict.runtime.clone() } else { None };
+    let install_url = if available { None } else { install_url_for(&platform) };
+    let pinned = if available { None } else { verdict.requested.clone() };
+    let pinned_via = pinned.as_ref().map(|_| pin_source_label(&verdict.requested_via));
+    RuntimeAvailability {
+        available,
+        detected,
         platform,
         install_url,
-        pinned: pinned.map(|p| p.binary().to_string()),
         pinned_unusable: pinned.is_some(),
-        pinned_installed,
-        alternative_usable,
-    })
+        pinned,
+        pinned_via,
+        pinned_installed: verdict.requested_installed,
+        alternative_usable: verdict.alternative_usable.clone(),
+        not_switched: if available { None } else { verdict.not_switched.clone() },
+    }
+}
+
+/// What the modal shows as the pin's origin: the env var's name, or the
+/// ABSOLUTE path of the runtime.txt record (the file the user would
+/// edit) — mapped from the verdict's `requested_via` (`env` /
+/// `record` / `confirmed`).
+fn pin_source_label(requested_via: &str) -> String {
+    match requested_via {
+        "env" => "VCT_CONTAINER_RUNTIME".to_string(),
+        _ => vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
+            .map(|root| {
+                root.join("state").join("install").join("runtime.txt").display().to_string()
+            })
+            .unwrap_or_else(|| "state/install/runtime.txt".to_string()),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -195,6 +225,76 @@ pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R11 L6 / R12 M3: the stale-record reason reaches the modal on the
+    /// refused-pin path — and only there — rendered from the VERDICT's
+    /// `not_switched` (Python's text; nothing is re-derived from PATH).
+    #[test]
+    fn the_modal_carries_why_the_stale_record_was_not_switched() {
+        let why = "docker is not installed; podman holds none of VCO's data";
+        let refused = refused_verdict(why);
+        let av = availability(&refused, "linux".into());
+        assert!(!av.available && av.pinned_unusable);
+        assert_eq!(av.pinned.as_deref(), Some("docker"));
+        assert_eq!(av.pinned_installed, false);
+        assert_eq!(av.alternative_usable.as_deref(), Some("podman"));
+        assert_eq!(av.not_switched.as_deref(), Some(why));
+        // The field serialises under the name the frontend reads.
+        let json = serde_json::to_value(&av).unwrap();
+        assert_eq!(json["not_switched"], serde_json::json!(why));
+        // No pin → nothing to explain; a resolved verdict → nothing either.
+        let mut unpinned = refused.clone();
+        unpinned.requested = None;
+        unpinned.requested_via = "auto".into();
+        unpinned.not_switched = None;
+        assert_eq!(availability(&unpinned, "linux".into()).not_switched, None);
+        let mut quiet = refused_verdict(why);
+        quiet.resolved = true;
+        quiet.refused = false;
+        quiet.refusal = None;
+        quiet.runtime = Some("podman".into());
+        quiet.compose_form = Some("subcommand".into());
+        quiet.requested = None;
+        quiet.requested_via = "auto".into();
+        let ok = availability(&quiet, "linux".into());
+        assert!(ok.available && ok.not_switched.is_none());
+    }
+
+    /// A refused-pin verdict shape for [`availability`] tests.
+    fn refused_verdict(why: &str) -> RuntimeVerdict {
+        RuntimeVerdict {
+            runtime: None,
+            state: "absent".into(),
+            resolved: false,
+            compose: None,
+            compose_form: None,
+            binary_path: None,
+            search_path: None,
+            installed: Some("podman".into()),
+            requested: Some("docker".into()),
+            requested_via: "record".into(),
+            requested_installed: false,
+            alternative_usable: Some("podman".into()),
+            record_reconciled: false,
+            outcome: "unusable".into(),
+            not_switched_key: Some("no_data".into()),
+            not_switched: Some(why.into()),
+            same_engine: false,
+            refused: true,
+            refusal: Some("refused (not switched)".into()),
+            reason: "why".into(),
+        }
+    }
+
+    #[test]
+    fn the_pin_source_names_the_env_var_or_the_record_file() {
+        assert_eq!(pin_source_label("env"), "VCT_CONTAINER_RUNTIME");
+        let record = pin_source_label("record");
+        assert!(
+            record.ends_with("runtime.txt"),
+            "the record label must name the file: {record}"
+        );
+    }
 
     #[test]
     fn install_url_known_platforms_resolve() {
@@ -249,64 +349,303 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn check_returns_sensible_shape_on_host() {
-        // The function's contract: never Err, always returns a
-        // RuntimeAvailability. On dev machines podman is usually on
-        // PATH (Linux user) → `available: true`. On CI with no
-        // runtime → `available: false` + `install_url: Some(...)`.
-        // We can't assert which branch we're in, but we CAN assert
-        // the shape is internally consistent.
-        let r = check_container_runtime_available()
-            .await
-            .expect("preflight never returns Err");
+    // ───────────────────────────────────────────────────────────────
+    // The command's REAL contract, pinned hermetically (R12-bis): Ok —
+    // with the shape the modal renders — on a healthy install, Err (the
+    // loud broken-install fail) when vco_lib cannot import. The test
+    // this replaces asserted "never Err", which stopped being the
+    // contract in v0.2.97 R12.
+    //
+    // Hermeticity: the command takes no install root — it walks
+    // `orchestrator_install_root()`, which under `cargo test` resolves
+    // to THIS checkout, whose `vco_lib` is what the decide child
+    // imports (child cwd == root; `python -m` puts cwd first on
+    // sys.path). So `storage_ux::fake_runtime_support::
+    // use_checkout_vco_lib` has nothing to add here — what the HOST
+    // could leak in is pinned instead: `$VCT_VENV` names the
+    // interpreter (the ladder's first tier, so the install-root tiers
+    // never run), the lookup PATH is a stub dir, the pin is cleared and
+    // the tool-search table emptied (the child can never probe the
+    // host's real podman/docker). The runtime caches are invalidated by
+    // the command itself.
+    // ───────────────────────────────────────────────────────────────
+    #[cfg(test)]
+    mod hermetic {
+        use super::*;
+        use std::path::{Path, PathBuf};
 
-        if r.available {
-            assert!(
-                r.detected.is_some(),
-                "available=true must come with a detected runtime name"
-            );
-            let name = r.detected.as_deref().unwrap();
-            assert!(
-                matches!(name, "podman" | "docker"),
-                "detected runtime must be podman or docker, got: {}",
-                name
-            );
-            assert!(
-                r.install_url.is_none(),
-                "install_url should be None when runtime is already available"
-            );
-        } else {
-            assert!(
-                r.detected.is_none(),
-                "available=false must have detected=None"
-            );
-            // install_url is Some on the three known platforms, None on
-            // 'unknown'. Either is fine — the frontend handles both.
+        /// A fake runtime binary on the stub lookup PATH. POSIX reuses the
+        /// shared `fake_runtime_support::fake_runtime` (shell grammar);
+        /// Windows gets a local `.cmd` twin answering the same probe
+        /// grammar the Python resolver drives (`version` / `--version` /
+        /// `info` / `compose version` → exit 0, everything else → 1).
+        /// These stubs were the only thing keeping this module unix-only
+        /// (R12-bis N4(b)): the Err/Ok contract itself is OS-neutral.
+        #[cfg(unix)]
+        fn fake_runtime(dir: &Path, name: &str) {
+            crate::commands::storage_ux::fake_runtime_support::fake_runtime(dir, name, &[]);
         }
 
-        // Platform is always one of the four known strings regardless
-        // of branch.
-        assert!(
-            matches!(r.platform.as_str(), "linux" | "macos" | "windows" | "unknown"),
-            "platform must be a known value, got: {}",
-            r.platform
-        );
+        #[cfg(windows)]
+        fn fake_runtime(dir: &Path, name: &str) {
+            // Found by the Python child's `shutil.which` via PATHEXT
+            // (.CMD is on the default PATHEXT); CreateProcess runs .cmd
+            // through cmd.exe, so `exit /b` codes propagate.
+            //
+            // Quoting (v0.2.97 follow-up): the stub's path may live
+            // under a %TEMP% containing spaces. Every spawner on the
+            // chain passes an ARG VECTOR, never a pre-built string —
+            // Rust std (>=1.77.2) applies the BatBadBut cmd.exe
+            // quoting rules when the program is a .bat/.cmd, and
+            // Python's list2cmdline quotes spaced paths — so the path
+            // itself arrives correctly quoted either way. The residual
+            // risk was INSIDE the script: `%1` KEEPS the caller's
+            // surrounding quotes, which would make `if "%1"=="info"`
+            // compare `"info"` against `info` and miss (stub answers 1
+            // → the Ok legs fail spuriously). `%~1`/`%~2` strip the
+            // surrounding quotes, so the probe grammar matches under
+            // either caller quoting. The script references no paths of
+            // its own — only these literals — so nothing else in it
+            // needs quoting.
+            let script = concat!(
+                "@echo off\r\n",
+                "if \"%~1 %~2\"==\"compose version\" exit /b 0\r\n",
+                "if \"%~1\"==\"info\" exit /b 0\r\n",
+                "if \"%~1\"==\"--version\" exit /b 0\r\n",
+                "if \"%~1\"==\"version\" exit /b 0\r\n",
+                "exit /b 1\r\n",
+            );
+            std::fs::write(dir.join(format!("{name}.cmd")), script).unwrap();
+        }
 
-        // v0.2.92 BLOCKER-4 invariants, whichever branch the host is in.
-        if r.available {
-            // A resolved runtime is never reported as a refused pin.
-            assert!(r.pinned.is_none() && !r.pinned_unusable);
+        /// A vco_lib-capable interpreter for the Ok legs: the resolver's
+        /// own ladder answer, else the OS's system interpreter. `None`
+        /// means this host cannot run the Ok contract at all — skip
+        /// rather than fail (the same discipline as `services::runtime`'s
+        /// on-host probes).
+        fn vco_lib_python() -> Option<PathBuf> {
+            if let Some(p) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() {
+                return Some(p);
+            }
+            #[cfg(unix)]
+            {
+                let system = PathBuf::from("/usr/bin/python3");
+                if system.is_file() {
+                    return Some(system);
+                }
+                vct_launcher_core::paths::which_on_path("python3")
+            }
+            #[cfg(windows)]
+            {
+                // `python` (PATH, e.g. the runner's toolchain) else the
+                // `py` launcher — both accept `-m` / `-c` unchanged.
+                vct_launcher_core::paths::which_on_path("python")
+                    .or_else(|| vct_launcher_core::paths::which_on_path("py"))
+            }
+        }
+
+        /// True when `py` can import `vco_lib.runtime_reconcile` with the
+        /// CHECKOUT as cwd — exactly what the decide child does.
+        fn imports_vco_lib(py: &Path) -> bool {
+            let checkout = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .ancestors()
+                .nth(2)
+                .expect("CARGO_MANIFEST_DIR reaches the checkout root");
+            std::process::Command::new(py)
+                .arg("-c")
+                .arg("import vco_lib.runtime_reconcile")
+                .current_dir(checkout)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        /// A `$VCT_VENV` that IS a broken interpreter: every invocation
+        /// prints vco_lib's can't-import error and exits 1 — the shape of
+        /// an install whose venv lost its vco_lib (loud-fail territory).
+        /// POSIX: a `#!/bin/sh` script; Windows: a `.cmd` twin (the
+        /// resolver accepts any existing file as the interpreter-binary
+        /// shape, and CreateProcess runs `.cmd` through cmd.exe, so the
+        /// stderr text and the exit code propagate to the decide child's
+        /// error surface). Quoting (v0.2.97 follow-up): the stub path
+        /// may live under a `%TEMP%` containing spaces — the decide
+        /// child spawns it via Rust std's arg-vector `Command::new(path)`
+        /// (tokio delegates to std), and std >=1.77.2 applies the
+        /// BatBadBut cmd.exe quoting rules for `.bat`/`.cmd` programs,
+        /// so a spaced path is quoted correctly and the script RUNS
+        /// rather than failing to spawn. The script body references no
+        /// paths — only literals — so it holds no further quoting
+        /// surface. $VCT_VENV carries the path as a plain env var (never
+        /// a command line), which needs no quoting.
+        #[cfg(unix)]
+        fn broken_python(dir: &Path) -> PathBuf {
+            use std::os::unix::fs::PermissionsExt;
+            let script = dir.join("python");
+            std::fs::write(
+                &script,
+                "#!/bin/sh\necho \"ModuleNotFoundError: No module named 'vco_lib'\" >&2\nexit 1\n",
+            )
+            .unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+
+        #[cfg(windows)]
+        fn broken_python(dir: &Path) -> PathBuf {
+            let script = dir.join("python.cmd");
+            std::fs::write(
+                &script,
+                "@echo off\r\necho ModuleNotFoundError: No module named 'vco_lib' 1>&2\r\nexit /b 1\r\n",
+            )
+            .unwrap();
+            script
+        }
+
+        /// Run the command under the pinned environment: `venv` as
+        /// `$VCT_VENV` (absolute interpreter path — the ladder's
+        /// interpreter-binary shape), `bin` as the only lookup PATH, pin
+        /// cleared, tool-search table emptied — on a current-thread
+        /// runtime, under the workspace env lock.
+        fn with_pinned_env<T>(
+            venv: &Path,
+            bin: &Path,
+            fut: impl std::future::Future<Output = T>,
+        ) -> T {
+            let venv = venv.display().to_string();
+            let mut out = None;
+            vct_launcher_core::test_env::with_env_vars(
+                &[
+                    ("VCT_VENV", Some(venv.as_str())),
+                    // The ladder must stop at $VCT_VENV — the host's
+                    // install-root vars never reach it.
+                    ("VCT_INSTALL_ROOT", None),
+                    ("VCT_ORCHESTRATOR_ROOT", None),
+                    ("VCT_CONTAINER_RUNTIME", None),
+                    // An empty value REPLACES the table.
+                    ("VCT_TOOL_SEARCH_DIRS", Some("")),
+                ],
+                || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    out = Some(vct_launcher_core::paths::with_lookup_path(
+                        Some(bin.as_os_str()),
+                        || rt.block_on(fut),
+                    ));
+                },
+            );
+            out.unwrap()
+        }
+
+        #[test]
+        fn check_is_ok_and_available_on_a_healthy_install() {
+            let Some(py) = vco_lib_python() else {
+                eprintln!("skip: no vco_lib-capable python on this host");
+                return;
+            };
+            if !imports_vco_lib(&py) {
+                eprintln!(
+                    "skip: {} cannot import vco_lib.runtime_reconcile from the checkout",
+                    py.display()
+                );
+                return;
+            }
+            // A fake podman answering the resolver's probes (version /
+            // info / compose version) on the stub PATH — nothing real.
+            let dir = tempfile::tempdir().unwrap();
+            fake_runtime(dir.path(), "podman");
+
+            let r = with_pinned_env(&py, dir.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect("healthy install: the verdict runs, so Ok");
+
+            // Deterministic branch: podman + compose answered on the
+            // stub PATH, so the modal gets "available" with the detected
+            // name — never an install URL.
+            assert!(r.available);
+            assert_eq!(r.detected.as_deref(), Some("podman"));
+            assert!(r.install_url.is_none());
+            assert!(
+                matches!(r.platform.as_str(), "linux" | "macos" | "windows" | "unknown"),
+                "platform must be a known value, got: {}",
+                r.platform
+            );
+            // v0.2.92 BLOCKER-4 invariants: an available runtime is
+            // never also a refused pin.
+            assert!(r.pinned.is_none() && !r.pinned_unusable && !r.pinned_installed);
             assert!(r.alternative_usable.is_none());
         }
-        assert_eq!(r.pinned.is_some(), r.pinned_unusable);
-        if let Some(p) = r.pinned.as_deref() {
-            assert!(matches!(p, "podman" | "docker"));
-            // The alternative is never the pinned runtime itself — that is
-            // the swap the whole refusal exists to prevent.
-            assert_ne!(r.alternative_usable.as_deref(), Some(p));
-        } else {
-            assert!(!r.pinned_installed && r.alternative_usable.is_none());
+
+        #[test]
+        fn check_is_ok_but_not_available_when_no_runtime_exists() {
+            let Some(py) = vco_lib_python() else {
+                eprintln!("skip: no vco_lib-capable python on this host");
+                return;
+            };
+            if !imports_vco_lib(&py) {
+                eprintln!(
+                    "skip: {} cannot import vco_lib.runtime_reconcile from the checkout",
+                    py.display()
+                );
+                return;
+            }
+            // A stub PATH with NO runtime binaries at all: the verdict
+            // resolves "nothing installed" — a runtime STATE, so still
+            // Ok, rendered by the modal's not-installed branch.
+            let dir = tempfile::tempdir().unwrap();
+
+            let r = with_pinned_env(&py, dir.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect("no runtime installed is a state, not a failure: Ok");
+
+            assert!(!r.available);
+            assert!(r.detected.is_none());
+            if r.platform == "unknown" {
+                assert!(r.install_url.is_none());
+            } else {
+                assert!(
+                    r.install_url.is_some(),
+                    "not-available on a known platform offers the install URL"
+                );
+            }
+            // No pin was set, so no pin is rendered.
+            assert!(r.pinned.is_none() && !r.pinned_unusable && !r.pinned_installed);
+            assert!(r.alternative_usable.is_none());
+        }
+
+        #[test]
+        fn check_errs_loudly_when_vco_lib_cannot_import() {
+            let stub_dir = tempfile::tempdir().unwrap();
+            let py = broken_python(stub_dir.path());
+            let empty_bin = tempfile::tempdir().unwrap();
+
+            let err = with_pinned_env(&py, empty_bin.path(), async {
+                check_container_runtime_available().await
+            })
+            .expect_err(
+                "a venv that cannot import vco_lib is a broken install: Err, \
+                 never a silent available:false",
+            );
+
+            // The loud-fail message names the failed verdict child and
+            // carries Python's own diagnosis — it must NOT be the
+            // not-installed shape the runtime download dialog renders.
+            // (The child died before printing JSON, so the arm that
+            // fires is the unreadable-output one; either way the name
+            // and the stderr diagnosis are the contract.)
+            assert!(
+                err.contains("runtime_reconcile decide"),
+                "Err must name the failed decide child, got: {err}"
+            );
+            assert!(
+                err.contains("No module named 'vco_lib'"),
+                "Err must carry Python's can't-import diagnosis, got: {err}"
+            );
         }
     }
 }

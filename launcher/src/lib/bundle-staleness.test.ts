@@ -9,7 +9,7 @@
 // either `current` or `stale`, and to stop a FAILED census rendering as
 // "all current" / "0 stale".
 
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import {
   chipFor,
   indexCensus,
@@ -17,6 +17,8 @@ import {
   needsAttentionCount,
   undeterminedCensus,
   shouldRecensusOnUpdaterEdge,
+  createCensusController,
+  type CensusView,
   CENSUS_UNAVAILABLE_REASON,
   NOT_IN_CENSUS_REASON,
 } from '$lib/bundle-staleness';
@@ -236,5 +238,299 @@ describe('shouldRecensusOnUpdaterEdge — re-census when an update completes', (
   it('does not fire while the update is still running', () => {
     expect(shouldRecensusOnUpdaterEdge(false, true)).toBe(false);
     expect(shouldRecensusOnUpdaterEdge(true, true)).toBe(false);
+  });
+});
+
+// ─── createCensusController — every trigger, one ordering rule ──────────
+//
+// Owner-reported (v0.2.97): after a successful "Update all" the Projects
+// page kept showing "8 stale of 9" because the census was only re-taken on
+// mount and on the orchestrator-update edge. Each trigger below is one
+// place the page must re-take it; the ordering tests pin that an older
+// response never overwrites a newer one.
+
+/** A census where every one of `n` projects has the given verdict. */
+function uniformCensus(verdict: 'current' | 'stale', n = 9): BundleStalenessCensus {
+  const projects = Array.from({ length: n }, (_, i) => ({
+    id: `p${i}`,
+    name: `P${i}`,
+    folder: `/tmp/p${i}`,
+    verdict,
+    reason: verdict === 'current' ? 'noop' : 'files_changed',
+    changed_files: verdict === 'current' ? [] : ['.claude/hooks/x.sh'],
+    user_modified: 0,
+  }));
+  return {
+    determined: true,
+    error: null,
+    registry: 'launcher.db',
+    running_version: '0.2.97',
+    projects,
+    summary: {
+      current: verdict === 'current' ? n : 0,
+      stale: verdict === 'stale' ? n : 0,
+      unknown: 0,
+    },
+    remedy_gui: null,
+    remedy_cli: null,
+  };
+}
+
+interface Pending {
+  resolve: (c: BundleStalenessCensus) => void;
+  reject: (e: unknown) => void;
+}
+
+/** A controller whose census calls are held open until the test settles
+ *  them, so response ORDER is under the test's control. */
+function harness(opts: { enabled?: () => boolean } = {}) {
+  const pending: Pending[] = [];
+  const views: CensusView[] = [];
+  const fetchCensus = vi.fn(
+    () =>
+      new Promise<BundleStalenessCensus>((resolve, reject) => {
+        pending.push({ resolve, reject });
+      }),
+  );
+  const ctl = createCensusController({
+    fetchCensus,
+    onChange: (v) => views.push(v),
+    enabled: opts.enabled,
+  });
+  return { ctl, fetchCensus, pending, views };
+}
+
+/** Let resolved promise continuations run. */
+const flush = () => new Promise<void>((r) => setTimeout(r, 0));
+
+describe('createCensusController — Update all finishing re-takes the census', () => {
+  it('done-success: a completed run invokes the census and shows the fresh verdicts', async () => {
+    const h = harness();
+    const first = h.ctl.load();
+    h.pending[0].resolve(uniformCensus('stale', 9));
+    await first;
+    expect(summaryLine(h.ctl.view().census)).toBe('9 stale of 9 project bundles.');
+
+    const after = h.ctl.updateAllFinished('completed');
+    expect(h.fetchCensus).toHaveBeenCalledTimes(2);
+    h.pending[1].resolve(uniformCensus('current', 9));
+    await after;
+    expect(summaryLine(h.ctl.view().census)).toBe('All 9 project bundles are up to date.');
+    expect(chipFor(h.ctl.view().census, 'p0').label).toBe('Bundle current');
+  });
+
+  it('done-failure: an errored run ALSO invokes the census (a partial run changed bundles)', async () => {
+    const h = harness();
+    void h.ctl.load();
+    h.pending[0].resolve(uniformCensus('stale'));
+    await flush();
+
+    void h.ctl.updateAllFinished('errored');
+    expect(h.fetchCensus).toHaveBeenCalledTimes(2);
+  });
+
+  it('a census call that rejects is shown as UNDETERMINED, never as the previous verdicts', async () => {
+    const h = harness();
+    void h.ctl.load();
+    h.pending[0].resolve(uniformCensus('stale'));
+    await flush();
+
+    const after = h.ctl.updateAllFinished('completed');
+    h.pending[1].reject(new Error('command bundle_staleness_census not found'));
+    await after;
+    expect(h.ctl.view().census?.determined).toBe(false);
+    expect(needsAttentionCount(h.ctl.view().census)).toBeNull();
+  });
+});
+
+describe('createCensusController — Refresh re-takes the census', () => {
+  it('refresh invokes the census every time it is pressed', () => {
+    const h = harness();
+    void h.ctl.refresh();
+    void h.ctl.refresh();
+    expect(h.fetchCensus).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('createCensusController — overlapping calls: newest wins', () => {
+  it('an OLDER response arriving last does not overwrite the newer one', async () => {
+    const h = harness();
+    // Request 1 (e.g. a Refresh mid-run) and request 2 (Update all done)
+    // are both in flight; request 2 answers first.
+    const r1 = h.ctl.refresh();
+    const r2 = h.ctl.updateAllFinished('completed');
+    h.pending[1].resolve(uniformCensus('current'));
+    await r2;
+    expect(summaryLine(h.ctl.view().census)).toBe('All 9 project bundles are up to date.');
+
+    h.pending[0].resolve(uniformCensus('stale'));
+    await r1;
+    expect(summaryLine(h.ctl.view().census)).toBe('All 9 project bundles are up to date.');
+    expect(h.ctl.view().checking).toBe(false);
+  });
+
+  it('in-order responses both apply, the last one shown', async () => {
+    const h = harness();
+    const r1 = h.ctl.refresh();
+    const r2 = h.ctl.refresh();
+    h.pending[0].resolve(uniformCensus('stale'));
+    await r1;
+    // Request 2 is still out, so the page says the figures may change.
+    expect(h.ctl.view().checking).toBe(true);
+    expect(needsAttentionCount(h.ctl.view().census)).toBe(9);
+    h.pending[1].resolve(uniformCensus('current'));
+    await r2;
+    expect(needsAttentionCount(h.ctl.view().census)).toBe(0);
+    expect(h.ctl.view().checking).toBe(false);
+  });
+
+  it('an older REJECTION arriving last does not replace a newer determined census', async () => {
+    const h = harness();
+    const r1 = h.ctl.refresh();
+    const r2 = h.ctl.refresh();
+    h.pending[1].resolve(uniformCensus('current'));
+    await r2;
+    h.pending[0].reject(new Error('late failure'));
+    await r1;
+    expect(h.ctl.view().census?.determined).toBe(true);
+  });
+
+  it('attempted is false until the first response, then stays true', async () => {
+    const h = harness();
+    const r1 = h.ctl.load();
+    expect(h.ctl.view().attempted).toBe(false);
+    expect(h.ctl.view().checking).toBe(true);
+    h.pending[0].resolve(uniformCensus('current'));
+    await r1;
+    expect(h.ctl.view().attempted).toBe(true);
+  });
+});
+
+describe('createCensusController — no Tauri host', () => {
+  it('takes no census when disabled', () => {
+    const h = harness({ enabled: () => false });
+    void h.ctl.load();
+    void h.ctl.refresh();
+    void h.ctl.updateAllFinished('completed');
+    expect(h.fetchCensus).not.toHaveBeenCalled();
+    expect(h.ctl.view().checking).toBe(false);
+  });
+});
+
+describe('createCensusController — orchestrator update edge + the call-out', () => {
+  it('fires on the falling edge only and raises the call-out', () => {
+    const h = harness();
+    h.ctl.updaterTick(false);
+    h.ctl.updaterTick(true);
+    expect(h.fetchCensus).not.toHaveBeenCalled();
+    h.ctl.updaterTick(false);
+    expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+    expect(h.ctl.view().postUpdateNotice).toBe(true);
+    h.ctl.updaterTick(false);
+    expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the call-out while bundles are stale; Update all bringing them current clears it', async () => {
+    const h = harness();
+    h.ctl.updaterTick(true);
+    h.ctl.updaterTick(false);
+    h.pending[0].resolve(uniformCensus('stale'));
+    await flush();
+    expect(h.ctl.view().postUpdateNotice).toBe(true);
+
+    const after = h.ctl.updateAllFinished('completed');
+    h.pending[1].resolve(uniformCensus('current'));
+    await after;
+    // "Project bundles are not updated with it" is no longer true.
+    expect(h.ctl.view().postUpdateNotice).toBe(false);
+  });
+
+  it('an all-current answer to a request started BEFORE the update does not clear the call-out', async () => {
+    const h = harness();
+    const early = h.ctl.refresh(); // started before the update completed
+    h.ctl.updaterTick(true);
+    h.ctl.updaterTick(false); // request 2
+    h.pending[0].resolve(uniformCensus('current'));
+    await early;
+    expect(h.ctl.view().postUpdateNotice).toBe(true);
+  });
+
+  it('an undetermined census never clears the call-out', async () => {
+    const h = harness();
+    h.ctl.updaterTick(true);
+    h.ctl.updaterTick(false);
+    h.pending[0].resolve(failedCensus('no interpreter'));
+    await flush();
+    expect(h.ctl.view().postUpdateNotice).toBe(true);
+  });
+
+  it('dismiss clears the call-out', () => {
+    const h = harness();
+    h.ctl.updaterTick(true);
+    h.ctl.updaterTick(false);
+    h.ctl.dismissNotice();
+    expect(h.ctl.view().postUpdateNotice).toBe(false);
+  });
+});
+
+describe('createCensusController — projects added or removed from any surface', () => {
+  it('the first settled observation is a baseline, not a change', () => {
+    const h = harness();
+    h.ctl.projectsChanged([], true); // still loading: ignored
+    h.ctl.projectsChanged(['a', 'b'], false);
+    expect(h.fetchCensus).not.toHaveBeenCalled();
+  });
+
+  it('an added and a removed project each re-take the census', () => {
+    const h = harness();
+    h.ctl.projectsChanged(['a', 'b'], false);
+    h.ctl.projectsChanged(['a', 'b', 'c'], false);
+    expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+    h.ctl.projectsChanged(['a', 'c'], false);
+    expect(h.fetchCensus).toHaveBeenCalledTimes(2);
+  });
+
+  it('a reorder or a re-load of the same set does not', () => {
+    const h = harness();
+    h.ctl.projectsChanged(['a', 'b'], false);
+    h.ctl.projectsChanged(['b', 'a'], false);
+    h.ctl.projectsChanged(['a', 'b'], true);
+    h.ctl.projectsChanged(['a', 'b'], false);
+    expect(h.fetchCensus).not.toHaveBeenCalled();
+  });
+});
+
+describe("createCensusController — a new project's background bundle install finishing", () => {
+  const s = (status: 'pending' | 'running' | 'done' | 'deferred' | 'failed', id = 'n', at = 1) =>
+    ({ project_id: id, status, observed_at: at });
+
+  it('fires when a setup reaches a terminal status (done / deferred / failed)', () => {
+    for (const terminal of ['done', 'deferred', 'failed'] as const) {
+      const h = harness();
+      h.ctl.setupObserved(null);
+      h.ctl.setupObserved(s('running'));
+      expect(h.fetchCensus).not.toHaveBeenCalled();
+      h.ctl.setupObserved(s(terminal));
+      expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('fires once per setup, not on every later tick of the same terminal state', () => {
+    const h = harness();
+    h.ctl.setupObserved(null);
+    h.ctl.setupObserved(s('running'));
+    h.ctl.setupObserved(s('done'));
+    h.ctl.setupObserved(s('done'));
+    expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+    h.ctl.setupObserved(null); // banner dismissed
+    expect(h.fetchCensus).toHaveBeenCalledTimes(1);
+    h.ctl.setupObserved(s('done', 'other', 2)); // a second add finishes
+    expect(h.fetchCensus).toHaveBeenCalledTimes(2);
+  });
+
+  it('a setup already terminal when the page mounts is a baseline (the mount census covers it)', () => {
+    const h = harness();
+    h.ctl.setupObserved(s('done'));
+    expect(h.fetchCensus).not.toHaveBeenCalled();
   });
 });

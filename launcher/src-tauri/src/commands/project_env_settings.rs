@@ -1,16 +1,21 @@
 //! Settings struct + populate helper for per-project env-file writers.
 //!
-//! Background: Until 2026-05-06, `write_project_env_files` and
-//! `ensure_project_env_template` accepted a hand-crafted argument list of
+//! Background: Until 2026-05-06, the Rust env writer and the Rust `.env`
+//! template writer (both retired v0.2.97) accepted a hand-crafted argument list of
 //! `(folder, project_name, write_disabled)` and derived every other value
 //! from hardcoded constants. The launcher's adopted service ports,
 //! `ACTIVE_EMBEDDING` choice, and shared-KG name were all invisible to
 //! the create-project path — see `launcher-settings-propagation-audit-2026-05-06.md`
 //! for the full inventory of "values that should propagate but don't".
 //!
-//! This module introduces `ProjectEnvSettings` as a single named bundle
-//! plumbed through both writers, plus a `populate` helper that reads the
-//! launcher's current state (app_state k/v + services.toml + canonical
+//! This module introduces `ProjectEnvSettings` as a single named bundle —
+//! today consumed by the project-root `.env` write (its service ports go to
+//! `vco_lib.env_template` through the bridge), the kg-sync / kg-summary
+//! spawns, and the access-list values
+//! `refresh_project_env_with_db` reports; the canonical env SURFACES are
+//! written by `vco_lib.config_projection` alone since the Rust writer's
+//! retirement — plus a `populate` helper that reads the
+//! launcher's current state (app_state k/v + service_endpoints rows + canonical
 //! defaults) once per `create_project_v2` / rename / shared-KG-toggle
 //! call. Future launcher-state values can be added here without churning
 //! every call site.
@@ -24,24 +29,18 @@
 //!     "VibeCodedTools_KnowledgeGraph" in v0.2.12 PR-26 — etc.) so a
 //!     launcher with no custom settings produces identical output to the
 //!     pre-refactor code modulo the shared-KG rename.
-//!   * Reads are best-effort: a missing app_state row or unreadable
-//!     services.toml falls through to defaults. The write path must NEVER
+//!   * Reads are best-effort: a missing app_state row or an absent
+//!     `service_endpoints` row falls through to defaults. The write path must NEVER
 //!     fail because state lookup hiccupped.
 //!   * Adopted services (mode = `Adopt` / `Parallel`) override default
 //!     ports. Refused / Unresolved fall back to canonical defaults.
 
-use std::path::PathBuf;
-
-use crate::commands::installer::resolve_orchestrator_root;
 // Canonical home for the `default_text_embedding` app_state key — reuse it
 // here rather than re-declaring the magic string a third time (it is also
 // privately re-declared in `embedding_catalog.rs`, with a sync comment).
 use crate::commands::openai_cmd::APP_STATE_DEFAULT_TEXT_EMBED;
-use crate::commands::projects_v2::{
-    get_shared_kg_read_disabled, get_shared_kg_write_disabled, sanitize_kg_collection,
-};
+use crate::commands::projects_v2::sanitize_kg_collection;
 use crate::db::Db;
-use crate::services::adoption::{self, AdoptionMode};
 
 /// `app_state` key for the active embedding profile (qwen3 / openai / arctic / codesage).
 /// Default: `"qwen3"` (matches install.py's default and the MCP server's fallback).
@@ -106,11 +105,11 @@ pub const APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL: &str =
 pub const APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL: &str =
     "rl.online_training_disabled_global";
 
-/// `app_state` keys for explicit port overrides. When set, these win over
-/// services.toml adoption + the canonical defaults.
-pub const APP_STATE_KEY_WEAVIATE_PORT: &str = "weaviate.port_override";
-pub const APP_STATE_KEY_OLLAMA_PORT: &str = "ollama.port_override";
-pub const APP_STATE_KEY_CODE_EMBED_PORT: &str = "code_embed.port_override";
+/// Where the core services are reached: `vct_launcher_core::services::
+/// service_endpoints` — the launcher.db `service_endpoints` row, else the
+/// compiled default — the resolver the hub's `/config` shares with
+/// [`populate`] and the Python projection mirrors (v0.2.97).
+use vct_launcher_core::services::service_endpoints::{self as endpoints, CoreService};
 
 /// `app_state` boolean for the GPU toggle. Used by callers that need to
 /// know whether the launcher's current install runs in GPU mode (for
@@ -118,11 +117,12 @@ pub const APP_STATE_KEY_CODE_EMBED_PORT: &str = "code_embed.port_override";
 /// `cpu_only = !use_gpu` for env_file plumbing.
 pub const APP_STATE_KEY_USE_GPU: &str = "launcher.use_gpu";
 
-/// Canonical defaults — duplicated from `commands::installer` (private constants).
-/// Kept in lockstep via a unit test below.
-pub const DEFAULT_WEAVIATE_PORT: u16 = 8081;
-pub const DEFAULT_OLLAMA_PORT: u16 = 11435;
-pub const DEFAULT_CODE_EMBED_PORT: u16 = 11440;
+/// Canonical default ports — declared in `service_endpoints` (see above) and
+/// kept in lockstep with `commands::installer`'s private copies via a unit
+/// test below.
+pub use vct_launcher_core::services::service_endpoints::{
+    DEFAULT_CODE_EMBED_PORT, DEFAULT_OLLAMA_PORT, DEFAULT_WEAVIATE_PORT,
+};
 pub const DEFAULT_ACTIVE_EMBEDDING: &str = "qwen3";
 
 /// Text model id → ACTIVE_EMBEDDING profile.
@@ -210,6 +210,11 @@ pub fn set_text_embedding_and_profile(
 ///     the `set_codegraph_floors` pattern.)
 ///   * `codegraph.retrieval_floor` / `codegraph.post_rerank_floor` —
 ///     written only by `set_codegraph_floors`, which already refreshes.
+///
+/// v0.2.97: the service endpoints are NOT app_state keys. They are
+/// `service_endpoints` rows, whose one writer (`vco_lib.service_endpoints`)
+/// re-projects every project itself after a change; the retired
+/// `*.port_override` keys feed nothing and so trigger nothing.
 pub fn app_state_key_triggers_env_reprojection(key: &str) -> bool {
     matches!(
         key,
@@ -560,10 +565,10 @@ pub fn is_shared_kg_class_name(name: &str, canonical: &str) -> bool {
         || name.eq_ignore_ascii_case(LEGACY_SHARED_KG_COLLECTION)
 }
 
-/// Populated once per project-env write call. Plumbed through
-/// `write_project_env_files` and `ensure_project_env_template` so future
-/// launcher-state values can be added here without re-threading every
-/// call site.
+/// Populated once per project-env write call. Its ports are forwarded to
+/// the project-root `.env` writer (`vco_lib.env_template`, and its safe-add
+/// sidecar) so future launcher-state values can be added here without
+/// re-threading every call site.
 ///
 /// String-typed for trivial JSON / TOML serialisation in tests; the fields
 /// are typed numerically only where a u16 is unambiguously a port.
@@ -574,22 +579,16 @@ pub struct ProjectEnvSettings {
     pub active_embedding: String,
 
     /// Per-service URLs. Composed from the resolved port + the
-    /// canonical scheme/host.
+    /// canonical scheme/host. (v0.2.97: no `code_embed_url` — its one
+    /// reader, the retired Rust `.env` renderer, is superseded by
+    /// `vco_lib.env_template`, which composes `CODE_EMBED_URL` from the
+    /// forwarded `code_embed_port` the same way.)
     pub weaviate_url: String,
     pub ollama_url: String,
-    pub code_embed_url: String,
 
     pub weaviate_port: u16,
     pub ollama_port: u16,
     pub code_embed_port: u16,
-
-    /// Container runtime detected at populate-time (`"podman"` / `"docker"`)
-    /// or `None` if neither is on PATH. Hooks re-probe at exec time;
-    /// this value is informational for future compose-override generation
-    /// (PR-3 currently only carries it for symmetry — the hook templates
-    /// stay runtime-detected on purpose).
-    #[allow(dead_code)]
-    pub container_runtime: Option<String>,
 
     /// Per-project KG collection name (`<sanitized>_KnowledgeGraph`).
     pub kg_collection: String,
@@ -604,19 +603,6 @@ pub struct ProjectEnvSettings {
     /// overridable via app_state.
     pub shared_kg_collection: String,
 
-    /// Asymmetric write-gate (read of shared KG is unconditional).
-    /// True ⇒ project carries `SHARED_KG_WRITE_DISABLED=true`.
-    pub shared_kg_write_disabled: bool,
-
-    /// v0.2.46 Decision B — symmetric READ gate. Mirror of
-    /// `shared_kg_write_disabled` above. When `true`, the project's env
-    /// surfaces carry `SHARED_KG_READ_DISABLED=true`, which the MCP's
-    /// `_kg_collections_to_search` reads to drop `SHARED_KG_COLLECTION`
-    /// from the hybrid_search / semantic_graph_search fan-out. Pre-
-    /// v0.2.46 the read path was unconditional (asymmetric-by-default);
-    /// v0.2.46 lets users opt OUT explicitly while keeping default ON.
-    pub shared_kg_read_disabled: bool,
-
     /// CPU-only flag (mirror of `!use_gpu`). True when the launcher's
     /// install was configured for CPU-only. Reserved for future per-
     /// project compose-override generation.
@@ -630,21 +616,6 @@ pub struct ProjectEnvSettings {
 
     /// Project's display name (raw, not sanitized — for `PROJECT_NAME`).
     pub project_name: String,
-
-    /// Orchestrator clone root (PR-2 portability, 2026-05-06). `Some` when
-    /// `resolve_orchestrator_root(db)` succeeds at populate time; `None`
-    /// falls through to the older behaviour where `VCT_ORCHESTRATOR_ROOT`
-    /// / `VCT_INFRASTRUCTURE_DIR` are simply omitted from `.claude/env`
-    /// (the in-tree hooks have a fallback resolution path). Routed via the
-    /// settings struct so PR-2's value flows through PR-3's plumbing
-    /// rather than being a side-channel resolver call inside the writer
-    /// body.
-    ///
-    /// v0.2.37: switched from uncached `find_local_repo_root().ok()` to
-    /// the canonical DB-cached `resolve_orchestrator_root(db)` resolver,
-    /// so populate emits the orchestrator root even when `current_exe()`
-    /// is far from the clone (binary in `~/bin/`, clone in `~/dev/`).
-    pub orchestrator_root: Option<PathBuf>,
 
     /// Multi-source KG access list (P1-D, 2026-05-08). Sorted, deduped list
     /// of peer project names (sanitized — i.e. the prefix used in the
@@ -665,101 +636,6 @@ pub struct ProjectEnvSettings {
     /// `VCT_CODE_GRAPH_ACCESS_LIST=Foo,Bar,Baz`.
     pub code_graph_access_list: Vec<String>,
 
-    /// v0.2.76 (seams-lens #1): the value written to `CODE_GRAPH_PROJECT`.
-    /// This is the code-graph class PREFIX the analyzer/MCP target, and it
-    /// MUST match the stored `project_codegraph_bindings.collection_prefix`
-    /// (the SSOT) for existing projects — otherwise the env-driven analyzer /
-    /// MCP hub-down fallback query a DIFFERENT prefix than the binding/hub
-    /// (split-brain for underscore-containing names, where the retired KG
-    /// sanitizer `sanitize_kg_collection` DROPPED underscores the analyzer
-    /// PRESERVES). Resolution (binding-first, matching the hub +
-    /// `config_projection.project_env_from_db`):
-    ///   * `populate()`: stored binding prefix if a row exists, else
-    ///     `project_naming::canonical_class_prefix(name)` (never re-derive for
-    ///     an existing project — honor the binding).
-    ///   * `with_defaults()` (no DB): `canonical_class_prefix(name)` — the
-    ///     value the first analysis will bind; no binding to contradict.
-    pub code_graph_project: String,
-
-    /// GitHub PAT (0.1.7 fork-readiness sweep, 2026-05-08). Resolved at
-    /// `populate` time from the OS keychain entry the OnboardingWizard
-    /// writes via `commands::installer::register_github_pat`
-    /// (`vct._user_shared_.shared.user / github_pat` — post-2026-05-10
-    /// module_id unification with the SecretsPanel UI_MODULE_BUCKET).
-    /// Honours the active-flag gate (`is_secret_active_cross_launcher`)
-    /// so a paused secret in any sibling launcher's DB returns `None`
-    /// here too.
-    ///
-    /// Replaces the pre-0.1.7 `git-credential-vct` helper: instead of
-    /// having git's credential protocol invoke a per-project
-    /// helper (incompatible with the active-flag gate), the launcher
-    /// now writes `GITHUB_TOKEN=<value>` to each registered project's
-    /// env files. Users configure git's credential helper once
-    /// (`gh auth setup-git`, or a thin shell helper that reads
-    /// `$GITHUB_TOKEN`) and the launcher takes over the per-project
-    /// gating via the env var.
-    ///
-    /// `None` means: no keychain entry, OR entry paused via Lifecycle B,
-    /// OR keychain backend unreachable. The pair-builder filter omits
-    /// the key from all 3 surfaces in that case (matching the
-    /// `VCT_ORCHESTRATOR_ROOT` / `VCT_KG_ACCESS_LIST` semantics).
-    ///
-    /// Conservative per-project gating: today, every registered project
-    /// receives `GITHUB_TOKEN` whenever the keychain has it active. That
-    /// matches the pre-0.1.7 file-based behaviour
-    /// (`~/.vct-secrets/shared/github_pat` is readable by every process
-    /// running as the user). A finer-grained per-project access matrix
-    /// for `github_pat` is out of scope for the 0.1.7 fork sweep — see
-    /// `docs/MIGRATION-0.2.0.md` "Replacing `git-credential-vct`".
-    pub github_token: Option<String>,
-
-    /// Subagent G (2026-05-08): per-project user-bucket secrets resolved
-    /// at populate time. Pairs of (KEY, VALUE) for entries that are both
-    /// (a) active under the cross-launcher gate, and (b) currently
-    /// keychain-present. Emitted alongside the canonical keys into all 3
-    /// launcher-managed env surfaces (`.claude/env`,
-    /// `.claude/settings.json` `env`, `.vscode/settings.json`
-    /// `claude-code.env`).
-    ///
-    /// Closes the "GUI says secret is set, but I can't actually use it"
-    /// gap: a user adding `MY_PROJECT_KEY` in the SecretsPanel now sees
-    /// it appear as a normal env var in their next Claude Code session
-    /// for that project (no session restart, courtesy of the
-    /// `refresh_project_env_with_db` hook in the secret-mutation
-    /// commands).
-    ///
-    /// Threat model note: any subprocess spawned in the project's
-    /// Claude Code session can read these as normal env vars —
-    /// including bundled MCP servers + hooks. Same exposure profile
-    /// `~/.vct-secrets/` already had pre-Subagent A.
-    ///
-    /// Disjoint from `github_token` (Subagent D): that resolves the
-    /// SHARED-scope keychain entry written by the OnboardingWizard
-    /// (`scope='shared'`, `module_id='installer'`). User-bucket secrets
-    /// here are at `scope='per_project'`, `module_id='user'`. The two
-    /// flows never enumerate each other's rows.
-    pub user_secret_pairs: Vec<(String, String)>,
-
-    /// Subagent G (2026-05-08): every KEY name the launcher has ever
-    /// observed for this project's user-bucket (`scope='per_project'`,
-    /// `module_id='user'`), regardless of active flag. ASCII-sorted by
-    /// key for deterministic env diffs.
-    ///
-    /// Used by the env writer as the STRIP set: any key in this list
-    /// that is NOT in `user_secret_pairs` is removed from every env
-    /// surface on the next write. This is how "paused" / "removed"
-    /// secrets get out of the surfaces — without this, a previously-
-    /// emitted user secret would persist stale even after the GUI says
-    /// it's off.
-    ///
-    /// Invariant: superset of the keys in `user_secret_pairs`. The
-    /// difference set is exactly the inactive / pending-removal
-    /// entries. Keys here that the user added BY HAND directly to a
-    /// JSON env block (never through `set_secret_v2`) DO NOT appear —
-    /// those are tracked solely in the JSON files and the writer
-    /// preserves them via the existing `merge_env_object_canonical`
-    /// deep-merge.
-    pub user_secret_known_keys: Vec<String>,
 }
 
 impl ProjectEnvSettings {
@@ -769,22 +645,13 @@ impl ProjectEnvSettings {
     #[allow(dead_code)]
     pub fn with_defaults(project_name: &str) -> Self {
         let kg_basename = sanitize_kg_collection(project_name);
-        // v0.2.76 (seams-lens #1): no DB here → no binding to honor → derive the
-        // code-graph prefix with the underscore-PRESERVING `canonical_class_prefix`
-        // (the rule the analyzer/hub/binding-seed use), falling back to the
-        // KG basename only for names canonical rejects (leading-digit / all-symbol),
-        // so this never panics on a pathological name.
-        let code_graph_project = crate::project_naming::canonical_class_prefix(project_name)
-            .unwrap_or_else(|_| kg_basename.clone());
         Self {
             active_embedding: DEFAULT_ACTIVE_EMBEDDING.to_string(),
             weaviate_url: format!("http://localhost:{}", DEFAULT_WEAVIATE_PORT),
             ollama_url: format!("http://localhost:{}", DEFAULT_OLLAMA_PORT),
-            code_embed_url: format!("http://localhost:{}", DEFAULT_CODE_EMBED_PORT),
             weaviate_port: DEFAULT_WEAVIATE_PORT,
             ollama_port: DEFAULT_OLLAMA_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
-            container_runtime: None,
             // v0.2.84 PLAN-v0284 D1 (review F4): name-derived KG/dev names here are the
             // SANCTIONED last resort — `with_defaults` has NO `Db` handle, so there is no
             // `project_kg_bindings` row to honor. D1's rule ("primary = binding when a row
@@ -796,142 +663,21 @@ impl ProjectEnvSettings {
             kg_collection: format!("{}_KnowledgeGraph", kg_basename),
             dev_collection: format!("{}_Development", kg_basename),
             shared_kg_collection: LAST_RESORT_SHARED_KG_COLLECTION.to_string(),
-            shared_kg_write_disabled: false,
-            // v0.2.46 Decision B — symmetric read gate. Default off
-            // (reads allowed) on a fresh defaults-only struct.
-            shared_kg_read_disabled: false,
             cpu_only: true,
             use_gpu: false,
             project_name: project_name.to_string(),
-            orchestrator_root: None,
             kg_access_list: Vec::new(),
             code_graph_access_list: Vec::new(),
-            code_graph_project,
-            // Tests use `with_defaults`; they get an absent token so the
-            // pair-builder omits `GITHUB_TOKEN` from the surfaces. Tests
-            // that exercise the GITHUB_TOKEN propagation path construct
-            // a settings struct directly and override this field.
-            github_token: None,
-            // Subagent G (2026-05-08): tests using `with_defaults` get
-            // empty user-secret state (no active pairs, no known keys).
-            // Tests that exercise the user-secret propagation path
-            // construct a settings struct directly + override.
-            user_secret_pairs: Vec::new(),
-            user_secret_known_keys: Vec::new(),
         }
-    }
-
-    /// `"true"` / `"false"` string form for env writers.
-    pub fn shared_kg_write_disabled_str(&self) -> &'static str {
-        if self.shared_kg_write_disabled { "true" } else { "false" }
-    }
-
-    /// v0.2.46 Decision B — `"true"` / `"false"` string form for env
-    /// writers. Mirrors `shared_kg_write_disabled_str` exactly so the
-    /// pair-builder match arm has a symmetric helper to call.
-    pub fn shared_kg_read_disabled_str(&self) -> &'static str {
-        if self.shared_kg_read_disabled { "true" } else { "false" }
     }
 }
 
-/// Resolve a port: app_state override > services.toml adoption > default.
-///
-/// `services.toml` adoption is honored only for the `Adopt` and `Parallel`
-/// modes. `Refuse` and `Unresolved` fall through to the default.
-fn resolve_port(
-    db: &Db,
-    state_key: &str,
-    services_state: &adoption::AdoptionState,
-    service_name: &str,
-    default: u16,
-) -> u16 {
-    // 1. Explicit user override via app_state.
-    if let Ok(Some(s)) = db.app_state_get(state_key) {
-        if let Ok(p) = s.parse::<u16>() {
-            if p > 0 {
-                return p;
-            }
-        }
-    }
-    // 2. services.toml adoption (Parallel uses `parallel_port`; Adopt
-    //    parses the external_url for the port).
-    if let Some(svc) = services_state.get(service_name) {
-        match svc.mode {
-            AdoptionMode::Parallel => {
-                if let Some(p) = svc.parallel_port {
-                    return p;
-                }
-            }
-            AdoptionMode::Adopt => {
-                if let Some(url) = svc.external_url.as_deref() {
-                    if let Some(p) = parse_port_from_url(url) {
-                        return p;
-                    }
-                }
-            }
-            AdoptionMode::Refuse | AdoptionMode::Unresolved => {}
-        }
-    }
-    default
-}
-
-/// Extract the port from a URL like `http://localhost:8081/v1/meta`.
-/// Returns `None` for unparseable / missing-port inputs.
-fn parse_port_from_url(url: &str) -> Option<u16> {
-    // Strip scheme.
-    let after_scheme = url
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(url);
-    // Slice up to first `/`.
-    let host_port = after_scheme.split('/').next().unwrap_or(after_scheme);
-    let port_str = host_port.rsplit(':').next()?;
-    port_str.parse::<u16>().ok()
-}
-
-/// Detect the container runtime synchronously without spawning child
-/// processes. Returns `Some("podman")`, `Some("docker")`, or `None`.
-/// Synchronous because populate runs from non-async callers
-/// (`write_project_env_files`); a runtime probe via `which` is sufficient
-/// — a full-fledged version check happens later via `detect_system`.
-///
-/// Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var as the
-/// user's explicit preference (v0.2.14 Bug #3 fix). If set to a
-/// recognized value AND that runtime is on PATH, returns it directly;
-/// else falls through to auto-detect (podman first, docker second).
-/// This matches the contract honored by `services/runtime.rs::resolve_runtime`,
-/// `install.py::_runtime_preference_from_env`, the hook scripts, and
-/// the boot wrapper.
-fn detect_runtime_sync() -> Option<String> {
-    if let Ok(raw) = std::env::var("VCT_CONTAINER_RUNTIME") {
-        let pref = raw.trim().to_ascii_lowercase();
-        if pref == "podman" || pref == "docker" {
-            if which_cmd(&pref).is_some() {
-                return Some(pref);
-            }
-            // Preference set but not installed — fall through to auto-detect.
-            // (Lenient: don't strand the user on a misconfigured env var.)
-        }
-        // "auto" / "" / unknown → fall through.
-    }
-    if which_cmd("podman").is_some() {
-        return Some("podman".to_string());
-    }
-    if which_cmd("docker").is_some() {
-        return Some("docker".to_string());
-    }
-    None
-}
-
-/// Minimal `which` — walk `PATH` and look for an executable file.
-///
-/// v0.2.77 (Part 7c task 3): delegates to the shared
-/// `vct_launcher_core::paths::which_on_path` (one home). Behaviour is
-/// preserved on POSIX and upgraded on Windows (the shared form also probes
-/// `.cmd`/`.bat`, not just `.exe`). Kept the local name so the two
-/// `.is_some()` call-sites are undisturbed.
-fn which_cmd(name: &str) -> Option<std::path::PathBuf> {
-    vct_launcher_core::paths::which_on_path(name)
+/// The code-embedding service port exactly as [`populate`] resolves it for
+/// the project env projection (its `service_endpoints` row, else 11440).
+/// v0.2.97: the Core module settings panel shows it read-only for
+/// `vct-code-embedding`'s `CODE_EMBED_PORT`.
+pub fn resolve_code_embed_port(db: &Db) -> u16 {
+    endpoints::machine_port(db, CoreService::CodeEmbed)
 }
 
 /// Populate `ProjectEnvSettings` for a project from launcher state.
@@ -946,7 +692,7 @@ fn which_cmd(name: &str) -> Option<std::path::PathBuf> {
 ///     yet (e.g. test contexts).
 ///
 /// Soft-fail policy: every read is wrapped in `unwrap_or` of the canonical
-/// default. A poisoned mutex / corrupt JSON / missing services.toml falls
+/// default. A poisoned mutex / corrupt JSON / missing endpoint row falls
 /// through silently. The whole point is that env-file writes must not be
 /// blocked by a state-read hiccup.
 pub fn populate(
@@ -954,29 +700,15 @@ pub fn populate(
     project_name: &str,
     project_id: Option<&str>,
 ) -> ProjectEnvSettings {
-    let services_state = adoption::read();
-
-    let weaviate_port = resolve_port(
-        db,
-        APP_STATE_KEY_WEAVIATE_PORT,
-        &services_state,
-        "weaviate",
-        DEFAULT_WEAVIATE_PORT,
-    );
-    let ollama_port = resolve_port(
-        db,
-        APP_STATE_KEY_OLLAMA_PORT,
-        &services_state,
-        "ollama",
-        DEFAULT_OLLAMA_PORT,
-    );
-    let code_embed_port = resolve_port(
-        db,
-        APP_STATE_KEY_CODE_EMBED_PORT,
-        &services_state,
-        "code_embed",
-        DEFAULT_CODE_EMBED_PORT,
-    );
+    // v0.2.97: the Weaviate URL comes from the ONE resolver the hub's
+    // `/config` also calls (`service_endpoints::machine_weaviate_url`: the
+    // launcher.db `service_endpoints` row, else `http://localhost:8081`). The
+    // port is the one that URL addresses, so `WEAVIATE_PORT` cannot disagree
+    // with it.
+    let weaviate_url = endpoints::machine_weaviate_url(db);
+    let weaviate_port = endpoints::weaviate_port_for_url(&weaviate_url);
+    let ollama_port = endpoints::machine_port(db, CoreService::Ollama);
+    let code_embed_port = endpoints::machine_port(db, CoreService::CodeEmbed);
 
     // v0.2.71 T-B-emb: resolve via the ONE shared cascade. Sticky per-project
     // user pick (module_settings/orchestrator-core/active_embedding WHERE
@@ -1045,19 +777,6 @@ pub fn populate(
             resolve_shared_kg_collection(db)
             .unwrap_or_else(|| LAST_RESORT_SHARED_KG_COLLECTION.to_string());
 
-    let shared_kg_write_disabled = match project_id {
-        Some(pid) => get_shared_kg_write_disabled(db, pid).unwrap_or(false),
-        None => false,
-    };
-
-    // v0.2.46 Decision B — symmetric READ gate. Same resolution shape
-    // as the write gate above; default false (reads allowed) when the
-    // row is absent OR no project_id was provided (test contexts).
-    let shared_kg_read_disabled = match project_id {
-        Some(pid) => get_shared_kg_read_disabled(db, pid).unwrap_or(false),
-        None => false,
-    };
-
     let use_gpu = db
         .app_state_get_bool(APP_STATE_KEY_USE_GPU)
         .ok()
@@ -1092,18 +811,6 @@ pub fn populate(
     let own_kg = collections.kg;
     let own_dev = collections.dev;
 
-    // v0.2.76 (seams-lens #1): CODE_GRAPH_PROJECT — binding-first, matching the
-    // hub resolver + `config_projection.project_env_from_db`. NEVER re-derive a
-    // prefix for an existing project: a stored
-    // `project_codegraph_bindings.collection_prefix` is the SSOT the analyzer
-    // last wrote to, and the env value MUST equal it or the env-driven analyzer
-    // / MCP hub-down fallback target a DIFFERENT prefix than the binding/hub.
-    // No binding row (never-analyzed project, or no project_id in a test
-    // context) → `canonical_class_prefix(name)` (the underscore-PRESERVING rule
-    // the analyzer + binding-seed use — NOT the underscore-DROPPING
-    // `sanitize_kg_collection` this used before the fix).
-    let code_graph_project = resolve_code_graph_project(db, project_id, project_name);
-
     // P1-D (2026-05-08): resolve cross-project KG + codegraph access lists
     // from the launcher's access matrix. These flow into env vars on the
     // 3 surfaces and are consumed by `weaviate_mcp/server.py` + the
@@ -1119,86 +826,21 @@ pub fn populate(
         None => Vec::new(),
     };
 
-    // v0.2.84 D8.1 (P7): populate() NO LONGER resolves secret VALUES.
-    //
-    // The GitHub PAT keychain read (`github_pat_for_env`) is removed here —
-    // it was a PURE-WASTE read on every populate(). The v0.2.73 strip-only
-    // WRITE INVARIANT (projects_v2.rs:3393-3431) forces the writer to emit
-    // NOTHING for GITHUB_TOKEN (the canonical value arm is `None`; the
-    // explicit `let _ = (&settings.user_secret_pairs, &settings.github_token)`
-    // no-op keeps the fields honest), so populate's resolved token value was
-    // read from the OS keychain and then discarded — one gnome-keyring
-    // Secret Service round-trip per project, per populate, for nothing. On
-    // update-all over K projects × ~6 populate call-sites that is ~6K
-    // wasted Secret Service reads that provably contributed to the P7
-    // keyring SIGTRAP recurrence. NOT feature removal (no production
-    // consumer of the VALUE exists — verified; the hub has its OWN
-    // keychain loop in vct-hub's /env resolver). See PLAN v0.2.84 D8.1.
-    let github_token: Option<String> = None;
-
-    // Subagent G (2026-05-08): the user-secret STRIP set (KEY names only).
-    //
-    // v0.2.84 D8.1: split from the value-resolving `resolve_user_secret_state`
-    // — populate now calls `resolve_user_secret_known_keys`, which reads
-    // ONLY launcher.db (the three key-name lists), NEVER the OS keychain.
-    //   * `user_secret_pairs`: forced EMPTY. The env writer discards it
-    //     anyway (v0.2.73 strip-only invariant) — resolving the values was
-    //     pure keychain waste (the load-bearing bulk of the per-project
-    //     read multiplier behind the P7 SIGTRAP).
-    //   * `user_secret_known_keys`: every KEY ever observed in the three
-    //     user buckets regardless of active flag — the STRIP set the writer
-    //     needs so paused / removed secrets get scrubbed from the surfaces.
-    //     Still populated (DB-only, no keychain).
-    //
-    // Without `project_id` (test contexts) we skip resolution — empty pairs
-    // + empty known set, identical to before.
-    let user_secret_pairs: Vec<(String, String)> = Vec::new();
-    let user_secret_known_keys = match project_id {
-        Some(pid) => resolve_user_secret_known_keys(db, pid),
-        None => Vec::new(),
-    };
-
     ProjectEnvSettings {
         active_embedding,
-        weaviate_url: format!("http://localhost:{}", weaviate_port),
+        weaviate_url,
         ollama_url: format!("http://localhost:{}", ollama_port),
-        code_embed_url: format!("http://localhost:{}", code_embed_port),
         weaviate_port,
         ollama_port,
         code_embed_port,
-        container_runtime: detect_runtime_sync(),
         kg_collection: own_kg,
         dev_collection: own_dev,
         shared_kg_collection,
-        shared_kg_write_disabled,
-        shared_kg_read_disabled,
         cpu_only: !use_gpu,
         use_gpu,
         project_name: project_name.to_string(),
-        // PR-2 portability: best-effort orchestrator clone root. Soft-fail
-        // (None) so a launcher running outside a git checkout still
-        // produces a usable `.claude/env` (the bundled hooks' in-tree
-        // fallback path takes over).
-        //
-        // v0.2.37: was `find_local_repo_root().ok()` — the uncached
-        // walk-up resolver. That bit user_project_x: when the launcher
-        // binary lived at `~/bin/vct-launcher` and the clone at
-        // `~/dev/vco/`, the walk-up returned None and
-        // `VCT_ORCHESTRATOR_ROOT` was OMITTED from `.claude/env`
-        // (per the omit-on-None semantic in
-        // `write_project_env_files`). The canonical
-        // `resolve_orchestrator_root(db)` checks the DB cache first
-        // (`app_state['launcher.install_path']`, seeded at install
-        // time by install.py + on the first launcher boot that hits
-        // the walk-up), so populate succeeds even when
-        // `current_exe()` is far from the clone.
-        orchestrator_root: resolve_orchestrator_root(db),
         kg_access_list,
         code_graph_access_list,
-        code_graph_project,
-        github_token,
-        user_secret_pairs,
-        user_secret_known_keys,
     }
 }
 
@@ -1300,286 +942,6 @@ fn resolve_code_graph_access_peers(db: &Db, project_id: &str) -> Vec<String> {
     peers.into_iter().collect()
 }
 
-/// v0.2.76 (seams-lens #1): resolve the `CODE_GRAPH_PROJECT` env value —
-/// the code-graph class prefix the analyzer / MCP target.
-///
-/// Binding-first, matching the hub resolver
-/// (`launcher/src-tauri/vct-hub/src/config_api.rs` `code_graph_collection_prefix`)
-/// and `vco_lib/config_projection.py::_fetch_codegraph_binding_prefix`:
-///
-///   1. A non-empty `project_codegraph_bindings.collection_prefix` (the SSOT the
-///      analyzer last wrote to) — returned verbatim. NEVER re-derived: for an
-///      existing project the binding IS the truth, and the env value must equal
-///      it or the env-driven analyzer / MCP hub-down fallback query a DIFFERENT
-///      prefix (split-brain). No `enabled` filter (mirrors the hub read — a
-///      disabled binding still names the prefix in use).
-///   2. Otherwise `canonical_class_prefix(project_name)` — the underscore-
-///      PRESERVING rule the analyzer + binding-seed use (the value the first
-///      analysis will bind). This REPLACES the retired underscore-DROPPING
-///      `sanitize_kg_collection`, which produced `MyProject` for `My_Project`
-///      and split-brained underscore-containing names.
-///   3. If canonical rejects the name (leading-digit / all-symbol), fall back to
-///      `sanitize_kg_collection` so the writer never panics on a weird name.
-///
-/// Soft-fail: any DB error resolving the binding → treat as no-binding and
-/// derive (env-file writes must never block on a matrix-read hiccup).
-fn resolve_code_graph_project(db: &Db, project_id: Option<&str>, project_name: &str) -> String {
-    if let Some(pid) = project_id {
-        if let Ok(Some(binding)) = db.get_project_codegraph_binding(pid) {
-            let prefix = binding.collection_prefix.trim();
-            if !prefix.is_empty() {
-                return prefix.to_string();
-            }
-        }
-    }
-    crate::project_naming::canonical_class_prefix(project_name)
-        .unwrap_or_else(|_| sanitize_kg_collection(project_name))
-}
-
-/// v0.2.84 D8.1 (P7): resolve JUST the user-secret STRIP set — every KEY
-/// name ever observed across the three SecretsPanel buckets (per-project,
-/// shared, global) — WITHOUT touching the OS keychain.
-///
-/// This is the DB-only half split out of [`resolve_user_secret_state`].
-/// `populate()` calls THIS (not the value-resolving variant) because the
-/// env writer never emits secret VALUES (v0.2.73 strip-only invariant,
-/// projects_v2.rs:3393-3431) — it only needs the known-key set to STRIP
-/// paused / removed secrets from the surfaces. Resolving the values was a
-/// pure-waste keychain read per key per project (a load-bearing driver of
-/// the P7 gnome-keyring SIGTRAP recurrence under update-all).
-///
-/// Ordering + de-duplication are BYTE-IDENTICAL to
-/// [`resolve_user_secret_state`]'s `known_keys` output: per-project keys
-/// first (in the DB's list order), then shared keys not already present,
-/// then global keys not already present. This parity is load-bearing —
-/// the writer's strip set must match what the old (value-resolving) path
-/// produced or a paused secret could leak or a live one vanish.
-///
-/// Soft-fail: the three list reads soft-fail to empty inside their `db`
-/// helpers; this function never panics.
-fn resolve_user_secret_known_keys(db: &Db, project_id: &str) -> Vec<String> {
-    // Same three DB reads `resolve_user_secret_state` performs — key NAMES
-    // only, no keychain values. (`db.list_*_user_secret_keys` are the
-    // DB-only readers; the keychain access lived solely in the value arm.)
-    let per_project_keys = db.list_user_secret_keys_for_project(project_id);
-    let shared_keys = db.list_shared_user_secret_keys();
-    let global_keys = db.list_global_user_secret_keys();
-
-    let mut known_keys: Vec<String> =
-        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
-    // Dedup-preserving push in bucket order — mirrors `resolve_one_bucket`'s
-    // `out_known` accumulation exactly (per-project → shared → global).
-    for key in per_project_keys
-        .into_iter()
-        .chain(shared_keys)
-        .chain(global_keys)
-    {
-        if !known_keys.iter().any(|k| *k == key) {
-            known_keys.push(key);
-        }
-    }
-    known_keys
-}
-
-/// Subagent G (2026-05-08), broadened by H2 (2026-05-08): resolve the
-/// user-bucket secret state for the env-pair builder. Covers all THREE
-/// SecretsPanel tabs:
-///
-///   * Per-project tab → `(scope='per_project', project_id, module_id='user')`
-///   * Shared tab      → `(scope='shared',      '_user_shared_', 'user')`
-///   * Global tab      → `(scope='global',      '_global_',      'user')`
-///
-/// Pre-H2 only the per-project bucket flowed into env surfaces. Shared
-/// and Global rows existed in the keychain + active-flag DB but no
-/// consumer enumerated them, so a key the user added via the Shared
-/// tab was silent to every project's `.claude/env`. H2 closes that
-/// gap by merging all three buckets at populate time.
-///
-/// Returns `(active_pairs, known_keys)`:
-///
-///   * `active_pairs`: `(KEY, VALUE)` for every key (across all three
-///     buckets) where the cross-launcher active gate says active AND
-///     the OS keychain currently holds a value. Order is per-project
-///     keys first (ASCII-sorted), then shared (ASCII-sorted), then
-///     global (ASCII-sorted) — bucket-stable so env-surface diffs
-///     stay readable.
-///
-///   * `known_keys`: every KEY ever observed in any of the three
-///     buckets regardless of active flag. Same ordering as
-///     `active_pairs`. Superset of the keys in `active_pairs`.
-///
-/// The env writer uses the difference set (`known_keys` − keys-in-`active_pairs`)
-/// as its STRIP set: any of those keys still present in the env
-/// surfaces from a prior write get removed on this write. That is how
-/// paused / pending-removal secrets exit the surfaces — without it, a
-/// previously-emitted user secret would persist stale even after the
-/// GUI toggles it off.
-///
-/// Bucket-collision handling: if the same KEY exists in two buckets
-/// (e.g. a user adds `MY_KEY` per-project AND in Shared), the
-/// per-project value wins by virtue of bucket order — it lands in
-/// `active_pairs` first, and the writer's pair-canonicalization keeps
-/// the first occurrence. This matches the SecretsPanel's read-time
-/// resolution comment ("Per-project bag for P → Shared → Global,
-/// first hit wins").
-///
-/// Soft-fail: keychain backend unreachable / DB hiccup → empty pairs
-/// (the key vanishes from EMIT but stays in the strip set if its row
-/// exists). The env-file writes must never block on a metadata-read
-/// failure.
-///
-/// Disjoint from `github_pat_for_env` (Subagent D): that one targets
-/// the SHARED-scope `github_pat` keychain entry under
-/// `module_id='installer'`. This function only enumerates
-/// `module_id='user'` rows. The two flows never enumerate each
-/// other's entries — there is zero overlap.
-///
-/// v0.2.84 D8.1 (P7): `populate()` no longer calls this — it calls the
-/// DB-only [`resolve_user_secret_known_keys`] instead (the env writer
-/// discards the VALUES anyway, so resolving them was pure keychain waste).
-/// This value-resolving variant is RETAINED (not deleted) because it is
-/// the reference for the hub's parallel user-secret bucket loop and the
-/// `known_keys`-parity test below pins the two in lockstep. Test-only
-/// after the split, hence the `not(test)` dead-code allow.
-#[cfg_attr(not(test), allow(dead_code))]
-fn resolve_user_secret_state(db: &Db, project_id: &str) -> (Vec<(String, String)>, Vec<String>) {
-    // Per-project bucket (existing behaviour, byte-identical to pre-H2).
-    let per_project_keys = db.list_user_secret_keys_for_project(project_id);
-    // Shared bucket — applies to every registered project for this user.
-    let shared_keys = db.list_shared_user_secret_keys();
-    // Global bucket — applies machine-wide.
-    let global_keys = db.list_global_user_secret_keys();
-
-    let mut pairs: Vec<(String, String)> =
-        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
-    let mut known_keys: Vec<String> =
-        Vec::with_capacity(per_project_keys.len() + shared_keys.len() + global_keys.len());
-
-    // Helper closure: resolve one bucket. `scope_str` drives the active-flag
-    // gate; `slot_project_id` drives both the active-flag gate AND the
-    // keychain lookup (matches the writer's slot — SENTINEL_SHARED for
-    // shared, SENTINEL_GLOBAL for global, real UUID for per-project).
-    // Shared and global use module_id='user' across the board.
-    fn resolve_one_bucket(
-        db: &Db,
-        keys: &[String],
-        scope_str: &str,
-        slot_project_id: &str,
-        keychain_scope: crate::secrets::SecretScope<'_>,
-        out_pairs: &mut Vec<(String, String)>,
-        out_known: &mut Vec<String>,
-        already_emitted: &std::collections::HashSet<String>,
-        // GAP-2 (2026-07-14): when true, keys STILL enter `out_known` (so the
-        // env writer strips any previously-emitted copies) but are NEVER
-        // emitted into `out_pairs` — the bulk shared-secrets opt-out posture.
-        // Only the shared bucket passes `true` here (gated on the flag).
-        emit_disabled: bool,
-    ) {
-        for key in keys {
-            // The known-keys list always carries the key (drives strip
-            // set on the writer side). De-duplication on `out_known`
-            // prevents the same key showing up twice if it lives in
-            // multiple buckets.
-            if !out_known.iter().any(|k| k == key) {
-                out_known.push(key.clone());
-            }
-            // GAP-2: opt-out project → key is known (→ stripped) but never
-            // emitted as a pair. Exactly the inactive-key posture.
-            if emit_disabled {
-                continue;
-            }
-            // Skip emit if a previous bucket already populated this key.
-            // Bucket order = per-project → shared → global, so
-            // per-project wins (matches SecretsPanel's read order).
-            if already_emitted.contains(key) {
-                continue;
-            }
-            let active = crate::db::secret_active::is_secret_active_cross_launcher(
-                db,
-                scope_str,
-                slot_project_id,
-                "user",
-                key,
-            );
-            if !active {
-                continue;
-            }
-            match crate::secrets::get(keychain_scope, "user", key) {
-                Ok(Some(v)) => {
-                    out_pairs.push((key.clone(), v));
-                }
-                // Keychain has no value for this row (e.g. user removed
-                // via the OS keychain UI directly) — skip emit. The
-                // strip set still carries the key.
-                Ok(None) => {}
-                // Keychain backend unreachable — soft-fail.
-                Err(_) => {}
-            }
-        }
-    }
-
-    // Track keys already emitted so collisions across buckets resolve
-    // first-bucket-wins.
-    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
-
-    // 1. Per-project bucket — wins on collisions with shared/global.
-    resolve_one_bucket(
-        db,
-        &per_project_keys,
-        "per_project",
-        project_id,
-        crate::secrets::SecretScope::PerProject { project_id },
-        &mut pairs,
-        &mut known_keys,
-        &emitted,
-        false, // per-project bucket is never bulk-gated
-    );
-    for (k, _) in pairs.iter() {
-        emitted.insert(k.clone());
-    }
-
-    // 2. Shared bucket. GAP-2: gate on the per-project bulk opt-out. When
-    //    the flag is on, shared keys land in `known_keys` (stripped from env
-    //    surfaces) but never in `pairs`. Reads the SAME canonical gate the
-    //    core resolver uses (one home, `secret_scope_policy`), so the env
-    //    writer and the hub /env resolver never disagree.
-    let shared_secrets_read_disabled =
-        crate::db::secret_scope_policy::shared_secrets_read_disabled(db, project_id);
-    let shared_pairs_start = pairs.len();
-    resolve_one_bucket(
-        db,
-        &shared_keys,
-        "shared",
-        "_user_shared_",
-        crate::secrets::SecretScope::Shared {
-            project_id: "_user_shared_",
-        },
-        &mut pairs,
-        &mut known_keys,
-        &emitted,
-        shared_secrets_read_disabled,
-    );
-    for (k, _) in &pairs[shared_pairs_start..] {
-        emitted.insert(k.clone());
-    }
-
-    // 3. Global bucket. Machine-wide with distinct semantics — NOT covered
-    //    by the shared opt-out (per-key pause still applies).
-    resolve_one_bucket(
-        db,
-        &global_keys,
-        "global",
-        "_global_",
-        crate::secrets::SecretScope::Global,
-        &mut pairs,
-        &mut known_keys,
-        &emitted,
-        false, // global bucket is never bulk-gated
-    );
-
-    (pairs, known_keys)
-}
-
 // v0.2.92 W12 (Task 3) — `resolve_shared_kg_from_orchestrator_root` USED TO
 // LIVE HERE (PR-9, v0.2.11). It was a private copy of legs 1+2 of the
 // shared-KG resolution chain; `shared_kg_binding::resolve_shared_kg_collection`
@@ -1667,7 +1029,39 @@ pub fn should_regenerate_env_for_project(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::services::adoption::ServiceAdoption;
+
+    /// v0.2.97 (lane T): the bundled code-embedding manifest's health URL
+    /// names the port THIS resolver answers (it said 11438, a port nothing
+    /// serves). Lane W: it names it through `{code_embed_port}`, so the two
+    /// agree under an override as well as on a machine with none.
+    #[test]
+    fn code_embedding_health_url_is_the_resolvers_default() {
+        let _state = vct_launcher_core::test_env::state_dir_guard();
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
+        let db = Db::open().unwrap();
+        let (_, body) = vct_launcher_core::bundled_manifests::BUNDLED_MANIFESTS
+            .iter()
+            .find(|(name, _)| *name == "vct-code-embedding.json")
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_str(body).unwrap();
+        let url = manifest["runtime"]["health_check"]["url"].as_str().unwrap().to_string();
+        let ctx = vct_launcher_core::manifest::PlaceholderCtx::new("vct-code-embedding");
+        let expect = || format!("http://localhost:{}/health", resolve_code_embed_port(&db));
+        assert_eq!(ctx.resolve(&url), expect());
+        assert_eq!(resolve_code_embed_port(&db), DEFAULT_CODE_EMBED_PORT);
+        db.app_state_set(endpoints::APP_STATE_KEY_CODE_EMBED_PORT, "21441").unwrap();
+        assert_eq!(resolve_code_embed_port(&db), DEFAULT_CODE_EMBED_PORT, "retired key");
+        db.service_endpoint_seed_for_tests(&vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
+            "code_embed",
+            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
+            "localhost",
+            21440,
+        ))
+        .unwrap();
+        assert_eq!(ctx.resolve(&url), expect());
+        assert_eq!(resolve_code_embed_port(&db), 21440);
+    }
 
     #[test]
     fn defaults_match_installer_constants() {
@@ -1688,13 +1082,8 @@ mod tests {
         assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
         assert_eq!(s.weaviate_url, "http://localhost:8081");
         assert_eq!(s.ollama_url, "http://localhost:11435");
-        assert_eq!(s.code_embed_url, "http://localhost:11440");
+        assert_eq!(s.code_embed_port, 11440);
         assert_eq!(s.active_embedding, "qwen3");
-        assert_eq!(s.shared_kg_write_disabled_str(), "false");
-        assert!(!s.shared_kg_write_disabled);
-        // v0.2.46 Decision B — symmetric read gate defaults to off.
-        assert_eq!(s.shared_kg_read_disabled_str(), "false");
-        assert!(!s.shared_kg_read_disabled);
         assert!(!s.use_gpu);
         assert!(s.cpu_only);
     }
@@ -1732,141 +1121,49 @@ mod tests {
         assert!(!peers.contains(&"client-alpha".to_string()));
     }
 
-    #[test]
-    fn resolve_code_graph_project_prefers_existing_binding() {
-        // existing-binding-wins (seams-lens #1c): a stored codegraph binding
-        // (even a LEGACY dropped-underscore prefix) is the SSOT — the resolver
-        // returns it verbatim, NEVER re-deriving. Old installs stay on their
-        // real collections.
-        use crate::db::models::ProjectHost;
-        let db = Db::open_in_memory().unwrap();
-        db.insert_project("p1", "My_Project", "/tmp/p1", ProjectHost::Base, "my-project")
-            .unwrap();
-        db.set_project_codegraph_binding(
-            "p1",
-            "MyProject", // legacy dropped-underscore prefix a pre-fix analyzer wrote
-            None,
-            None,
-            None,
-            None,
-            true,
-            &serde_json::Value::Null,
-        )
-        .unwrap();
-        // Binding wins even though canonical(name) would now be My_Project.
-        assert_eq!(
-            resolve_code_graph_project(&db, Some("p1"), "My_Project"),
-            "MyProject",
-        );
-    }
+    // The override / parallel / adopt / refuse port legs these tests used to
+    // pin one by one are cases in `tests/fixtures/service_endpoint_parity.json`
+    // now, executed against the ONE resolver in
+    // `vct_launcher_core::services::service_endpoints` (and its Python mirror).
 
+    /// v0.2.97: the projection's Weaviate URL IS the machine resolver's —
+    /// the value the hub's `/config` serves, from the `service_endpoints`
+    /// row. An adopted external Weaviate keeps its host, and `WEAVIATE_PORT`
+    /// is that URL's port. The retired statement env var and app_state
+    /// override move nothing.
     #[test]
-    fn resolve_code_graph_project_no_binding_uses_canonical() {
-        // No binding → underscore-PRESERVING canonical prefix (NOT the retired
-        // sanitize_kg_collection). project_id absent (test context) also derives.
-        use crate::db::models::ProjectHost;
+    fn populate_weaviate_url_is_the_machine_resolvers() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[
+            (endpoints::STATEMENT_ENV, Some("http://statement.invalid:1")),
+        ]);
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open_in_memory().unwrap();
-        db.insert_project("p1", "My_Project", "/tmp/p1", ProjectHost::Base, "my-project")
-            .unwrap();
-        assert_eq!(
-            resolve_code_graph_project(&db, Some("p1"), "My_Project"),
-            "My_Project",
-        );
-        assert_eq!(
-            resolve_code_graph_project(&db, None, "foo_bar"),
-            "Foo_bar",
-        );
-    }
+        let mut row = ServiceEndpointRow::new("weaviate", EndpointMode::AdoptedExternal, "weaviate.lan", 8090);
+        row.grpc_port = Some(50051);
+        db.service_endpoint_seed_for_tests(&row).unwrap();
+        let s = populate(&db, "Acme", None);
+        assert_eq!(s.weaviate_url, "http://weaviate.lan:8090");
+        assert_eq!(s.weaviate_url, endpoints::machine_weaviate_url(&db));
+        assert_eq!(s.weaviate_port, 8090);
 
-    #[test]
-    fn parse_port_from_url_handles_canonical_shapes() {
-        assert_eq!(parse_port_from_url("http://localhost:8081"), Some(8081));
-        assert_eq!(parse_port_from_url("http://localhost:8081/v1/meta"), Some(8081));
-        assert_eq!(parse_port_from_url("https://host:11445/path"), Some(11445));
-        assert_eq!(parse_port_from_url("http://localhost"), None);
-        assert_eq!(parse_port_from_url("not-a-url"), None);
-    }
-
-    #[test]
-    fn resolve_port_app_state_override_wins() {
-        let db = Db::open_in_memory().unwrap();
-        db.app_state_set(APP_STATE_KEY_WEAVIATE_PORT, "9999").unwrap();
-        let services = adoption::AdoptionState::default();
-        let p = resolve_port(
-            &db,
-            APP_STATE_KEY_WEAVIATE_PORT,
-            &services,
-            "weaviate",
-            DEFAULT_WEAVIATE_PORT,
-        );
-        assert_eq!(p, 9999);
-    }
-
-    #[test]
-    fn resolve_port_services_toml_parallel_used() {
-        let db = Db::open_in_memory().unwrap();
-        let mut services = adoption::AdoptionState::default();
-        services.upsert(ServiceAdoption {
-            name: "ollama".into(),
-            mode: AdoptionMode::Parallel,
-            external_url: Some("http://localhost:11435".into()),
-            parallel_port: Some(11445),
-            container_name: None,
-        });
-        let p = resolve_port(
-            &db,
-            APP_STATE_KEY_OLLAMA_PORT,
-            &services,
+        db.app_state_set(endpoints::APP_STATE_KEY_OLLAMA_PORT, "21436").unwrap();
+        assert_eq!(populate(&db, "Acme", None).ollama_port, DEFAULT_OLLAMA_PORT);
+        db.service_endpoint_seed_for_tests(&ServiceEndpointRow::new(
             "ollama",
-            DEFAULT_OLLAMA_PORT,
-        );
-        assert_eq!(p, 11445);
-    }
-
-    #[test]
-    fn resolve_port_services_toml_adopt_url_used() {
-        let db = Db::open_in_memory().unwrap();
-        let mut services = adoption::AdoptionState::default();
-        services.upsert(ServiceAdoption {
-            name: "weaviate".into(),
-            mode: AdoptionMode::Adopt,
-            external_url: Some("http://localhost:8090".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        let p = resolve_port(
-            &db,
-            APP_STATE_KEY_WEAVIATE_PORT,
-            &services,
-            "weaviate",
-            DEFAULT_WEAVIATE_PORT,
-        );
-        assert_eq!(p, 8090);
-    }
-
-    #[test]
-    fn resolve_port_refused_falls_through_to_default() {
-        let db = Db::open_in_memory().unwrap();
-        let mut services = adoption::AdoptionState::default();
-        services.upsert(ServiceAdoption {
-            name: "weaviate".into(),
-            mode: AdoptionMode::Refuse,
-            external_url: Some("http://localhost:9999".into()),
-            parallel_port: None,
-            container_name: None,
-        });
-        let p = resolve_port(
-            &db,
-            APP_STATE_KEY_WEAVIATE_PORT,
-            &services,
-            "weaviate",
-            DEFAULT_WEAVIATE_PORT,
-        );
-        assert_eq!(p, DEFAULT_WEAVIATE_PORT);
+            EndpointMode::AdoptedExternal,
+            "localhost",
+            21435,
+        ))
+        .unwrap();
+        assert_eq!(populate(&db, "Acme", None).ollama_port, 21435);
     }
 
     #[test]
     fn populate_with_no_state_returns_canonical_defaults() {
+        // About the compiled default itself (nothing is requested).
+        let _allow = endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open_in_memory().unwrap();
         let s = populate(&db, "Acme", None);
         assert_eq!(s.active_embedding, "qwen3");
@@ -1875,10 +1172,6 @@ mod tests {
         assert_eq!(s.code_embed_port, DEFAULT_CODE_EMBED_PORT);
         assert_eq!(s.kg_collection, "Acme_KnowledgeGraph");
         assert_eq!(s.shared_kg_collection, "VibeCodedOrchestrator_KnowledgeGraph");
-        assert!(!s.shared_kg_write_disabled);
-        // v0.2.46 Decision B — symmetric read gate defaults off when
-        // no project row exists (populate gets `None` for project_id).
-        assert!(!s.shared_kg_read_disabled);
     }
 
     #[test]
@@ -2109,6 +1402,14 @@ mod tests {
         assert!(!app_state_key_triggers_env_reprojection(
             APP_STATE_KEY_SHARED_KG_NAME
         ));
+        // v0.2.97: the retired port-override keys feed no projection.
+        for key in [
+            endpoints::APP_STATE_KEY_WEAVIATE_PORT,
+            endpoints::APP_STATE_KEY_OLLAMA_PORT,
+            endpoints::APP_STATE_KEY_CODE_EMBED_PORT,
+        ] {
+            assert!(!app_state_key_triggers_env_reprojection(key), "{key}");
+        }
         assert!(!app_state_key_triggers_env_reprojection("onboarding.complete"));
         assert!(!app_state_key_triggers_env_reprojection(APP_STATE_KEY_USE_GPU));
     }
@@ -2694,7 +1995,8 @@ mod tests {
     /// populate consumed it (a read happened → the pin fails).
     ///
     /// Fails on the pre-fix tree: pre-D8.1 populate called
-    /// `github_pat_for_env` (1 PAT read) + `resolve_user_secret_state`
+    /// `github_pat_for_env` (1 PAT read; renamed `resolve_github_pat` in
+    /// v0.2.97, now read only by the PAT status surfaces) + `resolve_user_secret_state`
     /// (one `secrets::get` per active key), so both probes would return
     /// `Ok` and the assertions flip.
     #[test]
@@ -2766,22 +2068,10 @@ mod tests {
         );
         secrets::for_tests::fail_next_get("MY_API_KEY");
 
-        let s = populate(&db, "SecretsProject", Some("p-secrets"));
-
-        // D8.1 contract: no VALUES resolved.
-        assert!(
-            s.github_token.is_none(),
-            "populate must not resolve the PAT value (D8.1)"
-        );
-        assert!(
-            s.user_secret_pairs.is_empty(),
-            "populate must not resolve user-secret values (D8.1)"
-        );
-        // But the STRIP set (DB-only) IS still populated.
-        assert!(
-            s.user_secret_known_keys.iter().any(|k| k == "MY_API_KEY"),
-            "populate must still resolve the DB-only known-keys strip set"
-        );
+        // v0.2.97: the settings struct no longer carries secret fields at
+        // all (their only reader, the retired Rust env writer, is gone), so
+        // the pending-fail probe below is the whole contract.
+        let _ = populate(&db, "SecretsProject", Some("p-secrets"));
 
         // Probe: the fails must be STILL PENDING (populate read neither
         // value). A pending fail ⇒ direct get returns Err; a consumed fail
@@ -2805,67 +2095,4 @@ mod tests {
 
     // ─── v0.2.84 WP-2 (P7 D8.1): known-keys parity across the split ─────
 
-    /// `resolve_user_secret_known_keys` (DB-only) must produce a
-    /// `known_keys` list BYTE-IDENTICAL to the value-resolving
-    /// `resolve_user_secret_state`'s second tuple element — the strip set
-    /// the writer depends on. Proves the split preserved the ordering +
-    /// de-dup contract (per-project → shared → global, first-seen wins).
-    #[test]
-    fn known_keys_split_matches_full_resolver() {
-        use crate::db::models::ProjectHost;
-        use crate::secrets::{self, SecretScope};
-
-        let _g = secrets::for_tests::MockGuard::new();
-        let db = Db::open_in_memory().unwrap();
-        db.insert_project(
-            "p-keys",
-            "KeysProject",
-            "/tmp/vct-test-p-keys",
-            ProjectHost::Base,
-            "keysproject",
-        )
-        .unwrap();
-
-        // Per-project keys (two), one shared (also duplicated per-project to
-        // exercise the de-dup), one global.
-        for (scope_str, pid, scope) in [
-            ("per_project", "p-keys", SecretScope::PerProject { project_id: "p-keys" }),
-        ] {
-            for key in ["ZED_KEY", "ALPHA_KEY"] {
-                secrets::set(scope, "user", key, "v").unwrap();
-                db.mark_secret_active(scope_str, pid, "user", key).unwrap();
-            }
-        }
-        // Shared bucket: one new key + one colliding with a per-project key.
-        secrets::set(
-            SecretScope::Shared { project_id: "_user_shared_" },
-            "user",
-            "SHARED_ONLY",
-            "v",
-        )
-        .unwrap();
-        db.mark_secret_active("shared", "_user_shared_", "user", "SHARED_ONLY")
-            .unwrap();
-        secrets::set(
-            SecretScope::Shared { project_id: "_user_shared_" },
-            "user",
-            "ALPHA_KEY",
-            "v",
-        )
-        .unwrap();
-        db.mark_secret_active("shared", "_user_shared_", "user", "ALPHA_KEY")
-            .unwrap();
-        // Global bucket: one new key.
-        secrets::set(SecretScope::Global, "user", "GLOBAL_ONLY", "v").unwrap();
-        db.mark_secret_active("global", "_global_", "user", "GLOBAL_ONLY")
-            .unwrap();
-
-        let (_pairs, full_known) = resolve_user_secret_state(&db, "p-keys");
-        let split_known = resolve_user_secret_known_keys(&db, "p-keys");
-        assert_eq!(
-            split_known, full_known,
-            "the DB-only known-keys split must byte-match the full \
-             resolver's known_keys (ordering + de-dup contract)"
-        );
-    }
 }
