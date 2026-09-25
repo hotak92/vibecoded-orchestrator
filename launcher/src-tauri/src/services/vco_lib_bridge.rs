@@ -1013,6 +1013,67 @@ mod tests {
         std::env::remove_var("KG_COLLECTION");
     }
 
+    /// R12-bis N4 wiring test (vco_lib sandbox call-site): the child env
+    /// is EXACTLY the ONE child-env table's present pairs plus this
+    /// site's documented extras (`VCT_STATE_DIR`, `VCT_HUB_PORT`,
+    /// `VCT_HUB_TOKEN`, `VCT_INSTALL_ROOT`) — nothing else. Runs the
+    /// REAL builder (`reinject_minimal_env`) and inspects the resulting
+    /// `Command`'s envs via `get_envs()`, so reverting the
+    /// `child_env::reinject_std` call inside it to a hand-rolled key
+    /// list goes RED here instead of drifting silently. NOT a
+    /// source-text grep.
+    ///
+    /// Every table key is seeded in the parent env first, so an
+    /// omitting revert cannot hide behind "the key was absent anyway".
+    #[test]
+    fn sandbox_env_is_exactly_the_child_env_table_plus_the_vct_extras() {
+        let table_keys = ["PATH", "TEMP", "TMP", "TMPDIR", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "COMSPEC"];
+        let mut vars: Vec<(String, Option<String>)> = table_keys
+            .iter()
+            .map(|k| (k.to_string(), Some(format!("sentinel-{k}"))))
+            .collect();
+        for key in ["VCT_STATE_DIR", "VCT_HUB_PORT", "VCT_HUB_TOKEN", "VCT_INSTALL_ROOT"] {
+            vars.push((key.to_string(), Some(format!("sentinel-{key}"))));
+        }
+        vars.push(("KG_COLLECTION".into(), Some("leaky-decoy".into())));
+        let vars: Vec<(&str, Option<&str>)> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+
+        vct_launcher_core::test_env::with_env_vars(&vars, || {
+            let mut cmd = Command::new("python3"); // never spawned
+            reinject_minimal_env(&mut cmd);
+
+            let mut expected: std::collections::BTreeMap<String, String> =
+                vct_launcher_core::services::child_env::present_pairs()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+            for key in ["VCT_STATE_DIR", "VCT_HUB_PORT", "VCT_HUB_TOKEN", "VCT_INSTALL_ROOT"] {
+                expected.insert(key.to_string(), format!("sentinel-{key}"));
+            }
+
+            let envs: std::collections::BTreeMap<String, String> = cmd
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.expect("env_clear leaves no removed-key entries")
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                envs, expected,
+                "vco_lib sandbox env must be EXACTLY the child_env table's \
+                 present pairs + the four VCT resolver hints — a hand-rolled \
+                 list at this site has drifted"
+            );
+            assert!(!envs.contains_key("KG_COLLECTION"));
+        });
+    }
+
     /// An allowlisted key present in the parent env IS re-injected.
     #[test]
     fn keeps_allowlisted_key() {

@@ -1788,6 +1788,31 @@ mod tests {
         crate::secrets::test_serialize::keychain_serialize_lock()
     }
 
+    /// Cleanup keychain delete that does not swallow its error (v0.2.97
+    /// flaky-keychain-test sweep, 2026-09-25): a positively-identified
+    /// Secret-Service timeout is logged (best-effort cleanup after the
+    /// asserts have already held — the same tolerance class as the
+    /// installer's `clean_keychain!` skip), any other Err PANICS — a
+    /// silently-failed delete leaves residue in the OS keychain that a
+    /// later run can misread. Uses the ONE shared predicate in
+    /// `secrets::for_tests::is_keychain_unavailable_err`.
+    fn cleanup_keychain_delete(scope: secrets::SecretScope, module_id: &str, key: &str) {
+        if let Err(e) = secrets::delete(scope, module_id, key) {
+            if crate::secrets::for_tests::is_keychain_unavailable_err(&e) {
+                eprintln!(
+                    "[cleanup] keychain delete of {}/{} skipped (Secret Service \
+                     too slow/unavailable under load): {}",
+                    module_id, key, e
+                );
+            } else {
+                panic!(
+                    "cleanup keychain delete of {}/{} failed (residue risk): {}",
+                    module_id, key, e
+                );
+            }
+        }
+    }
+
     /// Point `$VCT_SECRETS_DIR` at a fresh, empty tier-2 file store for
     /// the lifetime of the returned guard, restoring the prior value (set
     /// or unset) on drop — including on panic.
@@ -2082,8 +2107,10 @@ mod tests {
             "reactivate did not restore the read gate; user would have to re-enter the value"
         );
 
-        // Cleanup keychain (best-effort).
-        let _ = secrets::delete(scope_enum, module_id, &key);
+        // Cleanup keychain (v0.2.97 flaky-class sweep: the delete's error
+        // is no longer swallowed — a silently-failed delete leaves keychain
+        // residue; only a proven Secret-Service timeout is tolerated).
+        cleanup_keychain_delete(scope_enum, module_id, &key);
         let _ = db.forget_secret_active_state(scope, project_id, module_id, &key);
     }
 
@@ -3788,7 +3815,7 @@ mod tests {
         assert_eq!(winner_pp, ("shared".to_string(), WinningStore::Keychain));
 
         // Cleanup.
-        let _ = secrets::delete(shared_scope, "user", &key);
+        cleanup_keychain_delete(shared_scope, "user", &key);
         let _ = db.forget_secret_active_state("shared", SENTINEL_SHARED, "user", &key);
         let _ = db.forget_secret_active_state("per_project", "pwin", "user", &key);
     }

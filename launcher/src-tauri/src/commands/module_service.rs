@@ -400,6 +400,30 @@ impl ContainerCli for SystemContainerCli {
     }
 }
 
+/// Build the `podman run` child — argv + the scrubbed env. Extracted
+/// from `launch_prepared_start` (v0.2.97 R12-bis N4) as the wiring-test
+/// seam: the test inspects the EXACT env the spawned runtime child
+/// would receive via `get_envs()`, so reverting this site to a
+/// hand-rolled key list goes red instead of silently drifting from
+/// `services::child_env`. Behaviour-identical to the pre-extraction
+/// inline block.
+fn build_container_run_command(
+    podman: &str,
+    spawn: &vct_launcher_core::services::container_runtime::SpawnArgs,
+) -> Command {
+    let mut cmd = Command::new(podman).silent();
+    cmd.args(&spawn.args);
+    cmd.env_clear();
+    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
+    // family, per-OS — the same keys the decide child and the vco_lib
+    // sandbox receive.
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
+    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
+    // in this child's environment, never in its argv.
+    spawn.apply_secret_env(&mut cmd);
+    cmd
+}
+
 /// Run a [`PreparedStart`]: pre-pull, `rm -f` any same-named container,
 /// create the volume dirs, `podman run`. Returns the container name.
 async fn launch_prepared_start(
@@ -448,16 +472,7 @@ async fn launch_prepared_start(
 
     // v0.2.54 (P0-4): `spawn` (built above) threads the detected engine +
     // gpu_mode so variant-declaring manifests get the right GPU flags.
-    let mut cmd = Command::new(&podman).silent();
-    cmd.args(&spawn.args);
-    cmd.env_clear();
-    // The ONE shared child-env table (R12-bis P2-1): home/temp/system
-    // family, per-OS — the same keys the decide child and the vco_lib
-    // sandbox receive.
-    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
-    // v0.2.97 (lane V): secret values reach `podman run -e KEY` only here —
-    // in this child's environment, never in its argv.
-    spawn.apply_secret_env(&mut cmd);
+    let mut cmd = build_container_run_command(&podman, &spawn);
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
     // v0.2.67: kill_on_drop is LOAD-BEARING for the 60s timeout below.
@@ -3639,6 +3654,7 @@ pub async fn retry_failed_module_installs(
 mod tests {
     use super::*;
     use vct_launcher_core::services::container_runtime::build_podman_run_args;
+    use vct_launcher_core::services::container_runtime::SpawnArgs;
     use crate::db::models::ProjectHost;
     use crate::manifest::{
         Compatibility, ContainerInstallBlock, HealthCheck, InstallBlock, InstallMethod,
@@ -3646,6 +3662,69 @@ mod tests {
         VolumeMount,
     };
     use std::collections::HashMap;
+
+    /// R12-bis N4 wiring test (module_service spawn call-site): the
+    /// `podman run` child's env is EXACTLY the ONE child-env table's
+    /// present pairs plus this site's documented extras (the injected
+    /// secret env — empty here, so no extras) — nothing else. Runs the
+    /// REAL builder (`build_container_run_command`) and inspects the
+    /// resulting `Command`'s envs via `get_envs()`, so reverting the
+    /// `child_env::reinject_tokio` call inside it to a hand-rolled key
+    /// list goes RED here instead of drifting silently. NOT a
+    /// source-text grep.
+    ///
+    /// Every table key is seeded in the parent env first, so an
+    /// omitting revert cannot hide behind "the key was absent anyway".
+    #[test]
+    fn container_run_child_env_is_exactly_the_child_env_table() {
+        let table_keys = ["PATH", "TEMP", "TMP", "TMPDIR", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "COMSPEC"];
+        let vars: Vec<(String, Option<String>)> = table_keys
+            .iter()
+            .map(|k| (k.to_string(), Some(format!("sentinel-{k}"))))
+            .chain(std::iter::once((
+                "KG_COLLECTION".to_string(),
+                Some("leaky-decoy".to_string()),
+            )))
+            .collect();
+        let vars: Vec<(&str, Option<&str>)> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+
+        vct_launcher_core::test_env::with_env_vars(&vars, || {
+            // No secrets → the child env is exactly the table.
+            let spawn = SpawnArgs::new(
+                vec!["run".into(), "--name".into(), "wire-test".into()],
+                vec![],
+            );
+            let cmd = build_container_run_command("/nonexistent/podman", &spawn);
+
+            let expected: std::collections::BTreeMap<String, String> =
+                vct_launcher_core::services::child_env::present_pairs()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+
+            let envs: std::collections::BTreeMap<String, String> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.expect("env_clear leaves no removed-key entries")
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                envs, expected,
+                "container-run child env must be EXACTLY the child_env \
+                 table's present pairs (+ injected secrets, empty here) — a \
+                 hand-rolled list at this site has drifted"
+            );
+            assert!(!envs.contains_key("KG_COLLECTION"));
+        });
+    }
 
     fn make_project() -> ProjectRow {
         ProjectRow {

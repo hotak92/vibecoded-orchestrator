@@ -369,26 +369,79 @@ mod tests {
     // host's real podman/docker). The runtime caches are invalidated by
     // the command itself.
     // ───────────────────────────────────────────────────────────────
-    #[cfg(all(test, unix))]
+    #[cfg(test)]
     mod hermetic {
         use super::*;
-        use crate::commands::storage_ux::fake_runtime_support::fake_runtime;
         use std::path::{Path, PathBuf};
 
+        /// A fake runtime binary on the stub lookup PATH. POSIX reuses the
+        /// shared `fake_runtime_support::fake_runtime` (shell grammar);
+        /// Windows gets a local `.cmd` twin answering the same probe
+        /// grammar the Python resolver drives (`version` / `--version` /
+        /// `info` / `compose version` → exit 0, everything else → 1).
+        /// These stubs were the only thing keeping this module unix-only
+        /// (R12-bis N4(b)): the Err/Ok contract itself is OS-neutral.
+        #[cfg(unix)]
+        fn fake_runtime(dir: &Path, name: &str) {
+            crate::commands::storage_ux::fake_runtime_support::fake_runtime(dir, name, &[]);
+        }
+
+        #[cfg(windows)]
+        fn fake_runtime(dir: &Path, name: &str) {
+            // Found by the Python child's `shutil.which` via PATHEXT
+            // (.CMD is on the default PATHEXT); CreateProcess runs .cmd
+            // through cmd.exe, so `exit /b` codes propagate.
+            //
+            // Quoting (v0.2.97 follow-up): the stub's path may live
+            // under a %TEMP% containing spaces. Every spawner on the
+            // chain passes an ARG VECTOR, never a pre-built string —
+            // Rust std (>=1.77.2) applies the BatBadBut cmd.exe
+            // quoting rules when the program is a .bat/.cmd, and
+            // Python's list2cmdline quotes spaced paths — so the path
+            // itself arrives correctly quoted either way. The residual
+            // risk was INSIDE the script: `%1` KEEPS the caller's
+            // surrounding quotes, which would make `if "%1"=="info"`
+            // compare `"info"` against `info` and miss (stub answers 1
+            // → the Ok legs fail spuriously). `%~1`/`%~2` strip the
+            // surrounding quotes, so the probe grammar matches under
+            // either caller quoting. The script references no paths of
+            // its own — only these literals — so nothing else in it
+            // needs quoting.
+            let script = concat!(
+                "@echo off\r\n",
+                "if \"%~1 %~2\"==\"compose version\" exit /b 0\r\n",
+                "if \"%~1\"==\"info\" exit /b 0\r\n",
+                "if \"%~1\"==\"--version\" exit /b 0\r\n",
+                "if \"%~1\"==\"version\" exit /b 0\r\n",
+                "exit /b 1\r\n",
+            );
+            std::fs::write(dir.join(format!("{name}.cmd")), script).unwrap();
+        }
+
         /// A vco_lib-capable interpreter for the Ok legs: the resolver's
-        /// own ladder answer, else `/usr/bin/python3`, else any python3
-        /// on the real PATH. `None` means this host cannot run the Ok
-        /// contract at all — skip rather than fail (the same discipline
-        /// as `services::runtime`'s on-host probes).
+        /// own ladder answer, else the OS's system interpreter. `None`
+        /// means this host cannot run the Ok contract at all — skip
+        /// rather than fail (the same discipline as `services::runtime`'s
+        /// on-host probes).
         fn vco_lib_python() -> Option<PathBuf> {
             if let Some(p) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() {
                 return Some(p);
             }
-            let system = PathBuf::from("/usr/bin/python3");
-            if system.is_file() {
-                return Some(system);
+            #[cfg(unix)]
+            {
+                let system = PathBuf::from("/usr/bin/python3");
+                if system.is_file() {
+                    return Some(system);
+                }
+                vct_launcher_core::paths::which_on_path("python3")
             }
-            vct_launcher_core::paths::which_on_path("python3")
+            #[cfg(windows)]
+            {
+                // `python` (PATH, e.g. the runner's toolchain) else the
+                // `py` launcher — both accept `-m` / `-c` unchanged.
+                vct_launcher_core::paths::which_on_path("python")
+                    .or_else(|| vct_launcher_core::paths::which_on_path("py"))
+            }
         }
 
         /// True when `py` can import `vco_lib.runtime_reconcile` with the
@@ -412,6 +465,21 @@ mod tests {
         /// A `$VCT_VENV` that IS a broken interpreter: every invocation
         /// prints vco_lib's can't-import error and exits 1 — the shape of
         /// an install whose venv lost its vco_lib (loud-fail territory).
+        /// POSIX: a `#!/bin/sh` script; Windows: a `.cmd` twin (the
+        /// resolver accepts any existing file as the interpreter-binary
+        /// shape, and CreateProcess runs `.cmd` through cmd.exe, so the
+        /// stderr text and the exit code propagate to the decide child's
+        /// error surface). Quoting (v0.2.97 follow-up): the stub path
+        /// may live under a `%TEMP%` containing spaces — the decide
+        /// child spawns it via Rust std's arg-vector `Command::new(path)`
+        /// (tokio delegates to std), and std >=1.77.2 applies the
+        /// BatBadBut cmd.exe quoting rules for `.bat`/`.cmd` programs,
+        /// so a spaced path is quoted correctly and the script RUNS
+        /// rather than failing to spawn. The script body references no
+        /// paths — only literals — so it holds no further quoting
+        /// surface. $VCT_VENV carries the path as a plain env var (never
+        /// a command line), which needs no quoting.
+        #[cfg(unix)]
         fn broken_python(dir: &Path) -> PathBuf {
             use std::os::unix::fs::PermissionsExt;
             let script = dir.join("python");
@@ -421,6 +489,17 @@ mod tests {
             )
             .unwrap();
             std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            script
+        }
+
+        #[cfg(windows)]
+        fn broken_python(dir: &Path) -> PathBuf {
+            let script = dir.join("python.cmd");
+            std::fs::write(
+                &script,
+                "@echo off\r\necho ModuleNotFoundError: No module named 'vco_lib' 1>&2\r\nexit /b 1\r\n",
+            )
+            .unwrap();
             script
         }
 
@@ -477,7 +556,7 @@ mod tests {
             // A fake podman answering the resolver's probes (version /
             // info / compose version) on the stub PATH — nothing real.
             let dir = tempfile::tempdir().unwrap();
-            fake_runtime(dir.path(), "podman", &[]);
+            fake_runtime(dir.path(), "podman");
 
             let r = with_pinned_env(&py, dir.path(), async {
                 check_container_runtime_available().await

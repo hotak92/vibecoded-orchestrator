@@ -2685,6 +2685,27 @@ pub mod for_tests {
     use std::collections::{HashMap, HashSet};
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    /// True when an error string positively identifies a keychain-op
+    /// timeout / worker unavailability — the deterministic `Display`
+    /// strings of [`super::KeychainTimeout`], embedded verbatim in the
+    /// error details by `set_raw` / `get_with_context` /
+    /// `delete_with_context`. No other error source produces these
+    /// substrings, so matching them is positive identification.
+    ///
+    /// ONE home (v0.2.97 flaky-keychain-test sweep, 2026-09-25) for the
+    /// predicate every keychain-touching test module uses to separate
+    /// "Secret Service too slow under load → SKIP the test" from "real
+    /// failure → panic with the error" — instead of `.ok().flatten()`
+    /// swallowing the error and the assert blaming the product.
+    /// Consumers: `commands::installer::github_pat_keychain_tests`,
+    /// `commands::secrets_cmd` / `commands::dashboard` real-keychain
+    /// tests, `vct-hub::modules_api` resolver tests.
+    pub fn is_keychain_unavailable_err(e: &str) -> bool {
+        e.contains("keychain operation timed out")
+            || e.contains("keychain worker stuck")
+            || e.contains("keychain worker unavailable")
+    }
+
     // ─── Hermetic keychain namespace (2026-09-17) ────────────────────────
     //
     // WHY THIS EXISTS. `commands::installer`'s github_pat tests addressed the

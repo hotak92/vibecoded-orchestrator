@@ -1199,13 +1199,6 @@ def _both_entry(root: Path, recorded: str, other: str, *, bind: str = "",
         holds = f"{other} holds VCO volumes (no containers)"
     else:
         holds = f"{other} holds VCO containers that are not running there"
-    if there == KIND_RUNNING:
-        holds = (f"{other} is running VCO containers as well" if here_running else
-                 f"{other} is running VCO containers")
-    elif there == KIND_VOLUMES:
-        holds = f"{other} holds VCO volumes (no containers)"
-    else:
-        holds = f"{other} holds VCO containers that are not running there"
     outcome = (f"VCO kept using {recorded}." if kept else
                f"{recorded} is not installed, so VCO started nothing.")
     if bind:

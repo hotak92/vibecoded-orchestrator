@@ -1839,6 +1839,29 @@ async fn git_clone(source: &str, git_ref: &str, dest: &Path) -> Result<(), Strin
     Ok(())
 }
 
+/// Build the post-install command child — argv + cwd + the scrubbed
+/// env. Extracted from `run_post_install_command` (v0.2.97 follow-up to
+/// R12-bis N4) as the wiring-test seam: the test inspects the EXACT env
+/// the spawned child would receive via `get_envs()`, so reverting the
+/// `child_env::reinject_tokio` call inside it to a hand-rolled key list
+/// goes red instead of silently drifting from `services::child_env`.
+/// Behaviour-identical to the pre-extraction inline block (stdio piping
+/// included — the caller reads the child's output).
+fn post_install_command(program: &str, args: &[String], cwd: &Path) -> Command {
+    let mut cmd = Command::new(program).silent();
+    cmd.args(args);
+    cmd.current_dir(cwd);
+    // Scrubbed env: only the ONE shared child-env table
+    // (`vct-launcher-core services::child_env`, R12-bis P2-1) — PATH +
+    // temp/locale keys + the per-OS home/system family.
+    cmd.env_clear();
+    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
+
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::piped());
+    cmd
+}
+
 async fn run_post_install_command(
     spec: &CommandSpec,
     ctx: &PlaceholderCtx,
@@ -1865,17 +1888,7 @@ async fn run_post_install_command(
         });
     let cwd = PathBuf::from(&cwd_str);
 
-    let mut cmd = Command::new(program).silent();
-    cmd.args(args);
-    cmd.current_dir(&cwd);
-    // Scrubbed env: only the ONE shared child-env table
-    // (`vct-launcher-core services::child_env`, R12-bis P2-1) — PATH +
-    // temp/locale keys + the per-OS home/system family.
-    cmd.env_clear();
-    vct_launcher_core::services::child_env::reinject_tokio(&mut cmd);
-
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    let mut cmd = post_install_command(program, args, &cwd);
 
     let timeout = Duration::from_secs(spec.timeout_s);
     let output = tokio::time::timeout(timeout, cmd.output())
@@ -2532,6 +2545,67 @@ mod tests {
     use super::*;
     use crate::commands::gpu_policy::GpuMode;
     use crate::manifest::GpuImageVariants;
+
+    /// R12-bis N4 wiring test (run_post_install_command call-site): the
+    /// post-install child's env is EXACTLY the ONE child-env table's
+    /// present pairs — nothing else (this site has no documented
+    /// extras). Runs the REAL builder (`post_install_command`) and
+    /// inspects the resulting `Command`'s envs via `get_envs()`, so
+    /// reverting the `child_env::reinject_tokio` call inside it to a
+    /// hand-rolled key list goes RED here instead of drifting
+    /// silently. NOT a source-text grep.
+    ///
+    /// Every table key is seeded in the parent env first, so an
+    /// omitting revert cannot hide behind "the key was absent anyway".
+    #[test]
+    fn post_install_child_env_is_exactly_the_child_env_table() {
+        let table_keys = ["PATH", "TEMP", "TMP", "TMPDIR", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "COMSPEC"];
+        let vars: Vec<(String, Option<String>)> = table_keys
+            .iter()
+            .map(|k| (k.to_string(), Some(format!("sentinel-{k}"))))
+            .chain(std::iter::once((
+                "KG_COLLECTION".to_string(),
+                Some("leaky-decoy".to_string()),
+            )))
+            .collect();
+        let vars: Vec<(&str, Option<&str>)> =
+            vars.iter().map(|(k, v)| (k.as_str(), v.as_deref())).collect();
+
+        vct_launcher_core::test_env::with_env_vars(&vars, || {
+            let cmd = post_install_command(
+                "/nonexistent/python3",
+                &["-m".to_string(), "some_module".to_string()],
+                Path::new("/nonexistent/cwd"),
+            );
+
+            let expected: std::collections::BTreeMap<String, String> =
+                vct_launcher_core::services::child_env::present_pairs()
+                    .into_iter()
+                    .map(|(k, v)| (k.to_string(), v))
+                    .collect();
+
+            let envs: std::collections::BTreeMap<String, String> = cmd
+                .as_std()
+                .get_envs()
+                .map(|(k, v)| {
+                    (
+                        k.to_string_lossy().to_string(),
+                        v.expect("env_clear leaves no removed-key entries")
+                            .to_string_lossy()
+                            .to_string(),
+                    )
+                })
+                .collect();
+
+            assert_eq!(
+                envs, expected,
+                "post-install child env must be EXACTLY the child_env \
+                 table's present pairs — a hand-rolled list at this site \
+                 has drifted"
+            );
+            assert!(!envs.contains_key("KG_COLLECTION"));
+        });
+    }
 
     fn manifest_with_variants(variants: Option<GpuImageVariants>) -> ModuleManifest {
         let mut m: ModuleManifest = serde_json::from_str(

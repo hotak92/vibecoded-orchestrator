@@ -1498,8 +1498,9 @@ mod tests {
             "keychain did not receive the secret"
         );
 
-        // Cleanup keychain best-effort.
-        let _ = crate::secrets::delete(
+        // Cleanup keychain (v0.2.97 flaky-class sweep: delete errors are
+        // no longer silently swallowed — see `cleanup_keychain_delete`).
+        cleanup_keychain_delete(
             crate::secrets::SecretScope::Global,
             &mcp_secret_module_id("test-secret-mcp"),
             "MY_API_KEY",
@@ -1794,10 +1795,39 @@ mod tests {
         );
 
         // Cleanup.
-        let _ = crate::secrets::delete(
+        cleanup_keychain_delete(
             crate::secrets::SecretScope::Global,
             &mcp_secret_module_id("legacy-mcp"),
             "LEGACY_PAT",
         );
+    }
+
+    /// Cleanup keychain delete that does not swallow its error (v0.2.97
+    /// flaky-keychain-test sweep, 2026-09-25): a positively-identified
+    /// Secret-Service timeout is logged (best-effort cleanup after the
+    /// asserts have already held), any other Err PANICS — a
+    /// silently-failed delete leaves residue in the OS keychain. Uses
+    /// the ONE shared predicate in
+    /// `secrets::for_tests::is_keychain_unavailable_err` (same helper
+    /// as `commands::secrets_cmd`'s tests).
+    fn cleanup_keychain_delete(
+        scope: crate::secrets::SecretScope,
+        module_id: &str,
+        key: &str,
+    ) {
+        if let Err(e) = crate::secrets::delete(scope, module_id, key) {
+            if crate::secrets::for_tests::is_keychain_unavailable_err(&e) {
+                eprintln!(
+                    "[cleanup] keychain delete of {}/{} skipped (Secret Service \
+                     too slow/unavailable under load): {}",
+                    module_id, key, e
+                );
+            } else {
+                panic!(
+                    "cleanup keychain delete of {}/{} failed (residue risk): {}",
+                    module_id, key, e
+                );
+            }
+        }
     }
 }

@@ -339,6 +339,83 @@ pub async fn decide_cached(opts: VerdictOpts<'_>) -> Result<RuntimeVerdict, Stri
     Ok(verdict)
 }
 
+/// Build the decide child's `Command` — argv + the scrubbed env.
+/// Extracted from [`decide_uncached`] (v0.2.97 R12-bis N4) as the
+/// wiring-test seam: the test inspects the EXACT env a spawned child
+/// would receive via `get_envs()`, so reverting this site to a
+/// hand-rolled key list goes red instead of silently drifting from
+/// `services::child_env`. Behaviour-identical to the pre-extraction
+/// inline block.
+///
+/// Env: the child probes runtime binaries and reads the pin, so it
+/// needs PATH, the home/temp/system family and VCT_CONTAINER_RUNTIME /
+/// VCT_TOOL_SEARCH_DIRS. The home family comes from the ONE shared
+/// child-env table (`services::child_env`, R12-bis P2-1) — per-OS, so
+/// a Windows child gets USERPROFILE/APPDATA/LOCALAPPDATA/
+/// HOMEDRIVE/HOMEPATH plus SYSTEMROOT/COMSPEC (it normally has no
+/// HOME; `Path.home()` and the runtime CLIs' config lookups read the
+/// Windows family, and without SYSTEMROOT a spawned python.exe fails
+/// to initialize). Nothing else is a decision input; per-launcher
+/// quirks must not leak in.
+#[allow(clippy::too_many_arguments)]
+fn decide_child_command(
+    python: &Path,
+    root: Option<&Path>,
+    mode: Mode,
+    purpose: Purpose,
+    path_env: Option<&std::ffi::OsStr>,
+    unset_keys: &[String],
+    env_pairs: &[(String, String)],
+) -> tokio::process::Command {
+    let mut cmd = tokio::process::Command::new(python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.runtime_reconcile")
+        .arg("decide")
+        .arg("--json")
+        .arg("--mode")
+        .arg(mode.as_str())
+        .arg("--purpose")
+        .arg(purpose.as_str());
+    if let Some(root) = root {
+        cmd.arg("--root").arg(root);
+        // `python -m` puts the CWD first on sys.path, so the child imports
+        // THIS clone's vco_lib ahead of anything the venv carries (the same
+        // rule `services::vco_lib_bridge` documents).
+        cmd.current_dir(root);
+    }
+    cmd.env_clear();
+    if let Some(path) = path_env {
+        cmd.env("PATH", path);
+    } else if let Some(p) = crate::paths::lookup_path() {
+        // The ONE process-PATH read (injectable per thread via
+        // `paths::with_lookup_path`) — not a hand-rolled var_os walk.
+        cmd.env("PATH", p);
+    }
+    for (key, value) in super::child_env::present_pairs() {
+        if key == "PATH" {
+            // Set above from the injectable lookup path — never re-read
+            // from the raw process env.
+            continue;
+        }
+        if unset_keys.iter().any(|k| k == key) {
+            continue;
+        }
+        cmd.env(key, value);
+    }
+    for key in ["VCT_CONTAINER_RUNTIME", "VCT_TOOL_SEARCH_DIRS"] {
+        if unset_keys.iter().any(|k| k == key) {
+            continue;
+        }
+        if let Ok(v) = std::env::var(key) {
+            cmd.env(key, v);
+        }
+    }
+    for (k, v) in env_pairs {
+        cmd.env(k, v);
+    }
+    cmd
+}
+
 /// The uncached spawn. Returns `Err` for every loud-fail shape (missing
 /// Python, spawn failure, timeout, bad exit code, unparseable JSON).
 pub async fn decide_uncached(opts: VerdictOpts<'_>) -> Result<RuntimeVerdict, String> {
@@ -364,63 +441,15 @@ pub async fn decide_uncached(opts: VerdictOpts<'_>) -> Result<RuntimeVerdict, St
         )?,
     };
 
-    let mut cmd = tokio::process::Command::new(&python).silent();
-    cmd.arg("-m")
-        .arg("vco_lib.runtime_reconcile")
-        .arg("decide")
-        .arg("--json")
-        .arg("--mode")
-        .arg(mode.as_str())
-        .arg("--purpose")
-        .arg(purpose.as_str());
-    if let Some(root) = &root {
-        cmd.arg("--root").arg(root);
-        // `python -m` puts the CWD first on sys.path, so the child imports
-        // THIS clone's vco_lib ahead of anything the venv carries (the same
-        // rule `services::vco_lib_bridge` documents).
-        cmd.current_dir(root);
-    }
-
-    // Env: the child probes runtime binaries and reads the pin, so it
-    // needs PATH, the home/temp/system family and VCT_CONTAINER_RUNTIME /
-    // VCT_TOOL_SEARCH_DIRS. The home family comes from the ONE shared
-    // child-env table (`services::child_env`, R12-bis P2-1) — per-OS, so
-    // a Windows child gets USERPROFILE/APPDATA/LOCALAPPDATA/
-    // HOMEDRIVE/HOMEPATH plus SYSTEMROOT/COMSPEC (it normally has no
-    // HOME; `Path.home()` and the runtime CLIs' config lookups read the
-    // Windows family, and without SYSTEMROOT a spawned python.exe fails
-    // to initialize). Nothing else is a decision input; per-launcher
-    // quirks must not leak in.
-    cmd.env_clear();
-    if let Some(path) = opts.path_env {
-        cmd.env("PATH", path);
-    } else if let Some(p) = crate::paths::lookup_path() {
-        // The ONE process-PATH read (injectable per thread via
-        // `paths::with_lookup_path`) — not a hand-rolled var_os walk.
-        cmd.env("PATH", p);
-    }
-    for (key, value) in super::child_env::present_pairs() {
-        if key == "PATH" {
-            // Set above from the injectable lookup path — never re-read
-            // from the raw process env.
-            continue;
-        }
-        if opts.unset_keys.iter().any(|k| k == key) {
-            continue;
-        }
-        cmd.env(key, value);
-    }
-    for key in ["VCT_CONTAINER_RUNTIME", "VCT_TOOL_SEARCH_DIRS"] {
-        if opts.unset_keys.iter().any(|k| k == key) {
-            continue;
-        }
-        if let Ok(v) = std::env::var(key) {
-            cmd.env(key, v);
-        }
-    }
-    for (k, v) in &opts.env_pairs {
-        cmd.env(k, v);
-    }
+    let mut cmd = decide_child_command(
+        &python,
+        root.as_deref(),
+        mode,
+        purpose,
+        opts.path_env.map(|v| v.as_os_str()),
+        &opts.unset_keys,
+        &opts.env_pairs,
+    );
 
     let out = tokio::time::timeout(DECIDE_TIMEOUT, cmd.output())
         .await
@@ -665,6 +694,93 @@ pub(crate) mod contract_support {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R12-bis N4 wiring test (decide-child call-site): the decide child's
+    /// env is EXACTLY the ONE child-env table's present pairs (minus the
+    /// keys `unset_keys` drops, PATH pinned from the injectable lookup
+    /// path) plus this site's documented extras (`VCT_CONTAINER_RUNTIME`,
+    /// `VCT_TOOL_SEARCH_DIRS`, `env_pairs`) — nothing else. Inspects the
+    /// built `Command`'s actual envs via `get_envs()`, so reverting the
+    /// call-site to a hand-rolled key list (dropping a table key) goes
+    /// RED here rather than drifting silently. NOT a source-text grep.
+    ///
+    /// Every table key is seeded in the parent env first, so an omitting
+    /// revert cannot hide behind "the key was absent anyway"; a decoy
+    /// (`KG_COLLECTION`) proves the `env_clear` really scrubs.
+    #[test]
+    fn decide_child_env_is_the_child_env_table_plus_documented_extras() {
+        // Sentinel values for every key the table may reinject (PATH is
+        // handled separately, from the injectable lookup path).
+        let table_keys = ["TEMP", "TMP", "TMPDIR", "USER", "LANG", "LC_ALL", "XDG_RUNTIME_DIR", "HOME", "USERPROFILE", "APPDATA", "LOCALAPPDATA", "HOMEDRIVE", "HOMEPATH", "SYSTEMROOT", "COMSPEC"];
+        let mut vars: Vec<(String, Option<String>)> = table_keys
+            .iter()
+            .map(|k| (k.to_string(), Some(format!("sentinel-{k}"))))
+            .collect();
+        // This site's documented extras, present in the parent.
+        vars.push(("VCT_CONTAINER_RUNTIME".into(), Some("podman".into())));
+        vars.push(("VCT_TOOL_SEARCH_DIRS".into(), Some("/sentinel-search".into())));
+        // The decoy the scrub must drop.
+        vars.push(("KG_COLLECTION".into(), Some("leaky-decoy".into())));
+        let vars: Vec<(&str, Option<&str>)> = vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_deref()))
+            .collect();
+
+        let lookup_path = std::path::PathBuf::from("/sentinel-lookup-path");
+        let unset = vec!["HOME".to_string()];
+        let pairs = vec![("VCT_DECIDE_TEST_PAIR".to_string(), "pair-value".to_string())];
+
+        let root = std::env::temp_dir();
+        crate::test_env::with_env_vars(&vars, || {
+            crate::paths::with_lookup_path(Some(lookup_path.as_os_str()), || {
+                let cmd = decide_child_command(
+                    std::path::Path::new("/nonexistent/python"),
+                    Some(&root),
+                    Mode::ReadOnly,
+                    Purpose::Infra,
+                    None, // path_env: None → the injectable lookup path
+                    &unset,
+                    &pairs,
+                );
+                // `get_envs()` after `env_clear` + reinjection: every
+                // entry is Some(value).
+                let envs: std::collections::BTreeMap<&std::ffi::OsStr, &std::ffi::OsStr> = cmd
+                    .as_std()
+                    .get_envs()
+                    .map(|(k, v)| (k, v.expect("env_clear leaves no removed-key entries")))
+                    .collect();
+
+                // Expected: the table's present pairs for THIS OS minus
+                // PATH (pinned below) minus the unset key …
+                let mut expected: std::collections::BTreeMap<std::ffi::OsString, std::ffi::OsString> =
+                    super::super::child_env::present_pairs()
+                        .into_iter()
+                        .filter(|(k, _)| *k != "PATH" && !unset.iter().any(|u| u == k))
+                        .map(|(k, v)| (k.into(), v.into()))
+                        .collect();
+                // … plus this site's documented extras …
+                expected.insert("VCT_CONTAINER_RUNTIME".into(), "podman".into());
+                expected.insert("VCT_TOOL_SEARCH_DIRS".into(), "/sentinel-search".into());
+                expected.insert("VCT_DECIDE_TEST_PAIR".into(), "pair-value".into());
+                // … plus PATH from the injectable lookup path.
+                expected.insert("PATH".into(), lookup_path.clone().into_os_string());
+
+                let expected: std::collections::BTreeMap<&std::ffi::OsStr, &std::ffi::OsStr> =
+                    expected.iter().map(|(k, v)| (k.as_os_str(), v.as_os_str())).collect();
+
+                assert_eq!(
+                    envs, expected,
+                    "decide child env must be EXACTLY the child_env table's \
+                     present pairs (minus unset_keys, PATH pinned from the \
+                     lookup path) + VCT_CONTAINER_RUNTIME/VCT_TOOL_SEARCH_DIRS \
+                     + env_pairs — a hand-rolled list at this site has drifted"
+                );
+                // The unset key and the decoy are provably absent.
+                assert!(!envs.contains_key(std::ffi::OsStr::new("HOME")));
+                assert!(!envs.contains_key(std::ffi::OsStr::new("KG_COLLECTION")));
+            })
+        });
+    }
 
     #[test]
     fn verdict_parses_the_documented_schema() {

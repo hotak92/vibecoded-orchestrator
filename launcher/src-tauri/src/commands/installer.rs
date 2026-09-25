@@ -14723,36 +14723,91 @@ MemAvailable:   23456789 kB
             crate::db::Db::open_in_memory().unwrap()
         }
 
-        /// Read directly from the keychain — used to verify what
-        /// `register_github_pat` and the migration write. Bypasses the
-        /// active-flag gate so it's a raw fact-check.
-        fn keychain_value() -> Option<String> {
+        /// The raw read behind [`keychain_value!`] /
+        /// [`keychain_value_legacy!`] — Err is NEVER swallowed (see the
+        /// macros below for why). Bypasses the active-flag gate so the
+        /// callers are raw fact-checks.
+        fn keychain_read(module_id: &str) -> Result<Option<String>, String> {
             crate::secrets::get(
                 crate::secrets::SecretScope::Shared {
                     project_id: SENTINEL_SHARED,
                 },
-                GITHUB_PAT_MODULE_ID,
+                module_id,
                 GITHUB_PAT_KEY,
             )
-            .ok()
-            .flatten()
+        }
+
+        /// Read directly from the keychain — used to verify what
+        /// `register_github_pat` and the migration write. Bypasses the
+        /// active-flag gate so it's a raw fact-check.
+        ///
+        /// v0.2.97 (second instance of the flaky-run class, 2026-09-25):
+        /// this used to be a plain `fn` ending in `.ok().flatten()`, which
+        /// read a Secret-Service timeout as "slot empty" — the assert then
+        /// blamed the product ("old slot must hold the seed" left=None
+        /// although the seed had succeeded). The READ path gets the same
+        /// hardening `clean_keychain!` (delete) and `seed_keychain!` (set)
+        /// already have: a positively-identified timeout skips the test,
+        /// any other Err panics with the error text, `Ok(v)` is the slot's
+        /// value. Macro (not fn) so the skip can `return` from the test.
+        macro_rules! keychain_value {
+            ($home:expr) => {
+                match keychain_read(GITHUB_PAT_MODULE_ID) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            eprintln!(
+                                "[skip] Secret Service too slow/unavailable under \
+                                 load ({}); same posture as keyring_available() == \
+                                 false — not a product regression",
+                                e
+                            );
+                            std::fs::remove_dir_all(&$home).ok();
+                            return;
+                        }
+                        panic!(
+                            "reading shared.{}/{} failed (a failed read must not \
+                             masquerade as an empty slot): {}",
+                            GITHUB_PAT_MODULE_ID,
+                            GITHUB_PAT_KEY,
+                            e
+                        );
+                    }
+                }
+            };
         }
 
         /// Read directly from the LEGACY (`installer/`) keychain slot.
         /// Used by the module_id consolidation tests to check the old
         /// slot was emptied after migration. Pre-2026-05-10 this was
         /// the only writer slot; post-fix it's read-only and gets
-        /// drained on first `register_github_pat` call.
-        fn keychain_value_legacy() -> Option<String> {
-            crate::secrets::get(
-                crate::secrets::SecretScope::Shared {
-                    project_id: SENTINEL_SHARED,
-                },
-                GITHUB_PAT_LEGACY_MODULE_ID,
-                GITHUB_PAT_KEY,
-            )
-            .ok()
-            .flatten()
+        /// drained on first `register_github_pat` call. Same
+        /// no-swallowed-Err contract as [`keychain_value!`].
+        macro_rules! keychain_value_legacy {
+            ($home:expr) => {
+                match keychain_read(GITHUB_PAT_LEGACY_MODULE_ID) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        if is_keychain_unavailable_err(&e) {
+                            eprintln!(
+                                "[skip] Secret Service too slow/unavailable under \
+                                 load ({}); same posture as keyring_available() == \
+                                 false — not a product regression",
+                                e
+                            );
+                            std::fs::remove_dir_all(&$home).ok();
+                            return;
+                        }
+                        panic!(
+                            "reading shared.{}/{} failed (a failed read must not \
+                             masquerade as an empty slot): {}",
+                            GITHUB_PAT_LEGACY_MODULE_ID,
+                            GITHUB_PAT_KEY,
+                            e
+                        );
+                    }
+                }
+            };
         }
 
         fn delete_keychain() {
@@ -14804,9 +14859,9 @@ MemAvailable:   23456789 kB
         /// identification, not a guess. Any OTHER error is a real failure
         /// and must fail the test loudly.
         fn is_keychain_unavailable_err(e: &str) -> bool {
-            e.contains("keychain operation timed out")
-                || e.contains("keychain worker stuck")
-                || e.contains("keychain worker unavailable")
+            // v0.2.97 sweep: delegates to the ONE shared predicate in
+            // `secrets::for_tests` (same strings; see the home there).
+            crate::secrets::for_tests::is_keychain_unavailable_err(e)
         }
 
         /// Outcome of [`delete_keychain_checked`].
@@ -14984,7 +15039,7 @@ MemAvailable:   23456789 kB
             // delete user-owned files in `~/.vct-secrets/shared/`.
 
             // Keychain has the value (raw — bypass the active gate).
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
 
             // The active-flag-gated read also surfaces the canary.
             assert_eq!(
@@ -15100,7 +15155,7 @@ MemAvailable:   23456789 kB
             assert!(!report.already_done, "first run is not already_done: {:?}", report);
 
             // Keychain has the value.
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
 
             // File PRESERVED — this is the non-destructive contract.
             assert!(
@@ -15177,7 +15232,7 @@ MemAvailable:   23456789 kB
                 report,
             );
 
-            assert_eq!(keychain_value().as_deref(), Some(canary.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(canary.as_str()));
             assert!(
                 flat.exists(),
                 "migration must NOT delete legacy flat path (user-owned): {}",
@@ -15342,7 +15397,7 @@ MemAvailable:   23456789 kB
             let scope = crate::secrets::SecretScope::Shared {
                 project_id: SENTINEL_SHARED,
             };
-            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored = keychain_value!(home);
             let stored_trim = stored.as_deref().unwrap_or("").trim();
             let force = false;
             assert!(
@@ -15362,7 +15417,7 @@ MemAvailable:   23456789 kB
             // With force=true, the keychain set proceeds (matches the
             // command's behaviour after the guard).
             crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &new_token).unwrap();
-            assert_eq!(keychain_value().as_deref(), Some(new_token.as_str()));
+            assert_eq!(keychain_value!(home).as_deref(), Some(new_token.as_str()));
 
             delete_keychain();
             std::fs::remove_dir_all(&home).ok();
@@ -15387,7 +15442,7 @@ MemAvailable:   23456789 kB
             crate::secrets::set(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY, &token).unwrap();
 
             // Same token, force=false → guard predicate is FALSE.
-            let stored = crate::secrets::get(scope, GITHUB_PAT_MODULE_ID, GITHUB_PAT_KEY).unwrap();
+            let stored = keychain_value!(home);
             let stored_trim = stored.as_deref().unwrap_or("").trim();
             let guard_fires = !stored_trim.is_empty() && stored_trim != token.trim();
             assert!(
@@ -15655,13 +15710,13 @@ MemAvailable:   23456789 kB
 
             // The new (user) slot has the value.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(canary.as_str()),
                 "register flow must write to the user slot",
             );
             // The legacy (installer) slot stays empty — no shadow row.
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "register flow must NOT write to the legacy installer slot",
             );
 
@@ -15688,9 +15743,9 @@ MemAvailable:   23456789 kB
             // Seed the LEGACY slot only.
             seed_keychain!(home, scope, GITHUB_PAT_LEGACY_MODULE_ID, GITHUB_PAT_KEY, &canary);
             // Pre-condition: new slot empty, old slot full.
-            assert!(keychain_value().is_none(), "new slot must start empty");
+            assert!(keychain_value!(home).is_none(), "new slot must start empty");
             assert_eq!(
-                keychain_value_legacy().as_deref(),
+                keychain_value_legacy!(home).as_deref(),
                 Some(canary.as_str()),
                 "old slot must hold the seed",
             );
@@ -15711,12 +15766,12 @@ MemAvailable:   23456789 kB
 
             // Post-condition: new slot has the value, old slot empty.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(canary.as_str()),
                 "value must be promoted to the user slot",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "old installer slot must be empty after migration",
             );
             assert_eq!(
@@ -15766,12 +15821,12 @@ MemAvailable:   23456789 kB
 
             // Post-condition: new slot retains its value, old slot empty.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(new_canary.as_str()),
                 "new slot value must NOT be overwritten when both slots had values",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "old installer slot must be cleared regardless of winner",
             );
 
@@ -15804,8 +15859,8 @@ MemAvailable:   23456789 kB
             assert!(report.flag_set, "expected flag_set=true: {:?}", report);
 
             // Both slots still empty.
-            assert!(keychain_value().is_none());
-            assert!(keychain_value_legacy().is_none());
+            assert!(keychain_value!(home).is_none());
+            assert!(keychain_value_legacy!(home).is_none());
 
             // Run #2: idempotent — already_done short-circuits.
             let report2 = migrate_github_pat_installer_to_user_module_id(&db).unwrap();
@@ -15906,7 +15961,7 @@ MemAvailable:   23456789 kB
                 "post-migration, the same value resolves through the new slot",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "legacy slot must be empty post-migration",
             );
 
@@ -15994,12 +16049,12 @@ MemAvailable:   23456789 kB
 
             // Value lands at the user slot, not the legacy installer slot.
             assert_eq!(
-                keychain_value().as_deref(),
+                keychain_value!(home).as_deref(),
                 Some(file_canary.as_str()),
                 "file→keychain migration must write to the user slot post-flip",
             );
             assert!(
-                keychain_value_legacy().is_none(),
+                keychain_value_legacy!(home).is_none(),
                 "file→keychain migration must NOT write to the legacy installer slot",
             );
 

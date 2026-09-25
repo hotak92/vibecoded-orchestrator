@@ -1,7 +1,7 @@
 {
   "_comment": [
     "v0.2.97 R10 J2/J6/J8 — ONE fixture for \"where is VCO's data, and why was a stale runtime record not switched\",",
-    "read by tests/test_v0297_r10_runtime_evidence.py (Python: vco_lib.runtime_reconcile / vco_lib.containers) AND by",
+    "read by tests/test_v0297_r10_runtime_evidence.py (Python: vco_lib.runtime_reconcile / vco_lib.containers).",
     "Python-only since v0.2.97 R12 (the Rust mirrors were retired; the Rust surfaces render the ONE Python verdict through runtime_verdict::decide, so this fixture pins the Python side alone).",
     "`compose_project`: the compose project VCO's stack runs under — containers.compose_project_name of the compose",
     "dir + file text (a top-level `name:` wins, else the dir basename normalised); a volume compose made for VCO",

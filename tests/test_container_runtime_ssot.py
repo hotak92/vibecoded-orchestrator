@@ -779,3 +779,21 @@ def test_the_env_pin_is_never_reconciled(tmp_path: Path):
     assert res.requested_via == containers.PIN_VIA_ENV
     assert res.alternative_usable == "podman"
     assert any("VCT_CONTAINER_RUNTIME=docker" in w for w in warnings)
+
+
+def test_fixture_comments_name_retired_rust_readers_only_as_retired():
+    """R12bis verify N2: the fixtures' ``_comment`` blocks told a reader
+    which Rust functions consume them. Those readers were retired in v0.2.97
+    R12 (every Rust surface asks ``runtime_verdict::decide``); a comment
+    line may still NAME a retired function for history, but only on a line
+    that says it was retired."""
+    retired = ("candidate_order", "select_runtime", "decide_module_runtime",
+               "runtime_evidence.rs")
+    for rel in ("tests/fixtures/container_runtime_parity.json",
+                "tests/fixtures/runtime_data_evidence_cases.json"):
+        comment = json.loads((REPO_ROOT / rel).read_text(encoding="utf-8"))["_comment"]
+        for line in comment:
+            if any(name in line for name in retired):
+                assert "retired" in line, (
+                    f"{rel} _comment names a retired Rust reader as live: {line!r}"
+                )

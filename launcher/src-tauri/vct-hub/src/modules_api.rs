@@ -1257,6 +1257,13 @@ async fn project_env(
 /// Returning `Option<String>` rather than emitting a `serde_json::Value`
 /// keeps this independent of the response shape so the unit test can
 /// pin behaviour without standing up axum + a hub server.
+///
+/// v0.2.97 (2026-09-25, second instance of the flaky keychain-read class):
+/// the keychain read used to end in `.ok().flatten()`, which read a
+/// Secret-Service timeout as "not set" and the caller's assert blamed the
+/// product. The read is now `Result`-returning; the test-side macro
+/// `resolve_or_skip!` (in `mod tests`) skips on a positively-identified
+/// timeout-class error and panics on any other Err.
 #[cfg(test)]
 pub(crate) fn resolve_secret_for_subprocess_env(
     db: &vct_launcher_core::db::Db,
@@ -1264,21 +1271,21 @@ pub(crate) fn resolve_secret_for_subprocess_env(
     project_id: &str,
     module_id: &str,
     key: &str,
-) -> Option<String> {
+) -> Result<Option<String>, String> {
     // PR-3 Commit 4: cross-launcher pause check (Option γ). A secret
     // paused in any launcher's DB blocks the read here.
     let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher(
         db, scope_str, project_id, module_id, key,
     );
     if !active {
-        return None;
+        return Ok(None);
     }
     let scope = match scope_str {
         "global" => vct_launcher_core::secrets::SecretScope::Global,
         "shared" => vct_launcher_core::secrets::SecretScope::Shared { project_id },
         _ => vct_launcher_core::secrets::SecretScope::PerProject { project_id },
     };
-    vct_launcher_core::secrets::get(scope, module_id, key).ok().flatten()
+    vct_launcher_core::secrets::get(scope, module_id, key)
 }
 
 // ─── Manifest scanning (shared with commands::modules) ──────────────────
@@ -1327,6 +1334,43 @@ pub(crate) fn scan_manifests() -> Vec<(std::path::PathBuf, vct_launcher_core::ma
 mod tests {
     use super::*;
     use vct_launcher_core::db::Db;
+
+    /// True when the error string positively identifies a keychain-op
+    /// timeout / worker unavailability — the ONE shared predicate in
+    /// `vct_launcher_core::secrets::for_tests` (same home the installer's
+    /// keychain tests use).
+    fn is_keychain_unavailable_err(e: &str) -> bool {
+        vct_launcher_core::secrets::for_tests::is_keychain_unavailable_err(e)
+    }
+
+    /// Call [`resolve_secret_for_subprocess_env`] without swallowing its
+    /// Err (v0.2.97, second instance of the flaky keychain-read class):
+    /// a positively-identified timeout skips the test (same posture as
+    /// a missing keychain backend), any other Err panics with the error
+    /// text, Ok(v) is the resolved value.
+    macro_rules! resolve_or_skip {
+        ($db:expr, $scope:expr, $project:expr, $module:expr, $key:expr) => {
+            match resolve_secret_for_subprocess_env($db, $scope, $project, $module, $key) {
+                Ok(v) => v,
+                Err(e) => {
+                    if is_keychain_unavailable_err(&e) {
+                        eprintln!(
+                            "[skip] Secret Service too slow/unavailable under \
+                             load ({}); same posture as a missing keychain \
+                             backend — not a product regression",
+                            e
+                        );
+                        return;
+                    }
+                    panic!(
+                        "hub resolver test read of {}/{} failed (a failed read \
+                         must not masquerade as 'not set'): {}",
+                        $module, $key, e
+                    );
+                }
+            }
+        };
+    }
 
     /// v0.2.97 (lane V): `/modules/catalog` carries each module's health from
     /// the poller's registry — the machine-wide instance as `health`, the
@@ -1419,7 +1463,7 @@ mod tests {
         // While ACTIVE: the resolver returns the cleartext value (the
         // launcher's contract for unwrapped subprocess env vars).
         let resolved =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert_eq!(resolved.as_deref(), Some(canary.as_str()));
 
         // Unset (Lifecycle B): keychain UNTOUCHED, active flag flipped.
@@ -1438,7 +1482,7 @@ mod tests {
         // But the hub-side resolver MUST refuse to serve it. This is
         // the bug we're fixing in PR-3 Commit 3.
         let resolved_paused =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert!(
             resolved_paused.is_none(),
             "paused secret leaked through hub resolver: {:?}",
@@ -1449,15 +1493,30 @@ mod tests {
         db.mark_secret_active(scope_str, project_id, module_id, &key)
             .unwrap();
         let resolved_reactivated =
-            resolve_secret_for_subprocess_env(&db, scope_str, project_id, module_id, &key);
+            resolve_or_skip!(&db, scope_str, project_id, module_id, &key);
         assert_eq!(resolved_reactivated.as_deref(), Some(canary.as_str()));
 
-        // Cleanup keychain (best-effort).
-        let _ = vct_launcher_core::secrets::delete(
+        // Cleanup keychain (v0.2.97 flaky-class sweep: the delete's error
+        // is no longer swallowed — a timeout-class error is logged, any
+        // other Err panics).
+        if let Err(e) = vct_launcher_core::secrets::delete(
             vct_launcher_core::secrets::SecretScope::Global,
             module_id,
             &key,
-        );
+        ) {
+            if is_keychain_unavailable_err(&e) {
+                eprintln!(
+                    "[cleanup] keychain delete of {}/{} skipped (Secret Service \
+                     too slow/unavailable under load): {}",
+                    module_id, key, e
+                );
+            } else {
+                panic!(
+                    "cleanup keychain delete of {}/{} failed (residue risk): {}",
+                    module_id, key, e
+                );
+            }
+        }
         let _ = db.forget_secret_active_state(scope_str, project_id, module_id, &key);
     }
 
@@ -1468,12 +1527,12 @@ mod tests {
         // resolver returns None (omits the env var). Doesn't require the
         // keychain backend — `is_set` returns false on a never-written key.
         let db = Db::open_in_memory().unwrap();
-        let res = resolve_secret_for_subprocess_env(
+        let res = resolve_or_skip!(
             &db,
             "global",
             "_global_",
             "user",
-            "NEVER_SET_KEY_PR3_TEST",
+            "NEVER_SET_KEY_PR3_TEST"
         );
         assert!(res.is_none());
     }
