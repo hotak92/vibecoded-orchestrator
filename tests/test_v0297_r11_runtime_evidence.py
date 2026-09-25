@@ -17,11 +17,12 @@ stale runtime record, and the one home of VCO's compose project.
 * L7 — ``containers.own_compose_project`` is the one reader of VCO's compose
   project.
 
-The fixture sections run by BOTH languages are
 ``tests/fixtures/runtime_data_evidence_cases.json`` ``kind`` / ``bind_verdict``
-/ ``all_bind`` / ``bind_probe`` (Rust: ``runtime_evidence.rs`` tests) and the
-parity fixture's ``runtime_txt_stale_record_*`` rows. Every runtime is a FAKE;
-every install root is a tmp directory.
+/ ``all_bind`` / ``bind_probe`` run here (Python is the one home since
+v0.2.97 retired the Rust ``runtime_evidence`` mirror — Rust surfaces get
+these answers through ``runtime_verdict``'s decide client); the parity
+fixture's ``runtime_txt_stale_record_*`` rows cover the same logic on the
+Rust side. Every runtime is a FAKE; every install root is a tmp directory.
 """
 from __future__ import annotations
 
@@ -364,21 +365,26 @@ def _all_folders(tmp_path: Path, root: Path, *, create: bool = True) -> None:
 @pytest.mark.parametrize("create", [True, False], ids=["folders_hold_data", "folders_not_there"])
 @pytest.mark.parametrize("rewrite", [True, False], ids=["install", "read_only"])
 def test_every_service_in_a_folder_switches_a_missing_record(tmp_path, rewrite, create):
-    """L3: podman recorded, not installed; docker answers with nothing of
-    VCO's; every service (the code_embed cache included) is a folder. Before:
-    install refused and handed the user `--container docker`. Now install
-    re-records docker (informational) and read-only drives it."""
+    """L3 + R12 M1: podman recorded, not installed; docker answers with
+    nothing of VCO's; every service (the code_embed cache included) is a
+    folder. install re-records docker (a switch strands no named volume).
+    Read-only REFUSES with ``no_data``: rule (ii) now needs positive evidence
+    that docker serves VCO (a stopped container or a VCO volume), and
+    "nothing found anywhere" is not it — a session hook must not drive the
+    other runtime onto the folders on absence alone."""
     root = _root(tmp_path, "podman")
     _all_folders(tmp_path, root, create=create)
     m = Machine(installed={"docker"}, up={"docker"})
     res = rr.reconcile(root, env={}, which=m.which, run=m.run, rewrite=rewrite)
-    assert res.outcome is rr.Outcome.REWRITTEN and res.runtime == "docker", res.detail
-    assert "no named volume behind" in res.detail
     if rewrite:
+        assert res.outcome is rr.Outcome.REWRITTEN and res.runtime == "docker", res.detail
+        assert "no named volume behind" in res.detail
         assert containers.read_runtime_txt(root) == "docker"
         assert [e.condition_id for e in res.entries] == [rr.CID_RECORD_RECONCILED]
     else:
-        assert containers.read_runtime_txt(root) == "podman"
+        assert res.outcome is rr.Outcome.UNUSABLE and res.runtime is None, res.detail
+        assert res.decline == "no_data"
+        assert containers.read_runtime_txt(root) == "podman" and not res.entries
 
 
 def test_one_service_on_a_named_volume_keeps_the_bind_rule(tmp_path):
@@ -434,5 +440,5 @@ def test_the_guard_and_the_reconcile_ask_the_one_reader(tmp_path, monkeypatch):
     # The guard reads the compose file it is handed.
     monkeypatch.setattr(containers, "find_existing_container", lambda *_a, **_k: None)
     install_services_guard.foreign_owned_services(
-        ["weaviate"], "podman", root / "infrastructure", root / "infrastructure" / "x.yml")
+        ["weaviate"], "podman", root / "infrastructure" / "x.yml")
     assert seen[-1] == str(root / "infrastructure" / "x.yml")

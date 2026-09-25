@@ -20,7 +20,15 @@
     "switches; stopped VCO containers are `both`; otherwise `keep`. `all_bind`: does every VCT_*_DATA_SOURCE resolve to a",
     "path (the environment's value when set, even empty, else the LAST .env assignment)? `bind_probe`: is a folder in",
     "this `setup` VCO's data — missing / a file / empty are not; an entry, an unsearchable parent (EACCES) or an",
-    "unlistable folder are (not provably empty; never an error)."
+    "unlistable folder are (not provably empty; never an error).",
+    "v0.2.97 R12 M1/M8 (Python-only until lane SSOT-2 folds them into the Rust mirrors): `bind_verdict_positive_only` —",
+    "the READ-ONLY rule: rule (ii) (every service a folder, recorded runtime not installed) switches only when",
+    "the OTHER runtime holds positive evidence of VCO (`other != none`); with nothing found anywhere the verdict",
+    "is `keep` and the decline is `no_data`. `bind_sources_effective` — the ONE precedence resolver",
+    "`effective_data_sources`: a VCT_*_DATA_SOURCE key set in the environment (EVEN SET EMPTY) beats the file's",
+    "value, an unset key falls to the LAST .env assignment, and a key set nowhere means the service's named",
+    "volume; `expect` lists the path-valued sources (file-mentioned keys in file order, then env-only keys in",
+    "DATA_SOURCE_KEYS order) and `expect_all_bind` says whether every service resolved to a folder."
   ],
   "compose_project": [
     {"name": "the_infrastructure_dir", "compose_dir": "infrastructure", "compose_text": "services: {}\n", "expect": "infrastructure"},
@@ -107,5 +115,17 @@
     {"name": "a_folder_with_an_entry_is_data", "setup": "non_empty", "expect": true},
     {"name": "a_folder_under_an_unsearchable_parent_is_not_provably_empty", "setup": "unsearchable_parent", "expect": true},
     {"name": "a_folder_this_user_cannot_list_is_not_provably_empty", "setup": "unlistable", "expect": true}
+  ],
+  "bind_verdict_positive_only": [
+    {"name": "read_only_nothing_found_anywhere_all_bind", "other": "none", "pinned_missing": true, "all_bind": true, "here_running": false, "positive_only": true, "expect": "keep"},
+    {"name": "read_only_leftover_volume_all_bind", "other": "volumes", "pinned_missing": true, "all_bind": true, "here_running": false, "positive_only": true, "expect": "switch"},
+    {"name": "read_only_stopped_containers_all_bind", "other": "stopped", "pinned_missing": true, "all_bind": true, "here_running": false, "positive_only": true, "expect": "switch"},
+    {"name": "read_only_running_containers_all_bind", "other": "running", "pinned_missing": true, "all_bind": true, "here_running": false, "positive_only": true, "expect": "switch"},
+    {"name": "install_nothing_found_anywhere_all_bind_still_switches", "other": "none", "pinned_missing": true, "all_bind": true, "here_running": false, "positive_only": false, "expect": "switch"}
+  ],
+  "bind_sources_effective": [
+    {"name": "env_set_empty_beats_the_file_path", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\n", "env": {"VCT_WEAVIATE_DATA_SOURCE": ""}, "expect": ["/srv/o", "/srv/c"], "expect_all_bind": false},
+    {"name": "env_volume_name_beats_the_file_path", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\nVCT_OLLAMA_DATA_SOURCE=/srv/o\nVCT_CODE_EMBED_CACHE_SOURCE=/srv/c\n", "env": {"VCT_OLLAMA_DATA_SOURCE": "vco_ollama_data"}, "expect": ["/srv/w", "/srv/c"], "expect_all_bind": false},
+    {"name": "env_only_keys_follow_file_order", "env_file": "VCT_WEAVIATE_DATA_SOURCE=/srv/w\n", "env": {"VCT_CODE_EMBED_CACHE_SOURCE": "/srv/c", "VCT_OLLAMA_DATA_SOURCE": "/srv/o"}, "expect": ["/srv/w", "/srv/o", "/srv/c"], "expect_all_bind": true}
   ]
 }

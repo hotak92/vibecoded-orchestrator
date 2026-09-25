@@ -914,12 +914,18 @@ pub(crate) fn choice_event_payload(
 
 /// What the boot path says when there is no runtime to drive (v0.2.97 R11
 /// L6), and whether it also offers the "install a container runtime"
-/// dialog: a refused PIN says the pin was refused and why (and offers no
-/// install — the runtime may well be installed, only down, or the user's
-/// data may be under the pinned one); only "nothing installed or usable"
-/// is "No container runtime found". Pure.
+/// dialog. R12 M4: the dialog opens when NOTHING is installed at all
+/// (the verdict's `installed` is empty), PIN OR NOT — a pin naming a
+/// runtime this machine does not have is exactly what that dialog is
+/// for. A refused pin with a runtime installed (down, or the data sits
+/// under the pinned one) still suppresses the dialog: the refusal names
+/// the pin, why the stale record was not switched and what to do, and an
+/// "install a runtime" dialog would contradict it. Pure.
 pub(crate) fn boot_without_runtime(detection: &RuntimeDetection) -> (String, bool) {
-    (detection.no_runtime_message(), detection.refusal.is_none())
+    (
+        detection.no_runtime_message(),
+        detection.refusal.is_none() || detection.installed.is_none(),
+    )
 }
 
 /// Auto-start the shared services on launcher boot (background task).
@@ -1047,6 +1053,10 @@ mod services_lifecycle_tests {
                  docker is not installed (not switched: podman holds none of VCO's data)."
                     .into(),
             ),
+            // The verdict's `installed`: podman IS installed here (it is the
+            // repin target the refusal names), so the install dialog must
+            // NOT open.
+            installed: Some("podman".into()),
         };
         let (message, offer_install) = boot_without_runtime(&refused);
         assert!(message.contains("pinned to docker"), "{message}");
@@ -1056,6 +1066,31 @@ mod services_lifecycle_tests {
         let (message, offer_install) = boot_without_runtime(&RuntimeDetection::default());
         assert!(message.starts_with("No container runtime found"), "{message}");
         assert!(offer_install);
+    }
+
+    /// R12 M4: under ANY pin, when the verdict says NO container runtime is
+    /// installed at all (`installed` empty), the boot path opens the install
+    /// dialog — the pin names a runtime this machine simply does not have,
+    /// which is exactly what that dialog is for. A pin that refuses while a
+    /// runtime IS installed keeps suppressing it (see the test above).
+    #[test]
+    fn the_boot_path_offers_the_install_dialog_when_nothing_is_installed_even_under_a_pin() {
+        let refused_nothing_installed = RuntimeDetection {
+            info: None,
+            not_switched: None,
+            refusal: Some(
+                "The container runtime is pinned to docker by \
+                 VCT_CONTAINER_RUNTIME, and docker is not installed."
+                    .into(),
+            ),
+            installed: None,
+        };
+        let (message, offer_install) = boot_without_runtime(&refused_nothing_installed);
+        assert!(message.contains("pinned to docker"), "{message}");
+        assert!(
+            offer_install,
+            "no runtime installed at all: the install dialog must open, pin or not"
+        );
     }
 
     fn row(service: &str, mode: EndpointMode, port: u16) -> ServiceEndpointRow {

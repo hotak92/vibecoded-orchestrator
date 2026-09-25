@@ -1229,12 +1229,15 @@ mod tests {
         fake_runtime(dir.path(), "podman", &["weaviate_data"]);
         fake_runtime(dir.path(), "docker", &["weaviate_data"]);
         let root = tempfile::tempdir().unwrap();
+        use crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib;
+        use_checkout_vco_lib(root.path());
         let list = |pin: Option<&str>| {
-            with_fake_runtimes(
-                dir.path(),
-                pin,
-                existing_volumes_on_storage_runtime_at(Some(root.path()), "inspect"),
-            )
+            with_fake_runtimes(dir.path(), pin, async {
+                // The verdict cache keys (root, mode, purpose) — no pin — so
+                // each ask must not replay the previous one's answer.
+                vct_launcher_core::services::runtime_verdict::invalidate();
+                existing_volumes_on_storage_runtime_at(Some(root.path()), "inspect").await
+            })
             .unwrap()
         };
         assert_eq!(list(Some("docker"))[0].mountpoint, "/fake/docker/weaviate_data");
@@ -1573,19 +1576,28 @@ mod tests {
     /// reports a sensible `from_mode` based on launcher.toml and
     /// validates the target path. Anything that would mutate the
     /// filesystem should NOT happen during this call.
-    #[tokio::test]
-    async fn dry_run_validates_target_path_without_mutating() {
+    #[test]
+    fn dry_run_validates_target_path_without_mutating() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("vct-volumes-dryrun");
 
         // Pre-condition: dir doesn't yet exist; dry-run must not create it.
         assert!(!target.exists());
 
-        let plan = set_volumes_config_dry_run(target.to_string_lossy().to_string()).await;
-
-        // The plan succeeds (validation only — parent exists, path is
-        // absolute) regardless of whether existing volumes are running.
-        let plan = plan.expect("dry run returns plan");
+        // The dry run resolves the storage runtime itself (repo root, the
+        // thread's PATH) — under stubs both runtimes answer with no volumes,
+        // so the plan is deterministic instead of probing this host's
+        // daemons. The cache is invalidated first: another test may have
+        // cached a verdict for the repo-root key.
+        use crate::commands::storage_ux::fake_runtime_support::{fake_runtime, with_fake_runtimes};
+        let stubs = tempfile::tempdir().unwrap();
+        fake_runtime(stubs.path(), "podman", &[]);
+        fake_runtime(stubs.path(), "docker", &[]);
+        let plan = with_fake_runtimes(stubs.path(), None, async {
+            vct_launcher_core::services::runtime_verdict::invalidate();
+            set_volumes_config_dry_run(target.to_string_lossy().to_string()).await
+        })
+        .expect("dry run returns plan");
         assert!(plan.to_path.contains("vct-volumes-dryrun"));
         assert!(plan.warnings.iter().any(|w| !w.is_empty()));
 

@@ -68,7 +68,11 @@ unsearchable parent — counts, R11 L1), the other runtime's listing is read by
       switched (read-only drives it; install re-records it, informational);
 (ii)  the recorded runtime is NOT installed and EVERY service's data is a
       folder (:func:`all_services_bind`) → no named volume is stranded:
-      switched, read-only and at install;
+      switched at INSTALL. A READ-ONLY caller needs positive evidence that the
+      other runtime serves VCO (``other_kind != KIND_NONE`` — R12 M1: a
+      session hook must never drive the other runtime onto the folders on the
+      strength of "I found nothing anywhere"); ``KIND_NONE`` falls to the
+      ``no_data`` refusal, exactly as the no-bind shape always did;
 (iii) STOPPED VCO containers under the other runtime → data under both:
       nothing is driven in (a) (read-only refuses with the reason); install
       records ``container_runtime_data_under_both`` (action_required);
@@ -76,8 +80,98 @@ unsearchable parent — counts, R11 L1), the other runtime's listing is read by
       (c) keeps it, (a) refuses read-only and records ``action_required`` at
       install.
 
+ONE ENGINE, TWO NAMES (R12 M7): the ``podman-docker`` package makes ``docker``
+a shim for podman, so one engine answers to both names and every listing is
+the same on both sides. :func:`runtimes_are_one_engine` is the ONE bounded
+identity probe (a version output naming the other engine, else a non-empty
+intersection of container IDs); when it says the two names are one engine,
+every "data under both" verdict is short-circuited to KEPT — there is no
+"both", and nothing to switch — and the answer says so
+(:attr:`Reconciliation.same_engine`).
+
 The runtime is never switched silently while VCO's data lives under the recorded
 one — every switch is a positive-evidence decision with a ledger record.
+
+``decide`` — the one verdict for every surface (R12 convergence)
+-----------------------------------------------------------------
+:func:`decide` (CLI: ``python -m vco_lib.runtime_reconcile decide --json
+[--root <install_root>] [--mode read-only|install] [--purpose infra|module]``)
+is the ONE JSON answer the Rust surfaces (launcher infra stack, module plane,
+hub supervisor, install preflight) render instead of mirroring this module's
+logic (A>B>C tier A: the path is user-action-triggered and ms-scale). It is
+the SAME core as ``python -m vco_lib.containers resolve`` — :func:`decide`
+calls :func:`vco_lib.containers.resolve` and this module's :func:`reconcile`
+and renders both; ``containers resolve`` renders the same answer for the
+session hooks' shell contract. ``--mode read-only`` (the default) writes
+nothing and starts nothing; ``--mode install`` is install.py's form (the
+record may be re-written, the ledger appended). ``--purpose infra`` probes
+compose; ``--purpose module`` does not (the module plane drives single
+containers, not compose). Every probe inside is time-bounded by the existing
+per-call timeouts (:data:`_LIST_TIMEOUT_S` and the containers module's probe
+timeouts).
+
+Exit codes: ``0`` resolved; ``3`` refused (state ``absent`` or ``unknown`` —
+the ``state`` field distinguishes them); anything else is an internal error.
+
+The JSON (``"schema": 1``; add fields, never change existing ones):
+
+=========================  =====================================================
+key                        meaning
+=========================  =====================================================
+``schema``                 always ``1``.
+``state``                  ``resolved`` / ``absent`` / ``unknown`` —
+                           :class:`vco_lib.containers.RuntimeState`.
+``runtime``                the runtime to drive, or ``None``.
+``compose``                compose argv prefix (``["podman", "compose"]``) or
+                           ``None`` (``null`` under ``--purpose module``).
+``compose_form``           ``subcommand`` / ``standalone`` / ``None``.
+``binary_path``            what :func:`vco_lib.tool_search_dirs.which` finds
+                           for ``runtime`` (``None`` when not resolved).
+``search_path``            the PATH the caller should export so the runtime
+                           tools resolve BY NAME to what was probed
+                           (:func:`vco_lib.tool_search_dirs.reachable_path`);
+                           ``None`` when nothing needs adding or no runtime.
+``installed``              the first candidate binary installed, usable or not.
+``requested``              the pinned runtime (``None`` = auto-detect).
+``requested_via``          ``env`` / ``record`` / ``confirmed`` / ``auto`` —
+                           ``record`` is ``state/install/runtime.txt``,
+                           ``confirmed`` adds that ``runtime.confirmed``
+                           matches it (never switched, only the user does).
+``requested_installed``    whether the pinned binary is installed at all.
+``alternative_usable``     the OTHER runtime when it is usable and the pinned
+                           one is not — the user's repin target (never driven).
+``record_reconciled``      the stale record was answered with the other
+                           runtime, read-only, on positive evidence.
+``outcome``                the reconcile's :class:`Outcome` for the record.
+``not_switched_key``       why a stale record was NOT switched — a
+                           ``[not_switched]`` key of the shared table, or
+                           ``None``.
+``not_switched``           that reason rendered (the full note; append as
+                           ``(not switched: ...)``), or ``None``.
+``same_engine``            the two names are ONE engine (M7) — no "both",
+                           no switch; the recorded runtime is kept.
+``refused``                ``True`` unless ``state`` is ``resolved``.
+``refusal``                the full user-facing refusal text when refused,
+                           else ``None``.
+``reason``                 always set: why this runtime (or why none).
+=========================  =====================================================
+
+Examples (abridged):
+
+.. code-block:: json
+
+    {"schema": 1, "state": "resolved", "runtime": "podman",
+     "compose": ["podman", "compose"], "compose_form": "subcommand",
+     "requested": "docker", "requested_via": "record",
+     "record_reconciled": true, "outcome": "rewritten",
+     "not_switched_key": null, "same_engine": false, "refused": false,
+     "reason": "stale runtime record: ... — using docker→podman ..."}
+
+    {"schema": 1, "state": "absent", "runtime": null, "compose": null,
+     "requested": "podman", "requested_via": "record",
+     "outcome": "unusable", "not_switched_key": "no_data",
+     "not_switched": "the container runtime is pinned to podman by ...: ...",
+     "refused": true, "refusal": "... (not switched: ...no_data...)"}
 
 Stdlib + stdlib-only ``vco_lib`` modules: this runs from install.py's pre-venv
 phase (``_detect_system``).
@@ -122,6 +216,7 @@ __all__ = [
     "vco_volume_names",
     "volume_names_from",
     "DATA_SOURCE_KEYS",
+    "effective_data_sources",
     "bind_sources_from",
     "bind_data_source",
     "bind_folder_holds_data",
@@ -130,6 +225,7 @@ __all__ = [
     "data_kind",
     "vco_data_kind",
     "bind_verdict",
+    "runtimes_are_one_engine",
     "KIND_RUNNING",
     "KIND_STOPPED",
     "KIND_VOLUMES",
@@ -147,6 +243,7 @@ __all__ = [
     "data_still_under_both",
     "runtime_down_message",
     "containers_skipped_note",
+    "decide",
     "main",
 ]
 
@@ -216,6 +313,15 @@ class Reconciliation:
     #: Why a stale record was NOT switched — a ``[not_switched]`` key of the
     #: shared table (``runtime_reconcile_messages.toml``), else ``None``.
     decline: Optional[str] = None
+    #: The two runtime names are ONE engine on this machine (a
+    #: ``podman-docker`` shim — R12 M7): every "data under both" shape is
+    #: really one engine's listing read twice, so the record is KEPT and this
+    #: flag says why no switch was even considered.
+    same_engine: bool = False
+    #: The bind-mounted data folder this outcome was decided over (R12 M3):
+    #: non-empty exactly when the decline is a BIND-layout one, so a renderer
+    #: can pick the rationale that matches what was probed.
+    bind: str = ""
 
 
 def _other(runtime: str) -> str:
@@ -248,6 +354,18 @@ def _list_names(argv: Sequence[str], run: RunFn) -> Optional[set[str]]:
     if res.returncode != 0:
         return None
     return {ln.strip().lstrip("/") for ln in (res.stdout or "").splitlines() if ln.strip()}
+
+
+def _list_output(argv: Sequence[str], run: RunFn) -> Optional[str]:
+    """A bounded listing command's stdout (``None`` when it could not run or
+    failed) — the raw-text sibling of :func:`_list_names`."""
+    try:
+        res = run(list(argv), capture_output=True, text=True, timeout=_LIST_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    return res.stdout or ""
 
 
 def vco_volume_names(install_root: Optional[Path], *,
@@ -368,7 +486,8 @@ VERDICT_KEEP = "keep"
 
 
 def bind_verdict(other_kind: str, *, pinned_missing: bool, all_bind: bool,
-                 here_running: bool = False) -> str:
+                 here_running: bool = False,
+                 positive_only: bool = False) -> str:
     """Pure: what a bind-mounted data layout makes of the OTHER runtime's
     listing (R11 L2/L3) — the precedence the stale-record reconcile applies
     while VCO's data is (partly) a folder on the host:
@@ -378,17 +497,24 @@ def bind_verdict(other_kind: str, *, pinned_missing: bool, all_bind: bool,
        run under the recorded runtime).
     2. The recorded runtime is NOT installed and EVERY service's data is a
        folder (no named volume in play, :func:`all_services_bind`): switching
-       strands nothing — ``switch``.
+       strands nothing — ``switch`` at install. With ``positive_only`` (a
+       READ-ONLY caller — R12 M1) the rule needs evidence that the other
+       runtime serves VCO (``other_kind != KIND_NONE``: a stopped container
+       or a VCO volume is evidence; nothing is not), else it falls through —
+       a session hook must not drive the other runtime onto the folders on
+       the strength of "I found nothing anywhere", and the decline becomes
+       ``no_data``, as the no-bind shape always was.
     3. STOPPED VCO containers under the other runtime next to the folder:
        data under both — ``both`` (only the user knows which one serves it).
     4. Only a leftover named volume there, or nothing: ``keep`` (R10 J2 — the
        folder is the data and a volume is not evidence about it).
 
     MUST MATCH ``runtime_evidence.rs::bind_verdict`` (the fixture's
-    ``bind_verdict`` rows run both)."""
+    ``bind_verdict`` rows run both; the ``bind_verdict_positive_only`` rows
+    are the read-only half, Python-side until the Rust mirrors retire)."""
     if other_kind == KIND_RUNNING:
         return VERDICT_BOTH if here_running else VERDICT_SWITCH
-    if pinned_missing and all_bind:
+    if pinned_missing and all_bind and not (positive_only and other_kind == KIND_NONE):
         return VERDICT_SWITCH
     if other_kind == KIND_STOPPED:
         return VERDICT_BOTH
@@ -444,6 +570,59 @@ def vco_data_kind(runtime: str, *, run: Optional[RunFn] = None,
                          corroborate_overrides=corroborate_overrides, want_running=True)
 
 
+#: Word-boundary runtime names in a ``version`` output — the shim leg of the
+#: one-engine probe (R12 M7). ``podman version`` under a ``podman-docker``
+#: shim prints e.g. ``docker version 4.9.3 (podman ...)``, naming BOTH.
+_ENGINE_NAME_RE = re.compile(r"\b(?:podman|docker)\b")
+
+#: A FULL container ID as ``ps -a --no-trunc --format {{.ID}}`` prints it
+#: (12–64 hex chars). Only these count for the ID-intersection leg: names,
+#: aliases and anything else a listing may emit must never read as "the same
+#: container under both runtimes".
+_CONTAINER_ID_RE = re.compile(r"^[0-9a-f]{12,64}$")
+
+
+def _container_ids(runtime: str, run: RunFn) -> Optional[set[str]]:
+    """The FULL container IDs a runtime lists (``ps -a --no-trunc``), or
+    ``None`` when the listing could not run."""
+    out = _list_output([runtime, "ps", "-a", "--no-trunc", "--format", "{{.ID}}"], run)
+    if out is None:
+        return None
+    return {line.strip() for line in out.splitlines()
+            if _CONTAINER_ID_RE.match(line.strip())}
+
+
+def runtimes_are_one_engine(a: str, b: str, *, run: Optional[RunFn] = None) -> Optional[bool]:
+    """Are these two runtime NAMES one engine on this machine (R12 M7)?
+
+    A ``podman-docker`` (or ``docker``-compatible) shim makes ``docker`` a
+    second NAME for podman: every "data under both runtimes" shape is then
+    one engine's listing read twice, and a "switch" would switch nothing.
+    ``True`` when that is PROVEN, ``None`` when it cannot be told — never
+    ``False``, because two genuinely distinct engines are indistinguishable
+    from two probes that could not prove anything.
+
+    TWO bounded legs (each within :data:`_LIST_TIMEOUT_S`):
+
+    1. SHIM: ``<name> version`` output naming the OTHER runtime at a word
+       boundary (``docker version ... (podman ...)``). One hit on either
+       side proves it.
+    2. IDs: both ``ps -a --no-trunc`` listings answer and SHARE a full
+       container ID — two distinct engines cannot list the same container.
+
+    Read-only. Only consulted on the ambiguous paths (both runtimes answer
+    AND the data seems to be under both), so the common cases pay nothing."""
+    _run = run or _tsd.run
+    for name, other in ((a, b), (b, a)):
+        out = _list_output([name, "version"], _run)
+        if out is not None and other in _ENGINE_NAME_RE.findall(out.lower()):
+            return True
+    ids_a, ids_b = _container_ids(a, _run), _container_ids(b, _run)
+    if ids_a is not None and ids_b is not None and ids_a & ids_b:
+        return True
+    return None
+
+
 def _data_listing(runtime: str, *, run: Optional[RunFn], install_root: Optional[Path],
                   env: Optional[Mapping[str, str]], corroborate_overrides: bool,
                   want_running: bool) -> Optional[str]:
@@ -481,12 +660,36 @@ def _is_bind_source(value: str) -> bool:
     return value.startswith(("/", ".", "~", "\\")) or bool(_DRIVE_PATH_RE.match(value))
 
 
+def effective_data_sources(env_file_text: str, env: Mapping[str, str]) -> dict[str, str]:
+    """ONE resolver for the ``VCT_*_DATA_SOURCE`` knobs (R12 M8): the value
+    compose will actually use per :data:`DATA_SOURCE_KEYS` key — ``env``'s
+    when the key is SET there (the shell environment wins over the file,
+    even when set to the empty string), else the LAST assignment for the key
+    in ``infrastructure/.env`` (compose's own precedence). Keys set nowhere
+    are absent from the result — a missing key means the service's named
+    volume. :func:`bind_sources_from` and :func:`all_services_bind` both
+    read THIS; no third copy of the precedence rule may appear."""
+    effective: dict[str, str] = {}
+    for key, value in parse_env_lines(env_file_text or ""):
+        if key in DATA_SOURCE_KEYS:
+            effective[key] = value
+    for key in DATA_SOURCE_KEYS:
+        if key in env:
+            effective[key] = env[key]
+    return effective
+
+
 def bind_sources_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, ...]:
-    """Pure: every non-empty :data:`DATA_SOURCE_KEYS` value that is a PATH
-    (a bind mount), in ``infrastructure/.env`` (file order) then in ``env``
-    (key order), each once. A value that is not a path names a volume and is
-    left to :func:`vco_volume_names`. MUST MATCH
+    """Pure: every :data:`DATA_SOURCE_KEYS` value that is a PATH (a bind
+    mount), each once. A value that is not a path names a volume and is left
+    to :func:`vco_volume_names`. Order: the keys the ``infrastructure/.env``
+    file mentions, in file order (so the fixture's ``bind_sources`` rows keep
+    byte-stable output), then the keys only ``env`` sets, in
+    :data:`DATA_SOURCE_KEYS` order — both read through the ONE resolver
+    :func:`effective_data_sources`. MUST MATCH
     ``container_runtime.rs::bind_sources_from`` (the shared fixture)."""
+    effective = effective_data_sources(env_file_text, env)
+    mentioned = [key for key, _ in parse_env_lines(env_file_text or "") if key in DATA_SOURCE_KEYS]
     found: list[str] = []
 
     def _add(value: str) -> None:
@@ -494,32 +697,27 @@ def bind_sources_from(env_file_text: str, env: Mapping[str, str]) -> tuple[str, 
         if v and _is_bind_source(v) and v not in found:
             found.append(v)
 
-    for key, value in parse_env_lines(env_file_text or ""):
-        if key in DATA_SOURCE_KEYS:
-            _add(value)
+    for key in mentioned:
+        _add(effective[key])
     for key in DATA_SOURCE_KEYS:
-        _add(env.get(key) or "")
+        if key in effective and key not in mentioned:
+            _add(effective[key])
     return tuple(found)
 
 
 def all_services_bind(env_file_text: str, env: Mapping[str, str]) -> bool:
     """Pure: does EVERY service's data mount resolve to a host folder (R11 L3)?
-    Per :data:`DATA_SOURCE_KEYS` key, the value compose uses — ``env``'s when
-    the key is set there (compose's shell environment wins, even set empty),
-    else the LAST assignment in ``infrastructure/.env`` — must be a path
-    (:func:`_is_bind_source`); an unset or empty key means the service's named
-    volume. Then no named volume is in play anywhere, so a runtime switch
-    strands none. MUST MATCH ``runtime_evidence.rs::all_services_bind`` (the
-    fixture's ``all_bind`` rows run both)."""
-    from_file: dict[str, str] = {}
-    for key, value in parse_env_lines(env_file_text or ""):
-        if key in DATA_SOURCE_KEYS:
-            from_file[key] = value
-    for key in DATA_SOURCE_KEYS:
-        value = env[key] if key in env else from_file.get(key, "")
-        if not _is_bind_source((value or "").strip()):
-            return False
-    return True
+    Every :data:`DATA_SOURCE_KEYS` key must be set (via
+    :func:`effective_data_sources` — the ONE precedence resolver) and its
+    value a path (:func:`_is_bind_source`); an unset or empty key, or one
+    that names a volume, means a named volume is in play. Then no named
+    volume is in play anywhere, so a runtime switch strands none. MUST MATCH
+    ``runtime_evidence.rs::all_services_bind`` (the fixture's ``all_bind``
+    rows run both)."""
+    effective = effective_data_sources(env_file_text, env)
+    if len(effective) != len(DATA_SOURCE_KEYS):
+        return False
+    return all(_is_bind_source((value or "").strip()) for value in effective.values())
 
 
 def install_all_bind(install_root: Optional[Path], *,
@@ -692,7 +890,8 @@ def reconcile(
     started = "; ".join(x for x in (started, ostarted) if x)
     if ostatus != "usable":
         return _unusable(root, pinned, via, status, "other_not_usable", started, rewrite)
-    decision = _bind_decision(root, pinned, other, pinned_missing=True, env=env, run=_run)
+    decision = _bind_decision(root, pinned, other, pinned_missing=True,
+                              positive_only=not rewrite, env=env, run=_run)
     if decision is not None:
         return _bind_stale_record(root, pinned, other, via, status, decision, started, rewrite)
     data = vco_data_under(other, run=_run, install_root=root, env=env, corroborate_overrides=True)
@@ -716,33 +915,48 @@ def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: 
                           f"{pinned} answers", started=started)
     if read_confirmed(root) == pinned or _status(other, which, run) != "usable":
         return kept
-    decision = _bind_decision(root, pinned, other, pinned_missing=False, env=env, run=run)
+    decision = _bind_decision(root, pinned, other, pinned_missing=False,
+                              positive_only=not rewrite, env=env, run=run)
     if decision is not None:
-        verdict, bind, _there = decision
+        verdict, bind, there, _all_bind = decision
         if verdict == VERDICT_SWITCH:
             # R11 L2 (i): the stack RUNS under the other runtime, on the folder.
             return _rewritten(root, pinned, other,
                               f"{pinned} answers but {other} is running VCO's containers "
                               f"(VCO's data is in the bind-mounted folder {bind})", rewrite, started)
         if verdict == VERDICT_BOTH:
+            # R12 M7: a podman-docker shim is ONE engine — its "containers
+            # under both" is one listing read twice; no both, no switch.
+            if runtimes_are_one_engine(pinned, other, run=run):
+                return Reconciliation(
+                    Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
+                    f"{pinned} and {other} are one engine on this machine; the "
+                    f"recorded {pinned} is kept", started=started, same_engine=True)
             # R11 L2 (ii): VCO containers under the other runtime next to the
             # folder — only the user knows which runtime serves it.
-            entries = (_both_entry(root, pinned, other, bind=bind, kept=True),) if rewrite else ()
+            entries = (_both_entry(root, pinned, other, bind=bind, kept=True, there=there),) \
+                if rewrite else ()
             return Reconciliation(Outcome.DATA_UNDER_BOTH, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                                   f"VCO's data is in the bind-mounted folder {bind} and {other} "
                                   f"holds VCO containers too; keeping the recorded {pinned}",
-                                  entries, started, decline="data_under_both")
+                                  entries, started, decline="data_under_both", bind=bind)
         # R10 J2 / R11 L2 (iii): at most a leftover volume there — the folder
         # is the data, and the record stands (an unlistable runtime too).
         return Reconciliation(Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                               f"{pinned} answers; VCO's data is in the bind-mounted folder "
                               f"{bind}, so the recorded {pinned} is kept", started=started)
-    here = vco_data_under(pinned, run=run, install_root=root, env=env)
-    there = vco_data_under(other, run=run, install_root=root, env=env, corroborate_overrides=True)
-    if here is None or there is None or not there:
+    here = vco_data_kind(pinned, run=run, install_root=root, env=env)
+    there = vco_data_kind(other, run=run, install_root=root, env=env, corroborate_overrides=True)
+    if here is None or there is None or there == KIND_NONE:
         return kept
-    if here:
-        entries = (_both_entry(root, pinned, other),) if rewrite else ()
+    if here != KIND_NONE:
+        if runtimes_are_one_engine(pinned, other, run=run):
+            return Reconciliation(
+                Outcome.KEPT, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
+                f"{pinned} and {other} are one engine on this machine; the "
+                f"recorded {pinned} is kept", started=started, same_engine=True)
+        entries = (_both_entry(root, pinned, other, there=there,
+                               here_running=here == KIND_RUNNING),) if rewrite else ()
         return Reconciliation(Outcome.DATA_UNDER_BOTH, pinned, pinned, _c.PIN_VIA_RUNTIME_TXT,
                               f"VCO containers/volumes exist under both {pinned} and {other}; "
                               f"keeping the recorded {pinned}", entries, started)
@@ -752,40 +966,45 @@ def _reconcile_usable(root: Path, pinned: str, other: str, which: WhichFn, run: 
 
 
 def _bind_decision(root: Path, pinned: str, other: str, *, pinned_missing: bool,
-                   env: Optional[Mapping[str, str]], run: RunFn) -> Optional[tuple[str, str, str]]:
+                   env: Optional[Mapping[str, str]], run: RunFn,
+                   positive_only: bool = False) -> Optional[tuple[str, str, str, bool]]:
     """The bind-mount arm of the reconcile (R10 J2, R11 L2/L3), read-only:
     ``None`` when it does not apply — no data folder holds anything and (for a
     recorded runtime that is not installed) not every service is a folder —
-    else ``(verdict, folder, kind)``: a :func:`bind_verdict` (or
+    else ``(verdict, folder, kind, all_bind)``: a :func:`bind_verdict` (or
     ``"unlistable"`` when a listing could not run), the first data folder
-    (``""`` when only :func:`all_services_bind` applies) and what the other
-    runtime holds (a ``KIND_*``, ``""`` when unlistable).
+    (``""`` when only :func:`all_services_bind` applies), what the other
+    runtime holds (a ``KIND_*``, ``""`` when unlistable) and whether EVERY
+    service's data is a host folder (:func:`install_all_bind`).
 
-    The other runtime is asked with ``corroborate_overrides`` (R10 J8); the
-    recorded one only when the other RUNS VCO's containers and it answers."""
+    ``positive_only`` is the read-only caller's rule for
+    :func:`bind_verdict` (R12 M1). The other runtime is asked with
+    ``corroborate_overrides`` (R10 J8); the recorded one only when the other
+    RUNS VCO's containers and it answers."""
     bind = bind_data_source(root, env=env)
     all_bind = pinned_missing and install_all_bind(root, env=env)
     if bind is None and not all_bind:
         return None
     there = vco_data_kind(other, run=run, install_root=root, env=env, corroborate_overrides=True)
     if there is None:
-        return "unlistable", bind or "", ""
+        return "unlistable", bind or "", "", all_bind
     here_running = False
     if there == KIND_RUNNING and not pinned_missing:
         here = vco_data_kind(pinned, run=run, install_root=root, env=env)
         if here is None:
-            return "unlistable", bind or "", there
+            return "unlistable", bind or "", there, all_bind
         here_running = here == KIND_RUNNING
     return (bind_verdict(there, pinned_missing=pinned_missing, all_bind=all_bind,
-                         here_running=here_running), bind or "", there)
+                         here_running=here_running, positive_only=positive_only),
+            bind or "", there, all_bind)
 
 
 def _bind_stale_record(root: Path, pinned: str, other: str, via: Optional[str], status: str,
-                       decision: tuple[str, str, str], started: str,
+                       decision: tuple[str, str, str, bool], started: str,
                        rewrite: bool) -> Reconciliation:
     """Case (a) — the recorded runtime is not installed — under a bind-mount
     layout, per :func:`bind_verdict`."""
-    verdict, bind, there = decision
+    verdict, bind, there, all_bind = decision
     if verdict == "unlistable":
         return _unusable(root, pinned, via, status, "unlistable", started, rewrite)
     if verdict == VERDICT_SWITCH:
@@ -802,9 +1021,15 @@ def _bind_stale_record(root: Path, pinned: str, other: str, via: Optional[str], 
         # R11 L2 (ii): stopped VCO containers under the other runtime next to
         # the folder — data under both. Nothing is driven; install asks.
         res = _unusable(root, pinned, via, status, "data_under_both", started, False, bind=bind)
-        entries = (_both_entry(root, pinned, other, bind=bind, kept=False),) if rewrite else ()
+        entries = (_both_entry(root, pinned, other, bind=bind, kept=False, there=there),) \
+            if rewrite else ()
         return Reconciliation(res.outcome, None, pinned, via, res.detail, entries, started,
-                              decline="data_under_both")
+                              decline="data_under_both", bind=bind)
+    if not rewrite and there == KIND_NONE and all_bind:
+        # R12 M1: the read-only rule (ii) needed positive evidence that the
+        # other runtime serves VCO; nothing was found anywhere, so nothing is
+        # switched — the no-bind "no data anywhere" decline, not "bind_data".
+        return _unusable(root, pinned, via, status, "no_data", started, rewrite, bind=bind)
     # R10 J2 / R11 L2 (iii): only a leftover volume there — the folder is the
     # data; install keeps the record (action_required), read-only refuses.
     return _unusable(root, pinned, via, status, "bind_data", started, rewrite, bind=bind)
@@ -856,9 +1081,10 @@ def _unusable(root: Optional[Path], pinned: str, via: Optional[str], status: str
     detail = unusable_detail(pinned, source, status, decline, bind=bind)
     if started:
         detail += f" ({started})"
-    entries = (_unusable_entry(root, pinned, via or "", status, detail),) if rewrite else ()
+    entries = (_unusable_entry(root, pinned, via or "", status, detail,
+                               bind_decline=bool(bind)),) if rewrite else ()
     return Reconciliation(Outcome.UNUSABLE, None, pinned, via, detail, entries, started,
-                          decline=decline)
+                          decline=decline, bind=bind)
 
 
 def _unusable_title(pinned: str) -> str:
@@ -871,7 +1097,10 @@ def _unusable_title(pinned: str) -> str:
 
 
 def _unusable_entry(root: Optional[Path], pinned: str, via: str, status: str,
-                    detail: str) -> DeferralEntry:
+                    detail: str, *, bind_decline: bool = False) -> DeferralEntry:
+    """``bind_decline``: the refusal is a BIND-layout decline (R12 M3) —
+    VCO's data is a host folder, so the "SEPARATE named volumes / EMPTY
+    knowledge graph" rationale does not apply and must not be claimed."""
     other = _other(pinned)
     if status != "missing":
         remedy = f"# Start {pinned}:\n{_start_command(pinned)}"
@@ -882,17 +1111,28 @@ def _unusable_entry(root: Optional[Path], pinned: str, via: str, status: str,
                   f"python install.py --update --container {other}")
     if via == _c.PIN_VIA_ENV and status != "missing":
         remedy += f"\n# Or stop pinning it: unset VCT_CONTAINER_RUNTIME (or set it to {other})"
-    return DeferralEntry(
-        condition_id=CID_UNUSABLE,
-        title=_unusable_title(pinned),
-        detected=detail + ".",
-        why_deferred=(
+    if bind_decline:
+        why_deferred = (
+            "VCO's data is the bind-mounted folder on this host, which either runtime "
+            f"could serve, and VCO will not pick one for you — it will not start the stack "
+            f"under {other} until the choice is made. Everything that does not need "
+            "containers was completed. This entry clears by itself once "
+            f"{pinned} answers; the next session start (or `python install.py --update`) "
+            "then brings the stack up."
+        )
+    else:
+        why_deferred = (
             f"VCO will not start the stack under {other} on its own: podman and docker keep "
             "SEPARATE named volumes, so the other runtime would bring up an EMPTY knowledge "
             "graph next to your data. Everything that does not need containers was completed. "
             f"This entry clears by itself once {pinned} answers; the next session start (or "
             "`python install.py --update`) then brings the stack up."
-        ),
+        )
+    return DeferralEntry(
+        condition_id=CID_UNUSABLE,
+        title=_unusable_title(pinned),
+        detected=detail + ".",
+        why_deferred=why_deferred,
         command_to_apply=remedy,
         severity="warning",
         dismiss_fields={"runtime": pinned, "via": via,
@@ -914,31 +1154,50 @@ def _reconciled_entry(root: Path, old: str, new: str, why: str) -> DeferralEntry
 
 
 def _both_entry(root: Path, recorded: str, other: str, *, bind: str = "",
-                kept: bool = True) -> DeferralEntry:
+                kept: bool = True, there: str = KIND_STOPPED,
+                here_running: bool = False) -> DeferralEntry:
     """``bind``: VCO's data is that host folder (R11 L2 (ii)) and ``other``
     holds VCO containers beside it; ``kept``: whether VCO went on using
-    ``recorded`` (it answers) or started nothing (it is not installed)."""
+    ``recorded`` (it answers) or started nothing (it is not installed).
+    ``there`` / ``here_running`` say what the probes actually FOUND under
+    ``other`` (R12 M2: the text never claims more than was probed — not
+    "containers or volumes" when the listing said which, and "running" only
+    when a running container was seen)."""
+    if there == KIND_RUNNING:
+        holds = (f"{other} is running VCO containers as well" if here_running else
+                 f"{other} is running VCO containers")
+    elif there == KIND_VOLUMES:
+        holds = f"{other} holds VCO volumes (no containers)"
+    else:
+        holds = f"{other} holds VCO containers that are not running there"
     outcome = (f"VCO kept using {recorded}." if kept else
                f"{recorded} is not installed, so VCO started nothing.")
     if bind:
         detected = (f"VCO's data is in the bind-mounted folder {bind}. {recorded} is recorded in "
-                    f"{_c.runtime_txt_path(root)}, and {other} holds VCO containers that are not "
-                    f"running there; either runtime could serve that folder. {outcome}")
+                    f"{_c.runtime_txt_path(root)}, and {holds}; either runtime could serve that "
+                    f"folder. {outcome}")
         why = ("Only you know which runtime should serve that folder — two engines on one data "
                "folder would corrupt it — so VCO will not pick for you.")
     else:
-        detected = (f"Both {recorded} (recorded in {_c.runtime_txt_path(root)}) and {other} hold "
-                    f"VCO containers or volumes. {outcome}")
+        detected = (f"{recorded} is recorded in {_c.runtime_txt_path(root)} and answers, and "
+                    f"{holds}. {outcome}")
         why = "Only you know which copy is current; VCO will not merge them or pick for you."
+    if kept:
+        command_to_apply = (f"# Keep {recorded} (confirms the record; silences this entry):\n"
+                            f"python install.py --update --container {recorded}\n"
+                            f"# Or switch to {other}:\n"
+                            f"python install.py --update --container {other}")
+    else:
+        command_to_apply = (f"# Reinstall {recorded}, then keep it:\n"
+                            f"python install.py --update --container {recorded}\n"
+                            f"# Or switch to {other} (re-records runtime.txt):\n"
+                            f"python install.py --update --container {other}")
     return DeferralEntry(
         condition_id=CID_DATA_UNDER_BOTH,
         title="VCO containers/volumes exist under both podman and docker",
         detected=detected,
         why_deferred=why,
-        command_to_apply=(f"# Keep {recorded} (confirms the record; silences this entry):\n"
-                          f"python install.py --update --container {recorded}\n"
-                          f"# Or switch to {other}:\n"
-                          f"python install.py --update --container {other}"),
+        command_to_apply=command_to_apply,
         severity="warning",
         dismiss_fields={"recorded": recorded, "root": str(root)},
     )
@@ -1103,11 +1362,17 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
     other = _other(recorded)
     rec_status = _status(recorded, _which, _run)
     if rec_status != "down" and _status(other, _which, _run) == "usable":
-        # R11 L2: the bind-mount arm decides "both" the way the reconcile does.
+        # R11 L2: the bind-mount arm decides "both" the way the reconcile does
+        # (read-only rules: R12 M1's positive-evidence requirement applies).
         decision = _bind_decision(root, recorded, other, pinned_missing=rec_status == "missing",
-                                  env=None, run=_run)
+                                  positive_only=True, env=None, run=_run)
         if decision is not None:
-            return None if decision[0] == "unlistable" else decision[0] == VERDICT_BOTH
+            if decision[0] == "unlistable":
+                return None
+            if decision[0] != VERDICT_BOTH:
+                return False
+            # R12 M7: one engine under two names is not "data under both".
+            return runtimes_are_one_engine(recorded, other, run=_run) is not True
     if any(_status(rt, _which, _run) != "usable" for rt in _c.RUNTIME_CANDIDATES):
         return None
     here = vco_data_under(recorded, run=_run, install_root=root)
@@ -1115,7 +1380,79 @@ def data_still_under_both(entry: Any, *, which: Optional[WhichFn] = None,
                            corroborate_overrides=True)
     if here is None or there is None:
         return None
+    if here and there and runtimes_are_one_engine(recorded, other, run=_run) is True:
+        # R12 M7: one engine under two names is not "data under both".
+        return False
     return bool(here and there)
+
+
+# ---------------------------------------------------------------------------
+# decide — the one JSON verdict (R12 convergence; see the module doc)
+# ---------------------------------------------------------------------------
+
+
+def decide(install_root: Optional[Path] = None, *, mode: str = "read-only",
+           purpose: str = "infra", env: Optional[Mapping[str, str]] = None,
+           which: Optional[WhichFn] = None, run: Optional[RunFn] = None,
+           home: Optional[Path] = None) -> dict:
+    """The ONE verdict every surface renders (schema and semantics in the
+    module docstring's ``decide`` section; ``"schema": 1``).
+
+    Same core as ``python -m vco_lib.containers resolve``: this calls
+    :func:`vco_lib.containers.resolve` AND :func:`reconcile` and renders
+    both — ``containers resolve`` is the same answer rendered for the
+    session hooks' shell contract. ``mode="read-only"`` writes nothing and
+    starts nothing; ``mode="install"`` is install.py's form. ``purpose``
+    picks whether compose is probed (``"infra"``) or not (``"module"`` —
+    the module plane drives single containers). Raises ``ValueError`` on an
+    unknown ``mode`` / ``purpose``; every probe inside is time-bounded by
+    the existing per-call timeouts."""
+    if mode not in ("read-only", "install"):
+        raise ValueError(f"unknown mode: {mode!r} (expected 'read-only' or 'install')")
+    if purpose not in ("infra", "module"):
+        raise ValueError(f"unknown purpose: {purpose!r} (expected 'infra' or 'module')")
+    _env = os.environ if env is None else env
+    if install_root is not None:
+        root: Optional[Path] = Path(install_root)
+    else:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415
+
+        root = resolve_install_root()
+    rec = reconcile(root, env=_env, which=which, run=run, rewrite=mode == "install")
+    det = _c.resolve(env=_env, which=which, run=run, warn=lambda _m: None,
+                     probe_compose=(purpose == "infra"), home=home, install_root=root)
+    if det.requested_via == _c.PIN_VIA_ENV:
+        requested_via = "env"
+    elif (rec.pinned is not None and root is not None
+          and read_confirmed(root) == rec.pinned):
+        requested_via = "confirmed"
+    elif det.requested_via == _c.PIN_VIA_RUNTIME_TXT:
+        requested_via = "record"
+    else:
+        requested_via = "auto"
+    resolved = det.state is _c.RuntimeState.RESOLVED
+    return {
+        "schema": 1,
+        "state": det.state.value,
+        "runtime": det.runtime,
+        "compose": det.compose if purpose == "infra" else None,
+        "compose_form": det.compose_form if purpose == "infra" else None,
+        "binary_path": _tsd.which(det.runtime, env=_env) if det.runtime else None,
+        "search_path": _tsd.reachable_path(env=_env) if det.runtime else None,
+        "installed": det.installed,
+        "requested": det.requested,
+        "requested_via": requested_via,
+        "requested_installed": det.requested_installed,
+        "alternative_usable": det.alternative_usable,
+        "record_reconciled": det.record_reconciled,
+        "outcome": rec.outcome.value,
+        "not_switched_key": rec.decline,
+        "not_switched": rec.detail if rec.decline else None,
+        "same_engine": rec.same_engine,
+        "refused": not resolved,
+        "refusal": None if resolved else det.reason,
+        "reason": det.reason,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1526,21 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     b = sub.add_parser("boot", help="Read-only reconcile of the install's runtime record.")
     b.add_argument("--root", required=True)
     b.add_argument("--json", action="store_true")
+    d = sub.add_parser(
+        "decide",
+        help="The ONE JSON verdict (R12 convergence): runtime to drive, compose form, pin "
+             "source, refusal text. Exit 0 resolved, 3 refused, else internal error.")
+    d.add_argument("--root", default=None,
+                   help="Install root to decide for (default: the clone this vco_lib "
+                        "belongs to).")
+    d.add_argument("--json", action="store_true",
+                   help="Print the schema-1 JSON verdict (the contract form).")
+    d.add_argument("--mode", choices=["read-only", "install"], default="read-only",
+                   help="read-only (default): write nothing, start nothing. install: the "
+                        "record may be re-written and the ledger appended.")
+    d.add_argument("--purpose", choices=["infra", "module"], default="infra",
+                   help="infra (default): probe compose. module: the module plane's "
+                        "single-container verdict, compose not probed.")
     r = sub.add_parser(
         "record-boot-refusal",
         help="Ledger entry for a refused runtime (the boot wrapper's exit 3, a session hook's "
@@ -1199,6 +1551,22 @@ def _cli(argv: Optional[Sequence[str]] = None) -> int:
     r.add_argument("--reason", default="")
     r.add_argument("--source", choices=sorted(_REFUSAL_SOURCES), default="boot")
     a = p.parse_args(argv)
+    if a.cmd == "decide":
+        root = Path(a.root) if a.root else None
+        try:
+            verdict = decide(root, mode=a.mode, purpose=a.purpose)
+        except ValueError as exc:
+            print(f"decide: {exc}", file=sys.stderr)
+            return 2
+        if a.json:
+            print(json.dumps(verdict, sort_keys=True))
+        else:
+            print(f"VCO_RUNTIME={shlex.quote(verdict['runtime'] or '')}")
+            print(f"VCO_STATE={shlex.quote(verdict['state'])}")
+            print(f"VCO_COMPOSE_FORM={shlex.quote(verdict['compose_form'] or '')}")
+            print(f"VCO_REQUESTED_VIA={shlex.quote(verdict['requested_via'])}")
+            print(f"VCO_REASON={shlex.quote(verdict['reason'])}")
+        return 0 if verdict["state"] == "resolved" else 3
     if a.cmd == "boot":
         res = reconcile(Path(a.root), rewrite=False)
         if a.json:

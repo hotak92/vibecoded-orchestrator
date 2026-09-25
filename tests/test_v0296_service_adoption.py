@@ -1115,10 +1115,10 @@ class GuardEntryTests(_TempCase):
                                   return_value=self.IDENTITY):
             identities = {}
             foreign = install_services_guard.foreign_owned_services(
-                ["code_embed"], "podman", infra, compose_file,
+                ["code_embed"], "podman", compose_file,
                 identities=identities)
             foreign_noparam = install_services_guard.foreign_owned_services(
-                ["code_embed"], "podman", infra, compose_file)
+                ["code_embed"], "podman", compose_file)
         self.assertEqual(set(foreign), {"code_embed"})
         self.assertEqual(foreign_noparam, foreign)  # backward compatible
         self.assertEqual(identities["code_embed"], self.IDENTITY)

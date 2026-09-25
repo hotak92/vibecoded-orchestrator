@@ -926,11 +926,17 @@ def _evaluate_candidate(
 def _pin_refusal_reason(
     pref: str, pinned: _CandidateProbe, alternative: Optional[str],
     *, via: str = PIN_VIA_ENV, recorded_file: Optional[Path] = None,
+    bind_decline: bool = False,
 ) -> str:
     """The actionable hint a refused pin carries — names what was pinned and
     through WHICH channel, why it is unusable, whether the other runtime IS
     usable, and the two things the user can do about it. Shaped like
-    ``container_runtime.rs::module_runtime_pin_refusal``."""
+    ``container_runtime.rs::module_runtime_pin_refusal``.
+
+    ``bind_decline`` (R12 M3): the pin was refused over a BIND-layout
+    decline — VCO's data is a host folder, not the other runtime's named
+    volumes — so the "SEPARATE named volumes / EMPTY stack" rationale is
+    not what stopped the switch and must not be claimed."""
     if via == PIN_VIA_RUNTIME_TXT:
         where = str(recorded_file) if recorded_file is not None else PIN_VIA_RUNTIME_TXT
         head = (
@@ -948,10 +954,16 @@ def _pin_refusal_reason(
         head = f"VCT_CONTAINER_RUNTIME={pref} is set but {pinned.why}"
         repin = f"unset VCT_CONTAINER_RUNTIME / set it to {alternative}"
     if alternative:
+        rationale = (
+            "VCO's data is the bind-mounted folder on this host, which either "
+            "runtime could serve, and VCO will not pick one for you"
+            if bind_decline else
+            "podman and docker have SEPARATE named volumes, so the stack would "
+            "come up EMPTY on the other one"
+        )
         return (
             f"{head}; {alternative} is usable but VCO will NOT drive it for you "
-            f"(podman and docker have SEPARATE named volumes, so the stack would "
-            f"come up EMPTY on the other one) — start {pref}, or {repin}"
+            f"({rationale}) — start {pref}, or {repin}"
         )
     other = next(c for c in RUNTIME_CANDIDATES if c != pref)
     return (
@@ -1066,6 +1078,8 @@ def resolve(
     order = runtime_candidate_order(pref)
     record_note: Optional[str] = None
     record_refusal_note: Optional[str] = None
+    record_bind_decline = False
+    record_switched_to: Optional[str] = None
     if (via == PIN_VIA_RUNTIME_TXT and root is not None and pref is not None
             and not _which(pref)):
         # The record names a runtime that is NOT installed. Ask the ONE
@@ -1092,8 +1106,12 @@ def resolve(
         if rec is not None and rec.outcome is _Outcome.REWRITTEN and rec.runtime in RUNTIME_CANDIDATES:
             order = [rec.runtime]
             record_note = rec.detail
+            record_switched_to = rec.runtime
         elif rec is not None and rec.outcome is _Outcome.UNUSABLE and rec.detail:
             record_refusal_note = rec.detail
+            # R12 M3: a BIND-layout decline must not be explained with the
+            # named-volumes rationale the probe never relied on.
+            record_bind_decline = bool(getattr(rec, "bind", ""))
 
     for candidate in order:
         p = probes[candidate] = _probe_one(candidate)
@@ -1124,9 +1142,29 @@ def resolve(
         # difference between "start podman" and "install a runtime".
         other = next(c for c in RUNTIME_CANDIDATES if c != pref)
         alternative = other if _probe_one(other).status == "usable" else None
+        if record_switched_to is not None and record_switched_to in probes:
+            # R12 M3: the reconcile switched the order to the OTHER runtime
+            # and THAT is the one that then failed its probe — the refusal
+            # names the runtime actually tried, never a pin refusal that
+            # claims the recorded one was driven.
+            switched = probes[record_switched_to]
+            reason = (
+                f"{record_note or 'the stale runtime record was reconciled'}, but driving "
+                f"{record_switched_to} failed — {switched.why}; start {record_switched_to} "
+                f"(or run `python install.py --update --container {pref}` to re-record "
+                f"{pref})"
+            )
+            _warn(reason)
+            return RuntimeResolution(
+                RuntimeState.ABSENT, None, installed, None, None,
+                False if switched.status == "refused" else None,
+                reason, requested=pref, requested_via=via,
+                requested_installed=probes[pref].status != "missing",
+            )
         reason = _pin_refusal_reason(
             pref, probes[pref], alternative,
             via=via or PIN_VIA_ENV, recorded_file=pin[2] if pin is not None else None,
+            bind_decline=record_bind_decline,
         )
         if record_refusal_note:
             # Why the stale-record reconcile did NOT switch (R9 H1/H2).

@@ -12,6 +12,13 @@
 // `vco_lib_bridge` (`python -m vco_lib.service_endpoints candidates --json`).
 pub mod runtime;
 
+// v0.2.97 R12 (owner ruling "Consolidate now"): the ONE Rust client for
+// `python -m vco_lib.runtime_reconcile decide --json` — every post-install
+// Rust surface asks it for the container-runtime verdict instead of
+// mirroring the reconcile rules. The pre-install onboarding wizard keeps a
+// minimal version probe (see `commands::installer::detect_runtime_version`).
+pub mod runtime_verdict;
+
 // v0.2.83 WP-B6: cross-writer file lock for the `UPDATE_DEFERRED.{md,json}`
 // read-modify-write cycle. The Python emitter (`vco_lib.deferral_emit`) holds an
 // exclusive `flock` on `<folder>/.claude/context/.update-deferred.lock`; the
@@ -61,10 +68,11 @@ pub mod compose_args;
 // and vct-hub/src/module_supervisor.rs; the drift between them caused
 // the supervisor-image-resolution-variant-gap bug fixed in this release.
 // See knowledge/concepts/supervisor-image-resolution-variant-gap-2026-06-04.md.
+// v0.2.97 R12: the WHICH-RUNTIME decision moved to Python
+// (`runtime_verdict::decide`); what stays here is the module plane's
+// container plumbing (run args, image refs, pulls, the reaper) and the
+// ownership guard.
 pub mod container_runtime;
-// v0.2.97 R10 J2/J6/J8: where VCO's data is + why a stale record was not
-// switched (the pure halves of container_runtime's reconcile arm).
-pub mod runtime_evidence;
 pub mod gpu_mode;
 
 // v0.2.95: the model gateway's port/file/service constants and the resolution

@@ -13504,6 +13504,7 @@ MemAvailable:   23456789 kB
         fake_runtime(dir.path(), "podman", &[]);
         fake_runtime(dir.path(), "docker", &["weaviate_data", "ollama_data"]);
         let root = tempfile::tempdir().unwrap();
+        crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib(root.path());
         let (found, refusal) =
             with_fake_runtimes(dir.path(), None, detect_existing_volumes_at(Some(root.path())));
         assert!(found.is_empty(), "docker's volumes were offered for reuse: {found:?}");

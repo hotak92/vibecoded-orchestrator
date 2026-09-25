@@ -1036,8 +1036,8 @@
       "expect_not_switched": "data_under_both"
     },
     {
-      "name": "runtime_txt_stale_record_all_bind_switches_without_data",
-      "_why": "R11 L3: EVERY service's data (Weaviate, Ollama, the code_embed cache) is a host folder, so no named volume is in play; runtime.txt records docker (not installed) and podman answers holding none of VCO's containers or volumes. Switching strands nothing: every surface drives podman (read-only too), install re-records it.",
+      "name": "runtime_txt_stale_record_all_bind_nothing_read_only_refuses",
+      "_why": "R12 M1 (Python side; the 2026-09-25 consolidation retired the Rust mirrors): EVERY service's data (Weaviate, Ollama, the code_embed cache) is a host folder, so no named volume is in play; runtime.txt records docker (not installed) and podman answers holding NONE of VCO's containers or volumes. Read-only rule (ii) needs positive evidence that the other runtime serves VCO — a stopped container or a VCO volume — and 'nothing found anywhere' is not it, so the record pin is REFUSED with the shared `no_data` wording (install still re-records podman: a switch strands no named volume). Both Rust planes ask Python for the verdict, so `expect_rust` (null) and `expect_module_plane` now match Python's own answer.",
       "env": null,
       "runtime_txt": "docker",
       "on_path": [
@@ -1057,21 +1057,22 @@
       "vco_data_under": {},
       "bind_data": "all",
       "expect": {
-        "state": "resolved",
-        "runtime": "podman",
-        "compose_form": "subcommand",
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
         "installed": "podman",
         "requested": "docker",
         "requested_via": "state/install/runtime.txt",
-        "substituted": true,
-        "record_reconciled": true
+        "substituted": false
       },
-      "expect_rust": {
-        "runtime": "podman",
-        "compose_form": "subcommand"
-      },
+      "expect_not_switched": "no_data",
+      "expect_rust": null,
       "expect_module_plane": {
-        "ok": "podman"
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
       }
     },
     {

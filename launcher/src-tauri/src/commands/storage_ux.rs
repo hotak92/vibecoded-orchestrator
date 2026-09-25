@@ -1438,8 +1438,15 @@ pub(crate) mod fake_runtime_support {
                 "      {v}) echo 'Error: cannot connect to the {name} service: timed out' >&2; exit 125;;\n"
             ));
         }
+        // The arms answer the argv PYTHON's resolver probes (`version`,
+        // `info`, `compose version` — 2026-09-25 consolidation: the verdict
+        // is the CLI's) plus the volume grammar this module's own commands
+        // drive.
         let script = format!(
-            "#!/bin/sh\ncase \"$1\" in\n  info|--version) exit 0;;\n  volume)\n    [ \"$2\" = inspect ] || exit 1\n    case \"$3\" in\n{arms}    esac\n    echo \"Error: no such volume $3\" >&2\n    exit 125;;\nesac\nexit 1\n"
+            "#!/bin/sh\ncase \"$1 $2\" in \"compose version\") exit 0;; esac\ncase \
+             \"$1\" in\n  info|--version|version) exit 0;;\n  volume)\n    [ \"$2\" = \
+             inspect ] || exit 1\n    case \"$3\" in\n{arms}    esac\n    echo \"Error: \
+             no such volume $3\" >&2\n    exit 125;;\nesac\nexit 1\n"
         );
         let path = dir.join(name);
         std::fs::write(&path, script).unwrap();
@@ -1495,6 +1502,24 @@ pub(crate) mod fake_runtime_support {
         closer.join().unwrap();
     }
 
+    /// Make a TEMP install root import THIS checkout's `vco_lib`: the
+    /// verdict child runs `python -m vco_lib.runtime_reconcile` with the
+    /// root as cwd (cwd is sys.path[0]), and a bare temp root would fall
+    /// through to whatever stale `vco_lib` the interpreter's venv carries.
+    /// A symlink is exactly what a real root has: its own copy.
+    pub(crate) fn use_checkout_vco_lib(root: &Path) {
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(2)
+            .expect("CARGO_MANIFEST_DIR reaches the checkout root");
+        let dst = root.join("vco_lib");
+        if dst.symlink_metadata().is_ok() {
+            return; // idempotent across a test's re-asks
+        }
+        std::os::unix::fs::symlink(checkout.join("vco_lib"), &dst)
+            .expect("symlink the checkout's vco_lib into the temp root");
+    }
+
     /// Run `fut` on THIS thread (a current-thread runtime), with `dir` as the
     /// only lookup PATH and `pin` as `VCT_CONTAINER_RUNTIME` (under the
     /// workspace env lock, restored afterwards).
@@ -1504,12 +1529,24 @@ pub(crate) mod fake_runtime_support {
         fut: impl std::future::Future<Output = T>,
     ) -> T {
         let mut out = None;
-        vct_launcher_core::test_env::with_env_vars(&[("VCT_CONTAINER_RUNTIME", pin)], || {
-            let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
-            out = Some(vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
-                rt.block_on(fut)
-            }));
-        });
+        vct_launcher_core::test_env::with_env_vars(
+            &[
+                ("VCT_CONTAINER_RUNTIME", pin),
+                // The verdict comes from a Python child now. Its PATH is the
+                // thread-local lookup path injected by `with_lookup_path`
+                // below (never the process PATH), and this empties the
+                // child's tool-search table (an empty value REPLACES it), so
+                // it can never probe the host's real podman/docker.
+                ("VCT_TOOL_SEARCH_DIRS", Some("")),
+            ],
+            || {
+                let rt =
+                    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+                out = Some(vct_launcher_core::paths::with_lookup_path(Some(dir.as_os_str()), || {
+                    rt.block_on(fut)
+                }));
+            },
+        );
         out.unwrap()
     }
 }
@@ -1556,6 +1593,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(root.path().join("state/install")).unwrap();
         std::fs::write(root.path().join("state/install/runtime.txt"), "docker\n").unwrap();
+        use crate::commands::storage_ux::fake_runtime_support::use_checkout_vco_lib;
+        use_checkout_vco_lib(root.path());
         let rt = with_fake_runtimes(dir.path(), None, storage_runtime_at(Some(root.path()))).unwrap();
         assert_eq!(rt, StorageRuntime { name: "docker".into(), pin: Some(RuntimePinSource::RuntimeTxt) });
     }

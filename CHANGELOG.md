@@ -463,7 +463,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`VCT_*_DATA_SOURCE`) keeps its recorded runtime against a leftover volume
   under the other runtime, but VCO follows its containers when they are
   running under the other one; if the other runtime holds stopped VCO
-  containers beside the folder, nothing starts until you pick a runtime with
+  containers beside the folder, VCO keeps the recorded runtime when it is
+  still installed, never switches on its own, and asks you in
+  `UPDATE_DEFERRED.md` to pick one with
   `install.py --update --container <podman|docker>`. When every service's
   data is in a folder, a runtime that is gone is simply re-recorded, since no
   volume is left behind. A data folder VCO cannot look into counts as data,
@@ -509,6 +511,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - The bash code-embed session hook no longer exits silently when the
   container runtime is refused: it says why, and leaves no temporary file
   behind (a problem since v0.2.92).
+- Which container runtime VCO uses is now decided in one place: the launcher,
+  the hub and its supervisor, the storage pages and the install check all
+  ask the same verdict the session hooks and the boot service use
+  (`python -m vco_lib.runtime_reconcile decide --json`), and show its
+  refusal text as is. Before, the launcher and hub kept their own copy of
+  the rules, which could disagree.
+- On Fedora/RHEL with `podman-docker` (where `docker` is podman under
+  another name), VCO no longer reports its data as being under both
+  runtimes; it keeps the recorded one.
 - The code-embed session hook takes the service's port from the recorded
   endpoint; an exported `CODE_EMBED_PORT` no longer steers it. When it cannot
   read the record, it changes nothing that session instead of guessing a

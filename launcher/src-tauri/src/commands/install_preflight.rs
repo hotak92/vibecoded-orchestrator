@@ -35,11 +35,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::services::runtime::{
-    detect_runtime_detailed, invalidate_cache as invalidate_runtime_cache, probe_runtime,
-    runtime_on_path, runtime_pin, RuntimeDetection,
-};
-use vct_launcher_core::services::container_runtime::RuntimePinSource;
+use vct_launcher_core::services::runtime_verdict::{self, RuntimeVerdict};
 
 /// Result of the install-pipeline preflight check.
 ///
@@ -149,98 +145,77 @@ fn current_platform() -> String {
 /// detection here also unblocks the cached value for the rest of the
 /// session.
 ///
-/// Never returns `Err`: the function's contract is "tell the frontend
-/// what's on PATH right now". Even on probe failure we return
-/// `available: false` so the frontend renders the install-instructions
-/// modal; we don't surface internal probe errors as command-level Err
-/// because that would route through the FE's generic error toast and
-/// hide the structured `RuntimeAvailability` shape that drives the
-/// modal's branches.
+/// Returns `Err` in exactly ONE case (v0.2.97 R12 loud-fail): the ONE
+/// verdict itself could not run — a missing or broken Python is a broken
+/// install and is surfaced, never papered over with `available: false`.
+/// Every runtime-state answer (refused pin, nothing installed, no
+/// compose) is the structured `RuntimeAvailability` shape that drives
+/// the modal's branches.
 #[tauri::command]
 pub async fn check_container_runtime_available() -> Result<RuntimeAvailability, String> {
     // Always re-probe — the user may have installed/uninstalled a
-    // runtime since the launcher booted. The cache exists to avoid
-    // re-probing on hot paths (services watcher polls every few
-    // seconds); for an explicit user-driven preflight, freshness wins
-    // over the ~50ms probe cost.
-    invalidate_runtime_cache();
+    // runtime since the launcher booted. Both the session detection
+    // cache and the ONE verdict cache are dropped, and the surfaces that
+    // share the verdict cache (boot, hub watchdog) re-probe with the
+    // fresh answer too.
+    crate::services::runtime::invalidate_cache();
+    runtime_verdict::invalidate();
 
-    let detection = detect_runtime_detailed().await;
+    // v0.2.97 R12: the modal's every field is a rendering of the ONE
+    // Python verdict (`vco_lib.runtime_reconcile decide --json`) —
+    // pinned / pinned_installed / alternative_usable / not_switched
+    // come from the verdict instead of re-derived by Rust probes.
+    let root = vct_launcher_core::orchestrator_manifest::orchestrator_install_root();
+    let verdict = runtime_verdict::decide(
+        root.as_deref(),
+        runtime_verdict::Mode::ReadOnly,
+        runtime_verdict::Purpose::Infra,
+    )
+    .await?;
 
-    // v0.2.92 BLOCKER-4: `detect_runtime` is strict about a pin, so `None`
-    // under a pin means "the runtime you pinned is unusable" — NOT "no
-    // container runtime is installed". Those are different sentences and
-    // different user actions, and the modal could not tell them apart.
-    let pin = if detection.info.is_none() { runtime_pin() } else { None };
-    let pinned = pin.map(|(runtime, _)| runtime);
-    let pinned_via = pin.map(|(_, source)| pin_source_label(source));
-    let pinned_installed = pinned.map(runtime_on_path).unwrap_or(false);
-    let alternative_usable = match pinned {
-        // Probe the runtime the user did NOT pin, so the modal can name the
-        // repin target. Only reached on the failure path, so no cost to the
-        // happy one.
-        Some(p) => probe_runtime(p.other())
-            .await
-            .map(|i| i.runtime.binary().to_string()),
-        None => None,
-    };
-
-    Ok(availability(
-        &detection,
-        current_platform(),
-        pinned.map(|p| p.binary().to_string()),
-        pinned_via,
-        pinned_installed,
-        alternative_usable,
-    ))
+    Ok(availability(&verdict, current_platform()))
 }
 
-/// The modal's shape from what the probes established — pure, so the
-/// refused-pin fields (R11 L6: `not_switched`) are tested without a
-/// runtime on the machine.
-fn availability(
-    detection: &RuntimeDetection,
-    platform: String,
-    pinned: Option<String>,
-    pinned_via: Option<String>,
-    pinned_installed: bool,
-    alternative_usable: Option<String>,
-) -> RuntimeAvailability {
-    let info = detection.info.clone();
-    let install_url = if info.is_none() { install_url_for(&platform) } else { None };
-    // The stale record's reason, on the refused-pin path only (a resolved
-    // runtime is never reported as refused).
-    let not_switched = if info.is_none() && pinned.is_some() {
-        detection.not_switched.clone()
-    } else {
-        None
-    };
+/// The modal's shape from the ONE verdict — pure, so every branch is
+/// testable without a runtime (or a Python) on the machine. A resolved
+/// verdict with compose is "available"; everything else renders the pin
+/// fields from the verdict (`requested`, `requested_via`,
+/// `requested_installed`, `alternative_usable`) and the stale-record
+/// reason (`not_switched`) — Python's wording, verbatim (M3).
+fn availability(verdict: &RuntimeVerdict, platform: String) -> RuntimeAvailability {
+    let available = verdict.resolved
+        && verdict.runtime.is_some()
+        && verdict.compose_form.is_some();
+    let detected = if available { verdict.runtime.clone() } else { None };
+    let install_url = if available { None } else { install_url_for(&platform) };
+    let pinned = if available { None } else { verdict.requested.clone() };
+    let pinned_via = pinned.as_ref().map(|_| pin_source_label(&verdict.requested_via));
     RuntimeAvailability {
-        available: info.is_some(),
-        detected: info.map(|i| i.runtime.binary().to_string()),
+        available,
+        detected,
         platform,
         install_url,
         pinned_unusable: pinned.is_some(),
         pinned,
         pinned_via,
-        pinned_installed,
-        alternative_usable,
-        not_switched,
+        pinned_installed: verdict.requested_installed,
+        alternative_usable: verdict.alternative_usable.clone(),
+        not_switched: if available { None } else { verdict.not_switched.clone() },
     }
 }
 
 /// What the modal shows as the pin's origin: the env var's name, or the
-/// ABSOLUTE path of the runtime.txt record (the file the user would edit).
-fn pin_source_label(source: RuntimePinSource) -> String {
-    match source {
-        RuntimePinSource::EnvOverride => source.label().to_string(),
-        RuntimePinSource::RuntimeTxt => {
-            vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
-                .map(|root| {
-                    root.join("state").join("install").join("runtime.txt").display().to_string()
-                })
-                .unwrap_or_else(|| source.label().to_string())
-        }
+/// ABSOLUTE path of the runtime.txt record (the file the user would
+/// edit) — mapped from the verdict's `requested_via` (`env` /
+/// `record` / `confirmed`).
+fn pin_source_label(requested_via: &str) -> String {
+    match requested_via {
+        "env" => "VCT_CONTAINER_RUNTIME".to_string(),
+        _ => vct_launcher_core::orchestrator_manifest::orchestrator_install_root()
+            .map(|root| {
+                root.join("state").join("install").join("runtime.txt").display().to_string()
+            })
+            .unwrap_or_else(|| "state/install/runtime.txt".to_string()),
     }
 }
 
@@ -251,47 +226,70 @@ fn pin_source_label(source: RuntimePinSource) -> String {
 mod tests {
     use super::*;
 
-    /// R11 L6: the reason the stale record was not switched reaches the
-    /// modal on the refused-pin path — and only there.
+    /// R11 L6 / R12 M3: the stale-record reason reaches the modal on the
+    /// refused-pin path — and only there — rendered from the VERDICT's
+    /// `not_switched` (Python's text; nothing is re-derived from PATH).
     #[test]
     fn the_modal_carries_why_the_stale_record_was_not_switched() {
         let why = "docker is not installed; podman holds none of VCO's data";
-        let refused = RuntimeDetection {
-            info: None,
-            not_switched: Some(why.into()),
-            refusal: Some("pinned to docker".into()),
-        };
-        let av = availability(
-            &refused,
-            "linux".into(),
-            Some("docker".into()),
-            Some("/i/state/install/runtime.txt".into()),
-            false,
-            Some("podman".into()),
-        );
+        let refused = refused_verdict(why);
+        let av = availability(&refused, "linux".into());
         assert!(!av.available && av.pinned_unusable);
+        assert_eq!(av.pinned.as_deref(), Some("docker"));
+        assert_eq!(av.pinned_installed, false);
+        assert_eq!(av.alternative_usable.as_deref(), Some("podman"));
         assert_eq!(av.not_switched.as_deref(), Some(why));
         // The field serialises under the name the frontend reads.
         let json = serde_json::to_value(&av).unwrap();
         assert_eq!(json["not_switched"], serde_json::json!(why));
-        // No pin → nothing to explain; nothing refused → nothing either.
-        let unpinned = availability(&refused, "linux".into(), None, None, false, None);
-        assert_eq!(unpinned.not_switched, None);
-        let quiet = availability(
-            &RuntimeDetection::default(),
-            "linux".into(),
-            Some("docker".into()),
-            None,
-            false,
-            None,
-        );
-        assert_eq!(quiet.not_switched, None);
+        // No pin → nothing to explain; a resolved verdict → nothing either.
+        let mut unpinned = refused.clone();
+        unpinned.requested = None;
+        unpinned.requested_via = "auto".into();
+        unpinned.not_switched = None;
+        assert_eq!(availability(&unpinned, "linux".into()).not_switched, None);
+        let mut quiet = refused_verdict(why);
+        quiet.resolved = true;
+        quiet.refused = false;
+        quiet.refusal = None;
+        quiet.runtime = Some("podman".into());
+        quiet.compose_form = Some("subcommand".into());
+        quiet.requested = None;
+        quiet.requested_via = "auto".into();
+        let ok = availability(&quiet, "linux".into());
+        assert!(ok.available && ok.not_switched.is_none());
+    }
+
+    /// A refused-pin verdict shape for [`availability`] tests.
+    fn refused_verdict(why: &str) -> RuntimeVerdict {
+        RuntimeVerdict {
+            runtime: None,
+            state: "absent".into(),
+            resolved: false,
+            compose: None,
+            compose_form: None,
+            binary_path: None,
+            search_path: None,
+            installed: Some("podman".into()),
+            requested: Some("docker".into()),
+            requested_via: "record".into(),
+            requested_installed: false,
+            alternative_usable: Some("podman".into()),
+            record_reconciled: false,
+            outcome: "unusable".into(),
+            not_switched_key: Some("no_data".into()),
+            not_switched: Some(why.into()),
+            same_engine: false,
+            refused: true,
+            refusal: Some("refused (not switched)".into()),
+            reason: "why".into(),
+        }
     }
 
     #[test]
     fn the_pin_source_names_the_env_var_or_the_record_file() {
-        assert_eq!(pin_source_label(RuntimePinSource::EnvOverride), "VCT_CONTAINER_RUNTIME");
-        let record = pin_source_label(RuntimePinSource::RuntimeTxt);
+        assert_eq!(pin_source_label("env"), "VCT_CONTAINER_RUNTIME");
+        let record = pin_source_label("record");
         assert!(
             record.ends_with("runtime.txt"),
             "the record label must name the file: {record}"

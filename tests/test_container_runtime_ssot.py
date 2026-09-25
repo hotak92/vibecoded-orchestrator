@@ -13,8 +13,10 @@ pairs) and their compose preference orders had drifted four ways. Now:
   resolve --json``.
 * ``tests/fixtures/container_runtime_parity.json`` describes hosts and the
   expected decision; this file drives ``resolve`` through injected probes
-  (no podman/docker needed) and ``runtime.rs``'s tests drive
-  ``candidate_order`` + ``select_runtime`` through the SAME file.
+  (no podman/docker needed) and ``runtime.rs``'s parity test drives the
+  same scenarios through the Python client (``runtime_verdict::decide`` —
+  v0.2.97 retired the Rust ``candidate_order``/``select_runtime`` mirror)
+  via the SAME file.
 
 Red-proofed against the pre-merge tree (``/tmp/merge-lane/pre/3.5/``):
 scenario ``both_compose_forms_prefer_subcommand`` returned ``podman-compose``
@@ -347,11 +349,11 @@ def test_a_pinned_probe_timeout_stays_unknown_not_a_refusal(tmp_path: Path):
 def test_a_pin_is_the_whole_candidate_order():
     """A pin is the ONLY candidate. The Rust side is held to the same rule by
     EXECUTION, not by a source pattern: ``runtime.rs``'s
-    ``parity_fixture_select_runtime_matches_every_scenario`` drives
-    ``candidate_order(env, runtime_txt)`` through every pinned row of the
-    shared fixture (``env_pref_unusable_*``, ``runtime_txt_pin_unusable_*``),
-    so a runtime.rs that fell through to the other runtime turns those rows
-    red there."""
+    ``parity_fixture_infra_plane_matches_every_scenario`` asks the Python
+    verdict client for every pinned row of the shared fixture
+    (``env_pref_unusable_*``, ``runtime_txt_pin_unusable_*``), so a client
+    or verdict that fell through to the other runtime turns those rows red
+    there."""
     assert containers.runtime_candidate_order("podman") == ["podman"]
     assert containers.runtime_candidate_order("docker") == ["docker"]
     assert containers.runtime_candidate_order(None) == ["podman", "docker"]
@@ -614,10 +616,14 @@ def test_the_uninstaller_holds_no_runtime_detection_of_its_own():
 
 
 def test_rust_mirror_reads_the_same_fixture():
-    """The class-C Rust mirror's tests must read THIS fixture, not a copy."""
+    """The Rust parity test must read THIS fixture, not a copy — and must go
+    through the Python verdict client (the mirror fns are retired, v0.2.97)."""
     rs = (REPO_ROOT / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "services" / "runtime.rs").read_text(encoding="utf-8")
     assert "container_runtime_parity.json" in rs
-    assert "fn select_runtime" in rs and "fn candidate_order" in rs
+    assert "runtime_verdict::decide" in rs
+    assert "fn select_runtime" not in rs and "fn candidate_order" not in rs, (
+        "the retired Rust mirror must not come back"
+    )
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shim scripts")

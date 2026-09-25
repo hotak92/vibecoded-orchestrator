@@ -89,7 +89,7 @@ def override_f_chain(infra_dir: Path) -> list[str]:
 
 
 def foreign_owned_services(
-    services: list[str], runtime: str, infra_dir: Path, compose_file: Path,
+    services: list[str], runtime: str, compose_file: Path,
     identities: Optional[dict] = None,
 ) -> dict[str, str]:
     """Which of ``services`` have an existing container ANOTHER compose
@@ -100,7 +100,11 @@ def foreign_owned_services(
     :class:`vco_lib.containers.ComposeIdentity` that produced the verdict
     (``None`` when unreadable) — the v0.2.96 deferral remedy derives the
     owning-name rebuild command from it.  Optional out-param: existing
-    callers and mocks that pass nothing behave exactly as before."""
+    callers and mocks that pass nothing behave exactly as before.
+
+    R12 M5: the dead ``infra_dir`` parameter is gone — the probe reads the
+    identity from the container and the project from ``compose_file``; the
+    directory was never used."""
     if not services:
         return {}
     own = _containers.compose_project_of(compose_file)
@@ -291,7 +295,7 @@ def apply_recreate_guard(
     """
     identities: dict = {}
     foreign = foreign_owned_services(
-        services_to_recreate, runtime, infra_dir, compose_file,
+        services_to_recreate, runtime, compose_file,
         identities=identities,
     )
     if not foreign:

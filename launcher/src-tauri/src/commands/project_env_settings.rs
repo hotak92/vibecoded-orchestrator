@@ -590,14 +590,6 @@ pub struct ProjectEnvSettings {
     pub ollama_port: u16,
     pub code_embed_port: u16,
 
-    /// Container runtime detected at populate-time (`"podman"` / `"docker"`)
-    /// or `None` if neither is on PATH. Hooks re-probe at exec time;
-    /// this value is informational for future compose-override generation
-    /// (PR-3 currently only carries it for symmetry — the hook templates
-    /// stay runtime-detected on purpose).
-    #[allow(dead_code)]
-    pub container_runtime: Option<String>,
-
     /// Per-project KG collection name (`<sanitized>_KnowledgeGraph`).
     pub kg_collection: String,
 
@@ -660,7 +652,6 @@ impl ProjectEnvSettings {
             weaviate_port: DEFAULT_WEAVIATE_PORT,
             ollama_port: DEFAULT_OLLAMA_PORT,
             code_embed_port: DEFAULT_CODE_EMBED_PORT,
-            container_runtime: None,
             // v0.2.84 PLAN-v0284 D1 (review F4): name-derived KG/dev names here are the
             // SANCTIONED last resort — `with_defaults` has NO `Db` handle, so there is no
             // `project_kg_bindings` row to honor. D1's rule ("primary = binding when a row
@@ -687,51 +678,6 @@ impl ProjectEnvSettings {
 /// `vct-code-embedding`'s `CODE_EMBED_PORT`.
 pub fn resolve_code_embed_port(db: &Db) -> u16 {
     endpoints::machine_port(db, CoreService::CodeEmbed)
-}
-
-/// Detect the container runtime synchronously without spawning child
-/// processes. Returns `Some("podman")`, `Some("docker")`, or `None`.
-/// Synchronous because populate runs from non-async callers
-/// (the env writers); a runtime probe via `which` is sufficient
-/// — a full-fledged version check happens later via `detect_system`.
-///
-/// Honors `VCT_CONTAINER_RUNTIME=podman|docker|auto` env var as the
-/// user's explicit preference (v0.2.14 Bug #3 fix). If set to a
-/// recognized value AND that runtime is on PATH, returns it directly;
-/// else falls through to auto-detect (podman first, docker second).
-/// This matches the contract honored by `services/runtime.rs::resolve_runtime`,
-/// `install.py::_runtime_preference_from_env`, the hook scripts, and
-/// the boot wrapper.
-fn detect_runtime_sync() -> Option<String> {
-    if let Ok(raw) = std::env::var("VCT_CONTAINER_RUNTIME") {
-        let pref = raw.trim().to_ascii_lowercase();
-        if pref == "podman" || pref == "docker" {
-            if which_cmd(&pref).is_some() {
-                return Some(pref);
-            }
-            // Preference set but not installed — fall through to auto-detect.
-            // (Lenient: don't strand the user on a misconfigured env var.)
-        }
-        // "auto" / "" / unknown → fall through.
-    }
-    if which_cmd("podman").is_some() {
-        return Some("podman".to_string());
-    }
-    if which_cmd("docker").is_some() {
-        return Some("docker".to_string());
-    }
-    None
-}
-
-/// Minimal `which` — walk `PATH` and look for an executable file.
-///
-/// v0.2.77 (Part 7c task 3): delegates to the shared
-/// `vct_launcher_core::paths::which_on_path` (one home). Behaviour is
-/// preserved on POSIX and upgraded on Windows (the shared form also probes
-/// `.cmd`/`.bat`, not just `.exe`). Kept the local name so the two
-/// `.is_some()` call-sites are undisturbed.
-fn which_cmd(name: &str) -> Option<std::path::PathBuf> {
-    vct_launcher_core::paths::which_on_path(name)
 }
 
 /// Populate `ProjectEnvSettings` for a project from launcher state.
@@ -887,7 +833,6 @@ pub fn populate(
         weaviate_port,
         ollama_port,
         code_embed_port,
-        container_runtime: detect_runtime_sync(),
         kg_collection: own_kg,
         dev_collection: own_dev,
         shared_kg_collection,
