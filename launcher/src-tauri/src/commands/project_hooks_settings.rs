@@ -1342,7 +1342,7 @@ mod tests {
             f.raw(),
             before.replace(
                 r#""bash .claude/hooks/notify-stop.sh""#,
-                r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#,
+                r#""bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh\"""#,
             ),
             "re-enable restores the original bytes, the hook path anchored"
         );
@@ -1362,15 +1362,15 @@ mod tests {
     // ─── v0.2.97: one hook, two spellings ──────────────────────────────
     //
     // A bundle update rewrites every VCO hook from `bash .claude/hooks/x.sh`
-    // to `bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`; the launcher DB's
+    // to `bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"`; the launcher DB's
     // mirror and parked rows keep the spelling they were written with.
 
-    const ANCHORED_STOP: &str = r#"bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh""#;
+    const ANCHORED_STOP: &str = r#"bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh""#;
 
     fn anchored_settings() -> String {
         SETTINGS_JSON.replace(
             r#""bash .claude/hooks/notify-stop.sh""#,
-            r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#,
+            r#""bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh\"""#,
         )
     }
 

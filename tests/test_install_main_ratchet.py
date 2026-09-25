@@ -355,7 +355,13 @@ _MAIN_SPAN_MAX = 1645
 # migration's no-registrar commit callable to
 # `vco_lib.service_lifecycle.commit_without_mcp_registration`. Measured
 # with `wc -l`, not predicted.
-_TOTAL_LINES_MAX = 23168
+#
+# v0.2.97 R8 G1 — re-pinned DOWNWARD 23168 -> 23142: the runtime.txt record
+# reconcile landed in `vco_lib.runtime_reconcile` (install.py calls it once
+# from `_detect_system`), the prompt's "installed but not responding" text
+# moved there too, and `_persist_runtime_txt` became a call to the one writer
+# `vco_lib.containers.write_runtime_txt`. Measured with `wc -l`.
+_TOTAL_LINES_MAX = 23142
 
 
 def _measure() -> tuple:

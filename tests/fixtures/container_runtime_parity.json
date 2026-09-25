@@ -33,7 +33,7 @@
     "`state/install/runtime.txt`, the labels of RuntimePinSource). The module plane is",
     "two-state over its Err: a probe that times out collapses into the same refusal",
     "arm as a dead daemon (`probe_timeout_is_unknown_not_absent` stays unknown ONLY",
-    "on the Python side)."
+    "v0.2.97 R8 follow-up (owner rule \"users never need a manual step\"): the RECORD pin — and only\nit — is reconciled read-only inside the resolver. When runtime.txt names a runtime that is NOT\ninstalled and the read-only record reconcile decides case (a) — the other runtime answers, holding\nVCO's containers/volumes (`vco_data_under`: {<rt>: true}), or no VCO data exists anywhere\n(`vco_data_under` absent/false for it) — every surface ANSWERS the other runtime: expect.runtime is\nthe other one, expect.substituted is TRUE and (Python) expect.record_reconciled is true, with\nrequested/requested_via still naming the stale record. A runtime listed in `vco_data_unlistable`\ncannot have its containers/volumes listed, so the reconcile refuses and the strict pin stands.\nThe env pin is NEVER reconciled (`env_pin_is_never_reconciled`), a recorded runtime that is\ninstalled but down stays refused (`runtime_txt_pin_unusable_is_refused_not_substituted`), and\n`expect.substituted` stays false on every other row."
   ],
   "scenarios": [
     {
@@ -703,6 +703,203 @@
       },
       "expect_module_plane": {
         "ok": "docker"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_other_holds_data",
+      "_why": "runtime.txt records docker but docker is gone; only podman is installed, it answers and holds VCO's containers/volumes. Case (a) of the record reconcile: every surface drives podman (writing nothing — the next update re-records it) instead of refusing every session until then.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "podman": true
+      },
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_no_data_anywhere",
+      "_why": "runtime.txt records docker but docker is gone; podman answers and NO VCO data exists under either runtime (a fresh machine whose record went stale). Still case (a): the reconcile answers podman rather than refusing — there is no data plane to fork.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "expect": {
+        "state": "resolved",
+        "runtime": "podman",
+        "compose_form": "subcommand",
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": true,
+        "record_reconciled": true
+      },
+      "expect_rust": {
+        "runtime": "podman",
+        "compose_form": "subcommand"
+      },
+      "expect_module_plane": {
+        "ok": "podman"
+      }
+    },
+    {
+      "name": "runtime_txt_stale_record_other_unlistable",
+      "_why": "runtime.txt records docker (gone); podman answers but its containers/volumes could not be listed. The reconcile cannot establish where the data is, so the strict pin stands: refused.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [
+        "podman"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {},
+      "vco_data_unlistable": [
+        "podman"
+      ],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": true
+        }
+      }
+    },
+    {
+      "name": "runtime_txt_record_missing_other_down_is_refused",
+      "_why": "runtime.txt records docker (gone) and podman is installed but its daemon does not answer: nothing to reconcile TO — the refusal stands and names no usable alternative.",
+      "env": null,
+      "runtime_txt": "docker",
+      "on_path": [
+        "podman"
+      ],
+      "version_ok": [
+        "podman"
+      ],
+      "daemon_ok": [],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "podman"
+      ],
+      "standalone_on_path": [],
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "podman",
+        "requested": "docker",
+        "requested_via": "state/install/runtime.txt",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "docker",
+          "via": "state/install/runtime.txt",
+          "alternative_usable": false
+        }
+      }
+    },
+    {
+      "name": "env_pin_is_never_reconciled",
+      "_why": "VCT_CONTAINER_RUNTIME=podman on a host where podman is gone and the record names docker (installed, answering, even holding VCO's data): the env pin is the USER's and is never reconciled — refused, exactly as before the record reconcile existed.",
+      "env": "podman",
+      "runtime_txt": "docker",
+      "on_path": [
+        "docker"
+      ],
+      "version_ok": [
+        "docker"
+      ],
+      "daemon_ok": [
+        "docker"
+      ],
+      "probe_unknown": [],
+      "compose_subcommand_ok": [
+        "docker"
+      ],
+      "standalone_on_path": [],
+      "vco_data_under": {
+        "docker": true
+      },
+      "expect": {
+        "state": "absent",
+        "runtime": null,
+        "compose_form": null,
+        "installed": "docker",
+        "requested": "podman",
+        "requested_via": "VCT_CONTAINER_RUNTIME",
+        "substituted": false,
+        "record_reconciled": false
+      },
+      "expect_rust": null,
+      "expect_module_plane": {
+        "refused": {
+          "pinned": "podman",
+          "via": "VCT_CONTAINER_RUNTIME",
+          "alternative_usable": true
+        }
       }
     }
   ]

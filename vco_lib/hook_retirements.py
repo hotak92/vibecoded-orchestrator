@@ -133,8 +133,11 @@ def hook_command_key(command: str) -> str:
 
     v0.2.97: the relative ``bash .claude/hooks/x.sh`` a pre-v0.2.97 install
     (or a launcher-parked entry, or the launcher DB's mirror row) still holds
-    and the ``bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`` a bundle update
-    now writes are the same hook; so are the guard-prefixed and bare forms.
+    and the anchored form a bundle update now writes
+    (``bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"`` on Linux/macOS,
+    ``powershell … -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"`` on
+    Windows) are the same hook; so are the guard-prefixed and bare forms, and
+    every anchored spelling the cycle wrote.
     Narrower than ``parked_hooks.same_hook_command`` (script basename): it is
     what the hooks editor matches a named entry by, and what the launcher's
     Hooks tab keys rows by, so it must not merge two DIFFERENT commands that

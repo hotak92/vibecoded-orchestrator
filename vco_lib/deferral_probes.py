@@ -820,6 +820,28 @@ def service_adoption_confirmation_still_pending(ctx: ProbeContext) -> Optional[b
         return None
 
 
+def container_runtime_still_unusable(ctx: ProbeContext) -> Optional[bool]:
+    """``container_runtime_unusable`` — does the pin still resolve to nothing?
+    One home for the rule: :func:`vco_lib.runtime_reconcile.unusable_still_applies`."""
+    from vco_lib import runtime_reconcile
+
+    try:
+        return runtime_reconcile.unusable_still_applies(ctx.entry)
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
+def container_runtime_data_still_under_both(ctx: ProbeContext) -> Optional[bool]:
+    """``container_runtime_data_under_both`` — do both runtimes still hold VCO
+    data for a record the user has not confirmed?"""
+    from vco_lib import runtime_reconcile
+
+    try:
+        return runtime_reconcile.data_still_under_both(ctx.entry)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 #: name → probe. Referenced from the registry as ``probe:py:<name>``.
 def code_embed_image_still_stale(ctx: ProbeContext) -> Optional[bool]:
     """``code_embed_image_stale`` — is the running service still on old source?
@@ -1048,6 +1070,8 @@ PROBES: dict[str, ProbeFn] = {
     "service_endpoint_still_ambiguous": service_endpoint_still_ambiguous,
     "adopted_service_config_drift_persists": adopted_service_config_drift_persists,
     "service_adoption_confirmation_still_pending": service_adoption_confirmation_still_pending,
+    "container_runtime_still_unusable": container_runtime_still_unusable,
+    "container_runtime_data_still_under_both": container_runtime_data_still_under_both,
 }
 
 

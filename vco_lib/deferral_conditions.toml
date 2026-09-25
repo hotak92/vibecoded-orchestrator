@@ -239,6 +239,29 @@ emit_surfaces = ["ledger"]
 dismiss_key = ["source", "value"]
 notes = """v0.2.97: an older endpoint setting (app_state *.port_override, a non-default vct-config.toml weaviate_url, an exported VCT_*_URL, or an import run's services.toml / alt-port override value) names an endpoint that does not answer and did not win. Re-detected every install run for the settings that stay in place, so settling or removing them drops the entry."""
 
+[conditions.container_runtime_record_reconciled]
+class = "informational_record"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.97 (R8 G1): install.py rewrote `state/install/runtime.txt` because VCO's own record named a runtime that is not installed (or holds none of VCO's containers/volumes while the other runtime holds them) — `runtime_reconcile.apply_at_install`, called from `_detect_system` INSIDE the install run, into that run's report. The next run finds the record matching the machine, does not re-detect it, and finalize drops it (one-shot record, family A). The auto-resolutions trail carries the same event."""
+
+[conditions.container_runtime_unusable]
+class = "action_required"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "probe:py:container_runtime_still_unusable"
+emit_surfaces = ["ledger"]
+dismiss_key = ["runtime", "via", "root"]
+notes = """v0.2.97 (R8 G1/G6): the pinned runtime (VCT_CONTAINER_RUNTIME, or VCO's record after reconcile could not settle it) cannot be used — install.py tried the documented start, skipped containers and finished the rest of the run; or the boot wrapper `scripts/launch-claude-mcp-stack.{sh,ps1}` exited 3 (`python -m vco_lib.runtime_reconcile record-boot-refusal`). The probe re-runs `containers.resolve()` for the entry's install root as the probing process sees the pin; it clears once that resolves to a runtime with compose (install re-probe pass, doctor, bundle update)."""
+
+[conditions.container_runtime_data_under_both]
+class = "action_required"
+owner = "vco_lib.runtime_reconcile"
+clear_probe = "probe:py:container_runtime_data_still_under_both"
+emit_surfaces = ["ledger"]
+dismiss_key = ["recorded", "root"]
+notes = """v0.2.97 (R8 G1 case c): podman AND docker both hold VCO containers/volumes; the recorded runtime was kept. Clears once the user confirms a runtime (`install.py --update --container <x>` writes `state/install/runtime.confirmed`) or VCO's data is no longer under both."""
+
 [conditions.adopted_service_config_drift]
 class = "environmental"
 owner = "vco_lib.service_reconcile"

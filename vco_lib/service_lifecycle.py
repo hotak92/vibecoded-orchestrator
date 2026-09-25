@@ -44,6 +44,8 @@ CLI (the hooks and the boot wrapper)::
     python -m vco_lib.service_lifecycle session-reconcile [--timeout S] [--if-stale S] [--require-fresh]
     python -m vco_lib.service_lifecycle session-lock-path
     python -m vco_lib.service_lifecycle with-session-lock [--wait S] [--busy LINE] -- CMD...
+    python -m vco_lib.service_lifecycle supervise -- CMD...
+    python -m vco_lib.service_lifecycle run-detached --hook H [--lock-wait S] [--busy LINE] -- CMD...
 """
 from __future__ import annotations
 
@@ -72,6 +74,7 @@ __all__ = [
     "lifecycle_plan",
     "migrate_code_embed",
     "migrate_managed_service",
+    "run_session_hook_detached",
     "run_with_session_lock",
     "session_lock_path",
     "session_reconcile_fresh",
@@ -951,16 +954,28 @@ def session_reconcile_argv() -> list[str]:
 # "reconcile → plan → act", and the reconcile runs once per window (a stamp),
 # whichever hook gets there first.
 #
-# The lock is an OS advisory lock on a file under the VCT state dir, held
-# by a process that exits with the work it guards, so a killed hook never
-# leaves a stale lock: the bash hooks re-run themselves under
-# `with-session-lock` (this module holds `flock(2)` on a NON-inheritable
-# descriptor and runs the hook as its child — a descriptor the child
-# inherited would outlive the hook in every `conmon` a `podman start`
-# spawns); the PowerShell hooks hold a `FileShare.None` FileStream (.NET
-# implements it with the same flock on Unix, a share-mode lock on Windows;
-# its handle is not inherited either). The path is decided here only
-# (:func:`session_lock_path`).
+# The lock is an OS advisory lock on a file under the VCT state dir. The bash
+# hooks re-run themselves under `with-session-lock` (this module holds
+# `flock(2)` on a NON-inheritable descriptor and runs the hook as its child —
+# a descriptor the child inherited would outlive the hook in every `conmon` a
+# `podman start` spawns); the PowerShell hooks hold a `FileShare.None`
+# FileStream (.NET implements it with the same flock on Unix, a share-mode
+# lock on Windows; its handle is not inherited either). The path is decided
+# here only (:func:`session_lock_path`).
+#
+# The lock is released only after the work it guards has ended (R8 G3). The
+# hook runner kills a hook at its registered `timeout`, and a first-session
+# `compose up` outlives any budget a session hook can have — so the lock
+# holder must never be the process that timeout reaches. `run-detached`
+# starts the locked part DETACHED (`vco_lib.hook_supervisor.relay_detached`)
+# and relays its output for at most SESSION_HOOK_RELAY_BUDGET_S[hook] —
+# inside the registered timeout, whatever the lock wait, the reconcile and the
+# compose cost — then leaves it running with the lock it holds. The holder
+# (`with-session-lock` / `supervise`) runs the hook in its own process group
+# (`hook_supervisor.run_supervised`): a SIGTERM / SIGINT / SIGHUP it does
+# receive goes to that whole group, and the lock is released only after the
+# child has exited (SIGKILL on the group after the grace). A hung child is
+# bounded by SESSION_LOCK_MAX_RUN_S the same way.
 
 #: Seconds a session reconcile's result stays fresh: a second hook (or a
 #: second session) inside this window reads the rows it just corrected.
@@ -970,6 +985,22 @@ SESSION_RECONCILE_EXIT_STALE = 5
 #: Set for the hook re-run under `with-session-lock` (the hook's cue that it
 #: holds the lock and must not re-run itself again).
 SESSION_LOCK_HELD_ENV = "VCO_SESSION_LOCK_HELD"
+#: Set for a hook re-run DETACHED by `run-detached` (the PowerShell hooks'
+#: cue: take the lock in-process and act, never detach again).
+SESSION_DETACHED_ENV = "VCO_SESSION_DETACHED"
+#: Seconds each session hook's relay forwards the detached work's output
+#: before it returns. Each is the hook's registered `timeout`
+#: (`templates/settings.json.*.template`) minus room for what the hook does
+#: in the foreground before it detaches (interpreter start-up; the watchdog's
+#: unlocked detection pass) — a test holds every template to it.
+SESSION_HOOK_RELAY_BUDGET_S: dict[str, float] = {
+    "ensure-containers": 10.0,
+    "verify-container-ports": 20.0,
+}
+#: The ceiling on the work run under the session lock: a hung `compose up`
+#: must not hold the lock (and so every later session's recovery) forever.
+#: Long enough for a first-session image build.
+SESSION_LOCK_MAX_RUN_S = 3600.0
 
 
 def session_lock_path() -> Path:
@@ -1013,13 +1044,20 @@ def acquire_session_lock_fd(fd: int, wait_s: float, *,
 
 
 def run_with_session_lock(command: Sequence[str], *, wait_s: float, busy: str = "",
-                          run: Optional[RunFn] = None, out: LogFn = print) -> int:
+                          max_run_s: Optional[float] = SESSION_LOCK_MAX_RUN_S,
+                          supervise: Optional[Callable[..., int]] = None,
+                          out: LogFn = print) -> int:
     """Run *command* (a hook re-running itself) holding the session lock; the
     child gets ``VCO_SESSION_LOCK_HELD=1``. The lock descriptor is not
-    inherited (PEP 446), so nothing the hook spawns can keep it. Lock busy
-    past *wait_s* → *busy* is printed and the hook is NOT run (exit 0: the
-    other hook is acting on the same containers, and a session-start hook
-    never fails the session). No ``fcntl`` → the hook runs unlocked."""
+    inherited (PEP 446), so nothing the hook spawns can keep it, and it is
+    released only after the child has exited: the child runs under
+    :func:`vco_lib.hook_supervisor.run_supervised` (signals forwarded to its
+    process group, bounded wait, *max_run_s* ceiling). Lock busy past
+    *wait_s* → *busy* is printed and the hook is NOT run (exit 0: the other
+    hook is acting on the same containers, and a session-start hook never
+    fails the session). No ``fcntl`` → the hook runs unlocked."""
+    from vco_lib.hook_supervisor import run_supervised  # noqa: PLC0415
+
     lock = session_lock_path()
     with open(lock, "a", encoding="utf-8") as fh:
         verdict = acquire_session_lock_fd(fh.fileno(), wait_s)
@@ -1029,8 +1067,37 @@ def run_with_session_lock(command: Sequence[str], *, wait_s: float, busy: str = 
             return 0
         env = dict(os.environ)
         env[SESSION_LOCK_HELD_ENV] = "1"
-        proc = (run or subprocess.run)(list(command), env=env)
-        return int(proc.returncode)
+        return int((supervise or run_supervised)(list(command), env=env, max_run_s=max_run_s))
+
+
+def detached_session_hook_argv(command: Sequence[str], *, lock_wait_s: Optional[float],
+                               busy: str = "") -> list[str]:
+    """What `run-detached` starts detached: *command* under the session lock
+    (``with-session-lock``, the bash hooks) when *lock_wait_s* is given, else
+    under the supervisor alone (``supervise``: the PowerShell hooks take the
+    lock in-process)."""
+    if lock_wait_s is None:
+        return [sys.executable, "-m", "vco_lib.service_lifecycle", "supervise",
+                "--", *command]
+    return [sys.executable, "-m", "vco_lib.service_lifecycle", "with-session-lock",
+            "--wait", f"{lock_wait_s:g}", "--busy", busy, "--", *command]
+
+
+def run_session_hook_detached(hook: str, command: Sequence[str], *,
+                              lock_wait_s: Optional[float], busy: str = "",
+                              relay: Optional[Callable[..., int]] = None) -> int:
+    """The foreground half of a session hook (R8 G3): start its locked part
+    detached and relay the output for SESSION_HOOK_RELAY_BUDGET_S[*hook*]."""
+    from vco_lib.hook_supervisor import relay_detached  # noqa: PLC0415
+
+    if hook not in SESSION_HOOK_RELAY_BUDGET_S:
+        raise ValueError(f"unknown session hook {hook!r} "
+                         f"(known: {', '.join(sorted(SESSION_HOOK_RELAY_BUDGET_S))})")
+    return int((relay or relay_detached)(
+        detached_session_hook_argv(command, lock_wait_s=lock_wait_s, busy=busy),
+        name=hook, budget_s=SESSION_HOOK_RELAY_BUDGET_S[hook],
+        extra_env={SESSION_DETACHED_ENV: "1"},
+    ))
 
 
 def session_reconcile_fresh(max_age_s: float = SESSION_RECONCILE_FRESH_S, *,
@@ -1120,14 +1187,37 @@ def _cli_session_lock_path(_args: argparse.Namespace) -> int:
     return 0
 
 
-def _cli_with_session_lock(args: argparse.Namespace) -> int:
+def _cli_command(args: argparse.Namespace) -> list[str]:
     command = list(args.command)
     if command and command[0] == "--":
         command = command[1:]
     if not command:
-        print("service_lifecycle with-session-lock: no command", file=sys.stderr)
+        print(f"service_lifecycle {args.verb}: no command", file=sys.stderr)
+    return command
+
+
+def _cli_with_session_lock(args: argparse.Namespace) -> int:
+    command = _cli_command(args)
+    if not command:
         return 2
     return run_with_session_lock(command, wait_s=args.wait, busy=args.busy)
+
+
+def _cli_supervise(args: argparse.Namespace) -> int:
+    from vco_lib.hook_supervisor import run_supervised  # noqa: PLC0415
+
+    command = _cli_command(args)
+    if not command:
+        return 2
+    return run_supervised(command, max_run_s=SESSION_LOCK_MAX_RUN_S)
+
+
+def _cli_run_detached(args: argparse.Namespace) -> int:
+    command = _cli_command(args)
+    if not command:
+        return 2
+    return run_session_hook_detached(args.hook, command, lock_wait_s=args.lock_wait,
+                                     busy=args.busy)
 
 
 def _split_names(raw: Optional[str]) -> Optional[list[str]]:
@@ -1210,6 +1300,24 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     p_lock.add_argument("--busy", default="", help="the line printed when the lock stays busy")
     p_lock.add_argument("command", nargs=argparse.REMAINDER)
     p_lock.set_defaults(handler=_cli_with_session_lock)
+
+    p_sup = sub.add_parser(
+        "supervise",
+        help="run a command in its own process group, forwarding SIGTERM/SIGINT/SIGHUP to it "
+             "and returning only once it has exited")
+    p_sup.add_argument("command", nargs=argparse.REMAINDER)
+    p_sup.set_defaults(handler=_cli_supervise)
+
+    p_det = sub.add_parser(
+        "run-detached",
+        help="a session hook's foreground half: start CMD detached (under the session lock "
+             "with --lock-wait) and relay its output within the hook's budget")
+    p_det.add_argument("--hook", required=True, choices=sorted(SESSION_HOOK_RELAY_BUDGET_S))
+    p_det.add_argument("--lock-wait", type=float, default=None, metavar="SECONDS",
+                       help="take the session lock (waiting up to SECONDS) around CMD")
+    p_det.add_argument("--busy", default="", help="the line printed when the lock stays busy")
+    p_det.add_argument("command", nargs=argparse.REMAINDER)
+    p_det.set_defaults(handler=_cli_run_detached)
 
     args = parser.parse_args(argv)
     return int(args.handler(args))

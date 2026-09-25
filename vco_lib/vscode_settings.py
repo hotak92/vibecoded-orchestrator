@@ -810,16 +810,13 @@ def is_loopback_host(host: str) -> bool:
 
     Deliberately does NOT resolve names: this function decides whether a URL
     in a config file is OUR gateway, and a DNS lookup would make that answer
-    depend on the network at the moment of a status refresh.
+    depend on the network at the moment of a status refresh. The rule is
+    :func:`vco_lib.service_probe_http.is_loopback_host` (the one Python home,
+    mirroring the Rust one), except that an EMPTY host is not a gateway URL.
     """
-    h = (host or "").strip().strip("[]").lower()
-    if h in {"localhost", "127.0.0.1", "::1", "0:0:0:0:0:0:0:1"}:
-        return True
-    # 127.0.0.0/8 — anything in the loopback block.
-    parts = h.split(".")
-    if len(parts) == 4 and parts[0] == "127":
-        return all(p.isdigit() and 0 <= int(p) <= 255 for p in parts)
-    return False
+    from vco_lib.service_probe_http import is_loopback_host as _rule  # noqa: PLC0415
+
+    return bool((host or "").strip().strip("[]")) and _rule(host)
 
 
 def is_vco_gateway_base_url(

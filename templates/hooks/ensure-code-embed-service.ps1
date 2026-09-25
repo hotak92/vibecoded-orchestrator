@@ -7,11 +7,21 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # Ensure the code embedding service container is running.
 # Mirror of ensure-code-embed-service.sh. No flock on Windows; we use a
 # best-effort lockfile (sentinel) instead.
+#
+# Optional service: whether compose may create the code_embed container is
+# decided by the launcher.db `service_endpoints` plan (v0.2.97) - the
+# launcher's Services page or `python -m vco_lib.service_endpoints show` /
+# `plan --json` - never by editing a compose file (it ships active in
+# infrastructure/docker-compose.yml). When the plan does not list code_embed
+# as a VCO-managed, enabled service, this hook silently no-ops (a CPU host
+# falls back to Ollama for code embeddings). The probe PORT likewise comes
+# from the plan (`services.code_embed.port`), never from env
+# `CODE_EMBED_PORT` - a retired input; env `*_PORT` values are projected
+# outputs only.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 . "$PSScriptRoot/_lib/compose-invocation.ps1"
 
-$Port = if ($env:CODE_EMBED_PORT) { $env:CODE_EMBED_PORT } else { "11440" }
 $ContainerName = if ($env:VCT_CODE_EMBED_CONTAINER) { $env:VCT_CODE_EMBED_CONTAINER } else { "code_embed" }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $LockFile = Join-Path $Tmp "code_embed_service.lock"
@@ -54,6 +64,22 @@ if (Test-Path $VenvLib) {
 if (-not $RunPy) {
     Write-Output "ensure-code-embed-service: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
     exit 0
+}
+
+# v0.2.97 (parity with the .sh sibling): the probe PORT comes from the
+# launcher.db service_endpoints plan (`services.code_embed.port`), never
+# from env `CODE_EMBED_PORT` - a retired input; env `*_PORT` values are
+# projected outputs only and `vco doctor` treats retired inputs as retired.
+# ONE plan read serves both the port and the compose gate in
+# Get-CodeEmbedUpArgs below. When the plan cannot be read, fall back to the
+# compiled default 11440 - never to env.
+$Port = 11440
+$SePlan = $null
+try {
+    $SePlan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json
+} catch { $SePlan = $null }
+if ($SePlan -and $SePlan.services.code_embed.port) {
+    $Port = [int]$SePlan.services.code_embed.port
 }
 $VcoRt = $null
 $VcoRtRc = $null
@@ -156,10 +182,9 @@ try {
     # one; plus the gpu profile it lives in). $null = compose must not run.
     function Get-CodeEmbedUpArgs {
         param([bool]$Build)
-        try {
-            $plan = (& $RunPy -m vco_lib.service_lifecycle plan --json 2>$null | Out-String) | ConvertFrom-Json
-        } catch { return $null }
-        if (-not $plan -or (@($plan.compose_services) -notcontains 'code_embed')) { return $null }
+        # The plan itself was already read once above (one read, two
+        # consumers); its compose_services list is the gate.
+        if (-not $SePlan -or (@($SePlan.compose_services) -notcontains 'code_embed')) { return $null }
         $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'compose-args', '--json', '--services', 'code_embed')
         if ($Build) { $pyArgs += '--build' }
         try {

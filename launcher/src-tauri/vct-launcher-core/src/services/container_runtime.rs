@@ -270,6 +270,70 @@ async fn runtime_binary_present(cmd: &str) -> bool {
     matches!(probe, Ok(Ok(s)) if s.success())
 }
 
+/// VCO's own named volumes (`infrastructure/docker-compose.yml`). A volume
+/// from this list seen under a runtime means VCO's data lives there.
+/// MUST MATCH `vco_lib.runtime_reconcile.VCO_VOLUME_NAMES` — the
+/// `vco_volume_names_match_the_installer_compose` test pins this table
+/// against the compose file, and the Python suite pins the same names.
+pub const VCO_VOLUME_NAMES: &[&str] = &[
+    "vco_weaviate_data",
+    "vco_ollama_data",
+    "vco_code_embed_cache",
+];
+
+/// The vco_/vct_-prefixed subset of `vco_lib.containers.all_known_names`
+/// (canonical + historical aliases): a container with one of these names
+/// under a runtime means VCO's data lives there. MUST MATCH the Python
+/// set built in `vco_lib.runtime_reconcile.vco_data_under`.
+pub const VCO_OUR_CONTAINER_NAMES: &[&str] = &[
+    "vco_weaviate",
+    "vco_ollama",
+    "vco_code_embed",
+    "vct_code_embed",
+];
+
+/// List names via `<cmd> <args...> --format ...`; `None` when the call
+/// fails or times out — "could not look" is never "empty". Read-only.
+async fn list_names(cmd: &str, args: &[&str]) -> Option<Vec<String>> {
+    use crate::process::CommandExt as _;
+
+    let out = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::process::Command::new(crate::paths::spawn_program(cmd))
+            .silent()
+            .args(args)
+            .output(),
+    )
+    .await;
+    let out = out.ok()?.ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim().trim_start_matches('/').to_string())
+            .filter(|l| !l.is_empty())
+            .collect(),
+    )
+}
+
+/// Does `cmd` hold VCO's containers or named volumes? The Rust mirror of
+/// `vco_lib.runtime_reconcile.vco_data_under` (case-C mirror, pinned by
+/// the shared parity fixture's `vco_data_under` / `vco_data_unlistable`
+/// fields): `Some(true)` / `Some(false)` only when BOTH listings
+/// answered; `None` when either could not (daemon down, CLI error).
+/// Read-only: `ps -a` and `volume ls`. Only VCO-prefixed names count.
+pub async fn vco_data_under(cmd: &str) -> Option<bool> {
+    let containers = list_names(cmd, &["ps", "-a", "--format", "{{.Names}}"]).await?;
+    let volumes = list_names(cmd, &["volume", "ls", "--format", "{{.Name}}"]).await?;
+    let ours = containers
+        .iter()
+        .any(|n| VCO_OUR_CONTAINER_NAMES.contains(&n.as_str()))
+        || volumes.iter().any(|n| VCO_VOLUME_NAMES.contains(&n.as_str()));
+    Some(ours)
+}
+
 /// Pure candidate-ordering helper for [`detect_container_runtime`].
 /// Split out so the env→runtime.txt→default precedence is unit-testable
 /// without spawning processes.
@@ -353,6 +417,33 @@ pub enum ModuleRuntimeProbe {
     Responsive,
     BinaryOnly,
     Missing,
+}
+
+/// v0.2.97 R8 follow-up: the ONE sanctioned pin substitution. A pin that
+/// came from the RECORD (`state/install/runtime.txt`) names a runtime that
+/// is NOT INSTALLED, while the other runtime answers and its data could be
+/// listed (VCO's data under it, or provably none anywhere) → drive the
+/// other runtime, read-only — the next update re-records it. The ENV pin
+/// is never reconciled, an installed-but-down recorded runtime is never
+/// switched (case (b)), and an unlistable other runtime is refused
+/// (`None` data — "could not look" is never "empty"). Pure so the shared
+/// parity fixture drives it exactly the way the async halves do; MUST
+/// MATCH the reconcile arm of `vco_lib.containers.resolve` (which fires
+/// only when the read-only `vco_lib.runtime_reconcile.reconcile` decides
+/// `REWRITTEN` on this same shape).
+pub fn record_reconcile_decides(
+    pinned: Option<(&str, RuntimePinSource)>,
+    pinned_missing: bool,
+    other_responsive: bool,
+    other_data_listed: Option<bool>,
+) -> Option<&'static str> {
+    let (pin, RuntimePinSource::RuntimeTxt) = pinned? else {
+        return None; // env pin / no pin: never reconciled
+    };
+    if !pinned_missing || !other_responsive || other_data_listed.is_none() {
+        return None;
+    }
+    Some(other_runtime(pin))
 }
 
 /// The refusal message for a pinned-but-unusable runtime. Pure, and
@@ -507,8 +598,43 @@ pub async fn detect_container_runtime_with_pin(
     let env_pref = runtime_preference_from_env();
     let runtime_txt = install_root.and_then(read_runtime_txt);
 
-    let order = runtime_candidate_order(env_pref.as_deref(), runtime_txt.as_deref());
+    let mut order = runtime_candidate_order(env_pref.as_deref(), runtime_txt.as_deref());
     let pinned = pinned_runtime(env_pref.as_deref(), runtime_txt.as_deref());
+
+    // v0.2.97 R8 follow-up: a STALE RECORD pin is the one sanctioned
+    // substitution. runtime.txt names a runtime that is not installed,
+    // the other runtime answers, and its data could be listed (VCO's
+    // data under it, or provably none anywhere) → drive the other
+    // runtime, read-only — the next update re-records it. Mirrors the
+    // reconcile arm of `vco_lib.containers.resolve`; the ENV pin is
+    // never reconciled and an installed-but-down record stays refused
+    // (the refusal path below keeps that contract).
+    if let Some((pin, RuntimePinSource::RuntimeTxt)) = pinned {
+        if crate::paths::which_on_path(pin).is_none() {
+            let other = other_runtime(pin);
+            let other_responsive = runtime_daemon_responsive(other).await;
+            let other_data_listed = if other_responsive {
+                vco_data_under(other).await
+            } else {
+                None
+            };
+            if let Some(sub) = record_reconcile_decides(
+                pinned,
+                true,
+                other_responsive,
+                other_data_listed,
+            ) {
+                tracing::info!(
+                    recorded = pin,
+                    runtime = sub,
+                    "stale runtime record: {} is not installed; driving {}                      (the next update re-records it)",
+                    pin,
+                    sub
+                );
+                order = vec![sub.to_string()];
+            }
+        }
+    }
 
     let mut probes: HashMap<String, ModuleRuntimeProbe> = HashMap::new();
     let mut resolved = false;
@@ -4069,6 +4195,29 @@ mod tests {
         probes
     }
 
+    /// The fixture's answer to "could the other runtime's data be
+    /// listed": `None` when the scenario marks it unlistable ("could not
+    /// look" is never "empty"), else whether VCO's data is under it.
+    /// Scenarios that do not model data at all answer `Some(false)` —
+    /// their pins are never missing-with-other-responsive, so the
+    /// reconcile arm's data probe is never reached for them.
+    fn fixture_other_data_listed(sc: &serde_json::Value, other: &str) -> Option<bool> {
+        if sc
+            .get("vco_data_unlistable")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|n| n.as_str() == Some(other)))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(
+            sc.get("vco_data_under")
+                .and_then(|v| v.get(other))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+    }
+
     #[test]
     fn parity_fixture_every_scenario_names_a_module_plane_expectation() {
         let fx = parity_fixture();
@@ -4105,8 +4254,26 @@ mod tests {
                 Some((p, RuntimePinSource::RuntimeTxt)) => (None, Some(p)),
                 None => (None, None),
             };
-            let order = runtime_candidate_order(env_arg, txt_arg);
             let probes = fixture_probes(sc);
+            // v0.2.97 R8 follow-up: apply the stale-record reconcile arm
+            // exactly the way `detect_container_runtime_with_pin` does,
+            // BEFORE the decision — a stale record naming a runtime that
+            // is not installed, with the other answering and its data
+            // listed, drives the other runtime. Rows without data fields
+            // never reach the data probe (their pins are not
+            // missing-with-other-responsive), so this is a no-op for them.
+            let mut order = runtime_candidate_order(env_arg, txt_arg);
+            if let Some((pin_name, _)) = pin {
+                let other = other_runtime(pin_name);
+                if let Some(sub) = record_reconcile_decides(
+                    pin,
+                    probes.get(pin_name) == Some(&ModuleRuntimeProbe::Missing),
+                    probes.get(other) == Some(&ModuleRuntimeProbe::Responsive),
+                    fixture_other_data_listed(sc, other),
+                ) {
+                    order = vec![sub.to_string()];
+                }
+            }
             let got = decide_module_runtime(&order, &probes, pin);
             let want = &sc["expect_module_plane"];
             match want["ok"].as_str() {
@@ -4137,14 +4304,20 @@ mod tests {
                             "scenario {}: refusal must say 'container runtime': {}",
                             name, err
                         );
-                        assert!(
-                            err.contains("SEPARATE named volumes"),
-                            "scenario {}: refusal must say why it will not \
-                             substitute: {}",
-                            name, err
-                        );
                         let alt_usable =
                             want["refused"]["alternative_usable"].as_bool().unwrap();
+                        // The why-not-substitute clause appears only in the
+                        // other-usable arm of `module_runtime_pin_refusal`
+                        // (the no-alternative arm says "start it / install it"
+                        // instead) — same split as the Python refusal.
+                        if alt_usable {
+                            assert!(
+                                err.contains("SEPARATE named volumes"),
+                                "scenario {}: refusal must say why it will not \
+                                 substitute: {}",
+                                name, err
+                            );
+                        }
                         assert_eq!(
                             err.contains("is a usable container runtime but VCO will NOT drive it"),
                             alt_usable,
@@ -4163,6 +4336,69 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The reconcile arm's VCO-data detector keys on VCO's own volume
+    /// names; they MUST match what `infrastructure/docker-compose.yml`
+    /// actually declares (the Python twin is
+    /// `test_vco_volume_names_match_the_installer_compose` in
+    /// tests/test_v0297_runtime_reconcile.py — same regex, same table).
+    #[test]
+    fn vco_volume_names_match_the_installer_compose() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../infrastructure/docker-compose.yml");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        // Same extraction as the Python twin: every
+        // `name: ${VCT_*_VOLUME_NAME:-<default>}` default, in file order
+        // (the comment block above the volumes mentions the placeholder
+        // too, so the `name:` prefix is load-bearing).
+        let mut defaults: Vec<String> = Vec::new();
+        for line in text.lines() {
+            if !line.contains("name: ${VCT_") {
+                continue; // the comment block mentions the placeholder too
+            }
+            let Some(idx) = line.rfind("_VOLUME_NAME:-") else { continue };
+            let rest = &line[idx + "_VOLUME_NAME:-".len()..];
+            let Some(end) = rest.find('}') else { continue };
+            defaults.push(rest[..end].trim().to_string());
+        }
+        assert_eq!(
+            defaults,
+            VCO_VOLUME_NAMES.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            "VCO_VOLUME_NAMES must match the installer compose exactly"
+        );
+    }
+
+    /// The reconcile decision is the one sanctioned substitution, and ONLY
+    /// on the shape that earns it (v0.2.97 R8 follow-up): record pin +
+    /// recorded runtime missing + other responsive + data listed. Every
+    /// neighbouring shape — env pin, no pin, recorded runtime installed
+    /// (so not missing), other down, data unlistable — must NOT switch.
+    #[test]
+    fn record_reconcile_decides_only_on_the_stale_record_shape() {
+        let record = Some(("docker", RuntimePinSource::RuntimeTxt));
+        let env = Some(("podman", RuntimePinSource::EnvOverride));
+        // The one shape that reconciles: data under the other runtime.
+        assert_eq!(
+            record_reconcile_decides(record, true, true, Some(true)),
+            Some("podman")
+        );
+        // ... and the no-data-anywhere variant (nothing to lose).
+        assert_eq!(
+            record_reconcile_decides(record, true, true, Some(false)),
+            Some("podman")
+        );
+        // The env pin is never reconciled.
+        assert_eq!(record_reconcile_decides(env, true, true, Some(true)), None);
+        // No pin at all.
+        assert_eq!(record_reconcile_decides(None, true, true, Some(true)), None);
+        // Recorded runtime installed (down, not missing): stays refused.
+        assert_eq!(record_reconcile_decides(record, false, true, Some(true)), None);
+        // Other runtime not answering: stays refused.
+        assert_eq!(record_reconcile_decides(record, true, false, Some(true)), None);
+        // Data could not be listed ("could not look" is never "empty").
+        assert_eq!(record_reconcile_decides(record, true, true, None), None);
     }
 
     /// v0.2.97 owner ruling "Honour the pin": an object that only the OTHER

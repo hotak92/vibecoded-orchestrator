@@ -172,6 +172,32 @@ class ShippedSidecarLifecycleTest(unittest.TestCase):
             f"<checkout>): {orphans}",
         )
 
+    def test_every_shipped_node_has_a_sidecar_entry(self):
+        """The coverage pin (v0.2.97, R8 follow-up): every shipped node —
+        every .md under templates/knowledge/ except TAG_HIERARCHY.md and
+        VOCABULARY.md — must HAVE an entry in the sidecar whose
+        content_hash matches the node's current text. The sibling tests
+        cover the entry side (orphans, stale hashes); this one covers the
+        node side, so a node added to templates/knowledge/ without
+        regenerating the sidecar cannot ship silently unsummarized (a
+        3rd-party install would regenerate its summary at first run
+        instead of reusing the pre-shipped one).
+        Regenerate with
+        ``scripts/build_shipped_kg_node_formats.py --private-root <checkout>``.
+        """
+        missing = [
+            _materialized_key(n)
+            for n in _shipped_nodes()
+            if _materialized_key(n) not in self.db
+        ]
+        self.assertEqual(
+            missing, [],
+            "shipped nodes with NO .node_formats.json entry (their summaries "
+            "cannot be reused on install). Regenerate with "
+            "scripts/build_shipped_kg_node_formats.py --private-root "
+            f"<checkout>. Missing: {missing}",
+        )
+
     def test_every_entry_hash_matches_current_node(self):
         """The reuse invariant: stored content_hash == hash of the CURRENT node.
 

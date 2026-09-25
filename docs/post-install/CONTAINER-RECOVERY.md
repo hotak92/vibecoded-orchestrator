@@ -101,11 +101,24 @@ and a recorded runtime that is down is refused, never swapped for the
 other one (the two keep separate volumes, so a swap starts an empty
 stack). `VCT_CONTAINER_RUNTIME=podman|docker`, in the environment the
 process starts from (shell rc, `<project>/.claude/env`, or the login
-session for the launcher), overrides the record. To switch for good:
-set `VCT_CONTAINER_RUNTIME` and re-run `python <install_root>/install.py
---update` (it records the runtime it used), or write the one word into
-`runtime.txt`; a running launcher keeps the environment it started with,
-so quit and relaunch it afterwards.
+session for the launcher), overrides the record and stays strict: a
+pinned runtime that is down is refused, and the refusal names the pin.
+
+`install.py` (install and `--update`) reconciles the record with the
+machine before using it. A recorded runtime that is no longer installed,
+while the other one answers and holds VCO's containers/volumes (or there
+are none anywhere), is re-recorded, and `UPDATE_DEFERRED.md` says what
+changed. A recorded runtime that is installed but not answering is
+started the documented way; if it still does not answer, the update
+finishes everything that does not need containers and leaves an entry
+naming what to start, which clears by itself once it answers. When both
+runtimes hold VCO data, the record is kept and the entry asks which one is
+current. The boot service (`scripts/launch-claude-mcp-stack.*`) reads its
+OWN clone's record, applies the same decision without rewriting anything,
+and records a refusal in the same ledger. To switch for good: `python
+<install_root>/install.py --update --container podman|docker` (it
+re-records `runtime.txt` and marks the choice as yours). A running launcher
+keeps the environment it started with, so quit and relaunch it afterwards.
 
 **Daemon-vs-binary**: the CLI binary AND the daemon both need to run.
 Symptom: `docker --version` works but `docker ps` errors `Cannot

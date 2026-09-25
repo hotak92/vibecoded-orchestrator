@@ -98,6 +98,7 @@ __all__ = [
     "runtime_candidate_order",
     "runtime_pin",
     "read_runtime_txt",
+    "write_runtime_txt",
     "runtime_txt_path",
     "PIN_VIA_ENV",
     "PIN_VIA_RUNTIME_TXT",
@@ -571,11 +572,22 @@ class RuntimeResolution:
     #: — see ``infrastructure/docker-compose.yml``, so driving the other one
     #: forks the data plane and brings up an EMPTY Weaviate).
     alternative_usable: Optional[str] = None
-    #: Always ``False`` since v0.2.92 — but still COMPUTED (``pref is not
-    #: None and candidate != pref``), so it is a live invariant rather than a
-    #: constant: any change that reintroduces a fall-through flips it and
+    #: Always ``False`` from v0.2.92 until the v0.2.97 record reconcile —
+    #: still COMPUTED (``pref is not None and candidate != pref``), so it is
+    #: a live invariant rather than a constant. The ONE sanctioned way it is
+    #: ``True`` is :attr:`record_reconciled` (case (a) of the install-record
+    #: reconcile, see :func:`resolve`); any change that reintroduces a
+    #: fall-through outside that arm flips it and
     #: ``tests/fixtures/container_runtime_parity.json`` fails on every row.
     substituted: bool = False
+    #: True only when the RECORD pin was answered with the other runtime
+    #: because the recorded one is not installed and the read-only record
+    #: reconcile decided case (a) (the other runtime answers, holding VCO's
+    #: data, or no VCO data exists anywhere) — see :func:`resolve`. What
+    #: lets a caller say what happened: the record stays stale on disk (the
+    #: next update re-records it), so the user gets ONE explanatory line,
+    #: not a refusal. An ENV pin is never reconciled.
+    record_reconciled: bool = False
 
     def to_dict(self) -> dict:
         d = asdict(self)
@@ -634,6 +646,29 @@ def read_runtime_txt(install_root: Optional[Path]) -> Optional[str]:
     except (OSError, ValueError):
         return None
     return token if token in RUNTIME_CANDIDATES else None
+
+
+def write_runtime_txt(install_root: Path, container_runtime: Optional[str]) -> Optional[str]:
+    """THE writer of ``state/install/runtime.txt`` — install.py
+    (``_persist_runtime_txt``) and the record reconcile
+    (:mod:`vco_lib.runtime_reconcile`) both call it, so the file has one
+    format. ``container_runtime`` may carry a version (``"Podman 5.0.1"``):
+    the first token, lower-cased, is recorded. Idempotent (no write when the
+    record already says it). Returns the recorded token, or ``None`` when the
+    value names no runtime (nothing written). Raises ``OSError``."""
+    parts = (container_runtime or "").split()
+    token = parts[0].lower() if parts else ""
+    if token not in RUNTIME_CANDIDATES:
+        return None
+    path = runtime_txt_path(install_root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        existing = path.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        existing = ""
+    if existing != token:
+        path.write_text(token + "\n", encoding="utf-8")
+    return token
 
 
 def runtime_pin(
@@ -856,9 +891,12 @@ def _pin_refusal_reason(
             f"the install recorded {pref} as this machine's container runtime "
             f"({where}) but {pinned.why}"
         )
+        # `install.py --container` re-records runtime.txt through the one
+        # writer; a hand edit of the file is never the remedy (G1, v0.2.97).
         repin = (
-            f"set VCT_CONTAINER_RUNTIME={alternative} to override the record, or "
-            f"write `{alternative}` into {where}"
+            f"run `python install.py --update --container {alternative}` (it "
+            f"re-records {where}), or set VCT_CONTAINER_RUNTIME={alternative} "
+            f"to override the record"
         ) if alternative else ""
     else:
         head = f"VCT_CONTAINER_RUNTIME={pref} is set but {pinned.why}"
@@ -922,6 +960,22 @@ def resolve(
     Probes are injectable (``which`` / ``run``) so the decision is unit-
     testable against ``tests/fixtures/container_runtime_parity.json``
     without podman or docker on the machine.
+
+    v0.2.97 (R8 follow-up, owner rule "users never need a manual step"): the
+    RECORD pin — and ONLY the record pin — is reconciled read-only. When
+    ``state/install/runtime.txt`` names a runtime that is NOT installed and
+    the read-only record reconcile (:func:`vco_lib.runtime_reconcile.reconcile`
+    with ``rewrite=False``) decides case (a) (the other runtime answers,
+    holding VCO's containers/volumes, or no VCO data exists anywhere), the
+    resolver ANSWERS the other runtime — writing nothing (the next update
+    re-records it) — with :attr:`record_reconciled` /
+    :attr:`RuntimeResolution.substituted` set and a ``reason`` that says what
+    happened. Without this, every session hook refused a stack that was
+    already running under the other runtime until the next update happened
+    to rewrite the record. Every other case keeps the strict v0.2.92
+    behaviour: a recorded runtime that is installed but down stays refused,
+    data under both runtimes stays refused, and the ENV pin is NEVER
+    reconciled.
     """
     _which = which or shutil.which
     _run = run or subprocess.run
@@ -930,6 +984,12 @@ def resolve(
     pref = pin[0] if pin is not None else None
     via = pin[1] if pin is not None else None
     installed = installed_runtime(env=env, which=_which, install_root=install_root) or None
+    if install_root is _DEFAULT_ROOT:
+        from vco_lib.python_exe import resolve_install_root  # noqa: PLC0415 — stdlib-light, lazy
+
+        root: Optional[Path] = resolve_install_root()
+    else:
+        root = Path(install_root) if install_root is not None else None  # type: ignore[arg-type]
 
     def _probe_one(candidate: str) -> _CandidateProbe:
         return _evaluate_candidate(
@@ -937,14 +997,17 @@ def resolve(
             probe_compose=probe_compose, home=home,
         )
 
-    def _resolved(candidate: str, p: _CandidateProbe) -> RuntimeResolution:
+    def _resolved(candidate: str, p: _CandidateProbe, *, note: Optional[str] = None,
+                  reconciled: bool = False) -> RuntimeResolution:
         return RuntimeResolution(
             RuntimeState.RESOLVED, candidate, installed, p.compose,
-            p.compose_form, p.daemon, p.why, requested=pref, requested_via=via,
+            p.compose_form, p.daemon, note or p.why, requested=pref, requested_via=via,
             requested_installed=pref is not None and probes[pref].status != "missing",
             # Computed, not hardcoded: with a one-element pinned order this
-            # can no longer be True, and the fixture asserts that on every row.
+            # is True only on the record-reconcile arm, and the fixture
+            # asserts that on every row.
             substituted=pref is not None and candidate != pref,
+            record_reconciled=reconciled,
         )
 
     probes: dict[str, _CandidateProbe] = {}
@@ -952,10 +1015,33 @@ def resolve(
     saw_unknown = False
     refused: list[str] = []
 
-    for candidate in runtime_candidate_order(pref):
+    order = runtime_candidate_order(pref)
+    record_note: Optional[str] = None
+    if (via == PIN_VIA_RUNTIME_TXT and root is not None and pref is not None
+            and not _which(pref)):
+        # The record names a runtime that is NOT installed. Ask the ONE
+        # record reconciler, READ-ONLY (no runtime.txt write, no daemon
+        # start, no ledger entry): its case (a) — the other runtime answers,
+        # holding VCO's containers/volumes, or no VCO data exists anywhere —
+        # is the only way the strict pin is lifted here. Installed-but-down,
+        # data under both, an unlistable other runtime and every reconcile
+        # failure keep the refusal below (the reconcile says UNUSABLE, the
+        # resolver's own ladder then refuses exactly as before). The env
+        # pin never reaches this arm.
+        from vco_lib.runtime_reconcile import Outcome as _Outcome  # noqa: PLC0415 — lazy: runtime_reconcile imports this module
+        from vco_lib.runtime_reconcile import reconcile as _record_reconcile
+
+        probes[pref] = _probe_one(pref)  # "missing" — the ladder's own verdict
+        rec = _record_reconcile(root, env=env, which=_which, run=_run, rewrite=False)
+        if (rec.outcome is _Outcome.REWRITTEN and rec.runtime in RUNTIME_CANDIDATES):
+            order = [rec.runtime]
+            record_note = rec.detail
+
+    for candidate in order:
         p = probes[candidate] = _probe_one(candidate)
         if p.status == "usable":
-            return _resolved(candidate, p)
+            return _resolved(candidate, p, note=record_note,
+                             reconciled=record_note is not None)
         if p.status == "unknown":
             saw_unknown = True
         elif p.status == "refused":
@@ -964,7 +1050,8 @@ def resolve(
             first_no_compose = candidate
 
     if first_no_compose is not None:
-        return _resolved(first_no_compose, probes[first_no_compose])
+        return _resolved(first_no_compose, probes[first_no_compose],
+                         note=record_note, reconciled=record_note is not None)
     if saw_unknown:
         return RuntimeResolution(
             RuntimeState.UNKNOWN, None, installed, None, None, None,
@@ -1099,6 +1186,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             # surfaces disagree, which is the split-brain BLOCKER-4 fixed.
             print(f"VCO_RUNTIME_REQUESTED_INSTALLED={'1' if res.requested_installed else '0'}")
             print(f"VCO_RUNTIME_ALTERNATIVE_USABLE={shlex.quote(res.alternative_usable or '')}")
+            # v0.2.97 (R8 follow-up): the record pin was answered with the
+            # other runtime (case (a) of the read-only record reconcile).
+            # ensure-containers.{sh,ps1} branch on this to say what happened
+            # (one stdout line, the reason carries it) instead of letting a
+            # stale-but-reconciled record look like a broken state.
+            print(f"VCO_RUNTIME_RECONCILED={'1' if res.record_reconciled else '0'}")
         else:
             line = res.runtime or "-"
             if res.compose:

@@ -180,6 +180,9 @@ pub const CONTAINER_HOST_ALIAS: &str = "host.containers.internal";
 ///
 /// The ONE Rust loopback rule (R7b F14): the hub's module health poller
 /// (`vct_hub::module_health`, which contacts only loopback) uses this too.
+/// MUST MATCH `vco_lib.service_probe_http.is_loopback_host` (Python), whose
+/// test (`tests/test_v0297_r8_g10_probe_loopback.py`) runs this function's
+/// test table.
 pub fn is_loopback_host(host: &str) -> bool {
     let bare = host.trim().trim_start_matches('[').trim_end_matches(']');
     bare.is_empty()

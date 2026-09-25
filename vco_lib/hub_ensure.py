@@ -92,7 +92,6 @@ import re
 import shutil
 import subprocess
 import sys
-import urllib.request
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -406,7 +405,13 @@ def probe_hub_health(timeout: float = 0.5, vct_root: Optional[Path] = None) -> b
         if port is None:
             return False
         url = f"http://127.0.0.1:{port}/api/v1/health"
-        resp = urllib.request.urlopen(url, timeout=timeout)
+        # R8 G10: the one probe opener — a stray process on that port
+        # answering `302 https://elsewhere/` is a 3xx (not healthy), never
+        # followed off-machine; and a proxy in the environment is not used
+        # for this loopback URL.
+        from vco_lib.service_probe_http import open_probe  # noqa: PLC0415
+
+        resp = open_probe(url, timeout)
         healthy = resp.status < 400
         if healthy:
             # V0243-1: unlink stale v0.2.21-cutover.flag when hub is up.
@@ -646,18 +651,10 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
     short-circuits when already running and returns within ~100 ms, so the
     cost of the spawn is bounded either way.
     """
-    from vco_lib.install_companions import detached_child_env
+    from vco_lib.install_companions import detached_child_env, detached_popen_kwargs
 
     argv = [str(binary), "--start-if-not-running"]
     env = detached_child_env()  # the hub outlives us: no relaunch record
-    creationflags = 0
-    start_new_session = False
-    if os.name == "nt":
-        # DETACHED_PROCESS | CREATE_NO_WINDOW — no conhost.exe flash when the
-        # parent is a GUI subsystem process.
-        creationflags = 0x0000_0008 | 0x0800_0000
-    else:
-        start_new_session = True
     try:
         if wait:
             completed = subprocess.run(
@@ -684,8 +681,7 @@ def _spawn(binary: Path, wait: bool) -> EnsureResult:
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                start_new_session=start_new_session,
-                creationflags=creationflags,
+                **detached_popen_kwargs(),
             )
     except OSError as exc:
         return EnsureResult(

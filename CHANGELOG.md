@@ -281,7 +281,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Every launcher, hub and `vct-cli` request to this machine — the hub, the
   model gateway, module ports, VCO's own services — now bypasses
   `HTTP_PROXY` and follows no redirects, so the hub's token never reaches a
-  proxy. A service adopted on another machine still goes through your proxy.
+  proxy; the install-time hub check does the same. `localhost` counts as this
+  machine, a name that only resolves to it does not. A service adopted on
+  another machine still goes through your proxy.
 - **Preferences → Modules** shows each module's HTTP API address with its
   live port.
 - Container modules the orchestrator starts now receive the settings their
@@ -297,8 +299,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   required, or one whose name cannot be used as an environment variable,
   stops the start — including a restart — and leaves the running container
   alone. Before, both lists were ignored.
-- Settings of modules installed machine-wide now reach each project's `/env`,
-  with the machine-wide value used where no per-project value is set, and the
+- Settings of modules installed machine-wide now reach each project's `/env`
+  (their secrets do not — a module's secrets reach a project only through a
+  per-project install, as before), with the machine-wide value used where no
+  per-project value is set, and the
   settings page offers only fields something actually delivers. Modules under
   development (`VCT_LAUNCHER_DEV_CATALOG_PASSTHROUGH`) are listed and their
   settings save. A setting's `validation` pattern must use a portable subset
@@ -343,13 +347,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Your data wins over a stranger's service.** A stopped VCO container that
   holds your knowledge graph or models outranks a running Weaviate or Ollama
   that someone else runs: VCO starts its own and never switches to the other
-  one. When it cannot tell which of several is yours, it asks through
-  `UPDATE_DEFERRED.md` instead of picking. A container with no record yet is
+  one. When it cannot tell which of several is yours, it picks one, says
+  which, and the entry in `UPDATE_DEFERRED.md` lets you choose another. A container with no record yet is
   only ever started by name, never removed and re-created. Interrupting the
   "use this Weaviate?" question (Ctrl-C) no longer counts as yes. A service
   that someone else starts on VCO's own port is noticed, not trusted.
 - The session-start check looks only at the recorded services — no port
-  scans, no reading other people's Weaviate. The two container hooks no
+  scans, and it reads another Weaviate only when one has appeared on VCO's
+  own recorded port. A container hook stopped at its time limit no longer
+  releases the shared lock while its `compose up` keeps running: the locked
+  work runs in the background, holds the lock until it has really finished,
+  and the hook shows its output within its time limit. The two container hooks no
   longer act at the same moment, and the port check removes nothing it could
   not re-check; it now logs every run to
   `.claude/logs/container_port_check.jsonl`, as its documentation said it did.
@@ -430,6 +438,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   relaunch. The first-install wizard shows this as a step to resolve instead
   of failing, and its pre-install check lists the same volumes the install
   will use.
+- The runtime the install recorded is VCO's own note, so an update keeps it
+  true instead of stopping on it. If the recorded runtime is no longer
+  installed, the update re-records the one your data is on and says so in
+  `UPDATE_DEFERRED.md` (until then, sessions and the boot service already
+  use that runtime). If it is installed but not answering, the update tries
+  to start it; if it still does not answer, the update finishes everything
+  else and leaves an entry naming what to start, which clears once it
+  answers. If podman and docker both hold VCO data, it keeps the recorded one
+  and asks; `install.py --update --container <podman|docker>` records your
+  choice. Before, an update in any of these cases exited with an error behind
+  a message that named the wrong runtime. A runtime you pinned with
+  `VCT_CONTAINER_RUNTIME` is never changed.
+- The boot service reads its own install's runtime record, never another
+  copy's, and falls back to its own compose folder when the configured one is
+  gone. When it cannot start the stack, the reason appears in
+  `UPDATE_DEFERRED.md`, not only in a log under `/tmp`.
 - Every VCO client (Python, shell, PowerShell, `vct-cli`, the launcher, and
   `vco verify-diagrams`) now finds the hub the same way, and agrees on what a
   valid port is: 1–65535 in plain digits (a sign, `_`, other numerals or
@@ -450,6 +474,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a command only podman has, so every lookup answered "not found". It now
   asks in a way both understand, and a runtime that cannot answer is treated
   as an error, never as "not found".
+- Moving code-embed during an update no longer registers VCO's MCP servers
+  twice (on a first install that logged two failures and rewrote
+  `~/.claude.json` mid-step); they are registered once, in the update's own
+  step.
 - `install.ps1 -WithMaoAgents` aborted the whole install: it passed a flag
   `install.py` does not accept. The switch now only warns that it is no
   longer needed (the specialist agents install unless you pass `-NoAgents`).

@@ -870,7 +870,54 @@ async fn resolve_runtime_in(install_root: Option<&std::path::Path>) -> Option<Ru
         std::env::var("VCT_CONTAINER_RUNTIME").ok().as_deref(),
     );
     let recorded = recorded_runtime_in(install_root);
-    let order = candidate_order(override_pref.as_deref(), recorded.as_deref());
+    let mut order = candidate_order(override_pref.as_deref(), recorded.as_deref());
+
+    // v0.2.97 R8 follow-up: a STALE RECORD pin is the one sanctioned
+    // substitution (the mirror of the reconcile arm in
+    // `container_runtime::detect_container_runtime_with_pin` and
+    // `vco_lib.containers.resolve`). runtime.txt names a runtime that is
+    // not installed, the other runtime answers, and its data could be
+    // listed (VCO's data under it, or provably none anywhere) → drive
+    // the other runtime, read-only — the next update re-records it. The
+    // ENV pin is never reconciled; an installed-but-down recorded
+    // runtime keeps the strict refusal (nothing runs).
+    {
+        use super::container_runtime::{
+            other_runtime, pinned_runtime, record_reconcile_decides, RuntimePinSource,
+        };
+        let env_pin = match override_pref.as_deref() {
+            Some(p @ ("podman" | "docker")) => Some(p),
+            _ => None,
+        };
+        let pinned = pinned_runtime(env_pin, recorded.as_deref());
+        if let Some((pin, RuntimePinSource::RuntimeTxt)) = pinned {
+            if which_on_path(pin).is_none() {
+                let other = other_runtime(pin);
+                let other_responsive =
+                    super::container_runtime::runtime_daemon_responsive(other).await;
+                let other_data_listed = if other_responsive {
+                    super::container_runtime::vco_data_under(other).await
+                } else {
+                    None
+                };
+                if let Some(sub) = record_reconcile_decides(
+                    pinned,
+                    true,
+                    other_responsive,
+                    other_data_listed,
+                ) {
+                    tracing::info!(
+                        recorded = pin,
+                        runtime = sub,
+                        "stale runtime record: {} is not installed; driving {}                          (the next update re-records it)",
+                        pin,
+                        sub
+                    );
+                    order = vec![runtime_named(sub)];
+                }
+            }
+        }
+    }
 
     for runtime in order {
         // Probe lazily (stop at the first acceptable runtime), but feed the
@@ -982,6 +1029,26 @@ mod tests {
             .collect()
     }
 
+    /// The fixture's answer to "could the other runtime's data be
+    /// listed" — mirrors the module plane's
+    /// `fixture_other_data_listed` (same fields, same semantics).
+    fn other_data_listed(sc: &serde_json::Value, other: &str) -> Option<bool> {
+        if sc
+            .get("vco_data_unlistable")
+            .and_then(|v| v.as_array())
+            .map(|arr| arr.iter().any(|n| n.as_str() == Some(other)))
+            .unwrap_or(false)
+        {
+            return None;
+        }
+        Some(
+            sc.get("vco_data_under")
+                .and_then(|v| v.get(other))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+        )
+    }
+
     fn runtime_from(name: &str) -> ContainerRuntime {
         match name {
             "podman" => ContainerRuntime::Podman,
@@ -1017,10 +1084,43 @@ mod tests {
         for sc in fx["scenarios"].as_array().unwrap() {
             let name = sc["name"].as_str().unwrap();
             let env = sc["env"].as_str();
-            let order = candidate_order(
+            let mut order = candidate_order(
                 normalise_override(env).as_deref(),
                 sc.get("runtime_txt").and_then(|v| v.as_str()),
             );
+            // v0.2.97 R8 follow-up: apply the stale-record reconcile arm
+            // the way `resolve_runtime_in` does — a record pin naming a
+            // runtime that is not installed, with the other answering and
+            // its data listed, drives the other runtime. Rows without
+            // data fields never reach the data probe.
+            {
+                use super::super::container_runtime::{
+                    other_runtime, pinned_runtime, record_reconcile_decides,
+                    RuntimePinSource,
+                };
+                let env_pin = match env {
+                    Some(p @ ("podman" | "docker")) => Some(p),
+                    _ => None,
+                };
+                let txt = sc
+                    .get("runtime_txt")
+                    .and_then(|v| v.as_str())
+                    .filter(|t| matches!(*t, "podman" | "docker"));
+                let pinned = pinned_runtime(env_pin, txt);
+                if let Some((pin, RuntimePinSource::RuntimeTxt)) = pinned {
+                    let other = other_runtime(pin);
+                    let on = names(sc, "on_path");
+                    let daemon_ok = names(sc, "daemon_ok");
+                    if let Some(sub) = record_reconcile_decides(
+                        pinned,
+                        !on.iter().any(|c| c == pin),
+                        daemon_ok.iter().any(|c| c == other),
+                        other_data_listed(sc, other),
+                    ) {
+                        order = vec![runtime_from(sub)];
+                    }
+                }
+            }
             let on_path = names(sc, "on_path");
             let version_ok = names(sc, "version_ok");
             let daemon_ok = names(sc, "daemon_ok");

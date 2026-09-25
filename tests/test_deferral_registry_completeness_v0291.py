@@ -269,6 +269,12 @@ _V0297_OWNED_ADDITIONS = frozenset({
     "legacy_service_statement_unimported",
     "service_adopted_without_prompt",
     "service_endpoints_migrated",
+    # v0.2.97 R8 G1: `vco_lib.runtime_reconcile.apply_at_install` runs from
+    # install.py's `_detect_system` INSIDE the run and adds the record to THAT
+    # run's report — family A proper. It records a completed one-time action
+    # (runtime.txt re-recorded); the next run finds the record matching the
+    # machine, does not re-detect it, and the one-shot expiry is the lifecycle.
+    "container_runtime_record_reconciled",
 })
 
 
@@ -631,6 +637,11 @@ class TestRegistryCompleteness(unittest.TestCase):
             "service_endpoint_unreachable", "service_endpoint_ambiguous",
             "legacy_service_statement_unimported", "adopted_service_config_drift",
             "service_adoption_confirmation_required",
+            # v0.2.97 R8 G1/G6: vco_lib.runtime_reconcile's entry builders attach
+            # runtime / via / root (and recorded / root) on every emit, the boot
+            # wrapper's record-boot-refusal included (pinned by
+            # tests/test_v0297_runtime_reconcile.py).
+            "container_runtime_unusable", "container_runtime_data_under_both",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

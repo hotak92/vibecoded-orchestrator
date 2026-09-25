@@ -27,7 +27,7 @@ import json
 import subprocess
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, cast
 
 import pytest
 
@@ -42,15 +42,24 @@ SCENARIOS = json.loads(FIXTURE.read_text(encoding="utf-8"))["scenarios"]
 
 
 class _Result:
-    def __init__(self, rc: int) -> None:
+    def __init__(self, rc: int, stdout: str = "") -> None:
         self.returncode = rc
-        self.stdout = ""
+        self.stdout = stdout
         self.stderr = ""
 
 
 def _probes(sc: dict):
-    """Build ``which`` / ``run`` doubles for one fixture scenario."""
+    """Build ``which`` / ``run`` doubles for one fixture scenario.
+
+    Besides the version / info / compose probes, serves the READ-ONLY record
+    reconcile's container / volume listings when the scenario models them
+    (``vco_data_under`` / ``vco_data_unlistable``, v0.2.97 R8 follow-up): a
+    runtime listed as holding VCO's data lists ``vco_*`` names, one that does
+    not lists a foreign container, and an unlistable runtime's listing exits
+    non-zero."""
     on_path = set(sc["on_path"]) | set(sc["standalone_on_path"])
+    data = sc.get("vco_data_under") or {}
+    unlistable = set(sc.get("vco_data_unlistable") or [])
 
     def which(name: str) -> Optional[str]:
         return f"/usr/bin/{name}" if name in on_path else None
@@ -65,9 +74,20 @@ def _probes(sc: dict):
             return _Result(0 if rt in sc["daemon_ok"] else 1)
         if sub == ["compose", "version"]:
             return _Result(0 if rt in sc["compose_subcommand_ok"] else 1)
+        if sub[:2] == ["ps", "-a"]:
+            if rt in unlistable:
+                return _Result(1)
+            return _Result(0, "vco_weaviate\n" if data.get(rt) else "someone_elses_ollama\n")
+        if sub[:2] == ["volume", "ls"]:
+            if rt in unlistable:
+                return _Result(1)
+            return _Result(0, "vco_weaviate_data\n" if data.get(rt) else "someone_elses_data\n")
         raise AssertionError(f"unexpected probe {argv!r}")
 
-    return which, run
+    # The fake's _Result is not a CompletedProcess subclass (see the
+    # module's other doubles); cast keeps this helper assignable to the
+    # resolver's RunFn without growing pyright's pre-existing count.
+    return which, cast(containers.RunFn, run)
 
 
 def _install_root(tmp_path: Path, runtime_txt: Optional[str]) -> Path:
@@ -98,18 +118,34 @@ def test_resolve_matches_the_parity_fixture(sc: dict, tmp_path: Path):
         "requested": res.requested, "requested_via": res.requested_via,
         "substituted": res.substituted,
     }
-    assert got == exp, f"{sc['name']}: {got} != {exp} ({res.reason})"
+    # `record_reconciled` rides along in `expect` only on the reconcile rows;
+    # it is asserted on its own line right below.
+    assert got == {k: v for k, v in exp.items() if k != "record_reconciled"}, (
+        f"{sc['name']}: {got} != {exp} ({res.reason})"
+    )
+    assert res.record_reconciled is exp.get("record_reconciled", False), sc["name"]
     if sc["env"] == "bogus":
         assert warnings and "unrecognized" in warnings[0]
     # Ruling (v0.2.92 BLOCKER-4, overturning ASK #1): a pin is HONOURED or
     # REFUSED — never swapped. `substituted` is still computed from
     # `pref is not None and candidate != pref`, so this is a live invariant
     # over every host in the fixture, not an assertion about a constant.
-    assert res.substituted is False, (
-        f"{sc['name']}: resolver substituted {res.runtime!r} for the pinned "
-        f"{res.requested!r} — that forks the data plane (separate named volumes)"
-    )
-    assert res.to_dict()["substituted"] is False  # what --json carries
+    # The ONE exception (v0.2.97 R8 follow-up, owner rule "users never need
+    # a manual step"): case (a) of the READ-ONLY record reconcile — the
+    # RECORD pin names a runtime that is not installed and the other one
+    # answers, holding VCO's data (or no data exists anywhere) — is answered
+    # with the other runtime, writing nothing. Only that arm may substitute,
+    # only via the record channel, and only with a reason that says so.
+    if exp["substituted"]:
+        assert exp["requested_via"] == containers.PIN_VIA_RUNTIME_TXT, sc["name"]
+        assert res.record_reconciled is True, sc["name"]
+        assert "stale runtime record" in res.reason, f"{sc['name']}: {res.reason}"
+    else:
+        assert res.substituted is False, (
+            f"{sc['name']}: resolver substituted {res.runtime!r} for the pinned "
+            f"{res.requested!r} — that forks the data plane (separate named volumes)"
+        )
+    assert res.to_dict()["substituted"] is exp["substituted"]  # what --json carries
     if exp["requested"] and exp["state"] != "resolved":
         # A refused pin is USELESS unless it says what to do next.
         assert res.runtime is None and res.compose is None
@@ -562,3 +598,99 @@ def test_the_hooks_entry_point_honours_the_install_record(tmp_path: Path):
     payload = json.loads(proc.stdout)
     assert (payload["runtime"], payload["requested"], payload["requested_via"]) == (
         "docker", "docker", "state/install/runtime.txt")
+
+
+# ---------------------------------------------------------------------------
+# v0.2.97 R8 follow-up — the READ-ONLY record reconcile inside the resolver.
+# The record pin (state/install/runtime.txt) naming a runtime that is NOT
+# installed, with the other runtime answering and holding VCO's data (or no
+# VCO data anywhere), is ANSWERED with the other runtime: nothing written,
+# the env pin never reconciled, installed-but-down still refused. The fixture
+# rows above pin the same rule; these drive it directly with an install root.
+# ---------------------------------------------------------------------------
+
+
+def _record_doubles(on_path: tuple[str, ...], daemon_ok: tuple[str, ...],
+                    data: dict[str, bool]):
+    """which/run doubles for a host with an install record: version/info
+    exit 0 for runtimes in ``daemon_ok`` (and 1 for an installed one whose
+    daemon is down), and the reconcile's ps/volume listings answer per
+    ``data`` (True → vco_* names, False → a foreign name)."""
+    def which(name: str) -> Optional[str]:
+        return f"/usr/bin/{name}" if name in on_path else None
+
+    def run(argv, **_kw):
+        rt, sub = argv[0], argv[1:]
+        if sub == ["version"]:
+            return _Result(0 if rt in on_path else 1)
+        if sub == ["info"]:
+            return _Result(0 if rt in daemon_ok else 1)
+        if sub == ["compose", "version"]:
+            return _Result(0)
+        if sub[:2] == ["ps", "-a"]:
+            return _Result(0, "vco_weaviate\n" if data.get(rt) else "someone_elses_ollama\n")
+        if sub[:2] == ["volume", "ls"]:
+            return _Result(0, "vco_weaviate_data\n" if data.get(rt) else "someone_elses_data\n")
+        raise AssertionError(f"unexpected probe {argv!r}")
+
+    # The fake's _Result is not a CompletedProcess subclass (see the
+    # module's other doubles); cast keeps this helper assignable to the
+    # resolver's RunFn without growing pyright's pre-existing count.
+    return which, cast(containers.RunFn, run)
+
+
+def test_a_stale_record_with_the_other_runtime_holding_the_data_resolves_to_it(
+    tmp_path: Path,
+):
+    """Case (a), the owner's field shape: the install recorded docker, the
+    user removed Docker Desktop and moved to podman (the boot wrapper already
+    brought the stack up under podman) — the resolver must ANSWER podman
+    instead of refusing every session until the next update re-records, and
+    it must WRITE NOTHING (the update owns the record)."""
+    root = _install_root(tmp_path, "docker")
+    which, run = _record_doubles(("podman",), ("podman",), {"podman": True})
+    res = containers.resolve(env={}, which=which, run=run, warn=lambda _m: None,
+                             home=tmp_path, install_root=root)
+    assert res.state is containers.RuntimeState.RESOLVED
+    assert res.runtime == "podman" and res.compose == ["podman", "compose"]
+    assert res.requested == "docker"
+    assert res.requested_via == containers.PIN_VIA_RUNTIME_TXT
+    assert res.substituted is True and res.record_reconciled is True
+    assert "stale runtime record" in res.reason
+    assert "holds VCO's containers/volumes" in res.reason
+    # Nothing is written: the record is the update's to re-make.
+    assert containers.read_runtime_txt(root) == "docker"
+
+
+def test_a_recorded_runtime_installed_but_down_is_still_refused(tmp_path: Path):
+    """The reconcile never lifts a pin whose runtime is INSTALLED but its
+    daemon does not answer — that machine may well hold the data; starting
+    the runtime is the remedy, not switching."""
+    root = _install_root(tmp_path, "docker")
+    which, run = _record_doubles(("podman", "docker"), ("podman",), {"podman": True})
+    warnings: list[str] = []
+    res = containers.resolve(env={}, which=which, run=run, warn=warnings.append,
+                             home=tmp_path, install_root=root)
+    assert res.state is containers.RuntimeState.ABSENT
+    assert res.runtime is None
+    assert res.substituted is False and res.record_reconciled is False
+    assert res.requested == "docker" and res.requested_installed is True
+    assert containers.read_runtime_txt(root) == "docker"
+
+
+def test_the_env_pin_is_never_reconciled(tmp_path: Path):
+    """The USER's pin is strict everywhere: docker pinned through
+    VCT_CONTAINER_RUNTIME on a host where docker is gone and podman holds
+    everything stays a refusal — even though the record would reconcile."""
+    root = _install_root(tmp_path, "podman")
+    which, run = _record_doubles(("podman",), ("podman",), {"podman": True})
+    warnings: list[str] = []
+    res = containers.resolve(env={"VCT_CONTAINER_RUNTIME": "docker"}, which=which,
+                             run=run, warn=warnings.append, home=tmp_path,
+                             install_root=root)
+    assert res.state is containers.RuntimeState.ABSENT
+    assert res.substituted is False and res.record_reconciled is False
+    assert res.requested == "docker"
+    assert res.requested_via == containers.PIN_VIA_ENV
+    assert res.alternative_usable == "podman"
+    assert any("VCT_CONTAINER_RUNTIME=docker" in w for w in warnings)

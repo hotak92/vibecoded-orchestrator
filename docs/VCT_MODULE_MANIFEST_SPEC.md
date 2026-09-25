@@ -398,11 +398,13 @@ a value reaches the module depends on who starts it:
 - **`mcp_stdio` / `mcp_http` / `cli` modules**, which VCO does not spawn:
   `runtime.env_from_secrets` is not consulted. The hub's
   `GET /api/v1/projects/{id}/env` serves every declared secret of every module
-  installed for the project — a per-project install, or an enabled
-  machine-wide install the project's enable setting leaves on — through the
-  same gate with that project as the requester (paused → omitted, never
-  returned empty); the project's resolver
-  (`vct_secrets_resolve`, `vco_lib.agent_secrets`) reads it at need.
+  installed for the project — a per-project install, or a bundled module —
+  through the same gate with that project as the requester (paused → omitted,
+  never returned empty); the project's resolver
+  (`vct_secrets_resolve`, `vco_lib.agent_secrets`) reads it at need. A module
+  installed only MACHINE-WIDE serves the project its settings (§8) but not its
+  secrets: installing a module for the whole machine does not hand its secrets
+  to every project.
 
 **A property of container env, not of VCO:** once a container runs, its
 environment is part of the container's configuration. `podman inspect` /

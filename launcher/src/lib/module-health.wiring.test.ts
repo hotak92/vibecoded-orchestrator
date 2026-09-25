@@ -42,6 +42,15 @@ function isIdent(n: unknown, name: string): boolean {
   return (n as Node | undefined)?.type === 'Identifier' && (n as Node).name === name;
 }
 
+/** `obj.prop` or `obj?.prop` (an optional member is wrapped in a ChainExpression). */
+function isMember(n: unknown, obj: string, prop: string): boolean {
+  let node = n as Node | undefined;
+  if (node?.type === 'ChainExpression') node = node.expression as Node;
+  return (
+    node?.type === 'MemberExpression' && isIdent(node.object, obj) && isIdent(node.property, prop)
+  );
+}
+
 function calls(root: unknown, name: string): Node[] {
   return [...walk(root)].filter(
     (n) => n.type === 'CallExpression' && isIdent(n.callee, name),
@@ -65,6 +74,19 @@ describe('ModuleCatalog — health pill wiring', () => {
     const moduleArg = args[1];
     expect(moduleArg.type).toBe('MemberExpression');
     expect(isIdent(moduleArg.object, 'm') && isIdent(moduleArg.property, 'id')).toBe(true);
+    // R7b F26 / R8 G7: the CURRENT project's id picks the per-project health
+    // row — `project?.id`, falling back to null (machine-wide health) only
+    // when no project is open.
+    const projectArg = args[2];
+    const projectId =
+      projectArg?.type === 'LogicalExpression' && projectArg.operator === '??'
+        ? projectArg.left
+        : projectArg;
+    expect(isMember(projectId, 'project', 'id')).toBe(true);
+    if (projectArg?.type === 'LogicalExpression') {
+      const fallback = projectArg.right as Node;
+      expect(fallback.type === 'Literal' && fallback.value === null).toBe(true);
+    }
     expect(isIdent(args[3], 'healthError')).toBe(true);
 
     // The {@const} result is what an {#if} renders.

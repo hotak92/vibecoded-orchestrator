@@ -52,6 +52,13 @@ pub fn is_loopback_url(url: &str) -> bool {
 
 /// A builder for `url`: [`builder`] when its host is loopback; otherwise a
 /// builder that follows no redirect but keeps the environment's proxy.
+///
+/// "Loopback" is the LITERAL rule (R8 G10, on purpose): `localhost` in any
+/// case (loopback by RFC 6761), 127/8, `::1`. A name that only RESOLVES to
+/// this machine (`localhost.localdomain`, an `/etc/hosts` alias) keeps the
+/// proxy: no name is resolved here, so the choice never depends on the
+/// resolver at the moment of the call. Python's twin is
+/// `vco_lib.service_probe_http.is_loopback_url`.
 pub fn builder_for(url: &str) -> reqwest::ClientBuilder {
     if is_loopback_url(url) {
         builder()
@@ -112,12 +119,19 @@ mod tests {
         for yes in [
             "http://127.0.0.1:7700/api/v1",
             "http://localhost:8081",
+            "http://LOCALHOST:8081",
             "http://[::1]:11434/api/tags",
             "http://127.0.0.2:1/",
         ] {
             assert!(is_loopback_url(yes), "{yes}");
         }
-        for no in ["http://gpu-box:11434", "http://192.168.1.5:8081", "not a url", "http://localhost.example.com/"] {
+        for no in [
+            "http://gpu-box:11434",
+            "http://192.168.1.5:8081",
+            "not a url",
+            "http://localhost.example.com/",
+            "http://localhost.localdomain:8081",
+        ] {
             assert!(!is_loopback_url(no), "{no}");
         }
     }

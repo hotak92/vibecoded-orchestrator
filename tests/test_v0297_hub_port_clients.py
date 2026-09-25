@@ -23,7 +23,7 @@ per ladder:
 
 Each shell client's port function (and its value helper) is extracted from the
 script and run alone, so no hub, token or CLI entry point is involved. No
-reader here opens a socket: install.py's probe has ``urlopen`` replaced.
+reader here opens a socket: install.py's probe has ``open_probe`` replaced.
 """
 
 from __future__ import annotations
@@ -156,11 +156,14 @@ def test_install_hub_health_probe_port(tmp_path: Path, monkeypatch: pytest.Monke
     class _Resp:
         status = 200
 
-    def fake_urlopen(url, timeout=None):  # never a socket
+    def fake_open_probe(url, timeout=None):  # never a socket
         probed.append(url)
         return _Resp()
 
-    monkeypatch.setattr(install.urllib.request, "urlopen", fake_urlopen)
+    # The probe opens through the one probe opener (R8 G10).
+    from vco_lib import service_probe_http
+
+    monkeypatch.setattr(service_probe_http, "open_probe", fake_open_probe)
     healthy = install._probe_vct_hub_health()
     if case["expect_file"] is None:
         assert (healthy, probed) == (False, [])

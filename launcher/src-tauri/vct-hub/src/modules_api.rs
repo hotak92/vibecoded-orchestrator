@@ -869,7 +869,12 @@ async fn project_env(
     // R7b F23: a module installed MACHINE-WIDE serves this project when that
     // install is enabled and the enable cascade leaves it on here — the same
     // rule the settings editor offers the project's fields by
-    // (`module_settings_schema::global_install_serves_project`).
+    // (`module_settings_schema::global_install_serves_project`). It serves
+    // its SETTINGS only (the owner's F23 ruling, R8 G4): its declared secrets
+    // keep the scope they had before — a per-project install, or a bundled
+    // module — so installing a module machine-wide never starts handing its
+    // secrets to every project.
+    let mut settings_only_ids: Vec<&str> = Vec::new();
     for row in h.0.list_global_module_installs().unwrap_or_default() {
         let serves = vct_launcher_core::module_settings_schema::global_install_serves_project(
             &h.0,
@@ -882,6 +887,7 @@ async fn project_env(
         }
         if let Some((_, m)) = manifests.iter().find(|(_, m)| m.id == row.module_id) {
             active.push(m);
+            settings_only_ids.push(&m.id);
         }
     }
     let mut bundled_ids: Vec<&str> = Vec::new();
@@ -893,6 +899,9 @@ async fn project_env(
             }
         }
     }
+    // A bundled module is installed for every project: its secrets are
+    // served whether or not it is ALSO installed machine-wide.
+    settings_only_ids.retain(|id| !bundled_ids.contains(id));
 
     for manifest in active {
         // Settings (non-secret). An installed module's value is the
@@ -955,6 +964,9 @@ async fn project_env(
         // 009 THIS project is the requester, so a per-project pause of a
         // shared/global secret applies; v0.2.82 WP-4a a non-lock keychain
         // error marks the response degraded instead of silently dropping it.
+        if settings_only_ids.contains(&manifest.id.as_str()) {
+            continue;
+        }
         for s in &manifest.secrets {
             use vct_launcher_core::module_secrets_env::{resolve_module_secret, SecretLookup};
             match resolve_module_secret(&h.0, &manifest.id, &s.key, &s.scope, Some(&project.id)) {
@@ -1765,6 +1777,69 @@ mod tests {
         // The bundled hub module's machine-wide port is not served.
         h.0.set_global_setting("vct-hub-api", "VCT_HUB_PORT", &serde_json::json!(7811)).unwrap();
         assert!(env_of("p-on").await.get("VCT_HUB_PORT").is_none());
+    }
+
+    /// R8 G4 (the owner's F23 ruling: settings, not secrets): a module
+    /// installed MACHINE-WIDE serves every project its settings, but NOT its
+    /// declared secrets — those keep the scope they had before F23 (a
+    /// per-project install, or a bundled module). The control half proves the
+    /// secret is resolvable: the same project with a per-project install of
+    /// the module does receive it.
+    #[tokio::test]
+    async fn project_env_serves_a_machine_wide_install_its_settings_but_not_its_secrets() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let guard = vct_launcher_core::test_env::state_dir_guard();
+        let id = "vct-g4-probe";
+        let manifest = serde_json::json!({
+            "id": id, "name": id, "version": "1.0.0", "category": "core",
+            "license": { "required": false },
+            "install": { "method": "local", "install_dir": format!("{{VCT_MODULES}}/{id}") },
+            "settings": [ { "key": "G4_SETTING", "type": "string", "scope": "global" } ],
+            "secrets": [
+                { "key": "G4_GLOBAL_TOKEN", "scope": "global", "required": false },
+                { "key": "G4_PROJECT_TOKEN", "scope": "per-project", "required": false }
+            ],
+            "runtime": { "type": "mcp_stdio" }
+        });
+        let dir = guard.path().join("modules").join(id);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("vct-module.json"), manifest.to_string()).unwrap();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "p-g4", "G4", "/tmp/g4-project");
+        h.0.insert_global_module_install("g-g4", id, "1.0.0", "/tmp/g").unwrap();
+        h.0.set_global_setting(id, "G4_SETTING", &serde_json::json!("machine")).unwrap();
+        use vct_launcher_core::secrets::SecretScope;
+        vct_launcher_core::secrets::set(SecretScope::Global, id, "G4_GLOBAL_TOKEN", "synthetic-global")
+            .unwrap();
+        vct_launcher_core::secrets::set(
+            SecretScope::PerProject { project_id: "p-g4" },
+            id,
+            "G4_PROJECT_TOKEN",
+            "synthetic-project",
+        )
+        .unwrap();
+        let get = || async {
+            reqwest::get(format!("{}/projects/p-g4/env", base))
+                .await
+                .unwrap()
+                .json::<serde_json::Value>()
+                .await
+                .unwrap()
+        };
+
+        let machine_wide = get().await;
+        assert_eq!(machine_wide["G4_SETTING"].as_str(), Some("machine"), "{machine_wide}");
+        assert!(
+            machine_wide.get("G4_GLOBAL_TOKEN").is_none()
+                && machine_wide.get("G4_PROJECT_TOKEN").is_none(),
+            "a machine-wide install served its secrets: {machine_wide}"
+        );
+
+        h.0.insert_module_install("mi-g4", "p-g4", id, "1.0.0", "/tmp/m").unwrap();
+        let installed = get().await;
+        assert_eq!(installed["G4_GLOBAL_TOKEN"].as_str(), Some("synthetic-global"), "{installed}");
+        assert_eq!(installed["G4_PROJECT_TOKEN"].as_str(), Some("synthetic-project"), "{installed}");
     }
 
     /// v0.2.97 (lane V round 2): an installed module's declared secret is

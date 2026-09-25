@@ -157,8 +157,15 @@ fi
 # it on a descriptor nothing this hook spawns inherits and re-runs this
 # script as its child). Busy past 6 s (the watchdog is recovering a
 # container): nothing is done this session — never a second actor.
+# R8 G3: that locked re-run is started DETACHED (`run-detached`): the 6 s
+# lock wait, the 8 s reconcile and a first-session `compose up` together
+# exceed this hook's 15 s timeout, and the timeout's kill must never reach
+# the lock holder (it would release the lock while `compose up` runs on).
+# This process only relays the re-run's output for the hook's budget
+# (`service_lifecycle.SESSION_HOOK_RELAY_BUDGET_S`), then returns; the lock
+# is released when the re-run really ends.
 if [ -z "${VCO_SESSION_LOCK_HELD:-}" ]; then
-    exec "$RUN_PY" -m vco_lib.service_lifecycle with-session-lock --wait 6 \
+    exec "$RUN_PY" -m vco_lib.service_lifecycle run-detached --hook ensure-containers --lock-wait 6 \
         --busy "ensure-containers: verify-container-ports is recovering a container right now; left the containers to it this session (the next session re-checks them)" \
         -- bash "${BASH_SOURCE[0]}" "$@"
 fi
@@ -186,13 +193,23 @@ if [ "$VCO_RUNTIME_STATE" != "resolved" ]; then
     exit 0
 fi
 RUNTIME="$VCO_RUNTIME"
+# v0.2.97 (R8 follow-up): the resolver answered the OTHER runtime because the
+# install's record names one that is not installed and the other holds VCO's
+# data (case (a) of the read-only record reconcile — the resolver says so via
+# requested_via + record_reconciled, and the reason carries the story). One
+# stdout line so the user sees what happened; nothing was written, the next
+# update re-records it.
+if [ "$VCO_RUNTIME_RECONCILED" = "1" ]; then
+    echo "ensure-containers: $VCO_RUNTIME_REASON"
+fi
 # User can override the compose invocation via VCT_COMPOSE_CMD.
 COMPOSE_CMD="${VCT_COMPOSE_CMD:-$VCO_COMPOSE_CMD}"
 
 # Session reconcile FIRST (v0.2.97): `python -m vco_lib.service_endpoints
 # reconcile --phase session --json`, run by `service_lifecycle
-# session-reconcile` as a child with a hard time bound (8 s of this hook's
-# 15 s), soft-failing to one stdout line. It is the emit site of
+# session-reconcile` as a child with a hard time bound (8 s), soft-failing
+# to one stdout line. It runs in the detached re-run (see the lock above), so
+# it does not count against this hook's 15 s timeout. It is the emit site of
 # `service_endpoint_unreachable` (an adopted container a row names is gone),
 # and it corrects the rows to what is running — an adopted container that
 # moved port, or a "VCO-managed" row whose container turns out to belong to

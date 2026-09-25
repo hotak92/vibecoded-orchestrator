@@ -501,7 +501,7 @@ mod tests {
         // root (`vco_lib.hooks_settings.insert_hook`).
         assert_eq!(
             f.raw(),
-            before.replace(r#""bash .claude/hooks/notify-stop.sh""#, r#""bash \"${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh\"""#),
+            before.replace(r#""bash .claude/hooks/notify-stop.sh""#, r#""bash \"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh\"""#),
             "re-enable restores the original bytes, the hook path anchored"
         );
         assert_eq!(

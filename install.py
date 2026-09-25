@@ -163,6 +163,7 @@ from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
+from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
@@ -6099,7 +6100,7 @@ def main() -> int:
     _check_prerequisites()
 
     # Step 2: Detect system
-    sysinfo = _detect_system(args)
+    sysinfo = _detect_system(args, _deferral_report)
     _print_system_info(sysinfo)
 
     # Step 2b: Optional companion tools (lean-ctx for context compression)
@@ -8010,7 +8011,7 @@ def _gpu_vendor_preference_from_env() -> Optional[str]:
     return gpu_vendor_preference_from_env()
 
 
-def _detect_system(args: argparse.Namespace) -> SystemInfo:
+def _detect_system(args: argparse.Namespace, deferral_report: Any = None) -> SystemInfo:
     print("[2/10] Detecting system ... ", flush=True)
     _log_install_event("2/10", "start", "detecting system")
     os_name = platform.system()
@@ -8183,12 +8184,16 @@ def _detect_system(args: argparse.Namespace) -> SystemInfo:
     ):
         _print_selinux_bind_mount_hint()
 
-    # Container runtime
+    # Container runtime. R8 G1: reconcile VCO's own runtime.txt record FIRST (a
+    # stale record is rewritten; a runtime that stays down defers containers).
+    _runtime_reconcile.apply_at_install(
+        PROJECT_ROOT, args, deferral_report, log_event=_log_install_event,
+        start_daemon=lambda rt: _try_start_podman_daemon() if rt == "podman" else _try_start_docker_daemon())
     if args.container:
         container_cmd = args.container
         print(f"  Container: {container_cmd} (forced)")
     else:
-        container_cmd = _detect_container_runtime()
+        container_cmd = "" if getattr(args, "containers_deferred", "") else _detect_container_runtime()
         if container_cmd:
             print(f"  Container: {container_cmd}")
         elif not args.no_containers:
@@ -9514,22 +9519,11 @@ def _prompt_install_container_runtime(args: argparse.Namespace) -> bool:
     # `docker version` fails with the same exit code as truly-absent
     # docker, which made our earlier message misleading. Reported
     # 2026-04-28: "PC had docker, but not currently running".
-    installed = _detect_installed_runtime()
-    if installed:
-        print(f"\n[!] {installed} is installed but its daemon isn't responding.")
-        if os_name == "Windows" and installed == "docker":
-            print("    Open Docker Desktop from the Start Menu or system tray,")
-            print("    wait for the whale icon to settle (~30 seconds), then re-run install.")
-        elif os_name == "Darwin" and installed == "docker":
-            print("    Open Docker Desktop from /Applications, wait for the whale")
-            print("    icon to settle (~30 seconds), then re-run install.")
-        elif installed == "podman":
-            print("    Start the Podman machine (Linux: systemctl --user start podman.socket;")
-            print("    macOS / Windows: podman machine start), then re-run install.")
-        else:
-            print("    Start the Docker daemon (`sudo systemctl start docker` on Linux),")
-            print("    then re-run install.")
-        print("    Or re-run with --no-containers to skip container setup.")
+    # R8 G1: under a pin the text names the PINNED runtime, never the other
+    # one as "installed but its daemon isn't responding" (vco_lib owns the text).
+    down = _runtime_reconcile.runtime_down_message(os_name, _detect_installed_runtime())
+    if down:
+        print(down)
         return False
 
     print("\n[!] No container runtime found. The orchestrator needs Podman or Docker.")
@@ -17402,29 +17396,10 @@ def _persist_runtime_txt(container_runtime: str | None) -> None:
     Soft-fail: any I/O error is logged and the install continues. The
     wrapper script re-probes PATH if runtime.txt is missing.
     """
-    if not container_runtime:
-        return
-    # The first whitespace-separated token is the binary name; the rest is
-    # the version string. Normalize to lowercase ("Podman" / "Docker"
-    # both seen in the wild on minor versions).
-    runtime_token = container_runtime.split()[0].lower()
-    if runtime_token not in ("podman", "docker"):
-        return
-    state_dir = PROJECT_ROOT / "state"
-    install_subdir = state_dir / "install"
-    runtime_file = install_subdir / "runtime.txt"
+    # The one writer (vco_lib.containers.write_runtime_txt): first token,
+    # lower-cased ("Podman 5.0.1" -> podman), idempotent, unknown tokens skipped.
     try:
-        install_subdir.mkdir(parents=True, exist_ok=True)
-        # Idempotent: only write if content differs (avoids unnecessary
-        # mtime churn that could confuse downstream watchers).
-        existing = ""
-        if runtime_file.is_file():
-            try:
-                existing = runtime_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                existing = ""
-        if existing != runtime_token:
-            runtime_file.write_text(runtime_token + "\n", encoding="utf-8")
+        _containers.write_runtime_txt(PROJECT_ROOT, container_runtime)
     except OSError as exc:
         _log_install_event(
             "manifest", "warn",
@@ -22804,8 +22779,7 @@ def _print_next_steps(sysinfo: SystemInfo, args: argparse.Namespace) -> None:
         print()
 
     if args.no_containers:
-        print("  NOTE: You skipped container setup. Start Weaviate and Ollama")
-        print("  manually before using the orchestrator.")
+        print(_runtime_reconcile.containers_skipped_note(args))
         print()
 
     print("  Documentation: docs/")

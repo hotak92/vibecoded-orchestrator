@@ -25,6 +25,7 @@ import unittest
 from pathlib import Path
 
 from tests.common.launcher_db_fixture import make_launcher_db
+from vco_lib import containers
 from vco_lib import service_endpoints as se
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -384,6 +385,123 @@ class HookSessionReconcileTests(_TmpCase, _Shells):
                 self.assertEqual(len(m.compose_calls()), 1, proc.stdout)
 
 
+# ===========================================================================
+# (1b) R8 follow-up — a stale install record no longer refuses the session
+# ============================================================================
+
+
+def _make_podman_hold_vco_data(machine: _Machine) -> None:
+    """Rewrite the fake podman so the READ-ONLY record reconcile sees VCO's
+    containers and volumes under it: the reconcile's UNFILTERED listings
+    (``ps -a --format {{.Names}}`` / ``volume ls --format {{.Name}}``) answer
+    with ``vco_*`` names. The hooks' own FILTERED ``ps`` calls name a
+    container and never match these patterns, so lifecycle behaviour is
+    unchanged."""
+    script = (machine.bin / "podman").read_text(encoding="utf-8")
+    script = script.replace(
+        "  ps)\n",
+        '  ps)\n    case "$*" in\n'
+        '      "-a --format {{.Names}}") echo vco_weaviate; echo vco_ollama; exit 0 ;;\n'
+        "    esac\n",
+        1,
+    )
+    script = script.replace(
+        "esac\nexit 0",
+        'volume)\n  case "$*" in\n'
+        '    *"ls"*) echo vco_weaviate_data ;;\n'
+        "  esac\n"
+        "  exit 0 ;;\n"
+        "esac\nexit 0",
+        1,
+    )
+    (machine.bin / "podman").write_text(script, encoding="utf-8")
+
+
+class StaleRecordHookTests(_TmpCase, _Shells):
+    """The record names docker, docker is not installed, only podman exists
+    and it holds VCO's containers — the hook acts under podman, says what
+    happened in ONE line, and never prints the pin refusal (R8 follow-up;
+    before it, every session refused until the next update re-recorded)."""
+
+    def _stale_record_root(self, m: _Machine) -> Path:
+        root = m.tmp / "stale-record-clone"
+        (root / "vco_lib").mkdir(parents=True)  # what looks_like_orchestrator_root
+        (root / ".claude").mkdir()            # accepts as a clone
+        containers.runtime_txt_path(root).parent.mkdir(parents=True)
+        containers.runtime_txt_path(root).write_text("docker\n", encoding="utf-8")
+        return root
+
+    @staticmethod
+    def _path_without_docker(m: _Machine) -> str:
+        """A PATH with NO docker on it anywhere: every executable of the
+        current PATH symlinked into a farm dir, minus docker / docker-compose
+        (the host's real docker must never be probed — and its presence would
+        flip the scenario from "record names a runtime that is not installed"
+        to "installed but refusing"). The fake bin stays first, so the fake
+        podman wins over the host's real one."""
+        farm = m.tmp / "pathfarm"
+        farm.mkdir(exist_ok=True)
+        seen = {"podman", "docker", "docker-compose", "podman-compose"}
+        for dir_ in os.environ.get("PATH", "").split(os.pathsep):
+            if not dir_:
+                continue
+            try:
+                entries = list(Path(dir_).iterdir())
+            except OSError:
+                continue
+            for exe in entries:
+                name = exe.name
+                if (name in seen or name.startswith("docker")
+                        or not exe.is_file() or not os.access(exe, os.X_OK)):
+                    continue
+                link = farm / name
+                if not link.exists():
+                    try:
+                        link.symlink_to(exe)
+                    except OSError:
+                        pass
+        return f"{m.bin}{os.pathsep}{farm}"
+
+    def test_the_hook_acts_under_podman_when_the_record_names_a_gone_docker(self):
+        for shell in self.shells():
+            with self.subTest(shell=shell):
+                m = self.machine([_row("weaviate"), _row("ollama"), _row("code_embed")],
+                                 {"vco_weaviate": "missing", "vco_ollama": "running",
+                                  "vco_code_embed": "running"})
+                _make_podman_hold_vco_data(m)
+                root = self._stale_record_root(m)
+                env = m.env(VCT_CONTAINER_RUNTIME="", VCT_INSTALL_ROOT=str(root))
+                env["PATH"] = self._path_without_docker(m)
+                if shell == "bash":
+                    argv = ["bash", str(HOOKS / "ensure-containers.sh")]
+                else:
+                    argv = [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                            str(HOOKS / "ensure-containers.ps1")]
+                proc = subprocess.run(argv, env=env, capture_output=True, text=True,
+                                      timeout=180, cwd=str(REPO_ROOT))
+                self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+                both = proc.stdout + proc.stderr
+                # NOT the pin refusal: the stack is running under podman.
+                self.assertNotIn("VCO will NOT drive", both)
+                self.assertNotIn("; skipping\n", both, both)
+                # ONE line says what happened (the reconcile's reason).
+                lines = [ln for ln in both.splitlines() if "stale runtime record" in ln]
+                self.assertEqual(len(set(lines)), 1, both)
+                self.assertIn("docker is not installed", lines[0])
+                self.assertIn("podman", lines[0])
+                # And it ACTED under podman: the missing managed service is
+                # composed up, the running ones are only inspected.
+                calls = m.compose_calls()
+                self.assertEqual(len(calls), 1, f"{calls}\n{both}")
+                _assert_explicit_managed_only(self, calls[0], ["weaviate"],
+                                              forbidden=("ollama",))
+                self.assertFalse([c for c in m.runtime_calls() if c[0] == "rm"],
+                                 m.runtime_calls())
+                # The record itself is untouched — the next update re-records it.
+                self.assertEqual(containers.runtime_txt_path(root).read_text(
+                    encoding="utf-8").strip(), "docker")
+
+
 class VerifyContainerPortsZombieGateTests(_TmpCase, _Shells):
     """`verify-container-ports.{sh,ps1}` — the second zombie-recovery site.
 
@@ -526,12 +644,10 @@ class VerifyContainerPortsLogTests(_TmpCase, _Shells):
                 self.assertEqual((step["container"], step["service"], step["action"]),
                                  ("vco_weaviate", "weaviate", "recreated"), last)
                 self.assertIn("weaviate", step["detail"])
-                # bash re-runs itself under the session lock: the detection
-                # run logs first; PowerShell takes the lock in-process.
-                if shell == "bash":
-                    self.assertEqual([r["action"] for r in lines], ["waiting_for_session_lock", "recovered"])
-                else:
-                    self.assertEqual(len(lines), 1, lines)
+                # Both shells re-run themselves detached under the session
+                # lock (R8 G3): the detection run logs first, the re-run
+                # logs the recovery.
+                self.assertEqual([r["action"] for r in lines], ["waiting_for_session_lock", "recovered"])
 
     def test_an_adopted_zombie_is_logged_as_left_as_is(self):
         for shell in self.shells():

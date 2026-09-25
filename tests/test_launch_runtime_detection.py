@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -49,6 +50,8 @@ pytestmark = pytest.mark.skipif(
 _NEEDED_COREUTILS = (
     # Coreutils invoked by the script's own helpers.
     "head", "tr", "timeout", "grep", "sleep", "date", "cat", "uname", "dirname",
+    # main() (the exit-3 ledger test runs it whole): the refusal-reason pipe.
+    "sed", "tail", "rm", "readlink",
     # `bash` and `env` are needed because the runtime stubs use a
     # `#!/usr/bin/env bash` shebang. Without symlinking these, the
     # shebang resolves /usr/bin/env (absolute path) but then env's
@@ -73,7 +76,7 @@ def _seed_fake_bin(fake_bin: Path) -> None:
 
 
 def _run_bash(snippet: str, env: dict | None = None,
-              timeout: float = 10.0) -> tuple[int, str, str]:
+              timeout: float = 10.0, script: Path = SCRIPT) -> tuple[int, str, str]:
     """Run a bash snippet that has the script already sourced. Return
     (rc, stdout, stderr) with trailing whitespace stripped.
 
@@ -105,7 +108,7 @@ def _run_bash(snippet: str, env: dict | None = None,
     # diagnostic still lands on stderr (where tests can assert on it
     # via `err`) but stays out of stdout.
     full = (
-        f'set +e; source "{SCRIPT}"; '
+        f'set +e; source "{script}"; '
         'log() { printf "%s\\n" "$*" 1>&2; }; '
         f'{snippet}'
     )
@@ -282,43 +285,82 @@ def test_resolve_runtime_file_a_down_runtime_is_still_the_pin(tmp_path: Path):
     assert out != str(fallback_path)
 
 
+def _clone(tmp_path: Path, name: str = "clone") -> tuple[Path, Path]:
+    """An orchestrator clone layout the wrapper can belong to: a COPY of the
+    script in ``<clone>/scripts/`` (so its own clone is ``<clone>``, not this
+    checkout), ``vco_lib`` linked in, and an ``infrastructure/`` compose home.
+    Returns ``(clone_root, script)``."""
+    root = tmp_path / name
+    (root / "scripts").mkdir(parents=True)
+    script = root / "scripts" / SCRIPT.name
+    shutil.copy2(SCRIPT, script)
+    (root / "vco_lib").symlink_to(REPO_ROOT / "vco_lib", target_is_directory=True)
+    (root / "infrastructure").mkdir()
+    (root / "infrastructure" / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+    return root, script
+
+
 def test_resolve_runtime_file_skips_a_file_that_names_no_runtime(tmp_path: Path):
     """PR-12 Bug C is kept: a candidate that is missing, empty or names no
-    runtime is not a pin — the next candidate is."""
+    runtime is not a pin — the next candidate (the own clone's record) is."""
     fake_bin = tmp_path / "bin"
     _seed_fake_bin(fake_bin)
+    root, script = _clone(tmp_path)
     garbage = _make_runtime_txt(tmp_path / "garbage", "nerdctl")
-    real = _make_runtime_txt(tmp_path / "install", "podman")
+    real = _make_runtime_txt(root, "podman")
     env = {
         "PATH": str(fake_bin),
         "HOME": str(tmp_path),
         "VCT_STACK_RUNTIME_FILE": str(garbage),
-        "VCT_STACK_WORKING_DIR": str(tmp_path / "install"),
     }
-    _, out, err = _run_bash('resolve_runtime_file', env=env)
+    _, out, err = _run_bash('resolve_runtime_file', env=env, script=script)
     assert out == str(real)
     assert "not podman or docker" in err
 
 
-def test_resolve_runtime_file_uses_orchestrator_root(tmp_path: Path):
-    """Third-priority candidate: VCT_ORCHESTRATOR_ROOT/state/install/runtime.txt."""
+def test_the_wrapper_reads_its_own_clones_record_not_another_clones(tmp_path: Path):
+    """R8 G5: the wrapper serves ITS OWN clone. A stale unit WorkingDirectory
+    (PR-12 Bug C) or VCT_ORCHESTRATOR_ROOT naming ANOTHER clone used to come
+    first, so that clone's docker record pinned this install's stack onto
+    docker's empty volumes. Now the own clone's podman record is THE pin and
+    the disagreement is logged."""
     fake_bin = tmp_path / "bin"
     _seed_fake_bin(fake_bin)
-    (fake_bin / "podman").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (fake_bin / "podman").chmod(0o755)
-
-    orch_root = tmp_path / "orchestrator"
-    orch_path = _make_runtime_txt(orch_root, "podman")
-
+    root, script = _clone(tmp_path)
+    own = _make_runtime_txt(root, "podman")
+    old = tmp_path / "old-clone"
+    _make_runtime_txt(old, "docker")
+    _make_runtime_txt(old / "infrastructure", "docker")
     env = {
         "PATH": str(fake_bin),
         "HOME": str(tmp_path),
-        # Working dir candidate doesn't exist.
-        "VCT_STACK_WORKING_DIR": str(tmp_path / "missing"),
-        "VCT_ORCHESTRATOR_ROOT": str(orch_root),
+        "VCT_STACK_WORKING_DIR": str(old / "infrastructure"),
+        "VCT_ORCHESTRATOR_ROOT": str(old),
     }
-    _, out, _ = _run_bash('resolve_runtime_file', env=env)
-    assert out == str(orch_path)
+    _, out, err = _run_bash('resolve_runtime_file', env=env, script=script)
+    assert out == str(own)
+    assert "ignoring the other clone's record" in err
+
+
+def test_a_stale_working_dir_falls_back_to_the_wrappers_own_clone(tmp_path: Path):
+    """R8 G5: a VCT_STACK_WORKING_DIR that is not a VCO compose home (moved /
+    re-cloned install) is logged and replaced by the own clone's
+    infrastructure/ — the same volume names, never an empty stack."""
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    root, script = _clone(tmp_path)
+    stale = tmp_path / "moved-away"
+    stale.mkdir()
+    env = {"PATH": str(fake_bin), "HOME": str(tmp_path), "VCT_STACK_WORKING_DIR": str(stale)}
+    _, out, err = _run_bash('resolve_working_dir; printf "%s" "$VCT_STACK_WORKING_DIR"',
+                            env=env, script=script)
+    assert out == str(root / "infrastructure")
+    assert "not a VCO compose directory" in err
+    # A real compose home is left alone.
+    env["VCT_STACK_WORKING_DIR"] = str(root / "infrastructure")
+    _, out, _ = _run_bash('resolve_working_dir; printf "%s" "$VCT_STACK_WORKING_DIR"',
+                          env=env, script=script)
+    assert out == str(root / "infrastructure")
 
 
 def test_resolve_runtime_file_returns_empty_when_no_candidate(tmp_path: Path):
@@ -406,24 +448,18 @@ def test_detect_runtime_picks_docker_when_only_docker_usable(tmp_path: Path):
 
 
 def test_detect_runtime_honors_runtime_txt_when_usable(tmp_path: Path):
-    """runtime.txt names podman + podman is usable → detect_runtime
-    short-circuits to podman without probing docker."""
+    """The own clone's runtime.txt names docker + docker is usable → docker,
+    although unpinned auto-detection would have picked the usable podman."""
     fake_bin = tmp_path / "bin"
     _seed_fake_bin(fake_bin)
-    (fake_bin / "podman").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (fake_bin / "podman").chmod(0o755)
-    (fake_bin / "podman-compose").write_text("#!/usr/bin/env bash\nexit 0\n")
-    (fake_bin / "podman-compose").chmod(0o755)
-
-    work_dir = tmp_path / "install"
-    _make_runtime_txt(work_dir, "podman")
-    env = {
-        "PATH": str(fake_bin),
-        "HOME": str(tmp_path),
-        "VCT_STACK_WORKING_DIR": str(work_dir),
-    }
-    _, out, _ = _run_bash('detect_runtime', env=env)
-    assert out == "podman-compose"
+    for name, body in (("podman", "exit 0\n"), ("podman-compose", "exit 0\n"), ("docker", _DOCKER_UP)):
+        (fake_bin / name).write_text("#!/usr/bin/env bash\n" + body)
+        (fake_bin / name).chmod(0o755)
+    root, script = _clone(tmp_path)
+    _make_runtime_txt(root, "docker")
+    env = {"PATH": str(fake_bin), "HOME": str(tmp_path)}
+    _, out, _ = _run_bash('detect_runtime', env=env, script=script)
+    assert out == "docker"
 
 
 # ---------------------------------------------------------------------------
@@ -440,28 +476,43 @@ _DOCKER_UP = 'if [ "$1" = "info" ]; then echo "Server:"; echo " Server Version: 
 _DOCKER_DOWN = 'if [ "$1" = "info" ]; then echo "Client:"; exit 1; fi\n'
 _PODMAN_UP = "exit 0\n"
 _PODMAN_DOWN = 'if [ "$1" = "info" ]; then exit 125; fi\nexit 0\n'
+# podman up, holding VCO's containers/volumes (what `ps -a` / `volume ls` list).
+_PODMAN_DATA = ('case "$1" in ps) echo vco_weaviate ;; volume) echo vco_weaviate_data ;; esac\n'
+                "exit 0\n")
 
 
-def _detect(env: dict) -> tuple[str, int, str]:
+def _detect(env: dict, script: Path = SCRIPT) -> tuple[str, int, str]:
     """detect_runtime's (stdout, return code, stderr)."""
-    _, out, err = _run_bash('out="$(detect_runtime)"; rc=$?; printf "%s|%s" "$out" "$rc"', env=env)
+    _, out, err = _run_bash('out="$(detect_runtime)"; rc=$?; printf "%s|%s" "$out" "$rc"', env=env,
+                            script=script)
     answer, _, rc = out.rpartition("|")
     return answer, int(rc), err
 
 
+def _py_env(tmp_path: Path) -> dict:
+    """What the wrapper needs to reach the Python reconcile: an interpreter
+    (VCO_VENV_PYTHON) that imports vco_lib, and a sandboxed state/home."""
+    return {"VCO_VENV_PYTHON": sys.executable, "PYTHONPATH": str(REPO_ROOT),
+            "VCT_STATE_DIR": str(tmp_path / "vct-state"),
+            "VCT_LAUNCHER_DB_PATH": str(tmp_path / "no-launcher.db"),
+            "VCT_STACK_LOG_FILE": str(tmp_path / "stack.log")}
+
+
 def test_a_runtime_txt_pin_whose_runtime_is_down_starts_nothing(tmp_path: Path):
-    """The install recorded docker; docker is down; podman (with compose)
-    is up. Pre-v0.2.97 (PR-12 Bug B) the wrapper started the stack under
-    podman — on podman's EMPTY volumes. Now: nothing, rc 4, one line naming
-    the pin (the runtime.txt path) and the fix."""
+    """The install recorded docker; docker is installed but DOWN; podman (with
+    compose, holding VCO data) is up. Pre-v0.2.97 (PR-12 Bug B) the wrapper
+    started the stack under podman — on podman's volumes, away from docker's
+    data. A down record is never switched (R8 G1 case b, read-only here):
+    nothing, rc 4, one line naming the pin (the runtime.txt path) and the fix."""
     fake_bin = tmp_path / "bin"
     _seed_fake_bin(fake_bin)
     _stub(fake_bin, "docker", _DOCKER_DOWN)
-    _stub(fake_bin, "podman", _PODMAN_UP)
+    _stub(fake_bin, "podman", _PODMAN_DATA)
     _stub(fake_bin, "podman-compose", "exit 0\n")
-    pin = _make_runtime_txt(tmp_path / "install", "docker")
-    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
-                            "VCT_STACK_WORKING_DIR": str(tmp_path / "install")})
+    root, script = _clone(tmp_path)
+    pin = _make_runtime_txt(root, "docker")
+    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path), **_py_env(tmp_path)},
+                           script=script)
     assert (out, rc) == ("", 4), err
     lines = [ln for ln in err.splitlines() if "pinned to docker" in ln]
     assert len(lines) == 1, err
@@ -504,11 +555,52 @@ def test_the_env_pin_outranks_runtime_txt(tmp_path: Path):
     _stub(fake_bin, "docker", _DOCKER_UP)
     _stub(fake_bin, "podman", _PODMAN_UP)
     _stub(fake_bin, "podman-compose", "exit 0\n")
-    _make_runtime_txt(tmp_path / "install", "podman")
+    root, script = _clone(tmp_path)
+    _make_runtime_txt(root, "podman")
     out, rc, _ = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path),
-                          "VCT_CONTAINER_RUNTIME": "docker",
-                          "VCT_STACK_WORKING_DIR": str(tmp_path / "install")})
+                          "VCT_CONTAINER_RUNTIME": "docker"}, script=script)
     assert (out, rc) == ("docker", 0)
+
+
+def test_a_stale_record_whose_runtime_is_gone_boots_where_the_data_is(tmp_path: Path):
+    """R8 G5 + the read-only G1 reconcile: the own clone recorded docker, docker
+    is no longer installed, podman answers and holds VCO's containers. Before,
+    the wrapper refused (rc 4 / exit 3) at every boot until someone edited the
+    record by hand. Now it boots under podman for this boot and leaves the
+    record alone (the next update re-records it)."""
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "podman", _PODMAN_DATA)
+    _stub(fake_bin, "podman-compose", "exit 0\n")
+    root, script = _clone(tmp_path)
+    record = _make_runtime_txt(root, "docker")
+    out, rc, err = _detect({"PATH": str(fake_bin), "HOME": str(tmp_path), **_py_env(tmp_path)},
+                           script=script)
+    assert (out, rc) == ("podman-compose", 0), err
+    assert "stale runtime record" in err
+    assert record.read_text(encoding="utf-8").strip() == "docker", "the wrapper never rewrites state"
+
+
+def test_an_exit_3_is_recorded_in_the_installed_clones_ledger(tmp_path: Path):
+    """R8 G6: the boot wrapper's exit 3 used to surface only in its /tmp log.
+    It now records `container_runtime_unusable` in its own clone's
+    UPDATE_DEFERRED ledger (the one Python emitter), and still exits 3."""
+    from vco_lib.deferral_report import DeferralReport
+
+    fake_bin = tmp_path / "bin"
+    _seed_fake_bin(fake_bin)
+    _stub(fake_bin, "docker", _DOCKER_DOWN)
+    _stub(fake_bin, "podman", _PODMAN_DATA)
+    root, script = _clone(tmp_path)
+    _make_runtime_txt(root, "docker")
+    env = {"PATH": str(fake_bin), "HOME": str(tmp_path), **_py_env(tmp_path)}
+    proc = subprocess.run([BASH or "bash", str(script)], capture_output=True, text=True,
+                          timeout=120, env=env, cwd=str(tmp_path))
+    assert proc.returncode == 3, proc.stdout + proc.stderr
+    entries = DeferralReport.read(root).entries
+    assert [e.condition_id for e in entries] == ["container_runtime_unusable"], proc.stdout + proc.stderr
+    assert "pinned to docker" in entries[0].detected
+    assert entries[0].dismiss_fields["root"] == str(root)
 
 
 def test_unpinned_auto_detection_keeps_its_fallback(tmp_path: Path):

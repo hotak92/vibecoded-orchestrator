@@ -23,7 +23,10 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # $env:CLAUDE_PROJECT_DIR, else the project this hook is installed in):
 # timestamp, runtime, each service's result (healthy | slow | zombie |
 # absent, with the container and port) and the action taken (none | skipped
-# + reason | lock_busy | recovered + what was done to each zombie).
+# + reason | waiting_for_session_lock | lock_busy | recovered + what was
+# done to each zombie). A run that finds a zombie re-runs itself detached
+# under the session lock, so it writes the detection line and the re-run
+# writes the recovery line.
 # Soft-fail: a log that cannot be written never changes what the hook does.
 # MUST MATCH the record verify-container-ports.sh writes.
 
@@ -307,7 +310,15 @@ if ($zombies.Count -eq 0) {
 # Recover only under the session lock, after the reconcile, on a repeated
 # detection (see the header of this section).
 . (Join-Path $LibDir "session-lock.ps1")
-$VcoSessionLock = Enter-VcoSessionLock -RunPy $RunPy -WaitSeconds 20
+# R8 G3 (parity with the .sh sibling): recovery runs DETACHED, so the 30 s
+# timeout's kill never reaches the lock holder mid-recovery; the detached
+# run repeats detection, then takes the lock.
+if (-not $env:VCO_SESSION_DETACHED) {
+    Write-VcoPortCheckLog -Action "waiting_for_session_lock"
+    Invoke-VcoSessionHookDetached -RunPy $RunPy -Hook "verify-container-ports" -ScriptPath $PSCommandPath
+    return
+}
+$VcoSessionLock = Enter-VcoSessionLock -RunPy $RunPy -WaitSeconds 15
 if (-not $VcoSessionLock.Held) {
     Write-Output "verify-container-ports: $($zombies.Count) zombie container(s) seen, but ensure-containers still holds the session lock; not recovered here (the next session re-checks)"
     Write-VcoPortCheckLog -Action "lock_busy" -Reason "ensure-containers held the session lock"

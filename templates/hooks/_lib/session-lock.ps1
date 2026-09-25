@@ -12,6 +12,30 @@
 # FileStream is the PowerShell form: .NET implements it with the same flock
 # on Unix and a share-mode lock on Windows, its handle is not inherited by
 # anything the hook starts, and it is released when the hook exits.
+#
+# R8 G3: "when the hook exits" must be when the WORK ends, and the hook
+# runner kills a hook at its registered timeout while a first-session
+# `compose up` is still running. So the lock is never taken by the process
+# that timeout reaches: Invoke-VcoSessionHookDetached re-runs the hook
+# DETACHED (`python -m vco_lib.service_lifecycle run-detached`, the same
+# relay the bash siblings use) and the detached run takes this lock around
+# its own synchronous work; the foreground only relays its output for the
+# hook's budget (`service_lifecycle.SESSION_HOOK_RELAY_BUDGET_S`).
+
+function Invoke-VcoSessionHookDetached {
+    <#
+    .SYNOPSIS
+      Re-run this hook detached and relay its output within the hook's
+      budget. The caller exits right after (the detached run does the work);
+      the caller checks $env:VCO_SESSION_DETACHED first, which the detached
+      run has set.
+    #>
+    param([Parameter(Mandatory)][string]$RunPy, [Parameter(Mandatory)][string]$Hook,
+          [Parameter(Mandatory)][string]$ScriptPath)
+    $shell = [System.Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+    & $RunPy -m vco_lib.service_lifecycle run-detached --hook $Hook -- `
+        $shell -NoProfile -ExecutionPolicy Bypass -File $ScriptPath
+}
 
 function Enter-VcoSessionLock {
     <#

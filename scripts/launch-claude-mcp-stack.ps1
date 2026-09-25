@@ -32,6 +32,11 @@
 #   wait_for_cdi()             | Wait-ForCdi (Windows: no-op; see note)
 #   overlay_exists()           | Test-OverlayExists
 #   pick_compose_invocation()  | Get-ComposeInvocation
+#   is_stack_dir()             | Test-StackDir
+#   own_stack_dir()            | Get-OwnStackDir
+#   resolve_working_dir()      | Resolve-WorkingDir
+#   reconcile_record()         | Invoke-RecordReconcile
+#   record_boot_refusal()      | Register-BootRefusal
 #   main()                     | Invoke-Main
 #
 # GPU on Windows: Docker Desktop and Podman both run via WSL2; GPU
@@ -47,7 +52,9 @@
 #   0   success (or compose returned 125 → some containers failed,
 #       restart policy will recover)
 #   2   FATAL: working directory does not exist / cd failed
-#   3   FATAL: no container runtime found
+#   3   FATAL: no container runtime found, or the pinned one is refused —
+#       recorded as `container_runtime_unusable` in the own clone's
+#       UPDATE_DEFERRED ledger (R8 G6)
 #   4   FATAL: pick_compose_invocation rejected runtime/gpu combo
 #   *   compose's own non-zero exit code is propagated as-is
 #
@@ -152,6 +159,16 @@ if ([string]::IsNullOrEmpty($script:VctScriptDir)) {
         $script:VctScriptDir = ''
     }
 }
+
+# The clone this wrapper belongs to — the install it serves (R8 G5): its
+# runtime.txt is THE record, its infrastructure/ the fallback compose home, its
+# ledger where an exit 3 is recorded (G6). Mirrors bash _VCT_OWN_ROOT.
+$script:VctOwnRoot = ''
+if ($script:VctScriptDir) {
+    try { $script:VctOwnRoot = [System.IO.Path]::GetFullPath((Join-Path $script:VctScriptDir '..')).TrimEnd('\', '/') } catch { $script:VctOwnRoot = '' }
+}
+$script:StackPy = $null
+$script:RuntimePinRefusalReason = ''
 
 # Test flag — when set, suppress Invoke-Main when the script is dot-sourced
 # AND not invoked directly. Mirrors `if [ "${BASH_SOURCE[0]}" = "${0}" ]`.
@@ -283,47 +300,58 @@ function Test-RuntimeUsable {
 }
 
 # ---------------------------------------------------------------------------
-# Resolve-RuntimeFile :: returns the path to the FIRST runtime.txt candidate
-# that exists and records a runtime token (podman / docker) — THE runtime.txt
-# pin. Empty string when none does (unpinned). Mirrors bash
+# Resolve-RuntimeFile :: returns the path of THE runtime.txt record — the
+# runtime.txt pin. Empty string when there is none (unpinned). Mirrors bash
 # resolve_runtime_file.
 #
-# Probe order (first hit wins):
+# Candidates (first that records podman/docker wins):
 #   1. $env:VCT_STACK_RUNTIME_FILE if explicitly set (caller override)
-#   2. $VctStackWorkingDir\state\install\runtime.txt
-#   3. $env:VCT_ORCHESTRATOR_ROOT\state\install\runtime.txt
-#   4. <script_dir>\..\state\install\runtime.txt   (script lives in
-#      <orchestrator>\scripts\, so .. is the orchestrator root)
+#   2. <own clone>\state\install\runtime.txt — the install this wrapper
+#      belongs to and serves (R8 G5), the record Python and Rust read.
+# VCT_STACK_WORKING_DIR (a compose dir, possibly a stale Task/unit working
+# dir — PR-12 Bug C) and VCT_ORCHESTRATOR_ROOT are NOT candidates: another
+# clone's record could pin this install's stack onto empty volumes. A
+# differing record there is logged, never used.
 #
-# A candidate that is missing, empty or names no runtime is skipped (PR-12
-# Bug C). One whose runtime is DOWN is NOT skipped: it is the pin, and
-# Find-Runtime refuses it (v0.2.97 — PR-12 Bug B's fall-through is
-# superseded by the pin rule).
+# A candidate that is missing, empty or names no runtime is skipped. One
+# whose runtime is DOWN is NOT skipped: it is the pin, and Find-Runtime
+# refuses it (or, for the own clone's record, reconciles it read-only).
 # ---------------------------------------------------------------------------
+function Get-OwnRuntimeFile {
+    if (-not $script:VctOwnRoot) { return '' }
+    return (Join-Path (Join-Path (Join-Path $script:VctOwnRoot 'state') 'install') 'runtime.txt')
+}
+
+function Read-RuntimeToken {
+    param([Parameter(Mandatory=$true)][string] $Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return '' }
+    try {
+        $line = Get-Content -LiteralPath $Path -TotalCount 1 -ErrorAction SilentlyContinue
+        if ($null -ne $line) { return ($line.Trim()).ToLowerInvariant() }
+    } catch { }
+    return ''
+}
+
+function Write-ForeignRecordNote {
+    param([string] $Used, [string] $Token)
+    $orchRoot = [Environment]::GetEnvironmentVariable('VCT_ORCHESTRATOR_ROOT')
+    if ([string]::IsNullOrEmpty($orchRoot)) { return }
+    $foreign = Join-Path (Join-Path (Join-Path $orchRoot 'state') 'install') 'runtime.txt'
+    if ($foreign -eq $Used) { return }
+    $ftok = Read-RuntimeToken -Path $foreign
+    if (($ftok -eq 'podman' -or $ftok -eq 'docker') -and $ftok -ne $Token) {
+        Write-StackLog "note: $foreign records $ftok, but this wrapper serves the install whose record is $Used ($Token) - ignoring the other clone's record"
+    }
+}
+
 function Resolve-RuntimeFile {
     $candidates = New-Object System.Collections.Generic.List[string]
     $explicit = [Environment]::GetEnvironmentVariable('VCT_STACK_RUNTIME_FILE')
     if (-not [string]::IsNullOrEmpty($explicit)) {
         [void] $candidates.Add($explicit)
     }
-    if (-not [string]::IsNullOrEmpty($script:VctStackWorkingDir)) {
-        [void] $candidates.Add((Join-Path $script:VctStackWorkingDir 'state\install\runtime.txt'))
-    }
-    $orchRoot = [Environment]::GetEnvironmentVariable('VCT_ORCHESTRATOR_ROOT')
-    if (-not [string]::IsNullOrEmpty($orchRoot)) {
-        [void] $candidates.Add((Join-Path $orchRoot 'state\install\runtime.txt'))
-    }
-    if (-not [string]::IsNullOrEmpty($script:VctScriptDir)) {
-        $rel = Join-Path $script:VctScriptDir '..\state\install\runtime.txt'
-        # Normalise the .. so dedup works correctly.
-        try {
-            $rel = [System.IO.Path]::GetFullPath($rel)
-        } catch {
-            # Path normalisation can fail on non-existent intermediate
-            # dirs in PS 5.1; tolerate by keeping the raw path.
-        }
-        [void] $candidates.Add($rel)
-    }
+    $own = Get-OwnRuntimeFile
+    if ($own) { [void] $candidates.Add($own) }
 
     $seen = ''
     foreach ($cand in $candidates) {
@@ -341,7 +369,10 @@ function Resolve-RuntimeFile {
         } catch {
             continue
         }
-        if ($token -eq 'podman' -or $token -eq 'docker') { return $cand }
+        if ($token -eq 'podman' -or $token -eq 'docker') {
+            Write-ForeignRecordNote -Used $cand -Token $token
+            return $cand
+        }
         if (-not [string]::IsNullOrEmpty($token)) {
             Write-StackLog "runtime.txt at $cand names '$token', not podman or docker — ignoring it"
         }
@@ -365,7 +396,48 @@ function Write-RuntimePinRefusal {
     } else {
         "set VCT_CONTAINER_RUNTIME=$other if the data is not in $Pinned (the install recorded $Pinned in $Source)"
     }
-    Write-StackLog "FATAL: the container runtime is pinned to $Pinned by $Source, but $Why — starting nothing (the stack's data is in $Pinned's volumes; $other would start it on empty ones). Fix: start $Pinned, or $change."
+    $script:RuntimePinRefusalReason = "the container runtime is pinned to $Pinned by $Source, but $Why — starting nothing (the stack's data is in $Pinned's volumes; $other would start it on empty ones). Fix: start $Pinned, or $change."
+    Write-StackLog "FATAL: $($script:RuntimePinRefusalReason)"
+}
+
+# ---------------------------------------------------------------------------
+# Get-StackPython :: the interpreter Invoke-Main resolved, else resolve one.
+# Invoke-RecordReconcile :: the READ-ONLY form of install.py's runtime-record
+# reconcile (python -m vco_lib.runtime_reconcile boot — the one home of the
+# decision; this wrapper never rewrites state). Returns the runtime to use for
+# THIS boot when VCO's own record is stale, else ''. Mirrors bash
+# reconcile_record.
+# Register-BootRefusal :: R8 G6 — records the exit 3 in the own clone's
+# ledger through the one Python emitter. Best effort. Mirrors bash
+# record_boot_refusal.
+# ---------------------------------------------------------------------------
+function Get-StackPython {
+    if ($script:StackPy) { return $script:StackPy }
+    return (Resolve-StackPython)
+}
+
+function Invoke-RecordReconcile {
+    $py = Get-StackPython
+    if (-not $py -or -not $script:VctOwnRoot) { return '' }
+    try {
+        $run = Invoke-StackPy -Python $py -Arguments @('vco_lib.runtime_reconcile', 'boot', '--root', $script:VctOwnRoot, '--json')
+        if ($run.Rc -ne 0) { return '' }
+        $res = $run.Stdout | ConvertFrom-Json
+    } catch { return '' }
+    if ($res.outcome -eq 'rewritten' -and $res.runtime) {
+        Write-StackLog $res.detail
+        return [string]$res.runtime
+    }
+    return ''
+}
+
+function Register-BootRefusal {
+    param([string] $Reason)
+    $py = Get-StackPython
+    if (-not $py -or -not $script:VctOwnRoot) { return }
+    try {
+        [void](Invoke-StackPy -Python $py -Arguments @('vco_lib.runtime_reconcile', 'record-boot-refusal', '--root', $script:VctOwnRoot, '--reason', $Reason))
+    } catch { }
 }
 
 # ---------------------------------------------------------------------------
@@ -411,11 +483,20 @@ function Find-Runtime {
     if (-not $pin) {
         $runtimeFile = Resolve-RuntimeFile
         if (-not [string]::IsNullOrEmpty($runtimeFile)) {
-            try {
-                $line = Get-Content -LiteralPath $runtimeFile -TotalCount 1 -ErrorAction SilentlyContinue
-                if ($null -ne $line) { $pin = ($line.Trim()).ToLowerInvariant() }
-            } catch { }
+            $pin = Read-RuntimeToken -Path $runtimeFile
             $pinSource = $runtimeFile
+        }
+    }
+
+    # R8 G5: VCO's OWN record (never VCT_CONTAINER_RUNTIME, never an explicit
+    # VCT_STACK_RUNTIME_FILE) is reconciled read-only when its runtime is not
+    # usable, so a stale record does not strand the stack at boot.
+    $ownFile = Get-OwnRuntimeFile
+    if ($pin -and $ownFile -and $pinSource -eq $ownFile -and -not (Test-RuntimeUsable -Token $pin)) {
+        $reconciled = Invoke-RecordReconcile
+        if ($reconciled -and $reconciled -ne $pin) {
+            $pin = $reconciled
+            $pinSource = "$pinSource (stale; reconciled to $reconciled for this boot)"
         }
     }
 
@@ -684,6 +765,44 @@ function Update-FileDefaults {
 }
 
 # ---------------------------------------------------------------------------
+# Test-StackDir :: $true iff $Dir is a compose home (docker-compose.yml or the
+# legacy compose.yaml). Get-OwnStackDir :: THIS wrapper's clone's compose home
+# (infrastructure/, else claude_mcp_servers/), or ''. Mirror bash
+# is_stack_dir / own_stack_dir.
+# ---------------------------------------------------------------------------
+function Test-StackDir {
+    param([string] $Dir)
+    if ([string]::IsNullOrEmpty($Dir) -or -not (Test-Path -LiteralPath $Dir -PathType Container)) { return $false }
+    foreach ($f in @('docker-compose.yml', 'compose.yaml', $script:VctStackComposeFile)) {
+        if ($f -and (Test-Path -LiteralPath (Join-Path $Dir $f) -PathType Leaf)) { return $true }
+    }
+    return $false
+}
+
+function Get-OwnStackDir {
+    if (-not $script:VctOwnRoot) { return '' }
+    foreach ($d in @('infrastructure', 'claude_mcp_servers')) {
+        $cand = Join-Path $script:VctOwnRoot $d
+        if (Test-StackDir -Dir $cand) { return $cand }
+    }
+    return ''
+}
+
+# Resolve-WorkingDir :: R8 G5 — a VCT_STACK_WORKING_DIR that is not a compose
+# home (a moved / re-cloned install's old Task/unit working dir — PR-12 Bug C)
+# is logged and replaced by THIS wrapper's own clone's, whose compose names the
+# same volumes — never an empty stack elsewhere. Mirrors bash
+# resolve_working_dir.
+function Resolve-WorkingDir {
+    if (Test-StackDir -Dir $script:VctStackWorkingDir) { return }
+    $ownDir = Get-OwnStackDir
+    if ($ownDir -and $ownDir -ne $script:VctStackWorkingDir) {
+        Write-StackLog "VCT_STACK_WORKING_DIR=$($script:VctStackWorkingDir) is not a VCO compose directory (stale?) - using this wrapper's own clone: $ownDir"
+        $script:VctStackWorkingDir = $ownDir
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Resolve-StackPython :: an interpreter that can import vco_lib from THIS
 # checkout (the script lives in <root>/scripts). Mirrors bash
 # resolve_stack_python: VCO_VENV_PYTHON, the hooks' shared resolver,
@@ -762,6 +881,7 @@ function Invoke-Main {
 
     Write-StackLog "starting (working_dir=$($script:VctStackWorkingDir) cdi_timeout=$($script:VctStackCdiTimeout) subcommand='$subcmd')"
 
+    Resolve-WorkingDir
     if (-not (Test-Path -LiteralPath $script:VctStackWorkingDir -PathType Container)) {
         Write-StackLog "FATAL: working directory does not exist: $($script:VctStackWorkingDir)"
         return 2
@@ -777,6 +897,7 @@ function Invoke-Main {
 
         # The service_endpoints plan (VCO-managed list + adopted containers).
         $stackPy = Resolve-StackPython
+        $script:StackPy = $stackPy
         if (-not $stackPy) {
             Write-StackLog "FATAL: no Python interpreter to read the service_endpoints plan (broken VCO install?) - nothing composed"
             return 5
@@ -816,9 +937,13 @@ function Invoke-Main {
         if ([string]::IsNullOrEmpty($runtime)) {
             # A refused pin already logged the one line naming the pin and
             # the fix (Write-RuntimePinRefusal).
+            $reason = $script:RuntimePinRefusalReason
             if (-not $script:RuntimePinRefused) {
-                Write-StackLog "FATAL: no container runtime found (tried VCT_CONTAINER_RUNTIME, runtime.txt, podman, docker)"
+                $reason = "no container runtime found (tried VCT_CONTAINER_RUNTIME, runtime.txt, podman, docker)"
+                Write-StackLog "FATAL: $reason"
             }
+            # R8 G6: exit 3 is recorded where session start and the launcher look.
+            Register-BootRefusal -Reason $reason
             return 3
         }
         Write-StackLog "runtime=$runtime"

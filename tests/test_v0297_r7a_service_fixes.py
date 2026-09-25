@@ -421,15 +421,15 @@ def test_a_busy_session_lock_runs_nothing(tmp_path, monkeypatch, capsys):
     lock = sl.session_lock_path()
     ran: list[Any] = []
 
-    def child(_cmd: Any, **kw: Any) -> Any:
+    def child(_cmd: Any, **kw: Any) -> int:
         ran.append(kw["env"])
-        return mock.Mock(returncode=0)
+        return 0
 
     with open(lock, "a", encoding="utf-8") as held:
         fcntl.flock(held.fileno(), fcntl.LOCK_EX)
-        rc = sl.run_with_session_lock(["true"], wait_s=0.3, busy="BUSY", run=child)
+        rc = sl.run_with_session_lock(["true"], wait_s=0.3, busy="BUSY", supervise=child)
     assert rc == 0 and ran == [] and "BUSY" in capsys.readouterr().out
-    rc = sl.run_with_session_lock(["true"], wait_s=0.3, busy="BUSY", run=child)
+    rc = sl.run_with_session_lock(["true"], wait_s=0.3, busy="BUSY", supervise=child)
     assert rc == 0 and ran and ran[0][sl.SESSION_LOCK_HELD_ENV] == "1"
 
 

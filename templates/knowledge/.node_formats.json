@@ -352,6 +352,15 @@
     "content_hash": "eaad8bc84653c5a9",
     "total_chunks": 1
   },
+  "knowledge/concepts/orchestrator-hook-system.md": {
+    "title": "Orchestrator Hook System",
+    "description": "The Orchestrator Hook System is a set of shell scripts registered in `.claude/settings.json` that intercept Claude Code lifecycle events (session start, tool use, file edits, compaction, stop) and automate security enforcement, knowledge-graph sync, and context preservation without manual intervention. Hooks bind to ~20 distinct events with optional tool-name matchers; blocking hooks can abort operations (exit non-zero) while non-blocking hooks run in the background. Key hooks include `PreToolUse` for credential scrubbing and security scanning, `PostToolUse` for KG/doc sync to Weaviate, `PreCompact`/`PostCompact` for context preservation across compaction, and `ensure-containers.sh` for auto-starting services. The hook system is the foundational layer that turns Claude Code into an autonomous workflow engine, enabling repeatable, secure, and knowledge-preserving agent interactions without ongoing operator intervention.",
+    "summary": "Hooks are shell scripts registered in `.claude/settings.json` that intercept Claude Code lifecycle events (SessionStart, PreToolUse, PostToolUse, Stop, compaction) to automate the orchestrator's core workflows: security enforcement, knowledge-graph sync, context preservation, and code quality gates. Blocking hooks can abort operations (exit non-zero); non-blocking hooks run asynchronously with optional tool-name matchers for fine-grained control.",
+    "generated_at": "2026-09-25T00:28:30.473795+00:00",
+    "backend": "cli",
+    "content_hash": "9a2236226ea8d8ae",
+    "total_chunks": 1
+  },
   "knowledge/concepts/orchestrator-knowledge-graph.md": {
     "title": "Orchestrator Knowledge Graph",
     "description": "The Orchestrator Knowledge Graph acts as the system's long-term memory by storing cross-project patterns and architectural decisions in Obsidian-style markdown files.\nIt automatically synchronizes content to a Weaviate vector database to enable semantic search for both human editors and AI clients.\nThe system enforces a \"write once, search everywhere\" principle to prevent future sessions from rediscovering known architectural ground.\nIts folder structure organizes nodes into categories like projects, concepts, tools, and research while using typed wiki links to maintain an acyclic graph.",
@@ -488,6 +497,15 @@
     "content_hash": "799ef4821d2dee54",
     "total_chunks": 1
   },
+  "knowledge/concepts/read-image-memory-aware-gating.md": {
+    "title": "read_image — Memory-Aware Vision-Model Gating",
+    "description": "The `read_image` MCP tool (removed in v0.2.11) was an Ollama-based vision system that returned images as base64 data URLs with optional on-device vision model descriptions, using memory-aware gating to fit models to available VRAM/RAM. It maintained per-model VRAM/RAM thresholds (e.g., qwen3.5:9b needed 7.5 GB VRAM / 12 GB RAM), tiered image resize budgets (1024²/720²/512²/256² pixels based on free VRAM), and auto-fallback logic to select smaller models when larger ones exceeded available memory. System-level probing occurred once at module load via GPU detection (nvidia-smi, system_profiler, psutil) and cached results without re-probing during sessions. Though removed as an MCP, this memory-aware gating pattern serves as a design reference for local vision model implementations; current users should employ Claude's native vision through the Read tool instead.",
+    "summary": "The `read_image` MCP tool (Ollama MCP) was removed in v0.2.11 and no longer exists — use Claude's native vision via the `Read` tool on image paths instead. This node documents the memory-aware gating design (VRAM-tiered resize budgets, per-model thresholds for q4_K_M quants, auto-fallback to smaller installed models) that remains a reference if a local vision tier is rebuilt.",
+    "generated_at": "2026-09-25T00:28:54.845466+00:00",
+    "backend": "cli",
+    "content_hash": "3706a92a34b067cc",
+    "total_chunks": 1
+  },
   "knowledge/concepts/reinforcement-learning.md": {
     "title": "Reinforcement Learning",
     "description": "Reinforcement Learning is a machine learning paradigm where an agent learns optimal decision-making by interacting with an environment to maximize cumulative rewards.\nIt operates through a core loop of observing states, selecting actions, receiving feedback, and updating its policy to improve future outcomes.\nThe field balances exploration of new actions against exploitation of known high-reward strategies using techniques like epsilon-greedy or Upper Confidence Bound.\nMajor algorithm categories include value-based methods like Q-Learning, policy gradient approaches like PPO, and actor-critic hybrids that combine both strategies.\nReinforcement Learning from Human Feedback (RLHF) is a critical application that aligns large language models with human preferences through iterative reward modeling.",
@@ -534,6 +552,15 @@
     "summary": "A SaaS pricing rollout is a deployment requiring a defined audience, measurement plan, rollback criteria, and communication sequence. The primary decision is determining who pays the new price: Option 1 (new signups only) is the default low-risk choice for indie founders under $25K MRR; Option 2 (grandfather with a 6–12 month sunset window) applies when old pricing was under-priced and loss cannot be sustained; Option 3 (immediate migration) is reserved for catastrophic pricing errors and expects 10–30% churn. Solo founders should generally use a single cutover with an 8–12 week measurement window rather than A/B testing, which requires high traffic and complex tooling. Key metrics to track include conversion rate, ARPU, time-to-upgrade, churn-by-tier, and revenue mix. Decision triggers at week 8 dictate whether to accept, iterate, or rollback based on MRR projections and churn spikes. Communication strategies range from light touches for new-signup-only changes to heavy, pre-announced sequences for sunset windows, avoiding apologetic tones and burying the price change. Operational rules for grandfathering must define lock-in duration, handling of upgrades/downgrades/cancellations, and the loss of grandfather status upon resubscription.",
     "generated_at": "2026-07-20T18:54:17.695479+00:00",
     "content_hash": "318df6e8a9517a9c",
+    "total_chunks": 1
+  },
+  "knowledge/concepts/safe-install.md": {
+    "title": "Safe-Install — Content-Based Service Detection",
+    "description": "Safe-Install probes backing services (Weaviate, Ollama, code-embed) by fingerprinting HTTP responses to classify them as not running, vct-managed, foreign, or incompatible—enabling safe coexistence without relying on container names. Detection runs in `vco_lib/service_detection.py` by sending probes to ports 8081, 11435, and 11440 and inspecting responses for service markers: vct-prefixed collections for Weaviate, API tags for Ollama, and /health responses for code-embed. Each state triggers appropriate handling: vct-managed services are auto-adopted, foreign Ollama is adopted unattended with a record, foreign Weaviate prompts interactively, and incompatible services raise errors. This matters because it allows the orchestrator to safely coexist with foreign services on canonical ports without conflicts or modifications to existing infrastructure.",
+    "summary": "Install.py fingerprints HTTP response content (not container names) from canonical ports—inspecting schema for vct collections, API tags, and health endpoints—to classify backing services (Weaviate, Ollama, code-embed) as not running / vct-managed / foreign / incompatible, enabling safe coexistence via the `--on-conflict` flag (alt-port / adopt / abort). This content-based detection allows the orchestrator to run alongside foreign services without modifying them, with logic in `service_detection.py` and `service_reconcile.py`.",
+    "generated_at": "2026-09-25T00:28:01.803559+00:00",
+    "backend": "cli",
+    "content_hash": "2f0666e0909fb511",
     "total_chunks": 1
   },
   "knowledge/concepts/saga-pattern-distributed-workflows.md": {

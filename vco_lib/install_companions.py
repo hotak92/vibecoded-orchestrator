@@ -508,6 +508,22 @@ def detached_child_env() -> dict:
     return scrub_install_relaunch_env(os.environ.copy())
 
 
+#: ``DETACHED_PROCESS | CREATE_NO_WINDOW`` — no console, and no conhost.exe
+#: flash when the parent is a GUI-subsystem process.
+_WINDOWS_DETACHED_FLAGS = 0x0000_0008 | 0x0800_0000
+
+
+def detached_popen_kwargs() -> dict:
+    """The ``subprocess.Popen`` keywords that detach a child from its caller:
+    a new session on POSIX (outside the caller's process group, so a signal to
+    that group — a hook runner's timeout kill — does not reach it), and
+    ``DETACHED_PROCESS | CREATE_NO_WINDOW`` on Windows. The one home of the
+    rule for the hub, the launcher and the session-hook relay."""
+    if os.name == "nt":
+        return {"creationflags": _WINDOWS_DETACHED_FLAGS}
+    return {"start_new_session": True}
+
+
 def is_running_inside_venv(venv_python, prefix: Optional[str] = None) -> bool:
     """True when THIS process is the venv owning ``venv_python`` (two levels up).
 

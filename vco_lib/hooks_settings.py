@@ -262,25 +262,46 @@ def _anchor_indices(tokens: Sequence[str]) -> Iterator[int]:
 
 #: Claude Code's "project root where the session started". It substitutes
 #: this placeholder in a hook's ``command`` AND exports it as an environment
-#: variable, so the double-quoted shell form below resolves either way: where
+#: variable, so the double-quoted shell form resolves either way: where
 #: Claude Code substitutes it the shell sees a literal quoted path; where it
 #: only exports it, ``sh`` / Git Bash expand ``${CLAUDE_PROJECT_DIR}`` inside
 #: the double quotes. The quotes keep a project path with spaces one argument.
 PROJECT_DIR_PLACEHOLDER = "${CLAUDE_PROJECT_DIR}"
 
+#: The form VCO ships on Linux/macOS (v0.2.97 review R8, G2/M1): the POSIX
+#: ``:-`` default makes the command degrade to the project cwd when NEITHER
+#: mechanism is present (a client that neither substitutes the placeholder
+#: nor exports the variable) instead of expanding to ``/.claude/hooks/x.sh`` —
+#: never worse than the pre-v0.2.97 relative form, which resolved against the
+#: session cwd exactly like ``.`` does here. NOT used on Windows: ``:-``
+#: parameter expansion is POSIX-only and would break under the PowerShell
+#: shell fallback Claude Code uses when Git Bash is absent, so Windows
+#: commands keep the exact placeholder — substitution is the documented
+#: mechanism and works whichever shell runs the command.
+PROJECT_DIR_FALLBACK_PLACEHOLDER = "${CLAUDE_PROJECT_DIR:-.}"
+
 #: An INVOKED hook script under the project's ``.claude/hooks/`` — relative
 #: (``.claude/hooks/x.sh``, ``./.claude/hooks/x.sh``) or already anchored at
-#: the project root (``$CLAUDE_PROJECT_DIR/…``, ``${CLAUDE_PROJECT_DIR}/…``),
-#: after quote-stripping and ``\`` → ``/``. The group is the basename.
+#: the project root (``$CLAUDE_PROJECT_DIR/…``, ``${CLAUDE_PROJECT_DIR}/…``,
+#: ``${CLAUDE_PROJECT_DIR:-.}/…``), after quote-stripping and ``\`` → ``/``.
+#: The group is the basename.
 _PROJECT_HOOK_SCRIPT_RE = re.compile(
-    r"^(?:\./|\$CLAUDE_PROJECT_DIR/|\$\{CLAUDE_PROJECT_DIR\}/)?"
+    r"^(?:\./|\$CLAUDE_PROJECT_DIR/|\$\{CLAUDE_PROJECT_DIR\}/|\$\{CLAUDE_PROJECT_DIR:-\.\}/)?"
     r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$"
 )
 
 
 def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -> str:
     """``command`` with every INVOKED project hook script anchored at the
-    project root: ``.claude/hooks/x.sh`` → ``"${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"``.
+    project root, in the per-OS form VCO ships:
+
+    * a ``.sh`` script → ``"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"``
+      (:data:`PROJECT_DIR_FALLBACK_PLACEHOLDER` — the POSIX ``:-`` default
+      keeps the command resolving when Claude Code provides neither the
+      placeholder substitution nor the exported variable);
+    * a ``.ps1`` script → ``"${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"``
+      (:data:`PROJECT_DIR_PLACEHOLDER` — the exact placeholder, because
+      ``:-`` is POSIX-only and breaks under the PowerShell shell fallback).
 
     Why (v0.2.97): Claude Code runs a hook command in the session's CURRENT
     directory, and that follows ``cd`` and worktrees. Every hook VCO shipped
@@ -294,9 +315,12 @@ def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -
     :func:`invoked_script_tokens`) are rewritten — a hook path that is an
     ARGUMENT (``bash wrap.sh --target .claude/hooks/x.sh``) is left alone —
     and everything else in the command (interpreter, flags, trailing
-    arguments, whitespace) is kept byte-for-byte. An already-anchored token is
-    normalised to the one quoted form, so the result is idempotent. ``only``
-    limits the rewrite to those script basenames (the hooks VCO ships).
+    arguments, whitespace) is kept byte-for-byte. An already-anchored token in
+    EITHER spelling (exact placeholder or ``:-.`` fallback) is normalised to
+    the one per-OS quoted form, so the result is idempotent AND an install
+    migrated to the exact-placeholder Linux form earlier in the cycle is
+    rewritten to the fallback form, never duplicated. ``only`` limits the
+    rewrite to those script basenames (the hooks VCO ships).
     """
     if not isinstance(command, str) or not command:
         return command
@@ -309,7 +333,9 @@ def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -
         match = _PROJECT_HOOK_SCRIPT_RE.match(norm[index])
         if match is None or (allowed is not None and match.group(1) not in allowed):
             continue
-        anchored = f'"{PROJECT_DIR_PLACEHOLDER}/.claude/hooks/{match.group(1)}"'
+        script = match.group(1)
+        form = PROJECT_DIR_PLACEHOLDER if script.endswith(".ps1") else PROJECT_DIR_FALLBACK_PLACEHOLDER
+        anchored = f'"{form}/.claude/hooks/{script}"'
         if tokens[index] != anchored:
             tokens[index] = anchored
             changed = True
@@ -374,10 +400,15 @@ def extract_hook_script_path(command: str) -> Optional[str]:
         low = tok.lower()
         if not low.endswith(_STARTER_SUFFIXES):
             continue
-        # v0.2.97: the project-root-anchored form VCO ships and suggests
-        # (`bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.sh"`) names the same
-        # project-relative script.
-        for prefix in (PROJECT_DIR_PLACEHOLDER + "/", "$CLAUDE_PROJECT_DIR/"):
+        # v0.2.97: the project-root-anchored forms VCO ships and suggests
+        # (`bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"` on Linux,
+        # `powershell … -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"`
+        # on Windows) name the same project-relative script.
+        for prefix in (
+            PROJECT_DIR_PLACEHOLDER + "/",
+            PROJECT_DIR_FALLBACK_PLACEHOLDER + "/",
+            "$CLAUDE_PROJECT_DIR/",
+        ):
             if tok.startswith(prefix):
                 tok = tok[len(prefix):]
                 break
@@ -944,12 +975,12 @@ def insert_hook(
 
     ``anchor_scripts`` (v0.2.97): the ``.claude/hooks/`` script basenames VCO
     ships (:func:`shipped_hook_scripts`). A parked entry for one of THOSE that
-    still invokes it by the relative path every release before v0.2.97 wrote
-    is restored ANCHORED at ``${CLAUDE_PROJECT_DIR}``
-    (:func:`anchor_hook_command`) — the form the bundle update now writes —
-    rather than as the relative command, which fails as soon as the session's
-    cwd moves. Everything else in the parked item is restored verbatim, and a
-    user's own hook is never rewritten.
+    still invokes it by the relative path every release before v0.2.97 wrote —
+    or by any anchored spelling an earlier v0.2.97 build wrote — is restored
+    in the CURRENT per-OS anchored form (:func:`anchor_hook_command`), the
+    form the bundle update now writes, rather than as the relative command,
+    which fails as soon as the session's cwd moves. Everything else in the
+    parked item is restored verbatim, and a user's own hook is never rewritten.
 
     Position is honoured when it still makes sense and clamped otherwise.
     When the disable left the group in place, the recorded group is

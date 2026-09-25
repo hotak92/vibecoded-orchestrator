@@ -9,7 +9,9 @@
 # `plan --json` — never by editing a compose file (it ships active in
 # infrastructure/docker-compose.yml). When the plan does not list code_embed
 # as a VCO-managed, enabled service, this hook silently no-ops (a CPU host
-# falls back to Ollama for code embeddings).
+# falls back to Ollama for code embeddings). The probe PORT likewise comes
+# from the plan (`VCO_CODE_EMBED_PORT`), never from env `CODE_EMBED_PORT` —
+# a retired input; env `*_PORT` values are projected outputs only.
 
 # Scrub sensitive env vars before any subprocess
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -19,7 +21,6 @@ set -euo pipefail
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
-PORT="${CODE_EMBED_PORT:-11440}"
 CONTAINER_NAME="${VCT_CODE_EMBED_CONTAINER:-code_embed}"
 LOCKFILE="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/code_embed_service.lock"
 
@@ -72,6 +73,20 @@ RUN_PY="${VCO_VENV_PYTHON:-${PY:-}}"
 if [ -z "$RUN_PY" ] || [ ! -x "$RUN_PY" ]; then
     echo "ensure-code-embed-service: no Python interpreter for vco_lib.containers (broken VCO install?); skipping"
     exit 0
+fi
+
+# v0.2.97: the probe PORT comes from the launcher.db service_endpoints plan
+# (`VCO_CODE_EMBED_PORT`), never from env `CODE_EMBED_PORT` — a retired
+# input; env `*_PORT` values are projected outputs only and `vco doctor`
+# treats retired inputs as retired. ONE plan read serves both the port and
+# the compose gate in code_embed_up_args below. When the plan cannot be
+# read, fall back to the compiled default 11440 — never to env.
+unset VCO_CODE_EMBED_PORT
+__vco_se_plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || __vco_se_plan=""
+PORT=11440
+if [ -n "$__vco_se_plan" ]; then
+    eval "$__vco_se_plan"
+    [ -n "${VCO_CODE_EMBED_PORT:-}" ] && PORT="$VCO_CODE_EMBED_PORT"
 fi
 __vco_rt_err="${TMPDIR:-${XDG_RUNTIME_DIR:-/tmp}}/vco-containers-resolve.$$"
 __vco_rt_out="$("$RUN_PY" -m vco_lib.containers resolve --shell 2>"$__vco_rt_err")" ; __vco_rt_rc=$?
@@ -150,10 +165,10 @@ fi
 # builds — `--no-deps` (code_embed's `depends_on: ollama` must never create an
 # Ollama next to an ADOPTED one) and the gpu profile the service lives in.
 # Prints the shell-quoted args, or nothing when compose must not run.
+# The plan itself was already eval'd above (one read, two consumers);
+# VCO_COMPOSE_SERVICES from that eval is the gate.
 code_embed_up_args() {
-    local plan
-    plan="$("$RUN_PY" -m vco_lib.service_lifecycle plan --shell 2>/dev/null)" || return 1
-    case " $(eval "$plan"; printf '%s' "${VCO_COMPOSE_SERVICES:-}") " in
+    case " ${VCO_COMPOSE_SERVICES:-} " in
         *" code_embed "*) ;;
         *) return 0 ;;
     esac

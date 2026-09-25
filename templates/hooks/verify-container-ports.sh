@@ -183,7 +183,11 @@ esac
 # never removed on a stale one, and never recovered by both hooks at once.
 # Detection runs unlocked; when it finds a zombie, the script re-runs itself
 # under the lock (detection repeats there: ensure-containers may have
-# recovered it meanwhile).
+# recovered it meanwhile). R8 G3: that re-run is DETACHED (`run-detached`) —
+# a 20 s lock wait plus the reconcile plus a recovery `compose up` do not fit
+# this hook's 30 s timeout, and the timeout's kill must never reach the lock
+# holder. This process relays the re-run's output for the hook's budget
+# (`service_lifecycle.SESSION_HOOK_RELAY_BUDGET_S`) and returns.
 LOCK_HELD="${VCO_SESSION_LOCK_HELD:-}"
 ROWS_CHECKED=false
 if [ -n "$LOCK_HELD" ]; then
@@ -318,7 +322,7 @@ if [ -z "$LOCK_HELD" ]; then
     # The re-run under the lock appends the recovery line.
     log_run waiting_for_session_lock
     # Recover only under the session lock, after the reconcile (see above).
-    exec "$RUN_PY" -m vco_lib.service_lifecycle with-session-lock --wait 20 \
+    exec "$RUN_PY" -m vco_lib.service_lifecycle run-detached --hook verify-container-ports --lock-wait 15 \
         --busy "verify-container-ports: ${#zombies[@]} zombie container(s) seen, but ensure-containers still holds the session lock; not recovered here (the next session re-checks)" \
         -- bash "${BASH_SOURCE[0]}" "$@"
 fi

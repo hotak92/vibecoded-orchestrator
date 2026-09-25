@@ -314,6 +314,12 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     # --- container lifecycle policy) immediately before they are read; a
     # --- user-set value is overwritten, so these are not env knobs.
     "VCO_ADOPTED_CONTAINERS": "assigned by the eval'd service_lifecycle plan (adopted containers to start by name); user env is overwritten before any read",
+    # --- v0.2.97 R8 G5: `local`s assigned by eval'ing `python -m
+    # --- vco_lib.runtime_reconcile boot` in the boot wrapper's
+    # --- reconcile_record, declared empty right before the eval.
+    "VCO_RECONCILE_OUTCOME": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
+    "VCO_RECONCILE_RUNTIME": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
+    "VCO_RECONCILE_DETAIL": "boot-wrapper local assigned by the eval'd runtime_reconcile boot output; never read from the environment",
     "VCO_LC_CONTAINER": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
     "VCO_LC_ON_MISSING": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",
     "VCO_LC_ON_STOPPED": "array assigned by the eval'd service_lifecycle plan; user env is overwritten before any read",

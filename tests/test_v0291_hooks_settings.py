@@ -1089,7 +1089,7 @@ class CliTests(_TempProject):
         # Byte-for-byte, except the one change v0.2.97 makes on purpose: a
         # VCO-shipped hook parked in the pre-v0.2.97 RELATIVE form comes back
         # anchored at the project root (it failed once the session's cwd moved).
-        anchored = json.dumps('bash "${CLAUDE_PROJECT_DIR}/.claude/hooks/notify-stop.sh"')
+        anchored = json.dumps('bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/notify-stop.sh"')
         self.assertEqual(
             self.raw(),
             self.original_text.replace('"bash .claude/hooks/notify-stop.sh"', anchored),

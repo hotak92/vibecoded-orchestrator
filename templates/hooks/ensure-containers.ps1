@@ -140,6 +140,12 @@ if (-not $RunPy) {
 # "reconcile -> plan -> act" runs under the per-user session lock shared with
 # verify-container-ports. Busy past 6 s: nothing is done this session.
 . (Join-Path $LibDir "session-lock.ps1")
+# R8 G3 (parity with the .sh sibling): the locked part runs DETACHED, so the
+# 15 s timeout's kill never reaches the lock holder mid-`compose up`.
+if (-not $env:VCO_SESSION_DETACHED) {
+    Invoke-VcoSessionHookDetached -RunPy $RunPy -Hook "ensure-containers" -ScriptPath $PSCommandPath
+    exit 0
+}
 $VcoSessionLock = Enter-VcoSessionLock -RunPy $RunPy -WaitSeconds 6
 if (-not $VcoSessionLock.Held) {
     Write-Output "ensure-containers: verify-container-ports is recovering a container right now; left the containers to it this session (the next session re-checks them)"
@@ -178,6 +184,15 @@ if ($VcoRt.state -ne "resolved") {
     exit 0
 }
 $Runtime = $VcoRt.runtime
+# v0.2.97 (R8 follow-up, parity with the .sh sibling): the resolver answered
+# the OTHER runtime because the install's record names one that is not
+# installed and the other holds VCO's data (case (a) of the read-only record
+# reconcile — requested_via + record_reconciled say so, the reason carries the
+# story). One stdout line so the user sees what happened; nothing was written,
+# the next update re-records it.
+if ($VcoRt.record_reconciled) {
+    Write-Output "ensure-containers: $($VcoRt.reason)"
+}
 # User can override the compose invocation via VCT_COMPOSE_CMD.
 $ComposeCmd = if ($env:VCT_COMPOSE_CMD) { $env:VCT_COMPOSE_CMD } elseif ($VcoRt.compose) { ($VcoRt.compose -join " ") } else { "" }
 

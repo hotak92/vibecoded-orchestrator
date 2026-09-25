@@ -23,7 +23,9 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+from tests.common.launcher_db_fixture import make_launcher_db
 from tests.common.ports import free_port
+from vco_lib import service_endpoints as _se
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 HOOKS = REPO_ROOT / "templates" / "hooks"
@@ -60,6 +62,15 @@ class _Fixture:
         self.marker = tmp / "container.created"
         self.compose_dir = tmp / "compose"
         self.compose_dir.mkdir(exist_ok=True)
+        # v0.2.97: the hook takes its probe PORT from the launcher.db
+        # service_endpoints plan, so the fixture owns the rows it reads —
+        # a temp state dir with a real-schema launcher.db (VCT_STATE_DIR is
+        # how `vco_lib.paths.launcher_db_path` is steered; same shape as
+        # tests/test_v0297_lifecycle_hooks.py's _Machine).
+        self.state = tmp / "state"
+        self.state.mkdir(exist_ok=True)
+        self.db = self.state / "launcher.db"
+        make_launcher_db(self.db)
 
         (self.bin / "podman").write_text(textwrap.dedent(f"""\
             #!/usr/bin/env bash
@@ -90,6 +101,13 @@ class _Fixture:
             (self.bin / f).chmod(0o755)
 
     def env(self, port: int) -> dict:
+        # The plan's code_embed row: VCO-managed + enabled (so the compose
+        # gate lists it) on THIS port — the port the hook must probe.
+        _se.write_rows(
+            [_se.EndpointRow(service="code_embed", mode="vco_managed",
+                             port=port, source="install_probe")],
+            db_path=self.db,
+        )
         env = dict(os.environ)
         env.update({
             "PATH": f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -97,7 +115,14 @@ class _Fixture:
             "VCT_COMPOSE_CMD": "vco-fake-compose",
             "VCT_COMPOSE_DIR": str(self.compose_dir),
             "VCT_CODE_EMBED_CONTAINER": "vco_code_embed_test",
+            # The PLAN (the launcher.db row above) decides which port the
+            # hook probes. CODE_EMBED_PORT stays exported here only as the
+            # projected transport the staleness-reporter child
+            # (`vco_lib.code_embed_image`) still reads — for the hook itself
+            # it is a retired input (v0.2.97), and the PlanPortProbeTests
+            # prove the hook ignores a value that disagrees with the row.
             "CODE_EMBED_PORT": str(port),
+            "VCT_STATE_DIR": str(self.state),
             "TMPDIR": str(self.tmp),
             # Hermeticity pin (2026-09-07 CI red): the hooks resolve their
             # runtime via `python -m vco_lib.containers resolve`, probing
@@ -119,6 +144,10 @@ class _Fixture:
         # ambient launcher shell cannot steer RUN_PY at a different tree.
         env.pop("VCT_VENV", None)
         env.pop("VCT_INSTALL_ROOT", None)
+        # VCT_LAUNCHER_DB_PATH would outrank VCT_STATE_DIR for the plan's
+        # launcher.db — scrub so an ambient value cannot point the hook at
+        # another tree's rows.
+        env.pop("VCT_LAUNCHER_DB_PATH", None)
         # `CODE_EMBED_PORT` above only decides the URL while nothing OUTRANKS
         # it: `code_embed_image.service_base_url` reads
         # `CODE_EMBED_SERVICE_URL` FIRST. An ambient value therefore points
@@ -168,6 +197,73 @@ class BashHookTests(unittest.TestCase):
             self.assertIn("--build", calls[0])
             self.assertNotIn("--build", calls[1])
             self.assertIn("was NOT rebuilt", proc.stdout)
+
+
+#: The plan's code_embed port for the port-provenance tests. A fixed,
+#: non-real port (nothing in VCO or the test fixtures listens on it) so the
+#: fake health service can bind it and the hook's probe can find it.
+PLAN_ROW_PORT = 12440
+
+#: The retired env input's decoy value: port 9 (discard) is unroutable
+#: locally — nothing ever answers there, so a hook that still read
+#: CODE_EMBED_PORT would probe a CLOSED port and fall through to compose.
+RETIRED_ENV_DECOY_PORT = 9
+
+
+@unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling is covered below")
+class BashPlanPortProbeTests(unittest.TestCase):
+    """v0.2.97 — the hook probes the launcher.db plan's port, never env.
+
+    The plan (a code_embed row on port 12440, VCO-managed + enabled) says
+    one port; env CODE_EMBED_PORT says another (unroutable). The container
+    is missing, and a fake health service answers on the PLAN's port — so
+    "Port 12440 already in use" proves which port was probed, and no compose
+    invocation proves the hook stopped there.
+    """
+
+    def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+            fx = _Fixture(Path(tmp))
+            env = fx.env(PLAN_ROW_PORT)
+            env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
+            proc = subprocess.run(
+                ["bash", str(HOOKS / "ensure-code-embed-service.sh")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+                          proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [],
+                             "the plan's port answered - compose must not run")
+
+
+@unittest.skipUnless(shutil.which("pwsh") or shutil.which("powershell"),
+                     "PowerShell not available")
+class PowerShellPlanPortProbeTests(unittest.TestCase):
+    """R42 + v0.2.97 — the .ps1 port provenance is proven by RUNNING it."""
+
+    @property
+    def shell(self):
+        return shutil.which("pwsh") or shutil.which("powershell")
+
+    def test_the_probe_uses_the_plans_port_not_env_code_embed_port(self):
+        with tempfile.TemporaryDirectory() as tmp, \
+                _HealthService({"status": "ok"}, port=PLAN_ROW_PORT):
+            fx = _Fixture(Path(tmp))
+            env = fx.env(PLAN_ROW_PORT)
+            env["CODE_EMBED_PORT"] = str(RETIRED_ENV_DECOY_PORT)
+            env["TEMP"] = str(fx.tmp)
+            proc = subprocess.run(
+                [self.shell, "-NoProfile", "-ExecutionPolicy", "Bypass",
+                 "-File", str(HOOKS / "ensure-code-embed-service.ps1")],
+                env=env, capture_output=True, text=True, timeout=180,
+                cwd=str(REPO_ROOT),
+            )
+            self.assertIn(f"Port {PLAN_ROW_PORT} already in use", proc.stdout,
+                          proc.stdout + proc.stderr)
+            self.assertEqual(fx.compose_invocations(), [],
+                             "the plan's port answered - compose must not run")
 
 
 @unittest.skipIf(IS_WINDOWS, "bash hook; the .ps1 sibling mirrors it")
@@ -347,9 +443,9 @@ class _HealthHandler(BaseHTTPRequestHandler):
 
 
 class _HealthService:
-    def __init__(self, payload: dict):
+    def __init__(self, payload: dict, port: int = 0):
         _HealthHandler.payload = payload
-        self.httpd = HTTPServer(("127.0.0.1", 0), _HealthHandler)
+        self.httpd = HTTPServer(("127.0.0.1", port), _HealthHandler)
         self.port = self.httpd.server_address[1]
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
 
