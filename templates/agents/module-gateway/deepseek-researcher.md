@@ -1,7 +1,7 @@
 ---
 name: deepseek-researcher
 description: Read-only research and investigation lane routed to DeepSeek V4.1 Flash through the local claude-gw gateway (qwen vendor). Use for bounded surveys, code-comprehension sweeps and diagnostic legwork that write one report — the strongest cheap research lane. Explicitly NOT a reviewer: it never passes verdict on a fix or a design. Not for edits. Requires the model gateway.
-model: claude-gw/qwen/deepseek-v4.1-flash
+model: claude-gw/qwen/deepseek-v4.1-flash[1m]
 effort: medium
 tools: Read, Grep, Glob, Bash, Write
 ---

@@ -564,6 +564,7 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
     the router never cataloged fails at spawn with nothing to compare
     against. That is why the pin reads the registry, not the template.
     """
+    from model_router.routing import advertised_id
     from model_router.vendors import GATEWAY_NAMESPACE, VENDORS
 
     seed = json.loads(
@@ -608,8 +609,25 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
             "the picker would never offer the model this lane names"
         )
 
+    # The expected id is the PUBLISHED id, computed by the router's own
+    # `advertised_id` from the same seed flag the catalog reads — not the bare
+    # id plus a suffix spelled here. Two things depend on it and only one is
+    # cosmetic:
+    #
+    #   * the picker offers exactly this string, so a definition naming
+    #     anything else is a lane the user cannot select;
+    #   * the client sizes its context window from the ID (measured
+    #     2026-09-28: `claude-gw/glm-5.3` -> 200000, `…[1m]` -> 1000000, and
+    #     the same pair for `claude-gw/qwen/qwen3.8-max`), so a bare id
+    #     starves the lane of 800K of window and auto-compacts it near 169K
+    #     while the picker advertises 1M.
+    #
+    # Deriving it here means a seed row whose `window_1m` flips turns this red
+    # until the definition follows.
     expected = {
-        name: f"{VENDORS[vendor_id].namespace}{bare}"
+        name: advertised_id(
+            VENDORS[vendor_id], bare, one_m=bool(seed[bare]["window_1m"]),
+        )
         for name, (vendor_id, bare) in lanes.items()
     }
     # The shared tuple IS the delivered set, and the engine enumerates the

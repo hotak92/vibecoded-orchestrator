@@ -266,12 +266,37 @@ pub fn seed_and_export_on_boot(db: &Db) {
             Err(e) => tracing::warn!("[vct] chat-model context: seeding failed: {}", e),
         },
         Ok(None) => {
-            // Not a degraded state: the gateway ships the same seed inside
-            // its own wheel and serves it whenever no export exists.
-            tracing::debug!(
-                "[vct] chat-model context: no shipped seed found (no orchestrator \
-                 clone resolved); the model gateway falls back to its bundled copy"
-            );
+            // "No seed" hides TWO states, and the old line conflated them by
+            // claiming the harmless one unconditionally.
+            //
+            //   * Empty table (a binary-only install): nothing to converge
+            //     and nothing to export, so the gateway's own bundled copy —
+            //     the same seed file, inside its wheel — answers every id.
+            //     Harmless, and quiet.
+            //   * Non-empty table: the rows stay exactly as they are. The
+            //     export below runs unconditionally and the gateway prefers
+            //     the export PER ROW (model_router/context_table.py), so this
+            //     machine's rows — stale ones included — keep being served
+            //     and no shipped correction can reach them. That is the state
+            //     a deleted/renamed clone leaves behind, and it is a silent
+            //     early-/compact for the user, so it warns.
+            let rows = db.list_chat_model_context().map(|r| r.len()).unwrap_or(0);
+            if rows == 0 {
+                tracing::debug!(
+                    "[vct] chat-model context: no shipped seed found (no orchestrator \
+                     clone, or no seed file inside it); the table is empty, so the \
+                     model gateway's bundled copy answers every id"
+                );
+            } else {
+                tracing::warn!(
+                    "[vct] chat-model context: no shipped seed found (no orchestrator \
+                     clone, or no seed file inside it) while the table holds {} row(s) — \
+                     they cannot be converged with the shipped defaults, and the export \
+                     below keeps serving them. Re-run `python install.py` to restore the \
+                     clone, then relaunch the launcher.",
+                    rows
+                );
+            }
         }
         Err(e) => tracing::warn!(
             "[vct] chat-model context: {} — re-run `python install.py` if this persists",

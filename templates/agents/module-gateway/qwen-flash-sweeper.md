@@ -1,7 +1,7 @@
 ---
 name: qwen-flash-sweeper
 description: Bulk mechanical sweep lane routed to Qwen3.8-Flash through the local claude-gw gateway. Use when the same judgement must be applied uniformly to many items — classifying call sites, inventorying a directory, tabulating every occurrence of a pattern — producing one table-shaped report. Not a reviewer, not for edits, and not for questions that need judgement per item. Requires the model gateway.
-model: claude-gw/qwen/qwen3.8-flash
+model: claude-gw/qwen/qwen3.8-flash[1m]
 effort: medium
 tools: Read, Grep, Glob, Bash, Write
 ---

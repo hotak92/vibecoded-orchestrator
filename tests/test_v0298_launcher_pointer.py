@@ -3,9 +3,9 @@
 A navigation pointer in user-facing text is a printed command: it has to name
 something that exists and lead the reader to the intended control. Nothing
 executes it, so nothing fails when it is wrong — the whole repo carried
-``Preferences -> Special Secrets`` in 24 places across 15 files (README,
-CHANGELOG, docs, install.py, vco_lib, vct-module.json, the ORCHESTRATOR
-template, search_mcp/wrapper.sh) while no launcher version ever had that label
+``Preferences -> Special Secrets`` in 19 live places across 12 files (README,
+docs, install.py, vco_lib, vct-module.json, the ORCHESTRATOR template,
+search_mcp/wrapper.sh) while no launcher version ever had that label
 (``git log --all -S "Special Secrets" -- launcher/`` is empty). The launcher's
 own surfaces are:
 
@@ -30,7 +30,7 @@ in this tree rather than imagined:
 * **a backslash continuation** — ``"… Special \\\nSecrets …"`` in shell or Python;
 * **hard-wrapped prose** — a blockquote or an 80-column wrap that puts
   ``Special`` at the end of one Markdown line and ``Secrets`` at the start of
-  the next. This one survived the 24-site sweep *and* the first version of
+  the next. This one survived the 19-site sweep *and* the first version of
   this guard, in ``tools/vct-secrets/MIGRATION.md``.
 
 Each fold below is the reader's view: what the compiler joins, or what the eye
@@ -187,7 +187,7 @@ def _live_text(path: pathlib.Path, text: str) -> str:
     # A QUOTED mention is not a pointer. The distinction is the whole point of
     # this file: a pointer is bare text a reader follows, while a changelog
     # entry describing the sweep has to name the phrase it removed — and it
-    # writes it in backticks. Every one of the 24 live pointers was bare.
+    # writes it in backticks. Every one of the 19 live pointers was bare.
     live = _collapse_literal_glue(
         _BACKSLASH_CONTINUATION.sub("", _BACKTICK_SPAN.sub("", text))
     )
@@ -323,7 +323,7 @@ class SplitLiteralTests(unittest.TestCase):
     def test_a_pointer_hard_wrapped_in_markdown_is_still_found(self) -> None:
         # The straggler this fold was written for: a blockquote wraps mid
         # pointer, so the phrase sits on two lines and no contiguous search —
-        # not the 24-site sweep, not the first version of this guard — sees it.
+        # not the 19-site sweep, not the first version of this guard — sees it.
         text = (
             "> written via the launcher GUI (OnboardingWizard / Preferences → Special\n"
             "> Secrets), then resolved through vct-hub.\n"

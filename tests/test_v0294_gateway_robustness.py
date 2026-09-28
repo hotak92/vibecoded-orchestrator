@@ -29,6 +29,7 @@ import aiohttp
 from aiohttp import web
 
 from model_router import server as srv
+from model_router import usage as U
 from model_router.__main__ import SERVER_LIMITS
 from tests.test_model_router_server import FAKE_OAUTH, GatewayTestBase, _Upstream
 from tests.test_v0294_gateway_access_log import LOGGER, _fields
@@ -574,9 +575,17 @@ class OAuthRereadTests(ChaosBase):
         self.anthropic_up.on_request = lambda: self.write_credentials(
             rotated, expires_in_ms=3_600_000,
         )
+        # The retry's answer carries usage, so the ledger row it OWES is
+        # observable: without it a usage-less 2xx declines in _submit_usage
+        # by design and the test could not tell the fix from the defect.
+        self.anthropic_up.messages_body = {
+            "id": "msg_1", "type": "message", "model": "claude-opus-5",
+            "content": [], "usage": {"input_tokens": 321, "output_tokens": 4},
+        }
         with self.assertLogs(LOGGER, level="INFO") as captured:
             resp = await self.client.post(
-                "/v1/messages", headers=self.headers(),
+                "/v1/messages",
+                headers=self.headers(**{U.SESSION_HEADER: "chat-oauth"}),
                 json={"model": "claude-opus-5", "messages": []},
             )
         self.assertEqual(resp.status, 200, await resp.text())
@@ -587,6 +596,21 @@ class OAuthRereadTests(ChaosBase):
         self.assertTrue(
             any("oauth_reread_retry" in m for m in captured.output), captured.output,
         )
+        # The retry re-sends the SAME turn, so it owes the SAME row: identity
+        # and numbers ride on `facts`, which the re-send used to be built
+        # without — leaving a repaired, billed turn absent from the record.
+        await self.client.app[srv.APP_KEY].usage.drain()
+        rows = [
+            json.loads(line)
+            for line in self.usage_ledger_path.read_text(
+                encoding="utf-8",
+            ).splitlines()
+            if line
+        ] if self.usage_ledger_path.is_file() else []
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["session"], "chat-oauth")
+        self.assertEqual(rows[0]["route"], "anthropic")
+        self.assertEqual(rows[0]["input_tokens"], 321)
 
     async def test_an_unchanged_credential_is_not_retried(self) -> None:
         """A genuinely dead login answers 401 once — never in a loop."""
@@ -677,6 +701,68 @@ class QuotaReprobeTests(ChaosBase):
             len([m for m in captured.output if "vendor_quota" in m]), 0,
             captured.output,
         )
+
+    async def test_a_re_probe_that_succeeds_is_counted_in_the_ledger(
+        self,
+    ) -> None:
+        """A repaired turn is still a turn, and the ledger is where that shows.
+
+        The re-probe answers the user from the VENDOR, so the request really
+        did consume context. ``_submit_usage`` counts from ``facts``, and the
+        re-send used to be built without it — so the first attempt after a
+        stale exhaustion verdict answered 200 and left the record saying
+        nothing had happened at all. (The refusal itself could not have
+        written the row anyway: a non-2xx declines.) Identity rides on
+        ``facts`` too, which is why the session is asserted and not just the
+        row count.
+        """
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        answers = {"n": 0}
+
+        def the_vendor_recovers() -> None:
+            answers["n"] += 1
+            if answers["n"] > 1:
+                self.vendor_up.messages_status = 200
+                self.vendor_up.messages_raw = None
+                # The recovering answer CARRIES usage: a usage-less 2xx
+                # declines in _submit_usage by design, so without this the
+                # test could not tell the fix from the defect.
+                self.vendor_up.messages_body = {
+                    "id": "msg_1", "type": "message", "content": [],
+                    "usage": {
+                        "input_tokens": 1234,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 7,
+                    },
+                }
+
+        self.vendor_up.on_request = the_vendor_recovers
+        resp = await self.client.post(
+            "/v1/messages",
+            headers=self.headers(**{U.SESSION_HEADER: "chat-reprobe"}),
+            json={"model": "claude-gw/glm-5.3", "messages": []},
+        )
+        self.assertEqual(resp.status, 200, await resp.text())
+        self.assertEqual(len(self.vendor_up.message_requests), 2)
+
+        await self.client.app[srv.APP_KEY].usage.drain()
+        self.assertTrue(
+            self.usage_ledger_path.is_file(),
+            "the successful re-probe wrote no ledger row at all",
+        )
+        rows = [
+            json.loads(line)
+            for line in self.usage_ledger_path.read_text(
+                encoding="utf-8",
+            ).splitlines()
+            if line
+        ]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["session"], "chat-reprobe")
+        self.assertEqual(rows[0]["input_tokens"], 1234)
+        self.assertEqual(rows[0]["output_tokens"], 7)
 
     async def test_a_second_exhaustion_verdict_is_the_one_the_user_sees(
         self,

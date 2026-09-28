@@ -55,8 +55,12 @@
 #       two legs, for VCO's OWN consumers (embeddings, gateway, codegraph,
 #       hooks) — they must resolve only VCO's slot and never read a
 #       project's key; a project's key is the project's. Tier 1 (hub) is
-#       UNCHANGED — same route, same requester project, same exit codes
-#       (the pause matrix still applies). Tier 2 reads shared\<key> ONLY
+#       UNCHANGED — same route, same requester project, same exit codes.
+#       The pause matrix decides what the HUB answers, not whether the
+#       chain stops: a hub refusal (key_not_active) falls through to the
+#       file store exactly as it does in the full chain, and exit 3 on an
+#       all-miss reports TIER 1's refusal — which the hub itself cannot
+#       tell apart from "never declared". Tier 2 reads shared\<key> ONLY
 #       (the projects\<NAME>\<key> leg is not consulted); tier 3 (the
 #       project's own `.env`) is not consulted at all, even when the
 #       first arg is a folder. MUST MATCH read_key_shared_only /
@@ -851,8 +855,10 @@ function Read-Key {
     # after tiers 2 and 3 also missed).
     #
     # -SharedOnly (v0.2.98): the chain minus two legs — tier 1 UNCHANGED
-    # (same route, same requester project, same exit codes; the pause
-    # matrix still applies), tier 2 reads shared\<key> only, tier 3 never.
+    # (same route, same requester project, same exit codes; the matrix
+    # gates what the HUB answers, and a hub refusal still falls through to
+    # the file store rather than stopping the chain), tier 2 reads
+    # shared\<key> only, tier 3 never.
     # MUST MATCH read_key_shared_only in vct_secrets_resolve.sh.
     param([string]$ProjectArg, [string]$Key, [switch]$SharedOnly)
     $tier1 = Read-KeyHub -ProjectArg $ProjectArg -Key $Key

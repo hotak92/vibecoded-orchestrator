@@ -54,9 +54,13 @@
 #       consumers (embeddings, gateway, codegraph, hooks) — they must
 #       resolve only VCO's slot and never read a project's key; a
 #       project's key is the project's. Tier 1 (hub) is UNCHANGED — same
-#       route, same requester project, same exit codes (the pause matrix
-#       still applies). Tier 2 reads shared/<key> ONLY (the
-#       projects/<NAME>/<key> leg is not consulted); tier 3 (the
+#       route, same requester project, same exit codes). The pause
+#       matrix decides what the HUB answers, not whether the chain
+#       stops: a hub refusal (key_not_active) falls through to the file
+#       store exactly as it does in the full chain, and exit 3 on an
+#       all-miss reports TIER 1's refusal — which the hub itself cannot
+#       tell apart from "never declared". Tier 2 reads shared/<key> ONLY
+#       (the projects/<NAME>/<key> leg is not consulted); tier 3 (the
 #       project's own `.env`) is not consulted at all, even when the
 #       first arg is a folder. All-miss keeps the tier-1 exit code and
 #       the miss diagnostic names ONLY the tiers this mode consulted.
@@ -980,9 +984,10 @@ file_store_get_shared_only() {
 read_key_shared_only() {
     # $1 = project_id_or_folder, $2 = key. See the Usage header: tier 1
     # UNCHANGED (same route, same requester project, same exit-code
-    # contract — the pause matrix still applies), tier 2 = shared/<key>
-    # only, tier 3 never. The all-miss diagnostic names ONLY the tiers
-    # this mode actually consulted.
+    # contract; the matrix gates what the HUB answers, and a hub refusal
+    # still falls through to the file store rather than stopping the
+    # chain), tier 2 = shared/<key> only, tier 3 never. The all-miss
+    # diagnostic names ONLY the tiers this mode actually consulted.
     local pid_arg="$1" key="$2"
     local val tier1_rc rc2
     set +e

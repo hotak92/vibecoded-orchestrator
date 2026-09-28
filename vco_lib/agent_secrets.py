@@ -53,10 +53,16 @@ Tiers 2 and 3 together are gated by ``allow_file_fallback`` — disable
 when only the keychain truth is acceptable.
 
 ``shared_only=True`` is the SCOPE switch (mirrored by ``--shared-only`` in
-``vct_secrets_resolve.sh`` / ``vct_secrets_resolve.ps1``): tier 2 is
-reduced to its ``shared/<key>`` leg and tier 3 is skipped entirely, so only
-the shared slot can answer. VCO's own consumers resolve through it — a
-project's own key must never be spent on VCO (owner ruling 2026-09-26).
+``vct_secrets_resolve.sh`` / ``vct_secrets_resolve.ps1``, whose comments
+read "tier 1 UNCHANGED — the chain minus two legs"): tier 2 is reduced to
+its ``shared/<key>`` leg and tier 3 is skipped entirely. Tier 1 is NOT
+gated: the same hub route with the same requester identity, because the
+hub's own per-(secret x requester) matrix decides what the hub may answer.
+What keeps a project's key out of VCO's own slot is therefore the hub's
+``slot_exclusive`` declaration for that key (``vct-module.json``), enforced
+in the hub's module API — not this flag. VCO's own consumers resolve
+through it so a project's key is never spent on VCO (owner ruling
+2026-09-26).
 
 Secrets NEVER touch argv, logs, or exception messages — errors name the
 key and the tiers consulted, never the value.
@@ -446,7 +452,9 @@ def get(
             or the project ``.env`` (tiers 2 AND 3 are both gated).
         shared_only: restrict the chain to the SHARED slot — tier 2 is
             ``shared/<key>`` only (the ``projects/<NAME>/`` leg is not
-            consulted) and tier 3 is not consulted at all. ``project``
+            consulted) and tier 3 is not consulted at all. Tier 1 is
+            UNCHANGED (sh/ps1 parity: the chain minus two legs), the hub's
+            own matrix gating what it may answer. ``project``
             stays the REQUESTER identity for the hub gate and for the
             requester's ``.no-shared-fallback`` opt-out; it never widens
             the lookup. VCO's own consumers use this mode so a project's

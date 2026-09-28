@@ -2138,6 +2138,12 @@ async def _proxy(
                         started=started,
                         note=f"{note} note=oauth_reread_retry".strip(),
                         images=images,
+                        # `facts` is what _submit_usage counts FROM: without
+                        # it the retry's successful turn writes no ledger row
+                        # (server.py::_submit_usage returns early on
+                        # `facts is None`), so the repaired request answered
+                        # the client but vanished from the usage record.
+                        facts=facts,
                         allow_oauth_retry=False,
                     )
             vendor = decision.vendor
@@ -2180,6 +2186,7 @@ async def _proxy(
                             started=started,
                             note=note,
                             images=images,
+                            facts=facts,
                         )
                         if allow_quota_reprobe
                         and isinstance(body, (bytes, bytearray))
@@ -2676,6 +2683,7 @@ def _quota_reprobe(
     started: float,
     note: str,
     images: str = IMAGES_UNCOUNTED,
+    facts: Optional[RequestFacts] = None,
 ) -> Callable[[], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
@@ -2694,6 +2702,12 @@ def _quota_reprobe(
     repair, so it does not open a second front on the same request. A vendor
     that answers "exhausted" to everything therefore costs exactly two
     upstream requests and then answers the client.
+
+    ``facts`` is threaded through for the same reason it is on the first
+    attempt: it is the evidence :func:`_submit_usage` counts FROM, so a
+    re-probe that SUCCEEDS is a real turn for the user and must land in the
+    usage ledger. Dropping it here made the repair invisible — the request
+    answered, and the record said nothing happened.
     """
     async def resend() -> web.StreamResponse:
         return await _proxy(
@@ -2708,6 +2722,7 @@ def _quota_reprobe(
             started=started,
             note=f"{note} note=quota_reprobe".strip(),
             images=images,
+            facts=facts,
             allow_oauth_retry=False,
             allow_quota_reprobe=False,
         )

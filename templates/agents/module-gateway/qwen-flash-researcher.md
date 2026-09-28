@@ -1,7 +1,7 @@
 ---
 name: qwen-flash-researcher
 description: Cheap read-only research lane routed to Qwen3.8-Flash through the local claude-gw gateway. Use for quick, bounded surveys and lookup legwork that write one report, when the question is narrow and the answer is findable by reading — the low-cost alternative to deepseek-researcher. Not a reviewer, not for edits. Requires the model gateway.
-model: claude-gw/qwen/qwen3.8-flash
+model: claude-gw/qwen/qwen3.8-flash[1m]
 effort: medium
 tools: Read, Grep, Glob, Bash, Write
 ---

@@ -7,12 +7,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a request the gateway repaired was counted as a turn that never happened (v0.2.98)
+
+- The gateway repairs two kinds of failed request rather than handing the
+  failure on: it re-reads a rotated credential and sends again, and it re-probes
+  a vendor's "you are out of quota" verdict once before passing it to the user.
+  Both repairs now answer the client from a request the gateway built a second
+  time — and that second build did not carry `facts`, the object the first
+  attempt assembles from the caller's headers. The counting path declines on
+  `facts is None`, so a repaired request that SUCCEEDED wrote no ledger row at
+  all: the user got a full answer, and the usage record read as if nothing had
+  been sent.
+- `facts` carries more than the token count — the session and the agent identity
+  are read from it too — so the row a re-probe writes is now attributed to the
+  same caller as the attempt it replaced, instead of to an anonymous one. It is
+  threaded on the re-sent request, on the re-probe's own construction site, and
+  through the re-probe's signature; a docstring beside that signature states why,
+  so the next editor does not remove the argument as redundant.
+- Red-proofed on both paths, one test each: with the argument removed the
+  re-probed request writes zero rows and the test fails naming the missing row;
+  with it restored the ledger holds exactly one row, carrying the session header
+  and the recovering vendor route. The assertions read identity rather than a
+  row count, so a row attributed to the wrong caller fails too.
+
+### Fixed — the shipped gateway subagents ran at a fifth of the window their picker advertised (v0.2.98)
+
+- All ten definitions under `templates/agents/module-gateway/` named their model
+  with a bare gateway id — `claude-gw/glm-5.3`, `claude-gw/qwen/qwen3.8-max` and
+  the rest. Measured on 2026-09-28, a bare gateway id is budgeted **200 000**
+  tokens by the client while the same id carrying the `[1m]` suffix is budgeted
+  1 000 000, and the model picker offers exactly the suffixed spelling because the
+  row's own window says 1M. Every dispatched gateway lane therefore ran with a
+  fifth of the window its picker entry claimed, and compacted at that fifth — the
+  defect the context-table correction above removed from the ids a user picks by
+  hand, left standing in the ids the shipped agents carry.
+- Each of the ten now names the advertised spelling, suffix included: the four
+  GLM lanes (`glm-implementer`, `glm-reviewer`, `glm-planner`,
+  `glm-flash-researcher`), and the six qwen-vendor lanes — the two DeepSeek
+  ones included, which had the same problem.
+- The same sweep found the shape twice more, in `templates/CLAUDE.md.template`'s
+  own routing table: its two GLM rows named bare ids while the paragraph three
+  lines above them already told the reader to route to `claude-gw/glm-5.3[1m]`,
+  and the rule added below states that every shipped gateway id is the advertised
+  spelling. Both rows carry the suffix now, so the table no longer contradicts
+  the rule beside it. Nothing is pinned to a bare id anywhere in the shipped
+  tree: the catalogue's `advertised_id()` is the only place in the repo that
+  builds a gateway id from parts, and it applies the suffix from the row's own
+  window.
+- The contract test no longer states the expected ids as literal strings. It
+  derives each one through `advertised_id(vendor, model_id, one_m=row["window_1m"])`
+  — the single home of the published spelling — so a window flipped in the seed,
+  or an agent left behind on an older id, fails the suite instead of shipping a
+  lane that runs at the wrong size.
+- `templates/CLAUDE.md.template` now states the rule: **the ID carries the
+  window, so the ID is part of the specification.** The paragraph gives the
+  measurement, says every shipped gateway id is the advertised spelling with its
+  suffix, and tells a reader writing an id by hand — in a slot, a script, a
+  frontmatter — to take it from `/v1/models` rather than assemble it.
+
+### Fixed — a boot line called the harmful case of "no shipped seed" the harmless one (v0.2.98)
+
+- When the launcher's boot path found no shipped seed to converge the chat-model
+  context table with, it logged *"Not a degraded state: the model gateway falls
+  back to its bundled copy"* — one sentence for two different states. The export
+  the gateway reads runs unconditionally and wins per row, so that fallback is
+  real only when the table is EMPTY. When the table already holds rows, the
+  export keeps serving those rows, and a shipped correction can no longer reach
+  the machine at all: the user whose table carries the old 200K qwen rows keeps
+  them, while a debug line tells whoever reads the log that nothing is wrong.
+- The branch now counts the rows and says which state it is in — a debug line for
+  the empty table, where the gateway's bundled copy really does answer every id,
+  and a warning for the non-empty one, naming the row count, the consequence and
+  the fix (`python install.py` to restore the clone, then relaunch the launcher).
+
+### Fixed — the secrets resolver's own header described a chain it does not run (v0.2.98)
+
+- `templates/scripts/vct_secrets_resolve.sh` and its `.ps1` sibling explain the
+  three-tier chain at the top of the file, and both said the launcher's pause
+  matrix "still applies" — as though a hub refusal were where the chain ends. It
+  is not: the matrix decides what the HUB answers, and a refusal falls through to
+  the file store exactly as an absent key does. Exit 3 on an all-miss reports
+  TIER 1's refusal, which the hub itself cannot tell apart from "never declared".
+  A comment that describes a guard is part of that guard, so the sentence was
+  wrong in the way that matters to whoever reads it next.
+- Both files now say what the code does, at the usage header and again beside
+  `read_key_shared_only`, and keep their "MUST MATCH" cross-reference to each
+  other.
+
 ### Fixed — every shipped pointer to the launcher's secrets surface now names a surface that exists (v0.2.98)
 
-- `Preferences -> Special Secrets` appeared **25 times in 12 live files** —
-  `install.py` (6), `vco_lib/openai_key.py` (4), `docs/CONFIGURATION.md` (3),
+- `Preferences -> Special Secrets` appeared **19 times in 12 live files** —
+  `install.py` (3), `vco_lib/openai_key.py` (2), `docs/CONFIGURATION.md` (3),
   `templates/ORCHESTRATOR-CLAUDE.md.template` (2),
-  `vco_lib/codegraph_deferrals.py` (2), `vct-module.json` (2), and one each in
+  `vco_lib/codegraph_deferrals.py` (1), `vct-module.json` (2), and one each in
   `README.md`, `claude_mcp_servers/search_mcp/wrapper.sh`,
   `docs/GETTING_STARTED.md`, `docs/features/05-install-and-secrets.md`,
   `tools/vct-secrets/README.md` and `tools/vct-secrets/MIGRATION.md`. No launcher
@@ -161,10 +248,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   row carrying it and 200K for every other row behind a gateway, so it is also
   what makes the context indicator count against the real window — the number
   a user reads when deciding to compact.
-- The four ids the qwen row curates away (`qwen3.7-max`, `qwen3.7-plus`,
-  `deepseek-v4-pro`, `deepseek-v4-flash-0731`) stay hidden, and are now
-  reported in `_vct_catalog_hidden` under their suffixed spelling — the id a
-  user would have seen, not the bare vendor id.
+- The three ids the qwen row withholds (`qwen3.7-max`, `qwen3.7-plus`,
+  `deepseek-v4-pro`) are now reported in `_vct_catalog_hidden` under their
+  suffixed spelling — the id a user would have seen, not the bare vendor id.
+  `qwen3.7-plus` and `deepseek-v4-pro` come from the row's `catalog_hide_ids`;
+  `qwen3.7-max` sits in the row's own `static_ids` and is withheld by the
+  latest-only family filter. The fourth id the row curates away is a different
+  case entirely: `catalog_exclude_prefixes` drops `deepseek-v4-flash-0731` and
+  every other dated snapshot outright, so it appears in neither list —
+  exclusion is not withholding, and a dated build is not a model anybody is
+  missing.
 - The correction reaches an existing install by itself: the launcher's boot path now
   **converges** the table with the shipped seed row by row instead of inserting only the
   rows the table is missing, so a corrected figure no longer waits for someone to press

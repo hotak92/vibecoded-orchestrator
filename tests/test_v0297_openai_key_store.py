@@ -138,6 +138,47 @@ def test_the_ignored_env_var_is_announced_once_and_never_prints_a_value(
     assert capsys.readouterr().err == "", "once per process, not once per call"
 
 
+def test_a_clean_miss_never_claims_more_than_it_can_prove(
+    stores: Path, monkeypatch, capsys,
+) -> None:
+    """The miss sentence asserts only what is ALWAYS true — no key was
+    RESOLVED. It must not say the slot is empty: an unreachable hub with file
+    fallback on reaches this branch as a plain ``SecretNotFound`` too, and
+    "hub down" is not "empty". The remedy states its own precondition."""
+    monkeypatch.setenv("OPENAI_API_KEY", OTHER)
+    assert openai_key.resolve_openai_api_key() == ""
+    err = capsys.readouterr().err
+    assert "no OpenAI key was resolved from VCO's own slot" in err
+    assert "no OpenAI key in VCO's own slot" not in err, "never asserts absence"
+    assert "must be running for the keychain to be readable" in err
+
+
+def test_a_slot_that_cannot_be_read_is_never_reported_as_an_absent_key(
+    stores: Path, monkeypatch, capsys,
+) -> None:
+    """A locked keychain / refusal / OS error is a READ FAILURE, not an
+    absence. Asserting the slot is empty would send the user to store a
+    SECOND copy of a key that is already there — the exact divergence this
+    module exists to prevent — so the branch must name the failure instead."""
+    from vco_lib import agent_secrets
+
+    monkeypatch.setenv("OPENAI_API_KEY", OTHER)
+
+    def _locked(*_a, **_kw):
+        raise agent_secrets.KeychainLocked("keychain is locked")
+
+    monkeypatch.setattr(agent_secrets, "get", _locked)
+    assert openai_key.resolve_openai_api_key() == ""
+    err = capsys.readouterr().err
+    assert "could not READ" in err and "KeychainLocked" in err, "names the failure"
+    assert "no OpenAI key" not in err, "never claims an absence"
+    assert "do NOT save a second copy" in err, "warns against the divergence"
+    assert f"vct set --shared --key {openai_key.OPENAI_SECRET_NAME}" not in err, (
+        "no store-it remedy on a key that may already be stored"
+    )
+    assert OTHER not in err, "a diagnostic never carries the value"
+
+
 def test_the_embedding_service_reads_through_the_resolver(stores: Path) -> None:
     from vco_lib import embedding_service
 

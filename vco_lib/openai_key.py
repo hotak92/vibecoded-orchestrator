@@ -76,27 +76,58 @@ class MigrationUnavailable(RuntimeError):
 _warned_env_var = False
 
 
-def _warn_env_var_ignored() -> None:
-    """Say ONCE, on stderr, that VCO's own slot is empty while
-    ``$OPENAI_API_KEY`` is set — the one way a pre-v0.2.98 env-var user can
-    lose the key without being told.
+def _warn_env_var_ignored(unreadable: str = "") -> None:
+    """Say ONCE, on stderr, that ``$OPENAI_API_KEY`` is set while VCO's own
+    slot did not answer — the one way a pre-v0.2.98 env-var user can lose the
+    key without being told.
 
-    Names the variable and the remedy, never a value. Only fires on a MISS
-    (when the slot answered there is nothing to report), and never raises: a
-    diagnostic must not be the thing that breaks an embedding run."""
+    Names the variable and, on a clean miss, the remedy; never a value. The
+    two cases are DIFFERENT claims and must not share a sentence:
+
+    * ``unreadable != ""`` — the slot provably could NOT be read (a locked
+      keychain, a refusal, an OS error). The key may be sitting there right
+      now, so asserting it is absent would be false, and the "store the key"
+      remedy would talk the user into a SECOND copy — the very divergence
+      this module exists to prevent. Name the failure and stop there.
+    * ``unreadable == ""`` — everything else. The sentence therefore claims
+      only what is ALWAYS true (no key was RESOLVED from the slot), never
+      that the slot is empty: an unreachable hub with file fallback on also
+      arrives here as a plain ``SecretNotFound`` (see
+      :func:`~vco_lib.agent_secrets.get`'s tail), and "hub down" is not
+      "empty". The remedy carries its own precondition for the same reason.
+
+    Only fires on a MISS (when the slot answered there is nothing to report),
+    and never raises: a diagnostic must not be the thing that breaks an
+    embedding run."""
     global _warned_env_var
     if _warned_env_var or not os.environ.get(OPENAI_ENV_VAR, "").strip():
         return
     _warned_env_var = True
     import sys
 
-    print(
-        f"VCO: no OpenAI key in VCO's own slot ({OPENAI_SECRET_NAME}), and "
+    shared = (
         f"{OPENAI_ENV_VAR} is set — VCO no longer reads that variable, because "
         f"a project shell may export ITS OWN key there and a project's key must "
-        f"never be spent on VCO. Store the key VCO should use in VCO's slot: "
+        f"never be spent on VCO. "
+    )
+    if unreadable:
+        print(
+            f"VCO: could not READ VCO's own OpenAI slot "
+            f"({OPENAI_SECRET_NAME}): {unreadable}. That is a read failure, "
+            f"not an absence — the key may still be stored, so do NOT save a "
+            f"second copy. " + shared + "Unlock the keychain / restart the "
+            "launcher (vct-hub), then retry.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"VCO: no OpenAI key was resolved from VCO's own slot "
+        f"({OPENAI_SECRET_NAME}). " + shared
+        + f"Store the key VCO should use in VCO's slot: "
         f"`vct set --shared --key {OPENAI_SECRET_NAME}` or the launcher's "
-        f"Preferences → Secrets.",
+        f"Preferences → Secrets. If you already stored one, the launcher "
+        f"(vct-hub) must be running for the keychain to be readable — check "
+        f"that before saving another copy.",
         file=sys.stderr,
     )
 
@@ -124,14 +155,21 @@ def resolve_openai_api_key(project: Optional[str] = None) -> str:
     if cache_key not in _resolved:
         from vco_lib import agent_secrets
 
+        unreadable = ""
         try:
             _resolved[cache_key] = agent_secrets.get(
                 OPENAI_SECRET_NAME, project=project, shared_only=True,
             ).strip()
-        except (agent_secrets.ResolverError, OSError, ValueError):
+        except agent_secrets.SecretNotFound:
+            # The slot answered and holds no such key: a PROVABLE absence.
             _resolved[cache_key] = ""
+        except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+            # KeychainLocked / HubUnreachable / Forbidden / OSError — we could
+            # NOT read the slot. Never reported as "no key in the slot".
+            _resolved[cache_key] = ""
+            unreadable = type(exc).__name__
         if not _resolved[cache_key]:
-            _warn_env_var_ignored()
+            _warn_env_var_ignored(unreadable)
     return _resolved[cache_key]
 
 

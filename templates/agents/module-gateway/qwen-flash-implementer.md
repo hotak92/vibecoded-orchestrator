@@ -1,7 +1,7 @@
 ---
 name: qwen-flash-implementer
 description: Cheap implementation lane routed to Qwen3.8-Flash through the local claude-gw gateway. Use for mechanical, fully-specified edits — a rename, a pinned signature change, a templated edit repeated across named files — where the exact change is already known. Never for a shared-component extraction or any change whose acceptance is not checkable. Requires the model gateway.
-model: claude-gw/qwen/qwen3.8-flash
+model: claude-gw/qwen/qwen3.8-flash[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
 ---

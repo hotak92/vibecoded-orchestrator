@@ -74,9 +74,9 @@ Only use `Grep` / `Read` when the user provides an exact file path, you're hunti
 
 This section is here because a **model gateway is configured for this machine** (Services → Model gateway in the launcher). It would be absent otherwise — a project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise. Turn it off per-project from the same card.
 
-**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module ships ten definitions across two lanes. The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
+**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module ships ten definitions across two lanes. The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
 
-**When you route to GLM, route to `claude-gw/glm-5.3`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.2 is 1M, glm-5.1 is 200K), so "the GLM one" is not a specification.
+**When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.2 is 1M, glm-5.1 is 200K), so "the GLM one" is not a specification.
 
 ⚠️ **Everything below is conditional on YOU having supplied the vendor's API
 key.** VCO ships no third-party key and never writes one. Without a key and a
@@ -95,8 +95,8 @@ default middle rung.
 |---|---|---|
 | Final plans, adversarial review, hardest architecture | Fable 5.1 | Highest independent composite (Artificial Analysis Intelligence Index v4.1.1: 66, top of the five compared) |
 | Agentic coding on real repos, multi-file refactors | Opus 5 | 97.0% SWE-bench Verified, first of 86 models on that leaderboard (Vals AI) |
-| Bulk code generation, debugging, mid-tier implementation | `claude-gw/glm-5.3` | Sits between Sonnet 5 and Opus 5 and **nearer Opus** — slightly below it. Roughly 60% of Sonnet's price |
-| High-volume mechanical sweeps, first-pass triage | `claude-gw/glm-5.3-flash`, **behind a verifier** | **Slightly above Sonnet 5**, at ~1/15 the price |
+| Bulk code generation, debugging, mid-tier implementation | `claude-gw/glm-5.3[1m]` | Sits between Sonnet 5 and Opus 5 and **nearer Opus** — slightly below it. Roughly 60% of Sonnet's price |
+| High-volume mechanical sweeps, first-pass triage | `claude-gw/glm-5.3-flash[1m]`, **behind a verifier** | **Slightly above Sonnet 5**, at ~1/15 the price |
 | Anything with an image, screenshot or diagram as input | a Claude model | GLM-5.3 (non-flash) is text-only |
 | Unsupervised edits to a green test suite | **not flash** | It broke an already-passing baseline test in 6.9% of agent rollouts (vs 4.4% for GLM-5.3) |
 
@@ -125,6 +125,19 @@ So `glm-5.2` has **five times** the window of `glm-5.1` — which is exactly why
 `glm-5*` wildcard is forbidden. Claude models are deliberately absent from that
 table: the client already knows their windows natively, and overriding them
 would only introduce drift.
+
+**The ID carries the window, so the ID is part of the specification.** Claude
+Code sizes a session from the id string it was given, and the gateway publishes
+the 1M variant of a row as `<id>[1m]` — the suffix is the whole signal. A bare
+gateway id is budgeted at **200 000** tokens even when the model's own row says
+1M (measured 2026-09-28: `claude-gw/glm-5.3` → 200 000, `claude-gw/glm-5.3[1m]`
+→ 1 000 000, the same pair for `claude-gw/qwen/qwen3.8-max`), so an unsuffixed
+spelling costs the session 800 000 tokens of window and triggers an early
+auto-compact while the picker advertises the larger figure. Every shipped
+gateway id — the picker's, and the `model:` of each `module-gateway` agent — is
+the advertised spelling, suffix included. When you write a gateway id by hand
+(a slot, a script, a frontmatter), take it from `/v1/models` rather than
+assembling it by hand.
 
 *Competence* across a large window is the open question: *"1M tokens accepted"*
 is a capacity claim, not a quality one, and no vendor here publishes

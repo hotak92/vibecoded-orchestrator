@@ -1,7 +1,7 @@
 ---
 name: qwen-implementer
 description: Implementation lane routed to Qwen3.8-Max through the local claude-gw gateway. Use for bounded code fixes that span several files or need multi-step reasoning inside one lane — the middle rung between deepseek-implementer and the flash lanes. Not for open-ended design; it is not a reviewer. Requires the model gateway.
-model: claude-gw/qwen/qwen3.8-max
+model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
 ---
