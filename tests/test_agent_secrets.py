@@ -464,6 +464,32 @@ def test_shared_only_miss_says_which_tiers_it_skipped(offline_hub, file_store):
     assert "vct set --shared --key absent_key" in message
 
 
+def test_shared_only_still_falls_through_a_hub_pause(tmp_path, monkeypatch):
+    """Tier 1 is UNCHANGED in this mode: a hub `key_not_active` falls through
+    to `shared/<key>` exactly as it does in the full chain — the mode reduces
+    tier 2 to that one leg, it does not gate it off.
+
+    Pinned behaviourally because a v0.2.98 review lane read this control flow
+    as the opposite (Python refusing where the shell served). The shell's
+    parity case is `test_shared_only_key_not_active_falls_to_shared_store` in
+    tests/test_vct_secrets_resolve.sh; together they settle the claim.
+    """
+    root = tmp_path / "store"
+    (root / "shared").mkdir(parents=True)
+    (root / "shared" / "paused_key").write_text("shared-file-copy")
+    # A per-project copy exists too, so the assertion below proves the mode's
+    # SCOPE as well: the shared leg answers, the project leg must not.
+    (root / "projects" / "demo").mkdir(parents=True)
+    (root / "projects" / "demo" / "paused_key").write_text("project-file-copy")
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(root))
+
+    def fake_hub_get(key, project):
+        raise AccessDenied(f"key {key!r} not active for project x")
+
+    monkeypatch.setattr(agent_secrets, "_hub_get", fake_hub_get)
+    assert get("paused_key", project="demo", shared_only=True) == "shared-file-copy"
+
+
 # ─── Tier 2: the `.no-shared-fallback` per-project opt-out ──────────────
 #
 # `docs/VCT_SECRETS_PRIMITIVE.md` §"Design choices" promises a project can

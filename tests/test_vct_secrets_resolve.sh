@@ -826,6 +826,29 @@ set -e
 assert_eq "$rc" "0" "test_shared_only_tier1_hub_unchanged/exit_code"
 assert_eq "$out" "hub-tier1-value" "test_shared_only_tier1_hub_unchanged/value"
 
+# (d2) "Tier 1 UNCHANGED" also means a hub PAUSE falls through: the fake hub
+# answers 404 key_not_active for this key, and --shared-only must then read
+# shared/<key> — the same fall-through the full chain performs (Test 12).
+# projects/<NAME>/<key> is populated too, so the value returned also proves
+# the mode's scope. Python parity case:
+# test_shared_only_still_falls_through_a_hub_pause in tests/test_agent_secrets.py.
+cat >"$scratch/responses/GET_projects_p1_env_key=PAUSED_SHARED_ONLY.json.status" <<'STATUS'
+404
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=PAUSED_SHARED_ONLY.json" <<'JSON'
+{"error": {"code": "key_not_active", "message": "key PAUSED_SHARED_ONLY paused"}}
+JSON
+printf 'shared-after-pause' >"$sharedonly_store/shared/PAUSED_SHARED_ONLY"
+printf 'project-after-pause' >"$sharedonly_store/projects/sodemo/PAUSED_SHARED_ONLY"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" VCT_HUB_TOKEN="$HUB_TOKEN_CANARY" \
+      VCT_SECRETS_DIR="$sharedonly_store" \
+      "$RESOLVER" --shared-only p1 PAUSED_SHARED_ONLY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_shared_only_key_not_active_falls_to_shared_store/exit_code"
+assert_eq "$out" "shared-after-pause" "test_shared_only_key_not_active_falls_to_shared_store/value"
+
 # (e) REGRESSION PIN: the legacy positional form still resolves through
 # all three tiers — the very values (b)/(c) refused must still serve there.
 set +e

@@ -201,9 +201,19 @@ def _fake_hub(status: int, body: str):
 
 
 def _run_resolver_live(
-    tmp_path: Path, arg1: str, key: str, secrets_dir: Path, port: int
+    tmp_path: Path,
+    arg1: str,
+    key: str,
+    secrets_dir: Path,
+    port: int,
+    *,
+    shared_only: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env)."""
+    """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env).
+
+    ``shared_only`` prepends the ``-SharedOnly`` switch, so that mode's tier-1
+    behaviour is testable against a hub that answers — the offline
+    ``_run_resolver_argv`` helper cannot exercise it."""
     import os
 
     env = {
@@ -215,8 +225,9 @@ def _run_resolver_live(
         "VCT_SECRETS_DIR": str(secrets_dir),
     }
     (tmp_path / "home").mkdir(exist_ok=True)
+    argv = ["-SharedOnly", arg1, key] if shared_only else [arg1, key]
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), arg1, key],
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), *argv],
         capture_output=True,
         text=True,
         env=env,
@@ -620,6 +631,39 @@ def test_ps1_shared_only_dash_dash_spelling_accepted(tmp_path, sharedonly_store)
     )
     assert cp.returncode == 0, cp.stderr
     assert cp.stdout == "shared-slot-value"
+
+
+def test_ps1_shared_only_key_not_active_falls_to_shared_store(
+    tmp_path, sharedonly_store
+):
+    """Tier 1 is UNCHANGED in this mode: a hub ``key_not_active`` (404) falls
+    through to ``shared/<key>`` exactly as it does in the full chain — the mode
+    reduces tier 2 to that one leg, it does not gate it off.
+
+    Pinned behaviourally because a v0.2.98 review lane read the Python control
+    flow as refusing here where the shell served; all three siblings fall
+    through by construction. Parity cases:
+    ``test_shared_only_still_falls_through_a_hub_pause`` in
+    tests/test_agent_secrets.py and
+    ``test_shared_only_key_not_active_falls_to_shared_store`` in
+    tests/test_vct_secrets_resolve.sh.
+    """
+    (sharedonly_store / "shared" / "PAUSED_KEY").write_text(
+        "shared-after-pause", encoding="utf-8"
+    )
+    # A per-project copy exists too, so the assertion below proves the mode's
+    # SCOPE as well: the shared leg answers, the project leg must not.
+    (sharedonly_store / "projects" / "sodemo" / "PAUSED_KEY").write_text(
+        "project-after-pause", encoding="utf-8"
+    )
+    body = '{"error": {"code": "key_not_active", "message": "key PAUSED_KEY paused"}}'
+    with _fake_hub(404, body) as port:
+        cp = _run_resolver_live(
+            tmp_path, "sodemo", "PAUSED_KEY", sharedonly_store, port, shared_only=True
+        )
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-after-pause"
+    assert "project-after-pause" not in (cp.stdout + cp.stderr)
 
 
 def test_ps1_legacy_positional_still_reads_project_slot(tmp_path, sharedonly_store):
