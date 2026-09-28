@@ -804,15 +804,6 @@ def _window_dict(window: Window, now: float) -> dict:
 
 
 # ── the one-line rendering (the status-line scripts print this verbatim) ─
-def format_tokens(count: int) -> str:
-    """``1234567`` -> ``1.2M``; ``950000`` -> ``950K``; ``830`` -> ``830``."""
-    if count >= 1_000_000:
-        return f"{count / 1_000_000:.1f}M".replace(".0M", "M")
-    if count >= 1_000:
-        return f"{count / 1_000:.0f}K"
-    return str(count)
-
-
 def _known(window: Mapping[str, Any]) -> bool:
     percent = window.get("percent")
     return isinstance(percent, (int, float)) and not isinstance(percent, bool)
@@ -831,13 +822,17 @@ def render_line(snapshot: Mapping[str, Any]) -> str:
     known is left out entirely — the line never says "error" and never shows
     a guess. The ONE renderer, so the bash and PowerShell status-line scripts
     cannot drift from each other: both print what this returns.
+
+    WINDOWS only. A vendor's ledger total is collected and still rides the
+    snapshot (``?format=json`` carries it) but is not rendered anywhere — it
+    measures what this one gateway relayed, not the account's plan usage. The
+    picker label and the launcher card had already dropped it; this renderer
+    was the last surface still printing it, and the same fact shown in one
+    place and not the others is worse than either choice made everywhere.
     """
     segments: list[str] = []
     for vendor in snapshot.get("vendors") or ():
         parts = [_window_text(w) for w in vendor.get("windows") or () if _known(w)]
-        tokens = vendor.get("tokens")
-        if isinstance(tokens, Mapping) and isinstance(tokens.get("tokens"), int) and tokens["tokens"] > 0:
-            parts.append(f"{format_tokens(tokens['tokens'])} tok/mo")
         if parts:
             segments.append(f"{vendor.get('label', vendor.get('id', '?'))} " + " · ".join(parts))
     return " │ ".join(segments)
@@ -859,12 +854,6 @@ def _local_clock(epoch_s: float) -> str:
     return time.strftime("%H:%M", time.localtime(epoch_s))
 
 
-def _local_day(epoch_s: float) -> str:
-    """``Sep 2`` — built by hand because ``%-d`` does not exist on Windows."""
-    moment = time.localtime(epoch_s)
-    return f"{time.strftime('%b', moment)} {moment.tm_mday}"
-
-
 def label_suffix(vendor: Mapping[str, Any], *, now: float, fresh_for_s: float) -> str:
     """``" · 5h 10% · wk 72% used"`` for one snapshot vendor, or ``""``.
 
@@ -880,13 +869,10 @@ def label_suffix(vendor: Mapping[str, Any], *, now: float, fresh_for_s: float) -
       clock time stays true for as long as the label is on screen;
     * **unknown is absence**: an unknown or stale window is left out (the
       snapshot has already aged it to ``null``) and a vendor with nothing
-      known gets no suffix at all — never ``0%``.
-
-    A vendor with no quota source (QwenCloud) shows the ledger's token total
-    instead — ``1.2M tokens used this month`` — when it is positive and
-    fresh. When the ledger can only vouch for part of the month (it began
-    mid-month, or rotated), the span it covers is named rather than passed
-    off as the month's: ``1.2M tokens used since Sep 2``.
+      known gets no suffix at all — never ``0%``. A vendor with no quota
+    source has nothing to show: the gateway's own token ledger is COLLECTED
+    (it stays in the snapshot) but never rendered — it measures what this
+    one gateway routed, not the account's plan usage.
     """
     windows = sorted(
         (w for w in vendor.get("windows") or () if _known(w)),
@@ -897,18 +883,6 @@ def label_suffix(vendor: Mapping[str, Any], *, now: float, fresh_for_s: float) -
         if seen is not None
     ]
     text = " · ".join(_window_text(w) for w in windows) + " used" if windows else ""
-    tokens = vendor.get("tokens")
-    if not text and isinstance(tokens, Mapping):
-        count = tokens.get("tokens")
-        seen = _reset_epoch(tokens.get("fetched_at"))
-        if (
-            isinstance(count, int) and not isinstance(count, bool) and count > 0
-            and seen is not None and now - seen <= STALE_AFTER_S
-        ):
-            since = _reset_epoch(tokens.get("counted_since"))
-            span = "this month" if since is None else f"since {_local_day(since)}"
-            text = f"{format_tokens(count)} tokens used {span}"
-            observed.append(seen)
     if not text:
         return ""
     if observed and now - min(observed) > fresh_for_s:
@@ -942,7 +916,6 @@ __all__ = [
     "LedgerMonthCounter",
     "STALE_AFTER_S",
     "UsageWindows",
-    "format_tokens",
     "label_suffix",
     "label_suffixes",
     "month_start",

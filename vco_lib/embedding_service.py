@@ -533,7 +533,9 @@ def _redacted_env_snapshot() -> dict[str, str]:
             out[key] = val
     # Redact: presence + length only — no character of the key reaches the
     # failure log (v0.2.97; it used to carry a 4-char prefix). Resolved the
-    # way the service resolves it (env, else the `openai_api_key` secret).
+    # way the service resolves it — VCO's OWN slot and nothing else (v0.2.98;
+    # the environment is no longer a source), so this entry reports the key
+    # VCO would actually use.
     from vco_lib.openai_key import resolve_openai_api_key
 
     api_key = resolve_openai_api_key()
@@ -725,13 +727,16 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
         )
         why_deferred = (
             "Cannot auto-fix: the user must bring up a local backend "
-            "(Ollama / CodeEmbed) or configure OPENAI_API_KEY. KG syncs "
-            "and code-graph indexing that require fresh vectors are "
-            "blocked until at least one backend comes back online."
+            "(Ollama / CodeEmbed) or store an OpenAI key in VCO's own slot. "
+            "KG syncs and code-graph indexing that require fresh vectors "
+            "are blocked until at least one backend comes back online."
         )
         command_to_apply = (
             "bash claude_mcp_servers/start-all.sh   "
-            "# OR: launch Ollama via podman/docker, OR: set OPENAI_API_KEY"
+            "# OR: launch Ollama via podman/docker, OR: store a key in VCO's "
+            "OpenAI slot (`vct set --shared --key openai_api_key`, value on "
+            "stdin — never in argv or shell history — or the launcher's "
+            "Preferences → Secrets → Shared (this user))"
         )
         hint_md = _failure_markdown_path(exc.install_root)
         kg_refs: list[str] = []
@@ -1651,8 +1656,9 @@ def configured_text_models() -> "list[str]":
         slot is embedded from a bounded, tagged sub-window when a chunk exceeds
         4 096 (``embed_text_all_configured``), so the active slot keeps full
         fidelity;
-      * the OpenAI text model IFF an OpenAI key is configured AND the active slot
-        isn't already OpenAI AND write-all-slots is on.
+      * the OpenAI text model IFF VCO's own OpenAI slot resolves a key
+        (``resolve_openai_api_key`` — not the environment, v0.2.98) AND the
+        active slot isn't already OpenAI AND write-all-slots is on.
 
     When write-all-slots is OFF this returns a single-element list (the active
     model) — so any min-across-slots collapse a caller runs is a no-op and the
@@ -1686,14 +1692,16 @@ def configured_text_models() -> "list[str]":
 
     # Secondary OpenAI slot (unless active is already OpenAI) when a key exists.
     # Presence of the key is the config signal; validity is a runtime concern.
+    # v0.2.98: the key is VCO's OWN slot and nothing else — the environment is
+    # not a source here either, so this admission test agrees with the key the
+    # write path will actually embed with (``self.openai_api_key``, resolved the
+    # same way). It used to OR in ``$OPENAI_EMBEDDING_API_KEY``, which admitted
+    # a slot into the write-set that the write path then skipped for want of a
+    # key — a fan-out entry with no write behind it.
     if "openai" not in active_model.lower():
         from vco_lib.openai_key import resolve_openai_api_key
 
-        openai_key = (
-            resolve_openai_api_key()
-            or os.environ.get("OPENAI_EMBEDDING_API_KEY", "").strip()
-        )
-        if openai_key:
+        if resolve_openai_api_key():
             openai_model = _to_openai_api_model(
                 os.environ.get("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
             )
@@ -1979,7 +1987,10 @@ class EmbeddingService:
             (v0.2.52 V52-AJ). Drives slot selection when value indicates
             a non-default provider (``"openai"`` selects the OpenAI
             text model, ``"arctic"`` selects snowflake-arctic-embed2).
-          * ``OPENAI_API_KEY`` → empty string is "no key configured".
+          * the OpenAI key is NOT read from the environment: it resolves
+            from VCO's own shared slot (``openai_api_key``) through
+            :func:`vco_lib.openai_key.resolve_openai_api_key`; an empty
+            string is "no key configured".
           * ``CODE_EMBED_BACKEND`` → ``"service"`` (default) /
             ``"ollama"``. Affects code-model defaults.
 
@@ -2036,8 +2047,11 @@ class EmbeddingService:
         else:
             code_model_id = DEFAULT_CODE_MODEL
 
-        # v0.2.97: env first, else the `openai_api_key` secret (launcher
-        # keychain → file store → the project's .env) — vco_lib.openai_key.
+        # v0.2.98: VCO's OWN slot only — the shared `openai_api_key`
+        # (launcher keychain → shared file store); the env var and any
+        # per-project binding are NOT sources. The resolved root rides along
+        # as the REQUESTER identity for the hub's pause matrix (and for the
+        # requester's `.no-shared-fallback` opt-out), never as a lookup scope.
         from vco_lib.openai_key import resolve_openai_api_key
 
         openai_api_key = resolve_openai_api_key(str(resolved_root))
@@ -3154,7 +3168,7 @@ class EmbeddingService:
         Probes Ollama via ``/api/tags`` (filtered to embedding-capable
         models), CodeEmbed is skipped here (it's a code-only backend),
         OpenAI is probed via the free ``/v1/models/<model>`` endpoint
-        if ``OPENAI_API_KEY`` is present.
+        if VCO's OpenAI slot resolves a key (or one is passed in).
 
         Each returned :class:`ModelChoice` carries ``available_now``
         based on whether the backend responded AND (for OpenAI) the
@@ -3169,11 +3183,14 @@ class EmbeddingService:
             or os.environ.get("OLLAMA_URL", DEFAULT_OLLAMA_URL).strip()
             or DEFAULT_OLLAMA_URL
         )
-        openai_api_key = (
-            openai_api_key
-            if openai_api_key is not None
-            else os.environ.get("OPENAI_API_KEY", "")
-        )
+        if openai_api_key is None:
+            # VCO's own slot only (v0.2.98) — NOT the env var: a project's
+            # key exported in that project's shell must not pay for VCO's
+            # embeddings. This used to read ``$OPENAI_API_KEY`` directly, a
+            # second resolution path beside ``resolve_openai_api_key``.
+            from vco_lib.openai_key import resolve_openai_api_key
+
+            openai_api_key = resolve_openai_api_key()
 
         owns_session = session is None
         sess = session or requests.Session()
@@ -3206,11 +3223,11 @@ class EmbeddingService:
         )
         # Same ONE home as ``for_project`` above (v0.2.92 R2).
         code_embed_url = _shared_service_base_url(code_embed_url)
-        openai_api_key = (
-            openai_api_key
-            if openai_api_key is not None
-            else os.environ.get("OPENAI_API_KEY", "")
-        )
+        if openai_api_key is None:
+            # Same ONE home as ``discover_text_models`` above (v0.2.98).
+            from vco_lib.openai_key import resolve_openai_api_key
+
+            openai_api_key = resolve_openai_api_key()
 
         owns_session = session is None
         sess = session or requests.Session()
@@ -3316,7 +3333,9 @@ class EmbeddingService:
                         slot=slot,
                         backend="openai",
                         available_now=False,
-                        reason_unavailable="OPENAI_API_KEY not configured",
+                        # Names the remedy the user can act on: the key
+                        # lives in VCO's slot, not in an env var (v0.2.98).
+                        reason_unavailable="no OpenAI key in VCO's slot",
                     )
                 )
 
@@ -3423,7 +3442,9 @@ class EmbeddingService:
                         slot=slot,
                         backend="openai",
                         available_now=False,
-                        reason_unavailable="OPENAI_API_KEY not configured",
+                        # Names the remedy the user can act on: the key
+                        # lives in VCO's slot, not in an env var (v0.2.98).
+                        reason_unavailable="no OpenAI key in VCO's slot",
                     )
                 )
 

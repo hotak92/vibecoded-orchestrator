@@ -166,6 +166,7 @@ from vco_lib import containers as _containers  # noqa: E402
 from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
+from vco_lib import openai_key as _openai_key  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -5400,7 +5401,7 @@ _OPENAI_KEY_HELP = (
     "nothing, e.g. --uninstall, refuse the flag). A value on the command line "
     "is visible to other local "
     "users and kept in shell history; setting it in the launcher "
-    "(Preferences → Special Secrets) avoids that."
+    "(Preferences → Secrets) avoids that."
 )
 
 
@@ -6563,6 +6564,8 @@ def main() -> int:
         _write_env_config(embed_config, args)
     else:
         _update_env_config(args)
+
+    _openai_key.emit_env_var_deferral(_deferral_report, embed_config.get("active_embedding"), log_event=_log_install_event)
 
     # Step 9: Configure Claude Code settings (skip on update)
     if mode == "install":
@@ -21631,7 +21634,7 @@ def _normalise_parsed_args(args: argparse.Namespace, parser: argparse.ArgumentPa
             parser.error(
                 f"--openai-key cannot be used with {flag}: that run stores nothing, so "
                 "the key would be dropped. Store it with a normal install / --update, "
-                "in the launcher (Preferences → Special Secrets), or with "
+                "in the launcher (Preferences → Secrets), or with "
                 "`vct set --shared --key openai_api_key` (value on stdin)."
             )
 
@@ -21678,7 +21681,7 @@ def _store_install_openai_key(value: str) -> None:
         where = store_openai_api_key(value)
     except StoreFailed as exc:
         print(f"\n  WARNING: the OpenAI key was NOT stored ({exc}). Set it in the "
-              "launcher (Preferences → Special Secrets) or with "
+              "launcher (Preferences → Secrets) or with "
               "`vct set --shared --key openai_api_key` (value on stdin).")
         _log_install_event("9/10", "warn", f"openai key not stored: {exc}")
         return

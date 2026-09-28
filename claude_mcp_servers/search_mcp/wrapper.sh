@@ -180,7 +180,7 @@ if [[ -z "${GITHUB_TOKEN:-}" ]]; then
     unset GITHUB_TOKEN
     echo "[search-mcp-wrapper] NOTE: starting WITHOUT GITHUB_TOKEN — the search server does not need it." >&2
     echo "  To make one available: register the PAT in the launcher (OnboardingWizard, or" >&2
-    echo "  Preferences -> Special Secrets). It lives in the OS keychain and is resolved at" >&2
+    echo "  Preferences -> Secrets). It lives in the OS keychain and is resolved at" >&2
     echo "  need through vct-hub — VCO writes no secret value into project files (v0.2.73)." >&2
     echo "  Check that it resolves (the exit code names the reason):" >&2
     echo "    ${RESOLVER:-$REPO_ROOT/.claude/scripts/vct_secrets_resolve.sh} \"$project_path\" github_pat" >&2

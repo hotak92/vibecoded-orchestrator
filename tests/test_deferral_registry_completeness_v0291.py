@@ -278,6 +278,17 @@ _V0297_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.98: `openai_key_env_var_no_longer_read`. Emitted by install.py's own
+# step 8 (AFTER the .env writers, so a --openai-key from the same run is
+# already in the slot) and added to THAT run's report — family A proper,
+# re-detected on every run and dropped by the same run that finds the slot
+# populated or the variable unset. It is an action_required entry, not a
+# record: the pre-v0.2.98 cohort owes the user a visible remedy.
+_V0298_OWNED_ADDITIONS = frozenset({
+    "openai_key_env_var_no_longer_read",
+})
+
+
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
         if not path.is_file() or path.suffix not in suffixes:
@@ -679,7 +690,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0292_OWNED_ADDITIONS
             | _V0293_OWNED_ADDITIONS
             | _V0295_OWNED_ADDITIONS
-            | _V0297_OWNED_ADDITIONS,
+            | _V0297_OWNED_ADDITIONS
+            | _V0298_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

@@ -61,8 +61,9 @@ import aiohttp
 LEGACY_TEXT_EMBEDDING_MODEL = os.getenv("LEGACY_TEXT_EMBEDDING_MODEL", "snowflake-arctic-embed2:latest")
 # OpenAI embedding config (only used when ACTIVE_EMBEDDING=openai or DUAL_EMBEDDING_ENABLED=true)
 OPENAI_EMBEDDING_MODEL = os.getenv("OPENAI_EMBEDDING_MODEL", "text-embedding-3-small")
-# v0.2.97: env first, else the `openai_api_key` secret through the canonical
-# chain (launcher keychain → file store → the project's .env).
+# v0.2.98: VCO's OWN slot only — the shared `openai_api_key` through the
+# canonical chain (launcher keychain → shared file store). The env var and any
+# per-project binding are NOT sources: a project's key is the project's.
 from vco_lib.openai_key import resolve_openai_api_key  # noqa: E402
 
 OPENAI_API_KEY = resolve_openai_api_key()

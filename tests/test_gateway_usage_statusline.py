@@ -46,7 +46,7 @@ _BASH = shutil.which("bash")
 _PWSH = shutil.which("pwsh") or shutil.which("powershell")
 
 TOKEN = "statusline-host-token-SYNTHETIC-0123456789abcdef"
-LINE = "Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72% │ Qwen 1.2M tok/mo"
+LINE = "Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72%"
 
 
 class _FakeGateway:

@@ -361,7 +361,22 @@ _MAIN_SPAN_MAX = 1645
 # from `_detect_system`), the prompt's "installed but not responding" text
 # moved there too, and `_persist_runtime_txt` became a call to the one writer
 # `vco_lib.containers.write_runtime_txt`. Measured with `wc -l`.
-_TOTAL_LINES_MAX = 23142
+#
+# v0.2.98 item 1 — re-pinned UP 23142 -> 23145 (+3), all of it
+# irreducible glue. The pre-v0.2.98 env-var cohort's ledger entry
+# (`openai_key_env_var_no_longer_read`) was first written INLINE here
+# (66 lines + a 6-line main() block); the ratchet caught it and the
+# whole thing moved to `vco_lib.openai_key.emit_env_var_deferral`,
+# which is also its right home — the probe
+# (`vco_lib.openai_key.env_var_no_longer_read`), the backend gate and
+# the emitter now sit together. What remains in install.py is the
+# module import, the single call line, and the blank separator that
+# keeps that call from reading as part of Step 9's block. main()
+# itself did NOT grow: it SHRANK by 5 (its own 6-line block collapsed
+# to the call). Same "inseparable thin-shim" precedent as the v0.2.81
+# Step-4c and v0.2.77 Part-5 lines above — measured with `wc -l`, not
+# predicted.
+_TOTAL_LINES_MAX = 23145
 
 
 def _measure() -> tuple:

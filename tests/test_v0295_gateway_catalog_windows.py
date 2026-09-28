@@ -789,7 +789,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
 
         The Token-Plan rows come from the declared fallback in this fixture
         (the injected fetch answers nothing, so the row's nine declared
-        ids serve). Three of the nine hide as older same-family siblings
+        ids serve). Since v0.2.98 the seed cites each of their OWN windows
+        (1M, from the vendor's per-model table), so the winners publish their
+        ``[1m]`` spelling and each withheld sibling is reported under the id
+        the user would have SEEN — the suffix, not the bare vendor id.
+        Three of the nine hide as older same-family siblings
         and two more as curated-hidden (qwen3.7-plus, deepseek-v4-pro).
         The dated ``deepseek-v4-flash-0731`` snapshot is curated out of the
         row entirely (owner ruling 2026-09-22 — its four-digit tail parses
@@ -805,10 +809,10 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 f"claude-sonnet-5{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3{ONE_M_SUFFIX}",
                 f"claude-gw/glm-5.3-flash{ONE_M_SUFFIX}",
-                "claude-gw/qwen/qwen3.8-max",
-                "claude-gw/qwen/qwen3.8-flash",
+                f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}",
+                f"claude-gw/qwen/qwen3.8-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.3{ONE_M_SUFFIX}",
-                "claude-gw/qwen/deepseek-v4.1-flash",
+                f"claude-gw/qwen/deepseek-v4.1-flash{ONE_M_SUFFIX}",
             ],
         )
         self.assertEqual(
@@ -825,10 +829,11 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 "claude-gw/glm-4.6", "claude-gw/glm-4.7",
                 "claude-gw/glm-5", "claude-gw/glm-5-turbo",
                 "claude-gw/glm-5.1", "claude-gw/glm-5.2",
-                "claude-gw/qwen/deepseek-v4-pro",
+                f"claude-gw/qwen/deepseek-v4-pro{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/glm-5.2{ONE_M_SUFFIX}",
-                "claude-gw/qwen/qwen3.6-flash", "claude-gw/qwen/qwen3.7-max",
-                "claude-gw/qwen/qwen3.7-plus",
+                f"claude-gw/qwen/qwen3.6-flash{ONE_M_SUFFIX}",
+                f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}",
+                f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",
                 "claude-opus-4-8", "claude-opus-5",
                 "claude-sonnet-4-6", "claude-sonnet-5",
             ],

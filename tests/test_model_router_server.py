@@ -51,9 +51,25 @@ from model_router.catalog import (
     SOURCE_UNFETCHED,
 )
 from model_router.config import GatewayConfig
+from model_router.context_table import load_seed
+from model_router.routing import ONE_M_SUFFIX
 from model_router.secrets import VendorKeyResolver
 from model_router.server import APP_KEY, create_app
 from model_router.vendors import ANTHROPIC_FAMILY, VENDORS, AnthropicFamily, Vendor
+
+
+def qwen_catalog_id(model_id: str) -> str:
+    """``claude-gw/qwen/<id>``, with the ``[1m]`` suffix its seed row earns.
+
+    Derived, never hand-copied: the context table owns whether a declared id
+    is published with the suffix, and the assertions below spelled three qwen
+    ids bare — they passed only while every Token-Plan row claimed a 200K
+    window, which v0.2.98 corrected. ``test_model_router_catalog`` derives the
+    same spelling the same way for the same reason.
+    """
+    row = load_seed().lookup(model_id)
+    suffix = ONE_M_SUFFIX if row is not None and row.window_1m else ""
+    return f"claude-gw/qwen/{model_id}{suffix}"
 
 HOST_TOKEN = "wp9-host-token-not-a-real-secret"
 FAKE_VENDOR_KEY = "wp9-vendor-key-synthetic"
@@ -1386,18 +1402,18 @@ class QwenVendorTests(GatewayTestBase):
         # [1m] — the context table keys the bare id and that id's verified
         # window is 1M, whatever endpoint serves it.
         self.assertEqual(ids, {
-            "claude-gw/qwen/qwen3.8-max", "claude-gw/qwen/qwen3.8-flash",
-            "claude-gw/qwen/glm-5.3[1m]",
-            "claude-gw/qwen/deepseek-v4.1-flash",
+            qwen_catalog_id("qwen3.8-max"), qwen_catalog_id("qwen3.8-flash"),
+            qwen_catalog_id("glm-5.3"),
+            qwen_catalog_id("deepseek-v4.1-flash"),
         })
         hidden = body["_vct_catalog_hidden"]
         # The three older same-family siblings plus the two curated-hidden
         # ids are withheld, namespaced and REPORTED — the filter narrows the
         # picker, never the router.
         for withheld in (
-            "claude-gw/qwen/qwen3.7-max", "claude-gw/qwen/qwen3.6-flash",
-            "claude-gw/qwen/glm-5.2[1m]",
-            "claude-gw/qwen/qwen3.7-plus", "claude-gw/qwen/deepseek-v4-pro",
+            qwen_catalog_id("qwen3.7-max"), qwen_catalog_id("qwen3.6-flash"),
+            qwen_catalog_id("glm-5.2"),
+            qwen_catalog_id("qwen3.7-plus"), qwen_catalog_id("deepseek-v4-pro"),
         ):
             self.assertIn(withheld, hidden)
         # The six excluded ids (five non-chat modalities plus one dated snapshot) are in NEITHER list: exclusion is not
@@ -1427,7 +1443,7 @@ class QwenVendorTests(GatewayTestBase):
             if row["id"].startswith("claude-gw/qwen/")
         }
         self.assertEqual(len(ids), 4)
-        self.assertIn("claude-gw/qwen/qwen3.8-max", ids)
+        self.assertIn(qwen_catalog_id("qwen3.8-max"), ids)
         # No key, no fetch — the picker must not require the key to exist.
         self.assertEqual(self.qwen_up.requests, [])
 
@@ -1439,14 +1455,14 @@ class QwenVendorTests(GatewayTestBase):
         body = await (await self.both.get("/v1/models", headers=self.auth())).json()
         self.assertEqual(body["_vct_catalog_source"]["qwen"], SOURCE_DECLARED)
         ids = {row["id"] for row in body["data"]}
-        self.assertIn("claude-gw/qwen/qwen3.8-max", ids)
+        self.assertIn(qwen_catalog_id("qwen3.8-max"), ids)
         # The curated-hidden ids stay out of the picker under both filters
         # but remain reported and routable by name.
-        self.assertIn("claude-gw/qwen/qwen3.7-plus", body["_vct_catalog_hidden"])
+        self.assertIn(qwen_catalog_id("qwen3.7-plus"), body["_vct_catalog_hidden"])
         # The default latest-only filter hides the older same-family
         # siblings — declared ids get no exemption from the owner's rule.
-        self.assertNotIn("claude-gw/qwen/qwen3.6-flash", ids)
-        self.assertIn("claude-gw/qwen/qwen3.6-flash", body["_vct_catalog_hidden"])
+        self.assertNotIn(qwen_catalog_id("qwen3.6-flash"), ids)
+        self.assertIn(qwen_catalog_id("qwen3.6-flash"), body["_vct_catalog_hidden"])
         self.assertEqual(len(self.qwen_up.requests), 1)
 
     async def test_messages_forward_to_the_token_plan_upstream(self) -> None:

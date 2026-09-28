@@ -43,8 +43,10 @@ def stores(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Path]:
     monkeypatch.delenv("VCT_HUB_TOKEN", raising=False)
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     openai_key._resolved.clear()
+    openai_key._warned_env_var = False
     yield secrets
     openai_key._resolved.clear()
+    openai_key._warned_env_var = False
 
 
 def _stored(secrets: Path) -> Path:
@@ -86,12 +88,54 @@ def test_the_keychain_request_uses_the_declared_slot_name(stores: Path) -> None:
 # ─── resolve ────────────────────────────────────────────────────────────
 
 
-def test_readers_resolve_the_stored_key_and_env_still_wins(stores: Path, monkeypatch) -> None:
+def test_the_vco_slot_is_the_only_source_and_the_env_var_is_ignored(
+    stores: Path, monkeypatch,
+) -> None:
+    """v0.2.98 scope rule (owner 2026-09-26). The old rule — ``$OPENAI_API_KEY``
+    wins — is exactly the path a project's exported key came in through."""
     assert openai_key.resolve_openai_api_key() == ""
-    openai_key.store_openai_api_key(CANARY)
-    assert openai_key.resolve_openai_api_key() == CANARY
     monkeypatch.setenv("OPENAI_API_KEY", OTHER)
-    assert openai_key.resolve_openai_api_key() == OTHER
+    assert openai_key.resolve_openai_api_key() == "", "the env var is not a source"
+    openai_key.store_openai_api_key(CANARY)
+    assert openai_key.resolve_openai_api_key() == CANARY, "VCO's own slot is"
+
+
+def test_a_projects_key_never_answers_for_vco(stores: Path, tmp_path, monkeypatch) -> None:
+    """The plan's red-proof: a project holding an OpenAI key in EVERY
+    project-scoped store it has — its ``.env`` (both spellings), the
+    per-project file-store slot, and the session environment — resolves to
+    ``""`` for VCO, and VCO's own shared slot answers once it is set."""
+    project = tmp_path / "rental-app"
+    project.mkdir()
+    (project / ".vct-project").write_text("rental-app\n")
+    (project / ".env").write_text(
+        f'OPENAI_API_KEY="{OTHER}"\nopenai_api_key="{OTHER}"\n'
+    )
+    per_project = stores / "projects" / "rental-app" / openai_key.OPENAI_SECRET_NAME
+    per_project.parent.mkdir(parents=True)
+    per_project.write_text(OTHER)
+    monkeypatch.setenv("OPENAI_API_KEY", OTHER)
+
+    assert openai_key.resolve_openai_api_key(str(project)) == ""
+    openai_key.store_openai_api_key(CANARY)
+    assert openai_key.resolve_openai_api_key(str(project)) == CANARY
+
+
+def test_the_ignored_env_var_is_announced_once_and_never_prints_a_value(
+    stores: Path, monkeypatch, capsys,
+) -> None:
+    """Never a silent loss for a pre-v0.2.98 env-var user: one stderr line
+    names the variable and the remedy — and no line ever carries the value."""
+    monkeypatch.setenv("OPENAI_API_KEY", OTHER)
+    assert openai_key.resolve_openai_api_key() == ""
+    err = capsys.readouterr().err
+    assert "OPENAI_API_KEY is set" in err
+    assert f"vct set --shared --key {openai_key.OPENAI_SECRET_NAME}" in err
+    assert OTHER not in err, "a diagnostic never carries the value"
+
+    openai_key._resolved.clear()
+    assert openai_key.resolve_openai_api_key() == ""
+    assert capsys.readouterr().err == "", "once per process, not once per call"
 
 
 def test_the_embedding_service_reads_through_the_resolver(stores: Path) -> None:

@@ -9331,7 +9331,7 @@ async def migrate_embeddings(
 
     This recreates the collection with named vector configuration, re-inserts all
     objects with their existing vector mapped to the scheme's primary named vector,
-    and optionally generates 'openai_embed' if OPENAI_API_KEY is set.
+    and optionally generates 'openai_embed' if VCO's OpenAI slot has a key.
 
     WARNING: This deletes and recreates the collection. Back up first.
 
@@ -9473,7 +9473,14 @@ async def backfill_embeddings(
         return json.dumps({"error": f"Invalid provider: {provider}. Valid: {valid_providers}"})
 
     if provider == "openai" and not OPENAI_API_KEY:
-        return json.dumps({"error": "OPENAI_API_KEY not set, cannot generate OpenAI embeddings"})
+        return json.dumps({
+            "error": (
+                "no OpenAI key in VCO's own slot (openai_api_key), cannot "
+                "generate OpenAI embeddings — store one with "
+                "`vct set --shared --key openai_api_key` (value on stdin) or "
+                "the launcher's Preferences → Secrets → Shared (this user)"
+            )
+        })
 
     # Determine the correct target vector name and embedding function based on
     # the collection's scheme and requested provider

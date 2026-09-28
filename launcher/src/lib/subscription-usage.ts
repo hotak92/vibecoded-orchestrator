@@ -13,8 +13,9 @@
 // reach every branch without a DOM. The rules it keeps from the backend:
 //   * an unknown window stays unknown — `percent: null` renders as "unknown"
 //     with its reason, never as an empty (0 %) or full (100 %) bar;
-//   * a vendor with no programmatic quota shows TOKENS, labelled as tokens,
-//     never a bar.
+//   * a vendor with no programmatic quota has no row here: the gateway's own
+//     token ledger stays in the snapshot (still collected) but is never
+//     rendered — it measures what this gateway routed, not plan usage.
 
 import { invoke, tauriAvailable } from '$lib/tauri';
 
@@ -195,23 +196,11 @@ export function vendorStatus(vendor: UsageVendor): string | null {
   }
 }
 
-/** "1,234,567 tokens this month" (+ " since 10 Sep" when the ledger
- * does not reach back to the month start). */
-export function describeTokens(tokens: UsageTokens, locale?: string): string {
-  const count = tokens.tokens.toLocaleString(locale);
-  if (!tokens.counted_since) return `${count} tokens this month`;
-  const since = new Date(tokens.counted_since).toLocaleDateString(locale, {
-    day: 'numeric',
-    month: 'short',
-  });
-  return `${count} tokens since ${since}`;
-}
-
-/** Vendors worth a row: anything with a window, tokens, or a status to say. */
+/** Vendors worth a row: anything with a window or a status to say. A
+ * tokens-only vendor is not one — the ledger total is collected but never
+ * rendered (owner 2026-09-28). */
 export function visibleVendors(snapshot: UsageSnapshot): UsageVendor[] {
-  return snapshot.vendors.filter(
-    (v) => v.windows.length > 0 || v.tokens !== undefined || v.state !== 'ok',
-  );
+  return snapshot.vendors.filter((v) => v.windows.length > 0 || v.state !== 'ok');
 }
 
 /** When to poll next: soon while the gateway is still fetching. */

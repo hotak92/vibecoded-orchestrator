@@ -1227,8 +1227,8 @@ def call_api(prompt: str) -> str:
 # Backend: OpenAI API (v0.2.23 C10 — gated by `kg_summary_openai_consent`)
 # ──────────────────────────────────────────────────────────────────────
 def openai_available() -> bool:
-    """Return True if an OpenAI key is configured (`OPENAI_API_KEY`, else the
-    stored `openai_api_key` secret — :func:`_openai_api_key`).
+    """Return True if an OpenAI key is configured (the shared
+    `openai_api_key` secret — :func:`_openai_api_key`).
 
     The actual gating (consent + key) is composed by `select_backend`
     — this just answers "is a key present at all". The consent check
@@ -1239,12 +1239,17 @@ def openai_available() -> bool:
     return bool(_openai_api_key())
 
 
-# v0.2.97: resolved, not only read from the environment. The key's home is
-# the `openai_api_key` secret (launcher keychain → ~/.vct-secrets → the
-# project's own .env); `install.py --openai-key` stores it there and never
-# in `.env`. This script cannot import `vco_lib` (see `_save_breaker_file`),
-# so it asks the SHIPPED resolver next to it — `vct_secrets_resolve.sh`
-# (`.ps1` on Windows), the sibling of `vco_lib.openai_key` /
+# v0.2.98 (owner ruling 2026-09-26): resolved through the shipped resolver
+# in its SHARED-ONLY form, and `$OPENAI_API_KEY` is never read. VCO's own
+# consumer must resolve ONLY VCO's slot — the shared `openai_api_key`
+# secret (launcher keychain → ~/.vct-secrets/shared) — never a project
+# scope, never a project `.env`, never the generic env var; a project's
+# key is the project's. `install.py --openai-key` stores it there and
+# never in `.env`. This script cannot import `vco_lib` (see
+# `_save_breaker_file`), so it asks the SHIPPED resolver next to it —
+# `vct_secrets_resolve.sh --shared-only <project> <key>`
+# (`-SharedOnly <project> <key>` on Windows, where `pwsh -File` binds a
+# leading `-`-token as a parameter), the sibling of `vco_lib.openai_key` /
 # `vco_lib.agent_secrets.get` — once per process.
 _OPENAI_SECRET_NAME = "openai_api_key"  # must match vco_lib.openai_key.OPENAI_SECRET_NAME
 _openai_key_cache: list[str] = []
@@ -1252,17 +1257,25 @@ _openai_key_cache: list[str] = []
 
 def _resolve_secret_via_shipped_resolver(key: str) -> str:
     """The value the shipped resolver prints for ``key`` (stdout, exit 0), or
-    ``""``. The value stays in this process: never logged, never in argv."""
+    ``""`` — asked in the resolver's SHARED-ONLY form, so only VCO's shared
+    slot is consulted (never a project scope, never the project's `.env`).
+    The value stays in this process: never logged, never in argv."""
     here = Path(__file__).resolve().parent
     project = os.environ.get("KG_PROJECT_ROOT", "").strip() or os.getcwd()
     if os.name == "nt":
         shell = shutil.which("pwsh") or shutil.which("powershell")
         script = here / "vct_secrets_resolve.ps1"
-        argv = [shell, "-NoProfile", "-File", str(script), project, key] if shell else None
+        argv = (
+            [shell, "-NoProfile", "-File", str(script), "-SharedOnly", project, key]
+            if shell
+            else None
+        )
     else:
         shell = shutil.which("bash")
         script = here / "vct_secrets_resolve.sh"
-        argv = [shell, str(script), project, key] if shell else None
+        argv = (
+            [shell, str(script), "--shared-only", project, key] if shell else None
+        )
     if argv is None or not script.is_file():
         return ""
     import subprocess
@@ -1275,10 +1288,11 @@ def _resolve_secret_via_shipped_resolver(key: str) -> str:
 
 
 def _openai_api_key() -> str:
-    """``$OPENAI_API_KEY`` when set, else the resolved ``openai_api_key``."""
-    env = os.getenv("OPENAI_API_KEY", "").strip()
-    if env:
-        return env
+    """The resolved shared ``openai_api_key`` slot, or ``""``.
+
+    `$OPENAI_API_KEY` is deliberately NOT read (v0.2.98 owner ruling
+    2026-09-26): VCO's own consumer resolves only VCO's shared slot — a
+    project's key is the project's."""
     if not _openai_key_cache:
         _openai_key_cache.append(_resolve_secret_via_shipped_resolver(_OPENAI_SECRET_NAME))
     return _openai_key_cache[0]

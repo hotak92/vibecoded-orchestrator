@@ -429,33 +429,44 @@ impl Db {
             .map_err(|e| format!("collect list tombstones: {}", e))
     }
 
-    /// Boot seed: insert every shipped row whose `model_id` is ABSENT.
-    /// Returns the number inserted (0 when the table already has them all).
+    /// Boot converge: bring the table in step with the shipped seed, row by
+    /// row — NEVER over a user edit and NEVER undoing a delete.
     ///
-    /// Per-row absence, not emptiness. The emptiness gate this replaces
-    /// (`seed_chat_model_context_if_empty`, v0.2.92) meant an UPGRADED
-    /// install never saw a newly shipped model: 0.2.93 added four Claude 5
-    /// rows to the seed and every table that already held the ten GLM rows
-    /// stayed at ten, so the gateway kept advertising Claude ids with the
-    /// client's conservative default window. A first-boot-only seed is a
-    /// seed that only ever works on machines that did not need it.
+    /// Per row of the shipped seed (the same per-row rule
+    /// `reseed_chat_model_context` applies, minus the one thing only a
+    /// deliberate click may do):
     ///
-    /// Never an UPDATE, and that is the whole safety argument: an existing
-    /// row may be a user edit, and this path cannot tell (it does not look —
-    /// see `reseed_chat_model_context`, which does look and preserves them
-    /// explicitly). Absent rows only.
+    ///   * absent and not tombstoned → INSERT. Per-row absence, not
+    ///     emptiness: the emptiness gate this path replaced
+    ///     (`seed_chat_model_context_if_empty`, v0.2.92) meant an UPGRADED
+    ///     install never saw a newly shipped model — 0.2.93 added four Claude
+    ///     5 rows and every table that already held the ten GLM rows stayed
+    ///     at ten. A first-boot-only seed is a seed that only ever works on
+    ///     machines that did not need it.
+    ///   * present, `user_edited = 0`, values differ → UPDATE to the shipped
+    ///     values. The row itself carries the answer the old "this path
+    ///     cannot tell" argument said was missing: `user_edited` is 0
+    ///     exactly when no human hand has written the row since it was
+    ///     seeded, so refreshing it cannot clobber anyone's edit. This is
+    ///     the case an insert-if-absent-only seed could never reach — the
+    ///     v0.2.98 qwen correction (200K → the vendor's per-model 1M) landed
+    ///     in the seed and reached no existing table.
+    ///   * present, `user_edited = 0`, values identical → written NOT AT
+    ///     ALL, so `updated_at` keeps meaning "when this row last changed",
+    ///     not "when the launcher last booted".
+    ///   * present, `user_edited = 1` → LEFT ALONE ENTIRELY, every column
+    ///     byte-identical.
+    ///   * tombstoned id (migration 045) → SKIPPED, even when absent: an
+    ///     automatic path must never undo a human's delete. Only the
+    ///     explicit "Reseed from shipped defaults" clears tombstones, and a
+    ///     deliberate click may.
     ///
-    /// A row the user DELETED does NOT come back: `delete_chat_model_context`
-    /// leaves a tombstone (migration 045) and this path skips any id that has
-    /// one. That is the half the emptiness gate used to provide for free, and
-    /// losing it silently was the cost this seeder is not allowed to have.
-    /// Only the explicit "Reseed from shipped defaults" clears tombstones —
-    /// an automatic path must never undo a human's delete, and a deliberate
-    /// click may.
-    pub fn seed_chat_model_context_upsert_missing(
+    /// Rows in the table that the shipped seed does not mention are never
+    /// removed: converge adds and refreshes, it does not prune.
+    pub fn converge_chat_model_context_seed(
         &self,
         rows: &[ChatModelContextInput],
-    ) -> Result<usize, String> {
+    ) -> Result<ReseedOutcome, String> {
         // Validate the WHOLE batch before writing any of it: a shipped seed
         // with one bad row is a broken build, and a half-seeded table would
         // hide that behind a table that looks populated.
@@ -469,54 +480,22 @@ impl Db {
         let mut guard = self.lock();
         let tx = guard
             .transaction()
-            .map_err(|e| format!("seed_chat_model_context_upsert_missing begin: {}", e))?;
-        let mut inserted = 0usize;
-        for row in &validated {
-            // `DO NOTHING`, never `DO UPDATE`: the row that is already there
-            // may be the user's, and this path has no business deciding.
-            let affected = tx
-                .execute(
-                    "INSERT INTO chat_model_context
-                        (model_id, vendor, context_window, max_output, window_1m,
-                         source, source_note, user_edited, updated_at)
-                     SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8
-                     WHERE ?1 NOT IN (SELECT model_id FROM chat_model_context_tombstone)
-                     ON CONFLICT(model_id) DO NOTHING",
-                    params![
-                        row.model_id,
-                        row.vendor,
-                        row.context_window,
-                        row.max_output,
-                        i64::from(row.window_1m),
-                        row.source,
-                        row.source_note,
-                        now,
-                    ],
-                )
-                .map_err(|e| format!("seed row {}: {}", row.model_id, e))?;
-            inserted += affected;
-        }
+            .map_err(|e| format!("converge_chat_model_context_seed begin: {}", e))?;
+        let outcome = converge_rows(&tx, &validated, &now, false)?;
         tx.commit()
-            .map_err(|e| format!("seed_chat_model_context_upsert_missing commit: {}", e))?;
-        Ok(inserted)
+            .map_err(|e| format!("converge_chat_model_context_seed commit: {}", e))?;
+        Ok(outcome)
     }
 
     /// Re-apply the shipped rows, NEVER over a user edit.
     ///
-    /// Per row: absent → insert; present with `user_edited = 0` and different
-    /// values → update; present with `user_edited = 0` and identical values →
-    /// left untouched (so `updated_at` keeps meaning "when this row last
-    /// changed"); present with `user_edited = 1` → LEFT ALONE ENTIRELY.
-    ///
-    /// Rows in the table that the shipped seed does not mention are never
-    /// removed: reseed adds and refreshes, it does not prune. A user's own
-    /// Kimi/Qwen rows survive it.
-    ///
-    /// It also CLEARS the tombstone of every id it re-applies (migration
-    /// 045). This is the one path allowed to: "restore the shipped defaults"
-    /// is a deliberate click that means exactly that, and leaving a tombstone
-    /// behind would let the next boot's seed disagree with the row this click
-    /// just restored.
+    /// The per-row rule is [`converge_chat_model_context_seed`]'s — the two
+    /// share one implementation (`converge_rows`) — plus exactly one power
+    /// the automatic boot path must never have: it CLEARS the tombstone of
+    /// every id it re-applies (migration 045). "Restore the shipped
+    /// defaults" is a deliberate click that means exactly that, and leaving
+    /// a tombstone behind would let the next boot's converge disagree with
+    /// the row this click just restored.
     pub fn reseed_chat_model_context(
         &self,
         rows: &[ChatModelContextInput],
@@ -528,87 +507,128 @@ impl Db {
             .collect::<Result<_, _>>()?;
 
         let now = now_iso8601_utc();
-        let mut outcome = ReseedOutcome::default();
         let mut guard = self.lock();
         let tx = guard
             .transaction()
             .map_err(|e| format!("reseed_chat_model_context begin: {}", e))?;
-        for row in &validated {
-            let existing: Option<ChatModelContextRow> = tx
-                .query_row(
-                    &format!(
-                        "SELECT {SELECT_COLUMNS} FROM chat_model_context WHERE model_id = ?1"
-                    ),
-                    params![row.model_id],
-                    row_from_sql,
-                )
-                .optional()
-                .map_err(|e| format!("reseed lookup {}: {}", row.model_id, e))?;
-
-            match existing {
-                Some(current) if current.user_edited => {
-                    outcome.preserved_user_edits += 1;
-                }
-                Some(current) if row.matches(&current) => {
-                    outcome.unchanged += 1;
-                }
-                Some(_) => {
-                    tx.execute(
-                        "UPDATE chat_model_context SET
-                            vendor         = ?2,
-                            context_window = ?3,
-                            max_output     = ?4,
-                            window_1m      = ?5,
-                            source         = ?6,
-                            source_note    = ?7,
-                            user_edited    = 0,
-                            updated_at     = ?8
-                         WHERE model_id = ?1",
-                        params![
-                            row.model_id,
-                            row.vendor,
-                            row.context_window,
-                            row.max_output,
-                            i64::from(row.window_1m),
-                            row.source,
-                            row.source_note,
-                            now,
-                        ],
-                    )
-                    .map_err(|e| format!("reseed update {}: {}", row.model_id, e))?;
-                    outcome.updated += 1;
-                }
-                None => {
-                    tx.execute(
-                        "DELETE FROM chat_model_context_tombstone WHERE model_id = ?1",
-                        params![row.model_id],
-                    )
-                    .map_err(|e| format!("reseed clear tombstone {}: {}", row.model_id, e))?;
-                    tx.execute(
-                        "INSERT INTO chat_model_context
-                            (model_id, vendor, context_window, max_output, window_1m,
-                             source, source_note, user_edited, updated_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
-                        params![
-                            row.model_id,
-                            row.vendor,
-                            row.context_window,
-                            row.max_output,
-                            i64::from(row.window_1m),
-                            row.source,
-                            row.source_note,
-                            now,
-                        ],
-                    )
-                    .map_err(|e| format!("reseed insert {}: {}", row.model_id, e))?;
-                    outcome.inserted += 1;
-                }
-            }
-        }
+        let outcome = converge_rows(&tx, &validated, &now, true)?;
         tx.commit()
             .map_err(|e| format!("reseed_chat_model_context commit: {}", e))?;
         Ok(outcome)
     }
+}
+
+/// The ONE per-row rule both the boot converge and the explicit reseed apply
+/// (one concern, one home — the boot path was taught this rule in v0.2.98,
+/// and the rule lives here rather than twice).
+///
+/// Per row: absent → insert; present with `user_edited = 0` and different
+/// values → update; present with `user_edited = 0` and identical values →
+/// written not at all (so `updated_at` keeps meaning "when this row last
+/// changed"); present with `user_edited = 1` → LEFT ALONE ENTIRELY.
+///
+/// `restore_deleted` is the ONLY difference between the two callers: when it
+/// is `true` (the reseed button — a deliberate click) an absent row is
+/// inserted and its delete tombstone cleared; when it is `false` (the
+/// automatic boot path) a tombstoned id is SKIPPED entirely, even when
+/// absent — an automatic path must never undo a human's delete.
+fn converge_rows(
+    tx: &rusqlite::Transaction<'_>,
+    rows: &[ChatModelContextInput],
+    now: &str,
+    restore_deleted: bool,
+) -> Result<ReseedOutcome, String> {
+    let mut outcome = ReseedOutcome::default();
+    for row in rows {
+        if !restore_deleted {
+            let tombstoned = tx
+                .query_row(
+                    "SELECT 1 FROM chat_model_context_tombstone WHERE model_id = ?1",
+                    params![row.model_id],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(|e| format!("converge tombstone check {}: {}", row.model_id, e))?
+                .is_some();
+            if tombstoned {
+                // Counted nowhere on purpose: the outcome's four counters
+                // describe writes and preservations, and "the user deleted
+                // this id" is neither.
+                continue;
+            }
+        }
+        let existing: Option<ChatModelContextRow> = tx
+            .query_row(
+                &format!("SELECT {SELECT_COLUMNS} FROM chat_model_context WHERE model_id = ?1"),
+                params![row.model_id],
+                row_from_sql,
+            )
+            .optional()
+            .map_err(|e| format!("converge lookup {}: {}", row.model_id, e))?;
+
+        match existing {
+            Some(current) if current.user_edited => {
+                outcome.preserved_user_edits += 1;
+            }
+            Some(current) if row.matches(&current) => {
+                outcome.unchanged += 1;
+            }
+            Some(_) => {
+                tx.execute(
+                    "UPDATE chat_model_context SET
+                        vendor         = ?2,
+                        context_window = ?3,
+                        max_output     = ?4,
+                        window_1m      = ?5,
+                        source         = ?6,
+                        source_note    = ?7,
+                        user_edited    = 0,
+                        updated_at     = ?8
+                     WHERE model_id = ?1",
+                    params![
+                        row.model_id,
+                        row.vendor,
+                        row.context_window,
+                        row.max_output,
+                        i64::from(row.window_1m),
+                        row.source,
+                        row.source_note,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("converge update {}: {}", row.model_id, e))?;
+                outcome.updated += 1;
+            }
+            None => {
+                if restore_deleted {
+                    tx.execute(
+                        "DELETE FROM chat_model_context_tombstone WHERE model_id = ?1",
+                        params![row.model_id],
+                    )
+                    .map_err(|e| format!("converge clear tombstone {}: {}", row.model_id, e))?;
+                }
+                tx.execute(
+                    "INSERT INTO chat_model_context
+                        (model_id, vendor, context_window, max_output, window_1m,
+                         source, source_note, user_edited, updated_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+                    params![
+                        row.model_id,
+                        row.vendor,
+                        row.context_window,
+                        row.max_output,
+                        i64::from(row.window_1m),
+                        row.source,
+                        row.source_note,
+                        now,
+                    ],
+                )
+                .map_err(|e| format!("converge insert {}: {}", row.model_id, e))?;
+                outcome.inserted += 1;
+            }
+        }
+    }
+    Ok(outcome)
 }
 
 // ─── Export document ──────────────────────────────────────────────────────
@@ -940,11 +960,12 @@ mod tests {
         assert_eq!(created.max_output, 0);
 
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&[ChatModelContextInput {
+            db.converge_chat_model_context_seed(&[ChatModelContextInput {
                 max_output: 0,
                 ..input("deepseek-v4-pro")
             }])
-            .unwrap(),
+            .unwrap()
+            .inserted,
             1,
             "the boot seed writes unstated rows too"
         );
@@ -1040,9 +1061,15 @@ mod tests {
         let db = make_db();
         let seed = vec![input("glm-5.1"), one_m("glm-5.2")];
 
-        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 2);
-        // Second boot: every shipped row is present, so nothing is written.
-        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
+        assert_eq!(db.converge_chat_model_context_seed(&seed).unwrap().inserted, 2);
+        // Second boot: every shipped row is present and matches, so nothing
+        // is written — not even a same-value UPDATE.
+        let again = db.converge_chat_model_context_seed(&seed).unwrap();
+        assert_eq!(
+            (again.inserted, again.updated, again.unchanged),
+            (0, 0, 2),
+            "a converged table is a no-op on the next boot"
+        );
         assert_eq!(db.list_chat_model_context().unwrap().len(), 2);
         assert!(
             db.list_chat_model_context()
@@ -1064,7 +1091,7 @@ mod tests {
         let old_seed: Vec<ChatModelContextInput> =
             (0..10).map(|i| input(&format!("glm-{}", i))).collect();
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&old_seed).unwrap(),
+            db.converge_chat_model_context_seed(&old_seed).unwrap().inserted,
             10
         );
 
@@ -1072,21 +1099,23 @@ mod tests {
         for id in ["claude-opus-5", "claude-sonnet-5", "claude-fable-5", "claude-fable-5-1"] {
             new_seed.push(one_m(id));
         }
+        let outcome = db.converge_chat_model_context_seed(&new_seed).unwrap();
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&new_seed).unwrap(),
-            4,
-            "only the absent rows are inserted"
+            (outcome.inserted, outcome.updated, outcome.unchanged),
+            (4, 0, 10),
+            "only the absent rows are inserted; the present ones already match"
         );
         assert_eq!(db.list_chat_model_context().unwrap().len(), 14);
         assert!(db.get_chat_model_context("claude-opus-5").unwrap().unwrap().window_1m);
     }
 
     #[test]
-    fn seed_never_overwrites_a_row_that_is_already_there() {
-        // The other half: an existing row may be a user edit, and the boot
-        // seed does not look. It inserts what is absent and touches nothing
-        // else — `reseed_chat_model_context` is the path that refreshes,
-        // and it is the one that checks `user_edited`.
+    fn converge_never_overwrites_a_user_edited_row() {
+        // The guard, not the absence: since v0.2.98 the boot path refreshes
+        // untouched rows, and what makes that safe is `user_edited` — the
+        // row carries the answer the old "cannot tell" argument said was
+        // missing. A USER-EDITED row is left entirely alone; refreshing an
+        // untouched row is covered by its own test below.
         let db = make_db();
         let edited = db
             .upsert_chat_model_context(
@@ -1099,17 +1128,133 @@ mod tests {
             )
             .unwrap();
 
+        let outcome = db
+            .converge_chat_model_context_seed(&[one_m("glm-5.1"), input("glm-5.2")])
+            .unwrap();
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&[one_m("glm-5.1"), input("glm-5.2")])
-                .unwrap(),
-            1,
-            "the absent row only"
+            (outcome.inserted, outcome.preserved_user_edits),
+            (1, 1),
+            "the absent row arrives; the user-edited one is preserved"
         );
         assert_eq!(
             db.get_chat_model_context("glm-5.1").unwrap().unwrap(),
             edited,
             "every field of the existing row survives, updated_at included"
         );
+    }
+
+    #[test]
+    fn converge_refreshes_an_untouched_row_to_the_shipped_values() {
+        // The v0.2.98 delivery defect, in miniature: the table already holds
+        // the OLD figure an earlier boot seeded (200K), the shipped seed now
+        // carries the vendor's per-model correction (1M), and the row has
+        // never been user-edited. Insert-if-absent-only could never reach
+        // this row; converge must.
+        let db = make_db();
+        db.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+
+        let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
+        assert_eq!(
+            outcome,
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0 },
+            "an untouched row with stale values is REFRESHED, not skipped"
+        );
+        let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
+        assert_eq!(row.context_window, 1_000_000);
+        assert!(row.window_1m);
+        assert!(!row.user_edited, "a converged row is still not a user edit");
+    }
+
+    #[test]
+    fn converge_leaves_a_user_edited_row_byte_identical() {
+        // The leave-alone half of the same rule: `user_edited = 1` means a
+        // human hand wrote this row, and no automatic path may touch it.
+        let db = make_db();
+        let edited = db
+            .upsert_chat_model_context(
+                ChatModelContextInput {
+                    context_window: 111_111,
+                    max_output: 999,
+                    source: "my own measurement".into(),
+                    source_note: "measured locally".into(),
+                    ..input("glm-5.1")
+                },
+                true,
+            )
+            .unwrap();
+
+        let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
+        assert_eq!(
+            outcome,
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1 }
+        );
+
+        // BYTE-IDENTICAL: context_window, max_output, window_1m, source,
+        // source_note AND updated_at — struct equality covers every column.
+        let after = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
+        assert_eq!(
+            after, edited,
+            "every column of a user-edited row survives converge unchanged, \
+             updated_at included"
+        );
+        assert_eq!(after.context_window, 111_111);
+        assert_eq!(after.max_output, 999);
+        assert!(!after.window_1m);
+        assert_eq!(after.source, "my own measurement");
+        assert_eq!(after.source_note, "measured locally");
+    }
+
+    #[test]
+    fn converge_does_not_rewrite_a_row_that_already_matches() {
+        // `updated_at` must mean "when this row last changed", not "when the
+        // launcher last booted" — the same rule the reseed path documents.
+        let db = make_db();
+        db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
+        let first = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
+
+        // The timestamps are second-precision: cross a second boundary so a
+        // rewrite could not hide behind truncation.
+        std::thread::sleep(std::time::Duration::from_secs(1));
+
+        let outcome = db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
+        assert_eq!(
+            outcome,
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0 },
+            "an identical row is counted, not written"
+        );
+        assert_eq!(
+            db.get_chat_model_context("glm-5.1").unwrap().unwrap(),
+            first,
+            "updated_at is untouched — nothing was written for this row"
+        );
+    }
+
+    #[test]
+    fn converge_never_reinserts_a_tombstoned_id_even_when_absent() {
+        // A tombstone for an id that is not in the table either: the user
+        // deleted a model the shipped seed did not carry YET. When the seed
+        // gains it, the automatic path still may not add it back.
+        let db = make_db();
+        db.delete_chat_model_context("glm-5.9").unwrap();
+        assert_eq!(
+            db.list_chat_model_context_tombstones().unwrap(),
+            vec!["glm-5.9"]
+        );
+
+        let outcome = db
+            .converge_chat_model_context_seed(&[one_m("glm-5.9"), input("glm-5.2")])
+            .unwrap();
+        assert_eq!(
+            (outcome.inserted, outcome.updated, outcome.unchanged, outcome.preserved_user_edits),
+            (1, 0, 0, 0),
+            "only the non-tombstoned absent row is written; the tombstoned \
+             id lands in NO counter"
+        );
+        assert!(
+            db.get_chat_model_context("glm-5.9").unwrap().is_none(),
+            "deleted means deleted, even for a newly shipped id"
+        );
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_some());
     }
 
     #[test]
@@ -1120,12 +1265,12 @@ mod tests {
         // those apart.
         let db = make_db();
         let seed = vec![input("glm-5.1"), one_m("glm-5.2")];
-        db.seed_chat_model_context_upsert_missing(&seed).unwrap();
+        db.converge_chat_model_context_seed(&seed).unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
         assert_eq!(db.list_chat_model_context_tombstones().unwrap(), vec!["glm-5.1"]);
 
         for _boot in 0..3 {
-            assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
+            assert_eq!(db.converge_chat_model_context_seed(&seed).unwrap().inserted, 0);
         }
         let ids: Vec<String> = db
             .list_chat_model_context()
@@ -1143,12 +1288,12 @@ mod tests {
         // boot's seed would disagree with the row it just restored.
         let db = make_db();
         let seed = vec![input("glm-5.1")];
-        db.seed_chat_model_context_upsert_missing(&seed).unwrap();
+        db.converge_chat_model_context_seed(&seed).unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
 
         assert_eq!(db.reseed_chat_model_context(&seed).unwrap().inserted, 1);
         assert!(db.list_chat_model_context_tombstones().unwrap().is_empty());
-        assert_eq!(db.seed_chat_model_context_upsert_missing(&seed).unwrap(), 0);
+        assert_eq!(db.converge_chat_model_context_seed(&seed).unwrap().inserted, 0);
         assert!(db.get_chat_model_context("glm-5.1").unwrap().is_some());
     }
 
@@ -1159,7 +1304,7 @@ mod tests {
         // state the next boot's seed silently undoes, reported to the caller
         // as a failure.
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         // Make the tombstone INSERT fail: the CHECK refuses a blank id, and a
         // blank id is what an empty model_id delete would write.
         assert!(db.delete_chat_model_context("").is_err());
@@ -1188,7 +1333,7 @@ mod tests {
         // Review R2-9: otherwise the pane shows the row the user just typed
         // while the next boot's seed still reads "they do not want this id".
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
         assert_eq!(db.list_chat_model_context_tombstones().unwrap(), vec!["glm-5.1"]);
 
@@ -1197,10 +1342,12 @@ mod tests {
             db.list_chat_model_context_tombstones().unwrap().is_empty(),
             "the id is wanted again — the memory of the delete goes with it"
         );
-        // And the boot seed leaves the re-added row exactly as typed.
+        // And the boot converge leaves the re-added row exactly as typed.
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&[one_m("glm-5.1")]).unwrap(),
-            0
+            db.converge_chat_model_context_seed(&[one_m("glm-5.1")])
+                .unwrap()
+                .preserved_user_edits,
+            1
         );
         assert!(db.get_chat_model_context("glm-5.1").unwrap().unwrap().user_edited);
     }
@@ -1210,11 +1357,12 @@ mod tests {
         // LEAVE-ALONE half: deleting one row must not make the table
         // un-seedable for the rest.
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")]).unwrap();
+        db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&[input("glm-5.1"), one_m("claude-opus-5")])
-                .unwrap(),
+            db.converge_chat_model_context_seed(&[input("glm-5.1"), one_m("claude-opus-5")])
+                .unwrap()
+                .inserted,
             1,
             "the new model arrives; the deleted one does not come back"
         );
@@ -1229,7 +1377,7 @@ mod tests {
             input("glm-5.1"),
             ChatModelContextInput { source: "".into(), ..input("glm-5.2") },
         ];
-        assert!(db.seed_chat_model_context_upsert_missing(&seed).is_err());
+        assert!(db.converge_chat_model_context_seed(&seed).is_err());
         assert!(
             db.list_chat_model_context().unwrap().is_empty(),
             "a half-seeded table would hide a broken build behind a populated look"
@@ -1241,7 +1389,7 @@ mod tests {
     #[test]
     fn reseed_refreshes_an_untouched_row() {
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
             .unwrap();
 
         // The vendor published a correction; the shipped seed now says 1M.
@@ -1259,7 +1407,7 @@ mod tests {
     #[test]
     fn reseed_leaves_a_user_edited_row_byte_identical() {
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
             .unwrap();
         let edited = db
             .upsert_chat_model_context(
@@ -1289,7 +1437,7 @@ mod tests {
     #[test]
     fn reseed_inserts_a_newly_shipped_model_and_skips_an_identical_row() {
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
             .unwrap();
 
         let outcome = db
@@ -1326,7 +1474,7 @@ mod tests {
     #[test]
     fn reseed_restores_a_deleted_shipped_row() {
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1")])
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
             .unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
 
@@ -1415,7 +1563,7 @@ mod tests {
         // Belt and braces on the contract's meaning: the two lists cannot
         // disagree, because a deleted row is gone from the table.
         let db = make_db();
-        db.seed_chat_model_context_upsert_missing(&[input("glm-5.1"), one_m("glm-5.2")])
+        db.converge_chat_model_context_seed(&[input("glm-5.1"), one_m("glm-5.2")])
             .unwrap();
         db.delete_chat_model_context("glm-5.1").unwrap();
         let doc = export_document(

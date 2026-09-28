@@ -376,6 +376,8 @@ Counts running `lean-ctx` processes and warns if the threshold is exceeded. Back
 ### `lean-ctx-rewrite.sh` — PreToolUse Bash
 Per-project lean-ctx PreToolUse hook for Bash tool calls. Wraps the user-issued command in `lean-ctx -c '...'` so output is compressed before it returns to Claude. Auto-detects `lean-ctx` commands and steps aside to prevent recursion.
 
+It also steps aside for commands whose output is *evidence* rather than noise, keyed on the FINAL `&&`-segment so `git log && git commit` still runs its commit raw: `git commit` / `git push` (a hook-failed commit must not lose its stderr), the seven read-only inspection verbs `git show` / `diff` / `grep` / `log` / `blame` / `cat-file` / `ls-tree` (a reviewer reading a branch it has not checked out gets lossy output otherwise — `git ls-tree -r` measured -94%), and every credential-bearing command (SEC-RAW). Both siblings, `lean-ctx-rewrite.sh` and `.ps1`, share one verb list, parity-pinned by `tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py`.
+
 ### `embedding-failures-surface.sh` — context injection
 Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.py` to Claude. When no embedding backend is reachable, the service drops a hint file; this hook injects its contents so Claude can diagnose / recover.
 

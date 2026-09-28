@@ -5,7 +5,7 @@
 # gateway-usage-statusline.sh — one compact line of subscription usage for
 # Claude Code's `statusLine`, e.g.
 #
-#   Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72% │ Qwen 1.2M tok/mo
+#   Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72%
 #
 # It prints what the local model gateway answers on
 # `GET /usage/windows?format=line` — the line is RENDERED by the gateway

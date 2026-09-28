@@ -67,8 +67,20 @@ EXPECTED_SEED_IDS = (
     EXPECTED_VENDOR_SEED_IDS | EXPECTED_QWEN_SEED_IDS | EXPECTED_CLAUDE_SEED_IDS
 )
 
+#: The vendor page that states each Token-Plan model's OWN window and output
+#: budget. The Claude Code integration page states the CLIENT's default (200K)
+#: and describes raising it; it is deliberately NOT the citation for a window.
+QWEN_PER_MODEL_SOURCE = (
+    "https://docs.qwencloud.com/developer-guides/getting-started/"
+    "text-generation-models"
+)
+
 #: Exactly the models whose official page states a 1M window.
-EXPECTED_1M_IDS = {"glm-5.3", "glm-5.3-flash", "glm-5.2"} | EXPECTED_CLAUDE_SEED_IDS
+EXPECTED_1M_IDS = (
+    {"glm-5.3", "glm-5.3-flash", "glm-5.2"}
+    | EXPECTED_CLAUDE_SEED_IDS
+    | EXPECTED_QWEN_SEED_IDS
+)
 
 #: Official documentation host per vendor id. A citation anywhere else is
 #: not a vendor page.
@@ -150,23 +162,48 @@ class SeedTests(unittest.TestCase):
         # ids' verified window: the rows must not be narrowed to match the
         # weaker citation.
 
-    def test_token_plan_rows_claim_only_the_documented_default(self) -> None:
-        """The Token-Plan page documents a 200K default and "1M where the
-        model supports it" WITHOUT naming models — so every one of these
-        rows claims 200K, flags no 1M, states no max_output, and SAYS SO in
-        its note. The day the vendor publishes per-model windows, these rows
-        are the ones to update and this test with them."""
-        for model_id in EXPECTED_QWEN_SEED_IDS:
+    def test_token_plan_rows_carry_the_vendors_per_model_windows(self) -> None:
+        """Each row is pinned to the figure the vendor's OWN per-model table
+        states.
+
+        The Token-Plan page documents a 200K default and "1M where the model
+        supports it" WITHOUT naming models, and these rows were read from it
+        until v0.2.98 — claiming 200K for every one of them, a 5x
+        understatement of a window the CLIENT then uses to decide when to
+        compact. The earlier form of this test named the day it would change
+        ("the day the vendor publishes per-model windows, these rows are the
+        ones to update and this test with them"); the vendor has published
+        them on the text-generation-models page, so both moved together. A
+        silent return to 200K now fails here instead of in a user's session.
+        """
+        expected = {
+            "qwen3.8-max": (1_000_000, 128_000),
+            "qwen3.8-flash": (1_000_000, 128_000),
+            "qwen3.7-max": (1_000_000, 64_000),
+            "qwen3.7-plus": (1_000_000, 64_000),
+            "qwen3.6-flash": (1_000_000, 64_000),
+            # A SHARED output+thinking budget, not an output-only ceiling.
+            "deepseek-v4-pro": (1_000_000, 393_216),
+            "deepseek-v4-flash-0731": (1_000_000, 393_216),
+            "deepseek-v4.1-flash": (1_000_000, 393_216),
+        }
+        self.assertEqual(set(expected), EXPECTED_QWEN_SEED_IDS)
+        for model_id, (window, max_output) in expected.items():
             with self.subTest(model=model_id):
                 row = self.seed.rows[model_id]
                 self.assertEqual(row.vendor, "qwen")
-                self.assertEqual(row.context_window, 200_000)
-                self.assertFalse(row.window_1m)
-                self.assertEqual(row.max_output, 0)
-                self.assertIn(
+                self.assertEqual(row.context_window, window)
+                self.assertTrue(row.window_1m)
+                self.assertEqual(row.max_output, max_output)
+                self.assertEqual(
+                    row.source, QWEN_PER_MODEL_SOURCE,
+                    "a window must cite the page that states the PER-MODEL "
+                    "figure, not the page describing the client's default",
+                )
+                self.assertNotIn(
                     "UNVERIFIED", row.source_note,
-                    f"{model_id}: the note must state that per-model 1M "
-                    "support is unverified",
+                    f"{model_id}: the vendor publishes this window now, so a "
+                    "note still calling it unverified contradicts the value",
                 )
 
     def test_claude_rows_are_first_party_and_1m(self) -> None:

@@ -56,6 +56,18 @@ pub struct OrchestratorBundledSecret {
     #[serde(default)]
     #[allow(dead_code)]
     pub description: String,
+    /// v0.2.98 slot-exclusivity: a bundled secret declared with
+    /// `scope == "shared" && slot_exclusive == true` OWNS its key name on
+    /// the hub's `/api/v1/projects/{id}/env` merged dict — the key is
+    /// served only by that declaration's own shared-slot read
+    /// (`resolve_module_secret(..., "shared", ...)` at the
+    /// SENTINEL_SHARED slot), never by a narrower or wider bucket under
+    /// the same name (installed-module declaration, legacy slot, user
+    /// bucket, cross-project grant). Absent/false keeps the historical
+    /// first-wins bucket merge. Owner ruling it implements: VCO's own
+    /// consumers use VCO's own slot; a project's key is the project's.
+    #[serde(default)]
+    pub slot_exclusive: bool,
 }
 
 fn default_orchestrator_secret_module_id() -> String {

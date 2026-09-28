@@ -756,6 +756,31 @@ For any OTHER command that returns silent non-zero (rare — e.g. a bespoke tool
 lean-ctx bypass "some-tool --that-fails-quietly"
 ```
 
+**Seven read-only `git` verbs step aside for the same reason `git commit` does** — `git show`,
+`git diff`, `git grep`, `git log`, `git blame`, `git cat-file` and `git ls-tree` run RAW. Their
+output *is* evidence: a lane reviewing a branch it has not checked out reads exactly these, and
+compressed output loses lines invisibly — `git ls-tree -r` measured **-94%** with 286 of 300
+paths silently dropped, and `git log` keeps the newest commits while the oldest disappear. The
+list is deliberately command-specific: `git status`, `git branch`, `git fetch` and every mutating
+verb still compress, and an ordinary command is still rewritten. Same final-`&&`-segment scoping.
+
+**When output still goes missing, bypass the pipeline rather than fight it.** Compression applies
+to what the command *prints*; bytes written to a file are not printed, so this is always verbatim:
+
+```bash
+git show origin/main:path/to/file > /tmp/x.txt && wc -l /tmp/x.txt   # then read /tmp/x.txt
+```
+
+**Recovery after the fact is limited, and which case you are in decides whether it exists at all.**
+With no `lean-ctx.toml` present the `tee` behaviour in force is `failures`: every tee file written
+under `~/.lean-ctx/tee/` corresponds to a command that **failed**, and holds that failure's
+verbatim output — while a command that *succeeded* writes no tee file, so a heavy-but-successful
+compression leaves nothing on disk to recover the dropped lines from. Do not reach for
+`tee_mode="always"` as the remedy without testing it end-to-end first; the reliable options are the
+step-aside list above, the dump-to-file form, and the upstream `tee_mode="high-compression"` in
+lean-ctx >= 3.8.18 — recommend that upgrade, and do not depend on it (the hooks must stay correct
+on the older binaries that ship today).
+
 **Target Metrics**:
 - Simple: <5K tokens
 - Complex: <20K tokens
@@ -864,7 +889,7 @@ VCO ships a secrets primitive so agents never scrape the environment for tokens.
 
 1. **Never grep `env` for secrets.** `env | grep TOKEN` (and similar) is blocked by the `pre-tool-use.sh` PreToolUse hook (its `.claude/scripts/bash_security.py` scanner). The block message includes the remediation below.
 
-2. **If a task needs a credential, assume one may already be provisioned — resolve it, don't ask the user to paste it.** The user adds secrets (API tokens, license keys, per-project credentials like a Jira or database token) through the launcher GUI (Projects → *project* → Secrets, or Preferences → Special Secrets → SecretsPanel, or the OnboardingWizard). Your job is to READ them through the sanctioned resolver, by the exact key name the user gave the secret.
+2. **If a task needs a credential, assume one may already be provisioned — resolve it, don't ask the user to paste it.** The user adds secrets (API tokens, license keys, per-project credentials like a Jira or database token) through the launcher GUI (Projects → *project* → Secrets, or Preferences → Secrets → Shared (this user), or the OnboardingWizard). Your job is to READ them through the sanctioned resolver, by the exact key name the user gave the secret.
 
 3. **Two stores, one resolution habit**:
    - **Launcher keychain** (canonical — holds `github_pat`, `openai_api_key`, module secrets, AND any per-project or shared secret the user adds in the GUI): values live in the OS keychain. Resolve through vct-hub: `{{ORCHESTRATOR_ROOT}}/templates/scripts/vct_secrets_resolve.sh <project-path> <key>` (`.ps1` sibling on Windows), or from Python: `from vco_lib.agent_secrets import get; get("<KEY>")` — hub-first with automatic file-store fallback. Use the exact key name from the SecretsPanel (e.g. a per-project `MYPROJECT_JIRA_TOKEN`).
@@ -935,7 +960,7 @@ curl -s http://localhost:11435/api/tags               # Ollama models
 
 Inside a Claude Code session, run `/context` to print the active workspace path and KG collection name. If the collection is wrong (e.g. it's reusing another project's KG), you opened Claude in the wrong directory — see the per-project isolation note above and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
-**GitHub access** (only if you push from this project): register the PAT via the launcher GUI (OnboardingWizard step 4, or Preferences → Special Secrets) — it lands in the OS keychain and the search MCP + hooks resolve it through vct-hub automatically. For shell use, see the **Secrets** section above (`vct exec` / `git-credential-vct`). Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) §Secrets.
+**GitHub access** (only if you push from this project): register the PAT via the launcher GUI (OnboardingWizard step 4, or Preferences → Secrets) — it lands in the OS keychain and the search MCP + hooks resolve it through vct-hub automatically. For shell use, see the **Secrets** section above (`vct exec` / `git-credential-vct`). Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) §Secrets.
 
 *Once you've completed first-run setup, remove this section: `python .claude/scripts/cleanup-setup-sections.py`*
 <!-- END: SETUP-ONLY -->

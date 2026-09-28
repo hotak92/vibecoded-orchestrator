@@ -11,7 +11,11 @@
 //!     the same file the gateway carries inside its own wheel as a fallback.
 //!     Read, never copied: an `include_str!` reaching out of the crate — or a
 //!     seed inlined into the migration SQL — would fork the shipped data into
-//!     two copies with two update paths.
+//!     two copies with two update paths. On boot the seed CONVERGES the table
+//!     with it per row: absent rows are inserted, untouched rows whose values
+//!     drifted are refreshed (a shipped correction reaches existing installs,
+//!     v0.2.98), user-edited rows are left byte-identical and deleted ids stay
+//!     deleted.
 //!   * **Export** — write `<vct_root>/model-gateway/chat_model_context.json`,
 //!     which the gateway reads. On EVERY mutation and on EVERY boot, because
 //!     a table edit that never reaches the file is a preference the daemon
@@ -223,27 +227,42 @@ pub fn export_now(db: &Db) -> ExportReport {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 
-/// Boot seed + export, called once from `lib.rs::run`.
+/// Boot converge + export, called once from `lib.rs::run`.
 ///
-/// The seed inserts shipped rows the table does not have yet — including on
-/// an UPGRADED install, which the first-boot-only gate this replaced could
-/// not do (0.2.93 shipped four Claude rows that reached no existing table).
-/// The export then runs unconditionally, so a table that gained rows reaches
-/// the gateway in the same boot rather than waiting for the next mutation.
+/// The converge brings the table in step with the shipped seed per row —
+/// including on an UPGRADED install, which the first-boot-only gate this
+/// path replaced could not touch (0.2.93 shipped four Claude rows that
+/// reached no existing table) and including a CORRECTED row, which the
+/// insert-if-absent-only rule could not reach either (v0.2.98 corrected the
+/// eight qwen rows from 200K to the vendor's per-model 1M; until the boot
+/// path learned the per-row rule, that correction landed only on fresh
+/// installs and every existing table kept advertising the wrong window).
+/// A row the user edited is left byte-identical and a deleted id stays
+/// deleted; only the explicit "Reseed from shipped defaults" may undo
+/// either. The export then runs unconditionally, so a table that changed
+/// reaches the gateway in the same boot rather than waiting for the next
+/// mutation.
 ///
 /// Soft-fail end to end: nothing here may block the launcher from starting.
 /// Every failure path logs a line a user can act on, and none of them leave
-/// the table half-written (the seeder validates the whole batch first, in one
-/// transaction).
+/// the table half-written (the converge validates the whole batch first, in
+/// one transaction).
 pub fn seed_and_export_on_boot(db: &Db) {
     match load_seed_rows(db) {
-        Ok(Some((path, rows))) => match db.seed_chat_model_context_upsert_missing(&rows) {
-            Ok(0) => {}
-            Ok(n) => tracing::info!(
-                "[vct] chat-model context: seeded {} new row(s) from {}",
-                n,
-                path.display()
-            ),
+        Ok(Some((path, rows))) => match db.converge_chat_model_context_seed(&rows) {
+            Ok(outcome) => {
+                if outcome.inserted > 0 || outcome.updated > 0 {
+                    tracing::info!(
+                        "[vct] chat-model context: converged with {}: {} new, {} \
+                         refreshed, {} unchanged, {} user edit(s) preserved",
+                        path.display(),
+                        outcome.inserted,
+                        outcome.updated,
+                        outcome.unchanged,
+                        outcome.preserved_user_edits
+                    );
+                }
+            }
             Err(e) => tracing::warn!("[vct] chat-model context: seeding failed: {}", e),
         },
         Ok(None) => {
@@ -411,7 +430,9 @@ pub async fn chat_model_context_status(
 // promise backed by nothing but a code reading.
 
 /// Insert or update one row FROM THE GUI, so `user_edited = 1` — which is
-/// what protects it from the next reseed — then re-export.
+/// what protects it from every automatic path that re-applies the shipped
+/// rows (the boot converge and "Reseed from shipped defaults" alike) — then
+/// re-export.
 pub fn upsert_and_export(
     db: &Db,
     input: ChatModelContextInput,
@@ -904,9 +925,10 @@ mod tests {
     /// The REAL shipped seed loads under the launcher's parser, with the ten
     /// cited GLM rows, the four first-party Claude 5 rows (read only by
     /// `vco_lib.vscode_settings.decorate_1m`; the gateway publishes
-    /// first-party ids verbatim), the eight v0.2.96 qwen Token-Plan rows
-    /// (whose `max_output` is 0 = UNSTATED — the vendor page publishes no
-    /// per-model figure and inventing one is forbidden) and the version-key
+    /// first-party ids verbatim), the eight v0.2.98-CORRECTED qwen Token-Plan
+    /// rows (the vendor's PER-MODEL figures — 1M window, `[1m]`, stated
+    /// `max_output`; until v0.2.98 they carried the integration page's
+    /// CLIENT-default 200K and an unstated 0 output) and the version-key
     /// evidence intact.
     ///
     /// This reads the repo file directly via `CARGO_MANIFEST_DIR`, which is
@@ -950,24 +972,31 @@ mod tests {
             assert!(row.window_1m && row.context_window == 1_000_000, "{}", id);
             assert!(row.source.starts_with("https://docs.anthropic.com"), "{}", id);
         }
-        // The v0.2.96 qwen Token-Plan rows: vendor `qwen`, the DOCUMENTED
-        // 200K default window, NOT 1M (per-model 1M support is UNVERIFIED —
-        // each row's source_note says so), and max_output 0 = UNSTATED: the
-        // cited page publishes no per-model figure and inventing one is
-        // forbidden. These rows are why migration 046 relaxed the CHECK.
+        // The v0.2.98-corrected qwen Token-Plan rows: vendor `qwen`, the
+        // vendor's PER-MODEL figures from the cited page — 1M window with
+        // the [1m] companion, and a STATED max_output (never the invented
+        // figure the pre-correction row refused to guess). Until v0.2.98
+        // these rows carried 200K / window_1m false / max_output 0 because
+        // the citation was the integration page's sentence about the
+        // CLIENT's default window.
         let qwen: Vec<&ChatModelContextInput> =
             rows.iter().filter(|r| r.vendor == "qwen").collect();
         assert_eq!(qwen.len(), 8, "the eight Token-Plan rows; no PAYG row exists");
         for row in &qwen {
             assert_eq!(
-                row.max_output, 0,
-                "{}: unstated, never an invented figure",
+                row.context_window, 1_000_000,
+                "{}: the vendor's per-model window, not the client default",
                 row.model_id
             );
-            assert_eq!(row.context_window, 200_000, "{}", row.model_id);
             assert!(
-                !row.window_1m,
-                "{}: per-model 1M support is UNVERIFIED",
+                row.window_1m,
+                "{}: the vendor's own table states the 1M window",
+                row.model_id
+            );
+            assert!(
+                row.max_output > 0,
+                "{}: a stated figure since v0.2.98 — 0 would mean the \
+                 correction was reverted",
                 row.model_id
             );
             assert!(
@@ -976,13 +1005,20 @@ mod tests {
                 row.model_id,
                 row.source
             );
-            assert!(
-                row.source_note.contains("UNVERIFIED") || row.source_note.contains("unstated"),
-                "{}: the honest caveat must travel with the row, got {:?}",
-                row.model_id,
-                row.source_note
-            );
         }
+        // The correction's own evidence travels with the primary row.
+        assert!(
+            qwen.iter()
+                .any(|r| r.source_note.contains("v0.2.98")
+                    && r.source_note.contains("CLIENT's default window")),
+            "the qwen3.8-max note must say where the old 200K came from, so a \
+             future editor does not 'correct' the row backwards"
+        );
+        // The stated output figures are the vendor's, expanded by the
+        // non-overstating decimal reading documented in the seed.
+        assert_eq!(by_id("qwen3.8-max").max_output, 128_000);
+        assert_eq!(by_id("qwen3.7-max").max_output, 64_000);
+        assert_eq!(by_id("deepseek-v4-pro").max_output, 393_216);
         // The version-key evidence: same family, 5x apart. If a future edit
         // ever collapses these into a `glm-5*` rule, this reds.
         assert!(by_id("glm-5.2").window_1m && by_id("glm-5.2").context_window == 1_000_000);
@@ -999,37 +1035,59 @@ mod tests {
     }
 
     /// CONSUMER-LEVEL CONTRACT (v0.2.96): an UNSTATED row never surfaces a
-    /// max-output figure anywhere along the launcher's own pipeline. The REAL
-    /// shipped seed — eight qwen rows with `max_output: 0` — goes through
-    /// parse → table → exported file, and the file the gateway reads carries
-    /// the 0 marker verbatim: never an invented count, never an absent key
-    /// (the reader's `or 0` coalescing means absent and 0 must not diverge).
-    /// The leave-alone half pins that a row WITH a published figure keeps it.
+    /// max-output figure anywhere along the launcher's own pipeline. A seed
+    /// carrying `max_output: 0` rows goes through parse → table → exported
+    /// file, and the file the gateway reads carries the 0 marker verbatim:
+    /// never an invented count, never an absent key (the reader's `or 0`
+    /// coalescing means absent and 0 must not diverge). The leave-alone half
+    /// pins that a row WITH a published figure keeps it.
+    ///
+    /// Since v0.2.98 the REAL shipped seed states a figure on every qwen
+    /// row, so this pins the contract on a synthetic clone seed — the
+    /// contract itself is still live: `upsert_chat_model_context` accepts a
+    /// 0 row and the export must keep carrying it as 0.
     #[test]
     #[serial_test::serial]
-    fn unstated_rows_flow_from_the_shipped_seed_into_the_export_as_zero() {
+    fn unstated_rows_flow_from_a_seed_into_the_export_as_zero() {
         let _env_lock = vct_launcher_core::test_env::env_lock();
-        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("..")
-            .join("..");
-        let mut seed = repo_root;
-        for seg in SEED_RELATIVE_PATH {
-            seed = seed.join(seg);
-        }
-        let raw = std::fs::read_to_string(&seed)
-            .unwrap_or_else(|e| panic!("shipped seed {} unreadable: {}", seed.display(), e));
-        let value: serde_json::Value = serde_json::from_str(&raw).expect("seed is valid JSON");
-        let rows = parse_document(&value).expect("seed parses under the writer's rules");
+        let dir = tmp_dir("unstated");
+        let clone = dir.join("clone");
+        let seed_dir = clone.join("claude_mcp_servers").join("model_router");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
+        std::fs::create_dir_all(clone.join("state")).unwrap();
+        std::fs::write(
+            clone.join("state").join("install-manifest.json"),
+            r#"{"installed": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seed_dir.join("chat_model_context.seed.json"),
+            r#"{"schema_version": 1, "models": {
+                 "qwen3.8-max": {"vendor": "qwen", "context_window": 1000000,
+                                 "max_output": 0, "window_1m": true,
+                                 "source": "https://docs.qwencloud.com/x",
+                                 "source_note": "vendor page states no figure"},
+                 "glm-5.2": {"vendor": "zai", "context_window": 1000000,
+                             "max_output": 128000, "window_1m": true,
+                             "source": "https://docs.z.ai/guides/llm/glm-5.2"}}}"#,
+        )
+        .unwrap();
 
         let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        let (_, rows) = load_seed_rows(&db)
+            .expect("seed loads")
+            .expect("the clone is pinned, so the seed is found");
         assert_eq!(
-            db.seed_chat_model_context_upsert_missing(&rows).unwrap(),
-            22,
-            "every shipped row — the unstated ones included — stores through \
-             the relaxed CHECK (migration 046)"
+            db.converge_chat_model_context_seed(&rows).unwrap().inserted,
+            2,
+            "every seed row — the unstated one included — stores through the \
+             relaxed CHECK (migration 046)"
         );
 
-        let dir = tmp_dir("unstated");
         let target = dir.join("chat_model_context.json");
         std::env::set_var(EXPORT_PATH_ENV, &target);
         let report = export_now(&db);
@@ -1039,37 +1097,102 @@ mod tests {
         let written: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
         let models = written["models"].as_object().unwrap();
-        for id in [
-            "qwen3.8-max",
-            "qwen3.8-flash",
-            "qwen3.7-max",
-            "qwen3.7-plus",
-            "qwen3.6-flash",
-            "deepseek-v4-pro",
-            "deepseek-v4-flash-0731",
-            "deepseek-v4.1-flash",
-        ] {
-            let entry = models
-                .get(id)
-                .unwrap_or_else(|| panic!("the export is missing {}", id));
-            assert_eq!(
-                entry["max_output"],
-                serde_json::json!(0),
-                "{}: the export carries the unstated marker, never a figure",
-                id
-            );
-            assert!(
-                entry.as_object().unwrap().contains_key("max_output"),
-                "{}: the key is present — absent and 0 must mean the same \
-                 thing to the reader, and the file says which one it wrote",
-                id
-            );
-        }
+        let entry = models
+            .get("qwen3.8-max")
+            .expect("the export is not missing the unstated row");
+        assert_eq!(
+            entry["max_output"],
+            serde_json::json!(0),
+            "the export carries the unstated marker, never a figure"
+        );
+        assert!(
+            entry.as_object().unwrap().contains_key("max_output"),
+            "the key is present — absent and 0 must mean the same thing to \
+             the reader, and the file says which one it wrote"
+        );
         // Leave-alone: a row WITH a published figure keeps it exactly.
         assert_eq!(
             models["glm-5.2"]["max_output"],
             serde_json::json!(128_000),
             "a stated figure is untouched by the unstated-marker contract"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The v0.2.98 delivery consequence, end to end on a synthetic clone: an
+    /// EXISTING install whose table still holds the pre-correction row an
+    /// earlier boot seeded (200K, no [1m], never user-edited) gets the
+    /// corrected shipped row on the next boot, and the FILE THE GATEWAY
+    /// READS carries it — so the `[1m]` advertisement follows the
+    /// correction without anyone pressing "Reseed from shipped defaults".
+    #[test]
+    #[serial_test::serial]
+    fn boot_converges_a_corrected_shipped_row_into_the_export() {
+        let _env_lock = vct_launcher_core::test_env::env_lock();
+        let dir = tmp_dir("converge");
+        let clone = dir.join("clone");
+        let seed_dir = clone.join("claude_mcp_servers").join("model_router");
+        std::fs::create_dir_all(&seed_dir).unwrap();
+        std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
+        std::fs::create_dir_all(clone.join("state")).unwrap();
+        std::fs::write(
+            clone.join("state").join("install-manifest.json"),
+            r#"{"installed": true}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            seed_dir.join("chat_model_context.seed.json"),
+            r#"{"schema_version": 1, "models": {
+                 "qwen3.8-max": {"vendor": "qwen", "context_window": 1000000,
+                                 "max_output": 128000, "window_1m": true,
+                                 "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models"}}}"#,
+        )
+        .unwrap();
+
+        let db = make_db();
+        db.app_state_set("launcher.install_path", &clone.display().to_string())
+            .unwrap();
+        // The pre-v0.2.98 row, exactly as an earlier boot seeded it: 200K,
+        // no [1m], an unstated 0 output, `user_edited = 0`.
+        db.upsert_chat_model_context(
+            ChatModelContextInput {
+                model_id: "qwen3.8-max".into(),
+                vendor: "qwen".into(),
+                context_window: 200_000,
+                max_output: 0,
+                window_1m: false,
+                source: "https://docs.qwencloud.com/".into(),
+                source_note: String::new(),
+            },
+            false,
+        )
+        .unwrap();
+
+        let target = dir.join("chat_model_context.json");
+        std::env::set_var(EXPORT_PATH_ENV, &target);
+        seed_and_export_on_boot(&db);
+        std::env::remove_var(EXPORT_PATH_ENV);
+
+        let row = db.get_chat_model_context("qwen3.8-max").unwrap().unwrap();
+        assert_eq!(row.context_window, 1_000_000, "the table converges");
+        assert!(row.window_1m);
+        assert!(!row.user_edited, "still not a user edit");
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            written["models"]["qwen3.8-max"]["context_window"],
+            serde_json::json!(1_000_000),
+            "the correction reaches the file the gateway reads"
+        );
+        assert_eq!(
+            written["models"]["qwen3.8-max"]["window_1m"],
+            serde_json::json!(true),
+            "so the gateway advertises the <id>[1m] companion"
+        );
+        assert_eq!(
+            written["models"]["qwen3.8-max"]["max_output"],
+            serde_json::json!(128_000)
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1127,8 +1250,9 @@ mod tests {
         assert_eq!(written["models"]["glm-5.2"]["window_1m"], serde_json::json!(true));
         assert_eq!(written["models"]["glm-5.1"]["window_1m"], serde_json::json!(false));
 
-        // SECOND BOOT after a user edit: the seed does not re-run (the table
-        // is not empty), the edit survives, and the export is refreshed.
+        // SECOND BOOT after a user edit: the converge still runs, but the
+        // `user_edited` row is preserved byte-identically, and the export is
+        // refreshed.
         db.upsert_chat_model_context(
             ChatModelContextInput { context_window: 777, ..input("glm-5.1") },
             true,

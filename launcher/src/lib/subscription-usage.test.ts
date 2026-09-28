@@ -13,7 +13,6 @@ import {
   barWidth,
   cardVisible,
   describeCountdown,
-  describeTokens,
   fetchUsage,
   INITIAL_CARD_STATE,
   nextPollMs,
@@ -138,29 +137,6 @@ describe('describeCountdown', () => {
   });
 });
 
-describe('tokens (no quota endpoint)', () => {
-  const tokens = {
-    tokens: 1234567,
-    requests: 12,
-    unit: 'tokens' as const,
-    period: 'month' as const,
-    period_start: '2026-09-01T00:00:00Z',
-    counted_since: null,
-    source: 'gateway_ledger',
-    fetched_at: '2026-09-23T04:00:00Z',
-  };
-  it('is labelled as tokens, never as a percentage', () => {
-    const text = describeTokens(tokens, 'en-US');
-    expect(text).toBe('1,234,567 tokens this month');
-    expect(text).not.toContain('%');
-  });
-  it('says when the ledger does not reach the month start', () => {
-    expect(describeTokens({ ...tokens, counted_since: '2026-09-10T12:00:00Z' }, 'en-US')).toMatch(
-      /^1,234,567 tokens since Sep 10$/,
-    );
-  });
-});
-
 describe('vendor rows', () => {
   it('states what a vendor without numbers is waiting on', () => {
     expect(vendorStatus(vendor())).toBeNull();
@@ -172,7 +148,22 @@ describe('vendor rows', () => {
   });
 
   it('drops only a vendor with nothing to show', () => {
-    const empty = vendor({ id: 'qwen' });
+    // A tokens-only vendor is dropped too: the ledger is collected but never
+    // rendered (owner 2026-09-28), and a row whose subject is usage has
+    // nothing left to say for it.
+    const empty = vendor({
+      id: 'qwen',
+      tokens: {
+        tokens: 1234567,
+        requests: 12,
+        unit: 'tokens',
+        period: 'month',
+        period_start: '2026-09-01T00:00:00Z',
+        counted_since: null,
+        source: 'gateway_ledger',
+        fetched_at: '2026-09-23T04:00:00Z',
+      },
+    });
     const pending = vendor({ id: 'zai', state: 'pending' });
     const withWindow = vendor({
       windows: [

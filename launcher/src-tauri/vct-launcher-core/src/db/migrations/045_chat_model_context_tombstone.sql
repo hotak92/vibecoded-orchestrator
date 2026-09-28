@@ -20,6 +20,19 @@
 -- rather than a flag column because the row it remembers no longer exists:
 -- there is nothing left to hang a column on.
 --
+-- v0.2.98 SUPERSEDES the RULE that paragraph states, not the reasoning behind
+-- it. The name above is the function as it stood at v0.2.94 — it is now
+-- `converge_chat_model_context_seed`, which applies one per-row rule shared
+-- with the reseed path through `converge_rows` — and "never touch what is
+-- there" turned out to be a delivery defect of its own: a CORRECTED shipped
+-- row is by definition one that is ALREADY there, so the v0.2.98 qwen window
+-- correction (200K to the vendor's per-model 1M) reached fresh installs only
+-- and every existing table kept the wrong figure. The seed now refreshes a
+-- row whose `user_edited = 0` and leaves a `user_edited = 1` row alone: the
+-- row could always answer "is this the system's copy or the user's?" for
+-- itself. This table's job is untouched by that change and is still exactly
+-- what the paragraphs below describe.
+--
 --   model_id    the deleted row's key, verbatim. Not a foreign key — its
 --               whole purpose is to outlive the row, so an FK would delete
 --               the memory along with the thing being remembered.

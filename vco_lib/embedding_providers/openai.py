@@ -240,8 +240,9 @@ class OpenAIAdapter:
         """
         if not self.api_key:
             raise RuntimeError(
-                "OpenAI API key not configured "
-                "(OPENAI_API_KEY env or keyring entry)"
+                "OpenAI API key not configured (VCO's own shared "
+                "`openai_api_key` slot: launcher keychain, or "
+                "~/.vct-secrets/shared/)"
             )
         if not texts:
             return []

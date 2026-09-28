@@ -190,8 +190,10 @@ def _service_hint(slot: str) -> tuple[str, str]:
     if "openai" in slot:
         return (
             "OpenAI API",
-            "# Check OPENAI_API_KEY is set and the key is valid:\n"
-            "# Preferences → Special Secrets → OpenAI → Re-check",
+            "# VCO's OpenAI embeddings need a key in VCO's own slot:\n"
+            "vct can-read --key openai_api_key   # exit 0 = a key is present\n"
+            "# to store one (value on stdin — never in argv or shell history):\n"
+            "#   printf %s \"$KEY\" | vct set --shared --key openai_api_key",
         )
     return (
         "Ollama (vco_ollama container on port 11435)",

@@ -30,7 +30,7 @@ There are two complementary secret stores in a VCO install:
 
 | Store | Backed by | Written by | Read via |
 |---|---|---|---|
-| **Launcher keychain** (canonical for launcher-managed slots like `github_pat`, `openai_api_key`) | OS keychain (macOS Keychain / Linux Secret Service / Windows Credential Manager) | Launcher GUI: OnboardingWizard step 4, or Preferences → Special Secrets → SecretsPanel | vct-hub `GET /api/v1/projects/{id}/env?key=…` — clients: `templates/scripts/vct_secrets_resolve.sh` / `.ps1`, `vco_lib/agent_secrets.py` |
+| **Launcher keychain** (canonical for launcher-managed slots like `github_pat`, `openai_api_key`) | OS keychain (macOS Keychain / Linux Secret Service / Windows Credential Manager) | Launcher GUI: OnboardingWizard step 4, or Preferences → Secrets → Shared (this user) | vct-hub `GET /api/v1/projects/{id}/env?key=…` — clients: `templates/scripts/vct_secrets_resolve.sh` / `.ps1`, `vco_lib/agent_secrets.py` |
 | **File store** (`~/.vct-secrets/`) | chmod-600 files | This CLI (`vct set`), manually | This CLI (`vct get` / `vct exec`), `git-credential-vct` |
 
 The launcher does **not** create or migrate the file store, and does **not**

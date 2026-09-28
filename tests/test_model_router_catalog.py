@@ -25,6 +25,7 @@ from pathlib import Path
 from model_router import catalog as cat
 from model_router.context_table import ContextTable, ModelContext, load_seed
 from model_router.vendors import ANTHROPIC_FAMILY, VENDORS, AnthropicFamily, Vendor
+from model_router.routing import ONE_M_SUFFIX
 
 
 from tests.common.qwen_catalog import (  # noqa: E402
@@ -729,11 +730,24 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
             e.id for e in full_catalog.entries
             if e.id.startswith("claude-gw/qwen/")
         ]
+        # WHICH declared ids advertise a ``[1m]`` row is the seed's answer,
+        # not this file's: the context-table test pins each Token-Plan row's
+        # own window, and deriving the spelling here keeps this test about the
+        # catalog rather than about a hand-copied id list (which went stale
+        # the moment the seed stopped claiming 200K for every Token-Plan row —
+        # the bare-id list below spelled three advertised ids without their
+        # suffix and passed only while the seed was wrong).
+        seed = load_seed()
+        one_m_ids = {
+            model_id for model_id in VENDORS["qwen"].static_ids
+            if (row := seed.lookup(model_id)) is not None and row.window_1m
+        }
+        self.assertTrue(one_m_ids, "the seed must flag at least one declared id")
         self.assertEqual(
             sorted(all_ids),
             sorted(
                 "claude-gw/qwen/" + model_id
-                + ("[1m]" if model_id in ("glm-5.2", "glm-5.3") else "")
+                + (ONE_M_SUFFIX if model_id in one_m_ids else "")
                 for model_id in VENDORS["qwen"].static_ids
                 if model_id not in VENDORS["qwen"].catalog_hide_ids
             ),
@@ -1150,14 +1164,14 @@ class CatalogHideIdsTests(unittest.TestCase):
     def test_hiding_a_family_newest_promotes_its_older_sibling(self):
         union = self._union(("qwen3.8-max",))
         published = {e.id for e in union.entries}
-        self.assertIn("claude-gw/qwen/qwen3.7-max", published,
+        self.assertIn(f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}", published,
                       "curation narrows a family, it does not freeze it out")
-        self.assertIn("claude-gw/qwen/qwen3.8-max", union.hidden)
+        self.assertIn(f"claude-gw/qwen/qwen3.8-max{ONE_M_SUFFIX}", union.hidden)
 
     def test_hide_matching_is_case_insensitive(self):
         union = self._union(("QWEN3.7-PLUS",))
-        self.assertIn("claude-gw/qwen/qwen3.7-plus", union.hidden)
-        self.assertNotIn("claude-gw/qwen/qwen3.7-plus",
+        self.assertIn(f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}", union.hidden)
+        self.assertNotIn(f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",
                          {e.id for e in union.entries})
 
     def test_first_party_ids_are_inert_to_a_vendor_hide_list(self):

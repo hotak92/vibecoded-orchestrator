@@ -422,6 +422,48 @@ def test_dotenv_values_never_in_exception(
     assert "tier 3" in msg and ".env" in msg
 
 
+# ─── Shared-only mode (v0.2.98) ─────────────────────────────────────────
+
+
+def test_shared_only_skips_the_per_project_leg(offline_hub, file_store):
+    """Auto mode keeps the per-project leg (``projects/<NAME>/<key>`` first);
+    the shared-only mode VCO's own consumers use goes straight to
+    ``shared/<key>``."""
+    assert get("github_pat", project="demo") == "demo-token-value"
+    assert get("github_pat", project="demo", shared_only=True) == "shared-token-value"
+
+
+def test_shared_only_never_reads_the_project_dotenv(offline_hub, file_store, tmp_path):
+    """Tier 3 is a project-scoped store by definition. Auto mode reads it (the
+    sanity leg below); the mode must not, even for the exact key name."""
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    (proj / ".env").write_text("dotenv_key=from-the-projects-own-env\n")
+    assert get("dotenv_key", project=str(proj)) == "from-the-projects-own-env"
+    with pytest.raises(SecretNotFound):
+        get("dotenv_key", project=str(proj), shared_only=True)
+
+
+def test_shared_only_still_honours_the_requesters_opt_out(offline_hub, file_store):
+    """The ``.no-shared-fallback`` marker is the user's "this project sees no
+    shared secrets" gate — it also silences the mode's only remaining leg."""
+    marker = file_store / "projects" / "demo" / agent_secrets.NO_SHARED_FALLBACK_MARKER
+    marker.write_text("")
+    with pytest.raises(SecretNotFound):
+        get("github_pat", project="demo", shared_only=True)
+
+
+def test_shared_only_miss_says_which_tiers_it_skipped(offline_hub, file_store):
+    """The miss diagnostic must not claim a tier was consulted when the mode
+    skipped it, and must point the remedy at the shared slot."""
+    with pytest.raises(SecretNotFound) as exc:
+        get("absent_key", project="demo", shared_only=True)
+    message = str(exc.value)
+    assert "not consulted (shared-only mode)" in message
+    assert "shared_only=True" in message
+    assert "vct set --shared --key absent_key" in message
+
+
 # ─── Tier 2: the `.no-shared-fallback` per-project opt-out ──────────────
 #
 # `docs/VCT_SECRETS_PRIMITIVE.md` §"Design choices" promises a project can

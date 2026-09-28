@@ -188,7 +188,7 @@ Two embedding stacks: text (KG, docs) and code (code-graph entities). Each has a
 1024-dimensional vectors under named vector `ollama_embed`. Kept populated for backward compatibility; allows switching `ACTIVE_EMBEDDING` back to `"ollama"` without re-indexing.
 
 ### OpenAI text embedding: `text-embedding-3-small` (optional)
-1536-dimensional vectors under named vector `openai_embed`. Only populated when `DUAL_EMBEDDING_ENABLED=true` and `OPENAI_API_KEY` is set.
+1536-dimensional vectors under named vector `openai_embed`. Only populated when the write-all-slots fan-out is on and a key resolves from VCO's own shared slot `openai_api_key` — not from `$OPENAI_API_KEY` (v0.2.98), so the admission test and the key the write path actually embeds with are the same one.
 
 ### Primary code embedding: `CodeSage-Large-v2` via FastAPI service
 2048-dimensional vectors under named vector `codesage_embed`. GPU-accelerated via the code embedding service at `http://localhost:11440` (`CODE_EMBED_SERVICE_URL`). Default for all code graph searches.

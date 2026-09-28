@@ -1198,6 +1198,61 @@ def _log_safe(value: object) -> str:
     )
 
 
+#: The access-line field for a request whose image blocks could not be
+#: counted — an unparseable body, a body past the rewrite buffer, or a defect
+#: in the counter. It is a VALUE, not an omission: "carried no image" reads
+#: ``images=0`` and only "could not count" reads ``images=?``, so after the
+#: fact the two can never be confused.
+IMAGES_UNCOUNTED = "images=?"
+
+
+def _count_image_blocks(blocks: Any) -> int:
+    """Count ``type == "image"`` blocks, walking into every nested ``content``.
+
+    A subagent that read an image file does not put the block at the top of a
+    message: it arrives inside a ``tool_result`` block's own ``content[]``
+    array, so a top-level-only scan would report 0 for exactly the requests
+    this count exists to identify. Any block that carries a ``content`` list
+    is walked (message and ``tool_result`` shapes alike, so the count does not
+    depend on where the client nested it).
+    """
+    if not isinstance(blocks, list):
+        return 0
+    total = 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            total += 1
+        if "content" in block:
+            total += _count_image_blocks(block["content"])
+    return total
+
+
+def _images_field(payload: Any) -> str:
+    """The access line's ``images=N`` — a COUNT, never a content byte.
+
+    Whether a request carried an image is the one question the access log
+    could not previously answer, and it is decisive: the gateway forwards the
+    body verbatim, so an image the client never sent cannot be lost on the
+    way through — but nothing recorded whether one arrived at all. A count
+    answers that after the fact without logging, formatting or even reading
+    a single byte of image data or message text.
+
+    Always returns a field — ``images=?`` included — so the line can never be
+    read as "no image" when the truth is "not counted"; the sentinel is the
+    difference between evidence and silence. And a failure to count must not
+    fail or delay the request: a diagnostic never costs a chat, so every
+    defect lands on the sentinel.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return IMAGES_UNCOUNTED
+        return f"images={_count_image_blocks(payload.get('messages'))}"
+    except Exception:  # noqa: BLE001 — a diagnostic must never cost a chat
+        return IMAGES_UNCOUNTED
+
+
 def _access_line(
     *,
     requested: str,
@@ -1573,6 +1628,10 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: span is what lets the routed name reach the upstream without the body
     #: being parsed — see :func:`_splice_literal`.
     model_field: Optional[HeadField] = None
+    #: The access line's image-block count. The sentinel until a parsed body
+    #: says otherwise: an over-buffer or unparseable body is never parsed a
+    #: second time just to count it, and "not counted" must not read as "0".
+    images_field = IMAGES_UNCOUNTED
     if over_buffer:
         # Deliberately NOT parsed and deliberately NOT refused: the body is
         # past what this daemon will hold, so it goes upstream as a stream and
@@ -1641,6 +1700,9 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             payload = parsed
             requested_model = payload.get("model") or ""
             stream_requested = bool(payload.get("stream"))
+            # Counted from the ALREADY-PARSED body — no second parse, and the
+            # bytes that go upstream are untouched by it either way.
+            images_field = _images_field(payload)
 
     decision: "Route | RouteError"
     if unparseable:
@@ -1848,6 +1910,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         stream_requested=stream_requested,
         started=started,
         note=note,
+        images=images_field,
         facts=facts,
     )
 
@@ -1892,6 +1955,7 @@ async def _proxy(
     stream_requested: bool = False,
     started: Optional[float] = None,
     note: str = "",
+    images: str = IMAGES_UNCOUNTED,
     allow_oauth_retry: bool = True,
     allow_quota_reprobe: bool = True,
     facts: Optional[RequestFacts] = None,
@@ -1945,7 +2009,12 @@ async def _proxy(
 
     def access(status: int, *, stream: bool, extra: str = "") -> None:
         nonlocal accumulator
-        parts = [part for part in (extra, note) if part]
+        # ``images`` FIRST and always, including 0: it is the one field that
+        # must be readable on every line, so it cannot ride in ``extra``,
+        # where each caller decides what appears — an absent field could not
+        # be told apart from a counter that never ran.
+        parts = [images]
+        parts.extend(part for part in (extra, note) if part)
         # Once, however many passes were abandoned: the handler may already
         # have put it in `note` for a REQUEST-side failure, and one line
         # saying the same thing twice reads as two events.
@@ -2068,6 +2137,7 @@ async def _proxy(
                         stream_requested=stream_requested,
                         started=started,
                         note=f"{note} note=oauth_reread_retry".strip(),
+                        images=images,
                         allow_oauth_retry=False,
                     )
             vendor = decision.vendor
@@ -2109,6 +2179,7 @@ async def _proxy(
                             stream_requested=stream_requested,
                             started=started,
                             note=note,
+                            images=images,
                         )
                         if allow_quota_reprobe
                         and isinstance(body, (bytes, bytearray))
@@ -2604,6 +2675,7 @@ def _quota_reprobe(
     stream_requested: bool,
     started: float,
     note: str,
+    images: str = IMAGES_UNCOUNTED,
 ) -> Callable[[], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
@@ -2635,6 +2707,7 @@ def _quota_reprobe(
             stream_requested=stream_requested,
             started=started,
             note=f"{note} note=quota_reprobe".strip(),
+            images=images,
             allow_oauth_retry=False,
             allow_quota_reprobe=False,
         )

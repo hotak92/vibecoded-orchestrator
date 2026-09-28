@@ -46,6 +46,22 @@
 #       Non-zero codes mean the key ALSO missed the file store and the
 #       project `.env`.
 #
+#   .\vct_secrets_resolve.ps1 -SharedOnly <project_id_or_folder> <secret_key>
+#     (through `pwsh -File`, whose argument parser binds a leading `-`-
+#     token as a parameter — so the flag is a switch there)
+#   .\vct_secrets_resolve.ps1 --shared-only <project_id_or_folder> <secret_key>
+#     (via -Command / in-shell invocation, byte-matching the .sh sibling)
+#       (v0.2.98) Both spellings are ONE mode: the single-key chain MINUS
+#       two legs, for VCO's OWN consumers (embeddings, gateway, codegraph,
+#       hooks) — they must resolve only VCO's slot and never read a
+#       project's key; a project's key is the project's. Tier 1 (hub) is
+#       UNCHANGED — same route, same requester project, same exit codes
+#       (the pause matrix still applies). Tier 2 reads shared\<key> ONLY
+#       (the projects\<NAME>\<key> leg is not consulted); tier 3 (the
+#       project's own `.env`) is not consulted at all, even when the
+#       first arg is a folder. MUST MATCH read_key_shared_only /
+#       `--shared-only` in vct_secrets_resolve.sh.
+#
 #   .\vct_secrets_resolve.ps1 resolve-project <folder>
 #       Print the project_id for <folder>. Same exit codes (0/1/2).
 #
@@ -99,7 +115,17 @@ param(
 
     # resolve-many's keys after the first (v0.2.97). Empty for the other forms.
     [Parameter(ValueFromRemainingArguments = $true)]
-    [string[]]$MoreArgs = @()
+    [string[]]$MoreArgs = @(),
+
+    # v0.2.98 shared-only mode (owner ruling 2026-09-26: VCO's OWN
+    # consumers resolve only VCO's slot — never a project scope, never a
+    # project `.env`). TWO spellings, one mode: `pwsh -File` binds a
+    # leading `-`-token as a parameter name, so through -File the flag is
+    # spelled `-SharedOnly` (native switch binding); the `--shared-only`
+    # spelling — first argument, byte-matching the .sh sibling — arrives
+    # via -Command / in-shell invocation, where it lands in $Arg1 as a
+    # plain string. Both are accepted; both are the same mode.
+    [switch]$SharedOnly
 )
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -776,6 +802,28 @@ function Get-DotenvValue {
     return @{ Found = $false }
 }
 
+function Get-SharedFileStoreValue {
+    # v0.2.98 --shared-only tier 2 (owner ruling 2026-09-26: VCO's OWN
+    # consumers resolve only VCO's slot — never a project scope, never a
+    # project `.env`): shared\<key> ONLY, the projects\<NAME>\<key> leg is
+    # NOT consulted. $ProjectArg is used ONLY for the .no-shared-fallback
+    # opt-out marker, never for a projects\<NAME>\<key> read. MUST MATCH
+    # file_store_get_shared_only in vct_secrets_resolve.sh.
+    # Returns @{ Found = $true/$false; Value = ... }.
+    param([string]$ProjectArg, [string]$Key)
+    $root = Get-SecretsRoot
+    $name = Get-FileProjectName -ArgValue $ProjectArg
+    if (Test-SharedFallbackDisabled -Name $name -Root $root) {
+        return @{ Found = $false }
+    }
+    $f = Join-Path (Join-Path $root "shared") $Key
+    if (Test-Path -LiteralPath $f -PathType Leaf) {
+        $v = Read-FileStripOneNewline -FilePath $f
+        if ($null -ne $v) { return @{ Found = $true; Value = $v } }
+    }
+    return @{ Found = $false }
+}
+
 function Get-LocalValue {
     # Tiers 2 + 3 for one key (shared by Read-Key and Read-Many). Returns
     # @{ Found = $true/$false; Value = ... }.
@@ -801,11 +849,26 @@ function Read-Key {
     # (tier 3). The final exit code on all-miss is TIER 1's code,
     # preserving the historical contract (exit 3 = key_not_active only
     # after tiers 2 and 3 also missed).
-    param([string]$ProjectArg, [string]$Key)
+    #
+    # -SharedOnly (v0.2.98): the chain minus two legs — tier 1 UNCHANGED
+    # (same route, same requester project, same exit codes; the pause
+    # matrix still applies), tier 2 reads shared\<key> only, tier 3 never.
+    # MUST MATCH read_key_shared_only in vct_secrets_resolve.sh.
+    param([string]$ProjectArg, [string]$Key, [switch]$SharedOnly)
     $tier1 = Read-KeyHub -ProjectArg $ProjectArg -Key $Key
     if ($tier1.ExitCode -eq 0) {
         [Console]::Out.Write($tier1.Value)
         return 0
+    }
+    if ($SharedOnly) {
+        $shared = Get-SharedFileStoreValue -ProjectArg $ProjectArg -Key $Key
+        if ($shared.Found) {
+            [Console]::Out.Write($shared.Value)
+            return 0
+        }
+        # Honest miss diagnostic: names ONLY the tiers this mode consulted.
+        Write-Err "key $Key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)"
+        return $tier1.ExitCode
     }
     $local = Get-LocalValue -ProjectArg $ProjectArg -Key $Key
     if ($local.Found) {
@@ -873,6 +936,28 @@ if ($Arg1 -eq "resolve-many") {
     }
     $rcMany = Read-Many -ProjectArg $Arg2 -Keys @($MoreArgs)
     exit $rcMany
+}
+
+if ($SharedOnly.IsPresent) {
+    # v0.2.98, the `pwsh -File` spelling (see the param block): the two
+    # positionals keep their ordinary meaning. MUST MATCH the .sh case arm.
+    if ($MoreArgs.Count -ne 0) {
+        Write-Err "usage: vct_secrets_resolve.ps1 -SharedOnly <project_id_or_folder> <secret_key>"
+        exit 64
+    }
+    $rcShared = Read-Key -ProjectArg $Arg1 -Key $Arg2 -SharedOnly
+    exit $rcShared
+}
+
+if ($Arg1 -eq "--shared-only") {
+    # v0.2.98, the .sh-sibling spelling (see the param block): delivered
+    # through -Command / in-shell invocation, never through -File.
+    if ($MoreArgs.Count -ne 1) {
+        Write-Err "usage: vct_secrets_resolve.ps1 --shared-only <project_id_or_folder> <secret_key>"
+        exit 64
+    }
+    $rcShared = Read-Key -ProjectArg $Arg2 -Key $MoreArgs[0] -SharedOnly
+    exit $rcShared
 }
 
 if ($MoreArgs.Count -gt 0) {

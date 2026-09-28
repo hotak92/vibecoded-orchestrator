@@ -139,6 +139,20 @@ format_version = 1
 # install.py-owned conditions (family A — drop-when-absent)
 # ═══════════════════════════════════════════════════════════════════════════
 
+[conditions.openai_key_env_var_no_longer_read]
+# v0.2.98 (owner ruling 2026-09-26): VCO's consumers read VCO's OWN
+# `openai_api_key` slot and nothing else — never $OPENAI_API_KEY, never a
+# per-project binding, never the project's .env. A pre-v0.2.98 machine whose
+# VCO embeddings were paid for by an exported $OPENAI_API_KEY therefore stops
+# embedding on update, with nothing the user can act on. Emitted by install.py
+# only when it can prove the gap (the variable is set in its own environment,
+# VCO's slot resolves empty, the active backend is `openai`), so the remedy
+# reaches the user through the ledger instead of a silent loss.
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+
 [conditions.env_secrets_retained_in_plaintext]
 class = "action_required"
 owner = "install.py"
