@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.98] - 2026-09-29
+
 ### Fixed — a request the gateway repaired was counted as a turn that never happened (v0.2.98)
 
 - The gateway repairs two kinds of failed request rather than handing the
