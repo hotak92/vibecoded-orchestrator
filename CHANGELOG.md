@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — a reviewer's own evidence could arrive through a lossy filter (v0.2.98)
+
+- The `lean-ctx` Bash-output compression hook rewrote every command it did not
+  explicitly step aside from, read-only git inspection included. A lane
+  reviewing a branch it has not checked out reads `git show`, `git diff`,
+  `git grep`, `git log`, `git blame`, `git cat-file` and `git ls-tree`, and
+  that output *is* the evidence its verdict rests on. Compressed, the loss is
+  invisible and unrecoverable: `git ls-tree -r` measured -94% with 286 of 300
+  paths silently dropped, `git log` keeps the newest commits while the oldest
+  disappear, and a successful heavy compression writes no recovery file — the
+  `tee` copy is written on failure only, so nothing on disk held what was
+  removed.
+- Those seven verbs now run raw, on the same final-`&&`-segment scoping the
+  existing `git commit` / `git push` step-aside uses, in both the `.sh` and
+  `.ps1` siblings. The list is command-specific: `git status`, `git branch`,
+  `git fetch` and every mutating verb still compress, and an ordinary command
+  is still rewritten.
+
+### Added — subagents on the qwen vendor (v0.2.98)
+
+- The module gateway shipped four agent definitions, all on Z.ai's GLM models.
+  It now ships ten: the four GLM ones plus six on the qwen vendor —
+  `deepseek-implementer` and `qwen-implementer` (implementation that needs
+  several files in view at once), `qwen-flash-implementer` (cheap, fully
+  specified mechanical edits), `deepseek-researcher` and
+  `qwen-flash-researcher` (read-only research that returns a lead, not a
+  verdict), and `qwen-flash-sweeper` (one mechanical rule across many items).
+- No reviewer and no planner ships on the qwen vendor: an implementation or
+  research lane may be cheap, a verdict may not be. Those roles stay on the
+  GLM lane and on the Anthropic tiers.
+- The delivered set is named once, in `tests/common/module_gateway.py`. The
+  contract test derives each definition's expected id from the vendor registry
+  — namespace, context-window row, and the ids that row itself offers — so a
+  renamed namespace or an id the vendor does not publish fails the suite
+  instead of shipping an agent that cannot spawn.
+
 ## [0.2.97] - 2026-09-25
 
 ### Fixed — on Windows, a failed update was reported as a success (v0.2.97)

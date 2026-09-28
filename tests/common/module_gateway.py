@@ -11,7 +11,8 @@ orchestrator; contract pins assert on each file), and two files grew
 hardcoded copies of the tuple in the WP-10 wave. When the set moved from
 the pair to the four-role set (owner ruling 2026-09-21: glm-reviewer is
 THE review lane, glm-flash-reviewer retired, flash keeps
-research/investigation), every copy would have needed the same edit —
+research/investigation), and again when the qwen-vendor lanes were added
+(owner ruling 2026-09-28), every copy would have needed the same edit —
 this module is why they don't.
 
 One constant, imported by every test that names the gated set:
@@ -29,9 +30,20 @@ from __future__ import annotations
 #: (strong tier first, flash last). Byte-identical delivery contract:
 #: these files carry hardcoded `claude-gw/*` frontmatter ids and land
 #: with no placeholder expansion.
+#:
+#: The z.ai block is the review/planning lane; the qwen-vendor block
+#: (owner ruling 2026-09-28) is execution and research, and deliberately
+#: carries NO reviewer or planner definition: those roles stay on GLM and
+#: on the Anthropic tiers. `qwen3.6-flash` gets no definition at all.
 MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "glm-implementer.md",
     "glm-reviewer.md",
     "glm-planner.md",
     "glm-flash-researcher.md",
+    "deepseek-implementer.md",
+    "qwen-implementer.md",
+    "qwen-flash-implementer.md",
+    "deepseek-researcher.md",
+    "qwen-flash-researcher.md",
+    "qwen-flash-sweeper.md",
 )
