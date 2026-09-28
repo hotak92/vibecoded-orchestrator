@@ -377,6 +377,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   renamed namespace or an id the vendor does not publish fails the suite
   instead of shipping an agent that cannot spawn.
 
+### Internal — the extractor-generation ladder records v0.2.98 without charging a re-walk (v0.2.98)
+
+- The ladder requires every release to name itself in **exactly one** of its two
+  lists, and that assertion is the decision gate rather than a formality: a bump
+  charges every project on the machine with one forced re-extraction pass, a
+  non-bump charges none. v0.2.98 is recorded as a non-bump, so this update
+  leaves every code graph on the machine alone.
+- The evidence is the extractor surface, not the release's size. The diff from
+  v0.2.97 to v0.2.98 across the twelve files that can change extraction
+  semantics — `templates/scripts/analyze_code_graph.py`, the eight
+  `codegraph_*` modules, `weaviate_mcp/chunking.py`,
+  `weaviate_mcp/code_truncation.py`, `schema_versions.py` — is empty, so no
+  entity is found, named, hashed, chunked or truncated any differently than it
+  was in v0.2.97.
+- The files nearest that surface which did change carry no extraction rule
+  between them: the OpenAI recovery hint now points at a surface that exists,
+  and the same key-slot wording was corrected in a docstring and one error
+  string. `CODEGRAPH_EMBED_REVISION` cannot have moved (the analyzer file
+  carrying it is untouched), `_CHUNKER_REVISION` stays at v0.2.92.1, and
+  `CODEGRAPH_COLLECTION_SCHEMA_VERSION` stays at 7.
+
 ## [0.2.97] - 2026-09-25
 
 ### Fixed — on Windows, a failed update was reported as a success (v0.2.97)

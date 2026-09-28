@@ -186,6 +186,30 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "_CHUNKER_REVISION unchanged at v0.2.92.1; CODEGRAPH_EMBED_REVISION "
         "unchanged at 1; CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
     ),
+    "0.2.98": (
+        "No extraction-semantics change. `git diff v0.2.97..HEAD` across the "
+        "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) is "
+        "EMPTY \u2014 zero files, zero lines; templates/scripts/"
+        "analyze_code_graph.py is untouched, so CODEGRAPH_EMBED_REVISION "
+        "cannot have moved. The three changed files nearest the surface "
+        "carry no extraction rule between them: codegraph_deferrals.py, "
+        "+4/-2, swaps the OpenAI recovery hint in _service_hint for the "
+        "`vct can-read --key openai_api_key` / `vct set --shared` pair (the "
+        "text it replaced pointed at a launcher page that no longer exists); "
+        "weaviate_mcp/server.py, +9/-2, corrects the same OpenAI-slot wording "
+        "in a docstring and in one backfill_embeddings error string; "
+        "weaviate_mcp/embeddings.py, +3/-2, is a comment plus a resolution-"
+        "scope change \u2014 OPENAI_API_KEY now comes from VCO's own shared "
+        "slot only, never a project's. Nothing about how an entity is found, "
+        "named, hashed, chunked or truncated moved. The rest of the release "
+        "is the model gateway's context-table delivery (the [1m] window ids "
+        "and the boot convergence), the qwen-vendor agent lane, the "
+        "read-only git step-aside, and the usage-surfaces removal. "
+        "_CHUNKER_REVISION unchanged at v0.2.92.1; "
+        "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.
