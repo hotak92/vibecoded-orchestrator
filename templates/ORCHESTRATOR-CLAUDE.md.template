@@ -777,9 +777,14 @@ under `~/.lean-ctx/tee/` corresponds to a command that **failed**, and holds tha
 verbatim output — while a command that *succeeded* writes no tee file, so a heavy-but-successful
 compression leaves nothing on disk to recover the dropped lines from. Do not reach for
 `tee_mode="always"` as the remedy without testing it end-to-end first; the reliable options are the
-step-aside list above, the dump-to-file form, and the upstream `tee_mode="high-compression"` in
+step-aside list above, the dump-to-file form, and the upstream `tee_mode="highcompression"` in
 lean-ctx >= 3.8.18 — recommend that upgrade, and do not depend on it (the hooks must stay correct
-on the older binaries that ship today).
+on the older binaries that ship today). The value is spelled with NO hyphen: the parser's
+accepted set is exactly `never`, `failures`, `highcompression`, `high_compression`, `always`
+(plus booleans `true` = failures / `false` = never), and `high-compression` is refused outright
+with `unknown tee_mode: high-compression`. On the older binaries that ship today (3.4.5 reports
+`Valid tee_mode values: always, failures, never`) the value does not exist at all, which is the
+second reason this is a recommendation and not a dependency.
 
 **Target Metrics**:
 - Simple: <5K tokens

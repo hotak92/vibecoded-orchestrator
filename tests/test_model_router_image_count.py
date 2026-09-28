@@ -166,6 +166,69 @@ class ImageCountTests(GatewayTestBase):
         self.assertEqual(forwarded, raw)
         self.assertIn(b'"data": "QQ=="', forwarded)
 
+    async def test_a_routing_refusal_carries_the_count_it_refused_on(self) -> None:
+        """A refused request still CARRIED its images, so the count is evidence.
+
+        This outcome returns before the proxy, and ``_proxy`` is where the
+        field is otherwise assembled — so without it here the one reader who
+        most needs the count (someone asking why a request was refused) can
+        tell "carried none" from "was never counted" no better than before the
+        sentinel existed.
+        """
+        payload = {
+            # No vendor serves this id, so routing refuses it.
+            "model": "gpt-9",
+            "messages": [{"role": "user", "content": [_image()]}],
+            "max_tokens": 8,
+        }
+        resp, line = await self._post(headers=self.auth(), json=payload)
+        self.assertEqual(resp.status, 400)
+        self.assertIn("route=refused", line)
+        self.assertIn(" images=1", line)
+
+    async def test_a_gateway_side_refusal_carries_the_count_too(self) -> None:
+        """The other refusal arm, which never reaches ``_proxy`` either."""
+        client = await self.make_client(
+            key_getter=lambda key, project=None: (_ for _ in ()).throw(
+                LookupError("absent"),
+            ),
+        )
+        with self.assertLogs(ACCESS_LOGGER, level=logging.INFO) as captured:
+            resp = await client.post(
+                "/v1/messages",
+                headers=self.auth(),
+                json={
+                    "model": "claude-gw/glm-5.3",
+                    "messages": [{"role": "user", "content": [_image()]}],
+                    "max_tokens": 8,
+                },
+            )
+        lines = [
+            out for out in captured.output if "model-gateway: requested=" in out
+        ]
+        self.assertTrue(lines, "no access line was logged for the request")
+        self.assertEqual(resp.status, 503)
+        self.assertIn("reason=vendor_key_unavailable", lines[0])
+        self.assertIn(" images=1", lines[0])
+
+    async def test_a_refusal_of_an_unparseable_body_reads_the_sentinel(
+        self,
+    ) -> None:
+        """``?``, not silence: the refusal arm keeps the distinction too.
+
+        The body is unreadable AND the request is refused, so nothing was
+        counted and nothing could have been — which is exactly the state ``?``
+        is for. A missing field here would read the same as ``images=0``.
+        """
+        self.write_credentials(None, expires_in_ms=3_600_000)
+        resp, line = await self._post(
+            headers={**self.auth(), "Content-Type": "application/json"},
+            data=b"{not json at all",
+        )
+        self.assertEqual(resp.status, 401)
+        self.assertIn("reason=claude_login_unavailable", line)
+        self.assertIn(" images=?", line)
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

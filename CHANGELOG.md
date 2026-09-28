@@ -221,6 +221,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `reset_s=3621`, `quota_words=1` — beside the class it produced, so the next
   occurrence is diagnosable from the log instead of being re-derived from the
   code.
+- The evidence is on the REPAIR's line too, which is the case where it was
+  otherwise lost outright. A re-probe that succeeds answers from the vendor
+  before the line that would have carried the class and the evidence, so the
+  log kept the repair and dropped the verdict repaired — the same gap the
+  re-probe exists to close, one step later, and exactly the self-healed
+  exhaustion a reader is most likely to ask about. The re-sent request now
+  carries the replaced verdict's own fields (`quota_code=1310`, `reset_s=…`)
+  on the line it already writes, so the request is still one client request
+  and one line. Two tests pin it from opposite sides: the evidence is present
+  when the re-probe wins, and `quota_class` is still absent from that line,
+  because no sentence reached the user.
 - No state was involved and none was added. The gateway keeps no quota or
   cooldown record anywhere, in memory or on disk, so no restart could have
   made a verdict stale and no model switch clears one: every verdict is read
@@ -330,6 +341,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   message: it arrives inside a `tool_result` block's own `content[]`, and a
   top-level-only scan would report 0 for exactly the requests this field
   exists to identify.
+- The field is on the refusal arms too, which is where "every line" was
+  almost not true. A refused request returns before the proxy, and the proxy
+  is where the field is otherwise assembled — so a routing refusal and a
+  gateway-side refusal both logged no `images=` at all, leaving the reader
+  who most needs the count (someone asking why their request was refused)
+  unable to tell "carried none" from "was never counted": the ambiguity the
+  sentinel exists to remove, reintroduced one arm over. Both arms now lead
+  with the count, and three tests pin it — one per refusal arm plus the
+  unreadable body, whose refusal reads `images=?`.
 - `images=?` means "could not count" — an unparseable body, or one past the
   rewrite buffer, which is deliberately not parsed a second time merely to be
   counted. A request that carried no image reads `images=0`. The sentinel is

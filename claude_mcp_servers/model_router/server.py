@@ -1727,7 +1727,13 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 status=decision.status,
                 started=started,
                 stream=stream_requested,
-                extra=f"reason={decision.reason}",
+                # ``images_field`` leads, exactly as it does on a proxied
+                # line. A refusal is still a request that CARRIED images, and
+                # omitting the field here would leave the one reader who most
+                # needs the count — someone asking why a request was refused —
+                # unable to tell "carried none" from "was never counted", the
+                # exact confusion the sentinel exists to remove.
+                extra=f"{images_field} reason={decision.reason}",
             )
         )
         return _json_error(decision.status, "invalid_request_error", decision.message)
@@ -1748,7 +1754,10 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 status=status,
                 started=started,
                 stream=stream_requested,
-                extra=f"reason={reason}",
+                # Same field set as every other terminal outcome, for the
+                # same reason: "in the SAME shape" has to include the fields,
+                # or the shape claim is only about the field ORDER.
+                extra=f"{images_field} reason={reason}",
             )
         )
 
@@ -2567,7 +2576,7 @@ async def _quota_response(
     vendor: Vendor,
     stream_requested: bool,
     access: Callable[..., None],
-    reprobe: Optional[Callable[[], Awaitable[web.StreamResponse]]] = None,
+    reprobe: Optional[Callable[[str], Awaitable[web.StreamResponse]]] = None,
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
@@ -2628,7 +2637,13 @@ async def _quota_response(
         # spend the client's request on the one thing that is not in doubt.
         # If the second attempt also refuses, the refusal below is the
         # vendor's own answer twice over, and it is sent.
-        return await reprobe()
+        # The verdict being repaired rides the REPAIR's own line. Without
+        # it, the log shows a request that took two upstream attempts and
+        # says nothing about what the first one decided — and that first
+        # verdict is the entire reason this re-probe exists. It is still one
+        # client request and one line: the evidence joins the line the
+        # re-probe writes rather than opening a second one.
+        return await reprobe(quota_evidence_fields(raw, upstream.headers))
     body = quota_error_body(
         vendor_display_name(vendor),
         hint,
@@ -2684,13 +2699,15 @@ def _quota_reprobe(
     note: str,
     images: str = IMAGES_UNCOUNTED,
     facts: Optional[RequestFacts] = None,
-) -> Callable[[], Awaitable[web.StreamResponse]]:
+) -> Callable[[str], Awaitable[web.StreamResponse]]:
     """A single re-send of a request whose quota refusal is being re-checked.
 
-    Returns a ZERO-ARGUMENT callable rather than a response, so the decision
-    to spend the second attempt stays where the evidence is
-    (:func:`_quota_response`) while the machinery for sending it stays where
-    every other send lives (:func:`_proxy`).
+    Returns a callable rather than a response, so the decision to spend the
+    second attempt stays where the evidence is (:func:`_quota_response`)
+    while the machinery for sending it stays where every other send lives
+    (:func:`_proxy`). Its one argument is REQUIRED and is the replaced
+    verdict's evidence: a default would let a caller drop it silently, which
+    is the very omission this parameter was added to close.
 
     ``body`` is BYTES and is reused verbatim — the same request, not a new
     one — which is why the caller builds this only when it holds bytes: a
@@ -2703,13 +2720,20 @@ def _quota_reprobe(
     that answers "exhausted" to everything therefore costs exactly two
     upstream requests and then answers the client.
 
+    ``first_verdict`` is what the replaced verdict decided, as ``key=value``
+    fields (:func:`model_router.quota.quota_evidence_fields`), and it rides
+    this attempt's access line. A re-probe that SUCCEEDS is the only record of
+    the verdict it repaired, so without it the log keeps the repair and drops
+    the thing repaired — the same evidence loss the re-probe was added to
+    close, one step later.
+
     ``facts`` is threaded through for the same reason it is on the first
     attempt: it is the evidence :func:`_submit_usage` counts FROM, so a
     re-probe that SUCCEEDS is a real turn for the user and must land in the
     usage ledger. Dropping it here made the repair invisible — the request
     answered, and the record said nothing happened.
     """
-    async def resend() -> web.StreamResponse:
+    async def resend(first_verdict: str) -> web.StreamResponse:
         return await _proxy(
             request,
             gateway,
@@ -2720,7 +2744,7 @@ def _quota_reprobe(
             requested_model=requested_model,
             stream_requested=stream_requested,
             started=started,
-            note=f"{note} note=quota_reprobe".strip(),
+            note=f"{note} note=quota_reprobe {first_verdict}".strip(),
             images=images,
             facts=facts,
             allow_oauth_retry=False,

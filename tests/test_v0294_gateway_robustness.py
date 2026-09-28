@@ -694,11 +694,62 @@ class QuotaReprobeTests(ChaosBase):
         )
         self.assertFalse(
             any("quota_class" in m for m in captured.output),
-            "a request that SUCCEEDED has no verdict to record, and the "
-            "first line of this test is that it succeeded",
+            "no sentence reached the user, so there is no CLASSIFIED verdict "
+            "to record — the raw evidence this repair was taken on rides the "
+            "re-probe's own line instead, which is a different field "
+            "(see test_the_repair_line_records_the_verdict_it_repaired)",
         )
         self.assertEqual(
             len([m for m in captured.output if "vendor_quota" in m]), 0,
+            captured.output,
+        )
+
+    async def test_the_repair_line_records_the_verdict_it_repaired(
+        self,
+    ) -> None:
+        """A re-probe that SUCCEEDS is the only record of the verdict it replaced.
+
+        ``quota_evidence_fields`` exists because "what carried this verdict"
+        is not recoverable from the log any other way — the deciding body is
+        written at DEBUG only, so nothing separates the vendor's own error
+        code from a reset time an hour out. That argument does not stop
+        applying when the re-probe WINS: the first attempt still decided
+        EXHAUSTED, on evidence, and the repair is only explicable if the log
+        says what it was repairing. Still one client request, one line.
+        """
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        answers = {"n": 0}
+
+        def the_vendor_recovers() -> None:
+            answers["n"] += 1
+            if answers["n"] > 1:
+                self.vendor_up.messages_status = 200
+                self.vendor_up.messages_raw = None
+
+        self.vendor_up.on_request = the_vendor_recovers
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers=self.headers(),
+                json={"model": "claude-gw/glm-5.3", "messages": []},
+            )
+        self.assertEqual(resp.status, 200, await resp.text())
+        repaired = [m for m in captured.output if "note=quota_reprobe" in m]
+        self.assertEqual(len(repaired), 1, captured.output)
+        # The vendor's own code, re-derived from the body the gateway refused
+        # on: a reader can tell a real exhaustion from a misread one.
+        self.assertIn("quota_code=1310", repaired[0])
+        # And the repair does not open a second line for the request.
+        self.assertEqual(
+            len(
+                [
+                    m
+                    for m in captured.output
+                    if "model-gateway: requested=" in m
+                ],
+            ),
+            1,
             captured.output,
         )
 
