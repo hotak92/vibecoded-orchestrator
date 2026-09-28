@@ -130,7 +130,15 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Mapping, NamedTuple, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    NamedTuple,
+    Optional,
+)
 
 import aiohttp
 from aiohttp import web
@@ -153,11 +161,13 @@ from .config import (
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
 from .quota import (
+    CLASS_EXHAUSTED,
     CLIENT_QUOTA_STATUS,
     QUOTA_STATUSES,
     classify_quota,
     find_reset_hint,
     quota_error_body,
+    quota_evidence_fields,
 )
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
@@ -1883,6 +1893,7 @@ async def _proxy(
     started: Optional[float] = None,
     note: str = "",
     allow_oauth_retry: bool = True,
+    allow_quota_reprobe: bool = True,
     facts: Optional[RequestFacts] = None,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
@@ -1894,11 +1905,17 @@ async def _proxy(
     writes, so a streamed-through request is identifiable from the log alone
     rather than only from the absence of a rewrite.
 
-    Exactly one condition is retried, and only when the body is bytes: a
-    first-party 401 whose credentials file has since changed
-    (:func:`_reread_oauth_headers`). ``allow_oauth_retry`` is the recursion
-    bound — the retried call sets it False, so a genuinely dead login answers
-    401 rather than looping.
+    Exactly two conditions are retried, and each only when the body is bytes:
+    a first-party 401 whose credentials file has since changed
+    (:func:`_reread_oauth_headers`), and a VENDOR QUOTA refusal that claims
+    the allowance is used up (:func:`_quota_reprobe`, and the reasoning is in
+    :func:`_quota_response`). A streamed body is already consumed and cannot
+    be sent twice, so such a request carries the 401 — or the refusal — to
+    the client, which is what native does when its own retry is impossible.
+    ``allow_oauth_retry`` and ``allow_quota_reprobe`` are the recursion
+    bounds: each retried call clears its own, so a genuinely dead login, and
+    a vendor that answers "exhausted" to every attempt alike, answer the
+    client instead of looping.
 
     On a stream, the SSE rewriter's held tail is flushed after the last
     upstream chunk — except on the client-disconnect path, where it is
@@ -2071,7 +2088,32 @@ async def _proxy(
                 gateway.note_vendor_success(vendor.vendor_id)
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
-                    upstream, vendor, stream_requested, access,
+                    upstream,
+                    vendor,
+                    stream_requested,
+                    access,
+                    # Only when a SECOND attempt is possible at all: the
+                    # body must still be sendable (bytes, not the consumed
+                    # iterator) and this attempt must not already be one.
+                    # Whether the re-probe is actually WORTH taking is
+                    # decided inside, on the evidence — see _quota_response.
+                    reprobe=(
+                        _quota_reprobe(
+                            request,
+                            gateway,
+                            decision,
+                            url,
+                            headers,
+                            body,
+                            requested_model=requested_model,
+                            stream_requested=stream_requested,
+                            started=started,
+                            note=note,
+                        )
+                        if allow_quota_reprobe
+                        and isinstance(body, (bytes, bytearray))
+                        else None
+                    ),
                 )
 
             relay = gateway.relay_headers(upstream)
@@ -2447,6 +2489,7 @@ async def _quota_response(
     vendor: Vendor,
     stream_requested: bool,
     access: Callable[..., None],
+    reprobe: Optional[Callable[[], Awaitable[web.StreamResponse]]] = None,
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
@@ -2467,6 +2510,24 @@ async def _quota_response(
     request asked for, so an SSE frame here would surface as a parser
     exception with the typed ``rate_limit_error`` lost — the opposite of the
     point. ``stream_requested`` survives only as a field in the access line.
+
+    An EXHAUSTED verdict is re-probed once before it is passed on, via
+    ``reprobe`` (see :func:`_quota_reprobe`). It is the one verdict that tells
+    a user to leave the model family, and it is reached from a single vendor
+    answer that may describe a condition already gone. The 2026-09-25 log
+    holds the shape: at 18:24:11.772 the same vendor answered the same model
+    with 200 (277 KB), and at 18:24:12.852 came a refusal this module
+    classifies EXHAUSTED — 1.1 SECONDS apart, and the sentence that reached
+    the user told them to switch families. What CARRIED that verdict is not
+    recoverable: the deciding body is written at DEBUG only, so nothing in
+    the log separates the vendor's own error code from a reset time an hour
+    out. That is the argument for the re-probe, and for
+    :func:`quota_evidence_fields` on the access line. A rate-limited verdict
+    is NOT re-probed: it sends the user nowhere, and a double request on
+    every thirty-second throttle is a cost with no reader.
+
+    The retried attempt writes the access line (with ``note=quota_reprobe``),
+    so the caller must not also write one: one client request, one line.
     """
     # A PEEK, deliberately, and the one place ``read(n)``'s real semantics
     # (what has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are
@@ -2482,6 +2543,14 @@ async def _quota_response(
     )
     hint = find_reset_hint(raw, upstream.headers)
     classification = classify_quota(upstream.status, raw, upstream.headers)
+    if reprobe is not None and classification == CLASS_EXHAUSTED:
+        # No delay, deliberately. What is stale here is the VERDICT, not the
+        # wait since it was issued — the evidence above is that the same
+        # vendor answered the same model a second before — so waiting would
+        # spend the client's request on the one thing that is not in doubt.
+        # If the second attempt also refuses, the refusal below is the
+        # vendor's own answer twice over, and it is sent.
+        return await reprobe()
     body = quota_error_body(
         vendor_display_name(vendor),
         hint,
@@ -2495,9 +2564,18 @@ async def _quota_response(
         # user reports "it told me to switch models", the line says whether
         # the gateway had evidence for that or fell back to the weaker
         # sentence, without needing the body it deliberately did not keep.
-        extra=(
-            f"note=vendor_quota upstream_status={upstream.status} "
-            f"quota_class={classification}"
+        extra=" ".join(
+            part
+            for part in (
+                f"note=vendor_quota upstream_status={upstream.status} "
+                f"quota_class={classification}",
+                # WHICH evidence carried the verdict, beside the verdict
+                # itself — see quota_evidence_fields. A support question
+                # ("it told me to switch models") is answerable from this
+                # line alone, without the body deliberately not kept.
+                quota_evidence_fields(raw, upstream.headers),
+            )
+            if part
         ),
     )
     # The vendor's own wait, relayed: the BODY is replaced (that is this
@@ -2512,6 +2590,56 @@ async def _quota_response(
     return web.json_response(
         body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
     )
+
+
+def _quota_reprobe(
+    request: web.Request,
+    gateway: Gateway,
+    decision: Route,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    requested_model: str,
+    stream_requested: bool,
+    started: float,
+    note: str,
+) -> Callable[[], Awaitable[web.StreamResponse]]:
+    """A single re-send of a request whose quota refusal is being re-checked.
+
+    Returns a ZERO-ARGUMENT callable rather than a response, so the decision
+    to spend the second attempt stays where the evidence is
+    (:func:`_quota_response`) while the machinery for sending it stays where
+    every other send lives (:func:`_proxy`).
+
+    ``body`` is BYTES and is reused verbatim — the same request, not a new
+    one — which is why the caller builds this only when it holds bytes: a
+    streamed body is already consumed and the refusal has to go to the client
+    instead.
+
+    ``allow_quota_reprobe=False`` is the recursion bound, and
+    ``allow_oauth_retry=False`` is deliberate too: this attempt is already a
+    repair, so it does not open a second front on the same request. A vendor
+    that answers "exhausted" to everything therefore costs exactly two
+    upstream requests and then answers the client.
+    """
+    async def resend() -> web.StreamResponse:
+        return await _proxy(
+            request,
+            gateway,
+            decision,
+            url,
+            headers,
+            body,
+            requested_model=requested_model,
+            stream_requested=stream_requested,
+            started=started,
+            note=f"{note} note=quota_reprobe".strip(),
+            allow_oauth_retry=False,
+            allow_quota_reprobe=False,
+        )
+
+    return resend
 
 
 async def _buffer_bounded(

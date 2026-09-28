@@ -25,6 +25,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `git fetch` and every mutating verb still compress, and an ordinary command
   is still rewritten.
 
+### Fixed — a stale exhaustion verdict told the user to leave the model family (v0.2.98)
+
+- A vendor's "you are out of quota" is the only refusal the gateway re-words,
+  and the one verdict that sends the user off the model family. It was reached
+  from a single answer. The 2026-09-25 log holds the shape: at 18:24:11.772
+  the vendor answered the same model with 200 (277 KB); at 18:24:12.852 came a
+  refusal the gateway classified `exhausted` — 1.1 seconds later — and the
+  sentence that reached the user told them the GLM allowance was gone for the
+  next hour, while a switch to another model and back worked. Nothing in the
+  log says what carried that verdict: the deciding body is written at DEBUG
+  only, so the vendor's own error code and a reset time an hour out are
+  indistinguishable after the fact.
+- An exhausted verdict is now re-checked once before it is passed on: the
+  request is sent again, and the user sees the verdict only if the vendor
+  refuses a second time. The re-check is taken on the EVIDENCE rather than on
+  the status — a rate-limited 429 is not re-sent, because it sends the user
+  nowhere and doubling every thirty-second throttle buys nothing — and it
+  cannot loop: the re-sent request may not re-check in turn, and only a
+  request body still buffered in memory qualifies, since a body large enough
+  to have been streamed through is already consumed.
+- The access line now names the evidence behind the verdict — `quota_code=1310`,
+  `reset_s=3621`, `quota_words=1` — beside the class it produced, so the next
+  occurrence is diagnosable from the log instead of being re-derived from the
+  code.
+- No state was involved and none was added. The gateway keeps no quota or
+  cooldown record anywhere, in memory or on disk, so no restart could have
+  made a verdict stale and no model switch clears one: every verdict is read
+  from the bytes of that one response. What was stale was the vendor's answer,
+  not the gateway's memory of it.
+
 ### Added — subagents on the qwen vendor (v0.2.98)
 
 - The module gateway shipped four agent definitions, all on Z.ai's GLM models.

@@ -304,6 +304,76 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(vendor_display_name(VENDORS["zai"]), "Z.ai")
 
 
+class EvidenceFieldTests(unittest.TestCase):
+    """What the log line must be able to say on its own.
+
+    ``quota_class`` alone cannot answer "was that verdict the vendor's own
+    code, or a reset time an hour out?" — and the body that would answer it
+    is deliberately not kept. The 2026-09-25 incident (a verdict 1.1 s after
+    the same model answered 200) was exactly that question with no way to
+    answer it, so the evidence is named beside the verdict.
+    """
+
+    def test_the_code_and_the_reset_distance_are_both_named(self) -> None:
+        body = json.dumps({"error": {"code": "1310", "reset_at": 3621}}).encode()
+        fields = quota.quota_evidence_fields(body, {})
+        self.assertIn("quota_code=1310", fields)
+        self.assertIn("reset_s=3621", fields)
+
+    def test_a_short_window_is_named_as_the_seconds_it_is(self) -> None:
+        self.assertEqual(
+            quota.quota_evidence_fields(b"{}", {"Retry-After": "30"}),
+            "reset_s=30",
+        )
+
+    def test_a_prose_only_verdict_says_so(self) -> None:
+        """Otherwise "no code and no reset" would have to be read as "the
+        weakest tier decided", which is an inference from two absences."""
+        self.assertEqual(
+            quota.quota_evidence_fields(b'{"message":"quota exceeded"}', {}),
+            "quota_words=1",
+        )
+
+    def test_no_readable_evidence_is_an_empty_fragment(self) -> None:
+        self.assertEqual(quota.quota_evidence_fields(b"", {}), "")
+        self.assertEqual(
+            quota.quota_evidence_fields(b"<html>go away</html>", {}), "",
+        )
+
+    def test_the_bracketed_spelling_names_the_same_code(self) -> None:
+        """One fact, two spellings — including in the log."""
+        fields = quota.quota_evidence_fields(
+            b"[1310] Weekly/Monthly Limit Exhausted", {},
+        )
+        self.assertIn("quota_code=1310", fields)
+        # That body says it twice over — the bracket AND the words. Both are
+        # reported; a code-backed verdict is the one that outranks the rest.
+        self.assertIn("quota_words=1", fields)
+        self.assertEqual(
+            quota.quota_evidence_fields(b"served [1310] times", {}),
+            "quota_code=1310",
+            "a bracket as the only evidence is still the vendor's own code",
+        )
+
+    def test_the_fields_agree_with_the_verdict_they_annotate(self) -> None:
+        """Re-derived by the same helpers, so the two cannot disagree."""
+        for body, headers in (
+            (b'{"error":{"code":"1310"}}', {}),
+            (b"{}", {"Retry-After": "86400"}),
+            (b'{"message":"quota exceeded"}', {}),
+            (b'{"error":{"code":"1302"}}', {}),
+            (b"", {}),
+        ):
+            with self.subTest(body=body, headers=headers):
+                verdict = quota.classify_quota(429, body, headers)
+                fields = quota.quota_evidence_fields(body, headers)
+                if verdict == quota.CLASS_EXHAUSTED:
+                    self.assertNotEqual(
+                        fields, "",
+                        "an exhausted verdict always had evidence",
+                    )
+
+
 class QuotaRelayTests(GatewayTestBase):
     async def _post(self, *, stream: bool):
         return await self.client.post(
@@ -366,6 +436,21 @@ class QuotaRelayTests(GatewayTestBase):
             any("quota_class=rate_limited" in line for line in captured.output),
             captured.output,
         )
+
+    async def test_the_access_line_names_the_evidence_not_only_the_verdict(
+        self,
+    ) -> None:
+        """The 2026-09-25 report was unanswerable for want of this line."""
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = b'{"error":{"code":"1310","reset_at":3621}}'
+        with self.assertLogs("model_router.server", level="INFO") as captured:
+            await self._post(stream=False)
+        line = next(
+            (m for m in captured.output if "vendor_quota" in m), "",
+        )
+        self.assertIn("quota_code=1310", line)
+        self.assertIn("reset_s=3621", line)
+        self.assertIn("quota_class=exhausted", line)
 
     async def test_a_streaming_client_gets_json_not_sse(self) -> None:
         """The SDK parses any non-2xx body as JSON, whatever it asked for.
