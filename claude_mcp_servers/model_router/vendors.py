@@ -222,7 +222,7 @@ VENDORS: Mapping[str, Vendor] = {
         secret_keys=("glm_api_key", "zai_api_key"),
         bare_id_prefixes=("glm",),
         catalog_path="/v1/models",
-        docs_url="https://docs.z.ai/devguide/interface/claude-code",
+        docs_url="https://docs.z.ai/devpack/tool/claude",
         # Documented by the vendor: their Claude Code page states the endpoint
         # maps Claude tier names onto GLM models server-side. A live probe on
         # 2026-09-02 returned HTTP 200 with model=glm-5.3-flash for every

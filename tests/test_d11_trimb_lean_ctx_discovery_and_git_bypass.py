@@ -166,6 +166,70 @@ class TestTrimBGitBypass:
         assert res.stdout.strip() != "", "non-git command must still rewrite"
 
 
+GIT_READONLY_VERBS = [
+    "show", "diff", "grep", "log", "blame", "cat-file", "ls-tree",
+]
+
+
+class TestTrimRReadonlyBypass:
+    """TRIM-r: read-only git INSPECTION commands run raw. lean-ctx compressed
+    `git ls-tree -r --name-only` by -94% (286/300 paths silently dropped) and
+    `git log --oneline -500` by -93% (OLDEST commits dropped, no signal) —
+    a reviewer lane lost evidence. Same FINAL-`&&`-segment segmentation as
+    TRIM-b; command-specific, NOT a blanket `git` gate."""
+
+    VERBS = GIT_READONLY_VERBS
+
+    def _run_with_binary(self, cmd: str, tmp_path: Path):
+        home = tmp_path / "home"
+        _make_fake_lean_ctx(home / ".cargo" / "bin")
+        return _run_sh(cmd, cargo_bin=home / ".cargo" / "bin",
+                       strip_path=True, fake_home=home)
+
+    @pytest.mark.parametrize("verb", VERBS)
+    def test_git_inspection_verb_passthrough(self, verb, tmp_path):
+        res = self._run_with_binary(f"git {verb} HEAD", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"git {verb} (read-only inspection) must pass through raw"
+        )
+
+    @pytest.mark.parametrize("cmd", [
+        "git status",
+        "git branch",
+        "git fetch origin",
+        "git remote -v",
+        "git add file.txt",
+        "git checkout main",
+    ])
+    def test_non_inspection_git_still_rewritten(self, cmd, tmp_path):
+        # Command-specific gate: only the seven inspection verbs step aside.
+        res = self._run_with_binary(cmd, tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            f"non-inspection git command must stay compressed: {cmd}"
+        )
+
+    def test_echo_git_show_still_rewritten(self, tmp_path):
+        # `echo git show` is NOT a real inspection → still compressed.
+        res = self._run_with_binary("echo git show", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", "echo git show must still be rewritten"
+
+    def test_final_segment_governs_git_show(self, tmp_path):
+        # `git show X && echo done` → final segment is `echo done`, NOT an
+        # inspection verb → compressed (mirrors TRIM-b segmentation).
+        res = self._run_with_binary("git show X && echo done", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "final && segment (echo done) must govern → rewritten"
+        )
+
+    def test_ordinary_command_still_rewritten(self, tmp_path):
+        res = self._run_with_binary("ls -la", tmp_path)
+        assert res.stdout.strip() != "", "non-git command must still rewrite"
+
+
 def test_sh_source_mentions_must_match_ps1():
     """Marker pin only — NOT the candidate-order parity guarantee.
 
@@ -272,6 +336,43 @@ def test_sec_raw_patterns_are_valid_in_python_re():
         _re.compile(p)
 
 
+def _extract_git_verbs(src: str, quote: str) -> list[str]:
+    """Pull the read-only git verb literals between the GIT-READONLY-VERBS
+    markers. `quote` is the string delimiter used by that language ('"' for
+    the sh-embedded python, "'" for PowerShell). Comment lines never start
+    with the delimiter, so a verb named only in a comment is not counted —
+    same discipline as _extract_patterns. BEGIN is taken as the LAST
+    occurrence and END as the first one after it, so prose comments that
+    mention the marker names (e.g. 'GIT-READONLY-VERBS-BEGIN/END' in the
+    TRIM-r comment block) cannot widen the extracted block."""
+    begin = src.rindex("GIT-READONLY-VERBS-BEGIN")
+    end = src.index("GIT-READONLY-VERBS-END", begin)
+    block = src[begin:end]
+    out = []
+    for line in block.splitlines():
+        line = line.strip().rstrip(",")
+        if len(line) >= 2 and line.startswith(quote) and line.endswith(quote):
+            out.append(line[1:-1])
+    return out
+
+
+def test_git_readonly_verb_list_parity_sh_ps1():
+    """The read-only git verb lists in the two siblings are identical AND
+    equal the canonical seven verbs (C-mirror discipline, same shape as
+    test_sec_raw_pattern_list_parity_sh_ps1 — extraction, not a source
+    scan, so a verb in a comment cannot satisfy it)."""
+    sh_verbs = _extract_git_verbs(SH_HOOK.read_text(encoding="utf-8"), '"')
+    ps1_verbs = _extract_git_verbs(PS1_HOOK.read_text(encoding="utf-8"), "'")
+    assert sh_verbs, "sh GIT-READONLY-VERBS block missing or unparsed"
+    assert sh_verbs == ps1_verbs, (
+        "git read-only verb lists diverged between .sh and .ps1"
+    )
+    assert sh_verbs == GIT_READONLY_VERBS, (
+        f"git read-only verb list must be exactly the canonical seven, "
+        f"got {sh_verbs!r}"
+    )
+
+
 # ─── pwsh-gated .ps1 behavioural parity ──────────────────────────────────
 
 
@@ -320,6 +421,37 @@ class TestPs1Parity:
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() == "", (
             "ps1 credential-bearing command must run raw"
+        )
+
+    @pytest.mark.parametrize("verb", GIT_READONLY_VERBS)
+    def test_ps1_git_inspection_verb_passthrough(self, verb, tmp_path):
+        res = self._run_ps1(f"git {verb} HEAD", tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"ps1 git {verb} (read-only inspection) must pass through raw"
+        )
+
+    def test_ps1_echo_git_show_still_rewritten(self, tmp_path):
+        res = self._run_ps1("echo git show", tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "ps1 echo git show must still be rewritten"
+        )
+
+    def test_ps1_final_segment_governs_git_show(self, tmp_path):
+        # `git show X && echo done` → final segment is `echo done` →
+        # compressed (TRIM-r uses TRIM-b's final-segment segmentation).
+        res = self._run_ps1("git show X && echo done", tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "ps1 final && segment (echo done) must govern → rewritten"
+        )
+
+    def test_ps1_non_inspection_git_still_rewritten(self, tmp_path):
+        res = self._run_ps1("git status", tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "ps1 non-inspection git command must stay compressed"
         )
 
 

@@ -13,7 +13,6 @@
     barWidth,
     cardVisible,
     describeCountdown,
-    describeTokens,
     fetchUsage,
     INITIAL_CARD_STATE,
     nextPollMs,
@@ -91,13 +90,6 @@
                 {/if}
               </div>
             {/each}
-            {#if vendor.tokens}
-              <div class="usage-row">
-                <span class="usage-label">mo</span>
-                <span class="usage-tokens">{describeTokens(vendor.tokens)}</span>
-                <span class="usage-reset">no quota endpoint — tokens, not a %</span>
-              </div>
-            {/if}
           </div>
         {/each}
       </div>
@@ -197,13 +189,9 @@
     font-size: 11px;
     color: var(--color-muted, #475569);
   }
-  .usage-unknown,
-  .usage-tokens {
+  .usage-unknown {
     grid-column: 2 / 4;
     color: var(--color-mid, #94a3b8);
-  }
-  .usage-tokens {
-    font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
   }
   .usage-muted {
     color: var(--color-muted, #475569);

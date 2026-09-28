@@ -201,9 +201,19 @@ def _fake_hub(status: int, body: str):
 
 
 def _run_resolver_live(
-    tmp_path: Path, arg1: str, key: str, secrets_dir: Path, port: int
+    tmp_path: Path,
+    arg1: str,
+    key: str,
+    secrets_dir: Path,
+    port: int,
+    *,
+    shared_only: bool = False,
 ) -> subprocess.CompletedProcess:
-    """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env)."""
+    """Invoke the ps1 resolver against a LIVE hub on ``port`` (token via env).
+
+    ``shared_only`` prepends the ``-SharedOnly`` switch, so that mode's tier-1
+    behaviour is testable against a hub that answers — the offline
+    ``_run_resolver_argv`` helper cannot exercise it."""
     import os
 
     env = {
@@ -215,8 +225,9 @@ def _run_resolver_live(
         "VCT_SECRETS_DIR": str(secrets_dir),
     }
     (tmp_path / "home").mkdir(exist_ok=True)
+    argv = ["-SharedOnly", arg1, key] if shared_only else [arg1, key]
     return subprocess.run(
-        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), arg1, key],
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), *argv],
         capture_output=True,
         text=True,
         env=env,
@@ -509,3 +520,158 @@ def test_ps1_pseudo_name_exclusion_is_case_sensitive(tmp_path, optout_store):
     cp = _run_resolver(tmp_path, "Shared", "OPTOUT_KEY", optout_store)
     assert cp.returncode != 0, cp.stdout
     assert cp.stdout == ""
+
+
+# ─── v0.2.98: --shared-only / -SharedOnly — VCO's slot only ─────────────
+#
+# PS1 sibling of Test 21 in tests/test_vct_secrets_resolve.sh (owner
+# ruling 2026-09-26: VCO's OWN consumers resolve only VCO's shared slot —
+# never a project scope, never a project `.env`). TWO spellings, one
+# mode: `pwsh -File` binds a leading `-`-token as a parameter name, so
+# the -File spelling is the `-SharedOnly` switch (what real callers,
+# including summary_backends.py on Windows, use); the `--shared-only`
+# first-argument spelling byte-matches the .sh sibling and arrives via
+# -Command / in-shell invocation.
+
+
+def _run_resolver_argv(
+    tmp_path: Path, secrets_dir: Path, *args: str
+) -> subprocess.CompletedProcess:
+    """Invoke the ps1 resolver with explicit argv and tier 1 unreachable."""
+    import os
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path / "home"),
+        "VCT_HUB_PORT": str(_dead_port()),
+        "VCT_STATE_DIR": str(tmp_path / "empty-state"),
+        "VCT_SECRETS_DIR": str(secrets_dir),
+    }
+    (tmp_path / "home").mkdir(exist_ok=True)
+    return subprocess.run(
+        [_PWSH, "-NoProfile", "-NonInteractive", "-File", str(RESOLVER), *args],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+
+
+@pytest.fixture()
+def sharedonly_store(tmp_path: Path) -> Path:
+    root = tmp_path / "sharedonly-store"
+    (root / "shared").mkdir(parents=True)
+    (root / "projects" / "sodemo").mkdir(parents=True)
+    return root
+
+
+def test_ps1_shared_only_resolves_shared_copy(tmp_path, sharedonly_store):
+    """(a) shared/<key> present → returned in shared-only mode."""
+    (sharedonly_store / "shared" / "SHARED_KEY").write_text(
+        "shared-slot-value", encoding="utf-8"
+    )
+    cp = _run_resolver_argv(tmp_path, sharedonly_store, "-SharedOnly", "sodemo", "SHARED_KEY")
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-slot-value"
+
+
+def test_ps1_shared_only_never_reads_project_slot(tmp_path, sharedonly_store):
+    """(b) projects/<NAME>/<key> present and shared absent → NOT returned;
+    the miss diagnostic names the mode (it must not claim tier 3 was
+    consulted)."""
+    (sharedonly_store / "projects" / "sodemo" / "SHARED_KEY").write_text(
+        "project-slot-value", encoding="utf-8"
+    )
+    cp = _run_resolver_argv(tmp_path, sharedonly_store, "-SharedOnly", "sodemo", "SHARED_KEY")
+    assert cp.returncode != 0, cp.stdout
+    assert cp.stdout == ""
+    assert "--shared-only" in cp.stderr, cp.stderr
+    assert "the project .env (tier 3) are not consulted" in cp.stderr, cp.stderr
+    assert "project-slot-value" not in (cp.stdout + cp.stderr)
+
+
+def test_ps1_shared_only_never_reads_project_dotenv(tmp_path, sharedonly_store):
+    """(c) a project .env holding the key → NOT returned, even when the
+    project arg is that folder (tier 3 is not consulted at all)."""
+    proj = tmp_path / "sharedonly-proj"
+    proj.mkdir()
+    (proj / ".env").write_text("SHARED_KEY=proj-env-value\n", encoding="utf-8")
+    cp = _run_resolver_argv(tmp_path, sharedonly_store, "-SharedOnly", str(proj), "SHARED_KEY")
+    assert cp.returncode != 0, cp.stdout
+    assert cp.stdout == ""
+    assert "proj-env-value" not in (cp.stdout + cp.stderr)
+
+
+def test_ps1_shared_only_dash_dash_spelling_accepted(tmp_path, sharedonly_store):
+    """The .sh-sibling `--shared-only` first-argument spelling reaches the
+    same mode when the script is invoked via -Command (pwsh -File binds a
+    leading `-`-token as a parameter, so -File callers use -SharedOnly)."""
+    (sharedonly_store / "shared" / "SHARED_KEY").write_text(
+        "shared-slot-value", encoding="utf-8"
+    )
+    import os
+
+    env = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": str(tmp_path / "home"),
+        "VCT_HUB_PORT": str(_dead_port()),
+        "VCT_STATE_DIR": str(tmp_path / "empty-state"),
+        "VCT_SECRETS_DIR": str(sharedonly_store),
+    }
+    (tmp_path / "home").mkdir(exist_ok=True)
+    cp = subprocess.run(
+        [
+            _PWSH, "-NoProfile", "-NonInteractive", "-Command",
+            f"& '{RESOLVER}' --shared-only sodemo SHARED_KEY",
+        ],
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=60,
+    )
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-slot-value"
+
+
+def test_ps1_shared_only_key_not_active_falls_to_shared_store(
+    tmp_path, sharedonly_store
+):
+    """Tier 1 is UNCHANGED in this mode: a hub ``key_not_active`` (404) falls
+    through to ``shared/<key>`` exactly as it does in the full chain — the mode
+    reduces tier 2 to that one leg, it does not gate it off.
+
+    Pinned behaviourally because a v0.2.98 review lane read the Python control
+    flow as refusing here where the shell served; all three siblings fall
+    through by construction. Parity cases:
+    ``test_shared_only_still_falls_through_a_hub_pause`` in
+    tests/test_agent_secrets.py and
+    ``test_shared_only_key_not_active_falls_to_shared_store`` in
+    tests/test_vct_secrets_resolve.sh.
+    """
+    (sharedonly_store / "shared" / "PAUSED_KEY").write_text(
+        "shared-after-pause", encoding="utf-8"
+    )
+    # A per-project copy exists too, so the assertion below proves the mode's
+    # SCOPE as well: the shared leg answers, the project leg must not.
+    (sharedonly_store / "projects" / "sodemo" / "PAUSED_KEY").write_text(
+        "project-after-pause", encoding="utf-8"
+    )
+    body = '{"error": {"code": "key_not_active", "message": "key PAUSED_KEY paused"}}'
+    with _fake_hub(404, body) as port:
+        cp = _run_resolver_live(
+            tmp_path, "sodemo", "PAUSED_KEY", sharedonly_store, port, shared_only=True
+        )
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "shared-after-pause"
+    assert "project-after-pause" not in (cp.stdout + cp.stderr)
+
+
+def test_ps1_legacy_positional_still_reads_project_slot(tmp_path, sharedonly_store):
+    """(e) REGRESSION PIN: the legacy positional form still resolves the
+    project's own slot — the very value (b) refused must still serve."""
+    (sharedonly_store / "projects" / "sodemo" / "SHARED_KEY").write_text(
+        "project-slot-value", encoding="utf-8"
+    )
+    cp = _run_resolver_argv(tmp_path, sharedonly_store, "sodemo", "SHARED_KEY")
+    assert cp.returncode == 0, cp.stderr
+    assert cp.stdout == "project-slot-value"

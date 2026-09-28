@@ -17,10 +17,13 @@ it went unread by the Python consumers. This module closes both halves:
   GUI writes) when the hub answers, else the file store
   ``$VCT_SECRETS_DIR/shared/openai_api_key`` through the ``vct`` CLI (its
   write guards apply).
-* **Resolve** — :func:`resolve_openai_api_key`: ``$OPENAI_API_KEY`` when the
-  caller's environment sets it, else the canonical chain
-  (:func:`vco_lib.agent_secrets.get` — keychain, file store, the project's
-  own ``.env``). Every Python reader goes through it.
+* **Resolve** — :func:`resolve_openai_api_key`: VCO's OWN slot only — the
+  shared ``openai_api_key`` (launcher keychain through the hub, else
+  ``~/.vct-secrets/shared/openai_api_key``), through
+  :func:`vco_lib.agent_secrets.get` in its shared-only mode. NOT
+  ``$OPENAI_API_KEY``, NOT a per-project binding, NOT the project's
+  ``.env``: a project's key is the project's (owner ruling 2026-09-26).
+  Every Python reader goes through it.
 * **Migrate** — :func:`migrate_dotenv_openai_key`: a pre-v0.2.97 root
   ``.env`` line VCO wrote (under its ``# OpenAI (for embeddings)`` header)
   is removed ONLY on value evidence — it equals what the store holds,
@@ -40,11 +43,16 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 #: The one name of the slot (``vct-module.json`` ``bundled_secrets``).
 OPENAI_SECRET_NAME = "openai_api_key"
-#: The environment variable the consumers (and the OpenAI SDKs) read.
+#: The variable VCO no longer reads for its own key (v0.2.98). Kept for the
+#: two places it still means something: the legacy ``.env`` LINE key
+#: :func:`migrate_dotenv_openai_key` removes, and the once-per-process warning
+#: :func:`_warn_env_var_ignored` emits when a pre-v0.2.98 env-var user would
+#: otherwise lose the key silently. A project shell may export its OWN key
+#: under this name — that is exactly why it must not answer for VCO.
 OPENAI_ENV_VAR = "OPENAI_API_KEY"
 #: The comment line ``install.py`` wrote right above the key before v0.2.97
 #: — the provenance of a VCO-written ``.env`` line.
@@ -63,27 +71,257 @@ class MigrationUnavailable(RuntimeError):
     answer. The message names the interpreter and the reason, never a value."""
 
 
-def resolve_openai_api_key(project: Optional[str] = None) -> str:
-    """The OpenAI key for ``project`` (``None`` → the current directory), or
-    ``""`` when none is configured anywhere.
+#: One warning per process: the env var is a process-wide fact, and a per-call
+#: repeat would be noise in an embedding loop.
+_warned_env_var = False
 
-    ``$OPENAI_API_KEY`` wins (an explicit per-process choice, and what the
-    OpenAI tooling itself reads); otherwise the canonical three-tier chain
-    answers once per project per process — a miss costs one bounded
+
+def _warn_env_var_ignored(unreadable: str = "") -> None:
+    """Say ONCE, on stderr, that ``$OPENAI_API_KEY`` is set while VCO's own
+    slot did not answer — the one way a pre-v0.2.98 env-var user can lose the
+    key without being told.
+
+    Names the variable and, on a clean miss, the remedy; never a value. The
+    two cases are DIFFERENT claims and must not share a sentence:
+
+    * ``unreadable != ""`` — the slot provably could NOT be read (a locked
+      keychain, a refusal, an OS error). The key may be sitting there right
+      now, so asserting it is absent would be false, and the "store the key"
+      remedy would talk the user into a SECOND copy — the very divergence
+      this module exists to prevent. Name the failure and stop there.
+    * ``unreadable == ""`` — everything else. The sentence therefore claims
+      only what is ALWAYS true (no key was RESOLVED from the slot), never
+      that the slot is empty: an unreachable hub with file fallback on also
+      arrives here as a plain ``SecretNotFound`` (see
+      :func:`~vco_lib.agent_secrets.get`'s tail), and "hub down" is not
+      "empty". The remedy carries its own precondition for the same reason.
+
+    Only fires on a MISS (when the slot answered there is nothing to report),
+    and never raises: a diagnostic must not be the thing that breaks an
+    embedding run."""
+    global _warned_env_var
+    if _warned_env_var or not os.environ.get(OPENAI_ENV_VAR, "").strip():
+        return
+    _warned_env_var = True
+    import sys
+
+    shared = (
+        f"{OPENAI_ENV_VAR} is set — VCO no longer reads that variable, because "
+        f"a project shell may export ITS OWN key there and a project's key must "
+        f"never be spent on VCO. "
+    )
+    if unreadable:
+        print(
+            f"VCO: could not READ VCO's own OpenAI slot "
+            f"({OPENAI_SECRET_NAME}): {unreadable}. That is a read failure, "
+            f"not an absence — the key may still be stored, so do NOT save a "
+            f"second copy. " + shared + "Unlock the keychain / restart the "
+            "launcher (vct-hub), then retry.",
+            file=sys.stderr,
+        )
+        return
+    print(
+        f"VCO: no OpenAI key was resolved from VCO's own slot "
+        f"({OPENAI_SECRET_NAME}). " + shared
+        + f"Store the key VCO should use in VCO's slot: "
+        f"`vct set --shared --key {OPENAI_SECRET_NAME}` or the launcher's "
+        f"Preferences → Secrets. If you already stored one, the launcher "
+        f"(vct-hub) must be running for the keychain to be readable — check "
+        f"that before saving another copy.",
+        file=sys.stderr,
+    )
+
+
+def resolve_openai_api_key(project: Optional[str] = None) -> str:
+    """VCO's OpenAI key for ``project`` (``None`` → the current directory), or
+    ``""`` when VCO has none configured.
+
+    SCOPE RULE (owner ruling 2026-09-26): VCO's consumers use VCO's own slot
+    and nothing else. The ONE source is the shared ``openai_api_key`` slot —
+    the launcher keychain row through the hub, else
+    ``~/.vct-secrets/shared/openai_api_key``. ``$OPENAI_API_KEY`` is NOT read
+    (a project's key exported in that project's shell must not pay for VCO's
+    embeddings), and neither is a per-project secret binding nor the project's
+    own ``.env``.
+
+    ``project`` is only the REQUESTER identity: the hub's per-(secret ×
+    requester) pause matrix gates the keychain leg with it, and the
+    requester's ``.no-shared-fallback`` marker gates the file-store leg. It
+    never widens the lookup to that project's buckets.
+
+    Answers once per project per process — a miss costs one bounded
     localhost request, not one per embedding call."""
-    env = os.environ.get(OPENAI_ENV_VAR, "").strip()
-    if env:
-        return env
     cache_key = project or ""
     if cache_key not in _resolved:
         from vco_lib import agent_secrets
 
+        unreadable = ""
         try:
-            _resolved[cache_key] = agent_secrets.get(OPENAI_SECRET_NAME, project=project).strip()
-        except (agent_secrets.ResolverError, OSError, ValueError):
+            _resolved[cache_key] = agent_secrets.get(
+                OPENAI_SECRET_NAME, project=project, shared_only=True,
+            ).strip()
+        except agent_secrets.SecretNotFound:
+            # The slot answered and holds no such key: a PROVABLE absence.
             _resolved[cache_key] = ""
+        except (agent_secrets.ResolverError, OSError, ValueError) as exc:
+            # KeychainLocked / HubUnreachable / Forbidden / OSError — we could
+            # NOT read the slot. Never reported as "no key in the slot".
+            _resolved[cache_key] = ""
+            unreadable = type(exc).__name__
+        if not _resolved[cache_key]:
+            _warn_env_var_ignored(unreadable)
     return _resolved[cache_key]
 
+
+def env_var_no_longer_read() -> str:
+    """Why the pre-v0.2.98 env-var cohort owes an action, or ``""``.
+
+    VCO used to take its OpenAI key from ``$OPENAI_API_KEY``. v0.2.98 reads
+    VCO's own slot and nothing else, so a user who configured VCO that way can
+    lose a working setup without being told: the variable is still exported,
+    the slot is empty, and the embeddings that answered yesterday now cannot.
+    This predicate is what the install-time UPDATE_DEFERRED entry
+    (``openai_key_env_var_no_longer_read``) is built from — the durable
+    channel the owner's "never a silent loss" requires.
+
+    Holds when reading the variable WOULD have supplied a key VCO's slot does
+    not have: ``$OPENAI_API_KEY`` is non-empty in this process's environment
+    AND the shared ``openai_api_key`` slot resolves empty. Returns a one-line
+    description of exactly those two facts — never a value, not even a length.
+
+    Deliberately does NOT go through :func:`resolve_openai_api_key`: that
+    answers once per project per process, and a cached miss from earlier in
+    the same run would make this decision stale. It probes the same one store
+    (``agent_secrets.get`` in shared-only mode) without the cache.
+
+    Only ONE resolver outcome counts as proof, and the two that do not are
+    named rather than swallowed by a broad ``except``:
+
+    * ``SecretNotFound`` — every tier was consulted and none held the key.
+      Proven: this is the claim.
+    * ``AccessDenied`` — the hub says the key is not ACTIVE for this requester
+      (paused in the launcher). That is the user's own choice and NOT an empty
+      slot, so it makes no claim.
+    * ``KeychainLocked`` — the keychain could not be read at all, so the slot
+      may well hold the key. A claim here would invent a finding from a failed
+      probe.
+
+    (A hub that is DOWN arrives as ``SecretNotFound`` once the file store has
+    also missed — the chain reports "consulted everything, found nothing". The
+    entry is worded for that: it says the slot resolves empty, which is true,
+    and it clears itself on the next update.)
+
+    Callers gate on the embedding backend: the cohort owes this action where
+    an OpenAI key is what VCO is meant to embed with. A machine on the default
+    ``qwen3`` backend never read the variable for VCO's benefit, so an
+    exported key there is noise, not a finding.
+    """
+    if not os.environ.get(OPENAI_ENV_VAR, "").strip():
+        return ""
+    from vco_lib import agent_secrets
+
+    try:
+        present = agent_secrets.get(OPENAI_SECRET_NAME, shared_only=True).strip()
+    except agent_secrets.SecretNotFound:
+        present = ""
+    except (agent_secrets.ResolverError, OSError, ValueError):
+        return ""
+    if present:
+        return ""
+    return (
+        f"{OPENAI_ENV_VAR} is set in this process's environment and VCO's own "
+        f"slot ({OPENAI_SECRET_NAME}) resolves empty"
+    )
+
+
+#: The condition id of the pre-v0.2.98 migration notice (registered in
+#: ``vco_lib/deferral_conditions.toml``: ``action_required``, owner
+#: ``install.py``, ``clear_probe = "owned-drop-when-absent"``).
+OPENAI_ENV_VAR_CID = "openai_key_env_var_no_longer_read"
+
+
+def emit_env_var_deferral(
+    report: Any,
+    active_embedding: Optional[str],
+    *,
+    log_event: Optional[Callable[..., None]] = None,
+) -> bool:
+    """Emit :data:`OPENAI_ENV_VAR_CID` for the pre-v0.2.98 env-var cohort.
+
+    The durable half of the owner's "never a silent loss" (2026-09-26): a
+    machine whose VCO embeddings were paid for by an exported
+    ``$OPENAI_API_KEY`` stops embedding the moment it updates, and this entry
+    in the ledger is the only channel that reaches the user. The verdict comes
+    from :func:`env_var_no_longer_read`, which proves the gap or says nothing.
+
+    install.py calls this AFTER its step-8 ``.env`` writers, so a key the
+    user passed with ``--openai-key`` in this same run is already in the
+    slot and the probe cannot report a gap that this run just closed.
+
+    ``active_embedding`` is taken as a PRIMITIVE rather than install.py's
+    ``embed_config`` dict (same reason
+    :func:`vco_lib.codegraph_deferrals.emit_code_backend_down` takes slot and
+    model): this module then has no dependency on the installer's config
+    shape. The GATE lives here, not at the call-site, because it is part of
+    the condition's meaning — an OpenAI key is only VCO's problem where VCO is
+    configured to embed with OpenAI. A machine on the default ``qwen3``
+    backend that happens to export the variable for unrelated tools owes
+    nothing and is not nagged; the runtime warning
+    (:func:`_warn_env_var_ignored`) covers the moment such a machine switches
+    backends.
+
+    Data-only above the probe: the entry construction, the ``None``-guard and
+    the emit soft-fail are :func:`vco_lib.deferral_report.safe_emit_entry`'s
+    (v0.2.77 Part 7a convergence). Returns ``True`` when the entry landed.
+
+    Nothing here reads the key, and nothing it writes carries a value.
+    """
+    if str(active_embedding or "") != "openai":
+        return False
+    try:
+        evidence = env_var_no_longer_read()
+    except Exception as exc:  # noqa: BLE001 — a diagnostic never breaks a run
+        if log_event is not None:
+            try:
+                log_event(
+                    "9/10", "warn",
+                    f"could not emit {OPENAI_ENV_VAR_CID} deferral: {exc}",
+                )
+            except Exception:
+                pass
+        return False
+    if not evidence:
+        return False
+
+    from vco_lib.deferral_report import safe_emit_entry
+
+    return safe_emit_entry(
+        report,
+        condition_id=OPENAI_ENV_VAR_CID,
+        title="VCO no longer reads OPENAI_API_KEY for its own embeddings",
+        detected=evidence,
+        why_deferred=(
+            "VCO used to take its OpenAI key from $OPENAI_API_KEY. Since "
+            "v0.2.98 it reads VCO's own shared slot and nothing else, because "
+            "a project shell may export ITS OWN key under that name and a "
+            "project's key must never be spent on VCO. This machine is on the "
+            "OpenAI embedding backend and its slot is empty, so embeddings "
+            "that used to work will not until the key VCO should use is "
+            "stored in VCO's slot."
+        ),
+        command_to_apply=(
+            "Store the key VCO should use in VCO's own slot: "
+            "`vct set --shared --key openai_api_key` (value on stdin, never in "
+            "argv or shell history), or in the launcher,\n"
+            "Preferences → Secrets → Shared (this user)\n"
+            "Nothing else needs changing, and this entry clears itself on the "
+            "next update. If you deliberately paused the slot, leave it: "
+            "dismiss this entry with `python -m vco_lib.project_init "
+            "dismiss-deferral --condition-id " + OPENAI_ENV_VAR_CID + "`."
+        ),
+        log_event=log_event,
+        log_step="9/10",
+    )
 
 def _store_in_keychain(value: str) -> bool:
     """``True`` when the hub stored the value in the launcher keychain's
@@ -147,7 +385,7 @@ def describe_store(where: str) -> str:
     if where == "keychain":
         return (
             "the launcher keychain (shared slot `openai_api_key` — "
-            "Preferences → Special Secrets)"
+            "Preferences → Secrets)"
         )
     root = os.environ.get("VCT_SECRETS_DIR", "").strip() or "~/.vct-secrets"
     return f"the file store ({root}/shared/{OPENAI_SECRET_NAME})"
@@ -272,7 +510,7 @@ def migrate_dotenv_openai_key_via(
         f"  .env: the OpenAI key VCO wrote there was LEFT in place — "
         f"{result['detail']}. Remove the `OPENAI_API_KEY=` line under "
         "`# OpenAI (for embeddings)` once the key is stored (launcher "
-        "Preferences → Special Secrets)."
+        "Preferences → Secrets)."
     )
     note("warn", f".env openai key left: {result['detail']}", {"status": result["status"]})
 
@@ -363,6 +601,9 @@ __all__ = [
     "StoreFailed",
     "SECRET_ARGV_FLAGS",
     "describe_store",
+    "OPENAI_ENV_VAR_CID",
+    "emit_env_var_deferral",
+    "env_var_no_longer_read",
     "migrate_dotenv_openai_key",
     "migrate_dotenv_openai_key_via",
     "redact_secret_argv",

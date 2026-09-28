@@ -130,7 +130,15 @@ import logging
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Mapping, NamedTuple, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Mapping,
+    NamedTuple,
+    Optional,
+)
 
 import aiohttp
 from aiohttp import web
@@ -153,11 +161,13 @@ from .config import (
 from .context_table import ContextTableLoader
 from .fileperms import OwnerOnlyState
 from .quota import (
+    CLASS_EXHAUSTED,
     CLIENT_QUOTA_STATUS,
     QUOTA_STATUSES,
     classify_quota,
     find_reset_hint,
     quota_error_body,
+    quota_evidence_fields,
 )
 from .routing import Route, RouteError, route as route_model
 from .secrets import VendorKeyResolver
@@ -1188,6 +1198,61 @@ def _log_safe(value: object) -> str:
     )
 
 
+#: The access-line field for a request whose image blocks could not be
+#: counted — an unparseable body, a body past the rewrite buffer, or a defect
+#: in the counter. It is a VALUE, not an omission: "carried no image" reads
+#: ``images=0`` and only "could not count" reads ``images=?``, so after the
+#: fact the two can never be confused.
+IMAGES_UNCOUNTED = "images=?"
+
+
+def _count_image_blocks(blocks: Any) -> int:
+    """Count ``type == "image"`` blocks, walking into every nested ``content``.
+
+    A subagent that read an image file does not put the block at the top of a
+    message: it arrives inside a ``tool_result`` block's own ``content[]``
+    array, so a top-level-only scan would report 0 for exactly the requests
+    this count exists to identify. Any block that carries a ``content`` list
+    is walked (message and ``tool_result`` shapes alike, so the count does not
+    depend on where the client nested it).
+    """
+    if not isinstance(blocks, list):
+        return 0
+    total = 0
+    for block in blocks:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") == "image":
+            total += 1
+        if "content" in block:
+            total += _count_image_blocks(block["content"])
+    return total
+
+
+def _images_field(payload: Any) -> str:
+    """The access line's ``images=N`` — a COUNT, never a content byte.
+
+    Whether a request carried an image is the one question the access log
+    could not previously answer, and it is decisive: the gateway forwards the
+    body verbatim, so an image the client never sent cannot be lost on the
+    way through — but nothing recorded whether one arrived at all. A count
+    answers that after the fact without logging, formatting or even reading
+    a single byte of image data or message text.
+
+    Always returns a field — ``images=?`` included — so the line can never be
+    read as "no image" when the truth is "not counted"; the sentinel is the
+    difference between evidence and silence. And a failure to count must not
+    fail or delay the request: a diagnostic never costs a chat, so every
+    defect lands on the sentinel.
+    """
+    try:
+        if not isinstance(payload, dict):
+            return IMAGES_UNCOUNTED
+        return f"images={_count_image_blocks(payload.get('messages'))}"
+    except Exception:  # noqa: BLE001 — a diagnostic must never cost a chat
+        return IMAGES_UNCOUNTED
+
+
 def _access_line(
     *,
     requested: str,
@@ -1563,6 +1628,10 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: span is what lets the routed name reach the upstream without the body
     #: being parsed — see :func:`_splice_literal`.
     model_field: Optional[HeadField] = None
+    #: The access line's image-block count. The sentinel until a parsed body
+    #: says otherwise: an over-buffer or unparseable body is never parsed a
+    #: second time just to count it, and "not counted" must not read as "0".
+    images_field = IMAGES_UNCOUNTED
     if over_buffer:
         # Deliberately NOT parsed and deliberately NOT refused: the body is
         # past what this daemon will hold, so it goes upstream as a stream and
@@ -1631,6 +1700,9 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             payload = parsed
             requested_model = payload.get("model") or ""
             stream_requested = bool(payload.get("stream"))
+            # Counted from the ALREADY-PARSED body — no second parse, and the
+            # bytes that go upstream are untouched by it either way.
+            images_field = _images_field(payload)
 
     decision: "Route | RouteError"
     if unparseable:
@@ -1655,7 +1727,13 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 status=decision.status,
                 started=started,
                 stream=stream_requested,
-                extra=f"reason={decision.reason}",
+                # ``images_field`` leads, exactly as it does on a proxied
+                # line. A refusal is still a request that CARRIED images, and
+                # omitting the field here would leave the one reader who most
+                # needs the count — someone asking why a request was refused —
+                # unable to tell "carried none" from "was never counted", the
+                # exact confusion the sentinel exists to remove.
+                extra=f"{images_field} reason={decision.reason}",
             )
         )
         return _json_error(decision.status, "invalid_request_error", decision.message)
@@ -1676,7 +1754,10 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 status=status,
                 started=started,
                 stream=stream_requested,
-                extra=f"reason={reason}",
+                # Same field set as every other terminal outcome, for the
+                # same reason: "in the SAME shape" has to include the fields,
+                # or the shape claim is only about the field ORDER.
+                extra=f"{images_field} reason={reason}",
             )
         )
 
@@ -1838,6 +1919,7 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         stream_requested=stream_requested,
         started=started,
         note=note,
+        images=images_field,
         facts=facts,
     )
 
@@ -1882,7 +1964,9 @@ async def _proxy(
     stream_requested: bool = False,
     started: Optional[float] = None,
     note: str = "",
+    images: str = IMAGES_UNCOUNTED,
     allow_oauth_retry: bool = True,
+    allow_quota_reprobe: bool = True,
     facts: Optional[RequestFacts] = None,
 ) -> web.StreamResponse:
     """Forward one request upstream and relay the answer.
@@ -1894,11 +1978,17 @@ async def _proxy(
     writes, so a streamed-through request is identifiable from the log alone
     rather than only from the absence of a rewrite.
 
-    Exactly one condition is retried, and only when the body is bytes: a
-    first-party 401 whose credentials file has since changed
-    (:func:`_reread_oauth_headers`). ``allow_oauth_retry`` is the recursion
-    bound — the retried call sets it False, so a genuinely dead login answers
-    401 rather than looping.
+    Exactly two conditions are retried, and each only when the body is bytes:
+    a first-party 401 whose credentials file has since changed
+    (:func:`_reread_oauth_headers`), and a VENDOR QUOTA refusal that claims
+    the allowance is used up (:func:`_quota_reprobe`, and the reasoning is in
+    :func:`_quota_response`). A streamed body is already consumed and cannot
+    be sent twice, so such a request carries the 401 — or the refusal — to
+    the client, which is what native does when its own retry is impossible.
+    ``allow_oauth_retry`` and ``allow_quota_reprobe`` are the recursion
+    bounds: each retried call clears its own, so a genuinely dead login, and
+    a vendor that answers "exhausted" to every attempt alike, answer the
+    client instead of looping.
 
     On a stream, the SSE rewriter's held tail is flushed after the last
     upstream chunk — except on the client-disconnect path, where it is
@@ -1928,7 +2018,12 @@ async def _proxy(
 
     def access(status: int, *, stream: bool, extra: str = "") -> None:
         nonlocal accumulator
-        parts = [part for part in (extra, note) if part]
+        # ``images`` FIRST and always, including 0: it is the one field that
+        # must be readable on every line, so it cannot ride in ``extra``,
+        # where each caller decides what appears — an absent field could not
+        # be told apart from a counter that never ran.
+        parts = [images]
+        parts.extend(part for part in (extra, note) if part)
         # Once, however many passes were abandoned: the handler may already
         # have put it in `note` for a REQUEST-side failure, and one line
         # saying the same thing twice reads as two events.
@@ -2051,6 +2146,13 @@ async def _proxy(
                         stream_requested=stream_requested,
                         started=started,
                         note=f"{note} note=oauth_reread_retry".strip(),
+                        images=images,
+                        # `facts` is what _submit_usage counts FROM: without
+                        # it the retry's successful turn writes no ledger row
+                        # (server.py::_submit_usage returns early on
+                        # `facts is None`), so the repaired request answered
+                        # the client but vanished from the usage record.
+                        facts=facts,
                         allow_oauth_retry=False,
                     )
             vendor = decision.vendor
@@ -2071,7 +2173,34 @@ async def _proxy(
                 gateway.note_vendor_success(vendor.vendor_id)
             if vendor is not None and upstream.status in QUOTA_STATUSES:
                 return await _quota_response(
-                    upstream, vendor, stream_requested, access,
+                    upstream,
+                    vendor,
+                    stream_requested,
+                    access,
+                    # Only when a SECOND attempt is possible at all: the
+                    # body must still be sendable (bytes, not the consumed
+                    # iterator) and this attempt must not already be one.
+                    # Whether the re-probe is actually WORTH taking is
+                    # decided inside, on the evidence — see _quota_response.
+                    reprobe=(
+                        _quota_reprobe(
+                            request,
+                            gateway,
+                            decision,
+                            url,
+                            headers,
+                            body,
+                            requested_model=requested_model,
+                            stream_requested=stream_requested,
+                            started=started,
+                            note=note,
+                            images=images,
+                            facts=facts,
+                        )
+                        if allow_quota_reprobe
+                        and isinstance(body, (bytes, bytearray))
+                        else None
+                    ),
                 )
 
             relay = gateway.relay_headers(upstream)
@@ -2447,6 +2576,7 @@ async def _quota_response(
     vendor: Vendor,
     stream_requested: bool,
     access: Callable[..., None],
+    reprobe: Optional[Callable[[str], Awaitable[web.StreamResponse]]] = None,
 ) -> web.StreamResponse:
     """Replace a vendor's quota refusal with one that names the vendor.
 
@@ -2467,6 +2597,24 @@ async def _quota_response(
     request asked for, so an SSE frame here would surface as a parser
     exception with the typed ``rate_limit_error`` lost — the opposite of the
     point. ``stream_requested`` survives only as a field in the access line.
+
+    An EXHAUSTED verdict is re-probed once before it is passed on, via
+    ``reprobe`` (see :func:`_quota_reprobe`). It is the one verdict that tells
+    a user to leave the model family, and it is reached from a single vendor
+    answer that may describe a condition already gone. The 2026-09-25 log
+    holds the shape: at 18:24:11.772 the same vendor answered the same model
+    with 200 (277 KB), and at 18:24:12.852 came a refusal this module
+    classifies EXHAUSTED — 1.1 SECONDS apart, and the sentence that reached
+    the user told them to switch families. What CARRIED that verdict is not
+    recoverable: the deciding body is written at DEBUG only, so nothing in
+    the log separates the vendor's own error code from a reset time an hour
+    out. That is the argument for the re-probe, and for
+    :func:`quota_evidence_fields` on the access line. A rate-limited verdict
+    is NOT re-probed: it sends the user nowhere, and a double request on
+    every thirty-second throttle is a cost with no reader.
+
+    The retried attempt writes the access line (with ``note=quota_reprobe``),
+    so the caller must not also write one: one client request, one line.
     """
     # A PEEK, deliberately, and the one place ``read(n)``'s real semantics
     # (what has ARRIVED, trimmed to n — see :func:`_buffer_bounded`) are
@@ -2482,6 +2630,20 @@ async def _quota_response(
     )
     hint = find_reset_hint(raw, upstream.headers)
     classification = classify_quota(upstream.status, raw, upstream.headers)
+    if reprobe is not None and classification == CLASS_EXHAUSTED:
+        # No delay, deliberately. What is stale here is the VERDICT, not the
+        # wait since it was issued — the evidence above is that the same
+        # vendor answered the same model a second before — so waiting would
+        # spend the client's request on the one thing that is not in doubt.
+        # If the second attempt also refuses, the refusal below is the
+        # vendor's own answer twice over, and it is sent.
+        # The verdict being repaired rides the REPAIR's own line. Without
+        # it, the log shows a request that took two upstream attempts and
+        # says nothing about what the first one decided — and that first
+        # verdict is the entire reason this re-probe exists. It is still one
+        # client request and one line: the evidence joins the line the
+        # re-probe writes rather than opening a second one.
+        return await reprobe(quota_evidence_fields(raw, upstream.headers))
     body = quota_error_body(
         vendor_display_name(vendor),
         hint,
@@ -2495,9 +2657,18 @@ async def _quota_response(
         # user reports "it told me to switch models", the line says whether
         # the gateway had evidence for that or fell back to the weaker
         # sentence, without needing the body it deliberately did not keep.
-        extra=(
-            f"note=vendor_quota upstream_status={upstream.status} "
-            f"quota_class={classification}"
+        extra=" ".join(
+            part
+            for part in (
+                f"note=vendor_quota upstream_status={upstream.status} "
+                f"quota_class={classification}",
+                # WHICH evidence carried the verdict, beside the verdict
+                # itself — see quota_evidence_fields. A support question
+                # ("it told me to switch models") is answerable from this
+                # line alone, without the body deliberately not kept.
+                quota_evidence_fields(raw, upstream.headers),
+            )
+            if part
         ),
     )
     # The vendor's own wait, relayed: the BODY is replaced (that is this
@@ -2512,6 +2683,75 @@ async def _quota_response(
     return web.json_response(
         body, status=CLIENT_QUOTA_STATUS, headers=quota_headers,
     )
+
+
+def _quota_reprobe(
+    request: web.Request,
+    gateway: Gateway,
+    decision: Route,
+    url: str,
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    requested_model: str,
+    stream_requested: bool,
+    started: float,
+    note: str,
+    images: str = IMAGES_UNCOUNTED,
+    facts: Optional[RequestFacts] = None,
+) -> Callable[[str], Awaitable[web.StreamResponse]]:
+    """A single re-send of a request whose quota refusal is being re-checked.
+
+    Returns a callable rather than a response, so the decision to spend the
+    second attempt stays where the evidence is (:func:`_quota_response`)
+    while the machinery for sending it stays where every other send lives
+    (:func:`_proxy`). Its one argument is REQUIRED and is the replaced
+    verdict's evidence: a default would let a caller drop it silently, which
+    is the very omission this parameter was added to close.
+
+    ``body`` is BYTES and is reused verbatim — the same request, not a new
+    one — which is why the caller builds this only when it holds bytes: a
+    streamed body is already consumed and the refusal has to go to the client
+    instead.
+
+    ``allow_quota_reprobe=False`` is the recursion bound, and
+    ``allow_oauth_retry=False`` is deliberate too: this attempt is already a
+    repair, so it does not open a second front on the same request. A vendor
+    that answers "exhausted" to everything therefore costs exactly two
+    upstream requests and then answers the client.
+
+    ``first_verdict`` is what the replaced verdict decided, as ``key=value``
+    fields (:func:`model_router.quota.quota_evidence_fields`), and it rides
+    this attempt's access line. A re-probe that SUCCEEDS is the only record of
+    the verdict it repaired, so without it the log keeps the repair and drops
+    the thing repaired — the same evidence loss the re-probe was added to
+    close, one step later.
+
+    ``facts`` is threaded through for the same reason it is on the first
+    attempt: it is the evidence :func:`_submit_usage` counts FROM, so a
+    re-probe that SUCCEEDS is a real turn for the user and must land in the
+    usage ledger. Dropping it here made the repair invisible — the request
+    answered, and the record said nothing happened.
+    """
+    async def resend(first_verdict: str) -> web.StreamResponse:
+        return await _proxy(
+            request,
+            gateway,
+            decision,
+            url,
+            headers,
+            body,
+            requested_model=requested_model,
+            stream_requested=stream_requested,
+            started=started,
+            note=f"{note} note=quota_reprobe {first_verdict}".strip(),
+            images=images,
+            facts=facts,
+            allow_oauth_retry=False,
+            allow_quota_reprobe=False,
+        )
+
+    return resend
 
 
 async def _buffer_bounded(

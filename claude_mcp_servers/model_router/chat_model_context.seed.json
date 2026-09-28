@@ -2,7 +2,7 @@
   "schema_version": 1,
   "generated_at": "2026-09-07T00:00:00Z",
   "source": "shipped-seed",
-  "_comment": "Seed for the chat-model context table. Keys are FULL model ids, never family wildcards: glm-5.2 has a 1M window while glm-5.1 has 200K, so a 'glm-5*' pattern would misreport by 5x. Every row cites the official vendor page it was read from; a row without a citation is a test failure, not a data choice (tests/test_model_router_context_table.py). TWO consumers read these rows. (1) vco_lib.vscode_settings.decorate_1m appends Claude Code's own '[1m]' context hint to a slot/default value naming a 1M model — the client assumes 200K for a plain id like claude-fable-5-1 (field symptom: '0% context remaining' right after compaction), and it reads the 'window_1m' flag. (2) The gateway's /v1/models DOES read these rows, as of v0.2.95: model_router.catalog.resolve_window treats a cited row here as the highest authority below a tombstone, and the 'context_window' it yields decides both the row's description and whether the catalog publishes an '[1m]' companion. (An earlier version of this note said the gateway did not read them and that first-party ids were published verbatim; both were true then and neither is now.) Because the two consumers read DIFFERENT fields, keep 'window_1m' and 'context_window' in agreement — the gateway logs a warning when a row contradicts itself. Window/output figures are the vendor's own decimal-K figures, not powers of two. This file is the FALLBACK: the launcher exports a user-editable table to <vct_root>/model-gateway/chat_model_context.json, and that export wins per ROW when present.",
+  "_comment": "Seed for the chat-model context table. Keys are FULL model ids, never family wildcards: glm-5.2 has a 1M window while glm-5.1 has 200K, so a 'glm-5*' pattern would misreport by 5x. Every row cites the official vendor page it was read from; a row without a citation is a test failure, not a data choice (tests/test_model_router_context_table.py). TWO consumers read these rows. (1) vco_lib.vscode_settings.decorate_1m appends Claude Code's own '[1m]' context hint to a slot/default value naming a 1M model — the client assumes 200K for a plain id like claude-fable-5-1 (field symptom: '0% context remaining' right after compaction), and it reads the 'window_1m' flag. (2) The gateway's /v1/models DOES read these rows, as of v0.2.95: model_router.catalog.resolve_window treats a cited row here as the highest authority below a tombstone, and the 'context_window' it yields decides both the row's description and whether the catalog publishes an '[1m]' companion. (An earlier version of this note said the gateway did not read them and that first-party ids were published verbatim; both were true then and neither is now.) Because the two consumers read DIFFERENT fields, keep 'window_1m' and 'context_window' in agreement — the gateway logs a warning when a row contradicts itself. Window/output figures are the vendor's own decimal-K figures, not powers of two. This file is the FALLBACK: the launcher exports a user-editable table to <vct_root>/model-gateway/chat_model_context.json, and that export wins per ROW when present. Window figures must come from the VENDOR'S PER-MODEL SPEC TABLE: an integration page (e.g. QwenCloud's Claude Code page) quotes the CLIENT's default window (200K) and describes raising it, which is not a per-model window — every qwen-vendor row here read 200000 in v0.2.97 for exactly that reason, understating a real 1M by 5x.",
   "models": {
     "glm-5.3": {
       "vendor": "zai",
@@ -78,67 +78,67 @@
     },
     "qwen3.8-max": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "Claude Code integration page states the client defaults to 200K and 'can be raised to 1M where the model supports it' WITHOUT naming which Token-Plan models support it; per-model 1M support is UNVERIFIED, so this row claims only the documented default. No per-model max_output is published on that page either (0 = unstated)."
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "Window and output are the vendor's PER-MODEL figures on the cited page. The 200000 this row carried until v0.2.98 came from the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; that citation is gone. The vendor writes output as '128k'/'64k' without expanding it — its DeepSeek '384k' expands to 393,216 (= 384*1024) — so the decimal readings are the non-overstating choice. The same vendor's Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384) with no stated rationale, but VCO writes no such knob (docs/CONFIGURATION.md, 'Panel mode'), so the 1M here is the documented model window. (Qwen3.8 table.)"
     },
     "qwen3.8-flash": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+      "context_window": 1000000,
+      "max_output": 128000,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max; same page, Qwen3.8 table."
     },
     "qwen3.7-max": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+      "context_window": 1000000,
+      "max_output": 64000,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max; same page, Qwen3.7 table."
     },
     "qwen3.7-plus": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page. The docs' own [1m] example uses qwen3.7-plus, but that is a MECHANISM example, not a per-model capability claim."
+      "context_window": 1000000,
+      "max_output": 64000,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max; same page, Qwen3.7 table. The integration page's [1m] example used this id, but that was a mechanism example, not a capability claim — the window here is the vendor's own per-model table."
     },
     "qwen3.6-flash": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "See qwen3.8-max: 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+      "context_window": 1000000,
+      "max_output": 64000,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max; same page, Qwen3.6 table."
     },
     "deepseek-v4-pro": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "Served through the same Token-Plan endpoint (the integration page lists it among its model ids). 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+      "context_window": 1000000,
+      "max_output": 393216,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024."
     },
     "deepseek-v4-flash-0731": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "Served through the same Token-Plan endpoint (the integration page lists it among its model ids). 1M per-model support UNVERIFIED, max_output unstated by the vendor page."
+      "context_window": 1000000,
+      "max_output": 393216,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-mode model list (probe 2026-09-22)."
     },
     "deepseek-v4.1-flash": {
       "vendor": "qwen",
-      "context_window": 200000,
-      "max_output": 0,
-      "window_1m": false,
-      "source": "https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
-      "source_note": "Served through the same Token-Plan endpoint: present on the subscription's live compatible-mode model list (probe 2026-09-22), which the cited integration page predates. 1M per-model support UNVERIFIED, max_output unstated by the vendor (0 = unstated)."
+      "context_window": 1000000,
+      "max_output": 393216,
+      "window_1m": true,
+      "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates."
     },
     "claude-fable-5-1": {
       "vendor": "anthropic",

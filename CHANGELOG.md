@@ -7,6 +7,397 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.98] - 2026-09-29
+
+### Fixed — a request the gateway repaired was counted as a turn that never happened (v0.2.98)
+
+- The gateway repairs two kinds of failed request rather than handing the
+  failure on: it re-reads a rotated credential and sends again, and it re-probes
+  a vendor's "you are out of quota" verdict once before passing it to the user.
+  Both repairs now answer the client from a request the gateway built a second
+  time — and that second build did not carry `facts`, the object the first
+  attempt assembles from the caller's headers. The counting path declines on
+  `facts is None`, so a repaired request that SUCCEEDED wrote no ledger row at
+  all: the user got a full answer, and the usage record read as if nothing had
+  been sent.
+- `facts` carries more than the token count — the session and the agent identity
+  are read from it too — so the row a re-probe writes is now attributed to the
+  same caller as the attempt it replaced, instead of to an anonymous one. It is
+  threaded on the re-sent request, on the re-probe's own construction site, and
+  through the re-probe's signature; a docstring beside that signature states why,
+  so the next editor does not remove the argument as redundant.
+- Red-proofed on both paths, one test each: with the argument removed the
+  re-probed request writes zero rows and the test fails naming the missing row;
+  with it restored the ledger holds exactly one row, carrying the session header
+  and the recovering vendor route. The assertions read identity rather than a
+  row count, so a row attributed to the wrong caller fails too.
+
+### Fixed — the shipped gateway subagents ran at a fifth of the window their picker advertised (v0.2.98)
+
+- All ten definitions under `templates/agents/module-gateway/` named their model
+  with a bare gateway id — `claude-gw/glm-5.3`, `claude-gw/qwen/qwen3.8-max` and
+  the rest. Measured on 2026-09-28, a bare gateway id is budgeted **200 000**
+  tokens by the client while the same id carrying the `[1m]` suffix is budgeted
+  1 000 000, and the model picker offers exactly the suffixed spelling because the
+  row's own window says 1M. Every dispatched gateway lane therefore ran with a
+  fifth of the window its picker entry claimed, and compacted at that fifth — the
+  defect the context-table correction above removed from the ids a user picks by
+  hand, left standing in the ids the shipped agents carry.
+- Each of the ten now names the advertised spelling, suffix included: the four
+  GLM lanes (`glm-implementer`, `glm-reviewer`, `glm-planner`,
+  `glm-flash-researcher`), and the six qwen-vendor lanes — the two DeepSeek
+  ones included, which had the same problem.
+- The same sweep found the shape twice more, in `templates/CLAUDE.md.template`'s
+  own routing table: its two GLM rows named bare ids while the paragraph three
+  lines above them already told the reader to route to `claude-gw/glm-5.3[1m]`,
+  and the rule added below states that every shipped gateway id is the advertised
+  spelling. Both rows carry the suffix now, so the table no longer contradicts
+  the rule beside it. Nothing is pinned to a bare id anywhere in the shipped
+  tree: the catalogue's `advertised_id()` is the only place in the repo that
+  builds a gateway id from parts, and it applies the suffix from the row's own
+  window.
+- The contract test no longer states the expected ids as literal strings. It
+  derives each one through `advertised_id(vendor, model_id, one_m=row["window_1m"])`
+  — the single home of the published spelling — so a window flipped in the seed,
+  or an agent left behind on an older id, fails the suite instead of shipping a
+  lane that runs at the wrong size.
+- `templates/CLAUDE.md.template` now states the rule: **the ID carries the
+  window, so the ID is part of the specification.** The paragraph gives the
+  measurement, says every shipped gateway id is the advertised spelling with its
+  suffix, and tells a reader writing an id by hand — in a slot, a script, a
+  frontmatter — to take it from `/v1/models` rather than assemble it.
+
+### Fixed — a boot line called the harmful case of "no shipped seed" the harmless one (v0.2.98)
+
+- When the launcher's boot path found no shipped seed to converge the chat-model
+  context table with, it logged *"Not a degraded state: the model gateway falls
+  back to its bundled copy"* — one sentence for two different states. The export
+  the gateway reads runs unconditionally and wins per row, so that fallback is
+  real only when the table is EMPTY. When the table already holds rows, the
+  export keeps serving those rows, and a shipped correction can no longer reach
+  the machine at all: the user whose table carries the old 200K qwen rows keeps
+  them, while a debug line tells whoever reads the log that nothing is wrong.
+- The branch now counts the rows and says which state it is in — a debug line for
+  the empty table, where the gateway's bundled copy really does answer every id,
+  and a warning for the non-empty one, naming the row count, the consequence and
+  the fix (`python install.py` to restore the clone, then relaunch the launcher).
+
+### Fixed — the secrets resolver's own header described a chain it does not run (v0.2.98)
+
+- `templates/scripts/vct_secrets_resolve.sh` and its `.ps1` sibling explain the
+  three-tier chain at the top of the file, and both said the launcher's pause
+  matrix "still applies" — as though a hub refusal were where the chain ends. It
+  is not: the matrix decides what the HUB answers, and a refusal falls through to
+  the file store exactly as an absent key does. Exit 3 on an all-miss reports
+  TIER 1's refusal, which the hub itself cannot tell apart from "never declared".
+  A comment that describes a guard is part of that guard, so the sentence was
+  wrong in the way that matters to whoever reads it next.
+- Both files now say what the code does, at the usage header and again beside
+  `read_key_shared_only`, and keep their "MUST MATCH" cross-reference to each
+  other.
+
+### Fixed — every shipped pointer to the launcher's secrets surface now names a surface that exists (v0.2.98)
+
+- `Preferences -> Special Secrets` appeared **19 times in 12 live files** —
+  `install.py` (3), `vco_lib/openai_key.py` (2), `docs/CONFIGURATION.md` (3),
+  `templates/ORCHESTRATOR-CLAUDE.md.template` (2),
+  `vco_lib/codegraph_deferrals.py` (1), `vct-module.json` (2), and one each in
+  `README.md`, `claude_mcp_servers/search_mcp/wrapper.sh`,
+  `docs/GETTING_STARTED.md`, `docs/features/05-install-and-secrets.md`,
+  `tools/vct-secrets/README.md` and `tools/vct-secrets/MIGRATION.md`. No launcher
+  version has ever had that label: `git log --all -S "Special Secrets" -- launcher/`
+  is empty, the sidebar entry is `label: 'Secrets'` at `/preferences/secrets`, the
+  Preferences page carries a `Secrets` section, and the tab a shared key like
+  `openai_api_key` is added under is `Shared (this user)`. Every live pointer now
+  names a surface that exists — `Preferences -> Secrets` — and the ones that tell
+  the user *where to put a key* name the tab as well
+  (`Preferences -> Secrets -> Shared (this user)`). Two kinds of mention are
+  deliberately left as they stand: the `CHANGELOG.md` entry for v0.1.x, because a
+  historical release note is a record of what was written then and not an
+  instruction a reader follows now, and backticked names of the phrase, which quote
+  it rather than point anywhere.
+- The sharpest instance was not a docs line but a live remedy.
+  `vco_lib/codegraph_deferrals.py::_service_hint` printed
+  `Preferences -> Special Secrets -> OpenAI -> Re-check` into the `command_to_apply`
+  field of the `code_graph_code_backend_unreachable` deferral — text the user is told
+  to act on, naming a row and a button that exist nowhere in the launcher (the only
+  `Re-check` buttons ship in `InstallHealthGate.svelte` and concern install health).
+  That branch now prints a probe that answers without reading the value
+  (`vct can-read --key openai_api_key`, exit 0 when the slot holds a key) and the
+  store command with its value arriving on stdin.
+- The two other printed remedies that name `vct set --shared --key openai_api_key` now
+  say the value goes on stdin — `vct set` refuses a TTY precisely because a value in
+  argv is visible to every local user and kept in shell history.
+- Guarded by `tests/test_v0298_launcher_pointer.py`: the label assertions read the
+  launcher's own `.svelte` sources, the remedy's every `->`-separated segment must be
+  a label those sources contain, and no live file may carry the legacy phrase.
+- The guard's first version read raw text, and a phrase that is **split in two** is
+  invisible to that — which is how the phrase returned inside the very file the sweep
+  had just corrected, as `"… Preferences → Special "` followed by `"Secrets …"` (two
+  adjacent literals, one sentence to a reader). A second shape hid the last surviving
+  site: `tools/vct-secrets/MIGRATION.md` wrapped the pointer across a blockquote line,
+  so neither the sweep nor the guard saw it. The scan now folds each shape the way its
+  reader does before searching — adjacent literal glue in every format, backslash
+  continuations, wrapped lines in `.md`/`.template`, and a Python file's real strings
+  via `ast` — while keeping genuinely separate blocks (headings, table rows, fences,
+  list boundaries) apart so it cannot invent a phrase nobody wrote. Both shapes are
+  red-proofed by mutation: restoring either one fails the guard naming its file.
+
+### Security — VCO's OpenAI embeddings use VCO's own key, never a project's (v0.2.98)
+
+- VCO took its OpenAI key from `$OPENAI_API_KEY` when that variable was set,
+  and otherwise fell back to the `openai_api_key` secret resolved **for the
+  consuming project** — which includes a per-project binding and, failing
+  that, that project's own `.env`. Both paths are wrong for the same reason:
+  the key VCO spends on its own embeddings is not the project's key to spend.
+  Run a session inside a project that exports its own `OPENAI_API_KEY`, or
+  that holds one in its `.env`, and VCO's KG sync, code-graph indexing and
+  dual-slot fan-out would bill that project's account. The environment is
+  worse than the `.env` case rather than milder: any tool, wrapper or
+  `direnv` rule in the shell can export the name, and the variable carries no
+  statement of who it belongs to.
+- A VCO consumer now resolves the shared `openai_api_key` slot and nothing
+  else — the launcher keychain slot, then `~/.vct-secrets/shared/`. The
+  project argument still travels, because it is the **requester identity** the
+  hub's pause matrix answers against and it carries that project's
+  `.no-shared-fallback` opt-out; it is no longer a lookup scope. The shipped
+  shell resolver gained the matching `--shared-only` flag (`.sh` and `.ps1`),
+  so the one non-Python consumer that reaches a key through it — the KG-summary
+  backend — resolves the same slot by the same rule.
+- The rule is enforced where the resolution happens, not only where it is
+  consumed: a key name declared at shared scope in a bundled module manifest
+  is served from its shared slot or not at all. A per-project or global row
+  under the same name can no longer stand in for it, so a project-scoped
+  `openai_api_key` cannot be reached by VCO's own embedding path through any
+  consumer — Python, shell, or the container spawn path.
+- **If you configured VCO by exporting `OPENAI_API_KEY` you owe one action,
+  and a silent stop is what this entry exists to prevent.** On a machine whose
+  active embedding profile is `openai` and whose VCO slot resolves empty, the
+  update writes a ledger entry naming the slot to fill — `vct set --shared
+  --key openai_api_key`, or the launcher's Preferences → Secrets →
+  Shared (this user) — and clears itself on the next update once the slot answers. A slot
+  the user has deliberately paused is not reported as an empty one, and an
+  unprovable probe (a locked keychain) makes no claim at all. Your own
+  environment variable is left exactly as it is, and no project's `.env` or
+  `.env.local` is read, moved or rewritten by this change.
+
+### Fixed — a reviewer's own evidence could arrive through a lossy filter (v0.2.98)
+
+- The `lean-ctx` Bash-output compression hook rewrote every command it did not
+  explicitly step aside from, read-only git inspection included. A lane
+  reviewing a branch it has not checked out reads `git show`, `git diff`,
+  `git grep`, `git log`, `git blame`, `git cat-file` and `git ls-tree`, and
+  that output *is* the evidence its verdict rests on. Compressed, the loss is
+  invisible and unrecoverable: `git ls-tree -r` measured -94% with 286 of 300
+  paths silently dropped, `git log` keeps the newest commits while the oldest
+  disappear, and a successful heavy compression writes no recovery file — the
+  `tee` copy is written on failure only, so nothing on disk held what was
+  removed.
+- Those seven verbs now run raw, on the same final-`&&`-segment scoping the
+  existing `git commit` / `git push` step-aside uses, in both the `.sh` and
+  `.ps1` siblings. The list is command-specific: `git status`, `git branch`,
+  `git fetch` and every mutating verb still compress, and an ordinary command
+  is still rewritten.
+
+### Fixed — a stale exhaustion verdict told the user to leave the model family (v0.2.98)
+
+- A vendor's "you are out of quota" is the only refusal the gateway re-words,
+  and the one verdict that sends the user off the model family. It was reached
+  from a single answer. The 2026-09-25 log holds the shape: at 18:24:11.772
+  the vendor answered the same model with 200 (277 KB); at 18:24:12.852 came a
+  refusal the gateway classified `exhausted` — 1.1 seconds later — and the
+  sentence that reached the user told them the GLM allowance was gone for the
+  next hour, while a switch to another model and back worked. Nothing in the
+  log says what carried that verdict: the deciding body is written at DEBUG
+  only, so the vendor's own error code and a reset time an hour out are
+  indistinguishable after the fact.
+- An exhausted verdict is now re-checked once before it is passed on: the
+  request is sent again, and the user sees the verdict only if the vendor
+  refuses a second time. The re-check is taken on the EVIDENCE rather than on
+  the status — a rate-limited 429 is not re-sent, because it sends the user
+  nowhere and doubling every thirty-second throttle buys nothing — and it
+  cannot loop: the re-sent request may not re-check in turn, and only a
+  request body still buffered in memory qualifies, since a body large enough
+  to have been streamed through is already consumed.
+- The access line now names the evidence behind the verdict — `quota_code=1310`,
+  `reset_s=3621`, `quota_words=1` — beside the class it produced, so the next
+  occurrence is diagnosable from the log instead of being re-derived from the
+  code.
+- The evidence is on the REPAIR's line too, which is the case where it was
+  otherwise lost outright. A re-probe that succeeds answers from the vendor
+  before the line that would have carried the class and the evidence, so the
+  log kept the repair and dropped the verdict repaired — the same gap the
+  re-probe exists to close, one step later, and exactly the self-healed
+  exhaustion a reader is most likely to ask about. The re-sent request now
+  carries the replaced verdict's own fields (`quota_code=1310`, `reset_s=…`)
+  on the line it already writes, so the request is still one client request
+  and one line. Two tests pin it from opposite sides: the evidence is present
+  when the re-probe wins, and `quota_class` is still absent from that line,
+  because no sentence reached the user.
+- No state was involved and none was added. The gateway keeps no quota or
+  cooldown record anywhere, in memory or on disk, so no restart could have
+  made a verdict stale and no model switch clears one: every verdict is read
+  from the bytes of that one response. What was stale was the vendor's answer,
+  not the gateway's memory of it.
+
+### Fixed — the Token-Plan models advertised a fifth of their context (v0.2.98)
+
+- Every qwen-vendor row in the shipped chat-model context table claimed a 200K
+  window, so the client behind the gateway compacted those models at a fifth
+  of the window they actually have. The 200K was never a model figure: the
+  cited page was QwenCloud's Claude Code integration page, and the sentence
+  read from it describes what the CLIENT assumes by default, not what the
+  model accepts. Each of the eight rows now cites the vendor's per-model table
+  (`developer-guides/getting-started/text-generation-models`): 1M with 128K
+  output for `qwen3.8-max` and `qwen3.8-flash`; 1M with 64K for `qwen3.7-max`,
+  `qwen3.7-plus` and `qwen3.6-flash`; and 1M with 393,216 for the three
+  DeepSeek V4 rows, a budget the vendor documents as SHARED between output and
+  thinking. Where the vendor writes only "128k"/"64k" the decimal readings are
+  kept — the non-overstating choice — while 393,216 is the vendor's own
+  expansion of its "384k".
+- Because a row's window decides whether the catalog also publishes the
+  `[1m]` companion, these models now reach the picker as `qwen3.8-max[1m]` and
+  friends. That suffix is the whole difference: the client budgets 1M for a
+  row carrying it and 200K for every other row behind a gateway, so it is also
+  what makes the context indicator count against the real window — the number
+  a user reads when deciding to compact.
+- The three ids the qwen row withholds (`qwen3.7-max`, `qwen3.7-plus`,
+  `deepseek-v4-pro`) are now reported in `_vct_catalog_hidden` under their
+  suffixed spelling — the id a user would have seen, not the bare vendor id.
+  `qwen3.7-plus` and `deepseek-v4-pro` come from the row's `catalog_hide_ids`;
+  `qwen3.7-max` sits in the row's own `static_ids` and is withheld by the
+  latest-only family filter. The fourth id the row curates away is a different
+  case entirely: `catalog_exclude_prefixes` drops `deepseek-v4-flash-0731` and
+  every other dated snapshot outright, so it appears in neither list —
+  exclusion is not withholding, and a dated build is not a model anybody is
+  missing.
+- The correction reaches an existing install by itself: the launcher's boot path now
+  **converges** the table with the shipped seed row by row instead of inserting only the
+  rows the table is missing, so a corrected figure no longer waits for someone to press
+  the model-gateway pane's "Reseed from shipped defaults" — which keeps its own job as the
+  only path that clears a delete tombstone. The section below is the whole story.
+- The model-gateway pane's **"Reseed from shipped defaults"** is unchanged: it still
+  re-applies the shipped rows, refreshes every row you have not edited, preserves the ones
+  you have byte-for-byte, and restores a shipped row you deleted. Use it to force the
+  shipped values back over your own edits; you no longer need it to receive a shipped
+  correction.
+
+### Fixed — a correction to the shipped model table now reaches an existing install (v0.2.98)
+
+- A shipped figure that CHANGES used to reach fresh installs only. The launcher writes the
+  chat-model context table on boot, and that path inserted only the rows the table did not
+  have yet (`ON CONFLICT DO NOTHING`): it never refreshed one, on the argument that an
+  existing row may be a user's own edit and the path could not tell the two apart. A
+  correction is by definition the case where the row **already exists**, so the delivery
+  path had nothing to deliver it with — and nothing else would ever have. This is not
+  hypothetical: the qwen window correction above landed in the seed and left every
+  existing table advertising 200K, which is the early `/compact` it was written to fix.
+- The row already carried the answer the old argument said was missing. `user_edited` is
+  `0` exactly when no human hand has written the row since it was seeded and `1` when the
+  GUI wrote it, so the boot path now **converges** the table with the shipped seed per
+  row: an absent row is inserted, a `user_edited = 0` row whose values differ from the
+  shipped ones is refreshed, a row that already matches is written not at all (so
+  `updated_at` keeps meaning "when this row last changed", not "when the launcher last
+  booted"), a `user_edited = 1` row — yours — is left byte-identical, and an id carrying a
+  delete tombstone is skipped even when absent.
+- Two boundaries are deliberate. **An automatic path never undoes a delete**: a deleted
+  shipped row stays deleted until you explicitly reseed, which is the one click that means
+  exactly that. And **an automatic path never overrules you**: editing a row in the
+  model-gateway pane is still what freezes it, so set your own window and it survives every
+  later release.
+- No restart is needed to receive a correction. The gateway re-reads the exported table
+  whenever the file changes and the launcher exports on the same boot it converges, so one
+  launch of the launcher is enough — including for a daemon that is already running.
+
+### Removed — the usage surfaces no longer show plan consumption (v0.2.98)
+
+- The subscription usage surfaces carried two different kinds of number, and
+  only one of them is the one you act on. A **context window** tells you when
+  to compact; a **plan-consumption total** tells you what you have spent, and
+  the vendor's own dashboard already says that. So the gateway's token ledger
+  — the figure that stood in for QwenCloud, whose Token Plan publishes no
+  quota anywhere — is still counted and still rides the snapshot
+  (`?format=json` carries it), but no surface renders it any more.
+- The removal is complete, which is the part worth stating. The launcher's
+  usage card, the `/model` picker's vendor label and the **status line** had
+  all been changed except the last: the status line kept printing
+  `… │ Qwen 1.2M tok/mo` after the other two had dropped it, so the same
+  fact was visible in one place and not in the others. `render_line` now
+  renders windows only, and its documented example, the two status-line
+  scripts' docstrings and `docs/CONFIGURATION.md` moved with it in the same
+  change rather than describing a line the code no longer produces.
+- `usage_windows.format_tokens` went with its last caller — it existed to
+  format that ledger figure and has no reader now.
+
+### Added — the access line counts the images a request carried (v0.2.98)
+
+- Whether an image reached the gateway at all was the one question its access
+  log could not answer, and it is the question that decides where a lost
+  image was lost: the gateway forwards the body verbatim, so one the client
+  never sent cannot disappear in transit. Every line now carries `images=N`,
+  counted from the body the daemon had already parsed — no second parse, and
+  the bytes that go upstream are untouched, so the count can never change
+  what is forwarded.
+- The count walks **nested** content, not just the top level of `messages`.
+  A subagent that reads an image file does not put the block at the top of a
+  message: it arrives inside a `tool_result` block's own `content[]`, and a
+  top-level-only scan would report 0 for exactly the requests this field
+  exists to identify.
+- The field is on the refusal arms too, which is where "every line" was
+  almost not true. A refused request returns before the proxy, and the proxy
+  is where the field is otherwise assembled — so a routing refusal and a
+  gateway-side refusal both logged no `images=` at all, leaving the reader
+  who most needs the count (someone asking why their request was refused)
+  unable to tell "carried none" from "was never counted": the ambiguity the
+  sentinel exists to remove, reintroduced one arm over. Both arms now lead
+  with the count, and three tests pin it — one per refusal arm plus the
+  unreadable body, whose refusal reads `images=?`.
+- `images=?` means "could not count" — an unparseable body, or one past the
+  rewrite buffer, which is deliberately not parsed a second time merely to be
+  counted. A request that carried no image reads `images=0`. The sentinel is
+  a value rather than an omission so the two can never be confused after the
+  fact, and a defect in the counter lands on it as well: a diagnostic must
+  never cost a chat.
+
+### Added — subagents on the qwen vendor (v0.2.98)
+
+- The module gateway shipped four agent definitions, all on Z.ai's GLM models.
+  It now ships ten: the four GLM ones plus six on the qwen vendor —
+  `deepseek-implementer` and `qwen-implementer` (implementation that needs
+  several files in view at once), `qwen-flash-implementer` (cheap, fully
+  specified mechanical edits), `deepseek-researcher` and
+  `qwen-flash-researcher` (read-only research that returns a lead, not a
+  verdict), and `qwen-flash-sweeper` (one mechanical rule across many items).
+- No reviewer and no planner ships on the qwen vendor: an implementation or
+  research lane may be cheap, a verdict may not be. Those roles stay on the
+  GLM lane and on the Anthropic tiers.
+- The delivered set is named once, in `tests/common/module_gateway.py`. The
+  contract test derives each definition's expected id from the vendor registry
+  — namespace, context-window row, and the ids that row itself offers — so a
+  renamed namespace or an id the vendor does not publish fails the suite
+  instead of shipping an agent that cannot spawn.
+
+### Internal — the extractor-generation ladder records v0.2.98 without charging a re-walk (v0.2.98)
+
+- The ladder requires every release to name itself in **exactly one** of its two
+  lists, and that assertion is the decision gate rather than a formality: a bump
+  charges every project on the machine with one forced re-extraction pass, a
+  non-bump charges none. v0.2.98 is recorded as a non-bump, so this update
+  leaves every code graph on the machine alone.
+- The evidence is the extractor surface, not the release's size. The diff from
+  v0.2.97 to v0.2.98 across the twelve files that can change extraction
+  semantics — `templates/scripts/analyze_code_graph.py`, the eight
+  `codegraph_*` modules, `weaviate_mcp/chunking.py`,
+  `weaviate_mcp/code_truncation.py`, `schema_versions.py` — is empty, so no
+  entity is found, named, hashed, chunked or truncated any differently than it
+  was in v0.2.97.
+- The files nearest that surface which did change carry no extraction rule
+  between them: the OpenAI recovery hint now points at a surface that exists,
+  and the same key-slot wording was corrected in a docstring and one error
+  string. `CODEGRAPH_EMBED_REVISION` cannot have moved (the analyzer file
+  carrying it is untouched), `_CHUNKER_REVISION` stays at v0.2.92.1, and
+  `CODEGRAPH_COLLECTION_SCHEMA_VERSION` stays at 7.
+
 ## [0.2.97] - 2026-09-25
 
 ### Fixed — on Windows, a failed update was reported as a success (v0.2.97)

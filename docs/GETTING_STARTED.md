@@ -420,5 +420,5 @@ Resolver client libraries ship in the install bundle: `templates/scripts/vct_pro
 - Read [docs/CONFIGURATION.md](CONFIGURATION.md) to understand where each config file lives and why
 - Run `/context` inside a Claude session to verify the active workspace path and KG collection name
 - Add `CLAUDE_CODE_EXPERIMENTAL_AGENT_TEAMS=1` to `~/.claude/settings.json` to enable parallel agents (3–5x speedup on multi-file tasks)
-- If you have an OpenAI key and want it as the default embedding provider, run the OnboardingWizard (Identity → Onboarding) or set it via Preferences → Special Secrets. The orchestrator validates via the free `GET /v1/models/text-embedding-3-small` endpoint — no billing entry created
+- If you have an OpenAI key and want it as the default embedding provider, run the OnboardingWizard (Identity → Onboarding) or set it via Preferences → Secrets. The orchestrator validates via the free `GET /v1/models/text-embedding-3-small` endpoint — no billing entry created
 - Check [docs/TROUBLESHOOTING.md](TROUBLESHOOTING.md) for container, MCP, hub, and hook issues

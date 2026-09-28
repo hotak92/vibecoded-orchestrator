@@ -51,6 +51,9 @@ from vco_lib.embedding_providers.openai import (  # noqa: E402 - after the sys.p
     OpenAIAdapter,
     ValidationResult,
 )
+from tests.common.vco_openai_slot import (  # noqa: E402 - after the sys.path bootstrap
+    vco_openai_slot,
+)
 from vco_lib.embedding_service import (  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
     ARCTIC_SECONDARY_MODEL,
     DEFAULT_CODE_MODEL,
@@ -747,10 +750,14 @@ class ConstructionPresetTests(unittest.TestCase):
                     svc.close()
 
     def test_openai_preset(self):
+        # v0.2.98: VCO's OWN slot makes the OpenAI path reachable — the env
+        # var does not (a project shell may export ITS key there, and a
+        # project's key must never pay for VCO's embeddings). This test used
+        # to set only ``OPENAI_API_KEY``; that is now the rule it would be
+        # pinning by accident, so the key goes where VCO reads it.
         with _EnvIsolation(), patch.dict(os.environ, {
             "ACTIVE_EMBEDDING": "openai",
-            "OPENAI_API_KEY": "sk-test",
-        }, clear=False):
+        }, clear=False), vco_openai_slot("sk-test"):
             ollama_m, code_m, oa_m = self._patch_adapters(
                 ollama_ready=False, code_ready=False, openai_valid=True
             )
@@ -1162,15 +1169,24 @@ class FailureCaptureTests(unittest.TestCase):
                         self.assertIn("Ask Claude", content)
 
     def test_redacted_env_snapshot_hides_api_key(self):
+        # Two canaries, one per source, because since v0.2.98 the snapshot's
+        # value can only come from VCO's own slot: the SLOT canary must be
+        # redacted to presence+length, and the ENV canary — set in the
+        # environment for the whole test — must not appear at all.
+        slot_canary = "sk-slot-canary-0123456789abcdef"
+        env_canary = "sk-env-canary-fedcba9876543210"
         with _EnvIsolation(), patch.dict(os.environ, {
-            "OPENAI_API_KEY": "sk-livekey-1234567890abcdef",
+            "OPENAI_API_KEY": env_canary,
             "OLLAMA_URL": "http://localhost:11435",
         }, clear=False):
             import tempfile
             with tempfile.TemporaryDirectory() as home_dir:
                 fake_home = Path(home_dir)
-                with patch.dict(os.environ, {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
-                                     "VCT_STATE_DIR": str(fake_home / ".vct")}):
+                with vco_openai_slot(slot_canary), patch.dict(
+                    os.environ,
+                    {"VCT_CLAUDE_DIR": str(fake_home / ".claude"),
+                     "VCT_STATE_DIR": str(fake_home / ".vct")},
+                ):
                     NoEmbeddingBackendError(
                         "test",
                         attempted_backends=["ollama"],
@@ -1180,9 +1196,14 @@ class FailureCaptureTests(unittest.TestCase):
                     log = fake_home / ".vct" / "metrics" / "embedding_failures.jsonl"
                     record = json.loads(log.read_text().strip().splitlines()[-1])
                     snap = record["env_snapshot"]
-                    self.assertNotIn("sk-livekey-1234567890abcdef", json.dumps(snap))
+                    serialised = json.dumps(snap)
+                    self.assertNotIn(slot_canary, serialised)
+                    self.assertNotIn(env_canary, serialised)
                     self.assertIn("OPENAI_API_KEY", snap)
                     self.assertIn("redacted", snap["OPENAI_API_KEY"])
+                    self.assertEqual(
+                        snap["OPENAI_API_KEY"], f"<redacted len={len(slot_canary)}>"
+                    )
                     self.assertEqual(snap["OLLAMA_URL"], "http://localhost:11435")
 
     def test_capture_disabled_skips_io(self):

@@ -778,6 +778,33 @@ fn mark_keychain_degraded(flag: &mut bool) {
     }
 }
 
+/// v0.2.98 (slot-exclusive bundled secrets): the set of key names the
+/// orchestrator's own `vct-module.json::bundled_secrets` declares with
+/// `scope == "shared" && slot_exclusive == true`. Each such key is OWNED
+/// by that bundled shared declaration: on `/env`'s merged dict it may be
+/// served ONLY by the bundled loop's own shared-slot read — every other
+/// bucket (an installed module's declaration of any scope, the legacy
+/// `installer/github_pat` fallback, the user-declared per-project/shared/
+/// global buckets, cross-project grants) is skipped for that key name.
+///
+/// This rule is deliberately NOT inside `resolve_module_secret`:
+/// containers and spawns keep their manifest-declared scope semantics —
+/// a module's own declaration still resolves there at its declared
+/// scope. Only `/env`'s merged dict, the one place a stand-in bucket
+/// could silently shadow the owning declaration under the same name,
+/// resolves the collision this way. Owner ruling it implements: VCO's
+/// own consumers use VCO's own slot; a project's key is the project's.
+fn slot_exclusive_keys(
+    orch_manifest: &vct_launcher_core::orchestrator_manifest::OrchestratorManifest,
+) -> std::collections::HashSet<String> {
+    orch_manifest
+        .bundled_secrets
+        .iter()
+        .filter(|bs| bs.scope == "shared" && bs.slot_exclusive)
+        .map(|bs| bs.key.clone())
+        .collect()
+}
+
 async fn project_env(
     State(h): State<LauncherDbHandle>,
     Path(project_id): Path<String>,
@@ -903,6 +930,17 @@ async fn project_env(
     // served whether or not it is ALSO installed machine-wide.
     settings_only_ids.retain(|id| !bundled_ids.contains(id));
 
+    // v0.2.98 (slot-exclusive bundled secrets): read the orchestrator's
+    // own manifest ONCE, before every resolution loop — one read serves
+    // both the slot-exclusivity set and the bundled-secrets loop further
+    // down (which previously read it inline). See `slot_exclusive_keys`
+    // for the ownership rule this set drives.
+    let orch_manifest = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest();
+    let slot_exclusive = orch_manifest
+        .as_ref()
+        .map(slot_exclusive_keys)
+        .unwrap_or_default();
+
     for manifest in active {
         // Settings (non-secret). An installed module's value is the
         // project's row, else (and always, for a `scope: "global"` setting)
@@ -968,6 +1006,23 @@ async fn project_env(
             continue;
         }
         for s in &manifest.secrets {
+            // Slot-exclusive skip (v0.2.98) — see `slot_exclusive_keys`
+            // for the full rule. Deliberately NOT inside
+            // `resolve_module_secret`: containers and spawns keep their
+            // manifest-declared scope semantics; only `/env`'s merged
+            // dict resolves a name collision between the owning bundled
+            // shared declaration and a stand-in bucket — and a module
+            // declaration is not the owning slot. Owner ruling: VCO's
+            // own consumers use VCO's own slot; a project's key is the
+            // project's.
+            if slot_exclusive.contains(&s.key) {
+                tracing::debug!(
+                    key = ?s.key,
+                    project = %project.id,
+                    "slot-exclusive shared key: owned by the bundled shared declaration — installed-module declaration skipped"
+                );
+                continue;
+            }
             use vct_launcher_core::module_secrets_env::{resolve_module_secret, SecretLookup};
             match resolve_module_secret(&h.0, &manifest.id, &s.key, &s.scope, Some(&project.id)) {
                 SecretLookup::Value(val) => {
@@ -1003,7 +1058,7 @@ async fn project_env(
     // The deduplication step prevents an orchestrator-bundled key from
     // overwriting an installed module's value (an installed module's
     // declaration takes precedence — the user explicitly opted into it).
-    if let Some(orch_manifest) = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest() {
+    if let Some(orch_manifest) = orch_manifest.as_ref() {
         for bs in &orch_manifest.bundled_secrets {
             // Skip if an installed module already populated this key. Pins
             // installed-module-wins so the orchestrator's bundled
@@ -1051,7 +1106,22 @@ async fn project_env(
             // across the upgrade. Once the migration has run the
             // legacy slot is empty and this branch is a no-op. Same gate,
             // on the legacy slot's OWN active flag.
-            if bs.scope == "shared" && bs.key == "github_pat" && bs.module_id == "user" {
+            //
+            // Slot-exclusive skip (v0.2.98) — see `slot_exclusive_keys`
+            // for the full rule: the legacy slot is a non-shared
+            // stand-in, so a slot-exclusive key never falls back to it.
+            // Deliberately NOT inside `resolve_module_secret` (containers
+            // and spawns keep their manifest-declared scope semantics);
+            // only `/env`'s merged dict resolves the collision. Owner
+            // ruling: VCO's own consumers use VCO's own slot; a project's
+            // key is the project's.
+            if slot_exclusive.contains(&bs.key) {
+                tracing::debug!(
+                    key = ?bs.key,
+                    project = %project.id,
+                    "slot-exclusive shared key: owned by the bundled shared declaration — legacy slot fallback skipped"
+                );
+            } else if bs.scope == "shared" && bs.key == "github_pat" && bs.module_id == "user" {
                 match resolve_module_secret(&h.0, "installer", &bs.key, "shared", Some(&project.id)) {
                     SecretLookup::Value(val) if !val.trim().is_empty() => {
                         env.insert(bs.key.clone(), serde_json::Value::String(val));
@@ -1121,6 +1191,23 @@ async fn project_env(
         if env.contains_key(&key) {
             continue;
         }
+        // Slot-exclusive skip (v0.2.98) — see `slot_exclusive_keys` for
+        // the full rule. Deliberately NOT inside `resolve_module_secret`:
+        // containers and spawns keep their manifest-declared scope
+        // semantics; only `/env`'s merged dict resolves a name collision
+        // between the owning bundled shared declaration and a stand-in
+        // bucket — and a user-declared bucket (per-project, shared, or
+        // global) is a stand-in for this key name. Owner ruling: VCO's
+        // own consumers use VCO's own slot; a project's key is the
+        // project's.
+        if slot_exclusive.contains(&key) {
+            tracing::debug!(
+                key = ?key,
+                project = %project.id,
+                "slot-exclusive shared key: owned by the bundled shared declaration — user-declared bucket skipped"
+            );
+            continue;
+        }
         env.insert(key, serde_json::Value::String(val));
     }
 
@@ -1147,6 +1234,23 @@ async fn project_env(
     if let Ok(grants) = h.0.list_grants_by_grantee(&project.id) {
         for g in &grants {
             if env.contains_key(&g.key) {
+                continue;
+            }
+            // Slot-exclusive skip (v0.2.98) — see `slot_exclusive_keys`
+            // for the full rule. Deliberately NOT inside
+            // `resolve_module_secret`: containers and spawns keep their
+            // manifest-declared scope semantics; only `/env`'s merged
+            // dict resolves a name collision between the owning bundled
+            // shared declaration and a stand-in bucket — and a
+            // cross-project grant is a stand-in for this key name.
+            // Owner ruling: VCO's own consumers use VCO's own slot; a
+            // project's key is the project's.
+            if slot_exclusive.contains(&g.key) {
+                tracing::debug!(
+                    key = ?g.key,
+                    project = %project.id,
+                    "slot-exclusive shared key: owned by the bundled shared declaration — cross-project grant skipped"
+                );
                 continue;
             }
             let active = vct_launcher_core::db::secret_active::is_secret_active_cross_launcher_for_requester(
@@ -3123,6 +3227,167 @@ mod tests {
         assert_eq!(
             body.get("EXAMPLE_SHARED_TOKEN").and_then(|v| v.as_str()),
             Some("synthetic-shared-value")
+        );
+    }
+
+    // ─── v0.2.98: slot-exclusive bundled secrets (`slot_exclusive_keys`) ────
+    //
+    // `vct-module.json::bundled_secrets` declares `openai_api_key` with
+    // `slot_exclusive: true` — that bundled shared declaration OWNS the
+    // key name on `/env`'s merged dict. These tests run against the REAL
+    // manifest (found by walking up from current_exe, same as every
+    // bundled-secrets test above) with the thread-local mock keychain.
+
+    /// Positive: the shared slot (module `user`, SENTINEL_SHARED) holds a
+    /// value → `/env?key=openai_api_key` returns it, straight from the
+    /// owning bundled shared declaration's own read.
+    #[tokio::test]
+    async fn slot_exclusive_shared_key_served_from_bundled_shared_slot() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "sx-proj-1", "Slot Exclusive P1", "/tmp/sx-proj-1");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Shared { project_id: "_user_shared_" },
+            "user",
+            "openai_api_key",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        h.0.mark_secret_active("shared", "_user_shared_", "user", "openai_api_key")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/sx-proj-1/env?key=openai_api_key", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("openai_api_key").and_then(|v| v.as_str()),
+            Some("synthetic-not-a-real-secret"),
+            "the owning shared slot must serve the slot-exclusive key; body: {}",
+            body
+        );
+    }
+
+    /// THE FIX: NO shared value, but the project has a per-project user
+    /// binding for the same key name → 404 `key_not_active`. Pre-fix the
+    /// 4th (user-declared) loop served that per-project value under the
+    /// name VCO's own declaration owns.
+    #[tokio::test]
+    async fn slot_exclusive_shared_key_refuses_per_project_stand_in() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "sx-proj-2", "Slot Exclusive P2", "/tmp/sx-proj-2");
+
+        // NO shared-slot value — only a per-project stand-in.
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "sx-proj-2" },
+            "user",
+            "openai_api_key",
+            "project-stand-in-value",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "sx-proj-2", "user", "openai_api_key")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/sx-proj-2/env?key=openai_api_key", base))
+            .await
+            .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 404,
+            "a per-project bucket must not stand in for the slot-exclusive shared key; body: {}",
+            body
+        );
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("key_not_active"),
+            "miss envelope must stay exactly key_not_active; body: {}",
+            body
+        );
+        assert!(
+            !body.to_string().contains("project-stand-in-value"),
+            "the stand-in value must not leak anywhere in the response"
+        );
+    }
+
+    /// Data-driven, not global: the SAME shape for a NON-exclusive
+    /// bundled key (`github_pat`, no `slot_exclusive` in the manifest) —
+    /// the per-project bucket IS still served. Proves the rule keys on
+    /// the manifest field, not on a hard-coded key list.
+    #[tokio::test]
+    async fn non_exclusive_bundled_key_still_serves_per_project_bucket() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let _probe = vct_launcher_core::secrets::TestProbeGuard::new(Some(false)); // unlocked
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "sx-proj-3", "Slot Exclusive P3", "/tmp/sx-proj-3");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::PerProject { project_id: "sx-proj-3" },
+            "user",
+            "github_pat",
+            "synthetic-not-a-real-pat",
+        )
+        .unwrap();
+        h.0.mark_secret_active("per_project", "sx-proj-3", "user", "github_pat")
+            .unwrap();
+
+        let resp = reqwest::get(format!("{}/projects/sx-proj-3/env?key=github_pat", base))
+            .await
+            .expect("hub reachable");
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            body.get("github_pat").and_then(|v| v.as_str()),
+            Some("synthetic-not-a-real-pat"),
+            "non-exclusive keys keep the historical bucket merge; body: {}",
+            body
+        );
+    }
+
+    /// The `slot_exclusive` flag parses from the real `vct-module.json`
+    /// and lands in the helper's set: `openai_api_key` is in, `github_pat`
+    /// (same scope, no flag) is out.
+    #[test]
+    fn slot_exclusive_flag_parses_from_vct_module_json() {
+        let m = vct_launcher_core::orchestrator_manifest::read_orchestrator_manifest()
+            .expect("vct-module.json must be discoverable from current_exe()");
+        let openai = m
+            .bundled_secrets
+            .iter()
+            .find(|bs| bs.key == "openai_api_key")
+            .expect("openai_api_key must be declared in bundled_secrets");
+        assert!(
+            openai.slot_exclusive,
+            "openai_api_key bundled declaration must carry slot_exclusive: true"
+        );
+        let pat = m
+            .bundled_secrets
+            .iter()
+            .find(|bs| bs.key == "github_pat")
+            .expect("github_pat must be declared in bundled_secrets");
+        assert!(
+            !pat.slot_exclusive,
+            "github_pat must NOT be slot-exclusive (the per-project bucket test depends on it)"
+        );
+
+        let set = super::slot_exclusive_keys(&m);
+        assert!(
+            set.contains("openai_api_key"),
+            "helper set must contain openai_api_key; got {:?}",
+            set
+        );
+        assert!(
+            !set.contains("github_pat"),
+            "helper set must NOT contain github_pat; got {:?}",
+            set
         );
     }
 

@@ -564,7 +564,8 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
     the router never cataloged fails at spawn with nothing to compare
     against. That is why the pin reads the registry, not the template.
     """
-    from model_router.vendors import GATEWAY_NAMESPACE
+    from model_router.routing import advertised_id
+    from model_router.vendors import GATEWAY_NAMESPACE, VENDORS
 
     seed = json.loads(
         (
@@ -573,14 +574,61 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
         ).read_text(encoding="utf-8")
     )["models"]
 
-    # The bare halves must be models the router knows (context-window rows).
-    assert "glm-5.3" in seed and "glm-5.3-flash" in seed
+    # (vendor row, bare model id) per delivered definition. Everything the
+    # id must satisfy is then read OFF the registry — the namespace, the
+    # context-window row, and whether the row actually publishes it — so a
+    # renamed namespace, a dropped catalog entry, or an id that only ever
+    # existed in this test turns red instead of shipping a dead id.
+    lanes = {
+        "glm-implementer.md": ("zai", "glm-5.3"),
+        "glm-reviewer.md": ("zai", "glm-5.3"),
+        "glm-planner.md": ("zai", "glm-5.3"),
+        "glm-flash-researcher.md": ("zai", "glm-5.3-flash"),
+        "deepseek-implementer.md": ("qwen", "deepseek-v4.1-flash"),
+        "qwen-implementer.md": ("qwen", "qwen3.8-max"),
+        "qwen-flash-implementer.md": ("qwen", "qwen3.8-flash"),
+        "deepseek-researcher.md": ("qwen", "deepseek-v4.1-flash"),
+        "qwen-flash-researcher.md": ("qwen", "qwen3.8-flash"),
+        "qwen-flash-sweeper.md": ("qwen", "qwen3.8-flash"),
+    }
 
+    # The z.ai rows ride the shared namespace every panel rule keys on; the
+    # qwen row extends it, which is why the ids are derived per row rather
+    # than assembled from one constant.
+    assert VENDORS["zai"].namespace == GATEWAY_NAMESPACE
+
+    for vendor_id, bare in lanes.values():
+        vendor = VENDORS[vendor_id]
+        assert bare in seed, f"{vendor_id}/{bare} has no context-window row"
+        # `verified_ids` is the stricter of the two: a row that sets it is
+        # saying every OTHER id it lists answers as a different model, so
+        # only those ids are ever offered.
+        offered = vendor.verified_ids or vendor.static_ids
+        assert bare in offered, (
+            f"{bare} is not in {vendor_id}'s offered set ({offered}) — "
+            "the picker would never offer the model this lane names"
+        )
+
+    # The expected id is the PUBLISHED id, computed by the router's own
+    # `advertised_id` from the same seed flag the catalog reads — not the bare
+    # id plus a suffix spelled here. Two things depend on it and only one is
+    # cosmetic:
+    #
+    #   * the picker offers exactly this string, so a definition naming
+    #     anything else is a lane the user cannot select;
+    #   * the client sizes its context window from the ID (measured
+    #     2026-09-28: `claude-gw/glm-5.3` -> 200000, `…[1m]` -> 1000000, and
+    #     the same pair for `claude-gw/qwen/qwen3.8-max`), so a bare id
+    #     starves the lane of 800K of window and auto-compacts it near 169K
+    #     while the picker advertises 1M.
+    #
+    # Deriving it here means a seed row whose `window_1m` flips turns this red
+    # until the definition follows.
     expected = {
-        "glm-implementer.md": f"{GATEWAY_NAMESPACE}glm-5.3",
-        "glm-reviewer.md": f"{GATEWAY_NAMESPACE}glm-5.3",
-        "glm-planner.md": f"{GATEWAY_NAMESPACE}glm-5.3",
-        "glm-flash-researcher.md": f"{GATEWAY_NAMESPACE}glm-5.3-flash",
+        name: advertised_id(
+            VENDORS[vendor_id], bare, one_m=bool(seed[bare]["window_1m"]),
+        )
+        for name, (vendor_id, bare) in lanes.items()
     }
     # The shared tuple IS the delivered set, and the engine enumerates the
     # directory with a glob — pin the two together, so a file dropped into

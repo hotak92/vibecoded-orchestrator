@@ -42,7 +42,9 @@ export async function getChatModelContextStatus(): Promise<ChatModelContextStatu
 
 /**
  * Insert or update one row. The backend marks it `user_edited`, which is what
- * protects it from the next "Reseed from shipped defaults".
+ * protects it from every automatic path that re-applies the shipped rows —
+ * both the boot converge and "Reseed from shipped defaults"; only editing the
+ * row back changes it.
  */
 export async function upsertChatModelContext(
   input: ChatModelContextInput,

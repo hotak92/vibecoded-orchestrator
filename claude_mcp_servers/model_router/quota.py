@@ -297,8 +297,8 @@ def _distance_from_number(value: float) -> float:
     return value
 
 
-def _mentions_exhaustion_code(body: bytes) -> bool:
-    """True when the vendor's OWN CODE says the allowance is used up.
+def _find_exhaustion_code(body: bytes) -> Optional[str]:
+    """The vendor's OWN CODE for "used up", or ``None``.
 
     The strongest evidence there is, and the only one that outranks a
     readable reset time: a code is a vendor's own classification of its own
@@ -308,15 +308,23 @@ def _mentions_exhaustion_code(body: bytes) -> bool:
     the bracketed form a vendor prints when it sends no envelope are the same
     claim. Ranking them differently made the classification depend on the
     body's shape rather than on what the vendor said.
+
+    Returns the code ITSELF rather than a bool, because the caller that
+    writes the log line needs to name it: "exhausted, because the vendor said
+    1310" and "exhausted, because the reset it quoted is a week away" are
+    different findings, and telling them apart afterwards must not depend on
+    the body the gateway deliberately does not keep.
     """
     scanned = body[:_SCAN_LIMIT_BYTES]
     text = scanned.decode("utf-8", "replace").lower()
-    if any(marker in text for marker in _EXHAUSTION_CODE_MARKERS):
-        return True
+    for marker in _EXHAUSTION_CODE_MARKERS:
+        if marker in text:
+            return marker.strip("[]")
     payload = _as_json(scanned)
     if payload is None:
-        return False
-    return _search_json(payload, _CODE_KEYS, _is_exhaustion_code) is not None
+        return None
+    found = _search_json(payload, _CODE_KEYS, _is_exhaustion_code)
+    return None if found is None else str(found).strip()
 
 
 def _mentions_exhaustion_words(
@@ -373,7 +381,7 @@ def classify_quota(
     not know which of the two this is" is exactly what the weaker sentence
     says, and it is true in both cases.
     """
-    if _mentions_exhaustion_code(body):
+    if _find_exhaustion_code(body) is not None:
         return CLASS_EXHAUSTED
     if status == 402:
         return CLASS_EXHAUSTED
@@ -385,6 +393,43 @@ def classify_quota(
     if _mentions_exhaustion_words(body, headers):
         return CLASS_EXHAUSTED
     return CLASS_RATE_LIMITED
+
+
+def quota_evidence_fields(
+    body: bytes = b"", headers: Mapping[str, str] | None = None,
+) -> str:
+    """The evidence behind a verdict, as ``key=value`` fields for a log line.
+
+    ``quota_class=exhausted`` alone says a NAMED decision was made but not
+    what carried it — and the next reader of that line cannot ask the body,
+    because the gateway deliberately does not keep it. So the two pieces that
+    can override everything else are named beside the verdict:
+
+    - ``quota_code=1310`` — the vendor classified its own refusal. Nothing
+      outranks this.
+    - ``reset_s=3621`` — the reset time it quoted, in seconds from now. Past
+      :data:`_LONG_RESET_S` this is what decided "exhausted" on its own.
+
+    Neither present, with no status 402 in the line, means the WEAKEST
+    evidence decided (the vendor's words) or nothing did. ``quota_words=1``
+    is written when the prose markers matched, so that case is visible too
+    rather than inferred from two absences.
+
+    Re-derived from the same arguments by the same helpers
+    :func:`classify_quota` uses, so the two cannot describe different bodies
+    — only a re-scan of a body already bounded to :data:`_SCAN_LIMIT_BYTES`,
+    on the refusal path alone.
+    """
+    fields: list[str] = []
+    code = _find_exhaustion_code(body)
+    if code:
+        fields.append(f"quota_code={code}")
+    distance = _reset_distance_s(_find_reset_value(body, headers))
+    if distance is not None:
+        fields.append(f"reset_s={int(distance)}")
+    if _mentions_exhaustion_words(body, headers):
+        fields.append("quota_words=1")
+    return " ".join(fields)
 
 
 def quota_message(
@@ -447,5 +492,6 @@ __all__ = [
     "classify_quota",
     "find_reset_hint",
     "quota_error_body",
+    "quota_evidence_fields",
     "quota_message",
 ]

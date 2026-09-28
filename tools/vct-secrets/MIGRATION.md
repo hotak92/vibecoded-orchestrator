@@ -6,10 +6,10 @@ files into the centralized, permission-hardened `~/.vct-secrets/` layout.
 > **Scope note (v0.2.54)**: this migration is a **manual** workflow. The
 > VCT Launcher does NOT perform it for you — launcher-managed secrets
 > (`github_pat`, `openai_api_key`) live in the **OS keychain** and are
-> written via the launcher GUI (OnboardingWizard / Preferences → Special
-> Secrets), then resolved through vct-hub. The `~/.vct-secrets/` file
-> store described here is the launcher-independent path. See
-> `tools/vct-secrets/README.md` §"Two stores, one mental model".
+> written via the launcher GUI (OnboardingWizard, or Preferences →
+> Secrets → Shared (this user)), then resolved through vct-hub. The
+> `~/.vct-secrets/` file store described here is the launcher-independent
+> path. See `tools/vct-secrets/README.md` §"Two stores, one mental model".
 
 ## The new layout
 

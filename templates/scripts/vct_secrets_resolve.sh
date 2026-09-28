@@ -49,6 +49,22 @@
 #                   Non-zero codes mean the key ALSO missed the file
 #                   store and the project `.env`.
 #
+#   vct_secrets_resolve.sh --shared-only <project_id_or_folder> <secret_key>
+#       (v0.2.98) The single-key chain MINUS two legs, for VCO's OWN
+#       consumers (embeddings, gateway, codegraph, hooks) — they must
+#       resolve only VCO's slot and never read a project's key; a
+#       project's key is the project's. Tier 1 (hub) is UNCHANGED — same
+#       route, same requester project, same exit codes). The pause
+#       matrix decides what the HUB answers, not whether the chain
+#       stops: a hub refusal (key_not_active) falls through to the file
+#       store exactly as it does in the full chain, and exit 3 on an
+#       all-miss reports TIER 1's refusal — which the hub itself cannot
+#       tell apart from "never declared". Tier 2 reads shared/<key> ONLY
+#       (the projects/<NAME>/<key> leg is not consulted); tier 3 (the
+#       project's own `.env`) is not consulted at all, even when the
+#       first arg is a folder. All-miss keeps the tier-1 exit code and
+#       the miss diagnostic names ONLY the tiers this mode consulted.
+#
 #   vct_secrets_resolve.sh resolve-project <folder>
 #       Print the project_id (UUID) registered for <folder>. Same exit
 #       codes (1=hub unreachable, 2=project not registered).
@@ -940,6 +956,60 @@ read_key() {
     return $tier1_rc
 }
 
+# ── Shared-only mode (v0.2.98) ──────────────────────────────────────────
+#
+# Owner ruling 2026-09-26: VCO's OWN consumers (embeddings, gateway,
+# codegraph, hooks) resolve ONLY VCO's slot — the shared `openai_api_key`.
+# Never a project scope, never a project `.env`, never the generic env
+# var. MUST MATCH `Read-Key -SharedOnly` in vct_secrets_resolve.ps1.
+file_store_get_shared_only() {
+    # $1 = project arg (used ONLY for the .no-shared-fallback opt-out
+    # marker — NEVER for a projects/<NAME>/<key> read), $2 = key.
+    # Prints the value; return 1 on miss.
+    local proj_arg="$1" key="$2"
+    local root name
+    root=$(secrets_root)
+    name=$(detect_file_project_name "$proj_arg")
+    if shared_fallback_disabled "$name" "$root"; then
+        return 1
+    fi
+    local f="$root/shared/$key"
+    if [[ -f "$f" ]]; then
+        read_file_strip_one_newline "$f"
+        return 0
+    fi
+    return 1
+}
+
+read_key_shared_only() {
+    # $1 = project_id_or_folder, $2 = key. See the Usage header: tier 1
+    # UNCHANGED (same route, same requester project, same exit-code
+    # contract; the matrix gates what the HUB answers, and a hub refusal
+    # still falls through to the file store rather than stopping the
+    # chain), tier 2 = shared/<key> only, tier 3 never. The all-miss
+    # diagnostic names ONLY the tiers this mode actually consulted.
+    local pid_arg="$1" key="$2"
+    local val tier1_rc rc2
+    set +e
+    val=$(read_key_hub "$pid_arg" "$key")
+    tier1_rc=$?
+    set -e
+    if [[ $tier1_rc -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    set +e
+    val=$(file_store_get_shared_only "$pid_arg" "$key")
+    rc2=$?
+    set -e
+    if [[ $rc2 -eq 0 ]]; then
+        printf '%s' "$val"
+        return 0
+    fi
+    err "key $key unresolved after hub (tier 1) and the shared file store (tier 2, --shared-only; the projects/ leg and the project .env (tier 3) are not consulted in this mode)"
+    return $tier1_rc
+}
+
 # ── resolve-many: several keys, one process (see Usage) ─────────────────
 # MUST MATCH Read-Many in vct_secrets_resolve.ps1.
 read_many() {
@@ -998,10 +1068,13 @@ read_many() {
 
 # ── Entry point ─────────────────────────────────────────────────────────
 main() {
-    if [[ $# -lt 2 || ( "$1" == "resolve-many" && $# -lt 3 ) ]]; then
+    if [[ $# -lt 2 || ( "$1" == "resolve-many" && $# -lt 3 ) || ( "$1" == "--shared-only" && $# -ne 3 ) ]]; then
         cat >&2 <<EOF
 Usage:
   $0 <project_id_or_folder> <secret_key>
+  $0 --shared-only <project_id_or_folder> <secret_key>
+      (tier 1 unchanged; tier 2 reads shared/<key> only — the projects/
+       leg and the project .env (tier 3) are not consulted)
   $0 resolve-project <folder>
   $0 resolve-many <project_id_or_folder> KEY [KEY...]
       (one KEY=VALUE line per resolved key)
@@ -1029,6 +1102,9 @@ EOF
         resolve-many)
             shift
             read_many "$@"
+            ;;
+        --shared-only)
+            read_key_shared_only "$2" "$3"
             ;;
         *)
             read_key "$1" "$2"

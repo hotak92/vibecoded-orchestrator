@@ -747,6 +747,129 @@ case "$optout_err" in
     *) assert_eq "0" "0" "test_optout_refusal_never_prints_value" ;;
 esac
 
+# ── Test 21 (v0.2.98): --shared-only — VCO's OWN consumers resolve only
+# VCO's slot (owner ruling 2026-09-26). Tier 1 unchanged; tier 2 reads
+# shared/<key> ONLY; tier 3 never. Parity sibling:
+# tests/test_vct_secrets_resolve_ps1.py (+ the source-parity pin in
+# tests/test_secrets_resolver_forbidden_parity.py).
+sharedonly_store="$scratch/sharedonly-store"
+mkdir -p "$sharedonly_store/shared" \
+         "$sharedonly_store/projects/sodemo"
+sharedonly_proj="$scratch/sharedonly-proj"
+mkdir -p "$sharedonly_proj"
+printf 'SHARED_KEY=proj-env-value\n' >"$sharedonly_proj/.env"
+
+run_shared_only() {
+    # $1 = project arg, $2 = key. Echoes stdout; sets `rc` + `so_err`.
+    set +e
+    out=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+          VCT_SECRETS_DIR="$sharedonly_store" \
+          env -u VCT_HUB_TOKEN -u VCT_HUB_PORT \
+          "$RESOLVER" --shared-only "$1" "$2" 2>"$scratch/so.err")
+    rc=$?
+    set -e
+    so_err=$(cat "$scratch/so.err")
+}
+
+# (a) shared/<key> present → returned in shared-only mode.
+printf 'shared-slot-value' >"$sharedonly_store/shared/SHARED_KEY"
+run_shared_only sodemo SHARED_KEY
+assert_eq "$rc" "0" "test_shared_only_shared_copy_resolves/exit_code"
+assert_eq "$out" "shared-slot-value" "test_shared_only_shared_copy_resolves/value"
+rm -f "$sharedonly_store/shared/SHARED_KEY"
+
+# (b) projects/<NAME>/<key> present and shared absent → NOT returned, and
+# the miss diagnostic names the mode (it must not claim tier 3 was
+# consulted).
+printf 'project-slot-value' >"$sharedonly_store/projects/sodemo/SHARED_KEY"
+run_shared_only sodemo SHARED_KEY
+case "$rc" in
+    0) assert_eq "1" "0" "test_shared_only_never_reads_project_slot/exit_nonzero (got 0)" ;;
+    *) assert_eq "0" "0" "test_shared_only_never_reads_project_slot/exit_nonzero" ;;
+esac
+assert_eq "$out" "" "test_shared_only_never_reads_project_slot/no_value"
+case "$so_err" in
+    *"--shared-only"*) assert_eq "0" "0" "test_shared_only_miss_diag_names_the_mode" ;;
+    *) assert_eq "1" "0" "test_shared_only_miss_diag_names_the_mode (got: $so_err)" ;;
+esac
+case "$so_err" in
+    *"the project .env (tier 3) are not consulted"*)
+        assert_eq "0" "0" "test_shared_only_miss_diag_is_honest_about_tier3" ;;
+    *) assert_eq "1" "0" "test_shared_only_miss_diag_is_honest_about_tier3" ;;
+esac
+case "$so_err" in
+    *project-slot-value*) assert_eq "1" "0" "test_shared_only_never_prints_the_refused_value" ;;
+    *) assert_eq "0" "0" "test_shared_only_never_prints_the_refused_value" ;;
+esac
+
+# (c) a project .env holding the key → NOT returned, even when the first
+# arg is that folder (tier 3 is not consulted in this mode at all).
+run_shared_only "$sharedonly_proj" SHARED_KEY
+case "$rc" in
+    0) assert_eq "1" "0" "test_shared_only_never_reads_project_dotenv/exit_nonzero (got 0)" ;;
+    *) assert_eq "0" "0" "test_shared_only_never_reads_project_dotenv/exit_nonzero" ;;
+esac
+assert_eq "$out" "" "test_shared_only_never_reads_project_dotenv/no_value"
+
+# Tier 1 UNCHANGED: with the fake hub up and a 200 fixture, --shared-only
+# still resolves through the hub (same route, same requester project —
+# the pause matrix still applies).
+cat >"$scratch/responses/GET_projects_p1_env_key=SHARED_ONLY_HUB_KEY.json" <<'JSON'
+{"SHARED_ONLY_HUB_KEY": "hub-tier1-value"}
+JSON
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" VCT_HUB_TOKEN="$HUB_TOKEN_CANARY" \
+      VCT_SECRETS_DIR="$sharedonly_store" \
+      "$RESOLVER" --shared-only p1 SHARED_ONLY_HUB_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_shared_only_tier1_hub_unchanged/exit_code"
+assert_eq "$out" "hub-tier1-value" "test_shared_only_tier1_hub_unchanged/value"
+
+# (d2) "Tier 1 UNCHANGED" also means a hub PAUSE falls through: the fake hub
+# answers 404 key_not_active for this key, and --shared-only must then read
+# shared/<key> — the same fall-through the full chain performs (Test 12).
+# projects/<NAME>/<key> is populated too, so the value returned also proves
+# the mode's scope. Python parity case:
+# test_shared_only_still_falls_through_a_hub_pause in tests/test_agent_secrets.py.
+cat >"$scratch/responses/GET_projects_p1_env_key=PAUSED_SHARED_ONLY.json.status" <<'STATUS'
+404
+STATUS
+cat >"$scratch/responses/GET_projects_p1_env_key=PAUSED_SHARED_ONLY.json" <<'JSON'
+{"error": {"code": "key_not_active", "message": "key PAUSED_SHARED_ONLY paused"}}
+JSON
+printf 'shared-after-pause' >"$sharedonly_store/shared/PAUSED_SHARED_ONLY"
+printf 'project-after-pause' >"$sharedonly_store/projects/sodemo/PAUSED_SHARED_ONLY"
+set +e
+out=$(VCT_HUB_PORT="$HUB_PORT" VCT_HUB_TOKEN="$HUB_TOKEN_CANARY" \
+      VCT_SECRETS_DIR="$sharedonly_store" \
+      "$RESOLVER" --shared-only p1 PAUSED_SHARED_ONLY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_shared_only_key_not_active_falls_to_shared_store/exit_code"
+assert_eq "$out" "shared-after-pause" "test_shared_only_key_not_active_falls_to_shared_store/value"
+
+# (e) REGRESSION PIN: the legacy positional form still resolves through
+# all three tiers — the very values (b)/(c) refused must still serve there.
+set +e
+out=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+      VCT_SECRETS_DIR="$sharedonly_store" \
+      env -u VCT_HUB_TOKEN -u VCT_HUB_PORT \
+      "$RESOLVER" sodemo SHARED_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_legacy_positional_still_reads_project_slot/exit_code"
+assert_eq "$out" "project-slot-value" "test_legacy_positional_still_reads_project_slot/value"
+set +e
+out=$(VCT_STATE_DIR="$scratch/empty-state-dir" \
+      VCT_SECRETS_DIR="$sharedonly_store" \
+      env -u VCT_HUB_TOKEN -u VCT_HUB_PORT \
+      "$RESOLVER" "$sharedonly_proj" SHARED_KEY 2>/dev/null)
+rc=$?
+set -e
+assert_eq "$rc" "0" "test_legacy_positional_still_reads_dotenv/exit_code"
+assert_eq "$out" "proj-env-value" "test_legacy_positional_still_reads_dotenv/value"
+
 # ── Summary ─────────────────────────────────────────────────────────────
 printf '\n%s\n' "── Summary: $PASS passed, $FAIL failed"
 exit $((FAIL > 0 ? 1 : 0))

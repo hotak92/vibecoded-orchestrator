@@ -234,3 +234,88 @@ class TestOpenAIModelResolution:
         monkeypatch.setenv("KG_SUMMARY_OPENAI_MODEL", "gpt-4.1-mini")
         mod = _load_script_module()
         assert mod._openai_model() == "gpt-4.1-mini"
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.2.98 (owner ruling 2026-09-26): _openai_api_key resolves ONLY VCO's
+# shared slot, through the shipped resolver's SHARED-ONLY form.
+# `$OPENAI_API_KEY` is never read, nor a project scope, nor a project
+# `.env` — a project's key is the project's.
+# ────────────────────────────────────────────────────────────────────
+
+_SB_PATH = _REPO_ROOT / "templates" / "scripts" / "summary_backends.py"
+
+
+def _load_summary_backends(name: str = "sb_shared_only_under_test") -> Any:
+    """Fresh summary_backends module (its `_openai_key_cache` is module
+    state, so each case needs a clean load)."""
+    sys.modules.pop(name, None)
+    spec = importlib.util.spec_from_file_location(name, _SB_PATH)
+    assert spec is not None and spec.loader is not None
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _dead_hub_port() -> int:
+    import socket
+
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+@pytest.fixture
+def isolated_resolver_env(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
+    """Tier 1 unreachable + isolated file store for the resolver subprocess
+    `_resolve_secret_via_shipped_resolver` spawns."""
+    store = tmp_path / "secrets-store"
+    (store / "shared").mkdir(parents=True)
+    (store / "projects").mkdir()
+    monkeypatch.setenv("VCT_SECRETS_DIR", str(store))
+    monkeypatch.setenv("VCT_HUB_PORT", str(_dead_hub_port()))
+    monkeypatch.delenv("VCT_HUB_TOKEN", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("KG_PROJECT_ROOT", raising=False)
+    return store
+
+
+class TestSharedOnlyOpenAIKeyResolution:
+    def test_resolves_the_shared_slot(
+        self, isolated_state: Path, isolated_resolver_env: Path,
+    ) -> None:
+        (isolated_resolver_env / "shared" / "openai_api_key").write_text(
+            "sk-shared-canary\n", encoding="utf-8"
+        )
+        mod = _load_summary_backends()
+        assert mod._openai_api_key() == "sk-shared-canary"
+
+    def test_never_reads_the_openai_api_key_env_var(
+        self, isolated_state: Path, isolated_resolver_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """RED-PROOF case (d): pre-change `_openai_api_key` preferred
+        `$OPENAI_API_KEY` — the generic env var a project may export. VCO's
+        own consumer must resolve only VCO's slot."""
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-env-canary")
+        mod = _load_summary_backends()
+        assert mod._openai_api_key() == ""
+
+    def test_never_reads_a_project_dotenv(
+        self, isolated_state: Path, isolated_resolver_env: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A project `.env` holding the key must not serve VCO's consumer
+        (pre-change the legacy positional resolver form fell through to
+        tier 3 and returned it)."""
+        proj = isolated_resolver_env.parent / "proj-with-key-env"
+        proj.mkdir()
+        (proj / ".env").write_text("openai_api_key=sk-proj-env\n", encoding="utf-8")
+        monkeypatch.setenv("KG_PROJECT_ROOT", str(proj))
+        mod = _load_summary_backends()
+        assert mod._openai_api_key() == ""

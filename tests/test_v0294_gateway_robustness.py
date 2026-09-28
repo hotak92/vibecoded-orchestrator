@@ -22,12 +22,14 @@ from __future__ import annotations
 import asyncio
 import json
 import unittest
-from typing import Any
+import unittest.mock
+from typing import Any, Callable
 
 import aiohttp
 from aiohttp import web
 
 from model_router import server as srv
+from model_router import usage as U
 from model_router.__main__ import SERVER_LIMITS
 from tests.test_model_router_server import FAKE_OAUTH, GatewayTestBase, _Upstream
 from tests.test_v0294_gateway_access_log import LOGGER, _fields
@@ -61,7 +63,7 @@ class _ChaosUpstream(_Upstream):
         self.accept_bearer: str | None = None
         #: Called as the stub answers, so a test can rotate the credentials
         #: file MID-FLIGHT rather than before the request.
-        self.on_request = None
+        self.on_request: Callable[[], None] | None = None
 
     def app(self) -> web.Application:
         app = super().app()
@@ -82,7 +84,11 @@ class _ChaosUpstream(_Upstream):
         from aiohttp.test_utils import TestServer
 
         self.server = TestServer(self.app())
-        await self.server.start_server(**SERVER_LIMITS)
+        await self.server.start_server(
+            max_field_size=SERVER_LIMITS["max_field_size"],
+            max_line_size=SERVER_LIMITS["max_line_size"],
+            max_headers=SERVER_LIMITS["max_headers"],
+        )
         return str(self.server.make_url("")).rstrip("/")
 
     async def _models(self, request: web.Request) -> web.Response:
@@ -130,6 +136,12 @@ class _ChaosUpstream(_Upstream):
             await response.write(b"event: message_stop\ndata: {}\n\n")
             await response.write_eof()
             return response
+        if self.on_request is not None:
+            # Also on the ORDINARY path, and before the answer is built: a
+            # test can then change what the NEXT answer will be from the
+            # answer being produced now — the shape of a vendor whose
+            # condition has already moved on.
+            self.on_request()
         response = await super()._messages(request)
         # Headers an SDK acts on ride on the ordinary (non-stream) answers.
         # Attached here rather than by re-registering a route, because the
@@ -540,7 +552,8 @@ class ClientCancellationTests(ChaosBase):
         line = next(
             (m for m in captured.output if "client_disconnected" in m), None,
         )
-        self.assertIsNotNone(line, captured.output)
+        if line is None:
+            self.fail(captured.output)
         fields = _fields(line)
         self.assertEqual(fields["route"], "vendor:zai")
         self.assertTrue(fields["bytes"].isdigit())
@@ -562,9 +575,17 @@ class OAuthRereadTests(ChaosBase):
         self.anthropic_up.on_request = lambda: self.write_credentials(
             rotated, expires_in_ms=3_600_000,
         )
+        # The retry's answer carries usage, so the ledger row it OWES is
+        # observable: without it a usage-less 2xx declines in _submit_usage
+        # by design and the test could not tell the fix from the defect.
+        self.anthropic_up.messages_body = {
+            "id": "msg_1", "type": "message", "model": "claude-opus-5",
+            "content": [], "usage": {"input_tokens": 321, "output_tokens": 4},
+        }
         with self.assertLogs(LOGGER, level="INFO") as captured:
             resp = await self.client.post(
-                "/v1/messages", headers=self.headers(),
+                "/v1/messages",
+                headers=self.headers(**{U.SESSION_HEADER: "chat-oauth"}),
                 json={"model": "claude-opus-5", "messages": []},
             )
         self.assertEqual(resp.status, 200, await resp.text())
@@ -575,6 +596,21 @@ class OAuthRereadTests(ChaosBase):
         self.assertTrue(
             any("oauth_reread_retry" in m for m in captured.output), captured.output,
         )
+        # The retry re-sends the SAME turn, so it owes the SAME row: identity
+        # and numbers ride on `facts`, which the re-send used to be built
+        # without — leaving a repaired, billed turn absent from the record.
+        await self.client.app[srv.APP_KEY].usage.drain()
+        rows = [
+            json.loads(line)
+            for line in self.usage_ledger_path.read_text(
+                encoding="utf-8",
+            ).splitlines()
+            if line
+        ] if self.usage_ledger_path.is_file() else []
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["session"], "chat-oauth")
+        self.assertEqual(rows[0]["route"], "anthropic")
+        self.assertEqual(rows[0]["input_tokens"], 321)
 
     async def test_an_unchanged_credential_is_not_retried(self) -> None:
         """A genuinely dead login answers 401 once — never in a loop."""
@@ -603,6 +639,249 @@ class OAuthRereadTests(ChaosBase):
         self.assertEqual(
             len(self.anthropic_up.message_requests), 1,
             "a consumed stream must not be replayed",
+        )
+
+
+#: The 2026-09-08 field body, and the verdict shape the re-probe guards.
+_EXHAUSTED_BODY = b'{"error":{"code":"1310","message":"Weekly/Monthly Limit Exhausted"}}'
+
+
+class QuotaReprobeTests(ChaosBase):
+    """An exhaustion verdict is re-checked once before it is passed on.
+
+    The sibling of :class:`OAuthRereadTests` — one request, at most one
+    repair attempt — and it exists for a stricter reason. A 401 costs a turn;
+    an exhaustion verdict sends the user OFF the model family. The 2026-09-25
+    log holds the shape: the same vendor answered the same model with 200 at
+    18:24:11.772, and a refusal this module classifies EXHAUSTED arrived at
+    18:24:12.852 — 1.1 seconds apart. Which evidence carried that verdict is
+    not recoverable from the log, because the deciding body is written at
+    DEBUG only.
+
+    So the re-probe is taken on the EVIDENCE, not on the status — a
+    rate-limited 429 sends the user nowhere and is not worth a second
+    request.
+    """
+
+    async def test_a_stale_exhaustion_verdict_costs_one_retry_not_the_turn(
+        self,
+    ) -> None:
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        answers = {"n": 0}
+
+        def the_vendor_recovers() -> None:
+            answers["n"] += 1
+            if answers["n"] > 1:
+                self.vendor_up.messages_status = 200
+                self.vendor_up.messages_raw = None
+
+        self.vendor_up.on_request = the_vendor_recovers
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers=self.headers(),
+                json={"model": "claude-gw/glm-5.3", "messages": []},
+            )
+        self.assertEqual(resp.status, 200, await resp.text())
+        self.assertEqual(
+            len(self.vendor_up.message_requests), 2,
+            "one refusal, then exactly one re-check",
+        )
+        self.assertTrue(
+            any("note=quota_reprobe" in m for m in captured.output),
+            captured.output,
+        )
+        self.assertFalse(
+            any("quota_class" in m for m in captured.output),
+            "no sentence reached the user, so there is no CLASSIFIED verdict "
+            "to record — the raw evidence this repair was taken on rides the "
+            "re-probe's own line instead, which is a different field "
+            "(see test_the_repair_line_records_the_verdict_it_repaired)",
+        )
+        self.assertEqual(
+            len([m for m in captured.output if "vendor_quota" in m]), 0,
+            captured.output,
+        )
+
+    async def test_the_repair_line_records_the_verdict_it_repaired(
+        self,
+    ) -> None:
+        """A re-probe that SUCCEEDS is the only record of the verdict it replaced.
+
+        ``quota_evidence_fields`` exists because "what carried this verdict"
+        is not recoverable from the log any other way — the deciding body is
+        written at DEBUG only, so nothing separates the vendor's own error
+        code from a reset time an hour out. That argument does not stop
+        applying when the re-probe WINS: the first attempt still decided
+        EXHAUSTED, on evidence, and the repair is only explicable if the log
+        says what it was repairing. Still one client request, one line.
+        """
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        answers = {"n": 0}
+
+        def the_vendor_recovers() -> None:
+            answers["n"] += 1
+            if answers["n"] > 1:
+                self.vendor_up.messages_status = 200
+                self.vendor_up.messages_raw = None
+
+        self.vendor_up.on_request = the_vendor_recovers
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers=self.headers(),
+                json={"model": "claude-gw/glm-5.3", "messages": []},
+            )
+        self.assertEqual(resp.status, 200, await resp.text())
+        repaired = [m for m in captured.output if "note=quota_reprobe" in m]
+        self.assertEqual(len(repaired), 1, captured.output)
+        # The vendor's own code, re-derived from the body the gateway refused
+        # on: a reader can tell a real exhaustion from a misread one.
+        self.assertIn("quota_code=1310", repaired[0])
+        # And the repair does not open a second line for the request.
+        self.assertEqual(
+            len(
+                [
+                    m
+                    for m in captured.output
+                    if "model-gateway: requested=" in m
+                ],
+            ),
+            1,
+            captured.output,
+        )
+
+    async def test_a_re_probe_that_succeeds_is_counted_in_the_ledger(
+        self,
+    ) -> None:
+        """A repaired turn is still a turn, and the ledger is where that shows.
+
+        The re-probe answers the user from the VENDOR, so the request really
+        did consume context. ``_submit_usage`` counts from ``facts``, and the
+        re-send used to be built without it — so the first attempt after a
+        stale exhaustion verdict answered 200 and left the record saying
+        nothing had happened at all. (The refusal itself could not have
+        written the row anyway: a non-2xx declines.) Identity rides on
+        ``facts`` too, which is why the session is asserted and not just the
+        row count.
+        """
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        answers = {"n": 0}
+
+        def the_vendor_recovers() -> None:
+            answers["n"] += 1
+            if answers["n"] > 1:
+                self.vendor_up.messages_status = 200
+                self.vendor_up.messages_raw = None
+                # The recovering answer CARRIES usage: a usage-less 2xx
+                # declines in _submit_usage by design, so without this the
+                # test could not tell the fix from the defect.
+                self.vendor_up.messages_body = {
+                    "id": "msg_1", "type": "message", "content": [],
+                    "usage": {
+                        "input_tokens": 1234,
+                        "cache_creation_input_tokens": 0,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 7,
+                    },
+                }
+
+        self.vendor_up.on_request = the_vendor_recovers
+        resp = await self.client.post(
+            "/v1/messages",
+            headers=self.headers(**{U.SESSION_HEADER: "chat-reprobe"}),
+            json={"model": "claude-gw/glm-5.3", "messages": []},
+        )
+        self.assertEqual(resp.status, 200, await resp.text())
+        self.assertEqual(len(self.vendor_up.message_requests), 2)
+
+        await self.client.app[srv.APP_KEY].usage.drain()
+        self.assertTrue(
+            self.usage_ledger_path.is_file(),
+            "the successful re-probe wrote no ledger row at all",
+        )
+        rows = [
+            json.loads(line)
+            for line in self.usage_ledger_path.read_text(
+                encoding="utf-8",
+            ).splitlines()
+            if line
+        ]
+        self.assertEqual(len(rows), 1, rows)
+        self.assertEqual(rows[0]["session"], "chat-reprobe")
+        self.assertEqual(rows[0]["input_tokens"], 1234)
+        self.assertEqual(rows[0]["output_tokens"], 7)
+
+    async def test_a_second_exhaustion_verdict_is_the_one_the_user_sees(
+        self,
+    ) -> None:
+        """Twice refused is refused: the re-probe must not become a loop."""
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            resp = await self.client.post(
+                "/v1/messages",
+                headers=self.headers(),
+                json={"model": "claude-gw/glm-5.3", "messages": []},
+            )
+        self.assertEqual(resp.status, 429)
+        body = await resp.json()
+        self.assertIn("Z.ai quota exhausted", body["error"]["message"])
+        self.assertNotIn("1310", body["error"]["message"])
+        self.assertEqual(
+            len(self.vendor_up.message_requests), 2,
+            "exactly one re-check, never a third attempt",
+        )
+        quota_lines = [m for m in captured.output if "vendor_quota" in m]
+        self.assertEqual(
+            len(quota_lines), 1,
+            f"one client request, one line: {quota_lines}",
+        )
+        self.assertIn("quota_class=exhausted", quota_lines[0])
+        self.assertIn("quota_code=1310", quota_lines[0])
+        self.assertIn("note=quota_reprobe", quota_lines[0])
+
+    async def test_a_rate_limit_is_not_re_probed(self) -> None:
+        """A paced refusal costs ONE request: it sends the user nowhere, so
+        a second attempt would buy nothing and double every throttle."""
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = (
+            b'{"error":{"code":"1302","message":"API request rate limit"}}'
+        )
+        resp = await self.client.post(
+            "/v1/messages",
+            headers=self.headers(),
+            json={"model": "claude-gw/glm-5.3", "messages": []},
+        )
+        self.assertEqual(resp.status, 429)
+        self.assertIn(
+            "rate-limited", (await resp.json())["error"]["message"],
+        )
+        self.assertEqual(len(self.vendor_up.message_requests), 1)
+
+    async def test_a_streamed_body_is_never_re_probed(self) -> None:
+        """An over-buffer body is already consumed; it cannot be sent twice,
+        so the refusal goes to the client — and it is the only body shape
+        that reaches this branch without a re-check."""
+        self.config.rewrite_buffer_bytes = 64 * 1024
+        client = await self.make_client()
+        self.vendor_up.messages_status = 429
+        self.vendor_up.messages_raw = _EXHAUSTED_BODY
+        resp = await client.post(
+            "/v1/messages",
+            headers=self.headers(),
+            data=_payload(256 * 1024),
+        )
+        self.assertEqual(resp.status, 429)
+        self.assertEqual(
+            len(self.vendor_up.message_requests), 1,
+            "a consumed stream must not be replayed",
+        )
+        self.assertIn(
+            "Z.ai quota exhausted", (await resp.json())["error"]["message"],
         )
 
 

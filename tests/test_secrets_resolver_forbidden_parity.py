@@ -115,3 +115,39 @@ def test_all_three_exit_code_tables_document_code_6():
         assert "6" in body and "locked" in lowered, (
             f"{name} exit-code table must document code 6 (keychain locked)"
         )
+
+
+# ─── v0.2.98: --shared-only mode exists in BOTH shell siblings ──────────
+#
+# Owner ruling 2026-09-26: VCO's OWN consumers (embeddings, gateway,
+# codegraph, hooks) resolve only VCO's shared slot — never a project
+# scope, never a project `.env`. The mode must exist on BOTH the .sh and
+# the .ps1 (the .ps1 is the native-Windows code path; a flag missing from
+# one sibling is a defect). Behavioural coverage: Test 21 in
+# tests/test_vct_secrets_resolve.sh and the shared-only class in
+# tests/test_vct_secrets_resolve_ps1.py.
+
+
+def test_sh_secrets_resolver_has_shared_only_mode():
+    body = (SCRIPTS / "vct_secrets_resolve.sh").read_text(encoding="utf-8")
+    assert '--shared-only)' in body, (
+        "sh resolver must dispatch --shared-only as a FIRST argument"
+    )
+    assert "file_store_get_shared_only" in body, (
+        "sh resolver's shared-only tier 2 must not consult projects/<NAME>/<key>"
+    )
+
+
+def test_ps1_secrets_resolver_has_shared_only_mode():
+    body = (SCRIPTS / "vct_secrets_resolve.ps1").read_text(encoding="utf-8")
+    assert "--shared-only" in body, (
+        "ps1 resolver must document/dispatch the --shared-only spelling"
+    )
+    assert "Get-SharedFileStoreValue" in body, (
+        "ps1 resolver's shared-only tier 2 must not consult projects/<NAME>/<key>"
+    )
+    assert "[switch]$SharedOnly" in body, (
+        "ps1 resolver needs the -SharedOnly switch — pwsh -File binds a "
+        "leading `-`-token as a parameter, so --shared-only never reaches "
+        "$Arg1 through -File"
+    )

@@ -52,6 +52,18 @@ three):
 Tiers 2 and 3 together are gated by ``allow_file_fallback`` — disable
 when only the keychain truth is acceptable.
 
+``shared_only=True`` is the SCOPE switch (mirrored by ``--shared-only`` in
+``vct_secrets_resolve.sh`` / ``vct_secrets_resolve.ps1``, whose comments
+read "tier 1 UNCHANGED — the chain minus two legs"): tier 2 is reduced to
+its ``shared/<key>`` leg and tier 3 is skipped entirely. Tier 1 is NOT
+gated: the same hub route with the same requester identity, because the
+hub's own per-(secret x requester) matrix decides what the hub may answer.
+What keeps a project's key out of VCO's own slot is therefore the hub's
+``slot_exclusive`` declaration for that key (``vct-module.json``), enforced
+in the hub's module API — not this flag. VCO's own consumers resolve
+through it so a project's key is never spent on VCO (owner ruling
+2026-09-26).
+
 Secrets NEVER touch argv, logs, or exception messages — errors name the
 key and the tiers consulted, never the value.
 """
@@ -203,12 +215,17 @@ def _shared_fallback_disabled(root: Path, name: Optional[str]) -> bool:
     return (root / "projects" / name / NO_SHARED_FALLBACK_MARKER).exists()
 
 
-def _file_store_get(key: str, project: Optional[str]) -> Optional[str]:
+def _file_store_get(
+    key: str, project: Optional[str], *, shared_only: bool = False,
+) -> Optional[str]:
     """Resolve ``key`` from the file store; None when absent.
 
     Order: ``projects/<NAME>/<key>`` (when a project name applies) →
     ``shared/<key>``. Strips ONE trailing newline, matching
     ``vct exec`` semantics.
+
+    ``shared_only`` drops the per-project leg: the shared slot is the only
+    candidate (see :func:`get`).
 
     The ``shared/`` leg is SKIPPED when the resolved project holds the
     ``.no-shared-fallback`` marker (see :data:`NO_SHARED_FALLBACK_MARKER`).
@@ -219,7 +236,7 @@ def _file_store_get(key: str, project: Optional[str]) -> Optional[str]:
     root = _secrets_root()
     candidates: list[Path] = []
     name = _detect_file_project_name(project)
-    if name:
+    if name and not shared_only:
         candidates.append(root / "projects" / name / key)
     if not _shared_fallback_disabled(root, name):
         candidates.append(root / "shared" / key)
@@ -416,6 +433,7 @@ def get(
     *,
     project: Optional[str] = None,
     allow_file_fallback: bool = True,
+    shared_only: bool = False,
 ) -> str:
     """Read a secret value through the canonical three-tier chain.
 
@@ -432,6 +450,15 @@ def get(
         allow_file_fallback: when False, only the hub answer counts —
             a hub miss raises instead of consulting ``~/.vct-secrets``
             or the project ``.env`` (tiers 2 AND 3 are both gated).
+        shared_only: restrict the chain to the SHARED slot — tier 2 is
+            ``shared/<key>`` only (the ``projects/<NAME>/`` leg is not
+            consulted) and tier 3 is not consulted at all. Tier 1 is
+            UNCHANGED (sh/ps1 parity: the chain minus two legs), the hub's
+            own matrix gating what it may answer. ``project``
+            stays the REQUESTER identity for the hub gate and for the
+            requester's ``.no-shared-fallback`` opt-out; it never widens
+            the lookup. VCO's own consumers use this mode so a project's
+            key can never answer for VCO.
 
     Raises:
         SecretNotFound: key resolves nowhere (all tiers consulted).
@@ -457,6 +484,22 @@ def get(
     if not key or not key.strip():
         raise SecretNotFound("empty key")
     key = key.strip()
+
+    def tier2_desc() -> str:
+        root = _secrets_root()
+        return f"{root}/shared" if shared_only else str(root)
+
+    def tier3_desc() -> str:
+        # Honest by construction: never claim a tier was consulted when the
+        # mode skipped it (a reader of the miss must be able to tell which
+        # stores were actually checked).
+        if shared_only:
+            return "not consulted (shared-only mode)"
+        d = _dotenv_dir(project)
+        return (
+            str(d / ".env") if d is not None
+            else "skipped (bare project NAME — tier 3 needs a path)"
+        )
 
     hub_error: Optional[ResolverError] = None
     try:
@@ -496,15 +539,18 @@ def get(
         hub_error = exc
 
     if allow_file_fallback:
-        value = _file_store_get(key, project)
+        value = _file_store_get(key, project, shared_only=shared_only)
         if value is not None:
             return value
         # Tier 3: the project's own .env — read-only, lowest priority.
         # `.env` last means a user migrating a key into the GUI gets the
         # managed copy immediately without deleting their .env line.
-        value = _project_dotenv_get(key, project)
-        if value is not None:
-            return value
+        # Skipped in shared-only mode: a project's `.env` is a project-scoped
+        # store by definition, and this mode exists so it cannot answer.
+        if not shared_only:
+            value = _project_dotenv_get(key, project)
+            if value is not None:
+                return value
 
     if isinstance(hub_error, AccessDenied):
         raise hub_error
@@ -513,31 +559,29 @@ def get(
         # project .env also missed (or fallback was disabled). Surface the
         # distinct KeychainLocked so the caller can branch on the honest
         # state, with a message naming BOTH the lock and the file-store miss.
-        _tier3_dir = _dotenv_dir(project)
-        _tier3_desc = (
-            str(_tier3_dir / ".env") if _tier3_dir is not None
-            else "skipped (bare project NAME — tier 3 needs a path)"
-        )
         raise KeychainLocked(
             f"hub keychain is locked; key {key!r} also absent from file store "
-            f"({_secrets_root()}) and project .env ({_tier3_desc}) "
+            f"({tier2_desc()}) and project .env ({tier3_desc()}) "
             f"(tiers 2+3 checked={allow_file_fallback}) — unlock the login "
             "keychain or open the launcher. "
             f"Underlying hub state: {hub_error}"
         ) from hub_error
     if isinstance(hub_error, SecretNotFound) or allow_file_fallback:
-        _tier3_dir = _dotenv_dir(project)
-        _tier3_desc = (
-            str(_tier3_dir / ".env") if _tier3_dir is not None
-            else "skipped (bare project NAME — tier 3 needs a path)"
+        _fix = (
+            f"Fix: store it in the shared slot — launcher Preferences → "
+            f"Secrets → Shared (this user), or "
+            f"`vct set --shared --key {key}`"
+            if shared_only else
+            f"Fix: launcher Preferences → Secrets, "
+            f"`vct set --shared --key {key}`, "
+            f"or add the key to the project's .env"
         )
         raise SecretNotFound(
             f"secret {key!r} not found (tier 1 hub: {hub_error}; tier 2 "
-            f"file store: {_secrets_root()}; tier 3 project .env: "
-            f"{_tier3_desc}; tiers 2+3 "
-            f"checked={allow_file_fallback}). Fix: launcher SecretsPanel, "
-            f"`vct set --shared --key {key}`, or add the key to "
-            f"the project's .env"
+            f"file store: {tier2_desc()}; tier 3 project .env: "
+            f"{tier3_desc()}; tiers 2+3 "
+            f"checked={allow_file_fallback}; shared_only={shared_only}). "
+            + _fix
         ) from hub_error
     raise hub_error
 

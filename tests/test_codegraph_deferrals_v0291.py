@@ -54,7 +54,10 @@ class TenancyTests(unittest.TestCase):
     def test_code_backend_down_names_the_service_to_restart(self) -> None:
         cases = {
             "codesage_embed": ("CodeEmbed", "podman start vco_code_embed"),
-            "openai_embed": ("OpenAI", "OPENAI_API_KEY"),
+            # v0.2.98: the remedy names VCO's OWN slot. It used to name
+            # `$OPENAI_API_KEY`, which no VCO consumer reads any more — the
+            # printed command has to send the user somewhere that works.
+            "openai_embed": ("OpenAI", "openai_api_key"),
             "qwen3_embed": ("Ollama", "podman start vco_ollama"),
         }
         for slot, (hint, cmd) in cases.items():

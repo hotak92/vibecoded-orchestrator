@@ -94,6 +94,17 @@ try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 # WHOLE command, not just the final `&&` segment. Pattern list between
 # SEC-RAW-PATTERNS-BEGIN/END MUST MATCH lean-ctx-rewrite.sh (parity-pinned
 # by tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
+#
+# TRIM-r: read-only git INSPECTION commands ALSO run raw. lean-ctx's
+# compression measured -94% on `git ls-tree -r --name-only` (286 of 300
+# paths silently dropped) and -93% on `git log --oneline -500` (dropping
+# the OLDEST commits, no signal). Same FINAL `&&`-segment segmentation as
+# TRIM-b; command-specific, NOT a blanket `git` gate (status/branch/fetch/
+# remote/add/checkout stay compressed). Exactly seven verbs, no others:
+# show diff grep log blame cat-file ls-tree. Verb list between
+# GIT-READONLY-VERBS-BEGIN/END MUST MATCH lean-ctx-rewrite.sh
+# (parity-pinned by
+# tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
 if ($HookStdin) {
     try {
         $payload = $HookStdin | ConvertFrom-Json -ErrorAction Stop
@@ -121,10 +132,25 @@ if ($HookStdin) {
             foreach ($p in $secretPatterns) {
                 if ([regex]::IsMatch($cmd, $p)) { exit 0 }
             }
+            # GIT-READONLY-VERBS-BEGIN
+            $gitRawVerbs = @(
+                'show',
+                'diff',
+                'grep',
+                'log',
+                'blame',
+                'cat-file',
+                'ls-tree'
+            )
+            # GIT-READONLY-VERBS-END
             $seg = ($cmd -split '&&')[-1].Trim()
             $toks = $seg -split '\s+'
             if ($toks.Count -ge 2 -and $toks[0] -eq 'git' -and
                 ($toks[1] -eq 'commit' -or $toks[1] -eq 'push')) {
+                exit 0
+            }
+            if ($toks.Count -ge 2 -and $toks[0] -eq 'git' -and
+                $gitRawVerbs -contains $toks[1]) {
                 exit 0
             }
         }

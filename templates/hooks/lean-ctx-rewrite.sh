@@ -108,6 +108,19 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # wrap. Pattern list between SEC-RAW-PATTERNS-BEGIN/END MUST MATCH
 # lean-ctx-rewrite.ps1 (parity-pinned by
 # tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
+#
+# TRIM-r: read-only git INSPECTION commands ALSO run raw. lean-ctx's
+# compression measured -94% on `git ls-tree -r --name-only` (286 of 300
+# paths silently dropped) and -93% on `git log --oneline -500` (dropping
+# the OLDEST commits, no signal) — a reviewer lane inspecting a branch
+# that was NOT checked out lost evidence. The gate uses the SAME FINAL
+# `&&`-segment segmentation as TRIM-b and is command-specific, NOT a
+# blanket `git` gate: `git status`/`branch`/`fetch`/`remote`/`add`/
+# `checkout` stay compressed. Exactly seven verbs, no others: show diff
+# grep log blame cat-file ls-tree. Verb list between
+# GIT-READONLY-VERBS-BEGIN/END MUST MATCH lean-ctx-rewrite.ps1
+# (parity-pinned by
+# tests/test_d11_trimb_lean_ctx_discovery_and_git_bypass.py).
 _lc_cmd="$(cat 2>/dev/null || true)"
 if [ -n "$_lc_cmd" ]; then
     PYBIN_BP="$(command -v python3 || command -v python || true)"
@@ -151,6 +164,22 @@ for _p in _SECRET_PATTERNS:
 seg = cmd.split("&&")[-1].strip()
 toks = seg.split()
 if len(toks) >= 2 and toks[0] == "git" and toks[1] in ("commit", "push"):
+    sys.stdout.write("raw")
+    sys.exit(0)
+# TRIM-r: read-only git inspection commands run raw (see comment block
+# above for the measured evidence). Same final-segment segmentation.
+# GIT-READONLY-VERBS-BEGIN
+_GIT_RAW_VERBS = (
+    "show",
+    "diff",
+    "grep",
+    "log",
+    "blame",
+    "cat-file",
+    "ls-tree",
+)
+# GIT-READONLY-VERBS-END
+if len(toks) >= 2 and toks[0] == "git" and toks[1] in _GIT_RAW_VERBS:
     sys.stdout.write("raw")
 ' 2>/dev/null || true)"
         if [ "$_lc_decision" = "raw" ]; then

@@ -372,8 +372,10 @@ class ServiceTests(unittest.IsolatedAsyncioTestCase):
         snap = service.snapshot()
         self.assertEqual(
             render_line(snap),
-            "Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72% │ Qwen 1.2M tok/mo",
+            "Claude 5h 31% · wk 27% · Fable 12% │ GLM 5h 10% · wk 72%",
         )
+        # The ledger total is COLLECTED and asserted just below, and
+        # deliberately not rendered: no token count in the line.
         vendors = {v["id"]: v for v in snap["vendors"]}
         self.assertEqual(vendors["zai"]["plan"], "pro")
         qwen_tokens = vendors["qwen"]["tokens"]

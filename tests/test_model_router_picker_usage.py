@@ -119,19 +119,15 @@ class LabelSuffixTests(unittest.TestCase):
         clock = time.strftime("%H:%M", time.localtime(old))
         self.assertTrue(self.suffix(vendor).endswith(f"(as of {clock})"))
 
-    def test_tokens_for_a_vendor_with_no_quota_source(self) -> None:
-        self.assertEqual(
-            self.suffix({"windows": [], "tokens": _tokens(1_234_567)}),
-            " · 1.2M tokens used this month",
-        )
-
-    def test_partial_month_coverage_names_its_span(self) -> None:
+    def test_a_ledger_total_is_never_a_suffix(self) -> None:
+        # Owner 2026-09-28: the gateway's own routed-token count measures what
+        # THIS gateway routed, not the account's plan usage — it must not be
+        # rendered. A vendor with no known windows gets an empty suffix even
+        # when the ledger holds a fresh, positive total.
+        self.assertEqual(self.suffix({"windows": [], "tokens": _tokens(1_234_567)}), "")
         since = datetime(2026, 9, 2, 10, tzinfo=timezone.utc).timestamp()
-        moment = time.localtime(since)
-        day = f"{time.strftime('%b', moment)} {moment.tm_mday}"
         self.assertEqual(
-            self.suffix({"windows": [], "tokens": _tokens(1_234_567, since=since)}),
-            f" · 1.2M tokens used since {day}",
+            self.suffix({"windows": [], "tokens": _tokens(1_234_567, since=since)}), "",
         )
 
     def test_zero_or_stale_tokens_are_omitted(self) -> None:
@@ -148,10 +144,7 @@ class LabelSuffixTests(unittest.TestCase):
                 {"id": "empty", "windows": [_window("5h", "5h", None)]},
             ],
         }
-        self.assertEqual(
-            label_suffixes(snapshot),
-            {"zai": " · 5h 10% used", "qwen": " · 950K tokens used this month"},
-        )
+        self.assertEqual(label_suffixes(snapshot), {"zai": " · 5h 10% used"})
         self.assertEqual(label_suffixes({"vendors": []}), {})
 
 
@@ -193,8 +186,9 @@ class ServiceSnapshotTests(unittest.IsolatedAsyncioTestCase):
         await self.service.refresh()
         fresh = label_suffixes(self.service.snapshot())
         self.assertEqual(fresh["zai"], " · 5h 10% · wk 72% used")
-        # The ledger holds an August row, so the month is fully covered.
-        self.assertEqual(fresh["qwen"], " · 1.2M tokens used this month")
+        # The qwen vendor has no quota source, only the gateway's own ledger —
+        # which is collected but never rendered, so it gets no suffix at all.
+        self.assertNotIn("qwen", fresh)
 
         self.clock[0] = T0 + 600  # past the refresh interval, inside STALE_AFTER_S
         clock = time.strftime("%H:%M", time.localtime(T0))

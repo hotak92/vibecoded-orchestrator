@@ -68,6 +68,7 @@ import argparse
 import os
 import sys
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest import mock
 from unittest.mock import MagicMock, patch
@@ -81,6 +82,7 @@ from vco_lib.embedding_providers.codeembed import CodeEmbedAdapter  # noqa: E402
 from vco_lib.embedding_providers.ollama import OllamaAdapter  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
 from vco_lib.embedding_providers.openai import OpenAIAdapter, ValidationResult  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
 from vco_lib.embedding_service import EmbeddingService  # noqa: E402 - after the sys.path bootstrap; this file is directly runnable (__main__ tail)
+from tests.common.vco_openai_slot import vco_openai_slot  # noqa: E402 - after the sys.path bootstrap
 
 
 # ---------------------------------------------------------------------------
@@ -438,17 +440,19 @@ class PresetToEmbeddingServiceParityTests(unittest.TestCase):
         emission sites).
         """
         cfg = install.EMBEDDING_CONFIGS[preset_name]
-        env = {
+        # NOTE (v0.2.98): no ``OPENAI_API_KEY`` here, and none anywhere else
+        # in this file. The openai preset's reachability comes from VCO's own
+        # ``openai_api_key`` slot (``vco_openai_slot`` in the caller), not
+        # from the environment — see the owner ruling in
+        # ``vco_lib/openai_key.resolve_openai_api_key``. install.py no longer
+        # emits that variable into any env either; it stores the value in the
+        # slot (``_store_install_openai_key``).
+        return {
             "EMBEDDING_MODEL": cfg["text_model"],
             "CODE_EMBED_BACKEND": cfg["code_backend"],
             "CODE_EMBED_MODEL": cfg["code_model"],
             "ACTIVE_EMBEDDING": cfg.get("active_embedding", "qwen3"),
         }
-        if preset_name == "openai":
-            # install.py would set OPENAI_API_KEY too — required for the
-            # openai readiness probe to fire.
-            env["OPENAI_API_KEY"] = "sk-fake-test-key"
-        return env
 
     def _assert_preset_constructs_correctly(
         self, plan_class: str, *, openai_valid: bool = False,
@@ -464,7 +468,11 @@ class PresetToEmbeddingServiceParityTests(unittest.TestCase):
             openai_valid=openai_valid,
         )
 
-        with _EnvScrub(), patch.dict(os.environ, env, clear=False):
+        slot = (
+            vco_openai_slot("sk-fake-slot-test-key")
+            if preset_name == "openai" else nullcontext()
+        )
+        with _EnvScrub(), patch.dict(os.environ, env, clear=False), slot:
             with patch("vco_lib.embedding_service.OllamaAdapter",
                        return_value=ollama_m), \
                  patch("vco_lib.embedding_service.CodeEmbedAdapter",
