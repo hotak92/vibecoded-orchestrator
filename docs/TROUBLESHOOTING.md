@@ -764,6 +764,24 @@ could not be read — probe failure is not evidence. To merge leftover objects
 into the class you kept: `python -m vco_lib.project_init migrate-collections
 --help`.
 
+## The update badge never lights on v0.2.97/0.2.98 (fixed in v0.2.99)
+
+Two defects shipped in v0.2.97/0.2.98 hid updates from the launcher without any error anywhere:
+
+- the startup code that registers the update badge threw `TypeError: Illegal invocation`
+  inside the webview (an invisible frontend error), so the badge, its hourly re-check,
+  and the "Open" links on the Preferences page were silently dead;
+- the tag-warming fetch (`git fetch --quiet --tags`) exits 1 **silently** whenever a
+  local tag differs from upstream's — which the release flow's tag re-point makes common —
+  logging only `(no stderr)` and starving other checks behind its retry ladder.
+
+**The update path itself still works on those builds.** Use the sidebar →
+**Preferences → Updates → "Check now"**, then **"Update now"** — that flow does not
+depend on the badge or on tag fetches, and it delivers v0.2.99, which fixes both defects
+(and force-updates the stale local tags on its next check). If even that page cannot
+check, run `python install.py --update` from the install root, then
+`git fetch --tags --force vco_upstream` inside it to align re-pointed tags.
+
 ## Update Bundle deferrals: `UPDATE_DEFERRED.md`
 
 When you click "Update bundle" in the per-project Settings page (or run `python -m vco_lib.project_init install-bundle --update`), the orchestrator writes `<project>/.claude/context/UPDATE_DEFERRED.md` whenever an update step needs explicit user consent before continuing. The launcher toast surfaces the count ("5 files updated, 2 deferrals"); the file lists each deferral entry with the exact command to clear it.
