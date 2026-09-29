@@ -66,7 +66,6 @@ use vct_launcher_core::process::CommandExt as _;
 
 use crate::commands::installer::{
     launcher_binary_filename, launcher_dist_subdir, read_on_disk_binary_version,
-    version_is_outdated,
 };
 
 // ---------------------------------------------------------------------------
@@ -222,13 +221,33 @@ pub(crate) fn decide_at_rest_action(verdict: &FreshnessVerdict) -> AtRestAction 
 /// nothing (we never infer staleness from missing metadata), and a running
 /// version NEWER than the sidecar is `Fresh` (a developer running a local
 /// cargo build against an older dist slot must not be nagged).
+///
+/// v0.2.100 WP-01: ordering goes through the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). A version that does not
+/// parse — sidecar OR running — contributes nothing, exactly like an absent
+/// sidecar, and the reason is logged with the offending string. It is never
+/// ranked: the old leading-digit parser read `0.2.100-rc1` as `0.2.100` and
+/// would have armed a binary swap over it.
 pub(crate) fn decide_binary_freshness(inputs: &FreshnessInputs) -> FreshnessVerdict {
     let on_disk_newer = inputs
         .on_disk_version
         .as_deref()
         .filter(|v| !v.is_empty())
-        // version_is_outdated(a, b) == (a < b)
-        .map(|on_disk| version_is_outdated(&inputs.running_version, on_disk))
+        .map(|on_disk| {
+            match vct_launcher_core::version::is_older(&inputs.running_version, on_disk) {
+                Ok(older) => older,
+                Err(e) => {
+                    tracing::warn!(
+                        "[binary_freshness] running {:?} vs dist sidecar {:?}: {} — \
+                         the version signal contributes nothing",
+                        inputs.running_version,
+                        on_disk,
+                        e
+                    );
+                    false
+                }
+            }
+        })
         .unwrap_or(false);
 
     match (on_disk_newer, inputs.dist_dirty) {
@@ -2331,6 +2350,37 @@ mod tests {
         assert_eq!(
             decide_binary_freshness(&inputs("0.2.91", Some(""), false)),
             FreshnessVerdict::Fresh
+        );
+    }
+
+    /// v0.2.100 WP-01 (act): an unparseable sidecar is never ranked. The
+    /// leading-digit parser read `0.2.100-rc1` as `0.2.100` > `0.2.99` and
+    /// returned `Stale(OnDiskNewerThanRunning)` — i.e. it would ARM a swap.
+    #[test]
+    fn unparseable_sidecar_contributes_nothing_to_the_verdict() {
+        assert_eq!(
+            decide_binary_freshness(&inputs("0.2.99", Some("0.2.100-rc1"), false)),
+            FreshnessVerdict::Fresh
+        );
+        assert_eq!(
+            decide_binary_freshness(&inputs("0.2.99", Some("0.2.100.1"), true)),
+            FreshnessVerdict::Stale(StaleReason::DistDirtyVsHead),
+            "the git signal still fires on its own; the version signal adds nothing"
+        );
+        assert_eq!(
+            decide_binary_freshness(&inputs("0.2", Some("0.2.100"), false)),
+            FreshnessVerdict::Fresh,
+            "an unparseable RUNNING version is not ranked either"
+        );
+    }
+
+    /// v0.2.100 WP-01 (leave-alone): 0.2.100 on disk IS newer than a running
+    /// 0.2.99 — numeric, not lexicographic.
+    #[test]
+    fn a_0_2_100_sidecar_is_newer_than_a_running_0_2_99() {
+        assert_eq!(
+            decide_binary_freshness(&inputs("0.2.99", Some("0.2.100"), false)),
+            FreshnessVerdict::Stale(StaleReason::OnDiskNewerThanRunning)
         );
     }
 

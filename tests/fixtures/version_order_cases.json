@@ -1,0 +1,42 @@
+{
+  "_doc": [
+    "The ONE case table for orchestrator/module version ordering (v0.2.100, owner ruling Q7).",
+    "A version is exactly ^v?(\\d+)\\.(\\d+)\\.(\\d+)$ with ASCII digits: no pre-release suffix,",
+    "no fourth number, no surrounding whitespace. Consumed by all three homes:",
+    "  Python  vco_lib/version_compare.py            (tests/test_v02100_version_order.py)",
+    "  Rust    vct-launcher-core/src/version.rs      (#[cfg(test)] in that file)",
+    "  TS      launcher/src/lib/version-compare.ts   (version-compare.test.ts)",
+    "`order`: cmp(a, b) must equal `cmp` (-1 / 0 / 1), and cmp(b, a) its negation.",
+    "`reject`: parsing must FAIL with the language's typed parse error; the string is never ranked."
+  ],
+  "order": [
+    {"a": "0.2.99", "b": "0.2.100", "cmp": -1},
+    {"a": "0.2.9", "b": "0.2.10", "cmp": -1},
+    {"a": "0.2.100", "b": "0.3.0", "cmp": -1},
+    {"a": "0.2.100", "b": "0.3.11", "cmp": -1},
+    {"a": "0.3.11", "b": "0.10.0", "cmp": -1},
+    {"a": "1.0.0", "b": "0.99.99", "cmp": 1},
+    {"a": "0.2.100", "b": "0.2.100", "cmp": 0},
+    {"a": "v0.2.99", "b": "v0.2.100", "cmp": -1},
+    {"a": "v0.2.9", "b": "0.2.10", "cmp": -1},
+    {"a": "0.3.11", "b": "v0.10.0", "cmp": -1},
+    {"a": "v1.0.0", "b": "v0.99.99", "cmp": 1},
+    {"a": "v0.2.100", "b": "0.2.100", "cmp": 0}
+  ],
+  "reject": [
+    "0.2.100-rc1",
+    "0.2.100.dev0",
+    "0.2.100.1",
+    "0.2",
+    "0.2.100 ",
+    "abc",
+    "",
+    " 0.2.100",
+    "0.2.100\n",
+    "vv0.2.100",
+    "V0.2.100",
+    "0.2.x",
+    "0.2.+1",
+    "0.2.١٠٠"
+  ]
+}

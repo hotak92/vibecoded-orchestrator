@@ -194,6 +194,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Sequence
 
+from vco_lib import compose_provider as _cp
 from vco_lib import containers as _c
 from vco_lib import tool_search_dirs as _tsd
 from vco_lib.compose_env import DATA_KNOBS
@@ -846,7 +847,22 @@ def _status(runtime: str, which: WhichFn, run: RunFn) -> str:
 
 def _start_if_down(runtime: str, status: str, start_daemon: Optional[StartFn],
                    which: WhichFn, run: RunFn) -> tuple[str, str]:
-    if status != "down" or start_daemon is None:
+    """Run the documented start for a ``down`` runtime — and, v0.2.100
+    (L1-F02), for a podman that answers ``podman info`` while its API socket
+    FILE is gone under an active unit (:func:`vco_lib.compose_provider.
+    socket_status` ``unit_active_file_missing``): ``podman info`` never uses
+    the socket, so "usable" alone would leave a docker-compose provider
+    unable to connect. The start helper is install.py's, which heals that
+    state (``systemctl --user restart podman.socket``)."""
+    if start_daemon is None:
+        return status, ""
+    if status == "usable":
+        if runtime != "podman":
+            return status, ""
+        sock = _cp.socket_status(runtime, run=run, which=which)
+        if sock.kind != _cp.SOCKET_UNIT_ACTIVE_FILE_MISSING:
+            return status, ""
+    elif status != "down":
         return status, ""
     try:
         ok, why = start_daemon(runtime)

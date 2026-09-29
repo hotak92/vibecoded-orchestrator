@@ -111,3 +111,7 @@ pub mod boot_token;
 // is what makes the deliberate-stop signal actually reach the watchdog —
 // the BLOCKER-1 remediation (marker had a consumer but no producer).
 pub mod watchdog_pause;
+// v0.2.100 WP-02 (AD-2): the ONE install-root resolver (cached root, then a
+// bounded identity-checked exe walk; standby-aware, never writes launcher.db
+// while install.py holds it). Every launcher/hub root resolver delegates here.
+pub mod install_root;

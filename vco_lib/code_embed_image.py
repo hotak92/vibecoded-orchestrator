@@ -497,19 +497,29 @@ def plan_rebuild(
     )
 
 
-def build_rejected_lines(compose_cmd: str, infra_dir) -> tuple:
+def build_rejected_lines(failure, manual_cmd: str, infra_dir) -> tuple:
     """What the installer prints when its compose rejected ``--build``.
 
-    Degrading LOUDLY beats both failing an install that would otherwise
-    succeed and pretending the image was refreshed.
-    """
+    Emitted ONLY on positive evidence (v0.2.100, L1-F07): ``failure`` must be
+    a :class:`vco_lib.compose_recovery.ComposeFailure` whose cause is
+    ``BUILD_FLAG_UNSUPPORTED``. Any other failure — a real build error above
+    all — returns ``()``: claiming "this compose does not accept --build"
+    after a build that simply FAILED would be a false statement. The printed
+    command is the caller's full argv (``-f`` chain, ``-p``) with ``--build``,
+    so it rebuilds exactly the stack that was just brought up. Degrading
+    LOUDLY beats both failing an install that would otherwise succeed and
+    pretending the image was refreshed."""
+    from vco_lib import compose_recovery as _cr  # noqa: PLC0415 — avoid an import cycle
+
+    if getattr(failure, "cause", None) != _cr.BUILD_FLAG_UNSUPPORTED:
+        return ()
     return (
         "  WARNING: the code_embed image was NOT rebuilt — this compose does "
-        "not accept `--build` on `up`. The service keeps running its existing "
-        "image, which for a pre-v0.2.92 image means over-window code is still "
-        "TRUNCATED silently. Rebuild it explicitly:",
-        f"    {compose_cmd} --profile gpu up -d --build --force-recreate "
-        f"{COMPOSE_SERVICE}",
+        "not accept `--build` on `up` (" + str(getattr(failure, "evidence", ""))[:160]
+        + "). The service keeps running its existing image, which for a "
+        "pre-v0.2.92 image means over-window code is still TRUNCATED silently. "
+        "Rebuild it explicitly with a compose that supports `up --build`:",
+        f"    {manual_cmd}",
         f"    (from {infra_dir})",
     )
 

@@ -376,7 +376,13 @@ _MAIN_SPAN_MAX = 1645
 # to the call). Same "inseparable thin-shim" precedent as the v0.2.81
 # Step-4c and v0.2.77 Part-5 lines above — measured with `wc -l`, not
 # predicted.
-_TOTAL_LINES_MAX = 23145
+#
+# v0.2.100 WP-04 — re-pinned DOWN 23145 -> 22677 (-468). Step 5's compose
+# tail (runtime pre-flight, GPU overlay pick, compose up + retry + failure
+# surfacing) moved to `vco_lib.install_services_up`, the podman machine
+# helper to `vco_lib.compose_provider`, and the reachability / podman-start
+# helpers became thin calls into `compose_provider`. Measured with `wc -l`.
+_TOTAL_LINES_MAX = 22677
 
 
 def _measure() -> tuple:

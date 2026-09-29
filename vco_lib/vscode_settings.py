@@ -1439,7 +1439,19 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
     mine = _this_package_version()
     if not running or not mine:
         return True, f"version comparison unavailable (running={running or '?'})"
-    if _version_tuple(running) < _version_tuple(mine):
+    running_key, mine_key = _version_tuple(running), _version_tuple(mine)
+    if running_key is None or mine_key is None:
+        # Freshness UNKNOWN — the same answer as an absent version above,
+        # never "fresh" and never "stale": a string that is not X.Y.Z was
+        # not read, so it cannot be ranked either way. Name it so the user
+        # sees which side is malformed.
+        bad = running if running_key is None else mine
+        side = "running daemon" if running_key is None else "this install"
+        return True, (
+            f"version comparison unavailable: the {side} reports {bad!r}, "
+            "which is not X.Y.Z"
+        )
+    if running_key < mine_key:
         return False, (
             f"the daemon answering is v{running}, older than this install "
             f"(v{mine}). Restart the gateway so the running code is the "
@@ -1448,20 +1460,23 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
     return True, f"v{running}"
 
 
-def _version_tuple(text: str) -> tuple:
-    """Comparable version key — see :mod:`vco_lib.version_compare`.
+def _version_tuple(text: str) -> "Optional[tuple[int, int, int]]":
+    """Comparable version key, or ``None`` when ``text`` is not ``X.Y.Z``.
 
-    This used to FILTER digits out of each dotted chunk, so ``0.2.95rc1``
-    became ``(0, 2, 951)`` and ranked above ``0.2.100``. The freshness proof
-    below reports whether the RUNNING gateway is the INSTALLED code, and an
-    editable install's metadata version carries a suffix routinely — so the
-    one comparison a user relies on to answer "is my restart needed" could
-    answer backwards. Now the leading-digit rule the rest of the codebase
-    already used.
+    Delegates to the ONE parser, :func:`vco_lib.version_compare.parse_version`
+    (strict three numeric parts, owner ruling v0.2.100). History: this used
+    to FILTER digits out of each dotted chunk (``0.2.95rc1`` -> ``(0, 2,
+    951)``, ranked above ``0.2.100``), then (v0.2.96) took each chunk's
+    leading digit run (``0.2.95rc1`` == ``0.2.95``). Both ranked a string
+    nobody should have produced; now it is not ranked at all, and the caller
+    reports freshness as unknown.
     """
-    from vco_lib.version_compare import version_parts
+    from vco_lib.version_compare import VersionParseError, parse_version
 
-    return tuple(version_parts(text))
+    try:
+        return parse_version(text)
+    except VersionParseError:
+        return None
 
 
 def _this_package_version() -> str:

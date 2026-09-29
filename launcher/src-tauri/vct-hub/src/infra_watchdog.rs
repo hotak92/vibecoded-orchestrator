@@ -128,6 +128,7 @@ use vct_launcher_core::services::service_endpoints::{
     is_compose_managed, lifecycle_container, machine_row, zombie_action, CoreService, ZombieAction,
 };
 use vct_launcher_core::services::runtime::{detect_runtime_detailed, RuntimeDetection, RuntimeInfo};
+use vct_launcher_core::services::install_root;
 use vct_launcher_core::services::watchdog_pause;
 
 use crate::modules_api::LauncherDbHandle;
@@ -511,46 +512,56 @@ pub fn service_in_stack(service: &str) -> bool {
 // ─── Orchestrator-clone / compose-file resolution (CONCERN-5) ────────────
 
 /// Locate `<orchestrator_clone>/infrastructure` so we can run compose
-/// against `docker-compose.yml`. The hub has no `current_exe()`-walk
-/// resolver (that lives launcher-side in `commands::installer`), so we
-/// resolve via two sources, in order, keeping the compose-file existence
-/// guard on each:
+/// against `docker-compose.yml`.
+///
+/// v0.2.100 WP-02 (AD-2): root resolution delegates to the ONE resolver,
+/// `vct_launcher_core::services::install_root::resolve`. The hub's cached
+/// candidates, in order, keeping the compose-file existence guard on each:
 ///   1. The orchestrator-root project's `folder_path` from launcher.db —
 ///      the row the launcher seeds at install (read poison-tolerantly via
 ///      `list_projects_nonpanicking`, see CONCERN-6).
 ///   2. CONCERN-5 fallback: the `VCT_ORCHESTRATOR_ROOT` / `VCT_INSTALL_ROOT`
-///      env vars (the SAME vars `ensure-containers.sh` uses) when the DB
-///      row is absent/stale.
+///      env vars (the SAME vars `ensure-containers.sh` uses).
+/// The first candidate that carries a compose file is the resolver's cache;
+/// with none, the resolver's bounded identity-checked walk from the hub's
+/// own exe (`<clone>/launcher/dist/<arch>/vct-hub`) is the last source — it
+/// never selects an unrelated repository.
 ///
-/// Returns `None` (soft) when neither source yields a directory containing
+/// Returns `None` (soft) when no source yields a directory containing
 /// `docker-compose.yml` — a stale/renamed clone shouldn't make us spawn a
 /// doomed `compose up` every tick.
 pub fn infrastructure_dir(db: &LauncherDbHandle) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
     // 1. launcher.db orchestrator-root row (non-panicking read).
     if let Ok(rows) = db.0.list_projects_nonpanicking() {
         if let Some(root) = rows
             .into_iter()
             .find(|p| p.host == ProjectHost::OrchestratorRoot)
         {
-            if let Some(dir) = infrastructure_dir_from_root(Path::new(&root.folder_path)) {
-                return Some(dir);
-            }
+            candidates.push(PathBuf::from(root.folder_path));
         }
     }
-
     // 2. CONCERN-5 env fallback: VCT_ORCHESTRATOR_ROOT → VCT_INSTALL_ROOT.
     for env_key in [ENV_ORCHESTRATOR_ROOT, ENV_INSTALL_ROOT] {
         if let Ok(root) = std::env::var(env_key) {
             let root = root.trim();
             if !root.is_empty() {
-                if let Some(dir) = infrastructure_dir_from_root(Path::new(root)) {
-                    return Some(dir);
-                }
+                candidates.push(PathBuf::from(root));
             }
         }
     }
+    let exe = std::env::current_exe().unwrap_or_default();
+    infrastructure_dir_from_candidates(candidates, &exe)
+}
 
-    None
+/// Pure half of [`infrastructure_dir`]: the first candidate with a compose
+/// file becomes the resolver's cache; otherwise the resolver's exe walk.
+pub fn infrastructure_dir_from_candidates(candidates: Vec<PathBuf>, exe: &Path) -> Option<PathBuf> {
+    let cached = candidates
+        .into_iter()
+        .find(|c| infrastructure_dir_from_root(c).is_some());
+    let root = install_root::resolve(cached, exe).ok()?;
+    infrastructure_dir_from_root(&root.path)
 }
 
 /// Given an orchestrator root, return `<root>/infrastructure` IFF it
@@ -1621,6 +1632,51 @@ mod tests {
         std::fs::write(infra.join("docker-compose.yml"), "services: {}\n").unwrap();
         let resolved = infrastructure_dir_from_root(root).expect("compose present → resolves");
         assert_eq!(resolved, infra);
+    }
+
+    // ----- v0.2.100 WP-02: delegation to the ONE install-root resolver -----
+
+    fn plant_clone(root: &Path, id: &str) {
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::write(root.join("infrastructure").join("docker-compose.yml"), "services: {}\n").unwrap();
+        std::fs::write(root.join("vct-module.json"), format!("{{\"id\": \"{}\"}}", id)).unwrap();
+    }
+
+    #[test]
+    fn infrastructure_dir_prefers_the_first_candidate_with_a_compose_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale");
+        let clone = dir.path().join("clone");
+        plant_clone(&clone, "orchestrator");
+        let exe = dir.path().join("elsewhere").join("vct-hub");
+        assert_eq!(
+            infrastructure_dir_from_candidates(vec![stale, clone.clone()], &exe),
+            Some(clone.join("infrastructure"))
+        );
+    }
+
+    #[test]
+    fn infrastructure_dir_walks_from_the_exe_when_no_candidate_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        plant_clone(&clone, "orchestrator");
+        let exe = clone.join("launcher").join("dist").join("linux-x64").join("vct-hub");
+        assert_eq!(
+            infrastructure_dir_from_candidates(vec![], &exe),
+            Some(clone.join("infrastructure"))
+        );
+    }
+
+    #[test]
+    fn infrastructure_dir_never_walks_into_an_unrelated_repo() {
+        // A compose file under an unrelated tree whose manifest is some other
+        // module's: the identity-checked walk refuses it.
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("home");
+        plant_clone(&other, "dotfiles");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let exe = other.join("bin").join("vct-hub");
+        assert_eq!(infrastructure_dir_from_candidates(vec![], &exe), None);
     }
 
     // ----- NIT-8 + wrapper-absent fallback: direct-compose argv -----

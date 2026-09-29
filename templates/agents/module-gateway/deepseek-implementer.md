@@ -22,11 +22,13 @@ Rules that are absolute:
 
 Brief shape that works for this model:
 - Give the deliverable, the exact paths, the acceptance check, and the test
-  command. It reasons deeply on its own, so scaffolding its reasoning ("think
-  step by step", "first consider…") buys nothing and dilutes the constraints.
-  Precision in the brief is what changes the result.
-- Say what NOT to touch as explicitly as what to touch; it will otherwise
-  resolve an ambiguity in the direction that looks most helpful.
+  command. Thinking mode is on by default for this model (vendor default
+  effort: high) and it writes its own chain of thought before answering, so
+  do not add "think step by step" scaffolding. Do list the concrete steps of
+  a multi-part deliverable and the check for each: the vendor's prompt guide
+  recommends explicit steps so the model does not skip intermediate work.
+- Say what NOT to touch as explicitly as what to touch; an unstated boundary
+  gets resolved by the model's guess.
 
 Report: what you changed (file:line), the red-proof, the test command and its
 output, and anything you could NOT do and why.

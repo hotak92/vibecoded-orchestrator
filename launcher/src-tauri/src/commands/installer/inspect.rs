@@ -57,30 +57,51 @@ pub fn read_bundled_version() -> Option<String> {
     v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-/// Compare two semver-ish strings (e.g. "0.0.7" vs "0.1.0"). Returns
-/// `true` if `installed < bundled`. Falls back to lexicographic if the
-/// strings don't parse as semver-style triplets.
+/// `true` iff `installed < bundled` under the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`, v0.2.100 owner ruling Q7).
+///
+/// Superseded (v0.2.100): this used to take each dotted part's leading digit
+/// run and its docstring promised it "falls back to lexicographic if the
+/// strings don't parse" — it never did; garbage read as `0`. Both are gone.
+///
+/// **Parse error → `false`, with a WARN naming the strings.** This bool
+/// shape exists for the `installer.rs` direction sites that still call it
+/// (WP-03b moves them onto `version::is_older` / `is_newer` with their own
+/// tri-state mapping); new code must call `vct_launcher_core::version`
+/// directly so it can tell "not older" from "could not read". This module's
+/// own caller, [`classify_version_status`], does exactly that.
 pub(crate) fn version_is_outdated(installed: &str, bundled: &str) -> bool {
-    fn parse(v: &str) -> Vec<u64> {
-        v.split('.')
-            .map(|p| p.chars().take_while(|c| c.is_ascii_digit()).collect::<String>())
-            .map(|s| s.parse::<u64>().unwrap_or(0))
-            .collect()
-    }
-    let i = parse(installed);
-    let b = parse(bundled);
-    let len = i.len().max(b.len());
-    for idx in 0..len {
-        let ii = *i.get(idx).unwrap_or(&0);
-        let bb = *b.get(idx).unwrap_or(&0);
-        if ii < bb {
-            return true;
-        }
-        if ii > bb {
-            return false;
+    match vct_launcher_core::version::is_older(installed, bundled) {
+        Ok(older) => older,
+        Err(e) => {
+            tracing::warn!(
+                "[version] cannot order {:?} against {:?}: {} — not reported as outdated",
+                installed,
+                bundled,
+                e
+            );
+            false
         }
     }
-    false
+}
+
+/// `"current" | "outdated" | "unknown"` for an installed vs bundled version.
+///
+/// v0.2.100 WP-01 tri-state rule: a version that is not `X.Y.Z` is
+/// `"unknown"` — never `"current"` (the old fallthrough) and never
+/// `"outdated"`.
+pub(crate) fn classify_version_status(installed: Option<&str>, bundled: Option<&str>) -> &'static str {
+    let (Some(i), Some(b)) = (installed, bundled) else {
+        return "unknown";
+    };
+    match vct_launcher_core::version::is_older(i, b) {
+        Ok(true) => "outdated",
+        Ok(false) => "current",
+        Err(e) => {
+            tracing::warn!("[version] orchestrator version status unknown: {}", e);
+            "unknown"
+        }
+    }
 }
 
 pub(crate) fn check_file_health(path: &Path, parser: impl FnOnce(&str) -> Result<(), String>) -> ConfigHealth {
@@ -134,13 +155,8 @@ pub fn inspect_orchestrator_at(path: String) -> OrchestratorState {
         .and_then(|v| v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string()));
 
     let bundled = read_bundled_version();
-    let version_status = match (installed_version.as_deref(), bundled.as_deref()) {
-        (Some(i), Some(b)) if i == b => "current",
-        (Some(i), Some(b)) if version_is_outdated(i, b) => "outdated",
-        (Some(_), Some(_)) => "current",
-        _ => "unknown",
-    }
-    .to_string();
+    let version_status =
+        classify_version_status(installed_version.as_deref(), bundled.as_deref()).to_string();
 
     // Config health checks. Each parser is intentionally cheap — we just
     // want to flag malformed files, not fully validate them.
@@ -487,3 +503,26 @@ pub fn detect_third_party_project_signals(install_path: String) -> ThirdPartyDet
     out
 }
 
+
+#[cfg(test)]
+mod v02100_version_status_tests {
+    use super::*;
+
+    #[test]
+    fn unparseable_version_is_unknown_never_current() {
+        // Before v0.2.100 `0.2.100-rc1` vs `0.2.100` fell through to "current".
+        assert_eq!(classify_version_status(Some("0.2.100-rc1"), Some("0.2.100")), "unknown");
+        assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.100.1")), "unknown");
+        assert_eq!(classify_version_status(Some("0.2.100"), None), "unknown");
+        assert!(!version_is_outdated("0.2", "0.2.100"), "bool shape: unreadable is not 'outdated'");
+    }
+
+    #[test]
+    fn leave_alone_parseable_versions_are_ordered_numerically() {
+        assert_eq!(classify_version_status(Some("0.2.99"), Some("0.2.100")), "outdated");
+        assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.100")), "current");
+        assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.99")), "current");
+        assert!(version_is_outdated("0.2.99", "0.2.100"));
+        assert!(!version_is_outdated("0.2.100", "0.2.99"));
+    }
+}

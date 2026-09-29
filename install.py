@@ -163,6 +163,8 @@ from vco_lib import service_endpoints as _service_endpoints  # noqa: E402
 from vco_lib import boot_service as _boot_service  # noqa: E402
 from vco_lib import gateway_boot_render as _gateway_boot_render  # noqa: E402
 from vco_lib import containers as _containers  # noqa: E402
+from vco_lib import compose_provider as _compose_provider  # noqa: E402
+from vco_lib import install_services_up as _isu  # noqa: E402
 from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
@@ -8785,179 +8787,30 @@ def _detect_container_runtime() -> str:
 
 
 def _container_runtime_reachable(container_cmd: str) -> bool:
-    """Quick proactive check that the container daemon/socket is responsive.
-
-    Used by `_start_services()` before compose-up to surface a
-    cross-platform actionable hint when the runtime is installed but
-    not running. v0.2.92 (§3.5): thin call into
-    :func:`vco_lib.containers.daemon_responsive` (`<runtime> info`, which
-    round-trips to the daemon / socket / machine — the same code path
-    compose-up needs). A probe that could not run counts as "not
-    reachable" here, because the caller's next step would fail the same way.
-    """
-    return _containers.daemon_responsive(container_cmd) is True
+    """``<runtime> info`` answers AND a podman API socket is not known broken
+    (v0.2.100 L1-F02: ``podman info`` never uses ``podman.sock``). Thin over
+    :func:`vco_lib.compose_provider.runtime_reachable` (which asks
+    ``_containers.daemon_responsive``). A probe that could not run counts as
+    "not reachable": the caller's next step would fail the same way."""
+    return _compose_provider.runtime_reachable(container_cmd)
 
 
-def _podman_machine_auto_init_and_start() -> tuple[bool, str]:
-    """v0.2.53 M-P1-2: auto-init then start Podman machine on macOS + Windows.
-
-    Pre-v0.2.53 install.py asked the user to run `podman machine init`
-    manually after seeing a "VM does not exist" error from `podman
-    machine start`. This was friction for first-time installs.
-
-    Sequence:
-      1. `podman machine list --format json` — probe whether ANY
-         machine exists. If none, run init.
-      2. `podman machine init` (only when (1) showed empty list).
-         This downloads ~500 MB of VM image; we use a 600s timeout.
-      3. `podman machine start` — boots the VM.
-
-    Returns (success, detail). Soft-fails on every error path; the
-    caller decides whether to write a deferral.
-
-    The init step is intentionally skipped if a machine already exists
-    (we don't want to clobber a user's existing config; we just want to
-    make sure SOMETHING is running). If init succeeds and start fails,
-    we return the start failure rather than the init success.
-    """
-    # Probe: does a machine already exist?
-    machine_exists = False
-    try:
-        list_result = subprocess.run(
-            ["podman", "machine", "list", "--format", "json"],
-            capture_output=True, text=True, timeout=15,
-        )
-        if list_result.returncode == 0:
-            try:
-                machines = json.loads(list_result.stdout or "[]")
-                machine_exists = bool(machines and isinstance(machines, list))
-            except (json.JSONDecodeError, TypeError):
-                machine_exists = False
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, f"podman machine list failed: {e}"
-
-    if not machine_exists:
-        # Run init. This is the long step (~500 MB download).
-        print("  Podman machine not initialized; running "
-              "`podman machine init` (this downloads ~500 MB; "
-              "may take 2-5 min)...", flush=True)
-        try:
-            init_result = subprocess.run(
-                ["podman", "machine", "init"],
-                capture_output=True, text=True, timeout=600,
-            )
-        except subprocess.TimeoutExpired:
-            return False, (
-                "podman machine init timed out after 10 min; "
-                "network down or VM image download blocked. "
-                "Run `podman machine init` manually and re-run install.py."
-            )
-        except OSError as e:
-            return False, f"podman machine init failed: {e}"
-        if init_result.returncode != 0:
-            return False, (
-                f"podman machine init exited {init_result.returncode}: "
-                f"{init_result.stderr.strip()[:300]}"
-            )
-        print("  Podman machine initialized.", flush=True)
-
-    # Now start.
-    try:
-        start_result = subprocess.run(
-            ["podman", "machine", "start"],
-            capture_output=True, text=True, timeout=120,
-        )
-    except (subprocess.TimeoutExpired, OSError) as e:
-        return False, f"podman machine start failed: {e}"
-    if start_result.returncode != 0:
-        # If machine is already running, that's success.
-        stderr = (start_result.stderr or "").strip()[:300]
-        if "already running" in stderr.lower():
-            return True, "podman machine already running"
-        return False, (
-            f"podman machine start exited {start_result.returncode}: "
-            f"{stderr}"
-        )
-    return True, "podman machine started"
+#: macOS / Windows: `podman machine` init-if-absent + start. The init downloads
+#: ~500 MB unattended and says so first (v0.2.53 M-P1-2); moved to
+#: vco_lib.compose_provider in v0.2.100.
+_podman_machine_auto_init_and_start = _compose_provider.podman_machine_init_and_start
 
 
 def _try_start_podman_daemon() -> tuple[bool, str]:
-    """v0.2.51 Bug G: auto-start the Podman daemon on a binary-present-but-
-    daemon-stopped condition.
-
-    Per-OS recipes:
-      * Linux: ``systemctl --user start podman.socket`` (rootless). The
-        --user scope mirrors the standard rootless Podman setup. Falls
-        back to a no-op if systemctl is missing (e.g. distros without
-        systemd: musl-based minimal images, Alpine on bare metal).
-      * macOS: ``podman machine start``. Boots the QEMU VM that Podman
-        runs containers in. First-time users need ``podman machine init``
-        first — which we DON'T do automatically (downloads ~500 MB,
-        consents to disk space; out of scope for an auto-start helper).
-      * Windows: ``podman machine start``. Same as macOS (WSL2 VM).
-
-    Returns:
-        Tuple of ``(success, detail)``:
-          * ``success=True``: daemon is now responsive to ``podman info``.
-          * ``success=False``: start command failed or daemon never became
-            responsive within the timeout. ``detail`` carries the failure
-            reason (subprocess stderr or timeout description) for the
-            caller's deferral entry.
-
-    Soft-fails throughout: never raises. The 30-second
-    post-start probe gives the socket time to bind without making the
-    install hang indefinitely on a misconfigured machine.
-
-    Why explicit start instead of waiting for compose-up to fail:
-    compose-up's failure surface is a cryptic "Cannot connect to Podman
-    socket" stderr that takes 10-30s to manifest. Surfacing the start +
-    a clear deferral upfront saves 10-30s and gives the user an
-    actionable next step.
-    """
-    os_name = platform.system()
-
-    if not shutil.which("podman"):
-        return False, "podman binary not on PATH"
-
-    if os_name == "Linux":
-        if not shutil.which("systemctl"):
-            return False, "systemctl not on PATH (distro without systemd)"
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "start", "podman.socket"],
-                capture_output=True, text=True, timeout=15,
-            )
-        except (subprocess.TimeoutExpired, OSError) as e:
-            return False, f"systemctl invocation failed: {e}"
-        if result.returncode != 0:
-            return False, (
-                f"systemctl --user start podman.socket exited "
-                f"{result.returncode}: {result.stderr.strip()[:200]}"
-            )
-    elif os_name in ("Darwin", "Windows"):
-        # v0.2.53 M-P1-2: auto-init then start on macOS + Windows.
-        # Pre-v0.2.53 we asked the user to run `podman machine init`
-        # themselves — but the recipe is well-documented and the typical
-        # first-time install dropped to a deferral here, blocking
-        # container setup until the user found the right command.
-        # Now we run init→start automatically; the user only sees the
-        # deferral if BOTH steps fail.
-        ok, detail = _podman_machine_auto_init_and_start()
-        if not ok:
-            return False, detail
-    else:
-        return False, f"unsupported OS '{os_name}'"
-
-    # Post-start probe: give the socket time to bind. systemctl --user
-    # start returns immediately, but the socket may need a beat. Same
-    # for podman machine start (the VM boot completes async).
-    deadline = time.monotonic() + 30.0
-    while time.monotonic() < deadline:
-        if _container_runtime_reachable("podman"):
-            return True, "daemon responsive"
-        time.sleep(1.0)
-
-    return False, "podman daemon did not become responsive within 30s"
+    """Start / heal podman's reachability — thin over
+    :func:`vco_lib.compose_provider.heal_socket`: Linux `systemctl --user
+    restart podman.socket` when the unit is active but the socket FILE is gone,
+    `start` when it is down; macOS / Windows `_podman_machine_auto_init_and_start`.
+    Then `podman info` must answer. ``(success, detail)``; never raises."""
+    res = _compose_provider.heal_socket("podman", machine_start=_podman_machine_auto_init_and_start)
+    if res.healed and _containers.daemon_responsive("podman") is not True:
+        return False, f"{res.reason}, but `podman info` still does not answer"
+    return res.healed, res.reason
 
 
 def _try_start_docker_daemon() -> tuple[bool, str]:
@@ -12551,347 +12404,26 @@ def _start_services(
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")
         return
 
-    # Proactive runtime-reachability check (2026-05-08). Catches "daemon
-    # not running" / "rootless socket not started" BEFORE we attempt
-    # compose-up — without this we used to wait for compose-up to fail
-    # with cryptic stderr ("Cannot connect to the Docker daemon" /
-    # "Cannot connect to Podman socket"), parse it, and emit a hint. Now
-    # we surface the actionable hint upfront with the OS-correct
-    # recovery command, saving 10-30s and giving the user a clearer
-    # signal.
-    #
-    # v0.2.51 Bug G: for Podman, ATTEMPT to start the daemon before
-    # giving up. systemctl --user start podman.socket on Linux is safe
-    # to call on a healthy machine (no-op if already started) and
-    # eliminates the most common "binary present but daemon stopped"
-    # failure mode. On macOS/Windows we try `podman machine start` — if
-    # the VM hasn't been initialized yet (first-time user), we emit a
-    # deferral with the manual `podman machine init` recipe rather than
-    # auto-downloading a multi-hundred-MB VM image unattended.
-    # Docker daemon start is NOT automated here — Docker Desktop on
-    # macOS/Windows requires GUI interaction; `sudo systemctl start
-    # docker` on Linux needs sudo+interactive password, which we don't
-    # shoulder for a non-blocking pre-flight check.
-    if not _container_runtime_reachable(sysinfo.container_cmd):
-        if sysinfo.container_cmd == "podman":
-            print(
-                "  [!] podman is installed but its daemon/socket isn't "
-                "responding to `podman info`. Attempting auto-start..."
-            )
-            ok, detail = _try_start_podman_daemon()
-            if ok:
-                print("      [OK] Podman daemon is now responsive.")
-            else:
-                print(f"      [!] Auto-start failed: {detail}")
-                _emit_podman_daemon_start_failed_deferral(
-                    deferral_report, detail=detail,
-                )
-                print(
-                    "      A deferral entry has been written to "
-                    "UPDATE_DEFERRED.md with the manual recovery recipe."
-                )
-                print(
-                    "      compose-up below may fail; re-run install.py "
-                    "after starting the daemon manually."
-                )
-        elif sysinfo.container_cmd == "docker" and platform.system() in ("Darwin", "Windows"):
-            # v0.2.54 (C-RT-7): docker auto-heal sibling of the podman
-            # branch above — `open -a Docker` (macOS) / shell-start of
-            # Docker Desktop (Windows) + 60s `docker info` poll. Linux
-            # stays manual (sudo systemctl needs an interactive password
-            # we don't shoulder in a pre-flight) and takes the hint
-            # branch below.
-            print(
-                "  [!] docker is installed but its daemon isn't responding "
-                "to `docker info`. Attempting to start Docker Desktop..."
-            )
-            ok, detail = _try_start_docker_daemon()
-            if ok:
-                print("      [OK] Docker daemon is now responsive.")
-            else:
-                print(f"      [!] Auto-start failed: {detail}")
-                print(
-                    "      compose-up below may fail; start Docker Desktop "
-                    "manually and re-run install.py once it settles."
-                )
-        else:
-            print(
-                f"  [!] {sysinfo.container_cmd} is installed but its daemon/socket\n"
-                f"      isn't responding to `{sysinfo.container_cmd} info`. The compose-up\n"
-                f"      below will fail. Most common fixes:"
-            )
-            if sysinfo.container_cmd == "docker":
-                print("        Linux:   sudo systemctl start docker")
-                print("        macOS:   open Docker Desktop and wait for it to start")
-                print("        Windows: start Docker Desktop")
-            else:
-                print("        Linux:   systemctl --user start podman.socket")
-                print("        macOS:   podman machine start")
-                print("        Windows: podman machine start")
-            print(
-                "      Re-run install.py once the runtime is reachable. (Skipping the\n"
-                "      compose-up below would leave the install in a partial state.)"
-            )
-
-    compose_cmd = _get_compose_command(sysinfo.container_cmd)
-
-    # v0.2.54 (gpu-audit C-4): persist + export the compose-substitution
-    # keys (CODE_EMBED_BACKEND / CODE_EMBED_DOCKERFILE) so the build
-    # actually receives them. infrastructure/.env covers every later
-    # compose invocation (boot wrapper, hooks, manual up); the explicit
-    # process-env merge below covers THIS invocation.
-    _write_infrastructure_env(embed_config)
-    compose_env = {**os.environ, **_compose_substitution_env(embed_config)}
-
-    cmd = [*compose_cmd, "-f", str(compose_file)]
-    # v0.2.96 WP-4: an explicit -f chain disables compose's auto-load of
-    # compose.override.yaml, so a (launcher-generated or adoption-generated)
-    # override in infrastructure/ would silently NOT reach the up below.
-    # Append the present override files to the chain; stock installs carry
-    # only the empty placeholders and get an unchanged argv.
-    cmd.extend(_svc_guard.override_f_chain(infra_dir))
-
-    # GPU overlay + code_embed profile.
-    # NVIDIA → docker-compose.gpu.yml (deploy.resources NVIDIA driver).
-    # AMD ROCm → docker-compose.amd-rocm.yml (Ollama ROCm image + /dev/kfd
-    # + /dev/dri device passthrough). The two are mutually exclusive —
-    # picking the wrong one means Ollama silently runs CPU-only despite
-    # has_gpu=True. Distinguished via sysinfo.gpu_vendor.
-    #
-    # Podman vs Docker: each engine needs a different compose overlay
-    # because the device-passthrough syntax differs (Docker reads
-    # `deploy.resources.reservations.devices`; Podman uses CDI form
-    # `devices: [nvidia.com/gpu=all]`). Pick by `sysinfo.container_cmd`.
-    is_podman = "podman" in (sysinfo.container_cmd or "").lower()
-
-    # Compose-overlay ambiguity check: if both the NVIDIA overlay file and
-    # the AMD ROCm overlay file exist, and both GPU tools respond, we cannot
-    # safely pick the right one without user input. Emit a deferral so the
-    # user can resolve explicitly (e.g. by passing --gpu or --cpu-only).
-    if sysinfo.has_gpu and deferral_report is not None:
-        _nvidia_file = infra_dir / ("podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml")
-        # v0.2.20: probe BOTH the canonical short name AND the legacy
-        # `amd-rocm.yml` name. Either being on disk counts as "AMD
-        # overlay available" for the purpose of the ambiguity check.
-        _amd_short = infra_dir / ("podman-compose.rocm.yml" if is_podman else "docker-compose.rocm.yml")
-        _amd_legacy = infra_dir / ("podman-compose.amd-rocm.yml" if is_podman else "docker-compose.amd-rocm.yml")
-        _amd_file_exists = _amd_short.exists() or _amd_legacy.exists()
-        _amd_file = _amd_short if _amd_short.exists() else _amd_legacy
-        if _nvidia_file.exists() and _amd_file_exists:
-            # Both overlay files present. Probe GPU tools to see if both are
-            # live. A tool that isn't installed (no rocm-smi on a pure-NVIDIA
-            # box, the common case; or either tool on a non-GPU machine) or
-            # that hangs past the timeout means "not live" — it must NOT crash
-            # the install. See _gpu_tool_reports_live (v0.2.62 fix): pre-fix
-            # these two calls invoked subprocess.run unguarded and aborted the
-            # whole install/update with FileNotFoundError on any box missing a
-            # tool.
-            _nvidia_live = _gpu_tool_reports_live("nvidia-smi", ["-L"])
-            _amd_live = _gpu_tool_reports_live("rocm-smi", ["--showid"])
-            if _nvidia_live and _amd_live:
-                deferral_report.add_entry(
-                    DeferralEntry(
-                        condition_id="compose_overlay_ambiguous",
-                        title="Compose GPU overlay ambiguous",
-                        detected=(
-                            "Both nvidia-smi and rocm-smi report a live GPU, and "
-                            "both NVIDIA and AMD ROCm compose overlay files exist. "
-                            "Cannot safely pick an overlay automatically."
-                        ),
-                        why_deferred=(
-                            "Picking the wrong overlay causes Ollama to silently "
-                            "run CPU-only. User must specify the GPU vendor."
-                        ),
-                        command_to_apply=(
-                            "# For NVIDIA:\n"
-                            "VCT_GPU_VENDOR=nvidia python install.py --gpu --update\n"
-                            "# For AMD ROCm:\n"
-                            "VCT_GPU_VENDOR=amd python install.py --gpu --update"
-                        ),
-                        severity="warning",
-                        kg_node_refs=[],
-                    )
-                )
-
-    if sysinfo.has_gpu:
-        if sysinfo.gpu_vendor == "amd":
-            # v0.2.20: prefer `docker-compose.rocm.yml` (canonical short
-            # name) over the legacy `docker-compose.amd-rocm.yml`. Both
-            # are valid; the short name is what new docs reference.
-            # Podman uses its own variant filename because the device-
-            # passthrough syntax can differ. Probe both.
-            rocm_candidates = []
-            if is_podman:
-                rocm_candidates.extend([
-                    "podman-compose.rocm.yml",
-                    "podman-compose.amd-rocm.yml",
-                ])
-            else:
-                rocm_candidates.extend([
-                    "docker-compose.rocm.yml",
-                    "docker-compose.amd-rocm.yml",
-                ])
-            rocm_file_name = None
-            rocm_file = None
-            for candidate in rocm_candidates:
-                p = infra_dir / candidate
-                if p.exists():
-                    rocm_file_name = candidate
-                    rocm_file = p
-                    break
-            if rocm_file is not None:
-                cmd.extend(["-f", str(rocm_file), "--profile", "gpu"])
-                engine = "Podman" if is_podman else "Docker"
-                print(f"  GPU overlay: AMD ROCm ({engine}: {rocm_file_name})")
-            else:
-                # Neither overlay file present — fall back to CPU.
-                tried = ", ".join(rocm_candidates)
-                print(f"  WARNING: AMD ROCm overlay not found (tried: {tried}), running CPU-only")
-        else:
-            # Default to NVIDIA overlay for has_gpu=True with vendor
-            # unset or "nvidia" (back-compat with --gpu flag).
-            gpu_file_name = "podman-compose.gpu.yml" if is_podman else "docker-compose.gpu.yml"
-            gpu_file = infra_dir / gpu_file_name
-            if gpu_file.exists():
-                # Podman + NVIDIA prerequisite: nvidia-ctk CDI spec must
-                # exist on the host. install.py runs the generator once
-                # before compose-up so compose can reference
-                # `nvidia.com/gpu=all` without manual setup.
-                if is_podman:
-                    _ensure_nvidia_cdi_spec_for_podman()
-                cmd.extend(["-f", str(gpu_file), "--profile", "gpu"])
-                engine = "Podman" if is_podman else "Docker"
-                print(f"  GPU overlay: NVIDIA ({engine}: includes code_embed container)")
-            else:
-                print(f"  WARNING: GPU overlay {gpu_file_name} not found, running CPU-only")
-
-    # The named set is start ∪ recreate (v0.2.61: naming keeps
-    # `--force-recreate` surgical — every unnamed service, adopted ones above
-    # all, stays untouched; a recreate removes the container, never its named
-    # volume). v0.2.97: the argv comes from the ONE builder
-    # (`service_lifecycle.compose_up_args`) — `--no-deps` always, `--build`
-    # only for a stale code_embed image (v0.2.92 BLOCKER-1), and an empty set
-    # yields NO compose call, never a bare `up -d` (I1).
-    from vco_lib.service_lifecycle import compose_up_args  # noqa: PLC0415
-    explicit_services = services_to_start + [
-        s for s in services_to_recreate if s not in services_to_start
-    ]
-    up_args, _dropped = compose_up_args(
-        explicit_services, build=bool(build_services),
-        force_recreate=bool(services_to_recreate),
-        gpu_mode="gpu" if sysinfo.has_gpu else "unknown",
-        prefix=cmd,  # the GPU overlay may already enable `--profile gpu`: once only
-    )
-    if not up_args:
-        print("  Nothing for compose to start or recreate.")
-        return
-    cmd.extend(up_args)
-    # The printed fallback is the same argv (a printed command is shipped
-    # code: a bare `up -d` would start copies of adopted services).
-    manual_up = " ".join([*compose_cmd, *up_args])
-    if services_to_recreate:
-        config_changed = [
-            s for s in services_to_recreate if s not in recreate_for_rebuild
-        ]
-        parts = []
-        if config_changed:
-            parts.append(f"config changed: {', '.join(config_changed)}")
-        if recreate_for_rebuild:
-            parts.append(f"image rebuilt: {', '.join(recreate_for_rebuild)}")
-        if services_to_start:
-            parts.append(f"starting: {', '.join(services_to_start)}")
-        print("  Recreating (" + "; ".join(parts) + ")")
-    elif services_to_start:
-        print(f"  Starting only: {', '.join(services_to_start)}")
-
-    # 15 min default cap: first-run pulls of weaviate + ollama images can
-    # take a while on slow links, but a hung daemon should not block us
-    # forever. Configurable via VCT_INSTALL_DOCKER_TIMEOUT (seconds) — bump
-    # for slow domestic links + cold cache (2026-05-23 observed: weaviate
-    # 1.28.4 pull alone is ~250MB and can hit the 15min wall on residential
-    # DSL while the daemon is still healthy and pulling in the background).
-    docker_timeout = 900
-    timeout_env = os.environ.get("VCT_INSTALL_DOCKER_TIMEOUT", "").strip()
-    if timeout_env:
-        try:
-            docker_timeout = max(60, int(timeout_env))
-        except ValueError:
-            pass
-    try:
-        result = subprocess.run(
-            cmd, capture_output=True, text=True, cwd=str(infra_dir), timeout=docker_timeout,
-            env=compose_env,
-        )
-    except subprocess.TimeoutExpired:
-        timeout_min = docker_timeout // 60
-        print(f"  FAIL (timed out after {timeout_min} min)")
-        print("  Container daemon may be hung. Try manually:")
-        print(f"    cd {infra_dir}")
-        print(f"    {manual_up}")
-        print("  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
-        _log_install_event(
-            "5/10", "error",
-            f"compose up timed out after {timeout_min} min",
-            data={"runtime": sysinfo.container_cmd, "timeout_sec": docker_timeout},
-        )
+    # The compose tail — runtime pre-flight + socket heal, provider-picked GPU
+    # overlay, compose up with non-destructive recovery, honest failure — is
+    # vco_lib.install_services_up (v0.2.100 WP-4 extraction; one home).
+    _outcome = _isu.compose_up_step(
+        _isu.Step5Plan(
+            runtime=sysinfo.container_cmd, has_gpu=sysinfo.has_gpu, gpu_vendor=sysinfo.gpu_vendor,
+            infra_dir=infra_dir, compose_file=compose_file, embed_config=embed_config,
+            services_to_start=services_to_start, services_to_recreate=services_to_recreate,
+            recreate_for_rebuild=recreate_for_rebuild, build_services=build_services, args=args,
+            detected=detected, deferral_report=deferral_report, guard_rows=_guard_rows,
+            install_root=PROJECT_ROOT),
+        _isu.Step5Hooks(
+            log_event=_log_install_event, reachable=_container_runtime_reachable,
+            try_start_podman=_try_start_podman_daemon, try_start_docker=_try_start_docker_daemon,
+            emit_podman_start_failed=_emit_podman_daemon_start_failed_deferral,
+            get_compose_command=_get_compose_command, write_infra_env=_write_infrastructure_env,
+            compose_subst_env=_compose_substitution_env, gpu_tool_live=_gpu_tool_reports_live,
+            ensure_cdi=_ensure_nvidia_cdi_spec_for_podman))
+    if _outcome == _isu.FAIL:
         sys.exit(1)
-    # v0.2.92 BLOCKER-1: `--build` is the NEW flag on this path. Not every
-    # compose implementation in the field accepts it on `up` (older
-    # podman-compose builds), and an install that used to succeed must not
-    # start failing because of a freshness optimisation. Retry ONCE without
-    # it: the stack comes up as before, and the image's staleness stays
-    # OBSERVABLE — `/health` still reports no matching source_sha, so `vco
-    # doctor` re-detects it in this same run and defers
-    # `code_embed_image_stale` with the explicit compose command. Degrading
-    # loudly beats both failing the install and pretending it rebuilt.
-    if result.returncode != 0 and "--build" in cmd:
-        print("  compose up --build failed — retrying without --build ...")
-        retry_cmd = [c for c in cmd if c != "--build"]
-        try:
-            result = subprocess.run(
-                retry_cmd, capture_output=True, text=True, cwd=str(infra_dir),
-                timeout=docker_timeout, env=compose_env,
-            )
-        except subprocess.TimeoutExpired:
-            result = subprocess.CompletedProcess(
-                retry_cmd, 1, "",
-                "compose up (retry without --build) timed out",
-            )
-        if result.returncode == 0:
-            for _line in _cei.build_rejected_lines(" ".join(compose_cmd), infra_dir):
-                print(_line)
-            _log_install_event(
-                "5/10", "warning",
-                "compose rejected --build; code_embed image NOT rebuilt",
-                data={"runtime": sysinfo.container_cmd},
-            )
-    if result.returncode != 0:
-        print("  FAIL")
-        for line in (result.stderr or "").strip().splitlines()[-10:]:
-            print(f"  {line}")
-        print("\n  Try starting manually:")
-        print(f"    cd {infra_dir}")
-        print(f"    {manual_up}")
-        _svc_guard.print_compose_failure_hints(result.stderr or "", sysinfo.container_cmd)
-        _log_install_event(
-            "5/10", "error",
-            f"compose up failed (exit {result.returncode})",
-            data={"runtime": sysinfo.container_cmd,
-                  "exit_code": result.returncode,
-                  "stderr_tail": (result.stderr or "").strip()[-400:]},
-        )
-        # v0.2.93: --update with every required service answering → record + go on.
-        if _svc_guard.compose_failure_followup(
-            args=args, detected=detected, has_gpu=sysinfo.has_gpu,
-            deferral_report=deferral_report, exit_code=result.returncode,
-            stderr=result.stderr or "",
-            manual_cmd=f"cd {infra_dir} && {manual_up}",
-            log_event=_log_install_event, install_root=PROJECT_ROOT, persist_on_hard_stop=_guard_rows,
-        ):
-            return
-        sys.exit(1)
-    print("  OK")
-    _log_install_event("5/10", "ok", "compose up completed")
 
 
 def _get_compose_command(container_cmd: str) -> list[str]:

@@ -1,0 +1,45 @@
+{
+  "_comment": "v0.2.100 WP-02 (AD-2) shared case table for the ONE install-root resolver. Rule-C mirror: the Rust implementation is launcher/src-tauri/vct-launcher-core/src/services/install_root.rs (is_orchestrator_clone / resolve / exe_is_inside); the Python lock is tests/test_v02100_install_root_identity.py. Both read THIS file; MUST stay in lockstep. Paths are '/'-separated and relative to a per-case temp dir; `files` maps a relative path to its content (the value `@orchestrator` is shorthand for a vct-module.json whose id is `orchestrator`). `identity` rows: is `dir` an orchestrator clone? (looks_like_orchestrator_root — vct-module.json OR install.py+CLAUDE.md — AND the vct-module.json `id` is exactly `orchestrator`). `resolve` rows: `db_cached` is the launcher.install_path cache (null = none), `exe` the running binary; expect.kind is ok|not_found, expect.source db_cache|exe_walk, expect.exe_inside says whether a self-update may run from this binary (false = RootError::ExeOutsideClone naming <root>/launcher/dist/). `containment` rows are string-level (they include Windows verbatim-prefix and UNC shapes a POSIX host cannot create on disk).",
+  "identity": [
+    {"name": "full clone: manifest id orchestrator + install.py + CLAUDE.md", "files": {"clone/vct-module.json": "@orchestrator", "clone/install.py": "", "clone/CLAUDE.md": ""}, "dir": "clone", "expect": true},
+    {"name": "manifest alone with the orchestrator id", "files": {"clone/vct-module.json": "@orchestrator"}, "dir": "clone", "expect": true},
+    {"name": "install.py + CLAUDE.md without a manifest is not identity-confirmed", "files": {"clone/install.py": "", "clone/CLAUDE.md": ""}, "dir": "clone", "expect": false},
+    {"name": "another module's manifest", "files": {"mod/vct-module.json": "{\"id\": \"vct-rl-reranker\"}", "mod/install.py": "", "mod/CLAUDE.md": ""}, "dir": "mod", "expect": false},
+    {"name": "id comparison is exact (case)", "files": {"clone/vct-module.json": "{\"id\": \"Orchestrator\"}"}, "dir": "clone", "expect": false},
+    {"name": "unparseable manifest", "files": {"clone/vct-module.json": "{not json", "clone/install.py": "", "clone/CLAUDE.md": ""}, "dir": "clone", "expect": false},
+    {"name": "manifest without an id", "files": {"clone/vct-module.json": "{\"name\": \"VibeCoded Orchestrator\"}"}, "dir": "clone", "expect": false},
+    {"name": "manifest id not a string", "files": {"clone/vct-module.json": "{\"id\": 7}"}, "dir": "clone", "expect": false},
+    {"name": "manifest is a directory", "files": {"clone/vct-module.json/x": ""}, "dir": "clone", "expect": false},
+    {"name": "unrelated git work tree", "files": {"home/.git/HEAD": "ref: refs/heads/main\n", "home/install.py": "", "home/CLAUDE.md": ""}, "dir": "home", "expect": false},
+    {"name": "empty directory", "files": {"empty/.keep": ""}, "dir": "empty", "expect": false}
+  ],
+  "resolve": [
+    {"name": "exe inside the clone (shipped dist layout)", "files": {"clone/vct-module.json": "@orchestrator", "clone/install.py": "", "clone/CLAUDE.md": ""}, "db_cached": null, "exe": "clone/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "exe inside the clone (cargo target layout)", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "clone/launcher/src-tauri/target/release/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "macOS .app bundle inside the clone", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "clone/launcher/dist/macos-arm64/VCT Launcher.app/Contents/MacOS/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "macOS .app in /Applications with a cached clone", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": "clone", "exe": "Applications/VCT Launcher.app/Contents/MacOS/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "db_cache", "exe_inside": false}},
+    {"name": "exe outside the clone, cache present", "files": {"clone/vct-module.json": "@orchestrator", "clone/install.py": "", "clone/CLAUDE.md": ""}, "db_cached": "clone", "exe": "tmpbin/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "db_cache", "exe_inside": false}},
+    {"name": "exe outside the clone, no cache", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "tmpbin/vct-launcher", "expect": {"kind": "not_found"}},
+    {"name": "exe under an unrelated git tree never yields a root", "files": {"home/.git/HEAD": "ref: refs/heads/main\n", "home/install.py": "", "home/CLAUDE.md": "", "home/vct-module.json": "{\"id\": \"dotfiles\"}"}, "db_cached": null, "exe": "home/bin/vct-launcher", "expect": {"kind": "not_found"}},
+    {"name": "exe under an unrelated git tree with a cached clone", "files": {"home/.git/HEAD": "ref: refs/heads/main\n", "home/install.py": "", "home/CLAUDE.md": "", "clone/vct-module.json": "@orchestrator"}, "db_cached": "clone", "exe": "home/bin/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "db_cache", "exe_inside": false}},
+    {"name": "missing markers: install.py + CLAUDE.md only", "files": {"clone/install.py": "", "clone/CLAUDE.md": ""}, "db_cached": null, "exe": "clone/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "not_found"}},
+    {"name": "stale cache falls through to the walk", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": "moved-away", "exe": "clone/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "cache naming an unrelated directory falls through", "files": {"clone/vct-module.json": "@orchestrator", "random/readme.txt": ""}, "db_cached": "random", "exe": "clone/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "cache wins over the walk when both are valid", "files": {"clone/vct-module.json": "@orchestrator", "other/vct-module.json": "@orchestrator"}, "db_cached": "clone", "exe": "other/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "db_cache", "exe_inside": false}},
+    {"name": "walk reaches the 8th level", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "clone/a/b/c/d/e/f/g/vct-launcher", "expect": {"kind": "ok", "root": "clone", "source": "exe_walk", "exe_inside": true}},
+    {"name": "walk is bounded to 8 levels", "files": {"clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "clone/a/b/c/d/e/f/g/h/vct-launcher", "expect": {"kind": "not_found"}},
+    {"name": "nearest clone wins over an outer unrelated repo", "files": {"home/.git/HEAD": "ref: refs/heads/main\n", "home/dev/clone/vct-module.json": "@orchestrator"}, "db_cached": null, "exe": "home/dev/clone/launcher/dist/linux-x64/vct-launcher", "expect": {"kind": "ok", "root": "home/dev/clone", "source": "exe_walk", "exe_inside": true}}
+  ],
+  "containment": [
+    {"name": "posix: exe under the root", "root": "/opt/vco", "exe": "/opt/vco/launcher/dist/linux-x64/vct-launcher", "inside": true},
+    {"name": "posix: sibling with a shared name prefix is outside", "root": "/opt/vco", "exe": "/opt/vco2/launcher/dist/linux-x64/vct-launcher", "inside": false},
+    {"name": "posix: trailing separator on the root", "root": "/opt/vco/", "exe": "/opt/vco/launcher/vct-launcher", "inside": true},
+    {"name": "posix: case differs is outside", "root": "/opt/VCO", "exe": "/opt/vco/launcher/vct-launcher", "inside": false},
+    {"name": "windows: verbatim exe under a plain root", "root": "C:\\vco", "exe": "\\\\?\\C:\\vco\\launcher\\dist\\windows-x64\\vct-launcher.exe", "inside": true},
+    {"name": "windows: verbatim root and plain exe", "root": "\\\\?\\C:\\vco", "exe": "C:\\vco\\launcher\\dist\\windows-x64\\vct-launcher.exe", "inside": true},
+    {"name": "windows: drive letter case-insensitive", "root": "c:\\VCO", "exe": "C:\\vco\\launcher\\dist\\windows-x64\\vct-launcher.exe", "inside": true},
+    {"name": "windows: UNC verbatim form", "root": "\\\\server\\share\\vco", "exe": "\\\\?\\UNC\\server\\share\\vco\\launcher\\dist\\windows-x64\\vct-launcher.exe", "inside": true},
+    {"name": "windows: other drive is outside", "root": "C:\\vco", "exe": "D:\\vco\\launcher\\dist\\windows-x64\\vct-launcher.exe", "inside": false},
+    {"name": "windows: Program Files copy is outside", "root": "C:\\Users\\u\\vco", "exe": "C:\\Program Files\\VCT\\vct-launcher.exe", "inside": false}
+  ]
+}

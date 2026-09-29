@@ -204,6 +204,35 @@ impl Db {
         self.0.lock().expect("db mutex poisoned")
     }
 
+    /// v0.2.100 WP-02 (L2-F07): the managed connection, but ONLY when it is
+    /// the real launcher.db. Inside the `install.py --update` window
+    /// ([`Db::close_for_update`]) the managed connection is a schema-less
+    /// stand-in, and every statement against it fails with `no such table`
+    /// — a misleading error, and for writers an attempted write into a
+    /// connection that is about to be discarded. `lock_live` turns that into
+    /// ONE typed error, [`DbStandby`], decided under the SAME guard the
+    /// caller then uses, so the window cannot open between check and use.
+    ///
+    /// Poison-tolerant like [`Db::lock_recover`]: callers that adopted the
+    /// typed-error API should not be able to panic on a poisoned mutex.
+    pub fn lock_live(&self) -> Result<std::sync::MutexGuard<'_, Connection>, DbStandby> {
+        let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if conn_is_update_standin(&guard) {
+            return Err(DbStandby);
+        }
+        Ok(guard)
+    }
+
+    /// v0.2.100 WP-02: the same verdict as [`Db::lock_live`] for callers that
+    /// go through `Db`'s own methods (which take the lock themselves):
+    /// `db.ensure_live()?.list_projects()`. The window can open between this
+    /// check and the method's own lock; the cost of that race is the old
+    /// `no such table` error, never a write that lands.
+    pub fn ensure_live(&self) -> Result<&Self, DbStandby> {
+        drop(self.lock_live()?);
+        Ok(self)
+    }
+
     /// v0.2.62 (CONCERN-6 remediation): poison-tolerant, non-panicking
     /// connection accessor for read-only callers that must NEVER crash on
     /// a poisoned mutex.
@@ -321,19 +350,12 @@ impl Db {
     /// `false`, so the poller warnings that surface real breakage keep
     /// firing.
     ///
-    /// Detection: `PRAGMA database_list` reports each attached database's
-    /// backing file; the in-memory stand-in — and only it — has an empty
-    /// one for `main`. A probe failure also reports `false` (fail toward
+    /// Detection: see [`conn_is_update_standin`] — an in-memory `main` with
+    /// an empty schema. A probe failure also reports `false` (fail toward
     /// the loud side).
     pub fn is_update_standby(&self) -> bool {
         let guard = self.0.lock().unwrap_or_else(|p| p.into_inner());
-        guard
-            .query_row("PRAGMA database_list", [], |row| {
-                let name: String = row.get(1)?;
-                let file: String = row.get(2)?;
-                Ok(name == "main" && file.is_empty())
-            })
-            .unwrap_or(false)
+        conn_is_update_standin(&guard)
     }
 
     /// Open an in-memory DB for tests. Runs all migrations + ensures the
@@ -350,6 +372,51 @@ impl Db {
         db.ensure_change_log()?;
         Ok(db)
     }
+}
+
+/// v0.2.100 WP-02: the typed "launcher.db is closed for an update" error
+/// returned by [`Db::lock_live`] / [`Db::ensure_live`] instead of the stand-in's
+/// `no such table`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DbStandby;
+
+impl std::fmt::Display for DbStandby {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "launcher.db is closed while install.py --update runs; \
+             retry once the update has finished",
+        )
+    }
+}
+
+impl std::error::Error for DbStandby {}
+
+impl From<DbStandby> for String {
+    fn from(e: DbStandby) -> String {
+        e.to_string()
+    }
+}
+
+/// Is `conn` the update-window stand-in installed by
+/// [`Db::close_for_update`]? Both must hold: `main` is in-memory
+/// (`PRAGMA database_list` reports an empty file) AND its schema is empty.
+/// The schema test (v0.2.100 WP-02) keeps a MIGRATED in-memory `Db`
+/// (`Db::open_in_memory`, every unit test) from reading as standby — only
+/// the schema-less stand-in does. Any probe failure reports `false`.
+fn conn_is_update_standin(conn: &Connection) -> bool {
+    let in_memory = conn
+        .query_row("PRAGMA database_list", [], |row| {
+            let name: String = row.get(1)?;
+            let file: String = row.get(2)?;
+            Ok(name == "main" && file.is_empty())
+        })
+        .unwrap_or(false);
+    if !in_memory {
+        return false;
+    }
+    conn.query_row("SELECT COUNT(*) FROM sqlite_master", [], |r| r.get::<_, i64>(0))
+        .map(|n| n == 0)
+        .unwrap_or(false)
 }
 
 // ─── Audit actor (OS user) ───────────────────────────────────────────────
@@ -485,6 +552,36 @@ mod close_reopen_tests {
                 "the restored file connection must read as real again"
             );
         });
+    }
+
+    // ─── v0.2.100 WP-02 (L2-F07): the typed standby guard ───────────
+
+    #[test]
+    fn lock_live_is_typed_standby_inside_the_window_and_live_after_reopen() {
+        with_state_dir(|_root| {
+            let db = Db::open().expect("open");
+            assert!(db.lock_live().is_ok(), "a healthy file-backed Db is live");
+            db.close_for_update().expect("close_for_update");
+            assert_eq!(db.lock_live().err(), Some(DbStandby));
+            assert_eq!(db.ensure_live().err(), Some(DbStandby));
+            let msg: String = DbStandby.into();
+            assert!(msg.contains("install.py --update"), "{}", msg);
+            assert!(!msg.contains("no such table"), "{}", msg);
+            db.reopen_after_update().expect("reopen_after_update");
+            assert!(db.lock_live().is_ok());
+            assert!(db.ensure_live().is_ok());
+        });
+    }
+
+    #[test]
+    fn a_migrated_in_memory_db_is_live_not_standby() {
+        // The leave-alone arm of the schema test in `conn_is_update_standin`:
+        // unit tests run on `open_in_memory`, which is in-memory but migrated.
+        let db = Db::open_in_memory().expect("in-memory");
+        assert!(!db.is_update_standby());
+        assert!(db.lock_live().is_ok());
+        db.close_for_update().expect("swap to the stand-in");
+        assert!(db.is_update_standby(), "the schema-less stand-in is standby");
     }
 
     #[test]

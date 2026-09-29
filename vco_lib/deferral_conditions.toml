@@ -313,6 +313,115 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.93: `compose up` failed on --update while every required service already answered; the update continued, the compose change did not apply."
 
+# v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12): registered in wave 1 (WP-04) ahead of
+# their emitters — the completeness test requires every EMITTED id to be here,
+# not the reverse. Each clears by re-detection (owned-drop-when-absent, R26).
+
+[conditions.compose_socket_heal_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3): compose could not reach the podman API socket and the non-destructive heal (`systemctl --user restart|start podman.socket`, or `podman machine start`) did not bring it back. Emitted by `vco_lib.compose_recovery` / `vco_lib.install_services_up` inside install.py step 5 and re-detected every run."
+
+[conditions.compose_provider_mismatch]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F05): a VCO container name is held by a container another compose tool created (its labels name podman-compose vs docker-compose). Never recreated automatically; consent + data check needed. Emitted by `vco_lib.compose_recovery.deferral_entries` inside install.py step 5."
+
+[conditions.compose_network_label_mismatch_attached]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F04/F22): compose refused a network labelled by a different compose tool and `ps -a --filter network=<n> -q` shows containers attached, so the network is left alone. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+
+[conditions.container_storage_leftover_unsafe]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F06): a storage-only leftover owns a VCO container name and could not be PROVEN safe to clear (still mounted in either mountinfo view, non-empty merged/, not a canonical VCO name, or a probe failed). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+
+[conditions.service_recreate_refused_data_unknown]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-4): a service recreate was refused because the data location of the running container could not be positively matched to the effective compose config. Registered ahead of its emitter (WP-07, `vco_lib.data_identity`), which runs inside install.py step 5."
+
+[conditions.ollama_not_ready_at_update]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-6): Ollama did not answer within the step-6 wait during an update; the owed model work resolves once it answers. Registered ahead of its emitter (install.py step 6)."
+
+[conditions.ollama_model_pull_failed]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-6, L1-F09): a model the configuration uses could not be pulled; the run records it instead of a traceback. Registered ahead of its emitter (install.py step 7)."
+
+[conditions.code_embed_backend_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100: the configured code-embedding backend is not available on this machine. Registered ahead of its emitter (WP-09)."
+
+[conditions.gated_delivery_skipped]
+class = "informational_record"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-7): gated bundle items (gateway agents) were skipped because the machine signal says the gate is closed — a by-design skip, recorded so it is visible. Registered ahead of its emitter (WP-10)."
+
+[conditions.gated_delivery_unknown]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-7): the gate for gated bundle items could not be evaluated (tri-state unknown); delivery is retried on the next run. Registered ahead of its emitter (WP-10)."
+
+[conditions.watchdog_foreign_container]
+class = "environmental"
+owner = "vct-hub (infra_watchdog.rs)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-5): the hub watchdog found a service container VCO does not own (by label) and left it alone. A true description of the machine. Registered ahead of its emitter (WP-06); emitted outside install.py, so install ownership gives the one-shot expiry on the next update."
+
+[conditions.services_stop_incomplete]
+class = "action_required"
+owner = "vct-launcher (commands/lifecycle.rs)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-5, L2-F09): quit-and-stop could not verify every VCO container stopped. Registered ahead of its emitter (WP-06); emitted by the launcher, outside install.py — one-shot expiry on the next update."
+
+[conditions.bundle_leftover_removed]
+class = "informational_record"
+owner = "vco_lib.bundle_leftovers"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, L5-F06): a file outside the bundle manifest whose bytes match a historical shipped template was backed up and removed. A completed action. Registered ahead of its emitter (WP-15)."
+
+[conditions.bundle_compose_copies_removed]
+class = "informational_record"
+owner = "vco_lib.bundle_leftovers"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, owner Q3): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Registered ahead of its emitter (WP-15)."
+
+[conditions.module_container_unlabelled]
+class = "informational_record"
+owner = "vct-launcher-core (container_ownership.rs)"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, L2-F17): a pre-existing module container carries no ownership label, so the reaper leaves it alone. Registered ahead of its emitter (WP-06)."
+
 [conditions.update_install_phase_failed]
 class = "action_required"
 owner = "install.py"

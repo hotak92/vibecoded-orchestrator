@@ -56,24 +56,15 @@ pub enum DeferralOutcome {
     Skipped,
 }
 
-/// Compare two semver-style "X.Y.Z" strings. Returns `Ordering::Less`
-/// when ``a < b``, etc. Returns `None` when either string is malformed.
-/// We don't pull in `semver` for this — the launcher version strings
-/// are always X.Y.Z without pre-release tags.
+/// Compare two `X.Y.Z` strings; `None` when either is malformed.
+///
+/// v0.2.100 WP-01: delegates to the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). The private parser it
+/// replaced had the same strictness (it already refused `0.2.46-dev`); the
+/// `Option` shape is this module's mapping of a parse error to
+/// [`DeferralOutcome::Skipped`] — never a crossing, never "no action".
 fn compare_versions(a: &str, b: &str) -> Option<std::cmp::Ordering> {
-    let parse = |s: &str| -> Option<(u32, u32, u32)> {
-        let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() != 3 {
-            return None;
-        }
-        let major = parts[0].parse::<u32>().ok()?;
-        let minor = parts[1].parse::<u32>().ok()?;
-        let patch = parts[2].parse::<u32>().ok()?;
-        Some((major, minor, patch))
-    };
-    let pa = parse(a)?;
-    let pb = parse(b)?;
-    Some(pa.cmp(&pb))
+    vct_launcher_core::version::cmp(a, b).ok()
 }
 
 /// Write the chunker-resync deferral notice to one project's
@@ -249,7 +240,13 @@ pub fn write_chunker_deferral_if_crossing_boundary(
     };
     let running_vs_bump = match compare_versions(running, CHUNKER_BUMP_VERSION) {
         Some(o) => o,
-        None => return DeferralOutcome::Skipped,
+        None => {
+            tracing::warn!(
+                "[chunker-deferral] version parse failed: running={} — skipping",
+                running
+            );
+            return DeferralOutcome::Skipped;
+        }
     };
 
     // Upgrade crosses the boundary iff prev < v0.2.46 AND running >= v0.2.46.
@@ -495,6 +492,26 @@ mod tests {
         assert_eq!(compare_versions("0.2", "0.2.46"), None);
         assert_eq!(compare_versions("0.2.x", "0.2.46"), None);
         assert_eq!(compare_versions("0.2.46-dev", "0.2.46"), None);
+        assert_eq!(compare_versions("0.2.46.1", "0.2.46"), None);
+    }
+
+    /// v0.2.100 WP-01: an unparseable version is `Skipped` — never read as
+    /// a crossing and never as "no action needed" (act + leave-alone).
+    #[test]
+    fn unparseable_versions_skip_the_deferral_decision() {
+        let db = Db::open_in_memory().expect("db");
+        assert_eq!(
+            write_chunker_deferral_if_crossing_boundary(&db, "0.2.45-rc1", "0.2.100"),
+            DeferralOutcome::Skipped
+        );
+        assert_eq!(
+            write_chunker_deferral_if_crossing_boundary(&db, "0.2.99", "0.2.100.1"),
+            DeferralOutcome::Skipped
+        );
+        assert_eq!(
+            write_chunker_deferral_if_crossing_boundary(&db, "0.2.99", "0.2.100"),
+            DeferralOutcome::NoActionNeeded
+        );
     }
 
     // A-5 (v0.2.73): these tests now exercise the Python-routed emitter

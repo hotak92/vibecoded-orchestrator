@@ -94,6 +94,16 @@ pub(crate) fn read_min_upgradable_from(install_path: &Path) -> Option<String> {
 /// Missing components default to 0; non-numeric components make the parse
 /// fail (returns `None`) so a malformed version can never be silently
 /// treated as `0.0.0` and wrongly trip the floor.
+///
+/// v0.2.100 WP-01: the ONE version comparator is
+/// `vct_launcher_core::version` (strict `X.Y.Z`, owner ruling Q7). This
+/// parser is the documented exception, kept for the hard-cut FLOOR gate
+/// only: its `Option` contract is the gate's fail-safe (any `None` → "not
+/// below the floor" → the in-place update runs and surfaces its own
+/// errors), and its lenient trimming / missing-component defaults are
+/// pinned by `installer.rs` tests outside this module. It never tolerates a
+/// suffix or a fourth number (`0.2.x`, `0.2.60-rc1`, `0.2.60.1` → `None`),
+/// so it cannot rank a string the SSOT rejects as a suffixed release.
 pub(crate) fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
     let v = v.trim().trim_start_matches('v');
     let mut parts = v.split('.');
@@ -108,6 +118,11 @@ pub(crate) fn parse_version_tuple(v: &str) -> Option<(u64, u64, u64)> {
         Some(s) => s.parse::<u64>().ok()?,
         None => 0,
     };
+    // v0.2.100: a fourth number is not a version (owner ruling Q7) — it used
+    // to be silently dropped, so `0.2.60.1` read as `0.2.60`.
+    if parts.next().is_some() {
+        return None;
+    }
     Some((major, minor, patch))
 }
 
@@ -258,3 +273,20 @@ pub(crate) fn launcher_binary_filename() -> &'static str {
     }
 }
 
+
+#[cfg(test)]
+mod v02100_floor_parser_tests {
+    use super::*;
+
+    /// v0.2.100 WP-01: the floor parser's `Option` contract rejects every
+    /// suffixed / four-part row of the shared case table, so the hard-cut
+    /// gate can never rank a version the SSOT refuses.
+    #[test]
+    fn floor_parser_rejects_suffixes_and_a_fourth_number() {
+        for bad in ["0.2.100-rc1", "0.2.100.dev0", "0.2.100.1", "abc", ""] {
+            assert_eq!(parse_version_tuple(bad), None, "{bad:?}");
+        }
+        assert!(!version_is_below_floor("0.2.60.1", "0.2.61"), "unparseable → never below");
+        assert!(version_is_below_floor("0.2.99", "0.2.100"), "leave-alone: ordered numerically");
+    }
+}

@@ -327,18 +327,9 @@ def _on_disk_launcher_version(install_root: Path, dist_rel_dir: str, binary_name
     return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
 
-def _version_parts(v: str) -> list[int]:
-    """Thin delegate to the ONE home — see :mod:`vco_lib.version_compare`.
-
-    Kept as a module-local name because this module's tests patch it.
-    """
-    from vco_lib.version_compare import version_parts
-
-    return version_parts(v)
-
-
 def _version_ge(a: str, b: str) -> bool:
-    """``a >= b`` on the leading numeric components.
+    """``a >= b`` for strict ``X.Y.Z`` versions (raises ``VersionParseError`` otherwise;
+    the caller maps that to "not probed" — see :mod:`vco_lib.version_compare`).
 
     Was a hand-written copy of install.py's ``_ge`` — its own docstring said
     "mirrors install.py's ``_ge``", which is a request for extraction rather

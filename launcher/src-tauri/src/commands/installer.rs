@@ -32,85 +32,56 @@ use vct_launcher_core::process::CommandExt as _;
 #[allow(dead_code)]
 const ORCHESTRATOR_REPO: &str = "https://github.com/hotak92/vibecoded-orchestrator.git";
 
-/// app_state key for the last-known install path. Cached after a successful
-/// install + opportunistically backfilled by `get_known_install_path` when
-/// it discovers an install via the exe-walk strategy. The wizard's
-/// `checkStatus()` uses this to avoid the hard-coded `$HOME/...` default
-/// (which produced a false-negative "Not installed" banner when users
-/// installed somewhere else, e.g. `/home/<user>/code/vco/`).
-pub(crate) const APP_STATE_KEY_INSTALL_PATH: &str = "launcher.install_path";
+/// app_state key for the last-known install path. The ONE definition lives
+/// in `vct_launcher_core::services::install_root` (v0.2.100 WP-02).
+pub(crate) use vct_launcher_core::services::install_root::APP_STATE_KEY_INSTALL_PATH;
 
-/// v0.2.37 canonical resolver (2026-05-27): single source of truth for
-/// the orchestrator clone root. Supersedes the previous parallel
-/// resolvers `find_local_repo_root` (uncached walk-up only) and
-/// `resolve_install_root_sync` (DB-cached + walk-up via `install.py +
-/// CLAUDE.md` markers only).
+use vct_launcher_core::services::install_root;
+
+/// Canonical orchestrator-root resolver for callers holding a `Db`.
 ///
-/// The two pre-v0.2.37 resolvers diverged in TWO ways:
-///   * Caching: only `resolve_install_root_sync` consulted the DB
-///     cache + wrote back on hit. `find_local_repo_root` was stateless,
-///     which bit `ProjectEnvSettings::populate` when `current_exe()`
-///     was far from the clone (e.g. binary installed at `~/bin/`,
-///     clone at `~/dev/vco/`) — populate returned `None` →
-///     `VCT_ORCHESTRATOR_ROOT` was OMITTED from `.claude/env`.
-///   * Marker pattern: `find_local_repo_root` looked for
-///     `vct-module.json` (the orchestrator clone's own manifest);
-///     `resolve_install_root_sync` looked for `install.py + CLAUDE.md`
-///     (the install-root files). These identify the same artifact — an
-///     orchestrator clone — by different signals, but a binary launched
-///     from a partial checkout might match one but not the other.
+/// v0.2.100 WP-02 (AD-2): a thin shim over
+/// `vct_launcher_core::services::install_root::resolve_with_store` — the ONE
+/// resolver (launcher.db cache first, kept only when it still passes
+/// `check_install_status`; then an exe walk bounded to 8 levels and
+/// identity-checked by `looks_like_orchestrator_root` AND the
+/// `vct-module.json` id). While `install.py --update` holds launcher.db
+/// (`db.is_update_standby()`) it answers from the process-level cache and
+/// performs NO DB read or write — the `no such table: app_state` log line of
+/// the 2026-09-29 field report cannot be produced here any more.
 ///
-/// This canonical resolver accepts BOTH marker patterns at every level
-/// of the walk: a directory is an orchestrator root if it contains
-/// EITHER `vct-module.json` OR (`install.py` + `CLAUDE.md`).
+/// Returns `None` when no install is discoverable; callers treat `None` as
+/// "scan the empty set" — never panic or return a phantom path.
 ///
-/// Strategy order:
-///   1. Read `launcher.install_path` from `app_state`. Validate the
-///      cached path still passes `check_install_status` (which gates on
-///      `install.py + CLAUDE.md`); fall through if stale.
-///   2. Walk up from `current_exe()` looking for EITHER marker pattern.
-///      On a hit, write back to app_state so future calls take the
-///      cached path.
-///
-/// Returns `None` when no install is discoverable. Callers should treat
-/// `None` as "scan the empty set" — never panic or return a phantom path.
-///
-/// **No hardcoded paths in the binary**: the resolution is fully
-/// runtime-derived (DB OR exe location). No `env!("CARGO_MANIFEST_DIR")`
-/// or `option_env!("VCT_REPO_ROOT")` fallback — those leak the
-/// build-host's absolute path and are wrong on shipped binaries
-/// (build-time != runtime). Privacy discipline established 2026-05-06.
+/// No hardcoded paths in the binary (privacy discipline 2026-05-06): the
+/// resolution is runtime-derived only (DB OR exe location), never
+/// `env!("CARGO_MANIFEST_DIR")` / `option_env!("VCT_REPO_ROOT")`.
 pub(crate) fn resolve_orchestrator_root(db: &Db) -> Option<PathBuf> {
-    // Strategy 1: cached path from app_state.
-    if let Ok(Some(cached)) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH) {
-        if !cached.is_empty() && check_install_status(cached.clone()) {
-            return Some(PathBuf::from(cached));
+    match resolve_root_with_db(db) {
+        Ok(r) => Some(r.path),
+        Err(e) => {
+            tracing::debug!("[vct] resolve_orchestrator_root: {}", e);
+            None
         }
     }
-    // Strategy 2: walk up from current_exe() honoring BOTH marker
-    // patterns (vct-module.json OR install.py+CLAUDE.md).
-    let found = walk_for_orchestrator_root()?;
-    // Sticky cache — future calls take the cached path.
-    let s = found.to_string_lossy().to_string();
-    if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
-        tracing::warn!(
-            "[vct] resolve_orchestrator_root: failed to cache install_path: {}",
-            e
-        );
-    }
-    Some(found)
 }
 
-/// DEPRECATED v0.2.37 shim — kept so existing call sites compile. New
-/// code MUST call `resolve_orchestrator_root(db)` directly to benefit
-/// from the DB cache (the writeback fix that closed the
-/// `.claude/env` omission bug). This shim retains the old name +
-/// signature for callers that genuinely don't have a `Db` handle in
-/// scope; it does ONLY the walk-up step (no DB read, no writeback).
-///
-/// Privacy discipline survives: still no `env!("CARGO_MANIFEST_DIR")`,
-/// still no `option_env!("VCT_REPO_ROOT")` (both would leak the
-/// build-host's path into shipped binaries).
+/// The typed form of [`resolve_orchestrator_root`] — for callers that must
+/// distinguish "exe outside the clone" (`require_exe_inside`) or report why
+/// nothing resolved. WP-03b's self-update migrates onto this.
+pub(crate) fn resolve_root_with_db(
+    db: &Db,
+) -> Result<install_root::InstallRoot, install_root::RootError> {
+    let exe = std::env::current_exe().map_err(|e| install_root::RootError::NotFound {
+        exe: PathBuf::from(format!("<current_exe unavailable: {}>", e)),
+    })?;
+    install_root::resolve_with_store(db, &exe, |p| {
+        check_install_status(p.to_string_lossy().to_string())
+    })
+}
+
+/// Pre-v0.2.37 name kept for existing call sites; identical to
+/// [`resolve_orchestrator_root`].
 pub(crate) fn resolve_install_root_sync(db: &Db) -> Option<PathBuf> {
     resolve_orchestrator_root(db)
 }
@@ -1560,115 +1531,57 @@ pub fn detect_existing_install_root() -> Option<String> {
 //
 //   1. Look up `launcher.install_path` in app_state. If set AND the path
 //      still passes `check_install_status`, return it.
-//   2. Walk up from `current_exe()` looking for the fixed install-root
-//      markers (`install.py` + `CLAUDE.md`). The relative path between
-//      the launcher binary and these files is fixed by the installer, so
-//      a short bounded walk is sufficient. On a hit, write it back to
-//      app_state so step 1 picks it up next time.
+//   2. Walk up from `current_exe()` (at most 8 levels) to the nearest
+//      identity-confirmed orchestrator clone (markers AND a
+//      `vct-module.json` with id `orchestrator`). On a hit, write it back
+//      to app_state so step 1 picks it up next time.
+//
+// Both steps are `vct_launcher_core::services::install_root` (v0.2.100
+// WP-02); while launcher.db is closed for an update the cache is the
+// process-level copy and nothing is written.
 //
 // Returns `Ok(None)` when no install is discoverable — that's not an
-// error, just "no install yet". Only DB errors propagate as `Err`.
+// error, just "no install yet". Only a DB read error (with no walk hit)
+// propagates as `Err`.
 // ---------------------------------------------------------------------------
 
-/// Resolve the install root from the launcher binary's location.
-///
-/// The folder layout is fixed by the installer — relative paths between
-/// the launcher exe and the install root never change once shipped, so
-/// we can rely on a structural walk rather than fingerprinting markers
-/// with stale-state semantics (`installed: true` in a manifest that may
-/// or may not exist for a hand-cloned dev tree).
-///
-/// Layouts in play:
-///   • Tauri release bundle (Linux/Windows): `<install>/launcher/src-tauri/target/release/launcher`
-///   • Tauri dev / `cargo run`:               `<install>/launcher/src-tauri/target/debug/launcher`
-///   • macOS .app bundle:                     `<install>/launcher/<...>/Contents/MacOS/launcher`
-///
-/// The first two are exactly 4 parents up from the exe. The .app case is
-/// deeper but still bounded, so a short walk that stops at the first
-/// directory containing `install.py` + `CLAUDE.md` covers all three
-/// without requiring per-platform branching. Sanity-only check (the two
-/// files), no manifest gating — a dev clone with no `state/install-manifest.json`
-/// is still a valid install root for launcher-discovery purposes.
+/// Legacy name for [`walk_for_orchestrator_root`] (the two walks were merged
+/// in v0.2.37).
 pub(crate) fn walk_for_install_markers() -> Option<PathBuf> {
     walk_for_orchestrator_root()
 }
 
-/// v0.2.37 canonical walk-up: returns the nearest ancestor of
-/// `current_exe()` that looks like an orchestrator clone root. A
-/// directory qualifies if it contains EITHER:
-///   * `vct-module.json` (the orchestrator clone's manifest — the
-///     marker `find_local_repo_root` used pre-v0.2.37), OR
-///   * `install.py` + `CLAUDE.md` (the install-root files — the
-///     marker `walk_for_install_markers` used pre-v0.2.37).
-///
-/// Both patterns identify the same artifact. Accepting either lets a
-/// binary launched from a partial checkout (release zip missing one of
-/// the markers, dev clone without a generated state file, etc.) still
-/// discover its root.
-///
-/// Walks up to 8 ancestor levels — covers Tauri release bundle, dev
-/// `cargo run`, and macOS .app bundle layouts without per-platform
-/// branching.
+/// Root for callers with NO `Db` handle. v0.2.100 WP-02: delegates to
+/// `install_root::resolve_current_exe_without_db` — the bounded (8-level),
+/// identity-checked walk from `current_exe()` (an exe under an unrelated git
+/// tree never yields a root), then the process-level cache the DB-aware
+/// resolver maintains, so a binary launched outside its clone still finds
+/// the root launcher.db named (I-04).
 pub(crate) fn walk_for_orchestrator_root() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let mut current = exe.parent()?.to_path_buf();
-    for _ in 0..8 {
-        if looks_like_orchestrator_root(&current) {
-            return Some(current);
-        }
-        if !current.pop() {
-            break;
-        }
-    }
-    None
+    install_root::resolve_current_exe_without_db().ok().map(|r| r.path)
 }
 
-/// Predicate for "is this directory an orchestrator clone root?".
-/// Pure function — no I/O beyond two `is_file` probes per call.
-///
-/// Accepts EITHER marker pattern. See `walk_for_orchestrator_root`
-/// for the privacy/cross-layout rationale.
-pub(crate) fn looks_like_orchestrator_root(dir: &Path) -> bool {
-    dir.join("vct-module.json").is_file()
-        || (dir.join("install.py").is_file() && dir.join("CLAUDE.md").is_file())
-}
+/// Structural marker predicate (`vct-module.json` OR `install.py` +
+/// `CLAUDE.md`) — the core's, re-exported for the `projects_v2` tests that
+/// pin it. Identity needs more — see `install_root::is_orchestrator_clone`.
+#[cfg(test)]
+pub(crate) use vct_launcher_core::services::install_root::looks_like_orchestrator_root;
 
 /// FE entry point — see module-level Bug A comment for the contract.
 ///
-/// Soft on failure by design: a missing app_state row, a stale cached
-/// path, or a no-match exe walk all collapse to `Ok(None)`. Only a real
-/// DB read error propagates.
+/// Soft on failure by design: a missing app_state row, a stale cached path
+/// or a no-match exe walk all collapse to `Ok(None)`; only a real DB read
+/// error (with no walk hit) propagates. v0.2.100 WP-02: the same resolver as
+/// [`resolve_orchestrator_root`], so during `install.py --update` a badge
+/// poll gets the process-cached root instead of `Err("no such table:
+/// app_state")`, and nothing is written.
 #[command]
 pub async fn get_known_install_path(db: State<'_, Db>) -> Result<Option<String>, String> {
-    // Strategy 1: cached path from app_state. Validate it still looks
-    // like a finished install — a user can rename / delete the install
-    // directory out from under the launcher, and we'd rather fall
-    // through to Strategy 2 than hand the FE a phantom path.
-    if let Some(cached) = db.app_state_get(APP_STATE_KEY_INSTALL_PATH)? {
-        if !cached.is_empty() && check_install_status(cached.clone()) {
-            return Ok(Some(cached));
-        }
-        // Cached row exists but the path no longer resolves; fall
-        // through. We deliberately do NOT delete the stale row here —
-        // the user may simply have the install on an unmounted drive,
-        // and a successful Strategy 2 will overwrite it anyway.
+    match resolve_root_with_db(&db) {
+        Ok(r) => Ok(Some(r.path.to_string_lossy().to_string())),
+        Err(install_root::RootError::Db(e)) => Err(e),
+        Err(_) => Ok(None),
     }
-
-    // Strategy 2: walk up from the launcher binary.
-    if let Some(found) = walk_for_install_markers() {
-        let s = found.to_string_lossy().to_string();
-        // Sticky cache: future calls take the fast Strategy 1 path.
-        // DB write failure here is non-fatal — log and proceed.
-        if let Err(e) = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, &s) {
-            tracing::warn!(
-                "[vct] get_known_install_path: failed to cache install_path: {}",
-                e
-            );
-        }
-        return Ok(Some(s));
-    }
-
-    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -10258,35 +10171,15 @@ pub async fn apply_pending_install(
 
 /// DEPRECATED v0.2.37 shim — prefer `resolve_orchestrator_root(db)`.
 ///
-/// Locate the orchestrator clone root by walking up from
-/// `current_exe()`. Accepts EITHER marker pattern (`vct-module.json` OR
-/// `install.py + CLAUDE.md`) via the canonical `walk_for_orchestrator_root`
-/// helper.
-///
-/// This shim exists for call sites that genuinely don't have a `Db`
-/// handle in scope (e.g. free functions in helper modules,
-/// volumes-only paths, early-init code). It does ONLY the walk-up step
-/// — no DB cache read, no writeback. New code that DOES have `db`
-/// available MUST use `resolve_orchestrator_root(db)` instead, so the
-/// DB cache stays warm and `ProjectEnvSettings::populate` can emit
-/// `VCT_ORCHESTRATOR_ROOT` even when the binary lives outside the
-/// clone (the bug that hit user_project_x pre-v0.2.37).
-///
-/// Privacy note (2026-05-06): no `env!("CARGO_MANIFEST_DIR")` or
-/// `option_env!("VCT_REPO_ROOT")` fallback. Both bake the build-host's
-/// absolute path into shipped binaries — `--remap-path-prefix` does
-/// NOT rewrite string literals. The shim is runtime-walk-only. The
-/// option_env Strategy 1 that lived here pre-v0.2.37 was unreachable
-/// on healthy release builds anyway (Strategy 2 always succeeded when
-/// the binary lived under the clone), so removing it is pure privacy
-/// + simplicity improvement.
+/// Locate the orchestrator clone root without a `Db` handle. v0.2.100 WP-02:
+/// the typed core resolver (`install_root::resolve_current_exe_without_db` —
+/// bounded identity-checked exe walk, then the process-level cache); the
+/// error names why nothing resolved. Code that HAS a `Db` must use
+/// [`resolve_orchestrator_root`] so the launcher.db cache stays warm.
 pub fn find_local_repo_root() -> Result<PathBuf, String> {
-    walk_for_orchestrator_root().ok_or_else(|| {
-        "Could not locate orchestrator clone root (no ancestor of \
-         current_exe() contains vct-module.json or install.py+CLAUDE.md). \
-         Run from a checkout or set launcher.install_path in app_state."
-            .to_string()
-    })
+    install_root::resolve_current_exe_without_db()
+        .map(|r| r.path)
+        .map_err(|e| e.to_string())
 }
 
 // The orchestrator-copy + conflict-strategy file operations (recursive copy

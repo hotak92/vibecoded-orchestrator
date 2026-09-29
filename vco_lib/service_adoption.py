@@ -97,6 +97,8 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import containers as _containers
 from vco_lib import compose_env as _compose_env
+from vco_lib import compose_provider as _compose_provider
+from vco_lib import compose_recovery as _compose_recovery
 from vco_lib.atomic import atomic_write_text
 from vco_lib.paths import vct_root_dir
 
@@ -207,23 +209,11 @@ _OVERRIDE_FILES: tuple[str, ...] = (
     "docker-compose.override.yml",
 )
 
-#: The mixed-provider stale-network-label refusal (install_services_guard
-#: module docstring; field 2026-09-07): "network <name> was found but has
-#: incorrect label com.docker.compose.network ...".
-_NETWORK_LABEL_REFUSAL_RE = re.compile(
-    r"network\s+(\S+)\s+was found but has incorrect label", re.IGNORECASE
-)
-
-#: GPU overlay by COMPOSE FORM (constraints #11 — normative where the plan
-#: and it disagree): the subcommand form delegates to docker-compose v2,
-#: which cannot parse the CDI ``devices: [nvidia.com/gpu=all]`` spec in
-#: ``podman-compose.gpu.yml``; the standalone form IS podman-compose.  The
-#: chosen chain is additionally verified to parse via ``compose config``
-#: before anything is stopped.
-GPU_OVERLAY_BY_FORM: dict[str, str] = {
-    "subcommand": "docker-compose.gpu.yml",
-    "standalone": "podman-compose.gpu.yml",
-}
+#: v0.2.100: the mixed-provider network-label refusal and the GPU overlay
+#: choice each have ONE home now — :mod:`vco_lib.compose_recovery` (classify +
+#: the attached-containers-proven-empty heal) and
+#: :func:`vco_lib.compose_provider.overlay_for_provider` (overlay by the
+#: provider's label family). The two functions below delegate.
 
 RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 LogFn = Callable[[str], None]
@@ -578,14 +568,15 @@ def infrastructure_env_for_substitution(infra_dir: Path) -> dict:
 
 
 def gpu_overlay_for_form(compose_form: Optional[str]) -> Optional[str]:
-    """The GPU overlay filename for the compose FORM actually in use —
-    constraints #11 (normative): picking by runtime NAME while the
-    effective provider is the other form ships an overlay the provider
-    cannot parse (``podman-compose.gpu.yml``'s CDI spec under
-    docker-compose v2).  The caller still verifies the chain parses."""
-    if not compose_form:
-        return None
-    return GPU_OVERLAY_BY_FORM.get(compose_form)
+    """The GPU overlay filename for a compose FORM — constraints #11: the
+    file follows the compose that PARSES it, never the runtime's name. Thin
+    over :func:`vco_lib.compose_provider.overlay_for_provider` with the
+    provider the form implies; a caller that has a detected
+    :class:`~vco_lib.compose_provider.ComposeProvider` should pass that
+    instead (a ``podman compose`` delegating to podman-compose breaks the
+    form-only rule). The caller still verifies the chain parses."""
+    provider = _compose_provider.provider_from_form(compose_form)
+    return _compose_provider.overlay_for_provider(provider, "nvidia")
 
 
 def _compose_entrypoints(need_gpu: bool, gpu_overlay: Optional[str],
@@ -1178,45 +1169,21 @@ def _collateral_warning(plans: Sequence[ServicePlan], runtime: str, run: RunFn,
 
 def _network_label_handling(argv: list[str], runtime: str, run: RunFn,
                              result: AdoptionResult, stderr: str) -> bool:
-    """The expected mixed-provider refusal on the first recreate: when
-    compose refuses because a network carries another tool's labels, and
-    that network provably has NO containers attached, remove it (a network,
-    never a volume, never a project) and let the caller retry once."""
-    m = _NETWORK_LABEL_REFUSAL_RE.search(stderr or "")
-    if not m:
+    """The expected mixed-provider refusal on the first recreate: ``True``
+    when compose refused a network carrying another tool's labels AND the
+    network was removed because ``<runtime> ps -a --filter network=<n> -q``
+    proved nothing attached — the caller then retries once. Thin over
+    :func:`vco_lib.compose_recovery.heal` (the one home of that rule, v0.2.100
+    L1-F04/F22); every runtime call still lands in ``result.argv_log``."""
+    failure = _compose_recovery.classify(stderr, runtime=runtime)
+    if failure.cause != _compose_recovery.NETWORK_LABEL_MISMATCH:
         return False
-    network = m.group(1)
-    try:
-        res = _run_logged(
-            [runtime, "network", "inspect", network],
-            run, result, capture_output=True, text=True, timeout=15,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    if res.returncode != 0:
-        return False
-    try:
-        info = json.loads((res.stdout or "").strip())
-    except ValueError:
-        return False
-    entries = info if isinstance(info, list) else [info]
-    attached = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        cont = entry.get("Containers") or entry.get("containers") or {}
-        if isinstance(cont, dict):
-            attached += len(cont)
-        elif isinstance(cont, list):
-            attached += len(cont)
-    if attached:
-        return False  # somebody is on it — never remove
-    try:
-        rm = _run_logged([runtime, "network", "rm", network], run, result,
-                         capture_output=True, text=True, timeout=15)
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return rm.returncode == 0
+
+    def logged(a, **kw):
+        return _run_logged(list(a), run, result, **kw)
+
+    return _compose_recovery.heal(failure, runtime=runtime, run=logged,
+                                  log=lambda _msg: None).healed
 
 
 def owning_service_config(identity) -> Optional[dict]:

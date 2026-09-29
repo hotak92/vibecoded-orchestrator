@@ -1,6 +1,6 @@
 ---
 name: qwen-implementer
-description: Implementation lane routed to Qwen3.8-Max through the local claude-gw gateway. Use for bounded code fixes that span several files or need multi-step reasoning inside one lane — the middle rung between deepseek-implementer and the flash lanes. Not for open-ended design; it is not a reviewer. Requires the model gateway.
+description: Implementation lane routed to Qwen3.8-Max through the local claude-gw gateway. Use for bounded code fixes that span several files or need multi-step reasoning inside one lane — the top rung of the qwen-vendor implementation lanes, above deepseek-implementer and the flash lanes. Not for open-ended design; it is not a reviewer. Requires the model gateway.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
@@ -20,6 +20,10 @@ Rules that are absolute:
   file:line evidence rather than inventing work.
 
 Where this lane fits:
+- It is the top rung because the vendor ranks it so: Alibaba's model-selection
+  guide lists qwen3.8-max under "Highest capability" and both
+  deepseek-v4.1-flash and qwen3.8-flash under "Lightweight & low-cost". That
+  is the vendor's tiering, not a VCO measurement.
 - Reach for it when one lane must hold several files in view at once, or when
   the cheap flash lane has already produced a lead that needs a second,
   independent implementation attempt in a different model family.

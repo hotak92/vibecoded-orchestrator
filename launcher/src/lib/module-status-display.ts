@@ -22,6 +22,7 @@
 // so we can unit-test the gating exhaustively without a Svelte runtime.
 
 import type { ModuleCatalogEntry, ModuleInstallRow, ModuleStatus } from '$lib/types/launcher';
+import { semverLess, VersionParseError } from '$lib/version-compare';
 
 /**
  * Discriminated union describing what the catalog tile should render
@@ -56,6 +57,11 @@ export type TileDisplay =
       kind: 'installed';
       install_row: ModuleInstallRow;
       can_update: boolean;
+      // v0.2.100 WP-01: "version unreadable: <s>" when the installed or
+      // catalog version is not X.Y.Z. `can_update` is then `false` — an
+      // unreadable version is never "update available" — and this string
+      // is what the tile should say instead of a verdict. `null` otherwise.
+      version_unreadable: string | null;
     }
   | {
       kind: 'errored';
@@ -70,28 +76,23 @@ export type TileDisplay =
   | { kind: 'available'; needs_license: boolean };
 
 /**
- * Best-effort semver comparison. Splits on '.', parses the leading
- * integer of each segment (so "0.2.4-dev" → 0.2.4) and compares
- * lexicographically. Returns true iff `a` is strictly less than `b`.
- *
- * Duplicated here (rather than imported from ModuleCatalog.svelte) so
- * the helper is self-contained for unit-testing.
+ * `can_update` for an installed tile, via the ONE comparator
+ * (`$lib/version-compare`, strict X.Y.Z). Superseded (v0.2.100): the
+ * leading-integer `semverLess` that lived here. A parse error maps to
+ * `can_update: false` + `version_unreadable: "version unreadable: <s>"`.
  */
-export function semverLess(a: string, b: string): boolean {
-  const parse = (v: string): number[] =>
-    v.split('.').map((s) => {
-      const match = s.match(/^(\d+)/);
-      return match ? parseInt(match[1], 10) : 0;
-    });
-  const aa = parse(a);
-  const bb = parse(b);
-  for (let i = 0; i < Math.max(aa.length, bb.length); i++) {
-    const x = aa[i] ?? 0;
-    const y = bb[i] ?? 0;
-    if (x < y) return true;
-    if (x > y) return false;
+export function resolveCanUpdate(
+  installedVersion: string,
+  catalogVersion: string,
+): { can_update: boolean; version_unreadable: string | null } {
+  try {
+    return { can_update: semverLess(installedVersion, catalogVersion), version_unreadable: null };
+  } catch (e) {
+    if (e instanceof VersionParseError) {
+      return { can_update: false, version_unreadable: `version unreadable: ${e.text}` };
+    }
+    throw e;
   }
-  return false;
 }
 
 /**
@@ -207,7 +208,7 @@ export function resolveTileDisplay(
   return {
     kind: 'installed',
     install_row: installRow,
-    can_update: semverLess(installRow.module_version, entry.version),
+    ...resolveCanUpdate(installRow.module_version, entry.version),
   };
 }
 

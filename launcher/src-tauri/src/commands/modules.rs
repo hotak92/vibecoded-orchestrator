@@ -624,19 +624,13 @@ pub(crate) fn list_module_catalog_impl_with_l0(
         // candidate status — small constant number of queries.
         let install_state = lookup_install_state(db, &l0.id);
 
+        let mut version_warning: Option<String> = None;
         let (kind, version_override): (&str, Option<&str>) = match &install_state {
             InstallState::None => ("available", None),
             InstallState::Installed { version } => {
-                if version == &l0.version {
-                    ("installed", Some(version.as_str()))
-                } else if semver_less(version, &l0.version) {
-                    // L0 is newer than installed → update available.
-                    ("update_available", Some(version.as_str()))
-                } else {
-                    // Installed is newer than (or equal to a previous-
-                    // rolled-back) L0. Silent per review §J4-d.
-                    ("installed", Some(version.as_str()))
-                }
+                let (kind, warning) = installed_catalog_kind(version, &l0.version);
+                version_warning = warning;
+                (kind, Some(version.as_str()))
             }
             InstallState::Broken { version } => ("broken", Some(version.as_str())),
             InstallState::Pending { status, version } => {
@@ -649,7 +643,11 @@ pub(crate) fn list_module_catalog_impl_with_l0(
             }
         };
 
-        modules.push(ModuleCatalogEntry::from_l0(l0, is_licensed, kind, version_override));
+        let mut entry = ModuleCatalogEntry::from_l0(l0, is_licensed, kind, version_override);
+        if let Some(w) = version_warning {
+            entry.catalog_warning = w;
+        }
+        modules.push(entry);
     }
 
     // Walk installed rows for any module_id NOT present in L0 (deprecated /
@@ -905,31 +903,30 @@ fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
     }
 }
 
-/// Coarse semver `a < b` test (matches `ModuleCatalog.svelte::semverLess`'s
-/// shape so renderer + catalog agree). Splits on '.', parses the leading
-/// integer of each segment, lex-compares.
-fn semver_less(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split('.')
-            .map(|s| {
-                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-                digits.parse::<u64>().unwrap_or(0)
-            })
-            .collect()
-    };
-    let aa = parse(a);
-    let bb = parse(b);
-    for i in 0..aa.len().max(bb.len()) {
-        let x = aa.get(i).copied().unwrap_or(0);
-        let y = bb.get(i).copied().unwrap_or(0);
-        if x < y {
-            return true;
-        }
-        if x > y {
-            return false;
+/// Catalog `kind` for an INSTALLED module against the L0 catalog version,
+/// plus a `catalog_warning` when the versions cannot be ordered.
+///
+/// v0.2.100 WP-01: ordering goes through the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). Superseded: a private
+/// leading-digit `semver_less` (mirroring the TS one) read `0.2.8-dev` as
+/// `0.2.8` and garbage as `0`. Tri-state now: an unreadable version is
+/// never `update_available` — the tile stays `installed` and carries the
+/// warning "version unreadable: <s>" instead of a verdict.
+fn installed_catalog_kind(installed: &str, l0: &str) -> (&'static str, Option<String>) {
+    if installed == l0 {
+        return ("installed", None);
+    }
+    match vct_launcher_core::version::is_older(installed, l0) {
+        // L0 is newer than installed → update available.
+        Ok(true) => ("update_available", None),
+        // Installed is newer than (or a rolled-back equal of) L0. Silent
+        // per review §J4-d.
+        Ok(false) => ("installed", None),
+        Err(e) => {
+            tracing::warn!("[modules] catalog update check: {}", e);
+            ("installed", Some(format!("version unreadable: {}", e.text)))
         }
     }
-    false
 }
 
 fn read_and_parse_manifest(path: &std::path::Path) -> Result<ModuleManifest, (String, String)> {
@@ -1251,38 +1248,6 @@ impl ManifestSource {
     }
 }
 
-/// v0.2.45 V45-C: tiny semver parser used by `resolve_manifest_for_install`
-/// to compare the on-disk manifest version against the L0 catalog version.
-///
-/// We don't pull in the `semver` crate just for this — splitting on `.` and
-/// parsing three `u64` components covers every published module version
-/// (v0.2.7, v0.2.8, 1.0.0, …). Pre-release and build-metadata suffixes are
-/// not supported; if a version string carries one (e.g. "0.2.8-rc1") we
-/// return None and the caller's safety net (`None` → on-disk wins) keeps
-/// behaviour conservative — we won't synthesize from a version we can't
-/// confidently compare.
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch_raw = parts.next()?;
-    // Reject anything with a pre-release / build-metadata suffix on the
-    // patch component (e.g. "0.2.8-rc1", "0.2.8+build42"). The safety net
-    // (None → on-disk wins) covers these — we'd rather honour the
-    // user's last-installed version than guess at suffix ordering.
-    if patch_raw.chars().any(|c| !c.is_ascii_digit()) {
-        return None;
-    }
-    let patch = patch_raw.parse::<u64>().ok()?;
-    // Reject trailing components ("0.2.8.4") — same reason: ambiguous
-    // ordering semantics. Pure 3-component versions only.
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
-}
-
 /// v0.2.33 B2: three-phase install manifest resolver. Returns the
 /// manifest the installer engine should consume plus a tag describing
 /// where it came from.
@@ -1364,12 +1329,24 @@ pub(crate) fn resolve_manifest_for_install(
             let l0_v_opt = resolve_install_metadata(db, module_id)
                 .ok()
                 .map(|l0| l0.version);
-            let l0_is_newer = match (
-                parse_semver(&on_disk_v),
-                l0_v_opt.as_deref().and_then(parse_semver),
-            ) {
-                (Some(od), Some(l0)) => l0 > od,
-                _ => false, // any parse failure → on-disk wins (safety net)
+            // v0.2.100 WP-01: the ONE comparator (strict X.Y.Z). Superseded
+            // the private `parse_semver`, which had the same strictness.
+            // Any parse failure → on-disk wins (safety net): we never
+            // synthesize from L0 when the versions cannot be compared.
+            let l0_is_newer = match l0_v_opt.as_deref() {
+                None => false,
+                Some(l0_v) => {
+                    match vct_launcher_core::version::is_newer(l0_v.trim(), on_disk_v.trim()) {
+                        Ok(newer) => newer,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[modules] {}: cannot order L0 {:?} vs on-disk {:?}: {} — on-disk wins",
+                                module_id, l0_v, on_disk_v, e
+                            );
+                            false
+                        }
+                    }
+                }
             };
             if l0_is_newer {
                 tracing::info!(
@@ -5357,7 +5334,7 @@ mod tests {
     }
 
     /// Case 5 (safety net): on-disk version unparseable ("abc"), L0 v0.2.8
-    /// → parse_semver returns None on on-disk → l0_is_newer = false →
+    /// → the version SSOT refuses to order it → l0_is_newer = false →
     /// phase 1 wins. We never synthesize from L0 when we can't confidently
     /// compare versions; honour the user's last-installed manifest.
     #[test]
@@ -5397,58 +5374,27 @@ mod tests {
 
     }
 
-    // ─── parse_semver unit tests ─────────────────────────────────────────
+    // ─── catalog kind for an installed module (v0.2.100 WP-01) ─────────
+    // `parse_semver`'s accept/reject/ordering tests were removed with the
+    // function: the same strict contract is now table-tested once, in
+    // vct_launcher_core::version against tests/fixtures/version_order_cases.json.
 
-    /// Pin the parser's accept-set against a representative range of
-    /// version strings: stable releases, leading-v prefix, multi-digit
-    /// components. Pure 3-component digits-only must all parse.
     #[test]
-    fn test_v0245_parse_semver_accepts_canonical_forms() {
-        assert_eq!(parse_semver("0.2.7"), Some((0, 2, 7)));
-        assert_eq!(parse_semver("0.2.8"), Some((0, 2, 8)));
-        assert_eq!(parse_semver("v0.2.45"), Some((0, 2, 45)));
-        assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
-        assert_eq!(parse_semver("12.34.56"), Some((12, 34, 56)));
-        assert_eq!(parse_semver("  0.2.7  "), Some((0, 2, 7)));
+    fn installed_catalog_kind_orders_numerically() {
+        assert_eq!(installed_catalog_kind("0.2.99", "0.2.100"), ("update_available", None));
+        assert_eq!(installed_catalog_kind("0.2.100", "0.2.99"), ("installed", None));
+        assert_eq!(installed_catalog_kind("0.2.100", "0.2.100"), ("installed", None));
     }
 
-    /// Pin the parser's reject-set against everything the safety net is
-    /// supposed to bail on: pre-release suffixes, build-metadata, missing
-    /// components, trailing components, non-numeric components. Any None
-    /// here is the signal for `l0_is_newer = false` → on-disk wins.
     #[test]
-    fn test_v0245_parse_semver_rejects_uncertain_forms() {
-        // Pre-release / build-metadata suffixes — ordering is ambiguous.
-        assert_eq!(parse_semver("0.2.8-rc1"), None);
-        assert_eq!(parse_semver("0.2.8+build42"), None);
-        // Missing patch.
-        assert_eq!(parse_semver("0.2"), None);
-        // Trailing component (CalVer-style).
-        assert_eq!(parse_semver("0.2.8.4"), None);
-        // Non-numeric components.
-        assert_eq!(parse_semver("abc"), None);
-        assert_eq!(parse_semver("0.a.0"), None);
-        // Empty.
-        assert_eq!(parse_semver(""), None);
-    }
-
-    /// Pin the strict-ordering predicate that drives the
-    /// `l0_is_newer` decision: tuple comparison gives the lexicographic
-    /// semver ordering for free, but the tests double-check the cases
-    /// that matter for the v0.2.7 → v0.2.8 fix path.
-    #[test]
-    fn test_v0245_parse_semver_ordering_is_strict() {
-        let a = parse_semver("0.2.7").unwrap();
-        let b = parse_semver("0.2.8").unwrap();
-        assert!(b > a, "0.2.8 must be strictly greater than 0.2.7");
-        assert!(a < b);
-        assert!(!(a > b));
-        // Equal is NOT greater.
-        let c = parse_semver("0.2.7").unwrap();
-        assert!(!(a > c));
-        // Minor / major bumps.
-        assert!(parse_semver("0.3.0").unwrap() > parse_semver("0.2.99").unwrap());
-        assert!(parse_semver("1.0.0").unwrap() > parse_semver("0.99.99").unwrap());
+    fn installed_catalog_kind_never_offers_an_update_it_cannot_read() {
+        // Old leading-digit parser: "0.2.7-dev" < "0.2.8" → update_available.
+        let (kind, warning) = installed_catalog_kind("0.2.7-dev", "0.2.8");
+        assert_eq!(kind, "installed");
+        assert_eq!(warning.as_deref(), Some("version unreadable: 0.2.7-dev"));
+        let (kind, warning) = installed_catalog_kind("0.2.7", "0.2.8.1");
+        assert_eq!(kind, "installed");
+        assert_eq!(warning.as_deref(), Some("version unreadable: 0.2.8.1"));
     }
 
     // ─── v0.2.49 Bug D / Path 1 (install_scope exposure) ───────────

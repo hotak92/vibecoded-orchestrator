@@ -23,8 +23,8 @@ import {
   installProgressLabel,
   moduleActionForKind,
   resolveProjectScopedAction,
+  resolveCanUpdate,
   resolveTileDisplay,
-  semverLess,
   statusBadgeLabel,
   truncateLastError,
 } from './module-status-display';
@@ -337,24 +337,48 @@ describe('statusBadgeLabel', () => {
   });
 });
 
-describe('semverLess', () => {
-  it('basic strict less-than', () => {
-    expect(semverLess('0.2.0', '0.2.1')).toBe(true);
-    expect(semverLess('0.2.1', '0.2.0')).toBe(false);
-    expect(semverLess('0.2.0', '0.2.0')).toBe(false);
+// v0.2.100 WP-01: the leading-integer `semverLess` (and its "pre-release
+// suffix parsed by leading integer" / "mismatched segment counts" tests)
+// moved to `version-compare.ts` as a STRICT X.Y.Z comparator, table-tested
+// in `version-compare.test.ts`. What stays here is the tile's mapping.
+describe('resolveCanUpdate (tri-state tile mapping)', () => {
+  it('leave-alone: orders numerically, 0.2.100 above 0.2.99', () => {
+    expect(resolveCanUpdate('0.2.99', '0.2.100')).toEqual({
+      can_update: true,
+      version_unreadable: null,
+    });
+    expect(resolveCanUpdate('0.2.100', '0.2.99')).toEqual({
+      can_update: false,
+      version_unreadable: null,
+    });
+    expect(resolveCanUpdate('0.2.0', '0.2.0')).toEqual({
+      can_update: false,
+      version_unreadable: null,
+    });
   });
 
-  it('handles pre-release suffix by parsing leading integer', () => {
-    // "0.2.4-dev" → 0.2.4; differs from strict semver but matches
-    // the historic launcher behavior (we don't differentiate
-    // pre-release from release for the "you have an update" CTA).
-    expect(semverLess('0.2.0', '0.2.4-dev')).toBe(true);
-    expect(semverLess('0.2.4-dev', '0.2.4')).toBe(false);
+  it('act: an unreadable version is never "update available"', () => {
+    // The old leading-integer parser said 0.2.0 < 0.2.4-dev → Update button.
+    expect(resolveCanUpdate('0.2.0', '0.2.4-dev')).toEqual({
+      can_update: false,
+      version_unreadable: 'version unreadable: 0.2.4-dev',
+    });
+    expect(resolveCanUpdate('1', '1.0.1')).toEqual({
+      can_update: false,
+      version_unreadable: 'version unreadable: 1',
+    });
   });
 
-  it('handles mismatched segment counts', () => {
-    expect(semverLess('1', '1.0.1')).toBe(true);
-    expect(semverLess('1.0', '1.0.0')).toBe(false);
+  it('resolveTileDisplay carries the unreadable string on the installed branch', () => {
+    const display = resolveTileDisplay(
+      makeEntry({ version: '0.2.5.1' }),
+      makeRow({ status: 'installed', module_version: '0.2.0' }),
+      false,
+    );
+    expect(display.kind).toBe('installed');
+    if (display.kind !== 'installed') return;
+    expect(display.can_update).toBe(false);
+    expect(display.version_unreadable).toBe('version unreadable: 0.2.5.1');
   });
 });
 

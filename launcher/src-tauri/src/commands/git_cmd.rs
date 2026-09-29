@@ -323,13 +323,20 @@ pub(crate) async fn remote_default_branch(
 /// the single line that most directly produced "everything reported healthy"
 /// during the five-week outage.
 ///
-/// Implementation: `git ls-remote --tags --refs --sort=-v:refname <remote>`
-/// and take the first row. `--refs` drops the `^{}` peeled duplicates;
-/// `-v:refname` is git's own version sort (verified: `v0.0.10` sorts above
-/// `v0.0.2`, which a lexicographic sort gets backwards).
+/// Implementation: `git ls-remote --tags --refs --sort=-v:refname <remote>`.
+/// `--refs` drops the `^{}` peeled duplicates.
 ///
-/// `Ok(None)` when the remote has no tags. `Err` when the remote could not
-/// be reached — the caller renders "couldn't check", never its own tag.
+/// v0.2.100 WP-01: only strict release tags are candidates — `v` + `X.Y.Z`
+/// per `vct_launcher_core::version` (owner ruling Q7) — and the newest is
+/// chosen by THAT comparator, not by taking git's first row. git's
+/// `-v:refname` ranks `v0.2.100-rc1` ABOVE `v0.2.100` (without a
+/// `versionsort.suffix` config) and accepts anything as a tag name, so a
+/// stray `v1.2`, `v0.2.100.1` or `-rc1` tag could have been reported as
+/// "the latest release". The sort flag is kept only as a cheap pre-order.
+///
+/// `Ok(None)` when the remote has no strict release tag. `Err` when the
+/// remote could not be reached — the caller renders "couldn't check",
+/// never its own tag.
 pub(crate) async fn latest_remote_tag(
     repo: &Path,
     remote: &str,
@@ -339,17 +346,27 @@ pub(crate) async fn latest_remote_tag(
         &["ls-remote", "--tags", "--refs", "--sort=-v:refname", remote],
     )
     .await?;
-    for line in out.lines() {
+    Ok(newest_release_tag(&out))
+}
+
+/// The newest strict `vX.Y.Z` tag named in `git ls-remote --tags` output.
+///
+/// Pure (no git) so the filter and the ordering are testable on their own;
+/// [`latest_remote_tag`] is the only caller. A tag without the `v` prefix
+/// is not a release tag in this repository's convention and is skipped.
+pub(crate) fn newest_release_tag(ls_remote_output: &str) -> Option<String> {
+    use vct_launcher_core::version;
+    ls_remote_output
+        .lines()
         // `<sha>\trefs/tags/<name>`
-        if let Some(refname) = line.split('\t').nth(1) {
-            if let Some(tag) = refname.trim().strip_prefix("refs/tags/") {
-                if !tag.is_empty() {
-                    return Ok(Some(tag.to_string()));
-                }
-            }
-        }
-    }
-    Ok(None)
+        .filter_map(|line| line.split('\t').nth(1))
+        .filter_map(|refname| refname.trim().strip_prefix("refs/tags/"))
+        .filter(|tag| tag.starts_with('v') && version::is_strict(tag))
+        .max_by(|a, b| {
+            // Both already passed `is_strict`, so `cmp` cannot fail.
+            version::cmp(a, b).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(str::to_string)
 }
 
 /// `true` when the working tree has no modified/staged/untracked entries.
@@ -788,7 +805,53 @@ mod tests {
             .await
             .expect("ls-remote")
             .expect("tags");
-        assert_eq!(tag, "v0.0.10", "must use git's version sort");
+        assert_eq!(tag, "v0.0.10", "must order by version, not lexicographically");
+    }
+
+    /// v0.2.100 WP-01: the release this cycle exists for, through REAL git:
+    /// a bare remote carrying v0.2.99 + v0.2.100 (+ v0.2.9/v0.2.10 and
+    /// v0.3.11/v0.10.0) must report v0.2.100 over v0.2.99 in its minor line
+    /// and v0.10.0 overall.
+    #[tokio::test]
+    async fn latest_remote_tag_ranks_0_2_100_above_0_2_99() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        let seed = repo.parent().unwrap().join("seed");
+        for t in ["v0.2.99", "v0.2.100", "v0.2.9", "v0.2.10"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.2.100", "0.2.100 > 0.2.99 > 0.2.10 > 0.2.9");
+
+        for t in ["v0.3.11", "v0.10.0"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.10.0", "0.10.0 > 0.3.11 > 0.2.100");
+    }
+
+    /// v0.2.100 WP-01: tags that are not strict `vX.Y.Z` never win — even
+    /// when git's own version sort puts them first (`-rc1` sorts ABOVE its
+    /// release under `-v:refname`).
+    #[tokio::test]
+    async fn latest_remote_tag_ignores_non_x_y_z_tags() {
+        skip_if_no_git!();
+        let (_tmp, repo, remote) = detached_fixture();
+        let seed = repo.parent().unwrap().join("seed");
+        for t in ["v0.2.100", "v0.2.100-rc1", "v1.2", "v0.2.100.1", "v9.9.9x", "9.9.9"] {
+            git(&seed, &["tag", t]);
+        }
+        git(&seed, &["push", "-q", "vco_upstream", "--tags"]);
+        let tag = latest_remote_tag(&repo, remote).await.expect("ls-remote").expect("tags");
+        assert_eq!(tag, "v0.2.100");
+    }
+
+    #[test]
+    fn newest_release_tag_is_none_when_no_tag_is_strict() {
+        let out = "abc\trefs/tags/v1.2\ndef\trefs/tags/v0.2.100-rc1\n";
+        assert_eq!(newest_release_tag(out), None);
     }
 
     #[tokio::test]

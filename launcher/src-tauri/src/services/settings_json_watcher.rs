@@ -563,14 +563,17 @@ async fn sync_watches<R: Runtime + 'static>(
     // catches up on its next tick after `reopen_after_update`. Only the
     // stand-in is silenced: a genuinely broken file-backed DB still
     // reports errors.
-    if db.is_update_standby() {
-        tracing::debug!(
-            "[settings_json_watcher] re-sync stood down: launcher.db is the \
-             update-window stand-in"
-        );
-        return Ok(());
-    }
-    let projects = db.list_projects().map_err(|e| format!("list_projects: {}", e))?;
+    //
+    // v0.2.100 WP-02: the stand-down is the typed `Db::ensure_live` verdict
+    // (`DbStandby`), the one guard every managed-connection caller shares.
+    let live = match db.ensure_live() {
+        Ok(live) => live,
+        Err(standby) => {
+            tracing::debug!("[settings_json_watcher] re-sync stood down: {}", standby);
+            return Ok(());
+        }
+    };
+    let projects = live.list_projects().map_err(|e| format!("list_projects: {}", e))?;
 
     let desired: HashSet<PathBuf> = projects
         .iter()
@@ -768,6 +771,19 @@ fn evaluate_drained_paths(
 /// env re-projection at the command layer: see
 /// `projects_v2::reproject_env_soft` / `refresh_all_projects_env_with_db`
 /// call sites. Those rewrites route back through THIS watcher.)
+/// The managed `Db` for an audit write, or `None` when it is absent or is the
+/// update-window stand-in (`Db::ensure_live` → `DbStandby`, logged at debug).
+fn live_db_for_audit<R: Runtime>(app: &AppHandle<R>) -> Option<tauri::State<'_, Db>> {
+    let db = app.try_state::<Db>()?;
+    match db.ensure_live() {
+        Ok(_) => Some(db),
+        Err(standby) => {
+            tracing::debug!("[settings_json_watcher] audit skipped: {}", standby);
+            None
+        }
+    }
+}
+
 async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchState>) {
     // Drain everything that accumulated during the debounce window. Each
     // path is evaluated independently against its own baseline.
@@ -814,7 +830,11 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
             decision.skipped
         );
         // Audit the SKIP too, so forensics can see the diff-guard working.
-        if let Some(db) = app.try_state::<Db>() {
+        // v0.2.100 WP-02: only into the live launcher.db — inside the
+        // install.py window the audit row would be written to the discarded
+        // stand-in (or fail with `no such table`), so it is skipped with a
+        // typed reason instead.
+        if let Some(db) = live_db_for_audit(&app) {
             let _ = db.audit(
                 "settings_json_watcher_auto_reload_skipped",
                 None,
@@ -860,8 +880,9 @@ async fn fire_reload<R: Runtime + 'static>(app: AppHandle<R>, state: Arc<WatchSt
         );
     }
 
-    // Audit log via the DB if available. Soft-fail.
-    if let Some(db) = app.try_state::<Db>() {
+    // Audit log via the DB if available (and live — see `live_db_for_audit`).
+    // Soft-fail.
+    if let Some(db) = live_db_for_audit(&app) {
         let _ = db.audit(
             "settings_json_watcher_auto_reload",
             None,

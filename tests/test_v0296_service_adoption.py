@@ -320,15 +320,16 @@ class World:
         if rest[0] == "inspect":
             i = rest.index("--format")
             return self._inspect(rest[i + 1], rest[i + 2])
+        if rest[0] == "ps" and any(a.startswith("network=") for a in rest):
+            # v0.2.100 (L1-F22): attached containers are listed with
+            # `ps -a --filter network=<n> -q`; nothing attached by default.
+            return _cp(argv, 0, "")
         if rest[0] == "ps":
             return _cp(argv, 0, "\n".join(OWNING_PROJECT_CONTAINERS) + "\n")
         if rest[0] == "stop":
             return _cp(argv)
         if rest[0] == "rm":
             return _cp(argv)
-        if rest[0] == "network" and rest[1] == "inspect":
-            return _cp(argv, 0, json.dumps(
-                [{"Name": rest[2], "Containers": {}}]))
         if rest[0] == "network" and rest[1] == "rm":
             return _cp(argv)
         if rest[0] == "compose":
@@ -912,10 +913,11 @@ class AdoptionFlowTests(_TempCase):
         ups = [a for a in result.argv_log
                if "up" in a and a[-1] == "weaviate"]
         self.assertEqual(len(ups), 2)  # refused once, retried once
-        insp = [a for a in result.argv_log if a[1:3] == ["network", "inspect"]]
+        attached_probe = [a for a in result.argv_log
+                          if a[1:2] == ["ps"] and f"network={OWN_PROJECT}_default" in a]
         rm = [a for a in result.argv_log if a[1:3] == ["network", "rm"]]
-        self.assertEqual(len(insp), 1)
-        self.assertEqual(insp[0][3], f"{OWN_PROJECT}_default")
+        self.assertEqual(attached_probe, [["podman", "ps", "-a", "--filter",
+                                           f"network={OWN_PROJECT}_default", "-q"]])
         self.assertEqual(len(rm), 1)
         self.assertEqual(rm[0][3], f"{OWN_PROJECT}_default")
 
@@ -926,21 +928,19 @@ class AdoptionFlowTests(_TempCase):
         real_run = world.run
 
         def guarded(argv, **kw):
-            if argv[1:3] == ["network", "inspect"]:
+            if argv[1:2] == ["ps"] and any(a.startswith("network=") for a in argv):
                 calls.append(list(argv))
-                return _cp(argv, 0, json.dumps(
-                    [{"Name": argv[3],
-                      "Containers": {"abc": {"Name": "vco_model_router"}}}]))
+                return _cp(argv, 0, "abc123def456\n")  # vco_model_router is attached
             return real_run(argv, **kw)
 
         result, _ = world.adopt(run=guarded)
         # no retry rescue: the up failed, the service rolled back, the
-        # ATTACHED network was inspected but NOT removed
+        # ATTACHED network was probed for attachments but NOT removed
         self.assertEqual(list(result.failed), ["weaviate"])
         self.assertEqual(result.adopted, [])
         self.assertEqual(world.projects["vco_ollama"], OWNING_PROJECT)
-        self.assertEqual(calls, [["podman", "network", "inspect",
-                                  f"{OWN_PROJECT}_default"]])
+        self.assertEqual(calls, [["podman", "ps", "-a", "--filter",
+                                  f"network={OWN_PROJECT}_default", "-q"]])
         self.assertNotIn(["podman", "network", "rm", f"{OWN_PROJECT}_default"],
                          result.argv_log)
 

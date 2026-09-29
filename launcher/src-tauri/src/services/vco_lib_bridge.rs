@@ -129,12 +129,19 @@ pub fn reinject_minimal_env(cmd: &mut Command) {
 }
 
 /// Resolve the orchestrator clone root for a `vco_lib` spawn, DB-cache
-/// first. Thin pass-through to the canonical Rust resolver so bridge
-/// callers don't each reach into `commands::installer`.
+/// first. Thin pass-through to the canonical Rust resolver
+/// (`commands::installer::resolve_orchestrator_root` →
+/// `vct_launcher_core::services::install_root`) so bridge callers don't each
+/// reach into `commands::installer`.
 ///
-/// Returns `None` for a standalone binary with no discoverable clone —
-/// callers should then OMIT any `--orchestrator-root` flag (the Python
-/// CLI defaults it to `None`), never pass an empty string.
+/// v0.2.100 WP-02 (L2-F07): inside the `install.py --update` window this
+/// answers from the process-level cache (set at every good launcher.db read)
+/// instead of walking-or-None, so a Python child spawned during the window
+/// gets the SAME `--orchestrator-root` it would get outside it.
+///
+/// Returns `None` only when no clone is discoverable at all — callers should
+/// then OMIT any `--orchestrator-root` flag (the Python CLI defaults it to
+/// `None`), never pass an empty string.
 pub fn resolve_orchestrator_root(db: &Db) -> Option<std::path::PathBuf> {
     crate::commands::installer::resolve_orchestrator_root(db)
 }

@@ -3168,9 +3168,36 @@ mod adopt_populated_tests {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
+                    // Read the WHOLE request: headers, then Content-Length bytes
+                    // of body. A single `read` returned only the headers when
+                    // the client sent the POST body in a second TCP segment,
+                    // so the GraphQL class was lost and every count read as 0 —
+                    // an intermittent red (v0.2.100 wave-1 gate, 1 run in 4).
+                    let mut raw: Vec<u8> = Vec::new();
                     let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw);
+                        if let Some(hdr_end) = text.find("\r\n\r\n") {
+                            let want = text[..hdr_end]
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= hdr_end + 4 + want {
+                                break;
+                            }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).to_string();
 
                     let body = if req.starts_with("GET /v1/schema") {
                         serde_json::json!({
@@ -3212,7 +3239,7 @@ mod adopt_populated_tests {
                     };
 
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
                         body
                     );

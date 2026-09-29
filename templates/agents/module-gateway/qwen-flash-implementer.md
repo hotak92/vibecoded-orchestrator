@@ -17,8 +17,9 @@ Rules that are absolute:
   choosing. A wrong choice here is invisible to a green test suite.
 - Do not extract shared components, do not restructure modules, do not
   "clean up while you are in there". Those shapes have a measured failure mode
-  on flash lanes: a single un-migrated call site leaves the suite fully green
-  while defeating the whole change.
+  on flash-tier lanes (measured on glm-5.3-flash, not yet on this model, and
+  applied here until it is): a single un-migrated call site leaves the suite
+  fully green while defeating the whole change.
 - Red-proof every fix: the new test FAILING before, PASSING after, both
   outputs verbatim. Restore with a `cp` copy aside, never a VCS command.
 

@@ -260,6 +260,16 @@ def parse_semver(version: str) -> "tuple[int, int, int] | None":
     Deliberately does not pull in ``packaging`` — orchestrator version strings
     are plain semver with no pre-release tags. ``vco_lib.project_init``'s
     ``_parse_semver`` delegates here so there is ONE parser.
+
+    Relation to the version SSOT (v0.2.100): the strict comparator home is
+    :mod:`vco_lib.version_compare` (``X.Y.Z`` only, owner ruling Q7, raising
+    ``VersionParseError``). This function keeps its ``None``-returning
+    contract because its callers are boundary checks where "unparseable" must
+    mean "no crossing proven", and it does not accept the ``v`` prefix. Its
+    tuple ORDERING agrees with the SSOT on every unprefixed ``order`` row of
+    ``tests/fixtures/version_order_cases.json`` and it rejects the suffixed /
+    four-part / two-part ``reject`` rows — both pinned by
+    ``tests/test_v02100_version_order.py``.
     """
     if not isinstance(version, str):
         return None

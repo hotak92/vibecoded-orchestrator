@@ -289,6 +289,36 @@ _V0298_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
+# wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
+# by the plan's ruling (state-keyed re-probe, R26). Two shapes:
+#   * install-run emitters (compose recovery / step 5-7 / bundle engine /
+#     gated delivery): family A proper — emitted INSIDE the install.py run
+#     into that run's report, so the run that no longer detects the state
+#     drops the row;
+#   * launcher / hub emitters (`watchdog_foreign_container`,
+#     `services_stop_incomplete`, `module_container_unlabelled`): never
+#     emitted from inside an install.py run, so install ownership is the
+#     one-shot auto-expiry the `stale_unit_retired_` precedent established.
+_V02100_OWNED_ADDITIONS = frozenset({
+    "compose_socket_heal_failed",
+    "compose_provider_mismatch",
+    "compose_network_label_mismatch_attached",
+    "container_storage_leftover_unsafe",
+    "service_recreate_refused_data_unknown",
+    "ollama_not_ready_at_update",
+    "ollama_model_pull_failed",
+    "code_embed_backend_unavailable",
+    "gated_delivery_skipped",
+    "gated_delivery_unknown",
+    "watchdog_foreign_container",
+    "services_stop_incomplete",
+    "bundle_leftover_removed",
+    "bundle_compose_copies_removed",
+    "module_container_unlabelled",
+})
+
+
 def _iter_source_files(suffixes):
     for path in REPO_ROOT.rglob("*"):
         if not path.is_file() or path.suffix not in suffixes:
@@ -691,7 +721,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0293_OWNED_ADDITIONS
             | _V0295_OWNED_ADDITIONS
             | _V0297_OWNED_ADDITIONS
-            | _V0298_OWNED_ADDITIONS,
+            | _V0298_OWNED_ADDITIONS
+            | _V02100_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "

@@ -3212,7 +3212,9 @@ where
 //   1. License revoked between attempts → `decision="skipped_license"`,
 //      audit-only, row unchanged.
 //   2. Manifest's `min_launcher_version` exceeds current launcher version
-//      → `decision="skipped_version"`, audit-only, row unchanged.
+//      → `decision="skipped_version"`, audit-only, row unchanged. Either
+//      version not X.Y.Z (v0.2.100) → `decision="skipped_version_unreadable"`
+//      with the offending string in `error` — never treated as satisfied.
 //   3. A healthy container with the expected name already exists →
 //      `decision="self_healed"`, row's `status` flipped to `Installed` and
 //      `last_error` cleared. No install re-run; the prior attempt
@@ -3232,13 +3234,14 @@ pub struct RetryReport {
     pub project_id: String,
     pub module_id: String,
     /// One of `retried_success` / `retried_failed` / `skipped_license` /
-    /// `skipped_version` / `skipped_manifest_missing` / `self_healed` /
-    /// `retried_unavailable`.
+    /// `skipped_version` / `skipped_version_unreadable` /
+    /// `skipped_manifest_missing` / `self_healed` / `retried_unavailable`.
     pub decision: String,
     /// Status after the retry decision was applied. `None` when the row
     /// was untouched (every `skipped_*` decision).
     pub new_status: Option<String>,
-    /// Error string when the retry failed (`retried_failed`), else `None`.
+    /// Error string when the retry failed (`retried_failed`) or a version was
+    /// unreadable (`skipped_version_unreadable`), else `None`.
     pub error: Option<String>,
 }
 
@@ -3283,38 +3286,27 @@ pub async fn set_auto_retry_failed_installs_setting(
     set_auto_retry_on_orchestrator_update(&db, enabled)
 }
 
-/// Compare two dotted version strings as semver-ish ordered tuples.
-/// Returns true iff `current >= required` (numeric-component-wise).
-/// Non-numeric suffixes (e.g. `-rc1`) are stripped before parsing; the
-/// resulting "x.y.z" prefix is compared as a Vec<u32>. Missing components
-/// default to 0 so `"0.2"` compares equal to `"0.2.0"`.
+/// Gate 2 of the auto-retry: does this launcher satisfy the manifest's
+/// `min_launcher_version`? `None` = pass; `Some((decision, error))` = skip.
 ///
-/// Conservative semantics: if EITHER side fails to parse, returns true
-/// (treat as compatible) so a malformed `min_launcher_version` doesn't
-/// silently block every retry. The install-time gate is the canonical
-/// version check; this helper is only an EARLY skip for the retry path.
-fn version_at_least(current: &str, required: &str) -> bool {
-    fn parse(v: &str) -> Option<Vec<u32>> {
-        let trimmed = v.split(|c: char| c == '-' || c == '+').next().unwrap_or(v);
-        let parts: Result<Vec<u32>, _> = trimmed.split('.').map(|p| p.parse::<u32>()).collect();
-        parts.ok()
+/// v0.2.100 WP-01: ordering goes through the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). Superseded: the private
+/// `version_at_least` returned `true` ("compatible") when either side
+/// failed to parse, so a malformed declaration was retried as if satisfied.
+/// Now an unreadable version is a named skip — `skipped_version_unreadable`
+/// with the offending string — never a pass.
+fn min_launcher_retry_decision(
+    launcher_ver: &str,
+    required: &str,
+) -> Option<(&'static str, Option<String>)> {
+    match vct_launcher_core::version::is_older(launcher_ver, required.trim()) {
+        Ok(false) => None,
+        Ok(true) => Some(("skipped_version", None)),
+        Err(e) => Some((
+            "skipped_version_unreadable",
+            Some(format!("min_launcher_version check: {e}")),
+        )),
     }
-    let (cur, req) = match (parse(current), parse(required)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return true,
-    };
-    let n = cur.len().max(req.len());
-    for i in 0..n {
-        let a = *cur.get(i).unwrap_or(&0);
-        let b = *req.get(i).unwrap_or(&0);
-        if a > b {
-            return true;
-        }
-        if a < b {
-            return false;
-        }
-    }
-    true
 }
 
 /// Core retry helper.
@@ -3461,15 +3453,16 @@ pub async fn retry_failed_module_installs(
 
         // Gate 2: min_launcher_version satisfied?
         if let Some(req) = manifest.compatibility.min_launcher_version.as_deref() {
-            if !version_at_least(launcher_ver, req) {
+            if let Some((decision, gate_error)) = min_launcher_retry_decision(launcher_ver, req) {
                 let detail = serde_json::json!({
                     "project_id": project_id,
                     "module_id": module_id,
                     "prior_status": prior_status,
                     "prior_error": prior_error,
-                    "decision": "skipped_version",
+                    "decision": decision,
                     "launcher_version": launcher_ver,
                     "min_launcher_version": req,
+                    "error": gate_error,
                 });
                 let _ = db.audit(
                     "module_install_auto_retry",
@@ -3480,9 +3473,9 @@ pub async fn retry_failed_module_installs(
                 reports.push(RetryReport {
                     project_id,
                     module_id,
-                    decision: "skipped_version".to_string(),
+                    decision: decision.to_string(),
                     new_status: None,
-                    error: None,
+                    error: gate_error,
                 });
                 continue;
             }
@@ -4953,19 +4946,32 @@ mod tests {
         .expect("flip to error");
     }
 
-    /// Verify `version_at_least` handles the canonical cases.
+    /// v0.2.100 WP-01 (leave-alone): satisfied / unsatisfied, numerically.
     #[test]
-    fn version_at_least_handles_basic_comparisons() {
-        assert!(version_at_least("0.2.44", "0.2.44"));
-        assert!(version_at_least("0.2.44", "0.2.43"));
-        assert!(version_at_least("0.3.0", "0.2.44"));
-        assert!(!version_at_least("0.2.40", "0.2.44"));
-        // Missing patch component defaults to 0.
-        assert!(version_at_least("0.2.0", "0.2"));
-        assert!(version_at_least("0.2", "0.2.0"));
-        // Malformed → conservative true (treat as compatible).
-        assert!(version_at_least("not-a-version", "0.2.0"));
-        assert!(version_at_least("0.2.0", "garbage"));
+    fn min_launcher_retry_decision_orders_numerically() {
+        assert_eq!(min_launcher_retry_decision("0.2.44", "0.2.44"), None);
+        assert_eq!(min_launcher_retry_decision("0.2.100", "0.2.99"), None);
+        assert_eq!(min_launcher_retry_decision("0.3.0", " 0.2.44 "), None);
+        assert_eq!(
+            min_launcher_retry_decision("0.2.99", "0.2.100"),
+            Some(("skipped_version", None))
+        );
+    }
+
+    /// v0.2.100 WP-01 (act): an unreadable version is a named skip. It used
+    /// to be `true` ("compatible") and the retry went ahead.
+    #[test]
+    fn min_launcher_retry_decision_refuses_unreadable_versions() {
+        for (cur, req, bad) in [
+            ("0.2.100", "garbage", "garbage"),
+            ("not-a-version", "0.2.0", "not-a-version"),
+            ("0.2.100", "0.2", "0.2"),
+            ("0.2.100", "0.2.99-rc1", "0.2.99-rc1"),
+        ] {
+            let (decision, err) = min_launcher_retry_decision(cur, req).expect("must skip");
+            assert_eq!(decision, "skipped_version_unreadable", "{cur} vs {req}");
+            assert!(err.unwrap_or_default().contains(bad), "{cur} vs {req}");
+        }
     }
 
     /// T-license: an error-state row whose manifest declares

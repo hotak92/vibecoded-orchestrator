@@ -284,14 +284,18 @@ class RocmOverlayShipsTests(unittest.TestCase):
         self.assertIn("/dev/dri", body)
 
     def test_install_py_probes_short_name_first(self):
-        # Static parity guard: the candidate list ordering in
-        # _start_services must keep the canonical short name first so
-        # this new file (not the legacy amd-rocm overlay) is selected.
-        src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-        podman_idx = src.find('"podman-compose.rocm.yml"')
-        legacy_idx = src.find('"podman-compose.amd-rocm.yml"')
-        self.assertGreater(podman_idx, 0)
-        self.assertGreater(legacy_idx, podman_idx)
+        # The overlay pick (v0.2.100: vco_lib.compose_provider, by the
+        # provider's label family) must keep the canonical short name first
+        # so this file (not the legacy amd-rocm overlay) is selected.
+        from vco_lib import compose_provider as cp  # noqa: PLC0415
+
+        for engine, stem in ((cp.ENGINE_PODMAN_COMPOSE, "podman-compose"),
+                             (cp.ENGINE_DOCKER_COMPOSE, "docker-compose")):
+            provider = cp.ComposeProvider(
+                "standalone", engine, (), "podman" if stem == "podman-compose" else "docker",
+                "podman")
+            self.assertEqual(cp.overlay_candidates(provider, "amd"),
+                             (f"{stem}.rocm.yml", f"{stem}.amd-rocm.yml"))
 
 
 if __name__ == "__main__":

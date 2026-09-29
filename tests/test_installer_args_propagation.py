@@ -110,13 +110,12 @@ def test_py_docker_timeout_configurable() -> None:
     was healthy and pulling in the background. An env-var escape hatch
     avoids forcing users to patch install.py to install on slow links.
     """
-    src = _read(PY)
-    pattern = re.search(
-        r"VCT_INSTALL_DOCKER_TIMEOUT",
-        src,
-    )
-    assert pattern, (
-        "install.py must read VCT_INSTALL_DOCKER_TIMEOUT (seconds) and use "
-        "it for the `docker compose up -d` subprocess timeout. The default "
-        "15 min cap is too low for cold-cache pulls on slow residential links."
+    # v0.2.100 WP-04: step 5's compose tail (and this knob's reader) moved
+    # to vco_lib.install_services_up — pinned by behaviour, not by source.
+    from vco_lib.install_services_up import compose_timeout_s  # noqa: PLC0415
+
+    assert compose_timeout_s({}) == 900
+    assert compose_timeout_s({"VCT_INSTALL_DOCKER_TIMEOUT": "1800"}) == 1800, (
+        "VCT_INSTALL_DOCKER_TIMEOUT (seconds) must set the `compose up` timeout: the "
+        "default 15 min cap is too low for cold-cache pulls on slow residential links."
     )
