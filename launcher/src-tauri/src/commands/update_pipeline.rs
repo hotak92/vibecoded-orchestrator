@@ -381,12 +381,20 @@ pub(crate) fn stop_hub_and_rename_binaries_aside(
 }
 
 /// Run every step between "the user asked" and "the tree is at the upstream
-/// tip": the in-progress-merge pre-flight, the sentinel clear, the MCP
-/// kill-sweep + update gate, the upstream remote, the hub stop, the pre-pull
-/// binary renames, the branch resolution, the fetch, the A0 user-editable
-/// pre-merge, F1, the generated-file reconcile, the pull-plan decision, the
-/// pull, every failure classification, the "already up to date" short-circuit
-/// and the HEAD-advance backstop.
+/// tip": the in-progress-merge pre-flight, the remote pin, the hub-stop
+/// pre-check, the sentinel clear, the MCP kill-sweep + update gate, the hub
+/// stop, the pre-pull binary renames, the branch resolution, the fetch, the A0
+/// user-editable pre-merge, F1, the generated-file reconcile, the pull-plan
+/// decision, the pull, every failure classification, the "already up to date"
+/// short-circuit and the HEAD-advance backstop.
+///
+/// v0.2.100 (WP-03a, L2-F14): this is now a COMPOSITION of the phase-level
+/// pieces below, and `update_run::run_update` composes the same pieces under
+/// its phase ledger. The order changed in one place and for one reason: the
+/// remote pin and the hub-stop pre-check are refusals that need no
+/// process-table mutation, so they run BEFORE the MCP kill-sweep. Before this,
+/// a pin failure killed every open Claude session's MCP servers and then
+/// refused — and the gate's `Drop` restarts nothing.
 ///
 /// Returns with the gate guard still ARMED — the caller holds it across
 /// `install.py` and the binary refresh, then drops it.
@@ -394,11 +402,6 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
     repo: &Path,
     opts: UpdatePipelineOptions<'_>,
 ) -> Result<UpdatePipelineOutcome, UpdatePipelineError> {
-    // `install_path` is the name — and the TYPE, owned — that every moved line
-    // below already used. Binding it here keeps the move mechanical, and
-    // therefore reviewable as a move: no `&install_path` had to become
-    // `install_path`, so a reviewer diffing against the pre-extraction span
-    // sees only the edits that carry meaning.
     let install_path = repo.to_path_buf();
     let surface = opts.surface;
     let progress = |stage: &str, message: &str, percentage: f32| {
@@ -411,61 +414,19 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
     // `run_preflight_refusals` for the ordering argument.
     run_preflight_refusals(&install_path, surface, &opts.extra_preflight).await?;
 
-    // v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a
-    // prior half-finished update. A fresh `update_orchestrator` run
-    // supersedes it — either we'll succeed (no resume needed), or we'll
-    // hit a new conflict and rewrite both with current SHAs/branch.
-    clear_update_resume_sentinel(&install_path);
-    clear_update_resume_deferral_if_solo(&install_path);
-
-    // V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. The user
-    // reported ~97 python (claude_mcp_servers + vct-coordination) and
-    // ~77 node (@upstash/context7 + @modelcontextprotocol/*) processes
-    // accumulating during update, requiring manual taskkill. Root cause
-    // is Windows mandatory file locks + Claude Code's MCP-respawn loop
-    // racing the binary refresh.
-    //
-    // Strategy:
-    //   1. Pre-sweep: terminate currently-running MCP processes whose
-    //      commandlines match strict MCP patterns. Soft-fail.
-    //   2. Acquire a RAII lockfile guard. The lockfile lives at
-    //      <vct_root>/.update-in-progress.json and is what the MCP
-    //      servers themselves read at startup (see
-    //      claude_mcp_servers/_lib/update_gate.py); any respawn during
-    //      the update window exits cleanly with code 75 before doing
-    //      any work, breaking the fork-bomb loop.
-    //   3. The guard's Drop impl deletes the lockfile on ALL exit paths
-    //      (success, ?-bail, panic), so even a crashed update doesn't
-    //      leave a stuck lockfile blocking future MCP spawns. The
-    //      boot-time stale-cleanup is the second line of defense.
-    let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
-    if pre_sweep_count > 0 {
-        tracing::info!(
-            "[vct] {}: pre-sweep terminated {} MCP-shaped \
-             process(es) before update",
-            surface,
-            pre_sweep_count
-        );
-    }
-    let (update_gate_guard, _gate_write_result) =
-        crate::commands::update_gate::UpdateInProgressGuard::new();
-    // _gate_write_result is intentionally discarded — soft-fail.
-    // If lockfile write fails (permission denied, FS full), we proceed
-    // with the update anyway (worst case: user sees the same pre-fix
-    // fork-bomb behaviour, same as today's status quo). The guard's
-    // Drop impl is a no-op when armed=false.
-
     // v0.2.21 (Stream A Design B extension): pin the canonical public
-    // AGPL upstream BEFORE any network ops. Same posture as the launcher
-    // self-update (see commands/self_update.rs): we never trust `origin`
-    // for upstream tracking because forks reset it to the fork URL.
-    // Hard-fail here — if we can't even configure the remote, the pull
-    // below would silently fall back to `origin` and pull the wrong
-    // commits. Better to surface the error to the GUI and let the user
-    // retry (or override via `VCO_UPSTREAM_URL` for self-hosters).
+    // AGPL upstream BEFORE any network ops. We never trust `origin` for
+    // upstream tracking because forks reset it to the fork URL. Hard-fail:
+    // if we cannot configure the remote, the pull below would silently fall
+    // back to `origin` and pull the wrong commits. v0.2.100: before the
+    // kill-sweep (L2-F14) — a refusal must not cost the user their MCPs.
     crate::commands::self_update::ensure_upstream_remote(&install_path)
         .await
         .map_err(UpdatePipelineError::Raw)?;
+    hub_stop_precheck().map_err(UpdatePipelineError::Raw)?;
+
+    clear_prior_resume_state(&install_path);
+    let update_gate_guard = arm_update_gate(surface);
 
     // Stage 0a/0b/0c — stop the hub, rename the two binaries aside. ONE home
     // for the whole trio (see `stop_hub_and_rename_binaries_aside`); the
@@ -473,22 +434,125 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
     let renames =
         stop_hub_and_rename_binaries_aside(&install_path, "update", Some("git pull"), &progress)
             .map_err(UpdatePipelineError::Raw)?;
-    let pre_pull_renamed_hub = renames.hub;
-    let pre_pull_renamed = renames.launcher;
 
-    // Stage 1: Pull latest
-    progress("update", "Pulling latest changes...", 10.0);
+    let pulled = pull_to_upstream(&install_path, &opts, &renames).await?;
+
+    Ok(UpdatePipelineOutcome {
+        already_up_to_date: pulled.already_up_to_date,
+        dist_binary_stale: pulled.dist_binary_stale,
+        pull_branch: pulled.pull_branch,
+        pre_pull_renamed: renames.launcher,
+        pre_pull_renamed_hub: renames.hub,
+        gate_guard: update_gate_guard,
+        db_audit: pulled.db_audit,
+    })
+}
+
+/// The one read-only refusal the hub stop can produce, run BEFORE the
+/// kill-sweep so it costs nothing: `<vct_root>/hub.pid` exists but cannot be
+/// read. `ensure_hub_stopped_for_update` refuses on exactly that condition
+/// (it cannot tell whether a hub is running), and it used to do so AFTER the
+/// sweep had already killed the MCP servers. An absent file is "no hub" and
+/// passes; every other outcome of the stop (a hub that will not die) needs the
+/// stop itself and stays in [`stop_hub_and_rename_binaries_aside`].
+pub(crate) fn hub_stop_precheck() -> Result<(), String> {
+    hub_stop_precheck_at(&vct_launcher_core::paths::vct_root_dir().join("hub.pid"))
+}
+
+/// [`hub_stop_precheck`] with the pid-file path injected (tests).
+pub(crate) fn hub_stop_precheck_at(pid_file: &Path) -> Result<(), String> {
+    match std::fs::read_to_string(pid_file) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Update refused before anything was changed: {} exists but cannot be read ({}), \
+             so the launcher cannot tell whether vct-hub is running and would not be able to \
+             stop it before the update. Check the file's permissions, or stop the hub with \
+             `vct-hub --stop`, then try again.",
+            pid_file.display(),
+            e
+        )),
+    }
+}
+
+/// v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a prior
+/// half-finished update. A fresh update supersedes it — either it succeeds (no
+/// resume needed) or it hits a new conflict and rewrites both with current
+/// SHAs/branch. MUST run after [`run_preflight_refusals`]: a clone wedged
+/// mid-merge needs the first click's sentinel to reopen its modal.
+pub(crate) fn clear_prior_resume_state(install_path: &Path) {
+    clear_update_resume_sentinel(install_path);
+    clear_update_resume_deferral_if_solo(install_path);
+}
+
+/// V52-AI (v0.2.52): the MCP kill-sweep + the update gate, as one step.
+///
+/// The user reported ~97 python and ~77 node MCP processes accumulating
+/// during an update (Windows mandatory file locks + Claude Code's MCP-respawn
+/// loop racing the binary refresh). Strategy:
+///   1. Pre-sweep: terminate currently-running MCP processes whose
+///      commandlines match strict MCP patterns. Soft-fail.
+///   2. Arm a RAII lockfile guard at `<vct_root>/.update-in-progress.json`;
+///      the MCP servers read it at startup (`claude_mcp_servers/_lib/
+///      update_gate.py`) and exit 75 during the window.
+///   3. The guard's Drop deletes the lockfile on ALL exit paths.
+///
+/// A lockfile write failure is soft (worst case: the pre-fix fork-bomb
+/// behaviour); the guard's Drop is a no-op when it never armed.
+///
+/// ORDER: callers run this only after every refusal that needs no mutation
+/// (L2-F14) — the sweep kills processes that nothing restarts.
+pub(crate) fn arm_update_gate(surface: &str) -> UpdateInProgressGuard {
+    let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
+    if pre_sweep_count > 0 {
+        tracing::info!(
+            "[vct] {}: pre-sweep terminated {} MCP-shaped process(es) before update",
+            surface,
+            pre_sweep_count
+        );
+    }
+    let (guard, _gate_write_result) = UpdateInProgressGuard::new();
+    guard
+}
+
+/// What [`pull_to_upstream`] established.
+pub(crate) struct PulledToUpstream {
+    pub already_up_to_date: bool,
+    pub dist_binary_stale: bool,
+    pub pull_branch: String,
+    pub db_audit: Vec<(String, serde_json::Value)>,
+}
+
+/// The git operation of a fast-forward update: resolve the branch, then the
+/// fetch → A0 → F1 → reconcile → pull → classification → HEAD-advance
+/// sequence. The hub must already be stopped and the binaries renamed aside
+/// (`renames`); every failure leg below restores them before returning.
+pub(crate) async fn pull_to_upstream(
+    install_path: &Path,
+    opts: &UpdatePipelineOptions<'_>,
+    renames: &PrePullRenames,
+) -> Result<PulledToUpstream, UpdatePipelineError> {
+    let surface = opts.surface;
+    if let Some(window) = opts.emit_progress_to {
+        emit_progress(window, "update", "Pulling latest changes...", 10.0);
+    }
 
     // Detect the current branch so the explicit `git pull <remote>
     // <branch>` invocation below doesn't depend on upstream tracking
     // config (which would point at `origin/<branch>` on a fork).
-    // v0.2.92 WP-13: through the ONE resolver (was an inline copy of the
-    // `HEAD → main` rule). A detached HEAD is logged, not blocked: the pull
-    // fast-forwards a detached HEAD perfectly well — verified empirically,
-    // see the comment on the `GitPullFailed` arm below.
-    let pull_branch_state = crate::commands::git_cmd::resolve_branch(&install_path)
-        .await
-        .map_err(|e| UpdatePipelineError::Raw(format!("git rev-parse failed: {}", e)))?;
+    // v0.2.92 WP-13: through the ONE resolver. A detached HEAD is logged, not
+    // blocked: the pull fast-forwards a detached HEAD perfectly well.
+    let pull_branch_state = match crate::commands::git_cmd::resolve_branch(install_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            abort_update_restore_binaries_and_hub(
+                install_path,
+                renames.launcher.as_deref(),
+                renames.hub.as_deref(),
+            );
+            return Err(UpdatePipelineError::Raw(format!("git rev-parse failed: {}", e)));
+        }
+    };
     let pull_branch = pull_branch_state.name.clone();
     if pull_branch_state.detached {
         tracing::warn!(
@@ -503,28 +567,25 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
     }
 
     let sequence = reconcile_and_pull(
-        &install_path,
+        install_path,
         pull_branch.clone(),
         &PullSequenceCtx {
             surface,
             emit_progress_to: opts.emit_progress_to,
             install_path_label: opts.install_path_label,
             start_branch: opts.start_branch,
-            head_sha_before: opts.head_sha_before,
+            head_sha_before: opts.head_sha_before.clone(),
             update_start_ms: opts.update_start_ms,
-            pre_pull_renamed: pre_pull_renamed.clone(),
-            pre_pull_renamed_hub: pre_pull_renamed_hub.clone(),
+            pre_pull_renamed: renames.launcher.clone(),
+            pre_pull_renamed_hub: renames.hub.clone(),
         },
     )
     .await?;
 
-    Ok(UpdatePipelineOutcome {
+    Ok(PulledToUpstream {
         already_up_to_date: sequence.already_up_to_date,
         dist_binary_stale: sequence.dist_binary_stale,
         pull_branch,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        gate_guard: update_gate_guard,
         db_audit: sequence.db_audit,
     })
 }
@@ -554,7 +615,7 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
 ///
 /// Both are refusals, so nothing is mutated on either path: no sentinel clear,
 /// no kill-sweep, no hub stop, no rename.
-async fn run_preflight_refusals(
+pub(crate) async fn run_preflight_refusals(
     install_path: &Path,
     surface: &'static str,
     extra: &ExtraPreflight<'_>,
@@ -1424,14 +1485,66 @@ async fn reconcile_and_pull(
 /// What `install.py --update` did. Everything the callers branch on, and
 /// nothing they do not: the recovery (revert the binaries, restart the hub,
 /// reopen the DB) is each caller's, because each holds different things open.
+///
+/// v0.2.100 (WP-03a, L2-F10): the failure REASON travels with the run. The
+/// docstring used to promise "stdout is deliberately NOT carried … no caller
+/// branches on it"; that was true, and it is exactly why a failure whose only
+/// text was on stdout (or a signal death with empty stderr) reached the user as
+/// "Update failed: Update failed:". The promise is superseded by the reader
+/// that now exists — `update_failure::failure_message` — which is why the exit
+/// facts and a BOUNDED stdout tail are carried below.
 pub(crate) struct InstallPyRun {
     pub success: bool,
-    /// install.py's stderr, for the caller's failure message. `stdout` is
-    /// deliberately NOT carried: it is consumed inside — streamed to the
-    /// progress modal when the caller asked for that, and handed to
-    /// `handle_install_phase_exit` either way — and no caller branches on it.
-    /// An unread field is the same defect one layer down.
+    /// install.py's full stderr. The legacy surfaces still quote it; the one
+    /// pipeline renders [`crate::commands::update_failure::failure_message`].
     pub stderr: String,
+    /// `ExitStatus::code()` — `None` when the process was killed by a signal.
+    pub exit_code: Option<i32>,
+    /// The terminating signal on Unix when `exit_code` is `None`.
+    pub signal: Option<i32>,
+    /// The last `[N/M]` step banner install.py printed, from the FULL output
+    /// (computed before the stdout tail is cut, so an early marker survives).
+    pub last_step: Option<String>,
+    /// The last [`STDOUT_TAIL_MAX_LINES`] lines of stdout (at most
+    /// [`STDOUT_TAIL_MAX_BYTES`]) — the failure reason when stderr is empty.
+    pub stdout_tail: String,
+}
+
+/// Bound on the stdout tail [`InstallPyRun`] keeps. install.py's stdout is the
+/// whole install transcript (thousands of lines); only its end explains a
+/// failure, and the message it feeds is a modal, not a log.
+pub(crate) const STDOUT_TAIL_MAX_LINES: usize = 40;
+/// Byte bound on the same tail (a single pathological line cannot blow it up).
+pub(crate) const STDOUT_TAIL_MAX_BYTES: usize = 16 * 1024;
+
+/// The last `max_lines` lines of `text`, then at most `max_bytes` from the end
+/// (cut on a char boundary). Pure; one home for "bounded tail".
+pub(crate) fn bounded_tail(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let joined = lines[start..].join("\n");
+    if joined.len() <= max_bytes {
+        return joined;
+    }
+    let mut cut = joined.len() - max_bytes;
+    while !joined.is_char_boundary(cut) {
+        cut += 1;
+    }
+    joined[cut..].to_string()
+}
+
+/// The terminating signal of a finished process, when there is one.
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 /// Run `python install.py --update` in `install_path`, record the outcome, and
@@ -1675,9 +1788,20 @@ pub(crate) async fn run_install_py_update(
         &stderr,
     );
 
+    let last_step = crate::commands::installer::classify_install_phase_exit(
+        false,
+        status.code(),
+        &stdout,
+        &stderr,
+    )
+    .and_then(|f| f.last_step);
     Ok(InstallPyRun {
         success: status.success(),
         stderr,
+        exit_code: status.code(),
+        signal: exit_signal(&status),
+        last_step,
+        stdout_tail: bounded_tail(&stdout, STDOUT_TAIL_MAX_LINES, STDOUT_TAIL_MAX_BYTES),
     })
 }
 
@@ -1889,6 +2013,65 @@ mod tests {
              (got {} bytes)",
             run.stderr.len(),
         );
+    }
+
+    /// v0.2.100 WP-03a (L2-F10): a failing install.py's reason travels with
+    /// the run — exit code, the last `[N/M]` marker from the FULL output (an
+    /// early marker survives the tail cut), and a BOUNDED stdout tail — so a
+    /// stdout-only failure is no longer rendered as an empty reason.
+    #[tokio::test]
+    async fn install_py_run_carries_exit_code_step_marker_and_bounded_stdout_tail() {
+        let Some(python) = python_cmd_for_tests() else {
+            eprintln!("skipping: no python on PATH");
+            return;
+        };
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            td.path().join("install.py"),
+            "import sys\n\
+             print('[5/10] Starting services')\n\
+             for i in range(200):\n    print('noise line %d' % i)\n\
+             print('ERROR: compose up failed')\n\
+             sys.stdout.flush()\n\
+             sys.exit(3)\n",
+        )
+        .unwrap();
+        let run = run_install_py_update(td.path(), python, "wp03a_stdout_tail", None)
+            .await
+            .expect("spawned");
+        assert!(!run.success);
+        assert_eq!(run.exit_code, Some(3));
+        assert_eq!(run.signal, None);
+        assert_eq!(run.last_step.as_deref(), Some("[5/10]"), "marker from the full output");
+        assert!(run.stdout_tail.ends_with("ERROR: compose up failed"), "{:?}", run.stdout_tail);
+        assert!(run.stdout_tail.lines().count() <= STDOUT_TAIL_MAX_LINES);
+        assert!(!run.stdout_tail.contains("[5/10]"), "the tail is bounded, the marker is not");
+    }
+
+    #[test]
+    fn bounded_tail_keeps_the_end_by_lines_then_bytes() {
+        let text = (1..=10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        assert_eq!(bounded_tail(&text, 3, 1000), "l8\nl9\nl10");
+        assert_eq!(bounded_tail(&text, 3, 3), "l10");
+        assert_eq!(bounded_tail("", 3, 10), "");
+        // never splits a multi-byte char
+        assert_eq!(bounded_tail("é€", 1, 3), "€");
+    }
+
+    /// The hub-stop pre-check refuses ONLY an unreadable pid file — the one
+    /// refusal of the hub stop decidable without killing anything — and lets
+    /// an absent or readable one through (leave-alone).
+    #[test]
+    fn hub_stop_precheck_refuses_only_an_unreadable_pid_file() {
+        let td = tempfile::tempdir().unwrap();
+        let pid = td.path().join("hub.pid");
+        assert!(hub_stop_precheck_at(&pid).is_ok(), "absent = no hub");
+        std::fs::write(&pid, "12345\n").unwrap();
+        assert!(hub_stop_precheck_at(&pid).is_ok(), "readable = the stop decides");
+        std::fs::remove_file(&pid).unwrap();
+        std::fs::create_dir(&pid).unwrap(); // a directory cannot be read as a file
+        let err = hub_stop_precheck_at(&pid).expect_err("unreadable refuses");
+        assert!(err.contains("before anything was changed"), "{err}");
     }
 
     /// The rendered body an install writes over the tracked stub: the user's

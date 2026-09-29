@@ -28,7 +28,7 @@
 //!
 //! 1. [`resolve`] — the cached root first (launcher.db `launcher.install_path`,
 //!    or the process-level copy of it while the DB is closed), re-checked
-//!    structurally; then a walk up from the exe bounded to
+//!    with the same identity rule as the walk (W1R-06); then a walk up from the exe bounded to
 //!    [`MAX_WALK_LEVELS`] ancestors that accepts a directory ONLY when it is
 //!    identity-confirmed by [`is_orchestrator_clone`]. No hit is a typed
 //!    [`RootError::NotFound`]; never a guess.
@@ -255,21 +255,40 @@ impl std::fmt::Display for RootError {
 
 impl std::error::Error for RootError {}
 
-/// Pure resolver: cached root first (structurally re-checked — a moved or
-/// deleted clone falls through), then the bounded identity-checked walk.
+/// Pure resolver: cached root first, then the bounded identity-checked walk.
 ///
-/// The cache is accepted on the structural check alone because it was
-/// written either by install.py / the installer (the user chose that path)
-/// or by an earlier identity-checked walk; the launcher layers its
-/// finished-install check on top before passing it in.
+/// The cache is held to the SAME identity rule as the walk
+/// ([`is_orchestrator_clone`] — structural markers AND a `vct-module.json`
+/// whose id is `orchestrator`). It used to be accepted on the structural
+/// markers alone (v0.2.100 wave-1 review W1R-06), on the argument that it was
+/// written by install.py or an identity-checked walk. Neither holds for two
+/// real sources: a `launcher.install_path` written by a pre-0.2.100 launcher
+/// from the OLD structural walk, and the hub's `VCT_ORCHESTRATOR_ROOT` /
+/// `VCT_INSTALL_ROOT` / project-row candidates — a user project carrying
+/// `install.py` + `CLAUDE.md` (and a bundled compose copy) passed the
+/// structural check and stuck as "the clone" forever. A cache that fails
+/// identity is logged and falls through to the walk; it is never rewritten
+/// here (the DB-aware entry point writes back only a walk hit).
+///
+/// The launcher layers its finished-install check on top before passing the
+/// cache in.
 pub fn resolve(db_cached: Option<PathBuf>, exe: &Path) -> Result<InstallRoot, RootError> {
     if let Some(cached) = db_cached {
-        if !cached.as_os_str().is_empty() && looks_like_orchestrator_root(&cached) {
-            return Ok(InstallRoot {
-                path: cached,
-                source: RootSource::DbCache,
-                exe: exe.to_path_buf(),
-            });
+        if !cached.as_os_str().is_empty() {
+            if is_orchestrator_clone(&cached) {
+                return Ok(InstallRoot {
+                    path: cached,
+                    source: RootSource::DbCache,
+                    exe: exe.to_path_buf(),
+                });
+            }
+            tracing::warn!(
+                "[vct] install_root: cached root {} is not an orchestrator clone \
+                 (needs vct-module.json with id \"{}\"); ignoring it and walking from {}",
+                cached.display(),
+                ORCHESTRATOR_MODULE_ID,
+                exe.display()
+            );
         }
     }
     match walk_from_exe(exe) {
@@ -710,6 +729,219 @@ mod tests {
             resolve_with_store(&store, &exe, |_| true),
             Err(RootError::Db("disk I/O error".into()))
         );
+    }
+
+    // ── W1R-06: the cache is held to the identity rule ────────────────
+
+    /// A pre-0.2.100 launcher wrote `launcher.install_path` from the OLD
+    /// structural walk: a user project with `install.py` + `CLAUDE.md` (and a
+    /// bundled compose copy) could be cached as "the clone". Act: the walk
+    /// finds the real clone, and its hit REPLACES the stale cache.
+    #[test]
+    fn stale_structural_only_db_cache_falls_through_and_is_replaced_act() {
+        let _g = PROCESS_CACHE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let (tmp, clone) = clone_tree();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(proj.join("infrastructure")).unwrap();
+        std::fs::write(proj.join("install.py"), "").unwrap();
+        std::fs::write(proj.join("CLAUDE.md"), "").unwrap();
+        std::fs::write(proj.join("infrastructure").join("docker-compose.yml"), "services: {}\n").unwrap();
+        assert!(looks_like_orchestrator_root(&proj), "the fixture must pass the OLD structural rule");
+        let store = FakeStore::new(false, Some(&proj.to_string_lossy()));
+        let exe = clone.join("launcher").join("dist").join("linux-x64").join("vct-launcher");
+        let r = resolve_with_store(&store, &exe, |_| true).unwrap();
+        assert_eq!(r.path, clone);
+        assert_eq!(r.source, RootSource::ExeWalk);
+        assert_eq!(store.writes.get(), 1, "the identity-checked walk hit replaces the stale cache");
+        assert_eq!(store.cached.borrow().as_deref(), Some(clone.to_string_lossy().as_ref()));
+        assert_eq!(process_root(), Some(clone));
+    }
+
+    /// Leave-alone: a stale structural-only cache and an exe outside every
+    /// clone is NotFound — the project is never returned, and nothing is
+    /// written (the stale row is not "confirmed" by a rewrite).
+    #[test]
+    fn stale_structural_only_db_cache_without_a_walk_hit_is_not_found_leave_alone() {
+        let _g = PROCESS_CACHE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("install.py"), "").unwrap();
+        std::fs::write(proj.join("CLAUDE.md"), "").unwrap();
+        let store = FakeStore::new(false, Some(&proj.to_string_lossy()));
+        let exe = tmp.path().join("tmpbin").join("vct-launcher");
+        assert_eq!(
+            resolve_with_store(&store, &exe, |_| true),
+            Err(RootError::NotFound { exe: exe.clone() })
+        );
+        assert_eq!(store.writes.get(), 0);
+    }
+
+    /// The standby path answers from the PROCESS cache — it gets the same
+    /// identity check (a non-clone process cache is never handed out).
+    #[test]
+    fn standby_process_cache_failing_identity_is_not_returned() {
+        let _g = PROCESS_CACHE_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(proj.join("vct-module.json"), r#"{"id": "dotfiles"}"#).unwrap();
+        set_process_root(&proj);
+        let store = FakeStore::new(true, None);
+        let exe = tmp.path().join("tmpbin").join("vct-launcher");
+        assert!(matches!(
+            resolve_with_store(&store, &exe, |_| true),
+            Err(RootError::NotFound { .. })
+        ));
+        *process_cell().write().unwrap() = None;
+    }
+
+    // ── W1R-16: the update stand-in must stay schema-less ─────────────
+    //
+    // `is_update_standby` is "in-memory AND empty schema". It is correct only
+    // while NO `Db` method issues DDL after `open`: one lazy
+    // `CREATE TABLE IF NOT EXISTS` on the managed connection would flip the
+    // stand-in to "live" mid-window — `lock_live` would hand it out, writes
+    // would land in it and vanish, and `resolve_with_store` would read
+    // `app_state` from it (`no such table`).
+
+    /// The lever is real: DDL on a stand-in DOES flip the probe. (This is
+    /// why the census below exists.)
+    #[test]
+    fn ddl_on_the_standin_flips_the_standby_probe() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db.ensure_change_log().unwrap();
+        assert!(!db.is_update_standby(), "lazy DDL turned the stand-in into a 'live' DB");
+    }
+
+    /// Behaviour: the public readers/writers the update window can reach
+    /// all fail on the stand-in and leave it schema-less.
+    #[test]
+    fn standin_stays_schema_less_through_db_methods() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        let _ = db.app_state_get(APP_STATE_KEY_INSTALL_PATH);
+        let _ = db.app_state_set(APP_STATE_KEY_INSTALL_PATH, "/x");
+        let _ = db.app_state_set_nonpanicking("k", "v");
+        let _ = db.app_state_get_bool("k");
+        let _ = db.app_state_delete_like("k%");
+        let _ = db.get_orchestrator_root_kg_collection();
+        let _ = db.list_projects();
+        let _ = db.list_projects_nonpanicking();
+        let _ = db.get_project("p");
+        let _ = db.list_project_folder_paths();
+        let _ = db.ensure_live();
+        let _ = RootStore::read_cached_root(&db);
+        let _ = RootStore::write_cached_root(&db, "/x");
+        assert!(db.is_update_standby(), "a Db method issued DDL on the update stand-in");
+    }
+
+    /// Census (the red-proof lever the review accepted): every production
+    /// DDL / `execute_batch` site on the launcher.db side is on this
+    /// allowlist, with the reason it cannot reach the stand-in. A new lazy
+    /// `CREATE` anywhere in the launcher crates fails here until it is
+    /// either moved into `migrations` or justified below.
+    #[test]
+    fn no_lazy_ddl_outside_migrations_census() {
+        // file (relative to launcher/src-tauri) -> why it cannot reach the stand-in
+        let allow: &[(&str, &str)] = &[
+            (
+                "vct-launcher-core/src/db/change_log.rs",
+                "ensure_change_log: called only from Db::open / open_in_memory (asserted below)",
+            ),
+            (
+                "vct-launcher-core/src/db/module_db_migrations.rs",
+                "module DDL runs after a module_db_migrations ledger read that fails on the \
+                 stand-in; the other hits are error-message strings",
+            ),
+            (
+                "vct-launcher-core/src/db/project_state.rs",
+                "BEGIN IMMEDIATE / COMMIT / ROLLBACK — transaction control, not DDL",
+            ),
+        ];
+        let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let needles = [
+            "create table",
+            "create index",
+            "create unique index",
+            "create trigger",
+            "create view",
+            "create virtual",
+            "alter table",
+            "drop table",
+            "execute_batch(",
+        ];
+        let mut hits: std::collections::BTreeSet<String> = Default::default();
+        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                let name = p.file_name().unwrap().to_string_lossy().to_string();
+                if p.is_dir() {
+                    if name != "migrations" {
+                        stack.push(p);
+                    }
+                    continue;
+                }
+                if !name.ends_with(".rs") || name == "migrations.rs" {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&p).unwrap();
+                let rel_path = p
+                    .strip_prefix(&base)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                for line in text.lines() {
+                    if line.starts_with("#[cfg(test)]") {
+                        break; // production code only
+                    }
+                    let t = line.trim_start();
+                    if t.starts_with("//") {
+                        continue;
+                    }
+                    let norm = t.to_ascii_lowercase().split_whitespace().collect::<Vec<_>>().join(" ");
+                    if needles.iter().any(|n| norm.contains(n)) {
+                        hits.insert(rel_path.clone());
+                    }
+                }
+            }
+        }
+        let allowed: std::collections::BTreeSet<String> =
+            allow.iter().map(|(f, _)| f.to_string()).collect();
+        let unexpected: Vec<_> = hits.difference(&allowed).collect();
+        assert!(
+            unexpected.is_empty(),
+            "DDL / execute_batch outside migrations in {:?} — a lazy DDL on the managed \
+             connection flips the update stand-in to 'live' (W1R-16)",
+            unexpected
+        );
+        // The change_log allowance holds only while its callers are the two
+        // open paths.
+        let mod_rs = std::fs::read_to_string(base.join("vct-launcher-core/src/db/mod.rs")).unwrap();
+        let prod = mod_rs.split("\n#[cfg(test)]").next().unwrap();
+        assert_eq!(prod.matches("ensure_change_log()").count(), 2);
+        let mut callers = 0usize;
+        let mut stack = vec![base.join("vct-launcher-core/src"), base.join("src")];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).unwrap().flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p.extension().map(|e| e == "rs").unwrap_or(false) {
+                    let text = std::fs::read_to_string(&p).unwrap();
+                    let prod = text.split("\n#[cfg(test)]").next().unwrap();
+                    callers += prod
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .filter(|l| l.contains(".ensure_change_log()"))
+                        .count();
+                }
+            }
+        }
+        assert_eq!(callers, 2, "ensure_change_log gained a caller outside Db::open / open_in_memory");
     }
 
     #[test]

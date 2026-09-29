@@ -328,8 +328,15 @@ def _on_disk_launcher_version(install_root: Path, dist_rel_dir: str, binary_name
 
 
 def _version_ge(a: str, b: str) -> bool:
-    """``a >= b`` for strict ``X.Y.Z`` versions (raises ``VersionParseError`` otherwise;
-    the caller maps that to "not probed" — see :mod:`vco_lib.version_compare`).
+    """``a >= b`` for strict ``X.Y.Z`` versions; RAISES ``VersionParseError`` otherwise
+    (see :mod:`vco_lib.version_compare`).
+
+    The caller (``launcher_binary_stale_still_applies``) does NOT yet map that
+    error to "not probed": a non-``X.Y.Z`` dist sidecar or source version
+    propagates the exception out of the probe. Mapping it (``except
+    VersionParseError`` → ``None`` + a log line) is v0.2.100 WP-12's scheduled
+    work (plan register F-W1-01, review W1R-08); until WP-12 lands, only strict
+    ``X.Y.Z`` producers reach this call.
 
     Was a hand-written copy of install.py's ``_ge`` — its own docstring said
     "mirrors install.py's ``_ge``", which is a request for extraction rather

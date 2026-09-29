@@ -290,8 +290,14 @@ impl Db {
         Ok(())
     }
 
-    /// TEST SEAM: upsert `row` verbatim. Not compiled into release builds —
+    /// TEST SEAM: upsert `row`. Not compiled into release builds —
     /// production rows are written by `vco_lib.service_endpoints` only.
+    /// v0.2.100 (AD-4, L1-F24): a recorded `data_mount_json` is NEVER
+    /// overwritten with NULL — `COALESCE(excluded.data_mount_json,
+    /// data_mount_json)`. MUST MATCH `vco_lib.service_endpoints.
+    /// keep_recorded_mount` (Python's explicit `clear_mount=True` has no Rust
+    /// counterpart: no Rust caller ever clears a mount); both run the
+    /// `mount_write_cases` of `tests/fixtures/service_endpoint_parity.json`.
     #[cfg(any(test, debug_assertions))]
     pub fn service_endpoint_seed_for_tests(&self, row: &ServiceEndpointRow) -> Result<(), String> {
         let guard = self.lock();
@@ -305,7 +311,8 @@ impl Db {
                  scheme = excluded.scheme, host = excluded.host, port = excluded.port, \
                  grpc_port = excluded.grpc_port, container_name = excluded.container_name, \
                  compose_project = excluded.compose_project, \
-                 data_mount_json = excluded.data_mount_json, enabled = excluded.enabled, \
+                 data_mount_json = COALESCE(excluded.data_mount_json, data_mount_json), \
+                 enabled = excluded.enabled, \
                  autostart = excluded.autostart, source = excluded.source, \
                  confirmed_by_user = excluded.confirmed_by_user, \
                  verified_at = excluded.verified_at, updated_at = excluded.updated_at",
@@ -373,6 +380,44 @@ mod tests {
         assert!(db.service_endpoint_seed_for_tests(&adopted_embed).is_err(), "code_embed is vco_managed");
         let nameless = ServiceEndpointRow::new("ollama", EndpointMode::AdoptedContainer, "localhost", 11434);
         assert!(db.service_endpoint_seed_for_tests(&nameless).is_err(), "adopted_container is named");
+    }
+
+    /// v0.2.100 (AD-4): the never-NULL mount rule, from the shared table.
+    #[test]
+    fn mount_write_cases_match_the_python_writer() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../tests/fixtures/service_endpoint_parity.json");
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let table: serde_json::Value = serde_json::from_str(&text).expect("parity table parses");
+        let cases = table["mount_write_cases"].as_array().expect("mount_write_cases");
+        assert!(!cases.is_empty());
+        let mount = |v: &serde_json::Value| -> Option<String> {
+            if v.is_null() {
+                None
+            } else {
+                Some(serde_json::to_string(v).unwrap())
+            }
+        };
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let db = Db::open_in_memory().unwrap();
+            let mut row = ServiceEndpointRow::new("ollama", EndpointMode::VcoManaged, "localhost", 11435);
+            if let Some(prior) = case.get("prior") {
+                if !prior.is_null() {
+                    row.data_mount_json = mount(&prior["data_mount"]);
+                    db.service_endpoint_seed_for_tests(&row).unwrap();
+                }
+            }
+            row.data_mount_json = mount(&case["write"]);
+            row.source = "live_reconcile".into();
+            db.service_endpoint_seed_for_tests(&row).unwrap();
+            let stored = db.service_endpoint_get("ollama").unwrap().unwrap().data_mount_json;
+            let stored: Option<serde_json::Value> =
+                stored.map(|s| serde_json::from_str(&s).unwrap());
+            let expect = if case["expect"].is_null() { None } else { Some(case["expect"].clone()) };
+            assert_eq!(stored, expect, "{name}");
+        }
     }
 
     /// A pre-047 DB has no table: that is "no row", not an error the

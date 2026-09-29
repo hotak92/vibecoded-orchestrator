@@ -332,6 +332,11 @@ class World:
             return _cp(argv)
         if rest[0] == "network" and rest[1] == "rm":
             return _cp(argv)
+        if rest[0] == "network" and rest[1] == "inspect":
+            # v0.2.100 (W1R-01): the network heal checks the network's OWN
+            # labels name the project being recovered (docker-compose v2 left
+            # its project label, podman-compose's network label is missing).
+            return _cp(argv, 0, json.dumps({"com.docker.compose.project": OWN_PROJECT}))
         if rest[0] == "compose":
             return self._compose(argv)
         raise AssertionError(f"unexpected runtime argv in tests: {argv}")
@@ -362,6 +367,9 @@ class World:
         raise AssertionError(f"unexpected inspect format in tests: {fmt}")
 
     def _compose(self, argv):
+        if argv[-1] == "version":
+            # v0.2.100: the compose PROVIDER is detected (overlay + recovery)
+            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
         if argv[-1] == "config":
             return _cp(argv, self.config_rc, "", "" if self.config_rc == 0
                        else "services.ollama.devices must be a list")
@@ -943,6 +951,9 @@ class AdoptionFlowTests(_TempCase):
                                   f"network={OWN_PROJECT}_default", "-q"]])
         self.assertNotIn(["podman", "network", "rm", f"{OWN_PROJECT}_default"],
                          result.argv_log)
+        # v0.2.100 (F-W1-13): the refusal is LEDGERED, never swallowed.
+        self.assertEqual([e.condition_id for e in result.entries],
+                         ["compose_network_label_mismatch_attached"])
 
     # -- refusals: unreconcilable stays foreign ----------------------------
 

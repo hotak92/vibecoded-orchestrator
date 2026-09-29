@@ -16,7 +16,10 @@ launcher read the same rows):
   adopted service is never composed, recreated or removed);
 * :func:`container_policies` / :func:`zombie_action` — per container, what to
   do when it is missing, stopped, or a podman zombie (running with a dead
-  PID). A zombie ``vco_managed`` container is removed and re-created; a zombie
+  PID). A zombie ``vco_managed`` container is removed and re-created — by
+  :func:`up_services` (the hooks' ``up`` verb), only after
+  :func:`vco_lib.data_identity.guard_recreate` proved compose mounts its live
+  data (v0.2.100 AD-4; a refusal removes nothing); a zombie
   ADOPTED container — or one whose service has NO row yet (ownership
   unknown) — only gets its orphan runtime state cleaned and a ``start`` —
   never ``rm``, because a compose re-create would bring it back on the
@@ -41,6 +44,8 @@ CLI (the hooks and the boot wrapper)::
     python -m vco_lib.service_lifecycle plan --shell|--json [--required "a b"]
     python -m vco_lib.service_lifecycle compose-args --services "a b"
         [--build] [--gpu-mode gpu|cpu|unknown] --shell|--json
+    python -m vco_lib.service_lifecycle up --services "a b" --compose-dir DIR
+        [--recreate "a"] [--build] [--guard-only] [--compose-cmd CMD] [--runtime R] [--shell]
     python -m vco_lib.service_lifecycle session-reconcile [--timeout S] [--if-stale S] [--require-fresh]
     python -m vco_lib.service_lifecycle session-lock-path
     python -m vco_lib.service_lifecycle with-session-lock [--wait S] [--busy LINE] -- CMD...
@@ -78,6 +83,7 @@ __all__ = [
     "run_with_session_lock",
     "session_lock_path",
     "session_reconcile_fresh",
+    "up_services",
     "zombie_action",
 ]
 
@@ -309,6 +315,8 @@ class MigrationResult:
     mount: Optional[dict] = None
     lines: list[str] = field(default_factory=list)
     argv_log: list[list[str]] = field(default_factory=list)
+    #: ledger rows the compose recovery owes (a refused heal), for the caller
+    entries: list = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -378,41 +386,6 @@ def _effective_mount(infra: Path, service: str, destination: str, need_gpu: bool
     service_cfg = (cfg.get("services") or {}).get(service) or {}
     mounts = _sa.config_mounts(service_cfg, cfg.get("volumes") or {})
     return files, mounts.get(destination)
-
-
-def _provider_mount(argv: list[str], infra: Path, service: str, destination: str, run: RunFn,
-                    result: MigrationResult) -> tuple[Any, str]:
-    """``compose config`` — the provider's OWN render — and the
-    *destination* mount it gives *service*. ``(None, why)`` when it cannot
-    be read."""
-    from vco_lib import service_adoption as _sa  # noqa: PLC0415
-
-    result.argv_log.append(list(argv))
-    try:
-        res = run(argv, capture_output=True, text=True, timeout=120, cwd=str(infra))
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return None, f"`compose config` could not run: {exc}"
-    if res.returncode != 0:
-        tail = (res.stderr or "").strip().splitlines()
-        return None, "`compose config` failed: " + (tail[-1] if tail else f"exit {res.returncode}")
-    try:
-        import yaml  # noqa: PLC0415 — venv-time only (see service_adoption's header)
-    except ImportError:
-        # v0.2.97: same degradation as every other unreadable render — the
-        # caller refuses the migration (install.py may be on the SYSTEM
-        # python here, post-venv, where PyYAML is absent).
-        return None, "PyYAML is not importable in this interpreter (venv not active?)"
-    try:
-        doc = yaml.safe_load(res.stdout or "")
-    except yaml.YAMLError as exc:
-        return None, f"`compose config` output is not YAML: {exc}"
-    if not isinstance(doc, dict):
-        return None, "`compose config` printed no configuration"
-    service_cfg = (doc.get("services") or {}).get(service)
-    if not isinstance(service_cfg, dict):
-        return None, f"`compose config` has no {service} service"
-    mounts = _sa.config_mounts(service_cfg, doc.get("volumes") or {})
-    return mounts.get(destination), ""
 
 
 def _describe_mount(mount: Any, destination: str = CACHE_DESTINATION) -> str:
@@ -569,12 +542,6 @@ def commit_without_mcp_registration(
     return commit
 
 
-def _same_identity(a: "_se.EndpointRow", b: "_se.EndpointRow") -> bool:
-    mount_a = dict(a.data_mount) if a.data_mount else None
-    mount_b = dict(b.data_mount) if b.data_mount else None
-    return (mount_a, a.container_name) == (mount_b, b.container_name)
-
-
 def migrate_managed_service(
     root: Path,
     row: "_se.EndpointRow",
@@ -605,14 +572,16 @@ def migrate_managed_service(
        ``not_needed``; no data mount, or a bind whose host path is
        missing/empty → ``refused``. The data inventory is read too (Weaviate's
        class list ``/v1/schema``, Ollama's model list ``/api/tags``);
-       unreadable → ``refused``. The mount is
-       recorded in the CURRENT row (``commit``; default
-       ``service_endpoints.commit_rows``) when that row did not carry it,
-       and ``infrastructure/.env`` gets the data-source knob and *row*'s
-       port keys (``compose_env.write_service_keys``).
-    2. BEFORE anything is stopped: the installer's effective config
-       (Python merge of the files on disk + ``.env``) AND the provider's own
-       ``compose config`` must both mount that same ``(kind, source,
+       unreadable → ``refused``. The data proof is
+       :func:`vco_lib.data_identity.guard_recreate` (v0.2.100 AD-4, the one
+       home for every recreate): the live mount is recorded in the CURRENT
+       row (``commit``; default ``service_endpoints.commit_rows``) when that
+       row did not carry it (a recorded mount that differs from the live one
+       refuses), and ``infrastructure/.env`` gets the data-source knob and
+       *row*'s port keys (``compose_env.write_service_keys``).
+    2. BEFORE anything is stopped: the provider's own ``compose config``
+       (the guard) AND the installer's effective config (Python merge of the
+       files on disk + ``.env``) must both mount that same ``(kind, source,
        destination)``. Anything else → ``refused``, ``.env`` restored,
        nothing touched.
     3. A container owned by another compose project: code-embed goes
@@ -624,7 +593,9 @@ def migrate_managed_service(
        (taking it over is the explicit ``hand-to-vco`` step, owner ruling
        Q2). One the installer already owns is re-created in
        place: ``up -d --force-recreate --no-deps <service>`` (``--build``
-       for code-embed only — the others run images).
+       for code-embed only — the others run images), through
+       :func:`vco_lib.compose_recovery.compose_up_with_recovery` (a refused
+       heal lands in ``MigrationResult.entries``).
     4. AFTER the up: the container carries the installer's project label,
        its data-mount key tuple is unchanged, it publishes *row*'s port(s),
        and the service answers as itself within *health_timeout_s*
@@ -641,7 +612,10 @@ def migrate_managed_service(
        registration).
     """
     from vco_lib import compose_env as _compose_env  # noqa: PLC0415
+    from vco_lib import compose_provider as _cp  # noqa: PLC0415
+    from vco_lib import compose_recovery as _cr  # noqa: PLC0415
     from vco_lib import containers as _containers  # noqa: PLC0415
+    from vco_lib import data_identity as _di  # noqa: PLC0415
     from vco_lib import service_adoption as _sa  # noqa: PLC0415
 
     service = row.service
@@ -688,16 +662,11 @@ def migrate_managed_service(
     if live is None:
         return refuse(f"could not positively read container '{ref}' (inspect failed)")
     data = _mount_at(live, destination)
-    if data is None:
-        return refuse(
-            f"container '{ref}' has no {destination} mount — its data lives inside the "
-            "container, and a recreate would start with an empty one"
-        )
-    if data.kind == "bind" and not _bind_holds_data(data.source):
+    if data is not None and data.kind == "bind" and not _bind_holds_data(data.source):
         return refuse(f"the data bind {data.source} is missing or empty on this host")
     inventory_before: Optional[frozenset[str]] = None
     live_port = _sa.live_http_host_port(service, live)
-    if service in ("weaviate", "ollama"):
+    if data is not None and service in ("weaviate", "ollama"):
         inventory_before = (_service_inventory(service, int(live_port), fetch)
                             if live_port.isdecimal() else None)
         if inventory_before is None:
@@ -705,14 +674,13 @@ def migrate_managed_service(
                 f"{service.capitalize()}'s {_INVENTORY_LABEL[service]} could not be read on "
                 f":{live_port or '?'} — without it the recreate could not be verified"
             )
-    mount = {"kind": data.kind, "source": data.source, "destination": data.destination}
-    result.mount = mount
     canonical = _containers.canonical_name(service)
     try:
         db_rows = dict(_se.load_rows(db_path))
     except Exception:  # noqa: BLE001 — unreadable ⇒ no recorded rows this run
         db_rows = {}
     prior = db_rows.get(service)
+    recorded_mount = prior.data_mount if prior is not None else row.data_mount
     if prior is None:
         # No recorded row: the CURRENT endpoint is what the container
         # publishes — never *row*'s target port (that is what a refusal or a
@@ -723,28 +691,11 @@ def migrate_managed_service(
             prior = dataclasses.replace(prior, port=int(live_port))
         if service == "weaviate" and live_grpc.isdecimal():
             prior = dataclasses.replace(prior, grpc_port=int(live_grpc))
-    identity_row = dataclasses.replace(prior, data_mount=mount,
-                                       container_name=prior.container_name or canonical)
-    new_row = dataclasses.replace(row, data_mount=mount,
-                                  container_name=row.container_name or canonical)
     commit_fn = commit or _default_commit(root, db_path)
-    if not _same_identity(identity_row, prior):
-        try:
-            commit_fn([identity_row])
-        except _se.ServiceRegistryUnavailable as exc:
-            say(f"{tag} WARNING: the data identity could not be recorded in launcher.db "
-                f"({exc}); projecting it into infrastructure/.env for this run")
-        except _se.InvalidEndpointRow as exc:
-            return refuse(f"the {service} row is invalid: {exc}")
-    try:
-        _compose_env.write_service_keys(infra, {**db_rows, service: new_row}, runtime=runtime)
-    except (OSError, ValueError) as exc:
-        return refuse(f"infrastructure/.env could not carry the {service} keys: {exc}")
-    env_state["restore"] = {**db_rows, service: identity_row}
-    moved = live_port != str(new_row.port) or (
+    moved = live_port != str(row.port) or (
         service == "weaviate"
         and str(live.host_ports.get(_sa.WEAVIATE_GRPC_CONTAINER_PORT, ""))
-        != str(_se.render_grpc_port(new_row)))
+        != str(_se.render_grpc_port(row)))
 
     # 2. pre-checks (nothing stopped yet) -----------------------------------
     if resolution is None:
@@ -757,34 +708,55 @@ def migrate_managed_service(
             resolution = None
     compose_form = getattr(resolution, "compose_form", None) if resolution is not None else None
     compose_argv = [str(p) for p in (getattr(resolution, "compose", None) or [runtime, "compose"])]
-    overlay = _sa.gpu_overlay_for_form(compose_form) if live.has_devices else None
+    overlay = None
+    if live.has_devices:
+        # The overlay FILE follows the compose that parses it — the DETECTED
+        # provider, never the bare form (v0.2.100 F-W1-13 / L1-F10).
+        overlay = _cp.overlay_for_provider(
+            _cp.detect(runtime, argv=compose_argv, run=run)
+            or _cp.provider_from_form(compose_form, runtime=runtime), "nvidia")
     if live.has_devices and (overlay is None or not (infra / overlay).is_file()):
         return refuse(
             f"the running service uses GPU devices but no GPU overlay matches the compose "
-            f"form '{compose_form}' — refusing rather than dropping the GPUs"
+            f"'{compose_form}' — refusing rather than dropping the GPUs"
         )
-    files, effective = _effective_mount(infra, service, destination, live.has_devices, overlay)
+    files, _unused = _effective_mount(infra, service, destination, live.has_devices, overlay)
     if not files:
         return refuse(f"no usable compose file in {infra}")
-    if effective is None or effective.key() != data.key():
-        return refuse(
-            f"the installer's effective config would mount {_describe_mount(effective, destination)} "
-            f"at {destination}, not the live {_describe_mount(data, destination)}"
-        )
     own_project = _containers.own_compose_project(root)
     chain: list[str] = []
     for path in files:
         chain += ["-f", str(path)]
-    provider, why = _provider_mount(
-        [*compose_argv, *chain, "-p", own_project, "--profile", "gpu", "config"],
-        infra, service, destination, run, result,
-    )
-    if provider is None and why:
-        return refuse(why)
-    if provider is None or provider.key() != data.key():
+    # The data proof — capture, record, project into .env, `compose config` —
+    # is vco_lib.data_identity's (v0.2.100 AD-4: one home for every recreate).
+    identity_base = dataclasses.replace(prior, container_name=prior.container_name or canonical)
+    env_state["restore"] = {**db_rows, service: identity_base}
+    guard = _di.guard_recreate(
+        service, runtime=runtime, infra_dir=infra, compose_argv=compose_argv,
+        row=dataclasses.replace(row, data_mount=recorded_mount,
+                                container_name=row.container_name or canonical),
+        rows=db_rows, record_row=identity_base, record=lambda r: commit_fn([r]),
+        run=run, names=[ref], files=files, project=own_project)
+    if guard.effective is not None and guard.effective.argv:
+        result.argv_log.append(list(guard.effective.argv))
+    for note in guard.notes:
+        say(f"{tag} WARNING: {note}; projecting it into infrastructure/.env for this run")
+    if guard.verdict == _di.NOTHING_TO_LOSE:
+        result.lines.append(f"{tag} no container to migrate; the next compose up creates it.")
+        return result
+    if guard.verdict != _di.PRESERVES:
+        return refuse(guard.reason)
+    mount = dict(guard.mount or {})
+    result.mount = mount
+    data_key = _di.mount_key(mount)
+    new_row = dataclasses.replace(row, data_mount=mount,
+                                  container_name=row.container_name or canonical)
+    env_state["restore"] = {**db_rows, service: dataclasses.replace(identity_base, data_mount=mount)}
+    _files, effective = _effective_mount(infra, service, destination, live.has_devices, overlay)
+    if effective is None or effective.key() != data_key:
         return refuse(
-            f"`compose config` would mount {_describe_mount(provider, destination)} at "
-            f"{destination}, not the live {_describe_mount(data, destination)}"
+            f"the installer's effective config would mount {_describe_mount(effective, destination)} "
+            f"at {destination}, not the live {_di.describe(mount)}"
         )
     identity = _containers.compose_identity_of(ref, runtime, run=run)
     foreign = _containers.foreign_compose_identity(identity, own_project)
@@ -801,14 +773,14 @@ def migrate_managed_service(
             f"container '{ref}' {foreign} — it is first re-created under the installer on its "
             "current port (`python install.py --update` does that, with its cache); move it after"
         )
-    described = _describe_mount(data, destination)
+    described = _di.describe(mount)
 
     def after_problem() -> str:
         after = _sa.live_service_state(ref, runtime, run)
         if after is None:
             return f"could not re-read container '{ref}' after the up"
         after_data = _mount_at(after, destination)
-        if after_data is None or after_data.key() != data.key():
+        if after_data is None or after_data.key() != data_key:
             return (f"the new container mounts {_describe_mount(after_data, destination)} at "
                     f"{destination}, not {described}")
         return (_published_problem(new_row, after)
@@ -845,6 +817,8 @@ def migrate_managed_service(
             extra_verify=verify_adopted, commit_rows=commit, db_path=db_path,
         )
         result.argv_log.extend(adoption.argv_log)
+        if isinstance(getattr(adoption, "entries", None), list):
+            result.entries.extend(adoption.entries)
         if service in adoption.adopted:
             return commit_final()
         if service in adoption.failed:
@@ -859,11 +833,20 @@ def migrate_managed_service(
     result.argv_log.append(list(up))
     problem = ""
     try:
-        res = run(up, capture_output=True, text=True, timeout=1800, cwd=str(infra))
-        if res.returncode != 0:
-            tail = (res.stderr or "").strip().splitlines()
-            problem = "compose up failed: " + (tail[-1] if tail else f"exit {res.returncode}")
-    except (subprocess.TimeoutExpired, OSError) as exc:
+        # The ONE compose-up-with-recovery home (v0.2.100 AD-3, F-W1-13):
+        # first stderr kept, non-destructive drift healed, a refused heal
+        # ledgered in result.entries.
+        up_res = _cr.compose_up_with_recovery(
+            up, cwd=str(infra), timeout=1800, runtime=runtime,
+            provider=_cp.detect(runtime, argv=compose_argv, run=run),
+            run=run, compose_run=run, log=say)
+        result.entries.extend(_cr.deferral_entries(up_res, manual_cmd=shlex.join(up)))
+        if up_res.timed_out:
+            problem = "compose up could not run: timed out"
+        elif not up_res.ok:
+            tail = (up_res.first_stderr or up_res.stderr or "").strip().splitlines()
+            problem = "compose up failed: " + (tail[-1] if tail else f"exit {up_res.returncode}")
+    except OSError as exc:
         problem = f"compose up could not run: {exc}"
     if not problem:
         after_identity = _containers.compose_identity_of(ref, runtime, run=run)
@@ -916,6 +899,178 @@ def migrate_code_embed(
         db_path=db_path, commit=commit, build=build, health_timeout_s=health_timeout_s,
         health_interval_s=health_interval_s,
     )
+
+
+# ─── `up`: the hooks' ONE guarded compose path (v0.2.100 AD-3/AD-4) ─────
+
+
+@dataclass
+class UpVerbResult:
+    """What :func:`up_services` did. ``cleared``: services the data guard let
+    through (and, unless ``guard_only``, composed); ``refused``: services
+    left alone (never removed); ``composed``: ``True`` when compose ran and
+    succeeded (``None`` when it did not run)."""
+
+    cleared: list[str] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+    removed: list[str] = field(default_factory=list)
+    composed: Optional[bool] = None
+    entries: list = field(default_factory=list)
+
+    @property
+    def returncode(self) -> int:
+        if self.composed is False:
+            return 1
+        return 3 if self.refused else 0
+
+
+def up_services(
+    services: Sequence[str],
+    *,
+    compose_dir: Path,
+    compose_argv: Sequence[str],
+    runtime: str,
+    recreate: Sequence[str] = (),
+    build: bool = False,
+    guard_only: bool = False,
+    rows: Optional[Mapping[str, "_se.EndpointRow"]] = None,
+    db_path: Optional[Path] = None,
+    run: Optional[RunFn] = None,
+    out: LogFn = print,
+) -> UpVerbResult:
+    """Bring up EXACTLY *services* from *compose_dir*, each one first cleared
+    by :func:`vco_lib.data_identity.guard_recreate` (the recreate data proof).
+    *recreate*: zombie containers VCO manages — removed (``rm --force``) only
+    AFTER their guard passed, then re-created by the same compose call. A
+    refused service is never removed, never composed. The compose call goes
+    through :func:`vco_lib.compose_recovery.compose_up_with_recovery` (the one
+    retry/heal home: ``--build`` is dropped only on positive "unsupported"
+    evidence, a build failure is reported, a refused heal is ledgered).
+    ``guard_only``: guard (and remove cleared zombies), but leave the compose
+    call to the caller (the CDI-wait wrapper)."""
+    from vco_lib import code_embed_image as _cei  # noqa: PLC0415
+    from vco_lib import compose_provider as _cp  # noqa: PLC0415
+    from vco_lib import compose_recovery as _cr  # noqa: PLC0415
+    from vco_lib import containers as _containers  # noqa: PLC0415
+    from vco_lib import data_identity as _di  # noqa: PLC0415
+    from vco_lib import tool_search_dirs as _tsd  # noqa: PLC0415
+
+    _run = run or _tsd.run  # finds the runtime outside PATH too (v0.2.97 R9 H5)
+    infra = Path(compose_dir)
+    if rows is None:
+        try:
+            rows = _se.load_rows(db_path)
+        except Exception:  # noqa: BLE001 — no rows: the guard proves from the runtime alone
+            rows = {}
+    files = _di.compose_files(infra)
+    project = _containers.compose_project_of(files[0])
+    result = UpVerbResult()
+    for service in dict.fromkeys(services):
+        row = rows.get(service)
+        if row is not None and row.mode != "vco_managed":
+            out(f"  [{service}] not VCO-managed ({row.mode}) — never composed")
+            result.refused.append(service)
+            continue
+        g = _di.guard_recreate(service, runtime=runtime, infra_dir=infra, compose_argv=compose_argv,
+                               row=row, rows=rows, db_path=db_path, run=_run, files=files,
+                               project=project)
+        for note in g.notes:
+            out(f"  [{service}] {note}")
+        if not g.ok:
+            out(f"  [{service}] recreate refused — {g.reason}. Left as it is; nothing removed.")
+            result.refused.append(service)
+            result.entries.append(g.deferral_entry())
+            continue
+        if g.recorded:
+            out(f"  [{service}] recorded its live data mount ({_di.describe(g.mount)})")
+        if service in recreate:
+            name = g.live.ref or (row.container_name if row is not None else None) \
+                or _containers.canonical_name(service)
+            try:
+                rm = _run([runtime, "rm", "--force", name], capture_output=True, text=True,
+                          timeout=60)
+                removed = rm.returncode == 0
+            except (subprocess.TimeoutExpired, OSError):
+                removed = False
+            if not removed:
+                out(f"  [{service}] could not remove the zombie container '{name}' — "
+                    "manual cleanup required")
+                result.refused.append(service)
+                continue
+            result.removed.append(name)
+        result.cleared.append(service)
+    if guard_only or not result.cleared:
+        return result
+    args, _dropped = compose_up_args(result.cleared, build=build)
+    if not args:
+        return result
+    chain: list[str] = []
+    for path in files:
+        chain += ["-f", str(path)]
+    argv = [*compose_argv, *chain, *(["-p", project] if project else []), *args]
+    manual = f"cd {infra} && {shlex.join(argv)}"
+    up = _cr.compose_up_with_recovery(
+        argv, cwd=str(infra), timeout=900, runtime=runtime,
+        provider=_cp.detect(runtime, argv=compose_argv, run=_run),
+        run=_run, compose_run=_run, log=out)
+    result.entries.extend(_cr.deferral_entries(up, manual_cmd=manual))
+    result.composed = up.ok
+    if up.ok:
+        out(f"Ran '{shlex.join(up.argv)}' in {infra}")
+        if up.build_dropped:
+            for line in _cei.build_rejected_lines(up.failure, shlex.join(up.argv), infra):
+                out(line)
+        return result
+    shown = up.final_failure or up.failure
+    if up.timed_out:
+        out("  compose up timed out")
+    for line in (up.first_stderr or up.stderr or "").strip().splitlines()[-5:]:
+        out(f"  {line}")
+    if shown is not None:
+        out(f"  Cause: {shown.label}. {shown.remedy}")
+    out(f"  Manual: {manual}")
+    return result
+
+
+def _cli_up(args: argparse.Namespace) -> int:
+    services = _split_names(args.services) or []
+    unknown = [s for s in services if s not in _se.SERVICES]
+    if unknown:
+        print(f"service_lifecycle: not VCO compose services: {' '.join(unknown)}", file=sys.stderr)
+        return 2
+    runtime = args.runtime
+    # Split on whitespace exactly like the hooks do ($COMPOSE_CMD word-splitting,
+    # Split-VcoComposeCommand) — a Windows path keeps its backslashes.
+    compose_argv = (args.compose_cmd or "").split()
+    if not runtime or not compose_argv:
+        from vco_lib import containers as _containers  # noqa: PLC0415
+
+        try:
+            res = _containers.resolve()
+        except Exception as exc:  # noqa: BLE001 — reported, nothing composed
+            print(f"service_lifecycle up: no container runtime resolved ({exc})")
+            return 1
+        runtime = runtime or res.runtime
+        compose_argv = compose_argv or [str(a) for a in (res.compose or [])]
+    if not runtime or not compose_argv:
+        print("service_lifecycle up: no container runtime / compose resolved; nothing composed")
+        return 1
+    result = up_services(
+        services, compose_dir=Path(args.compose_dir), compose_argv=compose_argv,
+        runtime=runtime, recreate=_split_names(args.recreate) or [], build=args.build,
+        guard_only=args.guard_only, db_path=args.db_path)
+    if result.entries:
+        try:
+            from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
+
+            emit_entries(Path(args.compose_dir).resolve().parent, result.entries)
+        except Exception as exc:  # noqa: BLE001 — the ledger is best-effort here; said
+            print(f"  (UPDATE_DEFERRED.md not written: {exc})")
+    if args.shell:
+        for key, values in (("CLEARED", result.cleared), ("REFUSED", result.refused),
+                            ("REMOVED", result.removed)):
+            print(f"vco_up_{key.lower()}={shlex.quote(' '.join(values))}")
+    return result.returncode
 
 
 # ─── the session reconcile, bounded (the session hooks' emit site) ──────
@@ -1277,6 +1432,25 @@ def _main(argv: Optional[Sequence[str]] = None) -> int:
     p_up.add_argument("--build", action="store_true")
     p_up.add_argument("--gpu-mode", default="unknown", choices=("gpu", "cpu", "unknown"))
     p_up.set_defaults(handler=_cli_compose_args)
+
+    p_upv = sub.add_parser(
+        "up", help="bring up EXACTLY the named services, each cleared by the data-identity "
+                   "guard first (zombies in --recreate removed only after it); exit 0 ok, "
+                   "1 compose failed, 3 some refused")
+    p_upv.add_argument("--services", required=True, help="space-separated compose service names")
+    p_upv.add_argument("--recreate", default=None,
+                       help="space-separated services whose (zombie) container is removed first")
+    p_upv.add_argument("--build", action="store_true")
+    p_upv.add_argument("--guard-only", action="store_true",
+                       help="guard (and remove cleared zombies) only; the caller composes")
+    p_upv.add_argument("--compose-dir", required=True, type=Path,
+                       help="the orchestrator's infrastructure/ directory")
+    p_upv.add_argument("--compose-cmd", default=None, help="the compose command (e.g. 'podman compose')")
+    p_upv.add_argument("--runtime", default=None, choices=("podman", "docker"))
+    p_upv.add_argument("--shell", action="store_true",
+                       help="end with vco_up_cleared/refused/removed shell assignments")
+    p_upv.add_argument("--db-path", type=Path, default=None)
+    p_upv.set_defaults(handler=_cli_up)
 
     p_rec = sub.add_parser(
         "session-reconcile",

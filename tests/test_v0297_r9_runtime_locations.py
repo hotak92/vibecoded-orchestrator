@@ -921,8 +921,10 @@ def test_a_session_hook_drives_a_runtime_found_only_in_a_user_local_dir(tmp_path
     """H5 for the session hooks: podman lives in ~/bin, which the hook's PATH
     lacks. The resolver finds it through the table and hands back the PATH that
     reaches it (`resolve --shell` exports it; the .ps1 applies `search_path`),
-    so the hook's own `podman rm -f` of a managed zombie runs — instead of the
-    session calling an installed runtime absent."""
+    so the managed zombie's removal runs — instead of the session calling an
+    installed runtime absent. v0.2.100: the removal is the guarded
+    `service_lifecycle up --recreate` verb's (`rm --force`), which inherits
+    that PATH and finds the runtime through the same table."""
     from tests.test_v0297_lifecycle_hooks import SENTINEL_MANAGED, _Machine
 
     m = _Machine(tmp_path, SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
@@ -945,7 +947,7 @@ def test_a_session_hook_drives_a_runtime_found_only_in_a_user_local_dir(tmp_path
     env[tsd.ENV_OVERRIDE] = "~/bin"
     proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=180,
                           cwd=str(REPO_ROOT))
-    assert ["rm", "-f", "vco_weaviate"] in m.runtime_calls(), proc.stdout + proc.stderr
+    assert ["rm", "--force", "vco_weaviate"] in m.runtime_calls(), proc.stdout + proc.stderr
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -35,7 +35,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib import code_embed_image, containers, install_services_guard  # noqa: E402
+from vco_lib import code_embed_image, containers, data_identity, install_services_guard  # noqa: E402
 
 
 def _install_module():
@@ -233,7 +233,11 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
         import argparse
         args = argparse.Namespace(update=update)
         ledger = _Ledger()
-        with mock.patch.object(install, "_detect_existing_volume_paths", return_value={}), \
+        # v0.2.100: the data-identity guard (tests/test_v02100_data_identity.py)
+        # would read this fake's one canned answer as an inspect failure —
+        # stub it as "proven" so this suite keeps pinning the IDENTITY guard.
+        with mock.patch.object(data_identity, "guard_compose_set", return_value=set()), \
+             mock.patch.object(install, "_detect_existing_volume_paths", return_value={}), \
              mock.patch.object(install, "_detect_existing_services", return_value={
                  "weaviate_url": "http://localhost:8081/v1/.well-known/ready",
                  "ollama_url": "http://localhost:11435/api/tags",
@@ -305,9 +309,16 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
         self.assertIn("FAIL", out)
         self.assertIn("Continuing:", out)
         self.assertIn("label mismatch", out)  # the targeted hint fired
-        self.assertEqual([e.condition_id for e in entries], ["services_compose_up_failed"])
-        self.assertIn("incorrect label", entries[0].detected)
-        self.assertIn("up -d", entries[0].command_to_apply)
+        # v0.2.100 (W1R-01): the network heal needs positive compose provenance from the
+        # network's own labels; this fake cannot provide it (every call rc=1), so the heal
+        # is REFUSED and ledgered before the update-continues row — never an `rm`.
+        self.assertEqual(
+            [e.condition_id for e in entries],
+            ["compose_network_label_mismatch_attached", "services_compose_up_failed"],
+        )
+        up_failed = next(e for e in entries if e.condition_id == "services_compose_up_failed")
+        self.assertIn("incorrect label", up_failed.detected)
+        self.assertIn("up -d", up_failed.command_to_apply)
 
     def test_compose_failure_on_fresh_install_still_exits(self):
         ours = containers.ComposeIdentity("infrastructure", str(REPO_ROOT / "infrastructure"))

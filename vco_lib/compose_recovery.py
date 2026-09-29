@@ -16,14 +16,23 @@ recovery that existed (network label) lived in one caller only.
 * :func:`heal` applies the ONE non-destructive repair per healable cause:
 
   - socket missing → :func:`vco_lib.compose_provider.heal_socket`;
-  - network label mismatch → ``network rm`` ONLY when
-    ``<runtime> ps -a --filter network=<n> -q`` is positively empty;
+  - network label mismatch → ``network rm`` ONLY when the network's OWN
+    labels prove compose created it for THIS project
+    (``com.docker.compose.project`` or ``io.podman.compose.project`` equal to
+    the project of the ``compose up`` being recovered — either family, since
+    the failure IS a family mismatch) AND
+    ``<runtime> ps -a --filter network=<n> -q`` is positively empty. A network
+    with no such provenance (hand-made, another project's, unreadable labels)
+    is refused and ledgered, never removed: it may carry a subnet / DNS / an
+    option its owner set;
   - storage-only leftover → only for a canonical VCO container name, only
     after BOTH mountinfo views (host and ``podman unshare``) show nothing of
     it, then a NON-recursive ``rmdir`` of empty leftover directories under its
-    ``merged/`` and ``podman rm --storage <id>``. A file, a symlink or a mount
-    point under ``merged/`` refuses the heal: a recursive delete there could
-    walk into a live bind mount's host data.
+    ``merged/`` and ``podman rm --storage --force <id>`` — the repair verified
+    by hand on 2026-09-29. A file, a symlink or a mount point under
+    ``merged/`` refuses the heal: a recursive delete there could walk into a
+    live bind mount's host data. If the ``rm`` itself errors the heal fails
+    CLOSED with the exact manual recipe in the ledger row.
 
   Anything that cannot be positively proven safe is REFUSED with a ledger row
   id (never guessed at, never "cleaned up anyway").
@@ -35,6 +44,7 @@ recovery that existed (network label) lived in one caller only.
 from __future__ import annotations
 
 import os
+import platform
 import re
 import subprocess
 from dataclasses import dataclass, field
@@ -54,7 +64,7 @@ __all__ = [
     "BUILD_FLAG_UNSUPPORTED", "UNKNOWN",
     "ComposeFailure", "HealResult", "UpResult",
     "classify", "refine", "heal", "compose_up_with_recovery", "deferral_entries",
-    "heal_deferral_entry", "daemon_remedy",
+    "heal_deferral_entry", "daemon_remedy", "compose_project_from_argv",
     "CID_SOCKET_HEAL_FAILED", "CID_PROVIDER_MISMATCH",
     "CID_NETWORK_LABEL_ATTACHED", "CID_STORAGE_LEFTOVER_UNSAFE",
 ]
@@ -196,9 +206,10 @@ def classify(stderr: str, *, provider: Optional[_cp.ComposeProvider] = None,
         return ComposeFailure(
             NETWORK_LABEL_MISMATCH, m.group(0).strip(),
             f"(label mismatch) network {net} was created by a different compose tool. VCO "
-            f"removes it when `{rt} ps -a --filter network={net} -q` lists nothing, and "
-            "compose recreates it with the right labels. If containers ARE attached they "
-            "belong to another compose project: it is left alone — see UPDATE_DEFERRED.md.",
+            "removes it only when its own labels show compose created it for this project "
+            f"AND `{rt} ps -a --filter network={net} -q` lists nothing; compose then recreates "
+            "it with the right labels. Otherwise (containers attached, or a network VCO cannot "
+            "prove is this project's) it is left alone — see UPDATE_DEFERRED.md.",
             True, subject=net)
 
     m = _RE_NAME_IN_USE.search(text)
@@ -213,7 +224,7 @@ def classify(stderr: str, *, provider: Optional[_cp.ComposeProvider] = None,
                 "order: confirm its layer id is absent from `/proc/self/mountinfo` AND from "
                 "`podman unshare cat /proc/self/mountinfo`; remove EMPTY leftover directories "
                 "under its overlay `merged/` with plain `rmdir` (never recursively); then "
-                f"`podman rm --storage {cid or '<id>'}`.",
+                f"`{_storage_rm_cmd('podman', cid or '<id>')}`.",
                 rt == "podman", subject=name, container_id=cid)
         return ComposeFailure(
             NAME_CONFLICT_OTHER_PROVIDER, m.group(0).strip(),
@@ -282,7 +293,52 @@ def _refuse(reason: str, cid: Optional[str] = None, actions: Optional[list] = No
     return HealResult(False, list(actions or []), reason, cid)
 
 
-def _heal_network(net: str, runtime: str, run: RunFn, log: LogFn) -> HealResult:
+def _network_labels(net: str, runtime: str, run: RunFn) -> tuple[Optional[dict], str]:
+    """``(labels, why)`` — the network's own labels, or ``None`` with the
+    reason they could not be read. Read-only."""
+    import json  # noqa: PLC0415
+
+    try:
+        res = run([runtime, "network", "inspect", net, "--format", "{{json .Labels}}"],
+                  capture_output=True, text=True, timeout=15)
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        return None, f"could not inspect network {net}: {exc}"
+    if res.returncode != 0:
+        return None, f"could not inspect network {net} (exit {res.returncode})"
+    raw = (res.stdout or "").strip()
+    try:
+        labels = json.loads(raw) if raw and raw != "null" else {}
+    except ValueError:
+        return None, f"could not parse the labels of network {net}"
+    if not isinstance(labels, dict):
+        return None, f"could not parse the labels of network {net}"
+    return {str(k): str(v) for k, v in labels.items()}, ""
+
+
+def _heal_network(net: str, runtime: str, run: RunFn, log: LogFn, *,
+                  project: Optional[str] = None) -> HealResult:
+    details = {"network": net, "project": project or "", "runtime": runtime}
+    # 1. Provenance (W1R-01): a name match plus "empty right now" is not
+    #    evidence the network is VCO's — a hand-made network with a subnet, or
+    #    another project called the same, would be deleted and recreated with
+    #    default options. The network's OWN labels must name this project.
+    if not project:
+        return HealResult(False, [], f"network {net}: the compose project being recovered is "
+                          "unknown, so its provenance cannot be checked — never removed",
+                          CID_NETWORK_LABEL_ATTACHED, details)
+    labels, why = _network_labels(net, runtime, run)
+    if labels is None:
+        return HealResult(False, [], f"{why} — provenance unknown, never removed",
+                          CID_NETWORK_LABEL_ATTACHED, details)
+    owners = {labels.get(k, "") for k in (_c.COMPOSE_PROJECT_LABEL,
+                                          _c.PODMAN_COMPOSE_PROJECT_LABEL)} - {""}
+    if project not in owners:
+        named = ", ".join(sorted(owners)) or "no compose project label"
+        details["owners"] = named
+        return HealResult(False, [], f"network {net} was not created by compose for project "
+                          f"{project} (its labels: {named}) — never removed",
+                          CID_NETWORK_LABEL_ATTACHED, details)
+    # 2. Nothing attached, positively.
     try:
         res = run([runtime, "ps", "-a", "--filter", f"network={net}", "-q"],
                   capture_output=True, text=True, timeout=15)
@@ -293,11 +349,12 @@ def _heal_network(net: str, runtime: str, run: RunFn, log: LogFn) -> HealResult:
                        f"(exit {res.returncode}) — left alone")
     attached = [ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()]
     if attached:
-        return _refuse(f"network {net} has {len(attached)} container(s) attached "
-                       f"({', '.join(attached[:5])}) — never removed", CID_NETWORK_LABEL_ATTACHED)
+        return HealResult(False, [], f"network {net} has {len(attached)} container(s) attached "
+                          f"({', '.join(attached[:5])}) — never removed",
+                          CID_NETWORK_LABEL_ATTACHED, details)
     argv = [runtime, "network", "rm", net]
-    log(f"  [heal] network {net} has no containers attached — removing it so compose "
-        "recreates it with its own labels")
+    log(f"  [heal] network {net} was created by compose for project {project} and has no "
+        "containers attached — removing it so compose recreates it with its own labels")
     try:
         rm = run(argv, capture_output=True, text=True, timeout=15)
     except (subprocess.TimeoutExpired, OSError) as exc:
@@ -305,7 +362,9 @@ def _heal_network(net: str, runtime: str, run: RunFn, log: LogFn) -> HealResult:
     if rm.returncode != 0:
         return _refuse(f"`{' '.join(argv)}` exited {rm.returncode}: "
                        f"{(rm.stderr or '').strip()[:200]}", actions=[" ".join(argv)])
-    return HealResult(True, [" ".join(argv)], f"network {net} removed (nothing attached)")
+    return HealResult(True, [" ".join(argv)],
+                      f"network {net} removed (compose-made for {project}, nothing attached)",
+                      None, details)
 
 
 def _read_host_mountinfo() -> str:
@@ -362,6 +421,13 @@ def _empty_dir_tree(root: Path) -> tuple[bool, str, list[Path]]:
     if why:
         return False, why, []
     return True, "", out
+
+
+def _storage_rm_cmd(runtime: str, container_id: str) -> str:
+    """The storage-record removal, exactly as verified by hand on 2026-09-29
+    (``podman rm --storage --force <id>``). ONE home: the heal, the classify
+    remedy and the ledger recipe all print this."""
+    return f"{runtime} rm --storage --force {container_id}"
 
 
 def _heal_storage_leftover(
@@ -422,30 +488,33 @@ def _heal_storage_leftover(
             return _refuse(f"layer {layer[:12]} is still MOUNTED ({label} mountinfo) — "
                            "never cleaned while mounted", CID_STORAGE_LEFTOVER_UNSAFE)
     merged = root / "overlay" / layer / "merged"
+    details = {"container_id": row.id, "layer": layer, "merged": str(merged), "name": name}
+
+    def refuse(reason: str, acts: Optional[list] = None) -> HealResult:
+        return HealResult(False, list(acts or []), reason, CID_STORAGE_LEFTOVER_UNSAFE, details)
+
     ok, why, dirs = _empty_dir_tree(merged)
     if not ok:
-        return _refuse(f"{why} — refusing: a recursive delete could reach live host data",
-                       CID_STORAGE_LEFTOVER_UNSAFE)
+        return refuse(f"{why} — refusing: a recursive delete could reach live host data")
     actions: list[str] = []
     for d in dirs:
         try:
             os.rmdir(d)  # non-recursive by construction: it fails on anything non-empty
         except OSError as exc:
-            return _refuse(f"rmdir {d} failed: {exc}", CID_STORAGE_LEFTOVER_UNSAFE, actions)
+            return refuse(f"rmdir {d} failed: {exc}", actions)
         actions.append(f"rmdir {d}")
-    argv = [runtime, "rm", "--storage", row.id]
+    argv = _storage_rm_cmd(runtime, row.id).split()
     log(f"  [heal] {name}: storage-only leftover {row.id[:12]}, nothing mounted — "
         "removing its storage record")
     try:
         rm = run(argv, capture_output=True, text=True, timeout=60)
     except (subprocess.TimeoutExpired, OSError) as exc:
-        return _refuse(f"`{' '.join(argv)}` could not run: {exc}", CID_STORAGE_LEFTOVER_UNSAFE,
-                       actions + [" ".join(argv)])
+        return refuse(f"`{' '.join(argv)}` could not run: {exc}", actions + [" ".join(argv)])
     actions.append(" ".join(argv))
     if rm.returncode != 0:
-        return _refuse(f"`{' '.join(argv)}` exited {rm.returncode}: "
-                       f"{(rm.stderr or '').strip()[:200]}", CID_STORAGE_LEFTOVER_UNSAFE, actions)
-    return HealResult(True, actions, f"storage-only leftover {row.id[:12]} removed")
+        return refuse(f"`{' '.join(argv)}` exited {rm.returncode}: "
+                      f"{(rm.stderr or '').strip()[:200]}", actions)
+    return HealResult(True, actions, f"storage-only leftover {row.id[:12]} removed", None, details)
 
 
 def heal(
@@ -457,19 +526,28 @@ def heal(
     socket_heal: Optional[Callable[[], HealResult]] = None,
     read_host_mountinfo: Optional[Callable[[], str]] = None,
     graphroot: Optional[Path] = None,
+    provider: Optional[_cp.ComposeProvider] = None,
+    project: Optional[str] = None,
 ) -> HealResult:
-    """The non-destructive repair for ``failure``'s cause (module doc)."""
+    """The non-destructive repair for ``failure``'s cause (module doc).
+    ``project`` — the compose project being recovered (the network heal's
+    provenance check); ``provider`` — the compose that failed (the socket heal
+    probes the socket IT dialled, and skips one it never uses)."""
     _run = run or _tsd.run
     _log = log or (lambda msg: print(msg, flush=True))
     if not failure.healable:
         return _refuse(f"{failure.cause}: not healable automatically")
     if failure.cause in (SOCKET_MISSING, DAEMON_DOWN):
-        res = (socket_heal or (lambda: _cp.heal_socket(runtime, run=_run)))()
+        # W1R-04: probe the socket compose NAMED (``failure.subject``), not an
+        # env-derived default that may be a different file.
+        sock = failure.subject if failure.cause == SOCKET_MISSING and failure.subject else None
+        res = (socket_heal or (lambda: _cp.heal_socket(runtime, run=_run, provider=provider,
+                                                       path=sock)))()
         for act in res.actions:
             _log(f"  [heal] {act}")
         return res
     if failure.cause == NETWORK_LABEL_MISMATCH:
-        return _heal_network(failure.subject, runtime, _run, _log)
+        return _heal_network(failure.subject, runtime, _run, _log, project=project)
     if failure.cause == NAME_CONFLICT_STORAGE_LEFTOVER:
         return _heal_storage_leftover(
             failure, runtime, _run, _log,
@@ -503,6 +581,27 @@ class UpResult:
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+
+def compose_project_from_argv(argv: Sequence[str],
+                              env: Optional[dict] = None) -> str:
+    """The compose project a ``compose … up`` argv runs under: ``-p`` /
+    ``--project-name``, else ``COMPOSE_PROJECT_NAME`` in ``env``, else what
+    compose derives from the first ``-f`` file (:func:`vco_lib.containers.
+    compose_project_of`). ``""`` when none of those is present."""
+    args = list(argv)
+    first_file = ""
+    for i, a in enumerate(args):
+        if a in ("-p", "--project-name") and i + 1 < len(args):
+            return args[i + 1]
+        if a.startswith("--project-name="):
+            return a.split("=", 1)[1]
+        if a in ("-f", "--file") and i + 1 < len(args) and not first_file:
+            first_file = args[i + 1]
+    named = ((env or {}).get("COMPOSE_PROJECT_NAME") or "").strip()
+    if named:
+        return named
+    return _c.compose_project_of(Path(first_file)) if first_file else ""
 
 
 def compose_up_with_recovery(
@@ -556,7 +655,8 @@ def compose_up_with_recovery(
         if not failure.healable or failure.cause == BUILD_FLAG_UNSUPPORTED or heals_left <= 0:
             return out
         heals_left -= 1
-        h = heal_fn(failure, runtime=runtime, run=run, log=_log)
+        h = heal_fn(failure, runtime=runtime, run=run, log=_log, provider=provider,
+                    project=compose_project_from_argv(cur, env))
         out.heals.append(h)
         if not h.healed:
             _log(f"  [heal refused] {h.reason}")
@@ -564,44 +664,75 @@ def compose_up_with_recovery(
         _log(f"  [healed] {h.reason} — retrying compose up")
 
 
-def heal_deferral_entry(h: HealResult, *, manual_cmd: str) -> Optional[DeferralEntry]:
+def _socket_recipe(h: HealResult, system: str) -> str:
+    """The manual socket recipe for the OS the heal ran on (W1R-11): the
+    ``podman machine`` pair on macOS / Windows, else the ``systemctl`` form
+    VCO actually used (user or system scope)."""
+    machine = any(a.startswith("podman machine") for a in h.actions)
+    if machine or system in ("Darwin", "Windows"):
+        return "podman machine list\npodman machine start"
+    system_scope = any(a.startswith("systemctl ") and "--user" not in a.split()
+                       for a in h.actions)
+    scope = "" if system_scope else "--user "
+    return (f"systemctl {scope}status podman.socket\n"
+            f"systemctl {scope}restart podman.socket")
+
+
+def heal_deferral_entry(h: HealResult, *, manual_cmd: str,
+                        system: Optional[str] = None) -> Optional[DeferralEntry]:
     """The ledger row a refused / failed heal owes (``None`` when it named no
     condition — e.g. a probe that could not run, where nothing is known)."""
     if h.deferral_cid == CID_SOCKET_HEAL_FAILED:
+        _system = system or platform.system()
         return DeferralEntry(
             condition_id=CID_SOCKET_HEAL_FAILED,
             title="Container API socket could not be restored",
             detected=f"compose could not reach the podman API socket; VCO ran "
                      f"{', '.join(h.actions) or 'no repair'} and it did not help: {h.reason}",
-            why_deferred="The socket unit did not bring the socket file back; the cause is "
-                         "outside what a restart can fix (systemd user session, permissions).",
-            command_to_apply="systemctl --user status podman.socket\n"
-                             "systemctl --user restart podman.socket\n"
-                             f"# then re-run:\n{manual_cmd}",
+            why_deferred="The socket unit / podman machine did not bring the socket back; the "
+                         "cause is outside what a restart can fix (systemd user session, "
+                         "permissions, the machine VM).",
+            command_to_apply=f"{_socket_recipe(h, _system)}\n# then re-run:\n{manual_cmd}",
             severity="warning")
     if h.deferral_cid == CID_NETWORK_LABEL_ATTACHED:
+        net = h.details.get("network") or "<network>"
+        rt = h.details.get("runtime") or "podman"
         return DeferralEntry(
             condition_id=CID_NETWORK_LABEL_ATTACHED,
-            title="Compose network labelled by another tool, with containers attached",
+            title="Compose network labelled by another tool was left alone",
             detected=f"compose refused a network created by a different compose tool: {h.reason}.",
-            why_deferred="Removing a network with containers attached would disconnect "
-                         "services another compose project owns.",
-            command_to_apply="# See who is attached, stop/move them under their own project, "
-                             f"then re-run:\n{manual_cmd}",
+            why_deferred="VCO removes such a network only when its own labels prove compose "
+                         "created it for this project AND nothing is attached. Removing any "
+                         "other network could disconnect another project's services or discard "
+                         "options its owner set (subnet, DNS).",
+            command_to_apply=(f"{rt} network inspect {net} --format '{{{{json .Labels}}}}'\n"
+                              f"{rt} ps -a --filter network={net}\n"
+                              "# if it is yours and nothing you need is attached:\n"
+                              f"# {rt} network rm {net}\n"
+                              f"# then re-run:\n{manual_cmd}"),
             severity="warning")
     if h.deferral_cid == CID_STORAGE_LEFTOVER_UNSAFE:
+        cid = h.details.get("container_id") or "<id>"
+        layer = h.details.get("layer") or "<layer-id>"
+        merged = h.details.get("merged") or "<graphroot>/overlay/<layer-id>/merged"
         return DeferralEntry(
             condition_id=CID_STORAGE_LEFTOVER_UNSAFE,
             title="Storage-only container leftover could not be cleared safely",
             detected=f"a storage-only leftover owns a VCO container name; VCO did not remove "
                      f"it: {h.reason}",
             why_deferred="It could not be proven that nothing is mounted from it and that "
-                         "only empty directories are left; a wrong delete can reach host data.",
-            command_to_apply="podman ps -a --external\n"
-                             "# confirm the layer id is absent from /proc/self/mountinfo AND "
-                             "`podman unshare cat /proc/self/mountinfo`,\n"
-                             "# rmdir (never rm -r) empty leftovers under its merged/, then:\n"
-                             f"podman rm --storage <id>\n{manual_cmd}",
+                         "only empty directories are left — or the removal command itself "
+                         "failed; a wrong delete can reach host data.",
+            command_to_apply=("podman ps -a --external\n"
+                              "# both must print NOTHING (nothing mounted from the layer):\n"
+                              f"grep {layer} /proc/self/mountinfo\n"
+                              f"podman unshare grep {layer} /proc/self/mountinfo\n"
+                              "# only EMPTY directories may be left; remove them with rmdir "
+                              "(never rm -r):\n"
+                              f"find {merged} -mindepth 1\n"
+                              f"find {merged} -mindepth 1 -depth -type d -empty -exec rmdir {{}} +\n"
+                              f"{_storage_rm_cmd('podman', cid)}\n"
+                              f"# then re-run:\n{manual_cmd}"),
             severity="warning")
     return None
 

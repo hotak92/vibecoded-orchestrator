@@ -1,9 +1,10 @@
 <script lang="ts">
   // v0.2.27: orchestrator-update divergence modal — rewrite.
   //
-  // Surfaced when `update_orchestrator` returns a structured error with
-  // `event: "orchestrator_update_non_ff"` — the user's local clone has
-  // diverged from upstream and `git pull --ff-only` failed.
+  // Surfaced when an update run (v0.2.100: `run_orchestrator_update`) reports
+  // a non-fast-forward (payload tag `event: "orchestrator_update_non_ff"`) —
+  // the user's local clone has diverged from upstream and
+  // `git pull --ff-only` failed.
   //
   // Design goals for this rewrite (vs the v0.2.23 original):
   //
@@ -37,19 +38,9 @@
   //    "dialog"` + `aria-modal` + `aria-labelledby`, Escape closes,
   //    focus is parked on a sensible primary action on mount.
 
-  import { invoke } from '$lib/tauri';
-  import { orchestrator } from '$lib/stores/orchestrator';
   import { updater, type OrchestratorNonFfPayload } from '$lib/stores/updater';
-  // v0.2.93 (field incident 2026-09-07): ONE tolerant parser for every
-  // structured Err payload (leading whitespace / `Error:` label / Error
-  // instance). The local `startsWith('{')` parser this replaces is the
-  // exact reason the conflict payload rendered NOTHING on 2026-09-07.
-  // The conflict payload type lives there too — no more per-file copies.
-  import {
-    parseTaggedErrorPayload,
-    parseOrchestratorConflictError,
-    errorText,
-  } from '$lib/tauri-error-payload';
+  // v0.2.100 (WP-08): errors are parsed ONCE, by the updater store's
+  // `routeUpdateError` (inside `updater.run`); this modal reads the route.
 
   // v0.2.78 ITEM #0 (F2): payload for an UNTRACKED-file collision where the
   // local file's content DIFFERS from the incoming upstream-added blob. The
@@ -61,7 +52,7 @@
   // keep-mine/take-upstream commands and points at that agent-resolvable path.
   type OrchestratorUntrackedCollisionPayload = {
     event: 'orchestrator_untracked_collision';
-    operation: 'merge' | 'rebase';
+    operation: 'merge' | 'rebase' | 'update';
     branch: string;
     divergent_files: string[];
   };
@@ -128,90 +119,45 @@
   }
 
   /**
-   * v0.2.78 ITEM #0 (F2): parse a Tauri error as a DIVERGENT untracked-collision
-   * payload. Returns null for any other shape. v0.2.93: via the shared
-   * tolerant parser (the conflict payload uses `parseOrchestratorConflictError`).
+   * v0.2.100 (WP-08, AD-1): Merge / Rebase run through the ONE update action,
+   * `updater.run(kind)` (overlay, typed-error routing, re-check). A conflict
+   * hands over to the hoisted conflict modal inside the store; a DIVERGENT
+   * untracked collision is rendered by THIS modal (`handleLocally`), as
+   * before; any other failure feeds this modal's retry state with the same
+   * single message the overlay shows.
    */
-  function parseUntrackedCollision(
-    raw: unknown,
-  ): OrchestratorUntrackedCollisionPayload | null {
-    return parseTaggedErrorPayload<OrchestratorUntrackedCollisionPayload>(
-      raw,
-      'event',
-      'orchestrator_untracked_collision',
-    );
+  async function runKind(kind: 'Merge' | 'Rebase') {
+    const op = kind === 'Merge' ? 'merge' : 'rebase';
+    busy = true;
+    busyOp = op;
+    lastError = null;
+    try {
+      const result = await updater.run(kind, { handleLocally: ['untrackedCollision'] });
+      if (result.ok) {
+        onClose();
+        return;
+      }
+      const routed = result.routed;
+      if (routed.to === 'untrackedCollision') {
+        untrackedCollision = routed.payload;
+      } else if (routed.to === 'failed') {
+        lastError = { title: kind === 'Merge' ? 'Merge failed' : 'Rebase failed', detail: routed.message };
+        if (kind === 'Merge') mergeFailed = true;
+        else rebaseFailed = true;
+      }
+      // conflict / autostash-pop / non-FF: the store opened that modal.
+    } finally {
+      busy = false;
+      busyOp = null;
+    }
   }
 
   async function runMerge() {
-    busy = true;
-    busyOp = 'merge';
-    lastError = null;
-    // v0.2.93 (field incident 2026-09-07): drive the ONE live progress
-    // overlay. Before this, the merge ran behind a static disabled
-    // "Merging…" label — indistinguishable from a hang.
-    updater.beginOp('merge');
-    try {
-      // The Rust command auto-restarts on success — we typically don't
-      // return here. If we DO, refresh the store state.
-      await invoke<void>('merge_orchestrator_with_upstream', { path: installPath });
-      await orchestrator.checkStatus();
-      onClose();
-      updater.endOp();
-    } catch (e) {
-      const conf = parseOrchestratorConflictError(e);
-      const untracked = parseUntrackedCollision(e);
-      if (conf) {
-        // Hand over to the hoisted conflict modal. Payload FIRST, then
-        // endOp: the overlay's falling edge must see the hand-over and
-        // close, never hold at "Update complete".
-        updater.setConflict(conf);
-        updater.endOp();
-      } else if (untracked) {
-        untrackedCollision = untracked;
-        updater.endOp();
-      } else {
-        const detail = errorText(e);
-        lastError = { title: 'Merge failed', detail };
-        mergeFailed = true;
-        // The overlay renders FAILED + the error text + Dismiss; this
-        // modal keeps its own copy for after the dismiss.
-        updater.endOp(detail);
-      }
-    } finally {
-      busy = false;
-      busyOp = null;
-    }
+    await runKind('Merge');
   }
 
   async function runRebase() {
-    busy = true;
-    busyOp = 'rebase';
-    lastError = null;
-    updater.beginOp('rebase');
-    try {
-      await invoke<void>('rebase_orchestrator_onto_upstream', { path: installPath });
-      await orchestrator.checkStatus();
-      onClose();
-      updater.endOp();
-    } catch (e) {
-      const conf = parseOrchestratorConflictError(e);
-      const untracked = parseUntrackedCollision(e);
-      if (conf) {
-        updater.setConflict(conf);
-        updater.endOp();
-      } else if (untracked) {
-        untrackedCollision = untracked;
-        updater.endOp();
-      } else {
-        const detail = errorText(e);
-        lastError = { title: 'Rebase failed', detail };
-        rebaseFailed = true;
-        updater.endOp(detail);
-      }
-    } finally {
-      busy = false;
-      busyOp = null;
-    }
+    await runKind('Rebase');
   }
 
   /**

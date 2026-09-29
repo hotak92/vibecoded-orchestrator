@@ -120,29 +120,45 @@ ENV = {"XDG_RUNTIME_DIR": "/run/user/1000"}
 
 
 class Systemd:
-    """A fake `systemctl --user`: ``active`` state + whether the socket file
-    exists; a restart/start brings the file back when ``heals``."""
+    """A fake host: `systemctl --user` (``active`` state; a restart/start
+    brings the file back when ``heals``), whether the default socket file
+    exists, what ``podman info`` reports as its RemoteSocket (``reported``:
+    ``None`` = podman does not answer the probe, else a path), the unit's
+    ``Listen`` paths, and any other socket files present (``files``)."""
 
-    def __init__(self, active=True, file=False, heals=True, verb_rc=0):
+    def __init__(self, active=True, file=False, heals=True, verb_rc=0, reported=None,
+                 listen=None, files=()):
         self.active, self.file, self.heals, self.verb_rc = active, file, heals, verb_rc
+        self.reported = reported
+        self.listen = [SOCK] if listen is None else list(listen)
+        self.files = set(files)
         self.calls = []
+
+    def systemctl_calls(self):
+        return [c for c in self.calls if c[0] == "systemctl"]
 
     def run(self, argv, **kw):
         self.calls.append(list(argv))
+        if Path(argv[0]).name == "podman" and argv[1:3] == ["info", "--format"]:
+            if self.reported is None:
+                return _cp(argv, 125, "", "Error: cannot connect")
+            return _cp(argv, 0, f"{self.reported}|{str(self.exists(self.reported)).lower()}\n")
         if argv[0] != "systemctl":
             raise AssertionError(argv)
-        verb = argv[2]
+        verb = argv[2] if argv[1] == "--user" else argv[1]
         if verb == "is-active":
             return _cp(argv, 0 if self.active else 3, "active\n" if self.active else "inactive\n")
+        if verb == "show":
+            return _cp(argv, 0, " ".join(f"{p} (Stream)" for p in self.listen) + "\n")
         if verb in ("restart", "start"):
             if self.verb_rc == 0 and self.heals:
                 self.file, self.active = True, True
+                self.files.update(p for p in self.listen if p != SOCK)
             return _cp(argv, self.verb_rc, "", "Failed" if self.verb_rc else "")
         raise AssertionError(argv)
 
     def exists(self, path):
-        assert path == SOCK
-        return self.file
+        return self.file if path == SOCK else path in self.files
 
     def kw(self):
         return dict(run=self.run, which=lambda n: "/usr/bin/" + n, env=ENV, system="Linux",
@@ -159,7 +175,7 @@ def test_socket_path_resolution():
 def test_socket_present_is_ok_without_asking_systemd():
     s = Systemd(file=True)
     assert cp.socket_status("podman", **s.kw()).kind == cp.SOCKET_OK
-    assert s.calls == []
+    assert s.systemctl_calls() == []
 
 
 def test_unit_active_but_file_missing_is_its_own_state():
@@ -192,6 +208,120 @@ def test_macos_windows_read_the_machine(rc, kind):
 
 
 # ---------------------------------------------------------------------------
+# W1R-05: which socket — the one compose dials, as podman / the env report it
+# ---------------------------------------------------------------------------
+
+CUSTOM = "/run/user/1000/custom/podman.sock"
+
+
+def test_podman_reported_path_is_authoritative_ok():
+    s = Systemd(file=False, reported=CUSTOM, files={CUSTOM})
+    st = cp.socket_status("podman", **s.kw())
+    assert (st.kind, st.path) == (cp.SOCKET_OK, CUSTOM)
+    assert s.systemctl_calls() == []
+
+
+def test_podman_reported_path_missing_under_an_active_unit_names_that_path():
+    s = Systemd(active=True, file=False, reported=CUSTOM, listen=[CUSTOM])
+    st = cp.socket_status("podman", **s.kw())
+    assert (st.kind, st.path) == (cp.SOCKET_UNIT_ACTIVE_FILE_MISSING, CUSTOM)
+
+
+def test_custom_listenstream_drop_in_is_ok_not_file_missing():
+    """A drop-in moved the socket: the default file is absent, the unit is
+    active, and it listens (present) elsewhere — a restart would change
+    nothing, so this is never `unit_active_file_missing`."""
+    s = Systemd(active=True, file=False, listen=[CUSTOM], files={CUSTOM})
+    st = cp.socket_status("podman", **s.kw())
+    assert (st.kind, st.path) == (cp.SOCKET_OK, CUSTOM) and "ListenStream" in st.detail
+
+
+@pytest.mark.parametrize("env,kind", [
+    ({"DOCKER_HOST": "unix:///var/run/docker.sock"}, cp.SOCKET_NOT_APPLICABLE),  # docker context
+    ({"DOCKER_HOST": "tcp://10.0.0.5:2375"}, cp.SOCKET_NOT_APPLICABLE),
+    ({"CONTAINER_HOST": "ssh://core@host/run/podman/podman.sock"}, cp.SOCKET_NOT_APPLICABLE),
+])
+def test_foreign_or_remote_hosts_are_never_file_missing(env, kind):
+    s = Systemd(active=True, file=False)
+    st = cp.socket_status("podman", **(s.kw() | {"env": ENV | env}))
+    assert st.kind == kind and st.kind != cp.SOCKET_UNIT_ACTIVE_FILE_MISSING
+    h = cp.heal_socket("podman", sleep=lambda _s: None, wait_s=0, **(s.kw() | {"env": ENV | env}))
+    assert not h.healed and h.deferral_cid is None
+    assert not any(c[-2] in ("restart", "start") for c in s.systemctl_calls())
+
+
+def test_docker_host_naming_podmans_own_socket_is_still_healed():
+    """Leave-alone's mirror: DOCKER_HOST pointing at podman's socket keeps
+    today's heal (it IS the socket compose dials)."""
+    s = Systemd(active=True, file=False)
+    env = ENV | {"DOCKER_HOST": f"unix://{SOCK}"}
+    assert cp.socket_status("podman", **(s.kw() | {"env": env})).kind == \
+        cp.SOCKET_UNIT_ACTIVE_FILE_MISSING
+    h = cp.heal_socket("podman", sleep=lambda _s: None, wait_s=0, **(s.kw() | {"env": env}))
+    assert h.healed and ["systemctl", "--user", "restart", "podman.socket"] in s.calls
+
+
+def test_explicit_path_from_compose_error_is_the_one_probed():
+    s = Systemd(active=True, file=True)  # the default socket is fine ...
+    st = cp.socket_status("podman", path="unix:///var/run/docker.sock", **s.kw())
+    assert st.kind == cp.SOCKET_NOT_APPLICABLE  # ... but compose dialled a non-podman one
+
+
+# ---------------------------------------------------------------------------
+# W1R-07: needs_api_socket has a reader
+# ---------------------------------------------------------------------------
+
+PC = cp.ComposeProvider("subcommand", cp.ENGINE_PODMAN_COMPOSE, ("podman", "compose"),
+                        "podman", "podman")
+DC = cp.ComposeProvider("subcommand", cp.ENGINE_DOCKER_COMPOSE, ("podman", "compose"),
+                        "docker", "podman")
+UNKNOWN = cp.ComposeProvider("subcommand", cp.ENGINE_UNKNOWN, ("podman", "compose"),
+                             "unknown", "podman")
+
+
+def test_unknown_engine_is_assumed_to_need_the_socket():
+    assert UNKNOWN.needs_api_socket and DC.needs_api_socket and not PC.needs_api_socket
+
+
+def test_podman_compose_provider_skips_the_socket_leave_alone():
+    s = Systemd(active=True, file=False)
+    assert cp.socket_status("podman", provider=PC, **s.kw()).kind == cp.SOCKET_NOT_APPLICABLE
+    h = cp.heal_socket("podman", provider=PC, sleep=lambda _s: None, wait_s=0, **s.kw())
+    assert not h.healed and h.deferral_cid is None and s.calls == []
+    kw = s.kw()
+    kw["run"] = _info_run(0, s)
+    assert cp.runtime_reachable("podman", provider=PC, **{k: kw[k] for k in
+                                ("run", "which", "env", "system", "exists")}) is True
+    assert s.systemctl_calls() == []
+
+
+def test_docker_compose_provider_keeps_the_heal_act():
+    s = Systemd(active=True, file=False)
+    assert cp.socket_status("podman", provider=DC, **s.kw()).kind == \
+        cp.SOCKET_UNIT_ACTIVE_FILE_MISSING
+    h = cp.heal_socket("podman", provider=DC, sleep=lambda _s: None, wait_s=0, **s.kw())
+    assert h.healed and ["systemctl", "--user", "restart", "podman.socket"] in s.calls
+
+
+@pytest.mark.parametrize("detected,expected", [(PC, True), (DC, False), (UNKNOWN, False),
+                                               (None, False)])
+def test_runtime_reachable_detects_the_provider_only_when_the_socket_is_broken(
+        monkeypatch, detected, expected):
+    calls = []
+    monkeypatch.setattr(cp, "detect", lambda rt, **kw: (calls.append(rt), detected)[1])
+    s = Systemd(active=True, file=False)
+    kw = s.kw()
+    kw["run"] = _info_run(0, s)
+    sel = {k: kw[k] for k in ("run", "which", "env", "system", "exists")}
+    assert cp.runtime_reachable("podman", **sel) is expected
+    assert calls == ["podman"]
+    # healthy socket: no provider detection at all
+    calls.clear()
+    s.file = True
+    assert cp.runtime_reachable("podman", **sel) is True and calls == []
+
+
+# ---------------------------------------------------------------------------
 # heal_socket — act / leave-alone
 # ---------------------------------------------------------------------------
 
@@ -215,16 +345,18 @@ def test_heal_starts_a_down_unit():
 
 
 def test_heal_leaves_a_healthy_socket_alone():
+    """W1R-04: nothing repaired is NOT "healed" — a retry loop must stop."""
     s = Systemd(file=True)
     h = _heal(s)
-    assert h.healed and h.actions == [] and s.calls == []
+    assert not h.healed and h.actions == [] and s.systemctl_calls() == []
+    assert h.deferral_cid is None and "nothing to heal" in h.reason
 
 
 def test_heal_does_nothing_on_uncertainty():
     s = Systemd(file=False)
     h = cp.heal_socket("podman", sleep=lambda _s: None, wait_s=0,
                        **(s.kw() | {"which": lambda n: None}))
-    assert not h.healed and h.actions == [] and s.calls == []
+    assert not h.healed and h.actions == [] and s.systemctl_calls() == []
 
 
 def test_heal_failure_names_the_ledger_row():
@@ -283,7 +415,7 @@ def test_runtime_reachable(info_rc, active, file, expected):
     s = Systemd(active=active, file=file)
     kw = s.kw()
     kw["run"] = _info_run(info_rc, s)
-    assert cp.runtime_reachable("podman", **{k: kw[k] for k in
+    assert cp.runtime_reachable("podman", provider=None, **{k: kw[k] for k in
                                              ("run", "which", "env", "system", "exists")}) is expected
 
 

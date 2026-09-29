@@ -63,6 +63,9 @@ class _Fixture:
         self.marker = tmp / "container.created"
         self.compose_dir = tmp / "compose"
         self.compose_dir.mkdir(exist_ok=True)
+        # v0.2.100 (L1-F17): the hooks compose only from the ORCHESTRATOR's
+        # infrastructure/ — its parent carries vct-module.json id "orchestrator".
+        (tmp / "vct-module.json").write_text('{"id": "orchestrator"}\n', encoding="utf-8")
         # v0.2.97: the hook takes its probe PORT from the launcher.db
         # service_endpoints plan, so the fixture owns the rows it reads —
         # a temp state dir with a real-schema launcher.db (VCT_STATE_DIR is
@@ -88,8 +91,12 @@ class _Fixture:
             esac
             exit 0
             """))
+        # v0.2.100 (L1-F07): `--build` is dropped only on POSITIVE evidence
+        # that the compose rejects the flag — the fake says so the way a real
+        # compose does ("unknown flag: --build").
         fail_arm = (
-            'if printf "%s\\n" "$@" | grep -q -- "--build"; then exit 1; fi\n'
+            'if printf "%s\\n" "$@" | grep -q -- "--build"; then '
+            'echo "Error: unknown flag: --build" >&2; exit 1; fi\n'
             if compose_fails_on_build else ""
         )
         (self.bin / "vco-fake-compose").write_text(
@@ -453,6 +460,19 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
             (bin_dir / "podman").write_text(textwrap.dedent(f"""\
                 #!/usr/bin/env bash
                 if [ "$1" = "info" ]; then exit 0; fi
+                if [ "$1" = "inspect" ] && [ "$2" = "--type" ]; then
+                  # v0.2.100: the data-identity guard's `inspect --type
+                  # container --format FMT NAME` (name LAST).
+                  name="${{@: -1}}"
+                  case "$name" in
+                    {missing}) echo "Error: no such container $name" >&2; exit 125 ;;
+                  esac
+                  case "$5" in
+                    *Mounts*) echo '[]' ;;
+                    *) echo "id-$name" ;;
+                  esac
+                  exit 0
+                fi
                 if [ "$1" = "inspect" ]; then
                   case "$2" in
                     {missing}) exit 1 ;;
@@ -478,6 +498,9 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
             orch.mkdir()
             compose_dir = tmp / "compose"
             compose_dir.mkdir()
+            # v0.2.100 (L1-F17): compose runs only from the orchestrator's own
+            # infrastructure/ — its parent carries vct-module.json id "orchestrator".
+            (tmp / "vct-module.json").write_text('{"id": "orchestrator"}', encoding="utf-8")
             env = dict(os.environ)
             env.update({
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",
@@ -533,6 +556,19 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
             (bin_dir / "podman").write_text(textwrap.dedent(f"""\
                 #!/usr/bin/env bash
                 if [ "$1" = "info" ]; then exit 0; fi
+                if [ "$1" = "inspect" ] && [ "$2" = "--type" ]; then
+                  # v0.2.100: the data-identity guard's `inspect --type
+                  # container --format FMT NAME` (name LAST).
+                  name="${{@: -1}}"
+                  case "$name" in
+                    {missing}) echo "Error: no such container $name" >&2; exit 125 ;;
+                  esac
+                  case "$5" in
+                    *Mounts*) echo '[]' ;;
+                    *) echo "id-$name" ;;
+                  esac
+                  exit 0
+                fi
                 if [ "$1" = "inspect" ]; then
                   case "$2" in
                     {missing}) exit 1 ;;
@@ -557,6 +593,9 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
             orch.mkdir()
             compose_dir = tmp / "compose"
             compose_dir.mkdir()
+            # v0.2.100 (L1-F17): compose runs only from the orchestrator's own
+            # infrastructure/ — its parent carries vct-module.json id "orchestrator".
+            (tmp / "vct-module.json").write_text('{"id": "orchestrator"}', encoding="utf-8")
             env = dict(os.environ)
             env.update({
                 "PATH": f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}",

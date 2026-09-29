@@ -105,6 +105,10 @@ class _Machine:
         self.compose_dir = tmp / "infrastructure"
         self.compose_dir.mkdir()
         (self.compose_dir / "docker-compose.yml").write_text("services: {}\n", encoding="utf-8")
+        # v0.2.100 (L1-F17): the hooks compose only from the ORCHESTRATOR's
+        # infrastructure/ — its parent carries vct-module.json id "orchestrator".
+        (tmp / "vct-module.json").write_text('{"id": "orchestrator"}\n', encoding="utf-8")
+        self.config_log = tmp / "compose-config.log"
         # Built line by line: a shebang that is not at column 0 is no shebang,
         # and only bash (not pwsh) would still run such a file.
         script = [
@@ -123,23 +127,32 @@ class _Machine:
             "    esac",
             "    exit 0 ;;",
             "  inspect)",
-            '    name="$2"',
+            # v0.2.100: the data-identity guard asks `inspect --type container
+            # --format FMT NAME` (name LAST); the hooks ask `inspect NAME --format FMT`.
+            '    if [ "$2" = "--type" ]; then name="${@: -1}"; fmt="$5"; else name="$2"; fmt="$4"; fi',
             '    STATUS=""',
             '    case "$name" in',
         ]
         for name, st in states.items():
             if st == "missing":
-                script.append(f"      {name}) exit 1 ;;")
+                script.append(f'      {name}) echo "Error: no such container {name}" >&2; exit 125 ;;')
             else:
                 status = "running" if st in ("running", "zombie") else st
                 pid = "0" if st == "zombie" else str(os.getpid())
                 script.append(f"      {name}) STATUS={status}; PID={pid} ;;")
         script += [
-            "      *) exit 1 ;;",
+            '      *) echo "Error: no such container $name" >&2; exit 125 ;;',
             "    esac",
-            '    case "$4" in',
+            '    case "$fmt" in',
             '      *State.Pid*) echo "$PID" ;;',
             '      *.Id*) echo "id-$name" ;;',
+            # the canonical default volume at each service's data path — what
+            # the fake compose `config` below renders too (data identity holds)
+            '      *Mounts*) case "$name" in',
+            '          *weaviate*) echo \'[{"Type":"volume","Name":"vco_weaviate_data","Destination":"/var/lib/weaviate"}]\' ;;',
+            '          *ollama*) echo \'[{"Type":"volume","Name":"vco_ollama_data","Destination":"/root/.ollama"}]\' ;;',
+            '          *) echo \'[{"Type":"volume","Name":"vco_code_embed_cache","Destination":"/cache"}]\' ;;',
+            "        esac ;;",
             '      *) echo "$STATUS" ;;',
             "    esac",
             "    exit 0 ;;",
@@ -150,10 +163,28 @@ class _Machine:
         # A curl that never reaches anything: verify-container-ports probes
         # the literal default ports, and a test must never touch a real service.
         (self.bin / "curl").write_text("#!/usr/bin/env bash\nexit 7\n", encoding="utf-8")
-        for fake, log in (("vco-fake-compose", self.compose_log), ("podman-compose", self.compose_log),
-                          ("runc", self.runc_log)):
+        config_yaml = (
+            "services:\n"
+            "  weaviate: {volumes: [{type: volume, source: weaviate_data, target: /var/lib/weaviate}]}\n"
+            "  ollama: {volumes: [{type: volume, source: ollama_data, target: /root/.ollama}]}\n"
+            "  code_embed: {volumes: [{type: volume, source: code_embed_cache, target: /cache}]}\n"
+            "volumes:\n"
+            "  weaviate_data: {name: vco_weaviate_data}\n"
+            "  ollama_data: {name: vco_ollama_data}\n"
+            "  code_embed_cache: {name: vco_code_embed_cache}\n")
+        for fake, log in (("vco-fake-compose", self.compose_log), ("podman-compose", self.compose_log)):
+            # `config` (the data-identity guard's read-only render) is logged
+            # apart, so compose.log holds the `up` calls only.
             (self.bin / fake).write_text(
-                f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{log}"\nexit 0\n', encoding="utf-8")
+                "#!/usr/bin/env bash\n"
+                'if [ "${@: -1}" = "config" ]; then\n'
+                f'  printf "%s\\n" "$*" >> "{self.config_log}"\n'
+                f"  cat <<'YAML'\n{config_yaml}YAML\n"
+                "  exit 0\n"
+                "fi\n"
+                f'printf "%s\\n" "$*" >> "{log}"\nexit 0\n', encoding="utf-8")
+        (self.bin / "runc").write_text(
+            f'#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "{self.runc_log}"\nexit 0\n', encoding="utf-8")
         # No GPU on the fake host (the wrapper would otherwise wait for CDI).
         (self.bin / "nvidia-smi").write_text("#!/usr/bin/env bash\nexit 1\n", encoding="utf-8")
         self.reconcile_script = tmp / "fake_reconcile.py"
@@ -536,7 +567,7 @@ class VerifyContainerPortsZombieGateTests(_TmpCase, _Shells):
             with self.subTest(shell=shell):
                 m = self.machine(SENTINEL_MANAGED, {"vco_weaviate": "zombie"})
                 proc = _run_verify(m, shell)
-                self.assertIn(["rm", "-f", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
+                self.assertIn(["rm", "--force", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
                 calls = m.compose_calls()
                 self.assertEqual(len(calls), 1, f"{calls}\n{proc.stdout}")
                 _assert_explicit_managed_only(self, calls[0], ["weaviate"], forbidden=("ollama",))
@@ -696,7 +727,7 @@ class VerifyContainerPortsLogTests(_TmpCase, _Shells):
                 (project / ".claude").write_text("a file where the log directory would go\n")
                 proc = _run_verify(m, shell, CLAUDE_PROJECT_DIR=str(project))
                 self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-                self.assertIn(["rm", "-f", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
+                self.assertIn(["rm", "--force", "vco_weaviate"], m.runtime_calls(), proc.stdout + proc.stderr)
                 self.assertEqual(len(m.compose_calls()), 1, proc.stdout)
                 self.assertTrue((project / ".claude").is_file())
 
@@ -757,9 +788,9 @@ class SessionLockTests(_TmpCase, _Shells):
                 proc = _run_verify(m, shell)
                 held.join()
                 rt = m.runtime_calls()
-                self.assertIn(["rm", "-f", "vco_weaviate"], rt, proc.stdout + proc.stderr)
+                self.assertIn(["rm", "--force", "vco_weaviate"], rt, proc.stdout + proc.stderr)
                 released, reconciled = rt.index(["RELEASED"]), rt.index(["RECONCILE"])
-                removed = rt.index(["rm", "-f", "vco_weaviate"])
+                removed = rt.index(["rm", "--force", "vco_weaviate"])
                 self.assertLess(released, reconciled, rt)
                 self.assertLess(reconciled, removed, rt)
                 calls = m.compose_calls()

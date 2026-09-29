@@ -382,7 +382,7 @@ _MAIN_SPAN_MAX = 1645
 # surfacing) moved to `vco_lib.install_services_up`, the podman machine
 # helper to `vco_lib.compose_provider`, and the reachability / podman-start
 # helpers became thin calls into `compose_provider`. Measured with `wc -l`.
-_TOTAL_LINES_MAX = 22677
+_TOTAL_LINES_MAX = 22671
 
 
 def _measure() -> tuple:

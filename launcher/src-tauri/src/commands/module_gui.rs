@@ -595,6 +595,7 @@ mod tests {
         for marker in ["CLAUDE.md", "install.py"] {
             std::fs::write(root.path().join(marker), "").unwrap();
         }
+        std::fs::write(root.path().join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06
         std::fs::create_dir_all(root.path().join("state")).unwrap();
         std::fs::write(root.path().join("state/install-manifest.json"), r#"{"installed": true}"#).unwrap();
         let module_dir = root.path().join("paid-modules").join("vct-dev-probe");

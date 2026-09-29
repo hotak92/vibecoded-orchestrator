@@ -336,14 +336,14 @@ class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-3, L1-F04/F22): compose refused a network labelled by a different compose tool and `ps -a --filter network=<n> -q` shows containers attached, so the network is left alone. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, unreadable, or the project is unknown). The id keeps its v0.2.100 wave-1 name; the row's title/recipe cover both reasons. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
 
 [conditions.container_storage_leftover_unsafe]
 class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-3, L1-F06): a storage-only leftover owns a VCO container name and could not be PROVEN safe to clear (still mounted in either mountinfo view, non-empty merged/, not a canonical VCO name, or a probe failed). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+notes = "v0.2.100 (AD-3, L1-F06; wave-1 review W1R-02): a storage-only leftover owns a VCO container name and could not be PROVEN safe to clear (still mounted in either mountinfo view, non-empty merged/, not a canonical VCO name, or a probe failed) — or the verified removal `podman rm --storage --force <id>` itself failed (fail-closed; the row carries the exact recipe). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
 
 [conditions.service_recreate_refused_data_unknown]
 class = "action_required"

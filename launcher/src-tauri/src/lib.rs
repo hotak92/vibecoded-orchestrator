@@ -737,6 +737,20 @@ pub fn run() {
         tracing::warn!("[vct] warning: ensure_orchestrator_root failed: {}", e);
     }
 
+    // v0.2.100 (F-W1-06, AD-2): prime the install-root PROCESS cache while
+    // launcher.db is known-good. The resolvers answer from that cache while
+    // `install.py --update` holds the DB (standby) and never touch the DB
+    // then; a launcher whose first resolution happened DURING an update would
+    // otherwise have nothing to answer with. Read-mostly: the only write is
+    // the sticky DB cache on an exe-walk hit, exactly as any later call.
+    match commands::installer::resolve_orchestrator_root(&db_handle) {
+        Some(root) => tracing::info!("[vct] install root: {}", root.display()),
+        None => tracing::warn!(
+            "[vct] install root not resolvable at boot (no launcher.db install path and no \
+             orchestrator clone above the running binary)"
+        ),
+    }
+
     // v0.2.92 WP-11: seed the chat-model context table from the ONE shipped
     // seed file when it is empty, then export it to
     // `<vct_root>/model-gateway/chat_model_context.json`.
@@ -3587,6 +3601,10 @@ pub fn run() {
             commands::audit::list_audit_events,
             // Launcher self-update (git-pull based, daily check)
             commands::self_update::check_for_launcher_update,
+            // v0.2.100 WP-03a (AD-1): THE orchestrator update — every kind,
+            // one pipeline. The legacy update commands below delegate to it
+            // from WP-03b and leave this list once no caller remains.
+            commands::update_run::run_orchestrator_update,
             commands::self_update::apply_launcher_update,
             commands::self_update::force_resync_launcher,
             // v0.2.92 WP-13: the ONLY path-less `git checkout <branch>` in

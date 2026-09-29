@@ -8,6 +8,15 @@
 //!   - About
 //!   - Quit
 //!
+//! v0.2.100 (WP-08, L2-F05 / L3-F04): "Check for updates", "About" and the
+//! recent-project items reach the GUI through ONE Tauri event,
+//! [`TRAY_ACTION_EVENT`] (`{kind, project_id}`), handled by one listener in
+//! the root layout (`launcher/src/lib/stores/ui.ts::routeTrayAction`). They
+//! used to `eval` JavaScript that dispatched DOM events nothing listened for
+//! and set `location.hash` under a path router — the items only focused the
+//! window. No JavaScript is built from strings here any more (the project id
+//! used to be interpolated unescaped into eval'd source).
+//!
 //! The services label is updated in place via [`MenuItem::set_text`]. Tauri
 //! routes the call through the OS-specific menu backend (muda), so on macOS
 //! the underlying `NSMenu` reapplies the item text on the main thread and on
@@ -33,6 +42,61 @@ const PROBE_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// Tray refresh cadence.
 const REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+// ---------------------------------------------------------------------------
+// v0.2.100 (WP-08) — tray menu → GUI action event
+// ---------------------------------------------------------------------------
+
+/// The ONE tray → GUI event name. Must match `TRAY_ACTION_EVENT` in
+/// `launcher/src/lib/stores/ui.ts` (locked by
+/// `tray_action_event_name_matches_the_gui_listener`).
+pub(crate) const TRAY_ACTION_EVENT: &str = "vct-tray-action";
+
+/// Payload of [`TRAY_ACTION_EVENT`]. `kind` is one of `check_updates`,
+/// `about`, `open_project`; `project_id` is set only for `open_project`.
+/// Mirrors `TrayAction` in `launcher/src/lib/stores/ui.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct TrayActionPayload {
+    pub kind: &'static str,
+    pub project_id: Option<String>,
+}
+
+/// Which GUI action a tray menu item id asks for. `None` for the items the
+/// tray handles itself (open / quit / hub stop) and for anything unknown.
+pub(crate) fn tray_action_for_menu_id(id: &str) -> Option<TrayActionPayload> {
+    match id {
+        "check_updates" => Some(TrayActionPayload {
+            kind: "check_updates",
+            project_id: None,
+        }),
+        "about" => Some(TrayActionPayload {
+            kind: "about",
+            project_id: None,
+        }),
+        other => {
+            let project_id = other.strip_prefix("project_")?;
+            if project_id.is_empty() {
+                return None;
+            }
+            Some(TrayActionPayload {
+                kind: "open_project",
+                project_id: Some(project_id.to_string()),
+            })
+        }
+    }
+}
+
+/// Bring the main window forward and hand the action to the GUI.
+fn show_main_and_emit<R: Runtime>(app: &AppHandle<R>, action: &TrayActionPayload) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+    if let Err(e) = app.emit(TRAY_ACTION_EVENT, action) {
+        tracing::warn!("[vct] tray: emit {} failed: {}", TRAY_ACTION_EVENT, e);
+    }
+}
 
 // ---------------------------------------------------------------------------
 // v0.2.91 WP-F1 — tray click policy (decision #1, Option A)
@@ -214,27 +278,6 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 }
             }
             "quit" => crate::quit_dialog::confirm_and_quit(app),
-            "check_updates" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                    // If we already know an update is pending (cached
-                    // state), open the updates preferences page directly.
-                    // Otherwise, fire the legacy event so any in-page
-                    // listener can prompt a manual check.
-                    let cached = self_update::get_cached_update_status();
-                    if cached.available {
-                        let _ = w.eval(
-                            "window.location.hash = '/preferences/updates'; \
-                             window.dispatchEvent(new CustomEvent('vct-check-updates'));",
-                        );
-                    } else {
-                        let _ = w.eval(
-                            "window.dispatchEvent(new CustomEvent('vct-check-updates'));",
-                        );
-                    }
-                }
-            }
             "hub_stop" => {
                 // v0.2.21 Step 13: ask the detached vct-hub to stop.
                 // Spawn on a blocking task because `hub_status::stop()`
@@ -251,10 +294,7 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                             // any open GUI page that watches hub
                             // status can refresh immediately rather
                             // than wait for its own next poll.
-                            let _ = app_handle.emit(
-                                "vct-hub-stopped",
-                                serde_json::json!({}),
-                            );
+                            let _ = app_handle.emit("vct-hub-stopped", serde_json::json!({}));
                         }
                         crate::hub_status::StopOutcome::BinaryNotFound => {
                             tracing::error!(
@@ -267,27 +307,13 @@ pub fn setup<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                     }
                 });
             }
-            "about" => {
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                    let _ = w.eval(
-                        "window.dispatchEvent(new CustomEvent('vct-show-about'));",
-                    );
+            // v0.2.100 (WP-08): check_updates / about / project_<id> — one
+            // event, one GUI listener (see TRAY_ACTION_EVENT).
+            other => {
+                if let Some(action) = tray_action_for_menu_id(other) {
+                    show_main_and_emit(app, &action);
                 }
             }
-            id if id.starts_with("project_") => {
-                let project_id = id.trim_start_matches("project_").to_string();
-                if let Some(w) = app.get_webview_window("main") {
-                    let _ = w.show();
-                    let _ = w.set_focus();
-                    let _ = w.eval(&format!(
-                        "window.location.hash = '/project/{}'; window.dispatchEvent(new CustomEvent('vct-open-project', {{ detail: {{ id: '{}' }} }}));",
-                        project_id, project_id
-                    ));
-                }
-            }
-            _ => {}
         })
         .on_tray_icon_event(|tray, event| {
             // v0.2.91 WP-F1: the closure only ACTS; the decision is the pure
@@ -522,6 +548,74 @@ fn format_update_label(status: &UpdateStatus) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // v0.2.100 (WP-08): tray menu ids → the GUI action event.
+    #[test]
+    fn check_updates_and_about_map_to_their_actions() {
+        assert_eq!(
+            tray_action_for_menu_id("check_updates"),
+            Some(TrayActionPayload {
+                kind: "check_updates",
+                project_id: None
+            })
+        );
+        assert_eq!(
+            tray_action_for_menu_id("about"),
+            Some(TrayActionPayload {
+                kind: "about",
+                project_id: None
+            })
+        );
+    }
+
+    #[test]
+    fn a_recent_project_item_carries_its_id_verbatim() {
+        // The id travels as DATA (JSON), never interpolated into script.
+        let a = tray_action_for_menu_id("project_ab'c);alert(1)//").expect("project item");
+        assert_eq!(a.kind, "open_project");
+        assert_eq!(a.project_id.as_deref(), Some("ab'c);alert(1)//"));
+        let json = serde_json::to_value(&a).unwrap();
+        assert_eq!(json["kind"], "open_project");
+        assert_eq!(json["project_id"], "ab'c);alert(1)//");
+    }
+
+    #[test]
+    fn tray_handled_and_unknown_ids_emit_nothing() {
+        for id in [
+            "open",
+            "quit",
+            "hub_stop",
+            "services_status",
+            "project_",
+            "",
+            "nope",
+        ] {
+            assert_eq!(tray_action_for_menu_id(id), None, "{id:?}");
+        }
+    }
+
+    #[test]
+    fn tray_action_payload_serialises_to_the_gui_shape() {
+        let json = serde_json::to_value(tray_action_for_menu_id("about").unwrap()).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "about", "project_id": null })
+        );
+    }
+
+    /// C-mirror lock: the event name is declared once per language.
+    #[test]
+    fn tray_action_event_name_matches_the_gui_listener() {
+        let ui_ts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("src")
+            .join("lib")
+            .join("stores")
+            .join("ui.ts");
+        let text = std::fs::read_to_string(&ui_ts).expect("read ui.ts");
+        let needle = format!("export const TRAY_ACTION_EVENT = '{}';", TRAY_ACTION_EVENT);
+        assert!(text.contains(&needle), "ui.ts must declare {needle}");
+    }
 
     #[test]
     fn tray_probe_urls_follow_the_machine_chain() {

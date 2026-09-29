@@ -287,6 +287,13 @@ pub mod update_gate;
 // `self_update::apply_launcher_update` is NOT rewired onto it yet — that is a
 // behaviour change (it gains install.py) and belongs to the follow-up.
 pub mod update_pipeline;
+// v0.2.100 WP-03a (AD-1): the ONE orchestrator-update pipeline — thirteen
+// fixed phases with a phase ledger, one command (`run_orchestrator_update`),
+// preflight before any mutation, install.py always, one version-guarded
+// relaunch. `update_failure` is the one home for how its failures reach the
+// user (`{kind, message, …}`, never empty, never "Update failed:"-prefixed).
+pub mod update_failure;
+pub mod update_run;
 pub mod volumes;
 // v0.2.71 Track T-WT (modes extended v0.2.91): GUI-only per-project worktree-repo mode
 // backing the subagent-git modal. NOT hub-resolved (config_api.rs untouched);

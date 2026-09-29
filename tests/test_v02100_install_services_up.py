@@ -46,7 +46,8 @@ class Ledger:
 class World:
     def __init__(self, tmp: Path, *, runtime="podman", compose=("podman", "compose"),
                  banner=BANNER_DC, compose_results=((0, ""),), reachable=True,
-                 has_gpu=True, gpu_vendor="nvidia", ps_attached=""):
+                 has_gpu=True, gpu_vendor="nvidia", ps_attached="",
+                 net_labels=None):
         self.infra = tmp / "infrastructure"
         self.infra.mkdir()
         self.compose_file = self.infra / "docker-compose.yml"
@@ -57,6 +58,9 @@ class World:
         self.results = list(compose_results)
         self.compose_calls, self.probe_calls, self.events = [], [], []
         self.reachable_v, self.ps_attached = reachable, ps_attached
+        # the field case: podman-compose made the network for project `infrastructure`
+        self.net_labels = ({"io.podman.compose.project": "infrastructure"}
+                           if net_labels is None else net_labels)
         self.started, self.cdi = [], []
         self.ledger = Ledger()
         self.plan = isu.Step5Plan(
@@ -76,6 +80,8 @@ class World:
         self.probe_calls.append(list(argv))
         if argv[-1] == "version":
             return _cp(argv, 0, "", self.banner)
+        if argv[1:3] == ["network", "inspect"]:
+            return _cp(argv, 0, json.dumps(self.net_labels))
         if argv[1] == "ps" and any(a.startswith("network=") for a in argv):
             return _cp(argv, 0, self.ps_attached)
         if argv[1:3] == ["network", "rm"]:
@@ -160,6 +166,29 @@ def test_network_label_with_attached_containers_is_ledgered_and_left(tmp_path):
     assert outcome == isu.FAIL
     assert not any(c[1:3] == ["network", "rm"] for c in w.probe_calls)
     assert cr.CID_NETWORK_LABEL_ATTACHED in w.ledger.cids
+
+
+def test_network_label_on_a_foreign_network_is_ledgered_and_left(tmp_path):
+    """W1R-01 end to end: nothing attached, but the network's own labels do
+    not name this project (hand-made) → never removed, one ledger row."""
+    w = World(tmp_path, compose_results=((1, CORPUS["field_2026_09_29_network_label"]),),
+              net_labels={})
+    outcome, _ = w.go()
+    assert outcome == isu.FAIL and len(w.compose_calls) == 1
+    assert not any(c[1:3] == ["network", "rm"] for c in w.probe_calls)
+    assert w.ledger.cids == [cr.CID_NETWORK_LABEL_ATTACHED]
+
+
+def test_socket_error_with_a_healthy_socket_is_one_attempt_and_no_heal_event(tmp_path):
+    """W1R-04 end to end: the socket compose named is fine → no "healed"
+    retry loop, no `heal` install event, no ledger row."""
+    w = World(tmp_path, compose_results=((1, CORPUS["field_2026_09_29_socket_file_missing"]),))
+    outcome, _ = w.go(heal=lambda f, **k: cr.heal(
+        f, socket_heal=lambda: cp.heal_socket("podman", status=cp.SocketStatus(cp.SOCKET_OK)),
+        **k))
+    assert outcome == isu.FAIL and len(w.compose_calls) == 1
+    assert not any(a and a[1] == "heal" for a, _k in w.events)
+    assert cr.CID_SOCKET_HEAL_FAILED not in w.ledger.cids
 
 
 def test_build_flag_rejected_retries_once_and_warns_with_the_full_command(tmp_path):

@@ -20,7 +20,8 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Both look the same from the host's POV (TCP probe fails despite ps
 # saying "running"). Recovery is engine-specific:
 #   - Podman: distinguish via PID-alive cross-check; recover dead-PID
-#     case with `podman rm -f` + compose up. Live PID = slow warm-up,
+#     case with remove + compose up through the data-guarded
+#     `service_lifecycle up --recreate` verb. Live PID = slow warm-up,
 #     skip recovery.
 #   - Docker: state-DB desync doesn't exist (daemon manages state
 #     centrally). Live `<runtime> ps` is trustworthy. Recovery is just
@@ -358,29 +359,24 @@ echo "🩺 Container port-binding watchdog: ${#zombies[@]} zombie state(s) detec
 echo "   (container says 'running' but host port is unbound AND container PID is dead)"
 
 project_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-# v0.2.97: the installer's compose (infrastructure/) FIRST — a VCO-managed
+# The compose dir: ONE home, _lib/compose-dir.sh (shared with
+# ensure-containers) — the installer's infrastructure/ first (a VCO-managed
 # service is re-created under the project that owns it, never under the
-# legacy claude_mcp_servers/ home (whose project label is what made
-# containers foreign-owned in the first place). Same tiers as
-# ensure-containers.
-compose_dir=""
-for candidate in "${VCT_COMPOSE_DIR:-}" "${VCT_INFRASTRUCTURE_DIR:-}" \
-        "${VCT_ORCHESTRATOR_ROOT:+$VCT_ORCHESTRATOR_ROOT/infrastructure}" \
-        "$project_root/infrastructure" "$project_root/claude_mcp_servers" "$project_root"; do
-    [ -n "$candidate" ] || continue
-    if [ -f "$candidate/compose.yaml" ] || [ -f "$candidate/compose.yml" ] || [ -f "$candidate/docker-compose.yml" ]; then
-        compose_dir="$candidate"
-        break
-    fi
-done
+# legacy home whose label made containers foreign-owned). v0.2.100 (L1-F17):
+# a directory whose parent is not the orchestrator clone is REFUSED.
+# shellcheck source=_lib/compose-dir.sh disable=SC1091
+. "$(dirname "${BASH_SOURCE[0]}")/_lib/compose-dir.sh"
+vco_resolve_compose_dir "$project_root" || true
+compose_dir="$COMPOSE_DIR"
 
 # v0.2.97 (plan invariants I1 + the zombie gate): what may be done to each
 # container comes from the launcher.db service_endpoints plan. Only a
-# VCO-managed service is `rm -f`'d and re-created — by compose, naming that
-# ONE service with `--no-deps`. An adopted container is never removed: a
-# re-create would put it on the installer's default, EMPTY volume. No
-# readable plan → nothing is re-created.
-up_args=()
+# VCO-managed service is removed and re-created — by `python -m
+# vco_lib.service_lifecycle up --recreate` (v0.2.100 AD-4), which removes it
+# only AFTER the data-identity guard proved compose mounts its live data, and
+# composes that ONE service with `--no-deps` through the one retry/heal home.
+# An adopted container is never removed: a re-create would put it on the
+# installer's default, EMPTY volume. No readable plan → nothing is re-created.
 zombie_policy() {  # container → "<service|-> <on_zombie>"
     local i
     for i in "${!VCO_LC_CONTAINER[@]}"; do
@@ -418,31 +414,29 @@ for entry in "${zombies[@]}"; do
             log_recovered "$name" left_as_is "the service_endpoints rows could not be re-checked"
             continue
         fi
-        # Podman state-DB desync: force-rm + recreate. `podman restart`
-        # would be a no-op because Podman thinks the container is alive.
-        up_line="$("$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services "$service" 2>/dev/null)" || up_line=""
-        if [ -z "$up_line" ]; then
-            echo "     ! no compose argv for $service — $name left as is"
-            log_recovered "$name" left_as_is "no compose argv"
+        # Podman state-DB desync: remove + recreate (`podman restart` would
+        # be a no-op because Podman thinks the container is alive) — through
+        # the ONE guarded verb, never an `rm` here.
+        if [ -n "$COMPOSE_DIR_REFUSAL" ]; then
+            echo "     ! $COMPOSE_DIR_REFUSAL ($name left as is)"
+            log_recovered "$name" left_as_is "compose dir is not the orchestrator's infrastructure/"
             continue
         fi
-        eval "up_args=($up_line)"
-        if "$RUNTIME" rm -f "$name" >/dev/null 2>&1; then
-            if [ -n "$compose_dir" ]; then
-                if ( cd "$compose_dir" && "${COMPOSE_CMD[@]}" "${up_args[@]}" >/dev/null 2>&1 ); then
-                    log_recovered "$name" recreated "$up_line"
-                else
-                    echo "     ! ${COMPOSE_CMD[*]} $up_line failed; manual: cd $compose_dir && ${COMPOSE_CMD[*]} $up_line"
-                    log_recovered "$name" failed "removed; compose up failed"
-                fi
-            else
-                echo "     ! could not auto-detect compose dir; manual: ${COMPOSE_CMD[*]} $up_line"
-                log_recovered "$name" failed "removed; no compose directory found"
-            fi
-        else
-            echo "     ! $RUNTIME rm -f $name failed"
-            log_recovered "$name" failed "$RUNTIME rm -f failed"
+        if [ -z "$compose_dir" ]; then
+            echo "     ! could not auto-detect the compose dir — $name left as is (set VCT_ORCHESTRATOR_ROOT; manual: $RUNTIME start $name)"
+            log_recovered "$name" left_as_is "no compose directory found"
+            continue
         fi
+        up_rc=0
+        up_out="$("$RUN_PY" -m vco_lib.service_lifecycle up --shell --services "$service" \
+            --recreate "$service" --compose-dir "$compose_dir" --compose-cmd "${COMPOSE_CMD[*]}" \
+            --runtime "$RUNTIME" 2>&1)" || up_rc=$?
+        printf '%s\n' "$up_out" | grep -v '^vco_up_' | grep -v '^$' | sed 's/^/     /'
+        case "$up_rc" in
+            0) log_recovered "$name" recreated "service_lifecycle up --recreate $service" ;;
+            3) log_recovered "$name" left_as_is "recreate refused: data identity not proven" ;;
+            *) log_recovered "$name" failed "service_lifecycle up exited $up_rc" ;;
+        esac
     else
         # Docker silent-crash: state DB is reliable, so this means the
         # app inside the container has wedged. `docker restart` cycles

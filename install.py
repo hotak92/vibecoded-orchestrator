@@ -11991,6 +11991,9 @@ def _migrate_code_embed_with_cache(row, runtime: str, deferral_report) -> None:
                                 commit=commit_without_mcp_registration(PROJECT_ROOT))
     _log_install_event("5b/10", "code_embed_migration", result.status,
                        data={"reason": result.reason})
+    if deferral_report is not None:
+        for entry in result.entries:
+            deferral_report.add_entry(entry)
     if not result.ok:
         _svc_guard.emit_code_embed_migration_refused(
             deferral_report, status=result.status, reason=result.reason,
@@ -12255,16 +12258,10 @@ def _start_services(
     # overlay file). On CPU-only setups the service uses Ollama as code embed
     # backend and code_embed is intentionally skipped.
     services_to_start: list[str] = []
-    # v0.2.61: services we OWN (vct-managed adopt) that may have a changed
-    # compose config (e.g. the Weaviate write-amplification env tuning). An
-    # adopt skips `compose up` entirely (the service is already running), so a
-    # changed `environment:` block never reaches compose → the new config
-    # silently never applies on `--update`. We force-recreate ONLY our own
-    # vct-managed adopts (probe == PROBE_VCT_MANAGED) so the new config lands;
-    # the named data volume is preserved across `--force-recreate` (it rm's the
-    # container, not the volume). FOREIGN adopts (someone else's container,
-    # probe == PROBE_FOREIGN, only via explicit --on-conflict adopt) are NEVER
-    # recreated — we must not touch a service we don't own.
+    # v0.2.61: our OWN vct-managed adopts are force-recreated so a changed
+    # compose config applies on --update; foreign adopts NEVER are. A recreate
+    # keeps the data only when compose mounts the live data — proven below by
+    # vco_lib.data_identity before compose runs (v0.2.100 AD-4), never assumed.
     services_to_recreate: list[str] = []
     if force_separate:
         # Every service VCO manages, NAMED (I1): a bare `up -d` would also
@@ -12293,23 +12290,13 @@ def _start_services(
             # "skip" → leave running untouched (incl. a foreign adopt).
 
         # ── v0.2.74 (R2): Weaviate reclaim-env DRIFT recreate ────────────────
-        # The adopt-recreate above only fires when THIS run classifies Weaviate
-        # as a fresh vct-managed ADOPT. But a running-and-ours Weaviate is often
-        # classified "reuse/skip" — so a compose env change (the 2GiB LSM cap +
-        # tombstone brake that let the 136GB dead segments compact) NEVER reached
-        # the live container, which stayed at the old 500MiB cap and could never
-        # reclaim. Independently INSPECT the running container's reclaim env and,
-        # if it drifts from compose, force a `--force-recreate` regardless of the
-        # adopt/skip classification. Data-safe: the named volume survives a
-        # recreate. Runs BEFORE the schema-migration 6_to_7 purge + the codegraph
-        # resync (both later in the update flow at the call site), so that heavy
-        # write activity lands under the 2GiB cap and compaction can collapse the
-        # backlog (HIGH-1 sequencing). Conservative: an un-inspectable container
-        # → no drift reported → no recreate (never recreate on uncertainty).
-        #
-        # v0.2.74 (Fable-review F3): additionally gated on the safety probe
-        # having classified weaviate as VCT-MANAGED (pure predicate below —
-        # see _should_check_weaviate_reclaim_drift for the full rationale).
+        # A running-and-ours Weaviate classified "reuse/skip" never received a
+        # compose env change (the 2GiB LSM cap + tombstone brake that let the
+        # 136GB dead segments compact). INSPECT its reclaim env; on drift force
+        # a `--force-recreate` (data identity guarded below), BEFORE the 6_to_7
+        # purge + codegraph resync (HIGH-1 sequencing). An un-inspectable
+        # container → no drift → no recreate. F3: gated on the probe having
+        # classified weaviate VCT-MANAGED (_should_check_weaviate_reclaim_drift).
         if _should_check_weaviate_reclaim_drift(
             decisions, services_to_start, services_to_recreate
         ):
@@ -12332,7 +12319,7 @@ def _start_services(
                         "  [recreate] Weaviate: reclaim-env drift detected "
                         "(running container predates the current compose tuning) "
                         "— forcing --force-recreate so the LSM/compaction config "
-                        "applies. The named data volume is preserved."
+                        "applies (only once its data mount is proven to come along)."
                     )
                     for _k, _have, _want in _drift_details:
                         print(f"      {_k}: running={_have!r} → compose={_want!r}")
@@ -12388,17 +12375,24 @@ def _start_services(
                   "served_sha": _rebuild.served_sha},
         )
 
-    # All required services already up AND none needs a config-recreate —
-    # nothing to do. (v0.2.61: a vct-managed adopt with a changed compose
-    # config lands in services_to_recreate, so we must NOT early-return when
-    # that list is non-empty — the recreate below applies the new config.)
-    # v0.2.93: a container another compose identity created is never recreated.
+    # Nothing to start or recreate → nothing to do. v0.2.93: a container
+    # another compose identity created is never recreated.
     _guard = _svc_guard.apply_recreate_guard(
         services_to_recreate=services_to_recreate, recreate_for_rebuild=recreate_for_rebuild,
         build_services=build_services, runtime=sysinfo.container_cmd, infra_dir=infra_dir,
         compose_file=compose_file, deferral_report=deferral_report, log_event=_log_install_event,
     )
     services_to_recreate, recreate_for_rebuild, build_services, _foreign, _guard_rows = _guard
+    # v0.2.100 (AD-4): `--force-recreate` reaches EVERY named service, so each
+    # is created only with its data identity proven (never an rm on refusal).
+    from vco_lib import data_identity as _di  # noqa: PLC0415
+    _refused = _di.guard_compose_set(
+        services_to_start + services_to_recreate, runtime=sysinfo.container_cmd, infra_dir=infra_dir,
+        compose_argv=lambda: _get_compose_command(sysinfo.container_cmd), compose_file=compose_file,
+        rows=_SERVICE_ENDPOINTS["rows"], deferral_report=deferral_report, log_event=_log_install_event)
+    services_to_start, services_to_recreate, recreate_for_rebuild, build_services = (
+        [s for s in lst if s not in _refused]
+        for lst in (services_to_start, services_to_recreate, recreate_for_rebuild, build_services))
     if not services_to_start and not services_to_recreate:
         print("  All required services already running — reusing them.")
         print("  (Set VCT_FORCE_SEPARATE_CONTAINERS=1 for separate per-install containers.)")

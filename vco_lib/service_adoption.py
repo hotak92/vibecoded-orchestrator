@@ -77,6 +77,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -1124,6 +1125,10 @@ class AdoptionResult:
     #: every podman/compose argv executed, in order — the audit trail tests
     #: assert against (never a volume subcommand, never a project down).
     argv_log: list[list[str]] = field(default_factory=list)
+    #: ledger rows the compose recovery owes (a refused heal — e.g. a
+    #: network another tool labelled, with containers attached — v0.2.100
+    #: F-W1-13); the caller adds them to its report.
+    entries: list = field(default_factory=list)
 
 
 def _run_logged(argv: list[str], run: RunFn, result: AdoptionResult, **kw):
@@ -1165,25 +1170,6 @@ def _collateral_warning(plans: Sequence[ServicePlan], runtime: str, run: RunFn,
             "  [collateral] their service-name DNS aliases on the shared "
             "network are preserved by the generated override."
         )
-
-
-def _network_label_handling(argv: list[str], runtime: str, run: RunFn,
-                             result: AdoptionResult, stderr: str) -> bool:
-    """The expected mixed-provider refusal on the first recreate: ``True``
-    when compose refused a network carrying another tool's labels AND the
-    network was removed because ``<runtime> ps -a --filter network=<n> -q``
-    proved nothing attached — the caller then retries once. Thin over
-    :func:`vco_lib.compose_recovery.heal` (the one home of that rule, v0.2.100
-    L1-F04/F22); every runtime call still lands in ``result.argv_log``."""
-    failure = _compose_recovery.classify(stderr, runtime=runtime)
-    if failure.cause != _compose_recovery.NETWORK_LABEL_MISMATCH:
-        return False
-
-    def logged(a, **kw):
-        return _run_logged(list(a), run, result, **kw)
-
-    return _compose_recovery.heal(failure, runtime=runtime, run=logged,
-                                  log=lambda _msg: None).healed
 
 
 def owning_service_config(identity) -> Optional[dict]:
@@ -1320,7 +1306,13 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
     gpu_services = [p for p in plans
                     if p.live is not None
                     and (p.live.has_devices or p.owning_declares_devices)]
-    gpu_overlay = gpu_overlay_for_form(compose_form) if gpu_services else None
+    # The overlay FILE follows the compose that parses it — the DETECTED
+    # provider (a `podman compose` may delegate to either engine), not the
+    # bare form (v0.2.100 F-W1-13 / L1-F10).
+    gpu_overlay = _compose_provider.overlay_for_provider(
+        _compose_provider.detect(runtime, argv=compose_argv, run=run)
+        or _compose_provider.provider_from_form(compose_form, runtime=runtime),
+        "nvidia") if gpu_services else None
     overlay_missing = gpu_overlay is None or not (infra_dir / gpu_overlay).is_file()
     if gpu_services and overlay_missing:
         for plan in gpu_services:
@@ -1382,10 +1374,13 @@ def _up_under_installer(compose_argv: list[str], files: Sequence[Path],
                         result: AdoptionResult, timeout: int = 900,
                         build: bool = False) -> tuple[bool, str]:
     """``compose up -d [--build] --no-deps <service>`` under the installer's
-    project, with the generated override in the -f chain.  Handles the
-    mixed-provider stale-network-label refusal (empty network → rm → ONE
-    retry).  ``build``: rebuild the image (code_embed, whose image is built
-    from the checkout — a stale one is one reason to migrate it)."""
+    project, with the generated override in the -f chain, through
+    :func:`vco_lib.compose_recovery.compose_up_with_recovery` (v0.2.100
+    F-W1-13: the one retry/heal home — a stale network label with nothing
+    attached is removed and retried, a refused heal is LEDGERED in
+    ``result.entries``, never swallowed). ``build``: rebuild the image
+    (code_embed, whose image is built from the checkout — a stale one is one
+    reason to migrate it)."""
     argv = list(compose_argv)
     for path in files:
         argv.extend(["-f", str(path)])
@@ -1393,25 +1388,23 @@ def _up_under_installer(compose_argv: list[str], files: Sequence[Path],
     if build:
         argv.append("--build")
     argv.extend(["--no-deps", service])
+
+    def logged(a, **kw):
+        return _run_logged(list(a), run, result, **kw)
+
     try:
-        res = _run_logged(argv, run, result, capture_output=True, text=True,
-                          timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "compose up timed out"
+        up = _compose_recovery.compose_up_with_recovery(
+            argv, env=None, timeout=timeout, runtime=runtime,
+            provider=_compose_provider.detect(runtime, argv=compose_argv, run=run),
+            run=logged, compose_run=logged, log=lambda _msg: None)
     except OSError as exc:
         return False, f"compose could not run: {exc}"
-    if res.returncode == 0:
+    result.entries.extend(_compose_recovery.deferral_entries(up, manual_cmd=shlex.join(argv)))
+    if up.timed_out:
+        return False, "compose up timed out"
+    if up.ok:
         return True, ""
-    stderr = res.stderr or ""
-    if "incorrect label" in stderr and "com.docker.compose.network" in stderr:
-        if _network_label_handling(argv, runtime, run, result, stderr):
-            try:
-                res = _run_logged(argv, run, result, capture_output=True,
-                                  text=True, timeout=timeout)
-                if res.returncode == 0:
-                    return True, ""
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+    stderr = up.stderr or up.first_stderr or ""
     return False, (stderr.strip().splitlines() or ["compose up failed"])[-1]
 
 

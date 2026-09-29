@@ -117,24 +117,43 @@ def test_identity_rule_agrees_with_the_shared_table(row, tmp_path):
     assert is_orchestrator_clone(_rel(tmp_path, row["dir"])) is row["expect"]
 
 
-@pytest.mark.parametrize("row", RESOLVE, ids=[r["name"] for r in RESOLVE])
-def test_walk_half_of_resolve_agrees_with_the_shared_table(row, tmp_path):
-    """The identity-checked walk decides every row that has no usable cache.
+def _resolve(db_cached: Path | None, exe: Path) -> tuple[Path, str] | None:
+    # must match install_root.rs::resolve — the cache is held to the SAME
+    # identity rule as the walk (W1R-06), never to the structural markers alone.
+    if db_cached is not None and is_orchestrator_clone(db_cached):
+        return db_cached, "db_cache"
+    walked = _walk_from_exe(exe)
+    return (walked, "exe_walk") if walked is not None else None
 
-    Rows with a valid cache are the structural cache check, not the identity
-    rule; for those this asserts only that the walk would NOT have found the
-    expected root by itself when the source is ``db_cache``.
-    """
+
+@pytest.mark.parametrize("row", RESOLVE, ids=[r["name"] for r in RESOLVE])
+def test_resolve_agrees_with_the_shared_table(row, tmp_path):
     _plant(tmp_path, row["files"])
     exe = _rel(tmp_path, row["exe"])
-    walked = _walk_from_exe(exe)
+    cached = _rel(tmp_path, row["db_cached"]) if row["db_cached"] is not None else None
+    got = _resolve(cached, exe)
     want = row["expect"]
     if want["kind"] == "not_found":
-        assert walked is None
-    elif want["source"] == "exe_walk":
-        assert walked == _rel(tmp_path, want["root"])
+        assert got is None
     else:
-        assert walked != _rel(tmp_path, want["root"]) or want["exe_inside"]
+        assert got == (_rel(tmp_path, want["root"]), want["source"])
+
+
+def test_structural_only_cache_is_not_identity(tmp_path):
+    """W1R-06: the rows that plant a structural-only (or foreign-id) cache must
+    be exactly the rows where the old structural rule would have accepted a
+    non-clone — so the corpus really exercises the gap."""
+    hits = 0
+    for i, row in enumerate(RESOLVE):
+        if row["db_cached"] is None:
+            continue
+        base = tmp_path / str(i)
+        _plant(base, row["files"])
+        cached = _rel(base, row["db_cached"])
+        if _looks_like_orchestrator_root(cached) and not is_orchestrator_clone(cached):
+            hits += 1
+            assert row["expect"].get("source") != "db_cache", row["name"]
+    assert hits >= 3, "resolve corpus lost its structural-only / foreign-id cache rows"
 
 
 def test_id_match_is_exact_not_normalised():

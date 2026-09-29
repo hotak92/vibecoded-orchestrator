@@ -1,0 +1,143 @@
+{
+  "_doc": [
+    "v0.2.100 WP-03a (AD-1, L2-F10, L3-F02): the error contract of the ONE orchestrator-update command.",
+    "Producer: launcher/src-tauri/src/commands/update_failure.rs (its tests execute every row below).",
+    "Consumer: the launcher store's routeUpdateError / errorText (WP-08 vitest reads this same file).",
+    "Command: invoke('run_orchestrator_update', {kind}) where kind is one of contract.update_kinds.",
+    "On failure the command rejects with a STRING that is JSON: {kind, message, ...payload}.",
+    "message is never empty and never starts with contract.forbidden_message_prefix; the frontend renders it ONCE, unprefixed.",
+    "Payload kinds flatten their payload into the top level and keep the legacy modal field names, including 'event'.",
+    "On success the command resolves with contract.outcome_example's shape."
+  ],
+  "contract": {
+    "command": "run_orchestrator_update",
+    "update_kinds": ["PullFf", "Merge", "Rebase", "Resume", "ApplyOnly", "ResetHard"],
+    "kinds": ["Refused", "NonFastForward", "UntrackedCollision", "AutostashPop", "Conflict", "InstallFailed", "Raw"],
+    "required_keys": ["kind", "message"],
+    "forbidden_message_prefix": "Update failed:",
+    "payload_events": {
+      "NonFastForward": "orchestrator_update_non_ff",
+      "UntrackedCollision": "orchestrator_untracked_collision",
+      "AutostashPop": "orchestrator_autostash_pop_conflict",
+      "Conflict": "orchestrator_update_conflict"
+    },
+    "outcome_example": {
+      "kind": "PullFf",
+      "head_before": "1111111111111111111111111111111111111111",
+      "head_after": "2222222222222222222222222222222222222222",
+      "install_py_ran": true,
+      "restarted": true,
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "message": "Orchestrator updated; relaunching into the new launcher binary.",
+      "phases": [
+        {"phase": "resolve_root", "status": "done", "detail": null},
+        {"phase": "claim", "status": "done", "detail": null},
+        {"phase": "preflight", "status": "done", "detail": null},
+        {"phase": "sweep_and_gate", "status": "done", "detail": null},
+        {"phase": "hub_stop_and_renames", "status": "done", "detail": null},
+        {"phase": "git_op", "status": "done", "detail": null},
+        {"phase": "head_advance", "status": "done", "detail": "verified by the pull sequence"},
+        {"phase": "install_py", "status": "done", "detail": null},
+        {"phase": "db_reopen_and_refresh", "status": "done", "detail": null},
+        {"phase": "gate_drop_and_hub_restart", "status": "done", "detail": null},
+        {"phase": "binary_refresh", "status": "done", "detail": null},
+        {"phase": "bookkeeping", "status": "done", "detail": null},
+        {"phase": "relaunch", "status": "done", "detail": null}
+      ]
+    }
+  },
+  "failure_message_cases": [
+    {
+      "name": "stderr_traceback_with_step",
+      "run": {"exit_code": 1, "signal": null, "last_step": "[5/10]", "stderr": "Traceback (most recent call last):\nRuntimeError: compose up failed", "stdout_tail": "[5/10] Starting services"},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["exited with code 1", "at step [5/10]", "RuntimeError: compose up failed", "Full log: /opt/vco/state/logs/install.jsonl"],
+      "expect_not_contains": ["Update failed:"]
+    },
+    {
+      "name": "stdout_only_failure_uses_stdout_tail",
+      "run": {"exit_code": 2, "signal": null, "last_step": "[7/10]", "stderr": "   \n", "stdout_tail": "[7/10] Pulling models\nERROR: model pull did not report success"},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["exited with code 2", "[7/10]", "Last output lines", "model pull did not report success"],
+      "expect_not_contains": ["Update failed:"]
+    },
+    {
+      "name": "signal_death_with_no_output",
+      "run": {"exit_code": null, "signal": 9, "last_step": null, "stderr": "", "stdout_tail": ""},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["was killed by signal 9", "before printing a step marker", "install.py printed nothing", "Full log:"],
+      "expect_not_contains": ["Update failed:"]
+    },
+    {
+      "name": "no_code_no_signal",
+      "run": {"exit_code": null, "signal": null, "last_step": null, "stderr": "", "stdout_tail": ""},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["exited without an exit code", "Full log:"],
+      "expect_not_contains": ["Update failed:"]
+    },
+    {
+      "name": "stderr_that_itself_says_update_failed",
+      "run": {"exit_code": 1, "signal": null, "last_step": "[3/10]", "stderr": "Update failed: Update failed:", "stdout_tail": ""},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["exited with code 1", "[3/10]"],
+      "expect_not_contains": []
+    },
+    {
+      "name": "long_stderr_is_bounded_to_the_last_20_lines",
+      "run": {"exit_code": 1, "signal": null, "last_step": "[4/10]", "stderr": "l01\nl02\nl03\nl04\nl05\nl06\nl07\nl08\nl09\nl10\nl11\nl12\nl13\nl14\nl15\nl16\nl17\nl18\nl19\nl20\nl21\nl22\nl23\nl24\nl25", "stdout_tail": ""},
+      "log_path": "/opt/vco/state/logs/install.jsonl",
+      "expect_contains": ["l06", "l25"],
+      "expect_not_contains": ["l05\n", "l01"]
+    }
+  ],
+  "normalise_cases": [
+    {"raw": "Update failed: Update failed:", "fallback": "The update failed and reported no reason.", "expect": "The update failed and reported no reason."},
+    {"raw": "Update failed: git rev-parse failed: bad HEAD", "fallback": "x", "expect": "git rev-parse failed: bad HEAD"},
+    {"raw": "update FAILED:   Update failed: hub would not stop", "fallback": "x", "expect": "hub would not stop"},
+    {"raw": "", "fallback": "The update failed and reported no reason.", "expect": "The update failed and reported no reason."},
+    {"raw": "   \n  ", "fallback": "The update failed and reported no reason.", "expect": "The update failed and reported no reason."},
+    {"raw": "Could not stop vct-hub. Update failed: later text stays", "fallback": "x", "expect": "Could not stop vct-hub. Update failed: later text stays"}
+  ],
+  "surface_errors": [
+    {
+      "name": "refused_python_missing",
+      "build": {"variant": "Refused", "code": "python_missing", "reason": "Update refused before anything was changed: no Python interpreter was found, so install.py --update could not run after the pull. Install Python 3.10+ (or fix PATH) and try again."},
+      "json": {"kind": "Refused", "code": "python_missing", "message": "Update refused before anything was changed: no Python interpreter was found, so install.py --update could not run after the pull. Install Python 3.10+ (or fix PATH) and try again."}
+    },
+    {
+      "name": "refused_kind_not_routed",
+      "build": {"variant": "Refused", "code": "kind_not_routed", "reason": "The Merge update is not available through run_orchestrator_update yet."},
+      "json": {"kind": "Refused", "code": "kind_not_routed", "message": "The Merge update is not available through run_orchestrator_update yet."}
+    },
+    {
+      "name": "non_fast_forward",
+      "build": {"variant": "NonFastForward", "payload": {"event": "orchestrator_update_non_ff", "branch": "main", "local_sha": "aaaa", "remote_sha": "bbbb", "diverged_files": ["CLAUDE.md"], "local_only_files": ["notes.md"], "upstream_only_files": ["install.py", "vco_lib/x.py"], "upstream_only_count": 2, "git_stderr": "fatal: Not possible to fast-forward, aborting."}},
+      "json": {"kind": "NonFastForward", "message": "Your orchestrator clone has diverged from upstream on branch main: 1 file(s) changed on both sides (CLAUDE.md), 2 coming in from upstream. Choose Merge, Rebase or Cancel.", "event": "orchestrator_update_non_ff", "branch": "main", "local_sha": "aaaa", "remote_sha": "bbbb", "diverged_files": ["CLAUDE.md"], "local_only_files": ["notes.md"], "upstream_only_files": ["install.py", "vco_lib/x.py"], "upstream_only_count": 2, "git_stderr": "fatal: Not possible to fast-forward, aborting."}
+    },
+    {
+      "name": "untracked_collision",
+      "build": {"variant": "UntrackedCollision", "payload": {"event": "orchestrator_untracked_collision", "operation": "update", "branch": "main", "resolvable": true, "identical_files": ["a.md"], "divergent_files": ["b.md"], "git_stderr": "error: The following untracked working tree files would be overwritten by merge"}},
+      "json": {"kind": "UntrackedCollision", "message": "The update would overwrite 2 untracked local file(s) (b.md, a.md). Nothing was changed; choose how to resolve them.", "event": "orchestrator_untracked_collision", "operation": "update", "branch": "main", "resolvable": true, "identical_files": ["a.md"], "divergent_files": ["b.md"], "git_stderr": "error: The following untracked working tree files would be overwritten by merge"}
+    },
+    {
+      "name": "autostash_pop",
+      "build": {"variant": "AutostashPop", "payload": {"event": "orchestrator_autostash_pop_conflict", "branch": "main", "conflicted_files": ["CLAUDE.md"], "git_stderr": "CONFLICT (content): Merge conflict in CLAUDE.md"}},
+      "json": {"kind": "AutostashPop", "message": "The update landed, but restoring your uncommitted local changes conflicted in 1 file(s) (CLAUDE.md). Your changes are safe in the stash; choose which version to keep.", "event": "orchestrator_autostash_pop_conflict", "branch": "main", "conflicted_files": ["CLAUDE.md"], "git_stderr": "CONFLICT (content): Merge conflict in CLAUDE.md"}
+    },
+    {
+      "name": "conflict_many_files",
+      "build": {"variant": "Conflict", "payload": {"event": "orchestrator_update_conflict", "operation": "merge", "branch": "main", "conflicted_files": ["f1", "f2", "f3", "f4", "f5", "f6", "f7"], "git_stderr": "CONFLICT"}},
+      "json": {"kind": "Conflict", "message": "The merge stopped on conflicts in 7 file(s) (f1, f2, f3, f4, f5 and 2 more). Resolve them, then continue the update.", "event": "orchestrator_update_conflict", "operation": "merge", "branch": "main", "conflicted_files": ["f1", "f2", "f3", "f4", "f5", "f6", "f7"], "git_stderr": "CONFLICT"}
+    },
+    {
+      "name": "install_failed",
+      "build": {"variant": "InstallFailed", "install_root": "/opt/vco", "run": {"exit_code": 1, "signal": null, "last_step": "[5/10]", "stderr": "RuntimeError: compose up failed", "stdout_tail": ""}},
+      "json": {"kind": "InstallFailed", "message": "install.py --update exited with code 1 at step [5/10]. Last stderr lines:\nRuntimeError: compose up failed\nFull log: /opt/vco/state/logs/install.jsonl", "log_path": "/opt/vco/state/logs/install.jsonl", "exit_code": 1, "signal": null, "last_step": "[5/10]"}
+    },
+    {
+      "name": "raw_double_prefixed_empty",
+      "build": {"variant": "Raw", "raw": "Update failed: Update failed: "},
+      "json": {"kind": "Raw", "message": "The update failed and reported no reason."}
+    }
+  ]
+}

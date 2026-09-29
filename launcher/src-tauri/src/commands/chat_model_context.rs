@@ -580,6 +580,7 @@ mod tests {
         let clone = dir.join("clone-without-seed");
         std::fs::create_dir_all(clone.join("state")).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         std::fs::write(
             clone.join("state").join("install-manifest.json"),
@@ -797,6 +798,7 @@ mod tests {
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
         std::fs::create_dir_all(&seed_dir).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         std::fs::create_dir_all(clone.join("state")).unwrap();
         std::fs::write(
@@ -1080,6 +1082,7 @@ mod tests {
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
         std::fs::create_dir_all(&seed_dir).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         std::fs::create_dir_all(clone.join("state")).unwrap();
         std::fs::write(
@@ -1159,6 +1162,7 @@ mod tests {
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
         std::fs::create_dir_all(&seed_dir).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         std::fs::create_dir_all(clone.join("state")).unwrap();
         std::fs::write(
@@ -1236,6 +1240,7 @@ mod tests {
         // `resolve_orchestrator_root`'s cached-path branch validates the
         // path with `check_install_status` (install.py + CLAUDE.md).
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         // `resolve_orchestrator_root`'s cached-path branch also requires
         // `check_install_status` to pass, which wants an install manifest
@@ -1339,6 +1344,7 @@ mod tests {
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
         std::fs::create_dir_all(&seed_dir).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         // `resolve_orchestrator_root`'s cached-path branch also requires
         // `check_install_status` to pass, which wants an install manifest
@@ -1371,6 +1377,7 @@ mod tests {
         let seed_dir = clone.join("claude_mcp_servers").join("model_router");
         std::fs::create_dir_all(&seed_dir).unwrap();
         std::fs::write(clone.join("install.py"), "# marker").unwrap();
+        std::fs::write(clone.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06: identity-checked cache
         std::fs::write(clone.join("CLAUDE.md"), "# marker").unwrap();
         // `resolve_orchestrator_root`'s cached-path branch also requires
         // `check_install_status` to pass, which wants an install manifest

@@ -10021,6 +10021,7 @@ SHARED_KG_OPT_OUT=false\n"),
         ));
         std::fs::create_dir_all(tmp.join("state")).unwrap();
         std::fs::write(tmp.join("install.py"), "# stub\n").unwrap();
+        std::fs::write(tmp.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06
         std::fs::write(tmp.join("CLAUDE.md"), "# stub\n").unwrap();
         std::fs::write(
             tmp.join("state/install-manifest.json"),

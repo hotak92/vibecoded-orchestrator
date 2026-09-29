@@ -585,38 +585,216 @@ fn frontmatter_has_stub_flag(content: &str) -> bool {
 /// Resolve the dist binary path under `install_root` for the current OS.
 /// Mirrors `install.py::_launcher_binary_relative_path`.
 fn resolve_target_binary(install_root: &Path) -> Result<PathBuf, String> {
-    let (subdir, fname) = launcher_binary_relative_path();
-    Ok(install_root
-        .join("launcher")
-        .join("dist")
-        .join(subdir)
-        .join(fname))
+    Ok(dist_launcher_path(install_root))
 }
 
-/// Mirror of `install.py::_launcher_binary_relative_path`. Keep in sync.
+/// `<install_root>/launcher/dist/<os-arch>/vct-launcher[.exe]` — the binary
+/// `install.py` refreshes and the release commits.
 ///
-/// v0.2.54 Track C (Intel-Mac fix): the macOS branch is arch-aware —
-/// a local build on an Intel Mac lands in `macos-x64/`, not
-/// `macos-arm64/`. Hardcoding arm64 made `restart_launcher` resolve a
-/// non-existent dist path on x86_64 hosts and fall back to
-/// `current_exe()` (= the OLD binary), silently defeating the restart.
-fn launcher_binary_relative_path() -> (&'static str, &'static str) {
-    #[cfg(target_os = "windows")]
-    {
-        ("windows-x64", "vct-launcher.exe")
+/// v0.2.100 (WP-03a): the `(subdir, filename)` pair is no longer a private
+/// mirror here — it comes from `installer::version_info`
+/// (`launcher_dist_subdir` / `launcher_binary_filename`), the same pair the
+/// sidecar reader uses, so the binary relaunched and the version checked
+/// cannot name different files.
+pub(crate) fn dist_launcher_path(install_root: &Path) -> PathBuf {
+    install_root
+        .join("launcher")
+        .join("dist")
+        .join(crate::commands::installer::launcher_dist_subdir())
+        .join(crate::commands::installer::launcher_binary_filename())
+}
+
+// ---------------------------------------------------------------------------
+// v0.2.100 (WP-03a, AD-1 phase 13, L2-F01/F12) — the pipeline's relaunch
+// ---------------------------------------------------------------------------
+
+/// What the pipeline relaunches into. One target today; the enum is the
+/// contract that a relaunch always names what it starts (never
+/// `current_exe()`, which re-executes the OLD binary whenever the running exe
+/// is not the dist file — L2-F12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelaunchTarget {
+    /// `launcher/dist/<os-arch>/vct-launcher[.exe]` under the install root.
+    Dist,
+}
+
+/// Why the relaunch was refused. Every arm is a typed refusal, never a
+/// silent relaunch of whatever happens to be on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelaunchRefusal {
+    /// The dist sidecar (`vct-launcher*.metadata.json`) carries no version.
+    DistVersionUnknown { binary: PathBuf },
+    /// A version on either side is not strict X.Y.Z.
+    VersionUnreadable { detail: String },
+    /// The dist binary is not strictly newer than the running one —
+    /// relaunching would load the same or an OLDER launcher (L2-F01).
+    NotNewer { running: String, dist: String },
+    /// The dist binary itself is missing.
+    BinaryMissing { binary: PathBuf },
+}
+
+impl std::fmt::Display for RelaunchRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelaunchRefusal::DistVersionUnknown { binary } => write!(
+                f,
+                "the launcher binary at {} has no readable version sidecar, so it cannot be \
+                 proven newer than the running launcher — not relaunching",
+                binary.display()
+            ),
+            RelaunchRefusal::VersionUnreadable { detail } => {
+                write!(f, "cannot order launcher versions ({}) — not relaunching", detail)
+            }
+            RelaunchRefusal::NotNewer { running, dist } => write!(
+                f,
+                "the launcher binary on disk (v{}) is not newer than the running launcher \
+                 (v{}) — not relaunching",
+                dist, running
+            ),
+            RelaunchRefusal::BinaryMissing { binary } => {
+                write!(f, "no launcher binary at {} — not relaunching", binary.display())
+            }
+        }
     }
-    #[cfg(all(target_os = "macos", target_arch = "x86_64"))]
-    {
-        ("macos-x64", "vct-launcher")
+}
+
+/// A relaunch that did not happen, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelaunchError {
+    Refused(RelaunchRefusal),
+    SpawnFailed(String),
+}
+
+impl std::fmt::Display for RelaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RelaunchError::Refused(r) => r.fmt(f),
+            RelaunchError::SpawnFailed(e) => f.write_str(e),
+        }
     }
-    #[cfg(all(target_os = "macos", not(target_arch = "x86_64")))]
-    {
-        ("macos-arm64", "vct-launcher")
+}
+
+/// What [`relaunch`] did. The caller returns right after either — the process
+/// is exiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RelaunchOutcome {
+    /// Windows stage-1 handoff: `vct-updater` owns the swap and the relaunch.
+    HandoffExit,
+    /// The dist binary was spawned detached; this process is exiting.
+    Spawned { exe: PathBuf },
+}
+
+/// Starts a launcher binary. Injected so the guard's act/leave-alone arms are
+/// tested without ever starting a real launcher.
+pub(crate) trait Spawner {
+    fn spawn_detached(&self, exe: &Path) -> Result<(), String>;
+}
+
+/// The production spawner: fully detached (`setsid` / `DETACHED_PROCESS`),
+/// null stdio — [`spawn_detached_launcher`].
+pub(crate) struct DetachedSpawner;
+
+impl Spawner for DetachedSpawner {
+    fn spawn_detached(&self, exe: &Path) -> Result<(), String> {
+        spawn_detached_launcher(exe)
     }
-    #[cfg(all(not(target_os = "windows"), not(target_os = "macos")))]
-    {
-        ("linux-x64", "vct-launcher")
+}
+
+/// The version guard, pure: may the pipeline relaunch into a dist binary at
+/// `dist_version`, given the `running` version? Only when the dist is
+/// STRICTLY newer (`version::is_older(running, dist)`); an absent or
+/// unparseable version is a refusal, never "fresh" (AD-8 tri-state rule).
+pub(crate) fn decide_relaunch(
+    running: &str,
+    dist_version: Option<&str>,
+    binary: &Path,
+) -> Result<(), RelaunchRefusal> {
+    let Some(dist) = dist_version.filter(|d| !d.trim().is_empty()) else {
+        return Err(RelaunchRefusal::DistVersionUnknown {
+            binary: binary.to_path_buf(),
+        });
+    };
+    match vct_launcher_core::version::is_older(running, dist) {
+        Err(e) => Err(RelaunchRefusal::VersionUnreadable {
+            detail: e.to_string(),
+        }),
+        Ok(false) => Err(RelaunchRefusal::NotNewer {
+            running: running.to_string(),
+            dist: dist.to_string(),
+        }),
+        Ok(true) if !binary.is_file() => Err(RelaunchRefusal::BinaryMissing {
+            binary: binary.to_path_buf(),
+        }),
+        Ok(true) => Ok(()),
     }
+}
+
+/// Guard, then spawn: the testable ACT of a relaunch. Returns the binary it
+/// started. Nothing is spawned on any refusal.
+pub(crate) fn spawn_guarded(
+    install_root: &Path,
+    running: &str,
+    spawner: &dyn Spawner,
+) -> Result<PathBuf, RelaunchError> {
+    let exe = dist_launcher_path(install_root);
+    let dist_version = crate::commands::installer::read_on_disk_binary_version(install_root);
+    decide_relaunch(running, dist_version.as_deref(), &exe).map_err(RelaunchError::Refused)?;
+    spawner
+        .spawn_detached(&exe)
+        .map_err(RelaunchError::SpawnFailed)?;
+    Ok(exe)
+}
+
+/// The ONE relaunch of the update pipeline (`update_run` phase 13).
+///
+/// 1. Version guard ([`decide_relaunch`]) — a refusal returns before anything
+///    else happens, so the caller still owns the hub restart.
+/// 2. Windows stage-1 branch: `binary_freshness::stage_and_handoff_after_update`
+///    stages binaries git could not write and, when it fires, `vct-updater`
+///    owns the swap and the relaunch — this process exits. No-op on POSIX.
+/// 3. Otherwise `before_spawn` runs (the caller's hub restart on Windows,
+///    where it must follow the handoff decision — v0.2.54 C-1), the dist
+///    binary is spawned DETACHED, the `launcher_restart_required` entry is
+///    cleared, and this process exits.
+pub(crate) async fn relaunch<R: Runtime>(
+    app: &AppHandle<R>,
+    target: RelaunchTarget,
+    install_root: &Path,
+    running: &str,
+    before_spawn: impl FnOnce(),
+) -> Result<RelaunchOutcome, RelaunchError> {
+    let RelaunchTarget::Dist = target;
+    let exe = dist_launcher_path(install_root);
+    let dist_version = crate::commands::installer::read_on_disk_binary_version(install_root);
+    decide_relaunch(running, dist_version.as_deref(), &exe).map_err(RelaunchError::Refused)?;
+
+    let handoff = crate::services::binary_freshness::stage_and_handoff_after_update(
+        install_root,
+        &install_root.display().to_string(),
+    )
+    .await;
+    if handoff.handoff_active {
+        tracing::info!(
+            "[restart] relaunch: stage-1 handoff active (lock={:?}); exiting so vct-updater \
+             swaps the locked binaries and relaunches",
+            handoff.lock_path
+        );
+        crate::quit_dialog::force_quit();
+        app.exit(0);
+        return Ok(RelaunchOutcome::HandoffExit);
+    }
+    if let Some(reason) = handoff.skip_reason.as_deref() {
+        tracing::debug!("[restart] relaunch: stage-1 handoff skipped ({})", reason);
+    }
+
+    before_spawn();
+    let exe = spawn_guarded(install_root, running, &DetachedSpawner)?;
+    if let Err(e) = clear_restart_deferral(install_root) {
+        tracing::warn!("[restart] relaunch: could not clear the restart deferral: {}", e);
+    }
+    crate::quit_dialog::force_quit();
+    app.exit(0);
+    Ok(RelaunchOutcome::Spawned { exe })
 }
 
 /// Spawn the new launcher fully detached. The current process exits
@@ -1072,12 +1250,105 @@ stub: true
         assert!(body.starts_with("restarted-at: "));
     }
 
+    // ---- v0.2.100 WP-03a: the pipeline relaunch's version guard -----------
+
+    /// Records every spawn instead of starting a process — no test may ever
+    /// start a real launcher.
+    #[derive(Default)]
+    struct RecordingSpawner {
+        spawned: std::cell::RefCell<Vec<PathBuf>>,
+    }
+
+    impl Spawner for RecordingSpawner {
+        fn spawn_detached(&self, exe: &Path) -> Result<(), String> {
+            self.spawned.borrow_mut().push(exe.to_path_buf());
+            Ok(())
+        }
+    }
+
+    /// A temp install root whose dist slot holds a binary + sidecar at `dist`.
+    fn root_with_dist(dist: Option<&str>) -> tempfile::TempDir {
+        let td = tempfile::tempdir().unwrap();
+        let exe = dist_launcher_path(td.path());
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        std::fs::write(&exe, b"not a real launcher").unwrap();
+        if let Some(v) = dist {
+            let meta = exe.with_file_name(format!(
+                "{}.metadata.json",
+                exe.file_name().unwrap().to_string_lossy()
+            ));
+            std::fs::write(&meta, format!("{{\"launcher_version\": \"{}\"}}", v)).unwrap();
+        }
+        td
+    }
+
+    /// ACT: a dist binary strictly newer than the running one is spawned —
+    /// exactly once, and it is the DIST path (never `current_exe()`).
+    #[test]
+    fn relaunch_proceeds_for_a_newer_dist_binary() {
+        let td = root_with_dist(Some("0.2.100"));
+        let spawner = RecordingSpawner::default();
+        let exe = spawn_guarded(td.path(), "0.2.99", &spawner).expect("newer dist relaunches");
+        assert_eq!(exe, dist_launcher_path(td.path()));
+        assert_eq!(*spawner.spawned.borrow(), vec![dist_launcher_path(td.path())]);
+    }
+
+    /// LEAVE-ALONE: an equal or OLDER dist binary is a typed refusal and
+    /// nothing is spawned (L2-F01: the old resolver installed the older one).
+    #[test]
+    fn relaunch_refuses_a_not_newer_dist_binary() {
+        for dist in ["0.2.99", "0.2.98", "0.2.9"] {
+            let td = root_with_dist(Some(dist));
+            let spawner = RecordingSpawner::default();
+            let err = spawn_guarded(td.path(), "0.2.99", &spawner).expect_err(dist);
+            assert_eq!(
+                err,
+                RelaunchError::Refused(RelaunchRefusal::NotNewer {
+                    running: "0.2.99".into(),
+                    dist: dist.into(),
+                })
+            );
+            assert!(spawner.spawned.borrow().is_empty(), "{dist}: nothing may be spawned");
+        }
+    }
+
+    /// Tri-state: an absent sidecar or a non-X.Y.Z version is never "newer".
+    #[test]
+    fn relaunch_refuses_unknown_or_unreadable_versions() {
+        let spawner = RecordingSpawner::default();
+        let td = root_with_dist(None);
+        assert!(matches!(
+            spawn_guarded(td.path(), "0.2.99", &spawner),
+            Err(RelaunchError::Refused(RelaunchRefusal::DistVersionUnknown { .. }))
+        ));
+        let td = root_with_dist(Some("0.2.100-rc1"));
+        assert!(matches!(
+            spawn_guarded(td.path(), "0.2.99", &spawner),
+            Err(RelaunchError::Refused(RelaunchRefusal::VersionUnreadable { .. }))
+        ));
+        assert!(spawner.spawned.borrow().is_empty());
+        // A missing binary with a newer sidecar is refused too.
+        let td = root_with_dist(Some("0.2.100"));
+        std::fs::remove_file(dist_launcher_path(td.path())).unwrap();
+        assert!(matches!(
+            decide_relaunch("0.2.99", Some("0.2.100"), &dist_launcher_path(td.path())),
+            Err(RelaunchRefusal::BinaryMissing { .. })
+        ));
+    }
+
     #[test]
     fn launcher_binary_relative_path_matches_python_helper() {
         // Sanity: the (subdir, fname) tuple must match
         // install.py::_launcher_binary_relative_path or downstream paths
         // diverge silently.
-        let (subdir, fname) = launcher_binary_relative_path();
+        // v0.2.100: the pair now has ONE home (`installer::version_info`);
+        // `dist_launcher_path` is built from it, asserted here end to end.
+        let subdir = crate::commands::installer::launcher_dist_subdir();
+        let fname = crate::commands::installer::launcher_binary_filename();
+        assert_eq!(
+            dist_launcher_path(Path::new("root")),
+            Path::new("root").join("launcher").join("dist").join(subdir).join(fname)
+        );
         #[cfg(target_os = "windows")]
         {
             assert_eq!(subdir, "windows-x64");

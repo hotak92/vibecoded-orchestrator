@@ -50,7 +50,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
@@ -77,6 +77,7 @@ __all__ = [
     "rows_digest",
     "commit_rows",
     "describe",
+    "keep_recorded_mount",
     "load_rows",
     "machine_code_embed_url",
     "machine_grpc_port",
@@ -623,15 +624,43 @@ class WriteResult:
     propagating: list[str] = field(default_factory=list)
 
 
+def _clear_set(clear_mount: "bool | Iterable[str]") -> frozenset[str]:
+    if clear_mount is True:
+        return frozenset(SERVICES)
+    if clear_mount is False:
+        return frozenset()
+    return frozenset(clear_mount)
+
+
+def keep_recorded_mount(prior: Optional[EndpointRow], row: EndpointRow,
+                        clear: bool = False) -> EndpointRow:
+    """*row* as it may be stored over *prior*: a recorded ``data_mount`` is
+    NEVER overwritten with NULL (v0.2.100 AD-4, U12) unless the caller clears
+    it explicitly. A row that carries no mount says "not observed this time",
+    not "there is no data" — reading it as the latter is how a 110 GB model
+    bind was nearly re-homed onto an empty default volume. MUST MATCH the
+    ``COALESCE(excluded.data_mount_json, data_mount_json)`` upsert in
+    ``vct-launcher-core/src/db/service_endpoints.rs`` (both run the
+    ``mount_write_cases`` of ``tests/fixtures/service_endpoint_parity.json``)."""
+    if prior is None or prior.data_mount is None or row.data_mount is not None or clear:
+        return row
+    return replace(row, data_mount=dict(prior.data_mount))
+
+
 def write_rows(rows: Iterable[EndpointRow], *, db_path: Optional[Path] = None,
-               now_ms: Optional[int] = None) -> WriteResult:
+               now_ms: Optional[int] = None,
+               clear_mount: "bool | Iterable[str]" = False) -> WriteResult:
     """Validate every row, then upsert the changed ones in ONE transaction.
 
     Nothing is written unless every row validates. An unchanged row is not
     rewritten (``updated_at`` keeps its value), so a re-run writes nothing.
+    A row with ``data_mount=None`` keeps the mount already recorded
+    (:func:`keep_recorded_mount`); ``clear_mount`` (``True``, or the services
+    to clear) is the only way to store NULL over a recorded mount.
     Raises :class:`InvalidEndpointRow` or :class:`ServiceRegistryUnavailable`.
     """
     batch = list(rows)
+    clear = _clear_set(clear_mount)
     seen: set[str] = set()
     for row in batch:
         validate_row(row)
@@ -646,6 +675,7 @@ def write_rows(rows: Iterable[EndpointRow], *, db_path: Optional[Path] = None,
         current = read_rows(conn)
         for row in batch:
             prior = current.get(row.service)
+            row = keep_recorded_mount(prior, row, row.service in clear)
             if prior is not None and _same(prior, row, _COMPARED_FIELDS):
                 continue
             mount = (
@@ -890,6 +920,7 @@ def commit_rows(
     out: Callable[[str], None] = print,
     now_ms: Optional[int] = None,
     propagate: bool = True,
+    clear_mount: "bool | Iterable[str]" = False,
 ) -> tuple[WriteResult, ApplyChangeReport]:
     """:func:`write_rows`, then :func:`apply_change` for the services whose
     change propagates. The one call a row-changing verb makes.
@@ -900,7 +931,7 @@ def commit_rows(
     the rows and runs NO chain (the session phase, whose caller is killed
     after 8 s): the digest then stays behind and the next caller that may
     propagate converges."""
-    result = write_rows(rows, db_path=db_path, now_ms=now_ms)
+    result = write_rows(rows, db_path=db_path, now_ms=now_ms, clear_mount=clear_mount)
     if not propagate:
         return result, ApplyChangeReport()
     changed = list(result.propagating)
@@ -1027,8 +1058,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     which = p_adopt.add_mutually_exclusive_group(required=True)
     which.add_argument("--container", help="a container VCO then starts/stops by name, never recreates")
     which.add_argument("--url", help="a URL (a native process or another host)")
-    p_adopt.add_argument("--accept-empty-kg", action="store_true",
-                         help="switch away from a Weaviate that holds VCO data")
+    p_adopt.add_argument("--accept-empty-kg", "--accept-empty", dest="accept_empty_kg",
+                         action="store_true",
+                         help="switch away from a Weaviate that holds VCO data, or an Ollama that "
+                              "holds models, to one that holds none")
     db_arg(p_adopt)
     root_arg(p_adopt)
     p_adopt.set_defaults(handler=reconcile_verb("adopt"))
@@ -1036,8 +1069,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_copy = sub.add_parser("use-vco-copy", help="let VCO run its own copy of a service")
     p_copy.add_argument("--service", required=True, choices=SERVICES)
     p_copy.add_argument("--port", type=int, default=None)
-    p_copy.add_argument("--accept-empty-kg", action="store_true",
-                        help="switch away from a Weaviate that holds VCO data")
+    p_copy.add_argument("--accept-empty-kg", "--accept-empty", dest="accept_empty_kg",
+                        action="store_true",
+                        help="switch away from a Weaviate that holds VCO data, or an Ollama that "
+                             "holds models, to a new, empty VCO copy")
     db_arg(p_copy)
     root_arg(p_copy)
     p_copy.set_defaults(handler=reconcile_verb("use-vco-copy"))
@@ -1050,8 +1085,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_move.add_argument("--url", default=None, help="an external endpoint's new URL")
     p_move.add_argument("--grpc-port", type=int, default=None, help="Weaviate's gRPC port: at --url (adopted), or where VCO's own "
                         "Weaviate moves it (default: keeps its offset from --port)")
-    p_move.add_argument("--accept-empty-kg", action="store_true",
-                        help="follow a Weaviate to an endpoint that holds no VCO data")
+    p_move.add_argument("--accept-empty-kg", "--accept-empty", dest="accept_empty_kg",
+                        action="store_true",
+                        help="follow a Weaviate (no VCO data) or an Ollama (no models) to an "
+                             "endpoint that holds none")
     db_arg(p_move)
     root_arg(p_move)
     p_move.set_defaults(handler=reconcile_verb("move"))

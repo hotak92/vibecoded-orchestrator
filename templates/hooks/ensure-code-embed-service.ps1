@@ -20,14 +20,20 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # outputs only.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-. "$PSScriptRoot/_lib/compose-invocation.ps1"
 
 $ContainerName = if ($env:VCT_CODE_EMBED_CONTAINER) { $env:VCT_CODE_EMBED_CONTAINER } else { "code_embed" }
 $Tmp = if ($env:TMPDIR) { $env:TMPDIR } elseif ($env:TEMP) { $env:TEMP } else { "C:\Windows\Temp" }
 $LockFile = Join-Path $Tmp "code_embed_service.lock"
 
 $ScriptDir = $PSScriptRoot
-$ComposeDir = if ($env:VCT_COMPOSE_DIR) { $env:VCT_COMPOSE_DIR } else { (Resolve-Path (Join-Path $ScriptDir "..\..\claude_mcp_servers")).Path }
+# The compose dir: ONE home, _lib/compose-dir.ps1 (shared with
+# ensure-containers and verify-container-ports; v0.2.100) - the
+# orchestrator's infrastructure\ first, and a directory whose parent is not
+# the orchestrator clone is REFUSED (review L1-F17).
+. (Join-Path $ScriptDir "_lib\compose-dir.ps1")
+$VcoComposeDir = Resolve-VcoComposeDir -RepoRoot ((Resolve-Path (Join-Path $ScriptDir "..\..")).Path)
+$ComposeDir = $VcoComposeDir.Dir
+$ComposeDirRefusal = $VcoComposeDir.Refusal
 
 # Cross-OS port probe via System.Net.Sockets.TcpClient.
 function Test-PortOpen([int]$port, [int]$timeoutSec = 2) {
@@ -194,67 +200,39 @@ try {
 
     # v0.2.97 (plan invariant I1, parity with the .sh sibling): compose may
     # create code_embed only while the launcher.db service_endpoints plan
-    # lists it as VCO-managed and enabled, and only with the argv
-    # `vco_lib.service_lifecycle compose-args` builds (`--no-deps`: its
-    # `depends_on: ollama` must never create an Ollama next to an ADOPTED
-    # one; plus the gpu profile it lives in). $null = compose must not run.
-    function Get-CodeEmbedUpArgs {
-        param([bool]$Build)
-        # The plan itself was already read once above (one read, two
-        # consumers); its compose_services list is the gate.
-        if (-not $SePlan -or (@($SePlan.compose_services) -notcontains 'code_embed')) { return $null }
-        $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'compose-args', '--json', '--services', 'code_embed')
-        if ($Build) { $pyArgs += '--build' }
-        try {
-            $parsed = (& $RunPy @pyArgs 2>$null | Out-String) | ConvertFrom-Json
-            if ($LASTEXITCODE -ne 0) { return $null }
-            return ,@($parsed.args)
-        } catch { return $null }
+    # lists it as VCO-managed and enabled (the plan read once above).
+    # v0.2.100 (AD-3/AD-4, F-W1-13): the compose call itself is the ONE
+    # guarded verb, `python -m vco_lib.service_lifecycle up` - the
+    # data-identity guard first, `--no-deps` + the gpu profile, and the one
+    # retry/heal home (`--build` dropped ONLY on positive "unsupported"
+    # evidence, a real build failure reported). No retry or hint here.
+    if (-not $SePlan -or (@($SePlan.compose_services) -notcontains 'code_embed')) {
+        Write-Output "[code_embed] not created: launcher.db service_endpoints does not list code_embed as a VCO-managed, enabled service (see ``python -m vco_lib.service_endpoints show``)"
+        exit 0
     }
-
-    if ($ComposeCmd -and (Test-Path $ComposeDir)) {
-        $upArgs = Get-CodeEmbedUpArgs -Build $true
-        if (-not $upArgs -or $upArgs.Count -eq 0) {
-            Write-Output "[code_embed] not created: launcher.db service_endpoints does not list code_embed as a VCO-managed, enabled service (see ``python -m vco_lib.service_endpoints show``)"
-            exit 0
-        }
+    if ($ComposeDirRefusal) {
+        Write-Output "[code_embed] $ComposeDirRefusal"
+        exit 0
+    }
+    if ($ComposeCmd -and $ComposeDir) {
         Write-Output "[code_embed] Starting code embedding service via $ComposeCmd..."
-        Push-Location $ComposeDir
+        # v0.2.92 BLOCKER-1: `--build` here - we are CREATING this container,
+        # so a build is already on the critical path when no image exists.
         try {
-            # v0.2.92 BLOCKER-1: `--build` here, for the same reason as the .sh
-            # sibling - we are CREATING this container, so a build is already on
-            # the critical path when no image exists; the flag only adds cost in
-            # the one case that must not be skipped (an image built from older
-            # source). Scoped to `code_embed`, so no other service is touched.
-            $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
-            $cmdHead = $composeInvocation.Head
-            $cmdRest = @($composeInvocation.Rest)
-            $output = & $cmdHead @cmdRest @upArgs 2>&1
-            $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
-        } finally { Pop-Location }
-        # The runtime, not an exit code, decides whether the retry is needed.
+            $output = & $RunPy -m vco_lib.service_lifecycle up --services code_embed --build `
+                --compose-dir $ComposeDir --compose-cmd $ComposeCmd --runtime $Runtime 2>&1
+            $output | Select-Object -Last 12 | ForEach-Object { Write-Output ([string]$_) }
+        } catch { Write-Output "[code_embed] $_" }
         $created = $false
         try {
             & $Runtime container inspect $ContainerName 2>$null | Out-Null
             if ($LASTEXITCODE -eq 0) { $created = $true }
         } catch { }
-        if (-not $created) {
-            # Older compose implementations reject `--build` on `up`. Retry
-            # without it rather than leaving the service down; the image then
-            # stays stale, which Report-VcoCodeEmbedStaleness and `vco doctor`
-            # both surface.
-            Write-Output "[code_embed] compose up --build did not create the container - retrying without --build"
-            $plainArgs = Get-CodeEmbedUpArgs -Build $false
-            if ($plainArgs -and $plainArgs.Count -gt 0) {
-                Push-Location $ComposeDir
-                try {
-                    $output = & $cmdHead @cmdRest @plainArgs 2>&1
-                    $output | Select-Object -Last 3 | ForEach-Object { Write-Output $_ }
-                } finally { Pop-Location }
-            }
-            Write-Output "[code_embed] NOTE: the image was NOT rebuilt from source; run 'python install.py --update' from the orchestrator root to refresh it."
+        if ($created) {
+            Write-Output "[code_embed] Started container $ContainerName on port $Port"
+        } else {
+            Write-Output "[code_embed] $ContainerName was not created (see above); ``python install.py --update`` from the orchestrator root retries it"
         }
-        Write-Output "[code_embed] Started container $ContainerName on port $Port"
     }
 } finally {
     # Touch the lock file mtime so it expires naturally.

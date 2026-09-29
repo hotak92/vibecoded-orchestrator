@@ -30,9 +30,17 @@ which files it can parse, and before this module nothing asked either:
    ``unit_active_file_missing``  ``systemctl --user restart podman.socket``
    ``down``                ``systemctl --user start podman.socket``
    ``machine_down``        ``podman machine`` init-if-absent + start
-   ``not_applicable``      docker (its daemon is not ours to start here)
+   ``not_applicable``      docker (its daemon is not ours to start here), a
+                           compose that never dials the socket
+                           (podman-compose), or a ``DOCKER_HOST`` /
+                           ``CONTAINER_HOST`` that is remote or not podman's
    ``unknown``             a probe could not run — no action on uncertainty
    ====================== =============================================
+
+   The socket examined is the one compose dials, in podman's own order:
+   ``DOCKER_HOST`` (handed to the provider unchanged), then what ``podman
+   info`` reports (``.Host.RemoteSocket``), then the derived default; a unit
+   whose custom ``ListenStream`` is present counts as ``ok``.
 
 Every probe is injectable (``run`` / ``which`` / ``env`` / ``system`` /
 ``exists``); the defaults are :mod:`vco_lib.tool_search_dirs` like the rest of
@@ -72,7 +80,9 @@ __all__ = [
     "detect",
     "provider_from_form",
     "socket_path",
+    "reported_socket",
     "socket_status",
+    "AUTO_PROVIDER",
     "heal_socket",
     "runtime_reachable",
     "podman_machine_init_and_start",
@@ -136,8 +146,17 @@ class ComposeProvider:
     @property
     def needs_api_socket(self) -> bool:
         """docker-compose (and a `podman compose` delegating to it) talks to
-        the podman API socket; podman-compose drives the podman CLI."""
-        return self.runtime == "podman" and self.label_family == "docker"
+        the podman API socket; podman-compose drives the podman CLI and never
+        dials it. An engine VCO could not name counts as needing it: the socket
+        heal is non-destructive, and skipping it on a guess would leave a
+        docker-compose delegate unable to connect.
+
+        Read by :func:`socket_status` / :func:`runtime_reachable` /
+        :func:`heal_socket` (their ``provider`` argument): a provider that does
+        not need the socket gets ``not_applicable`` — no restart, no wait, no
+        ``compose_socket_heal_failed`` row for a socket it never uses
+        (v0.2.100 wave-1 review W1R-07)."""
+        return self.runtime == "podman" and self.label_family != "podman"
 
 
 def _family(engine: str) -> str:
@@ -323,6 +342,10 @@ class HealResult:
     actions: list[str] = field(default_factory=list)
     reason: str = ""
     deferral_cid: Optional[str] = None
+    #: facts the heal established (container id, layer, network, project …) —
+    #: the ledger row renders its manual recipe from these, so the user gets
+    #: the exact commands, not placeholders
+    details: dict = field(default_factory=dict)
 
 
 def _uid() -> Optional[int]:
@@ -332,10 +355,11 @@ def _uid() -> Optional[int]:
 
 def socket_path(env: Optional[Mapping[str, str]] = None, *,
                 uid: Optional[int] = None) -> Optional[str]:
-    """The podman API socket a docker-compose provider will dial on Linux:
-    ``DOCKER_HOST`` / ``CONTAINER_HOST`` when they name a ``unix://`` path,
-    else the rootless default under ``$XDG_RUNTIME_DIR`` (root:
-    ``/run/podman/podman.sock``)."""
+    """The DERIVED podman API socket path — the last-resort fallback of
+    :func:`socket_status`, used only when neither the environment nor podman
+    itself names one: ``DOCKER_HOST`` / ``CONTAINER_HOST`` when they name a
+    ``unix://`` path, else the rootless default under ``$XDG_RUNTIME_DIR``
+    (root: ``/run/podman/podman.sock``)."""
     _env = os.environ if env is None else env
     for key in ("DOCKER_HOST", "CONTAINER_HOST"):
         val = (_env.get(key) or "").strip()
@@ -350,6 +374,66 @@ def socket_path(env: Optional[Mapping[str, str]] = None, *,
     if not runtime_dir:
         return None
     return str(Path(runtime_dir) / "podman" / "podman.sock")
+
+
+def _explicit_host(env: Mapping[str, str]) -> Optional[tuple[str, str]]:
+    """``(KEY, value)`` for the first of ``DOCKER_HOST`` / ``CONTAINER_HOST``
+    that is set. ``podman compose`` hands an already-set ``DOCKER_HOST`` to its
+    provider unchanged, so it names the socket compose will dial."""
+    for key in ("DOCKER_HOST", "CONTAINER_HOST"):
+        val = (env.get(key) or "").strip()
+        if val:
+            return key, val
+    return None
+
+
+def reported_socket(runtime: str, *, run: Optional[RunFn] = None,
+                    which: Optional[WhichFn] = None) -> Optional[tuple[str, bool]]:
+    """``(path, exists)`` of the API socket as PODMAN reports it
+    (``podman info`` ``.Host.RemoteSocket``) — the authoritative answer, which
+    already reflects podman's own configuration. ``None`` when podman does not
+    answer or reports no path (the caller falls back to the derived path)."""
+    if runtime != "podman":
+        return None
+    _run = run or _tsd.run
+    _which = which or _tsd.which
+    exe = _which(runtime) or runtime
+    try:
+        res = _run([exe, "info", "--format",
+                    "{{.Host.RemoteSocket.Path}}|{{.Host.RemoteSocket.Exists}}"],
+                   capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    line = next((ln.strip() for ln in (res.stdout or "").splitlines() if ln.strip()), "")
+    path, sep, exists = line.rpartition("|")
+    if not sep:
+        return None
+    path = path.strip()
+    if path.startswith("unix://"):
+        path = path[len("unix://"):]
+    if not path.startswith("/"):
+        return None
+    return path, exists.strip().lower() == "true"
+
+
+_LISTEN_PATH_RE = re.compile(r"(/\S+?)\s+\((?:Stream|SequentialPacket|Datagram)\)")
+
+
+def _unit_listen_paths(run: RunFn, *, root: bool) -> list[str]:
+    """The socket paths the ``podman.socket`` unit listens on
+    (``systemctl show -p Listen``) — a drop-in with a custom ``ListenStream``
+    shows here and nowhere else. ``[]`` when it cannot be read."""
+    argv = (["systemctl", "show", SOCKET_UNIT, "--property=Listen", "--value"] if root
+            else ["systemctl", "--user", "show", SOCKET_UNIT, "--property=Listen", "--value"])
+    try:
+        res = run(argv, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    if res.returncode != 0:
+        return []
+    return _LISTEN_PATH_RE.findall(res.stdout or "")
 
 
 def _is_socket(path: str) -> bool:
@@ -372,12 +456,35 @@ def socket_status(
     system: Optional[str] = None,
     exists: Optional[ExistsFn] = None,
     uid: Optional[int] = None,
+    provider: Optional[ComposeProvider] = None,
+    path: Optional[str] = None,
 ) -> SocketStatus:
-    """Classify the runtime's API socket (see the module table). Read-only."""
+    """Classify the runtime's API socket (see the module table). Read-only.
+
+    Which socket (v0.2.100 wave-1 review W1R-05) — the one compose will
+    actually dial, in podman's own order: ``path`` when the caller has it
+    (compose named it in its error), else ``DOCKER_HOST`` / ``CONTAINER_HOST``
+    (a non-``unix://`` endpoint is ``not_applicable``: remote, nothing local
+    to heal), else what ``podman info`` reports, else the derived default
+    (:func:`socket_path`). A missing file under an active unit is
+    ``unit_active_file_missing`` only when a restart can bring THAT file back:
+    a unit listening on a different, present path (a custom ``ListenStream``)
+    is ``ok``, and an explicit ``DOCKER_HOST`` naming a socket that is not
+    podman's (e.g. a docker context) is ``not_applicable``.
+
+    ``provider`` — when given and it does not use the API socket
+    (:attr:`ComposeProvider.needs_api_socket`), the answer is
+    ``not_applicable`` without probing anything."""
     if runtime != "podman":
         return SocketStatus(SOCKET_NOT_APPLICABLE, detail=f"{runtime}: not a podman socket")
+    if provider is not None and not provider.needs_api_socket:
+        return SocketStatus(SOCKET_NOT_APPLICABLE,
+                            detail=f"{provider.engine} drives the podman CLI; it never dials "
+                                   "the API socket")
     _run = run or _tsd.run
     _which = which or _tsd.which
+    _env = os.environ if env is None else env
+    _exists = exists or _is_socket
     os_name = system or platform.system()
     if os_name in ("Darwin", "Windows"):
         up = _c.daemon_responsive(runtime, which=_which, run=_run)
@@ -389,44 +496,95 @@ def socket_status(
     if os_name != "Linux":
         return SocketStatus(SOCKET_UNKNOWN, detail=f"unsupported OS {os_name!r}")
     _uid_v = _uid() if uid is None else uid
-    path = socket_path(env, uid=_uid_v)
-    if path is None:
+    root = _uid_v == 0
+
+    explicit_path: Optional[str] = None
+    if path:
+        explicit_path = path[len("unix://"):] if path.startswith("unix://") else path
+    else:
+        host = _explicit_host(_env)
+        if host is not None:
+            key, val = host
+            if not val.startswith("unix://"):
+                return SocketStatus(SOCKET_NOT_APPLICABLE,
+                                    detail=f"{key}={val} is not a local socket; VCO does not "
+                                           "manage it")
+            explicit_path = val[len("unix://"):]
+    reported = reported_socket(runtime, run=_run, which=_which)
+    derived = socket_path({k: v for k, v in _env.items()
+                           if k not in ("DOCKER_HOST", "CONTAINER_HOST")}, uid=_uid_v)
+    sock = explicit_path or (reported[0] if reported else None) or derived
+    if sock is None:
         return SocketStatus(SOCKET_UNKNOWN, detail="no XDG_RUNTIME_DIR to locate the socket")
-    if (exists or _is_socket)(path):
-        return SocketStatus(SOCKET_OK, path=path, unit=SOCKET_UNIT)
+    if (reported is not None and reported[0] == sock and reported[1]) or _exists(sock):
+        return SocketStatus(SOCKET_OK, path=sock, unit=SOCKET_UNIT)
     if not _which("systemctl"):
-        return SocketStatus(SOCKET_UNKNOWN, path=path,
+        return SocketStatus(SOCKET_UNKNOWN, path=sock,
                             detail="socket file missing and systemctl is not available")
     try:
-        res = _run(_systemctl_argv("is-active", root=_uid_v == 0),
+        res = _run(_systemctl_argv("is-active", root=root),
                    capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S)
     except (subprocess.TimeoutExpired, OSError):
-        return SocketStatus(SOCKET_UNKNOWN, path=path, unit=SOCKET_UNIT,
+        return SocketStatus(SOCKET_UNKNOWN, path=sock, unit=SOCKET_UNIT,
                             detail="`systemctl is-active podman.socket` could not run")
+    listen = _unit_listen_paths(_run, root=root)
+    podman_paths = {p for p in (derived, reported[0] if reported else None, *listen) if p}
+    if explicit_path is not None and explicit_path not in podman_paths:
+        return SocketStatus(SOCKET_NOT_APPLICABLE, path=sock,
+                            detail=f"{sock} is not podman's API socket (podman: "
+                                   f"{', '.join(sorted(podman_paths)) or 'unknown'}); VCO does "
+                                   "not manage it")
     state = (res.stdout or "").strip().splitlines()
     if state and state[0].strip() == "active":
-        return SocketStatus(SOCKET_UNIT_ACTIVE_FILE_MISSING, path=path, unit=SOCKET_UNIT,
-                            detail=f"{SOCKET_UNIT} is active but {path} does not exist")
-    return SocketStatus(SOCKET_DOWN, path=path, unit=SOCKET_UNIT,
-                        detail=f"{SOCKET_UNIT} is not active and {path} does not exist")
+        custom = [p for p in listen if p != sock and _exists(p)]
+        if custom:
+            return SocketStatus(SOCKET_OK, path=custom[0], unit=SOCKET_UNIT,
+                                detail=f"{SOCKET_UNIT} listens on {custom[0]} (custom "
+                                       f"ListenStream), not {sock}")
+        return SocketStatus(SOCKET_UNIT_ACTIVE_FILE_MISSING, path=sock, unit=SOCKET_UNIT,
+                            detail=f"{SOCKET_UNIT} is active but {sock} does not exist")
+    return SocketStatus(SOCKET_DOWN, path=sock, unit=SOCKET_UNIT,
+                        detail=f"{SOCKET_UNIT} is not active and {sock} does not exist")
+
+
+class _AutoProvider:
+    """Sentinel: :func:`runtime_reachable` detects the provider itself."""
+
+
+AUTO_PROVIDER = _AutoProvider()
 
 
 def runtime_reachable(runtime: str, *, run: Optional[RunFn] = None,
                       which: Optional[WhichFn] = None,
                       env: Optional[Mapping[str, str]] = None,
                       system: Optional[str] = None,
-                      exists: Optional[ExistsFn] = None) -> bool:
+                      exists: Optional[ExistsFn] = None,
+                      provider: "Optional[ComposeProvider] | _AutoProvider" = AUTO_PROVIDER,
+                      ) -> bool:
     """``<runtime> info`` answers AND the podman API socket is not in a state
-    that is known broken (``unit_active_file_missing`` / ``machine_down``).
-    ``podman info`` alone does not use the socket, so it cannot see state 1 of
-    the module doc. A socket that is merely not started (``down``) is not
-    "unreachable": podman-compose does not need it, and a docker-compose
-    provider's refusal is classified and healed at compose time."""
+    that is known broken (``unit_active_file_missing`` / ``machine_down``) FOR
+    A COMPOSE THAT USES IT. ``podman info`` alone does not use the socket, so
+    it cannot see state 1 of the module doc. A socket that is merely not
+    started (``down``) is not "unreachable": podman-compose does not need it,
+    and a docker-compose provider's refusal is classified and healed at
+    compose time.
+
+    ``provider`` (W1R-07): by default the provider is detected — only when the
+    socket is in a broken state, so a healthy machine pays nothing extra — and
+    a provider that never dials the socket (podman-compose) keeps the runtime
+    reachable. ``None`` = unknown provider (treated as needing the socket)."""
     if _c.daemon_responsive(runtime, which=which, run=run) is not True:
         return False
+    prov = None if isinstance(provider, _AutoProvider) else provider
     kind = socket_status(runtime, run=run, which=which, env=env, system=system,
-                         exists=exists).kind
-    return kind not in (SOCKET_UNIT_ACTIVE_FILE_MISSING, SOCKET_MACHINE_DOWN)
+                         exists=exists, provider=prov).kind
+    if kind not in (SOCKET_UNIT_ACTIVE_FILE_MISSING, SOCKET_MACHINE_DOWN):
+        return True
+    if isinstance(provider, _AutoProvider):
+        detected = detect(runtime, run=run, which=which, env=env)
+        if detected is not None and not detected.needs_api_socket:
+            return True
+    return False
 
 
 def podman_machine_init_and_start(*, run: Optional[RunFn] = None,
@@ -495,18 +653,29 @@ def heal_socket(
     wait_s: float = 30.0,
     machine_start: Optional[Callable[[], tuple[bool, str]]] = None,
     status: Optional[SocketStatus] = None,
+    provider: Optional[ComposeProvider] = None,
+    path: Optional[str] = None,
 ) -> HealResult:
     """Apply the one non-destructive repair for the socket's state, then
-    re-probe. Never touches a container, a volume or a network."""
+    re-probe. Never touches a container, a volume or a network.
+
+    ``healed`` means a repair was APPLIED and the condition is gone (W1R-04):
+    a socket that is already ``ok`` / ``not_applicable`` returns
+    ``healed=False``, no action and no ledger row, so a retry loop stops
+    instead of re-running an identical ``compose up``. ``path`` is the socket
+    compose actually dialled (its error names it); ``provider`` skips the heal
+    for a compose that never uses the socket (W1R-07)."""
     _run = run or _tsd.run
     _which = which or _tsd.which
     def _probe() -> SocketStatus:
         return socket_status(runtime, run=_run, which=_which, env=env,
-                             system=system, exists=exists, uid=uid)
+                             system=system, exists=exists, uid=uid,
+                             provider=provider, path=path)
 
     st = status or _probe()
     if st.kind in (SOCKET_OK, SOCKET_NOT_APPLICABLE):
-        return HealResult(st.kind == SOCKET_OK, reason=f"nothing to heal ({st.kind})")
+        why = f": {st.detail}" if st.detail else ""
+        return HealResult(False, reason=f"nothing to heal (socket {st.kind}{why})")
     if st.kind == SOCKET_UNKNOWN:
         return HealResult(False, reason=f"socket state unknown: {st.detail} — no action on uncertainty")
     actions: list[str] = []

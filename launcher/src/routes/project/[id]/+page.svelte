@@ -92,9 +92,9 @@
   // stable while a different project is loading.
   const isOrchestratorProject = $derived(project?.host === 'orchestrator_root');
 
-  // Orchestrator update banner. Loads inspect_orchestrator_at on
-  // mount; if version_status === 'outdated' a "Update this project"
-  // button appears.
+  // Orchestrator-clone notice. Loads inspect_orchestrator_at on mount; if
+  // this project's folder is an outdated VCO clone, an informational banner
+  // says how to update it (v0.2.100, owner Q1: no in-launcher action).
   type ConfigHealth = { file: string; ok: boolean; error: string | null };
   type OrchestratorState = {
     installed: boolean;
@@ -104,7 +104,6 @@
     config_health: ConfigHealth[];
   };
   let orchState = $state<OrchestratorState | null>(null);
-  let updating = $state(false);
   let rebuilding = $state(false);
   let resyncingKg = $state(false);
   let rebuildingSummaries = $state(false);
@@ -280,22 +279,6 @@
     }
   }
 
-  async function runUpdate() {
-    if (!project) return;
-    updating = true;
-    try {
-      await invoke('update_orchestrator_at', { path: project.folder_path });
-      orchState = await invoke<OrchestratorState>('inspect_orchestrator_at', {
-        path: project.folder_path,
-      });
-      toast.success('Orchestrator updated');
-    } catch (e) {
-      toast.error(e);
-    } finally {
-      updating = false;
-    }
-  }
-
   onMount(loadProject);
   $effect(() => {
     if (projectId) void loadProject();
@@ -419,41 +402,25 @@
   {/if}
 
   <!--
-    Orchestrator-update banner.
+    Orchestrator-clone notice (informational only).
 
-    Edge-case-only after PR-151 (2026-05-06): `inspect_orchestrator_at`
-    only returns `installed: true` for actual VCO clones (gated by
-    `vct-module.json` presence). Normal user-project folders return
-    `installed: false`, so this banner stays hidden for them. The
-    banner DOES appear when a user has registered the VCO clone
-    itself as a project (a legitimate edge case for orchestrator
-    self-development); in that case the banner offers the same
-    `update_orchestrator_at` flow that lives on the Settings tab.
-
-    Followup-#14 review (2026-05-07): banner kept rather than removed.
-    `runUpdate` here calls the SAME backend command as
-    `Settings → Update orchestrator`, so the two paths can't drift.
-    Removing it would silently lose the edge-case ability to update
-    from the project page; leaving it preserves it without breakage
-    for normal projects.
-
-    The guard chain that keeps this safe:
-      1. `inspect_orchestrator_at` returns `installed: false` for
-         project folders (PR-151).
-      2. `update_orchestrator_at` (the handler) is gated by
-         `validate_source_repo` (also PR-151) — refuses to run on
-         non-VCO targets even if the GUI somehow tried.
+    `inspect_orchestrator_at` returns `installed: true` only for actual VCO
+    clones (gated by `vct-module.json`), so normal project folders never see
+    this. v0.2.100 (owner Q1): the "Update orchestrator clone" button and its
+    `update_orchestrator_at` file-copy are retired — copying the running
+    install over another clone was a partial install by construction (no
+    git, no install.py). A VCO install is updated by its own launcher.
   -->
   {#if orchState && orchState.installed && orchState.version_status === 'outdated' && orchState.bundled_version}
     <div class="orch-banner">
       <span class="orch-banner-text">
         Orchestrator clone at this path
         {#if orchState.version}v{orchState.version}{/if}
-        — bundled launcher ships v{orchState.bundled_version}
+        — this launcher ships v{orchState.bundled_version}. Update it from the
+        launcher that runs from that clone (for this launcher's own install:
+        the update badge in the top bar), or run
+        <code>python install.py --update</code> in that folder.
       </span>
-      <button class="orch-banner-btn" onclick={runUpdate} disabled={updating}>
-        {updating ? 'Updating…' : 'Update orchestrator clone'}
-      </button>
     </div>
   {/if}
 
@@ -582,13 +549,6 @@
     font-size: 13px;
   }
   .orch-banner-text { line-height: 1.4; }
-  .orch-banner-btn {
-    background: rgba(0,191,166,0.9); border: 1px solid rgba(0,191,166,1);
-    color: #000; font-weight: 600;
-    padding: 6px 14px; border-radius: 6px; cursor: pointer;
-    font-size: 12px;
-  }
-  .orch-banner-btn:disabled { opacity: 0.6; cursor: not-allowed; }
   .tab-nav { display: flex; padding: 0 24px; border-bottom: 1px solid rgba(255,255,255,0.06); }
   .tab-btn {
     background: none; border: none; color: #888; padding: 12px 16px;

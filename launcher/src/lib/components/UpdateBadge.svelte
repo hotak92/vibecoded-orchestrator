@@ -7,21 +7,18 @@
   // doesn't re-fire on every render — only when the underlying version
   // actually changes.
   //
-  // v0.2.16 (W4 / 0.5): three-state banner. The Rust `check_for_updates`
-  // command now returns a full UpdateStatus struct with three flags:
-  //   - binary_stale  (highest priority) — newer launcher binary on disk
-  //                   than the running process. Resolved by restart.
-  //   - install_stale — source version > install manifest version
-  //                     (user `git pull`-ed manually). Resolved by
-  //                     install.py --update only (no git pull).
-  //   - remote_ahead  — origin/main is ahead of local. Resolved by
-  //                     full `update_orchestrator` (git pull + install).
-  //
-  // The banner renders ONE state at a time, in priority order.
+  // The badge renders ONE state at a time, in `updater.ts::pickKind`'s
+  // priority order (v0.2.100: a pending remote update is never hidden by a
+  // stale binary — the run relaunches the new binary anyway). The copy and
+  // the action for each state come from ONE table, `badgeCopyFor` /
+  // `actionForKind` in the updater store, shared with the Updates page.
+  // Every action goes through the store: `updater.run(kind)` /
+  // `updater.runRestart()` / `updater.openPendingConflict()` via
+  // `updater.perform(action)`.
 
   import { onMount } from 'svelte';
   import { orchestrator } from '$lib/stores/orchestrator';
-  import { updater, isAutostashPopResume } from '$lib/stores/updater';
+  import { updater, badgeCopyFor } from '$lib/stores/updater';
   // v0.2.93 (field incident 2026-09-07): the decision modals (divergence /
   // conflict / untracked-collision / autostash-pop) are no longer rendered
   // here — they live in `+layout.svelte`, keyed on the updater store. This
@@ -56,132 +53,10 @@
   // whichever popover is showing; it never replaces the real kind.
   const binaryAhead = $derived(orchState.updateStatus?.binary_ahead_of_install === true);
 
-  // v0.2.16 (W4 / 0.5): copy + action per kind. Drives both popover
-  // header text and primary button label/handler.
-  // v0.2.51 (Bug A): added 'merge_resolved_incomplete' kind — highest
-  // priority. Calls the new `resume_orchestrator_update` Tauri command
-  // via `updater.resumeUpdate()`.
-  const kindCopy = $derived.by(() => {
-    const us = orchState.updateStatus;
-    switch (upd.kind) {
-      case 'merge_in_progress': {
-        // v0.2.93 (field incident 2026-09-07): the clone is mid-merge
-        // (`.git/MERGE_HEAD` present) and the launcher has no conflict
-        // payload in memory — the modal never rendered, or the launcher
-        // was restarted while it was up. Highest priority: nothing else
-        // can run against a conflicted tree. The action re-fetches the
-        // payload (`get_pending_conflict_payload`) and reopens the
-        // hoisted conflict modal.
-        return {
-          title: 'Update stopped at a merge conflict — resolve it',
-          desc:
-            `An orchestrator ${us?.resume_operation || 'merge'} on ` +
-            `\`${us?.resume_branch || 'main'}\` stopped at a conflict and the ` +
-            `clone is still mid-merge. Nothing else can update until you ` +
-            `resolve it (keep local / accept upstream) or abort it. Click ` +
-            `Resolve conflict to reopen the resolution dialog.`,
-          buttonLabel: 'Resolve conflict',
-          actionKey: 'resolve_conflict' as const,
-        };
-      }
-      case 'merge_resolved_incomplete': {
-        const op = us?.resume_operation || 'update';
-        const branch = us?.resume_branch || 'main';
-        // v0.2.88 (MINOR-9): the autostash-pop sentinel reuses this badge kind,
-        // but its story is DIFFERENT — the merge SUCCEEDED and only restoring
-        // local WIP clashed; it was NOT "resolved outside the launcher" (after a
-        // restart the modal is simply gone). Branch the copy so it doesn't
-        // misdescribe the state, and point at the deferral's per-file steps
-        // (the resume marker-scan's generic `commit --amend` remediation is
-        // wrong for a stash-pop conflict).
-        // P2-M7: the branch itself now lives in `isAutostashPopResume`
-        // (stores/updater.ts) so this popover's copy and
-        // `OrchestratorUpdateProgressModal`'s overlay title decide it the
-        // same way instead of each carrying an independent check.
-        if (isAutostashPopResume(op)) {
-          return {
-            title: 'Finish Update',
-            desc:
-              `A recent update on \`${branch}\` merged successfully, but ` +
-              `restoring your uncommitted local changes (git \`--autostash\` ` +
-              `pop) conflicted, so \`install.py --update\` and the binary ` +
-              `refresh haven't run — last_installed_version is still ` +
-              `v${us?.installed_version || '?'} while source is ` +
-              `v${us?.source_version || '?'}. Resolve the conflicted file(s) ` +
-              `(the update wrote the exact per-file steps to ` +
-              `\`.claude/context/UPDATE_DEFERRED.md\`), then click Finish ` +
-              `Update.`,
-            buttonLabel: 'Finish Update',
-            actionKey: 'resume' as const,
-          };
-        }
-        return {
-          title: 'Continue Update',
-          desc:
-            `A previous orchestrator ${op} on \`${branch}\` was halted at a ` +
-            `conflict and resolved outside the launcher. The source is merged ` +
-            `but \`install.py --update\` and the binary refresh never ran — ` +
-            `last_installed_version is still v${us?.installed_version || '?'} ` +
-            `while source is v${us?.source_version || '?'}. Click Continue ` +
-            `Update to finish the install.`,
-          buttonLabel: 'Continue Update',
-          actionKey: 'resume' as const,
-        };
-      }
-      case 'binary_stale':
-        return {
-          title: 'Restart Launcher',
-          desc: us
-            ? `A newer launcher binary is on disk (v${us.on_disk_binary_version}). The running launcher is v${us.running_version}. Restart to load it.`
-            : 'A newer launcher binary is on disk. Restart to load it.',
-          buttonLabel: 'Restart Launcher',
-          actionKey: 'restart' as const,
-        };
-      case 'install_stale': {
-        // v0.2.60: distinguish a fresh apply from RESUMING a half-finished
-        // install. When a prior `install.py --update` already ran on this
-        // tree (installed_version present) but didn't reach the on-disk
-        // source version, the source is on disk yet the install is
-        // incomplete — clicking again RESUMES it, it isn't a brand-new
-        // install. Say so, so the user understands they're finishing a
-        // previously-interrupted update (e.g. one that hit the launcher.db
-        // lock and deferred), not starting over.
-        const priorInstall = !!us?.installed_version;
-        return {
-          title: priorInstall ? 'Resume Update' : 'Install Update',
-          desc: us
-            ? priorInstall
-              ? `A previous update to v${us.source_version} did not finish (last completed install: v${us.installed_version}). Click Resume Update to apply the rest.`
-              : `v${us.source_version} is on disk. Click Install Update to apply.`
-            : 'Source is newer than the last successful install. Click to apply.',
-          buttonLabel: priorInstall ? 'Resume Update' : 'Install Update',
-          actionKey: 'install' as const,
-        };
-      }
-      case 'remote_ahead':
-        return {
-          title: 'Update available',
-          desc: us
-            ? `A new version of the orchestrator is available on the remote. Current: v${us.installed_version || us.source_version || orchState.version || 'unknown'}.`
-            : 'A new version of the orchestrator is available.',
-          buttonLabel: 'Fetch + Install',
-          actionKey: 'fetch_install' as const,
-        };
-      default:
-        return {
-          title: 'Up to date',
-          desc: 'No pending updates detected.',
-          buttonLabel: '',
-          actionKey: null as
-            | null
-            | 'restart'
-            | 'install'
-            | 'fetch_install'
-            | 'resume'
-            | 'resolve_conflict',
-        };
-    }
-  });
+  // v0.2.100 (WP-08): copy + action per kind from the ONE wording table.
+  const kindCopy = $derived(
+    badgeCopyFor(upd.kind, orchState.updateStatus, orchState.version),
+  );
 
   $effect(() => {
     // Re-evaluate when the orchestrator store reports a change.
@@ -214,37 +89,9 @@
 
   async function handleAction() {
     popoverOpen = false;
-    if (kindCopy.actionKey === null) return;
-    // v0.2.40 (contributor) → v0.2.93: the full-screen blocking progress
-    // overlay is opened by `updater.beginOp()` INSIDE each store action
-    // (runUpdate / applyPendingInstall / runRestart / resumeUpdate), so the
-    // same overlay also covers the modal-launched ops (merge / rebase /
-    // keep-local / accept-upstream / abort) that this badge never sees.
-    // The overlay owns its own completion lifecycle (1.8 s hold at 100 %
-    // + 400 ms fade-out, or an immediate hand-over to a decision modal) and
-    // closes itself via ui.closeOrchestratorUpdateProgress().
-    switch (kindCopy.actionKey) {
-      case 'resolve_conflict':
-        // v0.2.93 (D): fetch the pending conflict payload from the backend
-        // and reopen the hoisted conflict modal. A plain read — no overlay.
-        await updater.openPendingConflict();
-        break;
-      case 'restart':
-        await updater.runRestart();
-        break;
-      case 'install':
-        await updater.applyPendingInstall();
-        break;
-      case 'fetch_install':
-        await updater.runUpdate();
-        break;
-      case 'resume':
-        // v0.2.51 Bug A: re-enter the post-merge tail of update_orchestrator
-        // (install.py --update + binary refresh + auto-restart). The Rust
-        // command audit-logs and refuses if conflict markers still present.
-        await updater.resumeUpdate();
-        break;
-    }
+    // v0.2.100 (WP-08): the store owns the action — the overlay is opened by
+    // `updater.beginOp()` inside it, errors are routed by `routeUpdateError`.
+    await updater.perform(kindCopy.action);
   }
 
   function handleDismiss() {
@@ -316,13 +163,19 @@
           <p class="popover-note">
             This clone is on a <strong>detached HEAD</strong> — it is not on a
             branch. Updates still apply, but the clone stays detached
-            afterwards. Preferences → Launcher updates has a one-click
+            afterwards. Preferences → Updates has a one-click
             reattach.
           </p>
         {/if}
         {#if binaryAhead}
           <p class="popover-note popover-note-warn">
             The running launcher is newer than the installed orchestrator — finish the update
+          </p>
+        {/if}
+        {#if kindCopy.binaryAlsoStale}
+          <p class="popover-note">
+            A newer launcher binary is also on disk; the update restarts into
+            the version it installs.
           </p>
         {/if}
         {#if upd.error}
@@ -335,7 +188,7 @@
           <button
             class="btn-3d btn-3d-primary btn-3d-sm"
             onclick={handleAction}
-            disabled={upd.updating || kindCopy.actionKey === null}
+            disabled={upd.updating || kindCopy.action === null}
           >
             {#if upd.updating}
               Working…
@@ -387,7 +240,7 @@
           <p class="popover-note">
             This clone is on a <strong>detached HEAD</strong>. That alone does
             not break the check, but it is worth fixing — Preferences →
-            Launcher updates has a one-click reattach.
+            Updates has a one-click reattach.
           </p>
         {/if}
         {#if binaryAhead}

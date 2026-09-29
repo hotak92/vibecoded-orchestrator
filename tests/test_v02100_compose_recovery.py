@@ -132,17 +132,33 @@ def test_refine_leaves_the_conflict_alone_without_positive_evidence(monkeypatch,
 # ---------------------------------------------------------------------------
 
 
+#: the field case: podman-compose made `infrastructure_default` for project
+#: `infrastructure`, then docker-compose v2 refused it for the missing label
+PODMAN_MADE = {"io.podman.compose.project": "infrastructure"}
+INSPECT = ["podman", "network", "inspect", "infrastructure_default", "--format",
+           "{{json .Labels}}"]
+
+
 class NetRun:
-    def __init__(self, attached="", ps_rc=0):
+    def __init__(self, attached="", ps_rc=0, labels=None, inspect_rc=0, raw=None):
         self.attached, self.ps_rc, self.calls = attached, ps_rc, []
+        self.labels = PODMAN_MADE if labels is None else labels
+        self.inspect_rc, self.raw = inspect_rc, raw
 
     def __call__(self, argv, **kw):
         self.calls.append(list(argv))
+        if argv[1:3] == ["network", "inspect"]:
+            out = self.raw if self.raw is not None else json.dumps(self.labels)
+            return _cp(argv, self.inspect_rc, out)
         if argv[1] == "ps":
             return _cp(argv, self.ps_rc, self.attached)
         if argv[1:3] == ["network", "rm"]:
             return _cp(argv)
         raise AssertionError(argv)
+
+    @property
+    def removed(self):
+        return any(c[1:3] == ["network", "rm"] for c in self.calls)
 
 
 def _net_failure():
@@ -150,30 +166,86 @@ def _net_failure():
     return cr.classify(stderr, runtime="podman")
 
 
-def test_network_with_nothing_attached_is_removed():
-    run = NetRun(attached="")
-    h = cr.heal(_net_failure(), runtime="podman", run=run, log=lambda m: None)
+def _net_heal(run, project="infrastructure"):
+    return cr.heal(_net_failure(), runtime="podman", run=run, log=lambda m: None,
+                   project=project)
+
+
+@pytest.mark.parametrize("labels", [
+    PODMAN_MADE,                                            # podman-compose family
+    {"com.docker.compose.project": "infrastructure"},       # docker-compose family
+])
+def test_compose_made_network_with_nothing_attached_is_removed_act(labels):
+    run = NetRun(attached="", labels=labels)
+    h = _net_heal(run)
     assert h.healed
     assert run.calls == [
+        INSPECT,
         ["podman", "ps", "-a", "--filter", "network=infrastructure_default", "-q"],
         ["podman", "network", "rm", "infrastructure_default"],
     ]
 
 
+@pytest.mark.parametrize("run_kw,why", [
+    ({"labels": {}}, "no compose project label"),                          # hand-made
+    ({"labels": {"io.podman.compose.project": "otherstack"}}, "otherstack"),  # other project
+    ({"labels": {"com.docker.compose.project": "Infrastructure"}}, "Infrastructure"),  # exact
+    ({"inspect_rc": 125}, "could not inspect"),                           # unreadable
+    ({"raw": "{not json"}, "could not parse"),                            # unparseable
+])
+def test_network_without_positive_provenance_is_never_removed_leave_alone(run_kw, why):
+    """W1R-01: "nothing attached" alone is not evidence the network is VCO's."""
+    run = NetRun(attached="", **run_kw)
+    h = _net_heal(run)
+    assert not h.healed and h.deferral_cid == cr.CID_NETWORK_LABEL_ATTACHED
+    assert why in h.reason
+    assert not run.removed
+    assert not any(c[1] == "ps" for c in run.calls), "provenance is checked FIRST"
+    row = cr.heal_deferral_entry(h, manual_cmd="cd x && up")
+    assert row is not None and "infrastructure_default" in row.command_to_apply
+    assert "network rm infrastructure_default" in row.command_to_apply  # commented recipe
+
+
+def test_network_heal_without_a_known_project_refuses():
+    run = NetRun(attached="")
+    h = _net_heal(run, project=None)
+    assert not h.healed and h.deferral_cid == cr.CID_NETWORK_LABEL_ATTACHED
+    assert run.calls == [] and not run.removed
+
+
 def test_network_with_attached_containers_is_never_removed_and_ledgered():
     run = NetRun(attached="abc123def456\n")
-    h = cr.heal(_net_failure(), runtime="podman", run=run, log=lambda m: None)
+    h = _net_heal(run)
     assert not h.healed and h.deferral_cid == cr.CID_NETWORK_LABEL_ATTACHED
-    assert not any(c[1:3] == ["network", "rm"] for c in run.calls)
+    assert not run.removed
     rows = cr.deferral_entries(cr.UpResult(1, heals=[h]), manual_cmd="cd x && up")
     assert [r.condition_id for r in rows] == [cr.CID_NETWORK_LABEL_ATTACHED]
 
 
 def test_network_whose_attachments_cannot_be_listed_is_left_alone():
     run = NetRun(ps_rc=125)
-    h = cr.heal(_net_failure(), runtime="podman", run=run, log=lambda m: None)
+    h = _net_heal(run)
     assert not h.healed and h.deferral_cid is None
-    assert not any(c[1:3] == ["network", "rm"] for c in run.calls)
+    assert not run.removed
+
+
+@pytest.mark.parametrize("argv,env,want", [
+    (["podman", "compose", "-f", "/x/infra/dc.yml", "-p", "vco", "up"], None, "vco"),
+    (["docker", "compose", "--project-name", "p1", "up"], None, "p1"),
+    (["docker", "compose", "--project-name=p2", "up"], None, "p2"),
+    (["docker-compose", "up"], {"COMPOSE_PROJECT_NAME": "envp"}, "envp"),
+    (["docker-compose", "up"], None, ""),
+])
+def test_compose_project_from_argv(argv, env, want):
+    assert cr.compose_project_from_argv(argv, env) == want
+
+
+def test_recovery_hands_the_argv_project_to_the_heal():
+    seen = []
+    script = ComposeScript((1, _net_failure().evidence), (0, ""))
+    _up(script, heal_fn=lambda f, **k: (seen.append(k.get("project")),
+                                        cp.HealResult(True, [], "healed"))[1])
+    assert seen == ["infrastructure"]  # ARGV's `-p infrastructure`
 
 
 # ---------------------------------------------------------------------------
@@ -206,7 +278,7 @@ class StorageWorld:
             return _cp(argv, 0, str(self.root) + "\n")
         if argv[1] == "unshare":
             return _cp(argv, self.unshare_rc, self.userns_mountinfo)
-        if argv[1:3] == ["rm", "--storage"]:
+        if argv[1:4] == ["rm", "--storage", "--force"]:
             return _cp(argv, self.rm_rc)
         raise AssertionError(argv)
 
@@ -232,8 +304,9 @@ def test_empty_storage_leftover_is_cleaned_non_recursively(tmp_path):
     assert h.healed, h.reason
     assert not (w.merged / "app").exists()
     assert w.merged.exists(), "merged/ itself is podman's to remove, never ours"
-    assert ["podman", "rm", "--storage", CID] in w.calls
-    assert h.actions[-1] == f"podman rm --storage {CID}"
+    # W1R-02: the verb verified by hand on 2026-09-29, after the rmdir.
+    assert ["podman", "rm", "--storage", "--force", CID] in w.calls
+    assert h.actions == [f"rmdir {w.merged / 'app'}", f"podman rm --storage --force {CID}"]
 
 
 def test_leftover_still_mounted_on_the_host_is_refused(tmp_path):
@@ -296,14 +369,71 @@ def test_storage_heal_does_not_apply_to_docker(tmp_path):
 
 
 def test_failed_storage_rm_is_reported(tmp_path):
+    """W1R-02 fail-closed: an rm this podman rejects is a refusal with the
+    EXACT manual recipe (real id, layer, merged path), never a guess."""
     w = StorageWorld(tmp_path, rm_rc=125)
     h = w.heal()
     assert not h.healed and h.deferral_cid == cr.CID_STORAGE_LEFTOVER_UNSAFE
+    row = cr.heal_deferral_entry(h, manual_cmd="cd x && up")
+    assert row is not None
+    recipe = row.command_to_apply
+    assert f"podman rm --storage --force {CID}" in recipe
+    assert f"grep {LAYER} /proc/self/mountinfo" in recipe
+    assert f"podman unshare grep {LAYER} /proc/self/mountinfo" in recipe
+    assert str(w.merged) in recipe and "rm -r" not in recipe.replace("never rm -r", "")
+    assert "<id>" not in recipe
+
+
+def test_refused_storage_heal_before_the_id_is_known_still_names_the_recipe(tmp_path):
+    w = StorageWorld(tmp_path, name="not_a_vco_name")
+    h = w.heal()
+    row = cr.heal_deferral_entry(h, manual_cmd="m")
+    assert row is not None and "podman rm --storage --force <id>" in row.command_to_apply
 
 
 # ---------------------------------------------------------------------------
 # socket heal routing (the heal itself is tested in test_v02100_compose_provider)
 # ---------------------------------------------------------------------------
+
+
+def test_socket_heal_probes_the_socket_compose_named(monkeypatch):
+    """W1R-04: the path in compose's error is the one checked, and the
+    provider is passed through (W1R-07)."""
+    stderr = next(c["stderr"] for c in CORPUS if c["id"] == "field_2026_09_29_socket_file_missing")
+    seen = {}
+    monkeypatch.setattr(cp, "heal_socket", lambda rt, **kw: (seen.update(kw),
+                                                           cp.HealResult(False))[1])
+    prov = cp.ComposeProvider("subcommand", cp.ENGINE_DOCKER_COMPOSE, (), "docker", "podman")
+    cr.heal(cr.classify(stderr, runtime="podman"), runtime="podman", run=lambda *a, **k: None,
+            log=lambda m: None, provider=prov)
+    assert seen["path"] == "/run/user/1000/podman/podman.sock" and seen["provider"] is prov
+
+
+def test_ok_socket_is_one_compose_attempt_and_no_heal_or_row():
+    """W1R-04: "nothing to heal" must end the loop — no three identical
+    retries, no "healed" record, no ledger row."""
+    stderr = next(c["stderr"] for c in CORPUS if c["id"] == "field_2026_09_29_socket_file_missing")
+    script = ComposeScript((1, stderr))
+    res = _up(script, heal_fn=lambda f, **k: cr.heal(
+        f, socket_heal=lambda: cp.heal_socket("podman", status=cp.SocketStatus(cp.SOCKET_OK)),
+        **k))
+    assert len(script.calls) == 1
+    assert [h.healed for h in res.heals] == [False]
+    assert cr.deferral_entries(res, manual_cmd="m") == []
+
+
+@pytest.mark.parametrize("system,actions,want,unwanted", [
+    ("Linux", ["systemctl --user restart podman.socket"], "systemctl --user restart", "machine"),
+    ("Linux", ["systemctl restart podman.socket"], "systemctl restart podman.socket", "--user"),
+    ("Darwin", ["podman machine start"], "podman machine start", "systemctl"),
+    ("Windows", ["podman machine start"], "podman machine start", "systemctl"),
+])
+def test_socket_row_recipe_matches_the_os(system, actions, want, unwanted):
+    """W1R-11: the recipe is the one for the OS the heal ran on."""
+    h = cp.HealResult(False, actions, "still missing", cr.CID_SOCKET_HEAL_FAILED)
+    row = cr.heal_deferral_entry(h, manual_cmd="m", system=system)
+    assert row is not None and want in row.command_to_apply
+    assert unwanted not in row.command_to_apply
 
 
 def test_socket_missing_heal_routes_to_the_socket_healer():

@@ -4516,6 +4516,7 @@ mod tests {
         // it's the cheaper path (no JSON to serialise).
         std::fs::write(install_root.join("CLAUDE.md"), "# stub").unwrap();
         std::fs::write(install_root.join("install.py"), "# stub").unwrap();
+        std::fs::write(install_root.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06
         std::fs::create_dir_all(install_root.join(".venv")).unwrap();
         db.app_state_set("launcher.install_path", install_root.to_str().unwrap())
             .unwrap();

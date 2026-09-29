@@ -46,13 +46,15 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
-  // v0.2.93 (field incident 2026-09-07): every handler here brackets its
-  // invoke with `updater.beginOp` / `endOp` so the ONE progress overlay
-  // (+layout) animates for keep-local / accept-upstream / continue / abort
-  // too — these ran with no live indicator before. The payload type is the
-  // shared declaration in `$lib/tauri-error-payload`.
+  // v0.2.93 (field incident 2026-09-07): every handler here drives the ONE
+  // progress overlay (+layout). v0.2.100 (WP-08): Continue is
+  // `updater.run('Resume')`; keep-local / accept-upstream / abort (git
+  // operations, not update kinds) bracket their invoke with
+  // `updater.beginOp` and end through `endOp` / `failOp` (the store's error
+  // router). The payload type is the shared declaration in
+  // `$lib/tauri-error-payload`.
   import { updater } from '$lib/stores/updater';
-  import { errorText, type OrchestratorConflictPayload } from '$lib/tauri-error-payload';
+  import type { OrchestratorConflictPayload } from '$lib/tauri-error-payload';
 
   let {
     payload,
@@ -208,9 +210,9 @@
       // Give the user a beat to see the toast before dismissing.
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Abort failed: ${detail}`;
-      updater.endOp(detail);
+      // v0.2.100 (WP-08, L3-F06): routed like every update failure.
+      const routed = updater.failOp(e);
+      if (routed.to === 'failed') error = `Abort failed: ${routed.message}`;
     } finally {
       aborting = false;
     }
@@ -288,10 +290,12 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Keep local failed: ${detail}`;
+      // v0.2.100 (WP-08, L3-F06): a structured payload (e.g. an untracked
+      // collision in the continued update) opens its modal; any other
+      // failure shows the same single message as the overlay.
+      const routed = updater.failOp(e);
+      if (routed.to === 'failed') error = `Keep local failed: ${routed.message}`;
       resolutionMode = null;
-      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -317,10 +321,9 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Accept upstream failed: ${detail}`;
+      const routed = updater.failOp(e);
+      if (routed.to === 'failed') error = `Accept upstream failed: ${routed.message}`;
       resolutionMode = null;
-      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -331,25 +334,21 @@
     if (!resumeReady) return;
     resuming = true;
     error = null;
-    updater.beginOp('resume');
+    // v0.2.100 (WP-08, AD-1): the ONE update action, kind `Resume` —
+    // audit-logs, refuses on stale/dirty state, then install.py --update +
+    // binary refresh + restart. The restart usually ends the process
+    // mid-call; the success branch is the crash-recovery path.
     try {
-      // resume_orchestrator_update audit-logs, refuses on stale/dirty
-      // state, then re-enters install.py --update + binary refresh +
-      // auto-restart. The auto-restart kills the launcher mid-call —
-      // in practice we never reach the `resumed = true` line, but it's
-      // there for crash-recovery paths where the restart hop fails.
-      await invoke<unknown>('resume_orchestrator_update', { path: installPath });
-      resumed = true;
-      updater.endOp();
-      toast.success('Update resumed — install.py is running.');
-      setTimeout(onClose, 600);
-    } catch (e) {
-      // The Rust command returns human-readable errors for the bad-state
-      // cases (still mid-merge, leftover markers, no sentinel). Surface
-      // verbatim — they're written FOR the user.
-      const detail = errorText(e);
-      error = `Continue Update failed: ${detail}`;
-      updater.endOp(detail);
+      const result = await updater.run('Resume');
+      if (result.ok) {
+        resumed = true;
+        toast.success('Update resumed — install.py is running.');
+        setTimeout(onClose, 600);
+      } else if (result.routed.to === 'failed') {
+        // Written FOR the user by the backend (still mid-merge, leftover
+        // markers, no sentinel) — shown verbatim, once.
+        error = `Continue Update failed: ${result.routed.message}`;
+      }
     } finally {
       resuming = false;
     }
