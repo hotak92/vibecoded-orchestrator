@@ -210,6 +210,21 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "_CHUNKER_REVISION unchanged at v0.2.92.1; "
         "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
     ),
+    "0.2.99": (
+        "No extraction-semantics change. `git diff v0.2.98..HEAD` across the "
+        "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) is "
+        "EMPTY — the release touches exactly two files, both in the "
+        "launcher: launcher/src/lib/gateway-freshness.ts (the "
+        "scheduleStartupCheck Illegal-invocation fix — frontend timers, "
+        "no extraction surface) and launcher/src-tauri/src/commands/"
+        "self_update.rs (the forced tag refspec + fetch exit-status "
+        "diagnostics — the update path, no extraction surface), plus "
+        "their tests and the release bookkeeping (CHANGELOG, version pins, "
+        "this ladder entry). _CHUNKER_REVISION unchanged at v0.2.92.1; "
+        "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.

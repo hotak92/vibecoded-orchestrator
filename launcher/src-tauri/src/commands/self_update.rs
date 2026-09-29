@@ -601,15 +601,26 @@ pub(crate) async fn serialized_fetch_upstream(
 
     let attempt = || async {
         let mut args: Vec<&str> = vec!["fetch", "--quiet"];
-        if matches!(policy, FetchPolicy::Tags) {
-            args.push("--tags");
-        }
         if no_write_fetch_head {
             args.push("--no-write-fetch-head");
         }
         args.push(VCO_UPSTREAM_REMOTE);
         if let Some(branch) = refspec {
             args.push(branch);
+        }
+        // v0.2.99: the Tags policy fetches an EXPLICIT forced refspec instead
+        // of `--tags`. `--tags` refuses to move a local tag that differs from
+        // the remote's — "would clobber existing tag", exit 1 — and under
+        // `--quiet` that rejection report is suppressed, so the failure read
+        // as "(no stderr)" and looked like a killed child (v0.2.98 field
+        // incident: the release workflow re-points tags after committing the
+        // dist binaries, so any clone that fetched between the first tag push
+        // and the re-point was wedged on every subsequent tag fetch, holding
+        // UPSTREAM_FETCH_LOCK through the whole 156s retry ladder each time).
+        // The leading `+` is git's canonical force-update form for a refspec;
+        // upstream release tags are canonical for this fetch by design.
+        if matches!(policy, FetchPolicy::Tags) {
+            args.push("+refs/tags/*:refs/tags/*");
         }
         // Through git_cmd's one program resolution, so a test's per-thread
         // lookup PATH reaches the fetch (review R6). The `--version` probe
@@ -635,6 +646,16 @@ pub(crate) async fn serialized_fetch_upstream(
             .last()
             .unwrap_or("")
             .to_string();
+        // v0.2.99: never return an EMPTY error. A silent non-zero exit (the
+        // `--quiet`-suppressed tag-clobber rejection was exactly this shape)
+        // left the logs with no datum to diagnose: no stderr, no exit code,
+        // no signal. `ExitStatus`'s Display prints `exit status: N` or
+        // `signal: N (SIG...)`, which is the missing evidence — the prefix
+        // below leans on that Display, so the line reads
+        // "(no stderr; git exit status: 1)".
+        if last.is_empty() {
+            return Err(format!("(no stderr; git {})", fetch.status));
+        }
         Err(last)
     };
 
@@ -4534,6 +4555,89 @@ mod tests {
             git_cmd::pin_absent_remote_head(&local, VCO_UPSTREAM_REMOTE);
 
             (tmp, local, remote)
+        }
+
+        // v0.2.99 regression: a RE-POINTED upstream tag must not wedge the
+        // Tags-policy fetch. The pre-fix invocation (`fetch --tags`) refuses
+        // to move a local tag that differs from the remote's — "would clobber
+        // existing tag", exit 1, and under `--quiet` even that report is
+        // suppressed, so the failure surfaced as "(no stderr)" and looked
+        // like a killed child. The release workflow re-points tags after
+        // committing dist binaries, so this is the FIELD shape: any clone
+        // fetched between the first tag push and the re-point was failing on
+        // every subsequent tag fetch, forever. The forced refspec
+        // (`+refs/tags/*:refs/tags/*`) is the fix.
+        #[tokio::test]
+        async fn tags_fetch_survives_a_repointed_upstream_tag() {
+            skip_if_no_git!();
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let root = tmp.path().to_path_buf();
+            let remote = root.join("remote.git");
+            let seed = root.join("seed");
+            let local = root.join("local");
+            std::fs::create_dir_all(&seed).unwrap();
+            std::fs::create_dir_all(&local).unwrap();
+
+            git(
+                &root,
+                &["init", "--bare", "--initial-branch=main", "-q", "remote.git"],
+            );
+            git(&seed, &["init", "--initial-branch=main", "-q"]);
+            std::fs::write(seed.join("README.md"), "c1\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "c1"]);
+            git(&seed, &["tag", "vX"]);
+            git(
+                &seed,
+                &["remote", "add", "vco_upstream", remote.to_str().unwrap()],
+            );
+            git(&seed, &["push", "-q", "vco_upstream", "main", "--tags"]);
+
+            // The local clone has vX at c1 — exactly what a user has if they
+            // fetched between a tag's first push and its re-point.
+            git(&local, &["init", "--initial-branch=main", "-q"]);
+            git(
+                &local,
+                &["remote", "add", "vco_upstream", remote.to_str().unwrap()],
+            );
+            git(&local, &["fetch", "-q", "vco_upstream", "--tags"]);
+
+            // Upstream re-points vX at a new commit (the dist-binary commit
+            // in the release flow) and force-pushes the tag.
+            std::fs::write(seed.join("README.md"), "c2\n").unwrap();
+            git(&seed, &["add", "-A"]);
+            git(&seed, &["commit", "-qm", "c2"]);
+            git(&seed, &["tag", "-f", "vX"]);
+            git(
+                &seed,
+                &["push", "-q", "--force", "vco_upstream", "main", "--tags"],
+            );
+
+            serialized_fetch_upstream(&local, FetchPolicy::Tags, None)
+                .await
+                .expect("tags fetch must survive a re-pointed upstream tag");
+
+            // The local tag must now match the re-pointed remote tag.
+            let read_tag = |cwd: &Path| -> String {
+                let out = StdCommand::new("git")
+                    .args(["rev-parse", "vX"])
+                    .current_dir(cwd)
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                    .output()
+                    .expect("git rev-parse vX");
+                assert!(
+                    out.status.success(),
+                    "rev-parse vX failed in {}",
+                    cwd.display()
+                );
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            };
+            assert_eq!(
+                read_tag(&local),
+                read_tag(&seed),
+                "the forced refspec must have moved the local tag"
+            );
         }
 
         // NOTE ON THE SEAM: these tests drive
