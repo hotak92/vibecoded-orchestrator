@@ -216,12 +216,28 @@ export interface TimerApi {
  * Arm the launcher-start check and return its cancel (review R1 F15). The
  * layout calls the cancel on teardown, so a remount (HMR, a dev reload) never
  * piles up checks from windows that no longer exist.
+ *
+ * v0.2.99: the default is now `undefined` + a direct call to the REAL
+ * globals. The previous default `{ setTimeout, clearTimeout }` captured
+ * DETACHED natives and invoked them as plain-object methods — a
+ * `TypeError: Illegal invocation` in every real browser engine (Chromium,
+ * WebKitGTK) the moment the layout mounted. Vitest's fake timers do not
+ * enforce the receiver, which is why the unit suite stayed green while the
+ * launcher's `+layout.svelte` onMount died BEFORE registering the
+ * orchestrator update check — v0.2.97 shipped with no update badge and no
+ * hourly re-check on any real install. The injected `timers` parameter is
+ * unchanged for tests that need fake timers.
  */
 export function scheduleStartupCheck(
   check: () => unknown,
-  timers: TimerApi = { setTimeout, clearTimeout },
+  timers?: TimerApi,
   delayMs: number = STARTUP_CHECK_DELAY_MS,
 ): () => void {
-  const handle = timers.setTimeout(() => void check(), delayMs);
-  return () => timers.clearTimeout(handle);
+  const handle = timers
+    ? timers.setTimeout(() => void check(), delayMs)
+    : setTimeout(() => void check(), delayMs);
+  return () => {
+    if (timers) timers.clearTimeout(handle);
+    else clearTimeout(handle);
+  };
 }

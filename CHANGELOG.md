@@ -7,6 +7,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.99] - 2026-09-29
+
+### Fixed — the launcher could not see or notify about updates (v0.2.99)
+
+- **The update badge and its hourly re-check never ran on any real install of
+  v0.2.97+.** `scheduleStartupCheck` (new in v0.2.97, for the gateway-freshness
+  prompt) captured the global `setTimeout`/`clearTimeout` into a plain object
+  and invoked them as object methods — detached natives, which throw
+  `TypeError: Illegal invocation` in every real browser engine (Chromium,
+  WebKitGTK). The call sits in `+layout.svelte`'s `onMount` BEFORE
+  `orchestrator.checkStatus()` is registered, so the throw killed the mount:
+  no update badge, no hourly poll, and the imperative `goto()` navigation on
+  the same layout tree stopped working (the Preferences "Open" button and the
+  "Preferences → Updates" inline link appeared dead). Unit tests stayed green
+  because vitest's fake timers do not enforce the native receiver. The
+  default is now `undefined` with a direct call to the real globals; the
+  injectable `timers` parameter is unchanged for tests. Verified in a real
+  browser against the production bundle: zero page errors at mount, and the
+  `checkStatus` → `check_for_updates` chain runs.
+- **The tag-warming fetch wedged permanently on clones whose local tags differ
+  from upstream's.** The Release workflow re-points a tag after committing the
+  dist binaries, so any clone fetched between the first tag push and the
+  re-point has a local tag `git fetch --tags` refuses to move — "would clobber
+  existing tag", exit 1 — and under `--quiet` that rejection report is
+  suppressed, so the failure logged as `(no stderr)` and mimicked a killed
+  child (17 tags, 5 silent failures per ladder, on the field install that
+  found this). Because the Tags ladder shares the process-wide fetch lock, it
+  also starved every other update check behind 156s of retries. The Tags
+  policy now fetches the explicit forced refspec `+refs/tags/*:refs/tags/*`
+  (upstream release tags are canonical for this fetch by design).
+  Red-proofed: with the old `--tags` invocation the new regression test
+  fails with the field symptom; with the forced refspec it passes and the
+  local tag moves.
+- **A silent non-zero git exit no longer surfaces as "(no stderr)".** When a
+  fetch fails with empty stderr, the error string now carries git's exit
+  status (`exit status: N` / `signal: N`), the single datum that separates a
+  refused fetch from a killed child — the missing evidence that cost the
+  v0.2.98 field debugging session most of its time.
+
 ## [0.2.98] - 2026-09-29
 
 ### Fixed — a request the gateway repaired was counted as a turn that never happened (v0.2.98)
