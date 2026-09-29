@@ -611,7 +611,71 @@ pub async fn set_project_module_enabled(
     // side-effect.
     spawn_re_render_claude_md(&db, &project_id);
 
+    // v0.2.100 (AD-7, L5-F03): a module row can change what the bundle
+    // DELIVERS (today: the model-gateway agent definitions), so the toggle
+    // runs the ordinary bundle update instead of leaving the delivery — and
+    // the re-rendered CLAUDE.md's claim about it — to whenever the user next
+    // updates. The decision of WHAT to deliver stays in Python
+    // (`vco_lib.module_gated_delivery`); this only triggers the engine.
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+
     Ok(())
+}
+
+/// Resolve `project_id`'s folder and hand it to `run`. Split from the spawn
+/// so the "a toggle triggers delivery" wiring is testable without a Tauri
+/// runtime. Soft-fail: an unknown project or a missing folder is logged and
+/// nothing runs (the DB row already landed; the next update delivers).
+fn schedule_bundle_update_for_project(db: &Db, project_id: &str, run: impl FnOnce(String, PathBuf)) {
+    match db.get_project(project_id) {
+        Ok(Some(p)) => {
+            let folder = PathBuf::from(&p.folder_path);
+            if folder.is_dir() {
+                run(project_id.to_string(), folder);
+            } else {
+                tracing::warn!(
+                    "[vct] module toggle: project folder {} does not exist; the next \
+                     bundle update delivers",
+                    folder.display()
+                );
+            }
+        }
+        Ok(None) => tracing::warn!(
+            "[vct] module toggle: project {} not found; no bundle update",
+            project_id
+        ),
+        Err(e) => tracing::warn!(
+            "[vct] module toggle: db lookup for {} failed: {}; no bundle update",
+            project_id,
+            e
+        ),
+    }
+}
+
+/// Background `install-bundle --update` for one project, single-flighted per
+/// project so two quick toggles cannot run two engines on one manifest.
+fn spawn_bundle_update(project_id: String, folder: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        let key = format!("module_toggle_bundle_update:{project_id}");
+        let Some(_guard) = crate::commands::single_flight::try_begin(key) else {
+            tracing::info!(
+                "[vct] module toggle: a bundle update for project {} is already \
+                 running; it (or the next update) delivers",
+                project_id
+            );
+            return;
+        };
+        let (warnings, _summary) =
+            crate::commands::projects_v2::run_install_bundle_update(&folder).await;
+        for w in &warnings {
+            tracing::warn!("[vct] module toggle bundle update ({}): {}", project_id, w);
+        }
+        tracing::info!(
+            "[vct] module toggle: bundle update finished for project {} ({} warning(s))",
+            project_id,
+            warnings.len()
+        );
+    });
 }
 
 /// Background re-render of `<project_folder>/CLAUDE.md` after a module
@@ -1623,6 +1687,24 @@ mod tests {
         let db = make_db_with_project("p1", "Acme", dir.path());
         let r = db.is_module_active("p1", "diagrams").unwrap();
         assert!(!r, "unknown module should be inactive (got {})", r);
+    }
+
+    /// v0.2.100 (AD-7, L5-F03): the toggle triggers the bundle update for
+    /// the toggled project's folder (act) — and runs nothing for a project
+    /// whose folder is gone or that is not registered (leave-alone).
+    #[test]
+    fn module_toggle_schedules_the_bundle_update_for_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let mut seen: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "p1", |id, f| seen.push((id, f)));
+        assert_eq!(seen, vec![("p1".to_string(), dir.path().to_path_buf())]);
+
+        let mut none: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "missing", |id, f| none.push((id, f)));
+        let gone = make_db_with_project("p2", "Gone", &dir.path().join("absent"));
+        schedule_bundle_update_for_project(&gone, "p2", |id, f| none.push((id, f)));
+        assert!(none.is_empty(), "nothing may run without a real folder: {none:?}");
     }
 
     #[test]

@@ -343,6 +343,7 @@ def test_container_drift_refreshes_a_vco_managed_row_project_and_mount(session):
                            containers=[_container("infrastructure", "/some/models")],
                            containers_listed=True, session=session)
     out = sr.decide(inp)
+    assert out.row is not None
     assert out.row.compose_project == "infrastructure"
     assert out.row.data_mount == _bind("/some/models")
     assert out.row.port == 11435 and out.row.mode == "vco_managed"
@@ -356,6 +357,7 @@ def test_a_vco_managed_row_is_not_moved_to_the_containers_port():
                           mounts=(det.Mount("bind", "/m", OLLAMA_DEST),))
     out = sr.decide(sr.ServiceInputs(service="ollama", existing=row, containers=[c],
                                      containers_listed=True))
+    assert out.row is not None
     assert out.row.port == 11435
 
 
@@ -367,6 +369,7 @@ def test_service_flag_vco_keeps_the_recorded_mount():
     out = sr.decide(sr.ServiceInputs(service="ollama", existing=row,
                                      choice=sr.Choice("ollama", "vco", None),
                                      port_free=lambda _p: True))
+    assert out.row is not None
     assert out.row.data_mount == _bind("/some/models")
     assert not out.clear_mount
 
@@ -378,6 +381,7 @@ def test_vco_copy_never_inherits_an_adopted_containers_mount(tmp_path):
     out = sr.decide(sr.ServiceInputs(service="ollama", existing=adopted,
                                      choice=sr.Choice("ollama", "vco", None),
                                      taken_ports=frozenset({11434}), port_free=lambda _p: True))
+    assert out.row is not None
     assert out.row.data_mount is None and out.clear_mount
     db = make_launcher_db(tmp_path / "launcher.db")
     se.write_rows([adopted], db_path=db)
@@ -493,17 +497,478 @@ def test_guard_compose_set_ledgers_and_prints_a_refusal(world):
     refused = di.guard_compose_set(["ollama"], runtime="podman", infra_dir=infra,
                                    compose_argv=lambda: ["podman", "compose"],
                                    rows=se.load_rows(db), deferral_report=ledger,
-                                   run=box.run, out=printed.append)
+                                   run=box.run, out=printed.append, db_path=db)
     assert refused == {"ollama"}
     assert [e.condition_id for e in ledger.entries] == [di.CID_RECREATE_REFUSED]
     assert any("[refuse-recreate] ollama" in p for p in printed)
     assert box.calls("rm") == [] and box.calls("up") == []
 
 
-def test_row_and_rows_are_not_mutated_by_the_guard(world):
+def test_the_callers_row_and_rows_are_not_mutated_but_the_result_carries_the_record(world):
+    """W2R-01 (b): the guard never edits the caller's objects — it RETURNS the
+    row as it left it (``GuardResult.row``: the recorded mount), which is what
+    a batch must thread into the next service's projection."""
     root, infra, models, db = world
     row = _ollama_row()
     se.write_rows([row], db_path=db)
+    rows = dict(se.load_rows(db))
+    before = dict(rows)
     box = Box(infra, live=_live_bind(models))
-    g = _guard(box, infra, db, row)
+    g = di.guard_recreate("ollama", runtime="podman", infra_dir=infra,
+                          compose_argv=["podman", "compose"], row=row, rows=rows,
+                          db_path=db, run=box.run)
     assert g.ok and row.data_mount is None and replace(row) == row
+    assert rows == before and rows["ollama"].data_mount is None
+    assert g.row is not None and g.row.data_mount == _bind(models)
+    assert replace(g.row, data_mount=None) == row
+
+
+def test_a_refused_guard_returns_the_callers_row_unchanged(world):
+    root, infra, models, db = world
+    se.write_rows([_ollama_row(VOLUME)], db_path=db)
+    row = se.load_rows(db)["ollama"]
+    g = _guard(Box(infra, live=_live_bind(models)), infra, db, row)
+    assert g.verdict == di.REFUSE_DIFFERENT and g.row == row
+
+
+# ─── W2R-01: a batch never drops a sibling's recorded data knob ─────────
+
+EMBED_DEST = "/cache"
+
+
+class TwoBox:
+    """A fake runtime + compose for ``vco_ollama`` AND ``vco_code_embed``.
+    ``compose config`` renders BOTH services from the ``infrastructure/.env``
+    on disk exactly like the base file's knobs (docker compose v2 long
+    syntax); ``compose up`` snapshots that ``.env`` — what the one up really
+    ran with."""
+
+    KNOBS = {"ollama": ("VCT_OLLAMA_DATA_SOURCE", "ollama_data", "vco_ollama_data", OLLAMA_DEST),
+             "code_embed": ("VCT_CODE_EMBED_CACHE_SOURCE", "code_embed_cache",
+                            "vco_code_embed_cache", EMBED_DEST)}
+
+    def __init__(self, infra: Path, live: dict, names: Optional[dict] = None):
+        self.infra = infra
+        self.live = live                       # service -> [inspect .Mounts entries]
+        self.names = names or {"ollama": "vco_ollama", "code_embed": "vco_code_embed"}
+        self.argv: list[list[str]] = []
+        self.configs: list[dict] = []          # parsed renders, in call order
+        self.env_at_up: list[dict] = []
+
+    def env_file(self) -> dict:
+        path = self.infra / ".env"
+        return dict(parse_env_lines(path.read_text(encoding="utf-8"))) if path.is_file() else {}
+
+    def _render(self) -> dict:
+        env = self.env_file()
+        services, volumes = {}, {}
+        for service, (knob, key, default, dest) in self.KNOBS.items():
+            source = env.get(knob, "")
+            vol = ({"type": "bind", "source": source, "target": dest, "bind": {"create_host_path": True}}
+                   if source else {"type": "volume", "source": key, "target": dest, "volume": {}})
+            services[service] = {"volumes": [vol]}
+            volumes[key] = {"name": default}
+        return {"name": "infrastructure", "services": services, "volumes": volumes}
+
+    def run(self, argv, **_kw):
+        import yaml
+
+        argv = [str(a) for a in argv]
+        self.argv.append(argv)
+        if argv[-1] == "config":
+            doc = self._render()
+            self.configs.append(doc)
+            return _cp(argv, 0, yaml.safe_dump(doc))
+        if argv[1:3] == ["compose", "version"]:
+            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
+        if "up" in argv:
+            self.env_at_up.append(self.env_file())
+            return _cp(argv)
+        if argv[1] == "inspect":
+            name, fmt = argv[-1], argv[argv.index("--format") + 1]
+            service = next((s for s, n in self.names.items() if n == name), None)
+            if service is None or service not in self.live:
+                return _cp(argv, 125, "", f"Error: no such container {name}")
+            if fmt == "{{.Id}}":
+                return _cp(argv, 0, "abc123\n")
+            if fmt == "{{json .Mounts}}":
+                return _cp(argv, 0, json.dumps(self.live[service]))
+        if argv[1] == "rm":
+            return _cp(argv)
+        raise AssertionError(f"unexpected argv {argv}")
+
+    def calls(self, word: str) -> list[list[str]]:
+        if word == "up":
+            return [a for a in self.argv if "up" in a and a[-1] != "config"]
+        return [a for a in self.argv if len(a) > 1 and a[1] == word]
+
+
+def _embed_row(mount: Optional[dict] = None) -> se.EndpointRow:
+    return se.EndpointRow(service="code_embed", mode="vco_managed", port=11440, data_mount=mount,
+                          container_name="vco_code_embed", source="install_probe")
+
+
+@pytest.fixture()
+def two(world, tmp_path):
+    root, infra, models, db = world
+    cache = tmp_path / "hf-cache"
+    (cache / "models--x").mkdir(parents=True)
+    live = {"ollama": _live_bind(models),
+            "code_embed": [{"Type": "bind", "Source": str(cache), "Destination": EMBED_DEST}]}
+    return infra, models, cache, db, TwoBox(infra, live)
+
+
+def _both_knobs(env: dict, models, cache) -> bool:
+    return (env.get("VCT_OLLAMA_DATA_SOURCE") == str(models)
+            and env.get("VCT_CODE_EMBED_CACHE_SOURCE") == str(cache))
+
+
+def _render_binds(doc: dict) -> dict:
+    return {s: (c["volumes"][0]["type"], c["volumes"][0]["source"]) for s, c in doc["services"].items()}
+
+
+def test_a_two_service_up_batch_on_null_rows_keeps_both_knobs_for_the_one_compose_up(two):
+    """The owner's damaged-machine shape: BOTH rows vco_managed with a NULL
+    mount, both containers on binds. The hooks' `up` verb guards ollama,
+    then code_embed, then runs ONE compose up — which must see both knobs."""
+    infra, models, cache, db, box = two
+    se.write_rows([_ollama_row(), _embed_row()], db_path=db)
+    out: list[str] = []
+    res = sl.up_services(["ollama", "code_embed"], compose_dir=infra,
+                         compose_argv=["podman", "compose"], runtime="podman", db_path=db,
+                         run=box.run, out=out.append)
+    assert res.cleared == ["ollama", "code_embed"] and res.returncode == 0, out
+    assert len(box.env_at_up) == 1 and _both_knobs(box.env_at_up[0], models, cache), box.env_at_up
+    # the render read for the LAST service shows BOTH binds
+    assert _render_binds(box.configs[-1]) == {"ollama": ("bind", str(models)),
+                                              "code_embed": ("bind", str(cache))}
+    rows = se.load_rows(db)
+    assert rows["ollama"].data_mount == _bind(models)
+    assert rows["code_embed"].data_mount == {"kind": "bind", "source": str(cache),
+                                             "destination": EMBED_DEST}
+
+
+def test_a_two_service_step5_batch_on_null_rows_keeps_both_knobs(two):
+    """The same through install.py step 5's `guard_compose_set`."""
+    infra, models, cache, db, box = two
+    se.write_rows([_ollama_row(), _embed_row()], db_path=db)
+    rows = se.load_rows(db)
+    refused = di.guard_compose_set(["ollama", "code_embed"], runtime="podman", infra_dir=infra,
+                                   compose_argv=["podman", "compose"], rows=rows, run=box.run,
+                                   out=lambda _l: None, db_path=db)
+    assert refused == set()
+    assert _both_knobs(box.env_file(), models, cache), box.env_file()
+    assert _render_binds(box.configs[-1])["ollama"] == ("bind", str(models))
+    assert rows["ollama"].data_mount is None  # the caller's mapping is not mutated
+
+
+def test_a_two_service_batch_on_recorded_rows_leaves_the_file_as_it_is(two):
+    """Leave-alone: the rows already carry both mounts — nothing is recorded,
+    the projected .env is identical before and after the second guard."""
+    infra, models, cache, db, box = two
+    se.write_rows([_ollama_row(_bind(models)), _embed_row(
+        {"kind": "bind", "source": str(cache), "destination": EMBED_DEST})], db_path=db)
+    from vco_lib import compose_env
+
+    compose_env.write_service_keys(infra, se.load_rows(db), runtime="podman")
+    before = (infra / ".env").read_bytes()
+    out: list[str] = []
+    res = sl.up_services(["ollama", "code_embed"], compose_dir=infra,
+                         compose_argv=["podman", "compose"], runtime="podman", db_path=db,
+                         run=box.run, out=out.append)
+    assert res.returncode == 0 and not any("recorded" in line for line in out), out
+    assert (infra / ".env").read_bytes() == before
+    assert _both_knobs(box.env_at_up[0], models, cache)
+
+
+def test_the_second_guard_of_a_batch_projects_the_first_guards_record(two):
+    """W2R-01 (b), isolated from the writer: the rows map handed to the
+    SECOND guard already carries the mount the first one recorded."""
+    infra, models, cache, db, box = two
+    se.write_rows([_ollama_row(), _embed_row()], db_path=db)
+    seen: list = []
+    real = di.guard_recreate
+
+    def spy(service, **kw):
+        seen.append((service, dict(kw["rows"])))
+        return real(service, **kw)
+
+    with mock.patch.object(di, "guard_recreate", spy):
+        sl.up_services(["ollama", "code_embed"], compose_dir=infra,
+                       compose_argv=["podman", "compose"], runtime="podman", db_path=db,
+                       run=box.run, out=lambda _l: None)
+        di.guard_compose_set(["ollama", "code_embed"], runtime="podman", infra_dir=infra,
+                             compose_argv=["podman", "compose"],
+                             rows={"ollama": _ollama_row(), "code_embed": _embed_row()},
+                             run=box.run, out=lambda _l: None, db_path=db)
+    by_call = [(svc, rows["ollama"].data_mount) for svc, rows in seen]
+    assert by_call == [("ollama", None), ("code_embed", _bind(models))] * 2, by_call
+
+
+def test_a_sibling_outside_the_batch_keeps_its_knob(two):
+    """W2R-01 (a), the writer: only code_embed is composed while ollama's
+    row is still NULL — ollama's knob, already in the block, survives the
+    projection (no batch threading can help here: ollama is not in it)."""
+    infra, models, cache, db, box = two
+    from vco_lib import compose_env
+
+    compose_env.write_service_keys(infra, {"ollama": _ollama_row(_bind(models))}, runtime="podman")
+    se.write_rows([_ollama_row(), _embed_row()], db_path=db)
+    res = sl.up_services(["code_embed"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", db_path=db, run=box.run, out=lambda _l: None)
+    assert res.returncode == 0
+    assert _both_knobs(box.env_at_up[0], models, cache), box.env_at_up
+
+
+# ─── W2R-01 (a): the writer never drops a data knob by omission ─────────
+
+
+def _keys(infra: Path) -> dict:
+    return dict(parse_env_lines((infra / ".env").read_text(encoding="utf-8")))
+
+
+@pytest.mark.parametrize("sibling", [
+    pytest.param(lambda: _ollama_row(), id="vco_managed-without-a-mount"),
+    pytest.param(lambda: None, id="no-row"),
+    pytest.param(lambda: se.EndpointRow(service="ollama", mode="adopted_external", port=11434,
+                                        source="user_cli"), id="not-vco_managed"),
+])
+def test_an_in_block_data_knob_survives_a_row_that_states_none(tmp_path, sibling):
+    from vco_lib import compose_env
+
+    compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row(_bind("/srv/my models"))},
+                                   runtime="podman")
+    rows = {"code_embed": _embed_row()}
+    row = sibling()
+    if row is not None:
+        rows["ollama"] = row
+    result = compose_env.write_service_keys(tmp_path, rows, runtime="podman")
+    got = _keys(tmp_path)
+    assert got["VCT_OLLAMA_DATA_SOURCE"] == "/srv/my models"
+    assert result.carried["VCT_OLLAMA_DATA_SOURCE"] == "/srv/my models"
+    assert (tmp_path / ".env").read_text().count("VCT_OLLAMA_DATA_SOURCE=") == 1
+
+
+def test_a_stated_mount_replaces_the_knob_pair(tmp_path):
+    """Act: the row states the OTHER half (a volume) → the bind knob leaves."""
+    from vco_lib import compose_env
+
+    compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row(_bind("/srv/m"))},
+                                   runtime="podman")
+    result = compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row(VOLUME)},
+                                            runtime="podman")
+    got = _keys(tmp_path)
+    assert got["VCT_OLLAMA_VOLUME_NAME"] == DEFAULT_VOLUME
+    assert "VCT_OLLAMA_DATA_SOURCE" not in got and not result.carried
+
+
+def test_a_row_less_service_keeps_its_port_keys_and_a_present_rows_unstated_port_leaves(tmp_path):
+    from vco_lib import compose_env
+
+    weav = se.EndpointRow(service="weaviate", mode="vco_managed", port=18081, grpc_port=15052,
+                          source="user_cli")
+    compose_env.write_service_keys(tmp_path, {"weaviate": weav, "ollama": _ollama_row()},
+                                   runtime="podman")
+    compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row()}, runtime="podman")
+    got = _keys(tmp_path)
+    assert (got["WEAVIATE_PORT"], got["WEAVIATE_GRPC_PORT"]) == ("18081", "15052")
+    adopted = se.EndpointRow(service="weaviate", mode="adopted_external", port=8080,
+                             source="user_cli")
+    compose_env.write_service_keys(tmp_path, {"weaviate": adopted}, runtime="podman")
+    assert "WEAVIATE_PORT" not in _keys(tmp_path)
+
+
+def test_a_carried_knob_never_duplicates_an_outside_line(tmp_path):
+    from vco_lib import compose_env
+
+    compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row(_bind("/srv/block"))},
+                                   runtime="podman")
+    env = tmp_path / ".env"
+    env.write_text(env.read_text() + "VCT_OLLAMA_DATA_SOURCE=/srv/outside\n", encoding="utf-8")
+    result = compose_env.write_service_keys(tmp_path, {"ollama": _ollama_row()}, runtime="podman")
+    text = env.read_text()
+    assert text.count("VCT_OLLAMA_DATA_SOURCE=") == 1 and "/srv/outside" in text
+    assert "VCT_OLLAMA_DATA_SOURCE" not in result.carried
+
+
+# ─── migrate_managed_service: a restore never writes the NULL row back ──
+
+
+def test_a_guard_refusal_restores_the_observed_mount_not_the_null_row(tmp_path):
+    """The guard projected the live mount into .env, then refused (`compose
+    config` failed). The restore that follows must project the OBSERVED
+    mount — never the NULL row it started from (W2R-01 (b))."""
+    from tests.test_v0297_service_lifecycle import EmbedWorld
+    from types import SimpleNamespace
+    from vco_lib import compose_env, containers
+
+    cache = tmp_path / "hf-cache"
+    (cache / "models--x").mkdir(parents=True)
+    w = EmbedWorld(tmp_path, cache={"kind": "bind", "source": str(cache)})
+    w.config_rc = 1
+    db = make_launcher_db(tmp_path / "launcher.db")
+    se.write_rows([_embed_row()], db_path=db)       # the NULL row
+    projected: list = []
+    real_write = compose_env.write_service_keys
+
+    def spy(infra, rows, **kw):
+        projected.append(rows.get("code_embed"))
+        return real_write(infra, rows, **kw)
+
+    with mock.patch.object(compose_env, "write_service_keys", spy), \
+            mock.patch.object(containers, "_resolve_runtime", return_value="podman"):
+        result = sl.migrate_managed_service(
+            w.root, _embed_row(), runtime="podman", run=w.run, fetch=w.fetch, db_path=db,
+            commit=lambda rows: se.write_rows(list(rows), db_path=db),
+            resolution=SimpleNamespace(compose=["podman", "compose"], compose_form="subcommand"),
+            log=lambda _m: None, health_timeout_s=0.0, health_interval_s=0.0)
+    assert result.status == "refused" and "compose config" in result.reason, result.reason
+    assert len(projected) == 2, projected           # the guard's projection, then the restore
+    live = {"kind": "bind", "source": str(cache), "destination": EMBED_DEST}
+    assert projected[-1] is not None and projected[-1].data_mount == live, projected
+    env = dict(parse_env_lines((w.infra / ".env").read_text(encoding="utf-8")))
+    assert env["VCT_CODE_EMBED_CACHE_SOURCE"] == str(cache)
+
+
+# ─── W2R-04: the `compose config` render corpus ─────────────────────────
+
+CORPUS = json.loads((REPO_ROOT / "tests" / "fixtures" / "compose_config_render_corpus.json")
+                    .read_text(encoding="utf-8"))
+
+
+def _fill(value, infra: Path):
+    if isinstance(value, dict):
+        return {k: _fill(v, infra) for k, v in value.items()}
+    if isinstance(value, str):
+        return value.replace("{infra}", str(infra))
+    return value
+
+
+@pytest.mark.parametrize("case", CORPUS["cases"], ids=lambda c: c["name"])
+def test_compose_config_render_corpus(tmp_path, case):
+    infra = tmp_path / "infrastructure"
+    infra.mkdir()
+    render = case["render"]
+
+    def run(argv, **_kw):
+        assert argv[-1] == "config", argv
+        return _cp(argv, 0, render)
+
+    eff = di.effective_compose_mount(infra, case["service"], ["docker", "compose"],
+                                     files=[infra / "docker-compose.yml"],
+                                     project=case["project"] or "", run=run)
+    if "expect_error" in case:
+        assert eff.error, eff
+        for needle in case["expect_error"]:
+            assert needle in eff.error, (needle, eff.error)
+        # fail CLOSED: an unreadable render never proves a recreate
+        live = di.LiveMount(di.LIVE_PRESENT, "c", _bind("/srv/anything"))
+        assert di.recreate_preserves_data(case["service"], None, live, eff)[0] == di.REFUSE_UNKNOWN
+        return
+    assert eff.error == "", eff.error
+    assert eff.mount == _fill(case["expect_mount"], infra)
+    spec = di._sa.mount_from_inspect(_fill(case["live"], infra))
+    live = di.LiveMount(di.LIVE_PRESENT, "c", di._as_row_mount(spec))
+    assert di.recreate_preserves_data(case["service"], None, live, eff)[0] == case["expect_verdict"]
+
+
+def test_the_corpus_covers_every_shape_the_review_named():
+    names = " | ".join(c["name"] for c in CORPUS["cases"])
+    for shape in ("docker compose v2", "podman-compose", "Windows", "WSL2", "name:", "FAIL CLOSED"):
+        assert shape in names, shape
+
+
+def test_a_stored_mount_keeps_the_runtimes_own_spelling():
+    """The comparison folds Windows spellings; the ROW never does."""
+    live = {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/u/m", "Destination": OLLAMA_DEST}
+    row = di._as_row_mount(di._sa.mount_from_inspect(live))
+    assert row is not None and row["source"] == "/run/desktop/mnt/host/c/Users/u/m"
+    assert di.mount_key(row) == di.mount_key(_bind("C:\\Users\\u\\m"))
+
+
+# ─── W2R-05: a container under a historical alias is PRESENT ────────────
+
+
+def test_an_alias_named_container_is_present_never_nothing_to_lose(two):
+    infra, models, cache, db, box = two
+    from vco_lib import containers
+
+    alias = containers.all_known_names("ollama")[1]
+    box.names = {"ollama": alias, "code_embed": "vco_code_embed"}
+    live = di.capture_live_mount("ollama", "podman", run=box.run,
+                                 names=di.container_names("ollama", _ollama_row(container_name=None)))
+    assert live.state == di.LIVE_PRESENT and live.ref == alias
+    se.write_rows([_ollama_row(container_name=None)], db_path=db)
+    # not being removed: composing vco_ollama beside it is refused, nothing touched
+    res = sl.up_services(["ollama"], compose_dir=infra, compose_argv=["podman", "compose"],
+                         runtime="podman", db_path=db, run=box.run, out=lambda _l: None)
+    assert res.refused == ["ollama"] and box.calls("rm") == [] and box.calls("up") == []
+    assert "two containers on one data location" in res.entries[0].detected
+    refused = di.guard_compose_set(["ollama"], runtime="podman", infra_dir=infra,
+                                   compose_argv=["podman", "compose"], rows=se.load_rows(db),
+                                   run=box.run, out=lambda _l: None, db_path=db)
+    assert refused == {"ollama"}
+
+
+def test_an_alias_named_zombie_is_removed_then_recreated_on_its_data(two):
+    infra, models, cache, db, box = two
+    from vco_lib import containers
+
+    alias = containers.all_known_names("ollama")[1]
+    box.names = {"ollama": alias, "code_embed": "vco_code_embed"}
+    se.write_rows([_ollama_row(container_name=None)], db_path=db)
+    res = sl.up_services(["ollama"], recreate=["ollama"], compose_dir=infra,
+                         compose_argv=["podman", "compose"], runtime="podman", db_path=db,
+                         run=box.run, out=lambda _l: None)
+    assert res.returncode == 0 and res.removed == [alias]
+    assert box.env_at_up[0]["VCT_OLLAMA_DATA_SOURCE"] == str(models)
+
+
+# ─── W2R-09: an unreadable registry never recreates an existing container ─
+
+
+def test_an_unreadable_registry_refuses_a_live_container(world):
+    """The data WOULD come along (the knob is on disk, the render binds the
+    models) — but whether VCO owns the container is unknown: do nothing."""
+    root, infra, models, db = world
+    (infra / ".env").write_text(f"VCT_OLLAMA_DATA_SOURCE={models}\n", encoding="utf-8")
+    box = Box(infra, live=_live_bind(models))
+    out: list[str] = []
+    with mock.patch.object(se, "load_rows", side_effect=se.ServiceRegistryUnavailable("locked")):
+        res = sl.up_services(["ollama"], recreate=["ollama"], compose_dir=infra,
+                             compose_argv=["podman", "compose"], runtime="podman", run=box.run,
+                             out=out.append)
+    assert res.refused == ["ollama"] and res.returncode == 3
+    assert box.calls("rm") == [] and box.calls("up") == []
+    assert any("could not be read" in line and "locked" in line for line in out), out
+
+
+def test_an_unreadable_registry_still_creates_a_missing_container(world):
+    root, infra, models, db = world
+    box = Box(infra, exists=False)
+    with mock.patch.object(se, "load_rows", side_effect=se.ServiceRegistryUnavailable("locked")):
+        res = sl.up_services(["ollama"], compose_dir=infra, compose_argv=["podman", "compose"],
+                             runtime="podman", run=box.run, out=lambda _l: None)
+    assert res.cleared == ["ollama"] and res.returncode == 0 and len(box.calls("up")) == 1
+
+
+# ─── W2R-10: the printed inspect recipe names the runtime asked ─────────
+
+
+@pytest.mark.parametrize("runtime", ["podman", "docker"])
+def test_the_refusal_recipe_names_the_guards_runtime(world, runtime):
+    root, infra, models, db = world
+    se.write_rows([_ollama_row(VOLUME)], db_path=db)
+    box = Box(infra, live=_live_bind(models))
+    g = di.guard_recreate("ollama", runtime=runtime, infra_dir=infra,
+                          compose_argv=[runtime, "compose"], row=se.load_rows(db)["ollama"],
+                          db_path=db, run=box.run)
+    cmd = g.deferral_entry().command_to_apply
+    other = "docker" if runtime == "podman" else "podman"
+    assert f"{runtime} inspect --format" in cmd and f"{other} inspect" not in cmd
+
+
+def test_a_result_that_never_learned_its_runtime_prints_no_guess():
+    g = di.GuardResult("ollama", di.REFUSE_UNKNOWN, "x")
+    assert "<podman|docker> inspect" in g.deferral_entry().command_to_apply
+    assert "docker inspect" in g.deferral_entry(runtime="docker").command_to_apply

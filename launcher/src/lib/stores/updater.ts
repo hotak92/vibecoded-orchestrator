@@ -149,6 +149,21 @@ export interface UpdateOutcome {
   message?: string;
   /** The phase ledger (`update_run.rs::PhaseRecord`). */
   phases?: { phase: string; status: 'done' | 'skipped' | 'failed'; detail: string | null }[];
+  /** `ResetHard` only: where the discarded local work was saved
+   *  (`update_run.rs::ResetBackup`, owner ruling F-W2-03). */
+  reset_backup?: ResetBackup;
+}
+
+/** Mirrors Rust `update_run::ResetBackup`. */
+export interface ResetBackup {
+  /** `vco-backup/<stamp>` — the pre-reset HEAD. */
+  branch: string;
+  /** `vco-backup/<stamp>-wip` — the uncommitted + untracked changes. */
+  uncommitted_branch: string | null;
+  /** `<vct_root>/backups/orchestrator-reset-<stamp>.bundle`; null when there
+   *  was nothing local to save. */
+  bundle: string | null;
+  local_commits: number;
 }
 
 /** Which overlay op (title / running message) a run kind drives. */
@@ -925,6 +940,28 @@ export function routeUpdateError(raw: unknown): RoutedUpdateError {
   return { to: 'failed', message: normalizeFailureText(raw), errorKind: null };
 }
 
+/**
+ * v0.2.100 (W3-FIX): what a recovery modal does with the route `failOp`
+ * applied to its command's rejection. The resolve-and-continue commands
+ * (`resolve_autostash_pop_and_retry`, `resolve_untracked_collision_and_retry`)
+ * finish through the ONE update pipeline, so they reject with the same JSON
+ * contract as `run_orchestrator_update` (`{kind, message, ...}`) — rendering
+ * that raw (`${e}`) showed the JSON blob. Pure; never throws.
+ *   - `failed` → `inline` is `<label>: <message>`, the message rendered ONCE
+ *     and unprefixed (the same normalised text the overlay shows);
+ *   - a decision-modal route → no inline text; the store has opened that
+ *     modal, so `closeSelf` asks the caller to step aside — unless the route
+ *     reopens the caller's OWN modal (`self`) with the fresh payload.
+ */
+export function modalFailure(
+  routed: RoutedUpdateError,
+  label: string,
+  self: UpdateRoute,
+): { inline: string | null; closeSelf: boolean } {
+  if (routed.to === 'failed') return { inline: `${label}: ${routed.message}`, closeSelf: false };
+  return { inline: null, closeSelf: routed.to !== self };
+}
+
 /** What `updater.run` resolves to (it never rejects). */
 export type UpdateRunResult =
   | { ok: true; outcome: UpdateOutcome | null }
@@ -1233,7 +1270,8 @@ function createUpdaterStore() {
       // must keep `nonFf`, or that modal unmounts mid-flight).
       update((s) => ({
         ...s,
-        nonFf: kind === 'Merge' || kind === 'Rebase' ? s.nonFf : null,
+        // ResetHard is started from the divergence modal too (F-W2-03).
+        nonFf: kind === 'Merge' || kind === 'Rebase' || kind === 'ResetHard' ? s.nonFf : null,
         conflict: kind === 'Resume' ? s.conflict : null,
         untrackedCollision: null,
         autostashPop: null,
@@ -1254,7 +1292,9 @@ function createUpdaterStore() {
       // A successful Merge/Rebase ends the divergence modal's job: clear
       // `nonFf` BEFORE `endOp` so the overlay's falling edge reads success,
       // not a hand-over. (A successful Resume keeps `conflict`: the conflict
-      // modal shows its own success line and closes itself.)
+      // modal shows its own success line and closes itself. A successful
+      // ResetHard keeps `nonFf` the same way: the divergence modal names
+      // where the discarded commits were saved, then the user closes it.)
       update((s) => ({
         ...s,
         available: false,

@@ -81,6 +81,15 @@ SINGLE_FLIGHT = (
 SELF_UPDATE = (
     REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "self_update.rs"
 )
+#: v0.2.100 WP-03b: THE update pipeline — `run_orchestrator_update`, its
+#: driver and its live side effects. The per-surface update commands it
+#: replaced (installer.rs / self_update.rs) are gone.
+UPDATE_RUN = (
+    REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "update_run.rs"
+)
+
+#: The production `UpdateOps` impl in update_run.rs.
+LIVE_OPS_IMPL = "impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {"
 
 #: A column-0 Rust item start — the boundary that ends a function body for
 #: the purposes of this scan. Independent of any brace counting, so a
@@ -121,6 +130,28 @@ def function_body(lines: list[str], signature_prefix: str) -> list[str]:
         if _TOP_LEVEL_ITEM.match(line):
             break
         body.append(line)
+    return body
+
+
+def method_body(lines: list[str], impl_prefix: str, signature_prefix: str) -> list[str]:
+    """Lines of ONE method (4-space indent) of the impl starting with
+    `impl_prefix`, up to the method's closing ``    }``. [] when either is
+    absent — callers assert non-emptiness, as with :func:`function_body`.
+    """
+    try:
+        impl_at = next(i for i, ln in enumerate(lines) if ln.startswith(impl_prefix))
+        start = next(
+            i
+            for i in range(impl_at, len(lines))
+            if lines[i].startswith(signature_prefix)
+        )
+    except StopIteration:
+        return []
+    body = [lines[start]]
+    for line in lines[start + 1 :]:
+        body.append(line)
+        if line == "    }":
+            break
     return body
 
 
@@ -168,23 +199,21 @@ def discover_commands(lines: list[str]) -> dict[str, str]:
 CLONE_WRITING_CALLS = (
     "run_install_py_update(",
     "install_py_command(",
-    "run_post_pull_install_and_restart(",
     "stop_hub_and_rename_binaries_aside(",
-    "prepare_and_pull_orchestrator_repo(",
-    "stop_hub_then_hard_reset(",
-    "resume_orchestrator_update_with_claim(",
-    "update_orchestrator_with_claim(",
+    # v0.2.100 WP-03b: THE update pipeline and its two entry points. Every
+    # pull / merge / rebase / resume / hard reset of the clone runs through
+    # them (the per-surface helpers this list used to name —
+    # `prepare_and_pull_orchestrator_repo`, `stop_hub_then_hard_reset`,
+    # `update_orchestrator_with_claim`, `resume_orchestrator_update_with_claim`,
+    # `run_post_pull_install_and_restart`, `finish_apply_after_pull` — are
+    # gone, and so is `refresh_install_manifest`, whose only reason to be here
+    # was `update_orchestrator_at`, retired by owner Q1).
+    "run_update(",
+    "run_update_claimed(",
+    "continue_update_under_claim(",
     "resolve_conflict_and_resume(",
     "abort_merge_or_rebase_unclaimed(",
     "resolve_collision_files(",
-    "finish_apply_after_pull(",
-    # Writes `state/install-manifest.json` in an orchestrator root. Included so
-    # `update_orchestrator_at` — which file-copies a tree rather than calling
-    # any of the helpers above — is DISCOVERED and then explicitly exempted for
-    # acting on a different target, instead of being invisible to the scan and
-    # exempt by accident. The distinction matters: invisible is how the
-    # previous enumeration lost six surfaces.
-    "refresh_install_manifest(",
 )
 
 #: The ONE entry point. Every surface claims through it rather than through
@@ -203,6 +232,14 @@ HANDS_DOWN = {
     ),
 }
 
+#: v0.2.100 WP-03b: commands whose claim is taken INSIDE the one pipeline —
+#: `run_update` builds `LiveOps` with no claim and the driver's phase 2
+#: (`LiveOps::claim`) takes it — mapped to that method. Asserted to contain
+#: the entry point, like HANDS_DOWN.
+CLAIMS_IN_PIPELINE = {
+    "run_orchestrator_update": "    fn claim(&mut self",
+}
+
 #: Commands that touch `install.py` or a git tree but NOT the launcher's own
 #: orchestrator clone, with the reason each is out of scope. A name may only
 #: sit here with an argument; "it seemed unrelated" is how the previous
@@ -213,12 +250,9 @@ EXEMPT = {
         "`validate_source_repo`. Not the launcher's own clone, and it runs "
         "before any clone exists to serialise against."
     ),
-    "update_orchestrator_at": (
-        "a DIFFERENT target — it file-copies this tree into ANOTHER "
-        "orchestrator install. It holds `OP_UPDATE_ORCHESTRATOR_AT`, a "
-        "deliberately separate key (see single_flight.rs's do-not-merge "
-        "note): guarding one target must not block the other."
-    ),
+    # `update_orchestrator_at` (a file-copy into ANOTHER install, under its
+    # own `OP_UPDATE_ORCHESTRATOR_AT` key) was exempt here until v0.2.100,
+    # when the owner retired the command (Q1) — its entry and key are gone.
 }
 
 
@@ -243,29 +277,18 @@ class SingleFlightWiring(unittest.TestCase):
         )
         self.assertIn("OP_UPDATE_ALL_PROJECTS", text)
 
-    def test_update_orchestrator_at_claims_the_flight(self) -> None:
-        body = function_body(
-            code_only_lines(INSTALLER), "pub async fn update_orchestrator_at("
-        )
-        self.assertTrue(
-            body,
-            "update_orchestrator_at signature not found — the scan would pass "
-            "vacuously; fix the prefix if the signature changed.",
-        )
-        text = "\n".join(body)
-        self.assertIn(
-            "single_flight::begin_or_refuse",
-            text,
-            "update_orchestrator_at copies a whole orchestrator tree over the "
-            "target; MenuBar's loop guard is frontend-only (plan §F #26).",
-        )
-        self.assertIn("OP_UPDATE_ORCHESTRATOR_AT", text)
+    # RETIRED v0.2.100: `test_update_orchestrator_at_claims_the_flight` —
+    # `update_orchestrator_at` and its `OP_UPDATE_ORCHESTRATOR_AT` key were
+    # retired by the owner (Q1); no command copies a tree into another install.
 
     def test_the_two_commands_use_distinct_keys(self) -> None:
-        """One shared key would let an orchestrator-clone refresh block a
+        """One shared key would let an orchestrator-clone update block a
         project bundle reconcile. The two are deliberately separate
         operations (the do-not-merge boundary) — the guard must not
         re-couple them.
+
+        RETARGETED v0.2.100: the orchestrator side is the one pipeline's
+        claim (`LiveOps::claim`), not the retired `update_orchestrator_at`.
         """
         all_projects = "\n".join(
             function_body(
@@ -273,18 +296,24 @@ class SingleFlightWiring(unittest.TestCase):
             )
         )
         orchestrator = "\n".join(
-            function_body(
-                code_only_lines(INSTALLER), "pub async fn update_orchestrator_at("
-            )
+            method_body(code_only_lines(UPDATE_RUN), LIVE_OPS_IMPL, "    fn claim(&mut self")
         )
-        self.assertNotIn("OP_UPDATE_ORCHESTRATOR_AT", all_projects)
+        self.assertTrue(all_projects and orchestrator, "a scanned body vanished")
+        self.assertIn(ENTRY, orchestrator)
+        self.assertNotIn("begin_orchestrator_update_or_refuse", all_projects)
+        self.assertNotIn("OP_UPDATE_ORCHESTRATOR_CLONE", all_projects)
         self.assertNotIn("OP_UPDATE_ALL_PROJECTS", orchestrator)
 
     def test_guard_keys_are_defined_and_distinct(self) -> None:
+        """RETARGETED v0.2.100: the orchestrator key is the clone key; the
+        retired `OP_UPDATE_ORCHESTRATOR_AT` must not come back."""
         text = SINGLE_FLIGHT.read_text(encoding="utf-8")
         self.assertIn('OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects"', text)
         self.assertIn(
-            'OP_UPDATE_ORCHESTRATOR_AT: &str = "update_orchestrator_at"', text
+            'OP_UPDATE_ORCHESTRATOR_CLONE: &str = "orchestrator_update"', text
+        )
+        self.assertNotIn(
+            "OP_UPDATE_ORCHESTRATOR_AT", "\n".join(code_only_lines(SINGLE_FLIGHT))
         )
 
 
@@ -324,7 +353,7 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
 
     def _all_commands(self) -> dict[str, str]:
         merged: dict[str, str] = {}
-        for path in (INSTALLER, SELF_UPDATE):
+        for path in (INSTALLER, SELF_UPDATE, UPDATE_RUN):
             found = discover_commands(code_only_lines(path))
             self.assertTrue(
                 found,
@@ -349,7 +378,7 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
             "gone stale and this gate is vacuous.",
         )
 
-        unexplained = unclaimed - set(HANDS_DOWN) - set(EXEMPT)
+        unexplained = unclaimed - set(HANDS_DOWN) - set(CLAIMS_IN_PIPELINE) - set(EXEMPT)
         self.assertEqual(
             unexplained,
             set(),
@@ -387,6 +416,26 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
                 f"{helper_prefix!r} takes one for it. It no longer does.",
             )
 
+    def test_the_pipeline_entry_takes_the_claim_in_phase_two(self) -> None:
+        """v0.2.100 WP-03b: `run_orchestrator_update` is exempt from carrying
+        the claim in its own body only because the pipeline's phase 2 takes
+        it. Assert that it still does, and that the command reaches the
+        claim-TAKING entry (`run_update`), never the hand-over one.
+        """
+        lines = code_only_lines(UPDATE_RUN)
+        commands = discover_commands(lines)
+        for command, method in CLAIMS_IN_PIPELINE.items():
+            self.assertIn(command, commands, f"{command} is no longer a #[command]")
+            self.assertIn("run_update(", commands[command])
+            self.assertNotIn("run_update_claimed(", commands[command])
+            claim = "\n".join(method_body(lines, LIVE_OPS_IMPL, method))
+            self.assertTrue(claim, f"{method!r} not found in LiveOps")
+            self.assertIn(ENTRY, claim)
+        run_update = "\n".join(
+            function_body(lines, "pub(crate) async fn run_update<")
+        )
+        self.assertIn("LiveOps::new(app, window, None)", run_update)
+
     def test_exempt_entries_still_name_live_commands(self) -> None:
         """An exemption for a command that no longer exists is a rule nobody
         reads, protecting nothing — and it hides the next real one.
@@ -411,24 +460,23 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
         """
         commands = self._all_commands()
         writers, _ = classify_clone_writers(commands)
+        # v0.2.100 WP-03b: `update_orchestrator`, `merge_orchestrator_with_
+        # upstream`, `rebase_orchestrator_onto_upstream`, `resume_orchestrator_
+        # update`, `apply_pending_install`, `apply_launcher_update` and
+        # `force_resync_launcher` were REPLACED by `run_orchestrator_update`
+        # (one pipeline, `kind` selects the git operation);
+        # `update_orchestrator_at` was retired by the owner (Q1).
         expected = {
             # installer.rs
-            "update_orchestrator",
-            "merge_orchestrator_with_upstream",
-            "rebase_orchestrator_onto_upstream",
             "abort_orchestrator_merge_or_rebase",
-            "resume_orchestrator_update",
             "keep_local_and_continue_update",
             "accept_upstream_and_continue_update",
             "resolve_untracked_collision_and_retry",
             "resolve_autostash_pop_and_retry",
-            "apply_pending_install",
             "apply_hardware_reconfig",
-            "update_orchestrator_at",
             "install_orchestrator",
-            # self_update.rs
-            "apply_launcher_update",
-            "force_resync_launcher",
+            # update_run.rs
+            "run_orchestrator_update",
         }
         missing = expected - writers
         self.assertEqual(
@@ -482,7 +530,11 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
             )
         )
         self.assertTrue(text, "resolve_untracked_collision_and_retry not found")
-        self.assertIn("update_orchestrator_with_claim(app, path, window, flight)", text)
+        # v0.2.100 WP-03b: the hand-over target is the one pipeline, via
+        # `continue_update_under_claim` → `run_update_claimed` (pinned in
+        # `test_the_resume_chain_hands_the_claim_down_instead_of_retaking_it`).
+        self.assertIn("continue_update_under_claim(", text)
+        self.assertIn("flight)", text)
         self.assertNotIn(
             ENTRY,
             text,
@@ -513,76 +565,39 @@ class OrchestratorCloneClaimWiring(unittest.TestCase):
         ):
             text = "\n".join(function_body(lines, prefix))
             self.assertTrue(text, f"{prefix!r} not found in installer.rs")
+            # RETARGETED v0.2.100 (WP-03b): the resume tail is the one
+            # pipeline's `Resume` kind, reached through the claim hand-over.
             self.assertIn(
-                "resume_orchestrator_update_with_claim(",
+                "continue_update_under_claim(",
                 text,
                 f"{prefix!r} must hand its claim to the resume tail, not let "
                 "the tail take a second one.",
             )
-            self.assertNotIn(
-                "resume_orchestrator_update(app",
-                text,
-                f"{prefix!r} still calls the claim-TAKING resume command; "
-                "that call deadlocks against the claim it already holds.",
-            )
+            for taking in ("run_update(", "run_orchestrator_update("):
+                self.assertNotIn(
+                    taking,
+                    text,
+                    f"{prefix!r} calls the claim-TAKING pipeline entry; that "
+                    "call is refused by the claim it already holds.",
+                )
+        # …and the hand-over really hands over: it reaches the claim-RECEIVING
+        # entry, never the claim-taking one.
+        hand_over = "\n".join(
+            function_body(lines, "async fn continue_update_under_claim<")
+        )
+        self.assertTrue(hand_over, "continue_update_under_claim not found")
+        self.assertIn("run_update_claimed(", hand_over)
+        self.assertNotIn("run_update(", hand_over)
 
 
-class ArtefactSourceWiring(unittest.TestCase):
-    """v0.2.95 ship-gate MAJOR-2 — the already-up-to-date branch must not tell
-    the tail that the source tree moved.
-
-    `owes_manifest_refresh`'s three arms are unit-tested in Rust against real
-    manifest bytes; what a unit test cannot reach is which variant
-    `apply_launcher_update` hands to the tail, because that command takes an
-    `AppHandle`. Passing `SourceOnly` there is precisely the defect: it stamps
-    `post_source_only: true` on a tree that did not move, and
-    `check_for_updates` turns that into an `install_stale` badge demanding a
-    full re-install after a click that changed nothing.
-    """
-
-    def test_the_already_up_to_date_branch_passes_unchanged(self) -> None:
-        text = "\n".join(
-            function_body(
-                code_only_lines(SELF_UPDATE), "pub async fn apply_launcher_update<"
-            )
-        )
-        self.assertTrue(text, "apply_launcher_update not found")
-        # ARGUMENT position (trailing comma), not the `Unchanged =>` match arm
-        # further down the same body — otherwise reverting the early return to
-        # `SourceOnly` would still satisfy this, since the arm names both
-        # variants. The distinction is the whole assertion.
-        self.assertIn(
-            "ArtefactSource::Unchanged,",
-            text,
-            "the already-up-to-date early return must hand the tail "
-            "`ArtefactSource::Unchanged`; `SourceOnly` claims an advance that "
-            "did not happen (ship-gate MAJOR-2).",
-        )
-        self.assertNotIn(
-            "ArtefactSource::SourceOnly,",
-            text,
-            "a variant is being passed to the tail as a literal argument, and "
-            "the only branch that does that is the already-up-to-date one — "
-            "which moved nothing and must not say `SourceOnly`.",
-        )
-
-    def test_the_manifest_write_is_gated_on_the_decision_function(self) -> None:
-        """The gate must be the named decision, not an inline comparison that
-        a fourth variant could silently fall outside of.
-        """
-        text = "\n".join(
-            function_body(
-                code_only_lines(SELF_UPDATE), "async fn finish_apply_after_pull<"
-            )
-        )
-        self.assertTrue(text, "finish_apply_after_pull not found")
-        self.assertIn("owes_manifest_refresh(artefacts)", text)
-        self.assertNotIn(
-            "artefacts == ArtefactSource::SourceOnly",
-            text,
-            "the inline comparison is back; use `owes_manifest_refresh`, whose "
-            "match is exhaustive over the variants.",
-        )
+# RETIRED v0.2.100 (WP-03b): `ArtefactSourceWiring` (ship-gate MAJOR-2) pinned
+# which `ArtefactSource` variant `apply_launcher_update` handed its tail and
+# that `finish_apply_after_pull` gated the Rust manifest write on
+# `owes_manifest_refresh`. Superseded by the one pipeline: no launcher path
+# advances the source without running install.py any more, so the Rust
+# manifest writer (`manifest::refresh_install_manifest`) and the variant went
+# with those commands — install.py is the only writer of
+# `state/install-manifest.json` (see `manifest.rs`, "Bug G … RETIRED").
 
 
 class InstallPyRunnerDbGuardWiring(unittest.TestCase):
@@ -606,16 +621,36 @@ class InstallPyRunnerDbGuardWiring(unittest.TestCase):
 
     #: (file, signature prefix) of every function that runs install.py --update
     #: through the shared runner and holds an `AppHandle` to guard with.
-    RUNNER_CALLERS = (
-        (INSTALLER, "pub(crate) async fn update_orchestrator_with_claim<"),
-        (INSTALLER, "async fn run_post_pull_install_and_restart<"),
-        (SELF_UPDATE, "pub async fn apply_launcher_update<"),
-    )
+    #:
+    #: v0.2.100 WP-03b: ONE caller — the pipeline's phase 8
+    #: (`LiveOps::run_install_py`). The three it replaced
+    #: (`update_orchestrator_with_claim`, `run_post_pull_install_and_restart`,
+    #: `apply_launcher_update`) are gone. `None` impl = a top-level fn.
+    RUNNER_CALLERS = ((UPDATE_RUN, LIVE_OPS_IMPL, "    fn run_install_py("),)
+
+    def test_no_other_production_code_runs_the_install_py_runner(self) -> None:
+        """The list above is only complete if nothing else calls the runner."""
+        src_dir = UPDATE_RUN.parent.parent
+        callers = []
+        for rs in sorted(src_dir.rglob("*.rs")):
+            lines = code_only_lines(rs)
+            # Production code only: cut at the first test module.
+            cut = next(
+                (i for i, ln in enumerate(lines) if ln.startswith("mod tests")
+                 or ln.startswith("pub(crate) mod tests")),
+                len(lines),
+            )
+            if any("run_install_py_update(" in ln and "fn run_install_py_update(" not in ln
+                   for ln in lines[:cut]):
+                callers.append(rs.name)
+        self.assertEqual(callers, ["update_run.rs"])
 
     def test_every_install_py_runner_call_site_closes_the_db_first(self) -> None:
-        for path, prefix in self.RUNNER_CALLERS:
+        for path, impl_prefix, prefix in self.RUNNER_CALLERS:
             with self.subTest(fn=prefix):
-                text = "\n".join(function_body(code_only_lines(path), prefix))
+                text = "\n".join(
+                    method_body(code_only_lines(path), impl_prefix, prefix)
+                )
                 self.assertTrue(
                     text,
                     f"{prefix!r} not found in {path.name} — the scan would "

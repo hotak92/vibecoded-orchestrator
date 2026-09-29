@@ -740,7 +740,7 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
         seed = load_seed()
         one_m_ids = {
             model_id for model_id in VENDORS["qwen"].static_ids
-            if (row := seed.lookup(model_id)) is not None and row.window_1m
+            if (row := seed.lookup(model_id, "qwen")) is not None and row.window_1m
         }
         self.assertTrue(one_m_ids, "the seed must flag at least one declared id")
         self.assertEqual(

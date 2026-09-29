@@ -335,7 +335,8 @@ pub(crate) fn install_spawn_failed(spawn_error: &str, install_root: &Path) -> Up
 pub(crate) type AuditRows = Vec<(String, Value)>;
 
 /// Map the pipeline's condition enum onto the surface error. ONE rendering;
-/// the legacy `installer`/`self_update` renderers go with WP-03b.
+/// the per-surface `installer`/`self_update` renderers were retired with
+/// their commands in v0.2.100 (WP-03b).
 pub(crate) fn from_pipeline_error(err: UpdatePipelineError) -> (UpdateSurfaceError, AuditRows) {
     let mut audit = AuditRows::new();
     let clobber_row = |branch: &str, after_success: bool| {
@@ -352,14 +353,6 @@ pub(crate) fn from_pipeline_error(err: UpdatePipelineError) -> (UpdateSurfaceErr
         UpdatePipelineError::MergeInProgress { payload, .. } => {
             UpdateSurfaceError::Conflict(parse_payload(&payload))
         }
-        UpdatePipelineError::DirtyTrackedAtRisk { path } => UpdateSurfaceError::Refused {
-            code: "dirty_tracked_at_risk",
-            reason: format!(
-                "Uncommitted changes on tracked file '{}' would be lost — this update also \
-                 changes it. Commit, stash, or revert it before updating.",
-                path
-            ),
-        },
         UpdatePipelineError::Conflict {
             operation,
             branch,
@@ -421,7 +414,7 @@ pub(crate) fn from_pipeline_error(err: UpdatePipelineError) -> (UpdateSurfaceErr
 }
 
 /// The `orchestrator_update_non_ff` payload (same keys as
-/// `installer::serialize_orchestrator_non_ff_error`, which WP-03b retires).
+/// the retired `installer::serialize_orchestrator_non_ff_error`, WP-03b).
 pub(crate) fn non_ff_payload(
     branch: &str,
     local_sha: Option<&str>,
@@ -657,6 +650,33 @@ mod tests {
         let (e, audit) = from_pipeline_error(UpdatePipelineError::Raw(String::new()));
         assert!(audit.is_empty());
         assert_displayable(&e.message(), "empty Raw");
+    }
+
+    /// The RC-1 site: the merge landed and only the autostash POP conflicted.
+    /// The abort tail's clobber outcome becomes the audit row with
+    /// `pop_conflict_after_success: true` — and no row when nothing was
+    /// averted (the leave-alone case).
+    #[test]
+    fn pipeline_pop_conflict_maps_to_autostash_pop_with_the_after_success_audit_row() {
+        let pop = |record: bool| {
+            from_pipeline_error(UpdatePipelineError::AutostashPopConflict {
+                branch: "main".into(),
+                conflicted: vec!["CLAUDE.md".into()],
+                detail: "Applying autostash resulted in conflicts.".into(),
+                record_binary_clobber_averted: record,
+            })
+        };
+        let (e, audit) = pop(true);
+        let v = e.to_json_value();
+        assert_eq!(v["event"], "orchestrator_autostash_pop_conflict");
+        assert_eq!(v["conflicted_files"], json!(["CLAUDE.md"]));
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].0, "update_binary_clobber_averted");
+        assert_eq!(audit[0].1["pop_conflict_after_success"], true);
+        assert_eq!(audit[0].1["branch"], "main");
+
+        let (_, audit) = pop(false);
+        assert!(audit.is_empty(), "no clobber averted ⇒ no row: {audit:?}");
     }
 
     /// A handler payload that is not JSON is kept, not dropped.

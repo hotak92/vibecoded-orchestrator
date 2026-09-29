@@ -169,6 +169,7 @@ from vco_lib import runtime_reconcile as _runtime_reconcile  # noqa: E402
 from vco_lib import install_services_guard as _svc_guard  # noqa: E402
 from vco_lib import progress_event as _progress_event  # noqa: E402
 from vco_lib import openai_key as _openai_key  # noqa: E402
+from vco_lib import embedding_pull_plan as _embedding_pull_plan, ollama_pull as _ollama_pull  # noqa: E402
 from vco_lib.deferral_report import (  # noqa: E402
     DeferralEntry,
     DeferralReport,
@@ -392,17 +393,10 @@ DEFAULT_CODE_EMBED_PORT = 11440
 # (v0.2.92 folded the code-side CODE_MODEL_TOKEN_LIMITS copy into it; that
 #  copy had drifted to a 4x-too-large jina budget before it was deleted.)
 # That is the single source of truth — do not re-declare chunk sizes here.
-# Each profile keeps its own static `embedding_models` — these are the
-# Ollama-served embedding models that MUST be pulled regardless of
-# hardware. Inference models (qwen3.5:9b, gemma4:e4b, qwen3.5:0.8b) are
-# layered on at install time by `_inference_models_for_capability` based
-# on detected VRAM/RAM, then merged with `embedding_models` to form the
-# final pull list. See _build_ollama_pull_list().
-#
-# The "low_resource" profile is special: it explicitly opts the user in
-# to the smallest models, so we DO NOT layer larger inference tiers on
-# top of it even if the host could run them. Respect the explicit
-# choice.
+# The Ollama pull list is NOT declared here either: vco_lib.embedding_pull_plan
+# derives it from the FINAL config (text/code model after tier overrides), the
+# dual-embedding opt-ins and the capability tier (v0.2.100 AD-6). A profile only
+# states an explicit inference cap (`inference_models_override`, low_resource).
 EMBEDDING_CONFIGS = {
     "gpu": {
         "text_model": "qwen3-embedding:0.6b",
@@ -410,7 +404,6 @@ EMBEDDING_CONFIGS = {
         "code_backend": "gpu",
         "code_model": "codesage-large-v2",
         "code_dims": 2048,
-        "embedding_models": ["qwen3-embedding:0.6b"],
         # ACTIVE_EMBEDDING env var — controls which named-vector slot
         # the MCP server reads/writes. MUST match the slot name labelled
         # for the model that emitted the vector. See
@@ -424,10 +417,6 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
-        "embedding_models": [
-            "qwen3-embedding:0.6b",
-            "unclemusclez/jina-embeddings-v2-base-code:latest",
-        ],
         "active_embedding": "qwen3",
         "description": "CPU-only (qwen3 text + Jina V2 code, both via Ollama)",
     },
@@ -437,8 +426,6 @@ EMBEDDING_CONFIGS = {
         "code_backend": "openai",
         "code_model": "text-embedding-3-small",
         "code_dims": 1536,
-        # OpenAI handles embeddings; only inference models need pulling.
-        "embedding_models": [],
         "active_embedding": "openai",
         "description": "OpenAI API (fastest, requires API key)",
     },
@@ -453,10 +440,6 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
-        "embedding_models": [
-            "snowflake-arctic-embed2:latest",
-            "unclemusclez/jina-embeddings-v2-base-code:latest",
-        ],
         # Hard-cap inference models for this profile — user opted in.
         # qwen3.5:0.8b is the canonical always-fits floor on main.
         "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
@@ -467,25 +450,6 @@ EMBEDDING_CONFIGS = {
     },
 }
 
-
-def _build_ollama_pull_list(embed_config: dict, sysinfo: SystemInfo) -> list[str]:
-    """Combine the profile's static embedding models with the right
-    inference-model tier for this host. Deduplicates while preserving
-    order (embedding models first, inference second).
-    """
-    embedding_models: list[str] = list(embed_config.get("embedding_models") or [])
-    override = embed_config.get("inference_models_override")
-    if override:
-        inference_models = list(override)
-    else:
-        inference_models = _inference_models_for_capability(sysinfo)
-    seen: set[str] = set()
-    out: list[str] = []
-    for m in embedding_models + inference_models:
-        if m and m not in seen:
-            seen.add(m)
-            out.append(m)
-    return out
 
 HEALTH_TIMEOUT = 120  # seconds
 
@@ -2180,8 +2144,8 @@ MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 # consistency test (``tests/test_managed_paths_consistency.py``) pins
 # the two languages to the file contents.
 #
-# The .txt file lists itself, so ``update_orchestrator_at`` propagates
-# freshly-edited editions of the list into every existing install.
+# The .txt file lists itself, so a copy install (``copy_orchestrator_to_sync``)
+# carries freshly-edited editions of the list along.
 #
 # Note (PR-31 / v0.2.12): ``CLAUDE.md`` was removed from this whitelist.
 # The root CLAUDE.md is orchestrator-self development docs, not a user-
@@ -3994,7 +3958,7 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     # (installer.rs::build_lightweight_install_argv), so a reconcile call here
     # would gate on `args.update` (False) and no-op — dead code. The launcher's
     # real "Update orchestrator" (Settings→Updates) runs `install.py --update`
-    # (installer.rs::update_orchestrator), which is covered by the single call
+    # (update_run.rs::run_update, phase 8), which is covered by the single call
     # site in main(). One live wiring, no dead second leg.
     # v0.2.37: seed the launcher's install_path resolver on lightweight
     # too — the lightweight path is exactly what `--lightweight-old-path`
@@ -6228,18 +6192,9 @@ def main() -> int:
         _start_services(sysinfo, args, embed_config, decisions,
                         deferral_report=_deferral_report)
         if not args.skip_models:
-            _wait_for_ollama()
-            # v0.2.49 Bug I: pass the canonical embedding-model set so
-            # _pull_ollama_models can fail-fast on load-bearing pulls
-            # rather than silently continuing with a broken KG.
-            _embedding_models_set: set[str] = {
-                m for m in (embed_config.get("embedding_models") or [])
-                if isinstance(m, str) and m
-            }
-            _pull_ollama_models(
-                _build_ollama_pull_list(embed_config, sysinfo),
-                embedding_models=_embedding_models_set,
-            )
+            _rc = _ollama_models_step(embed_config, sysinfo, _deferral_report, _deferral_folder)
+            if _rc is not None:
+                return _rc
             # v0.2.49 Bug J: probe for dual Ollama instances now that
             # the launcher-managed one is known to be up; emit an
             # UPDATE_DEFERRED warning if a personal instance is also
@@ -7398,8 +7353,8 @@ def _apply_deferred_entries(
             #
             # Re-probe: the sentinel
             # `.claude/state/orchestrator-update-resume-needed.json`
-            # (written by the launcher's update commands, deleted by
-            # `resume_orchestrator_update` on success) is the source of
+            # (written by the launcher's update pipeline, deleted by a
+            # successful `Resume` run of it) is the source of
             # truth. Gone → the resume completed → resolved. Present →
             # the resume is still pending → keep. NOTE: the sentinel
             # lives in the INSTALL ROOT (= project_root for
@@ -7697,12 +7652,12 @@ def _apply_deferred_entries(
         elif cid == "launcher_update_diverged":
             # v0.2.55 (durable-logging fix, re-probe handler): the launcher
             # writes this entry when a GUI update could not fast-forward
-            # (non-FF divergence) OR `WaitForBinaryRefresh` timed out
-            # before the on-disk launcher binary reached the source target.
+            # (non-FF divergence) OR its binary check (decide_binary_refresh)
+            # found the on-disk launcher binary below the source target.
             # All three kinds share this condition_id (see
             # installer.rs::write_launcher_update_diverged_deferral).
             #
-            # Re-probe (mirrors WaitForBinaryRefresh's own exit condition):
+            # Re-probe (mirrors that binary check's "Ready" condition):
             # the source-of-truth is whether the on-disk launcher binary
             # version now meets/exceeds the source version. install.py
             # reaching THIS point already means the pull + --update
@@ -7731,8 +7686,8 @@ def _apply_deferred_entries(
                     return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
                 on_disk_version = _read_dist_meta_version(f"{fname}.metadata.json")
-                # Symmetric with the Rust WaitForBinaryRefresh hub-gate
-                # (v0.2.55): also re-probe the hub binary so a launcher that
+                # Symmetric with the Rust binary check's hub leg
+                # (update_run.rs::decide_binary_refresh): also re-probe the hub binary so a launcher that
                 # caught up but a still-stale hub doesn't clear the entry
                 # prematurely (the C2 asymmetry the review flagged). Absent
                 # hub sidecar → treated as "hub OK" (same as the Rust gate).
@@ -9861,14 +9816,6 @@ _TEXT_MODEL_ACTIVE_EMBEDDING = {
     "text-embedding-3-small": "openai",
 }
 
-# Models served via Ollama (must be in the pull list when selected).
-_OLLAMA_SERVED_EMBEDDING_MODELS = {
-    "qwen3-embedding:0.6b",
-    "unclemusclez/jina-embeddings-v2-base-code:latest",
-    "snowflake-arctic-embed2:latest",
-}
-
-
 def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None:
     """Shim over :func:`vco_lib.gpu_profile.apply_tier_overrides`.
 
@@ -9882,7 +9829,6 @@ def _apply_tier_overrides(config: dict, *, code_pick: str, kg_pick: str) -> None
         kg_pick=kg_pick,
         model_dims=_EMBEDDING_MODEL_DIMS,
         text_model_active_embedding=_TEXT_MODEL_ACTIVE_EMBEDDING,
-        ollama_served_models=_OLLAMA_SERVED_EMBEDDING_MODELS,
     )
 
 
@@ -9921,16 +9867,18 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
         return config
 
     # Replay-eligible: no flag and we have a recent choice.
-    prior_choices = _load_previous_choices()
-    if "embedding_mode" in prior_choices:
-        prior_value = prior_choices["embedding_mode"].get("value")
-        if prior_value in EMBEDDING_CONFIGS:
-            config = dict(EMBEDDING_CONFIGS[prior_value])
-            _record_install_choice(
-                "embedding_mode", prior_value,
-                {"reason": "replayed from last install"},
-            )
-            return config
+    # v0.2.100 (L1-F12): the replay re-applies the recorded tier picks, so a
+    # replayed cpu profile whose code ran on qwen3 does not revert to jina;
+    # the pull plan (step 7) then derives from this FINAL config.
+    prior = _load_previous_choices().get("embedding_mode") or {}
+    if prior.get("value") in EMBEDDING_CONFIGS:
+        config = dict(EMBEDDING_CONFIGS[prior["value"]])
+        _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
+                              kg_pick=prior.get("text_model") or config["text_model"])
+        _record_install_choice("embedding_mode", prior["value"], {
+            "reason": "replayed from last install",
+            "code_model": config["code_model"], "text_model": config["text_model"]})
+        return config
 
     # Auto-detection — v0.2.23 C10 tier-aware path.
     cores = _probe_cpu_cores()
@@ -10001,7 +9949,8 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # and CODE_EMBED_DIMS=768 was written to .env for a 1024-dim model.
     _apply_tier_overrides(config, code_pick=code_pick, kg_pick=kg_pick)
 
-    _record_install_choice("embedding_mode", profile_key, {"reason": reason})
+    _record_install_choice("embedding_mode", profile_key, {
+        "reason": reason, "code_model": config["code_model"], "text_model": config["text_model"]})
     return config
 
 
@@ -12439,139 +12388,31 @@ def _get_compose_command(container_cmd: str) -> list[str]:
 
 
 def _wait_for_ollama() -> None:
-    """Wait for Ollama to be ready."""
-    print("[6/10] Waiting for Ollama ... ", end="", flush=True)
-    _log_install_event("6/10", "start", "waiting for Ollama")
-    url = f"{_service_endpoint_urls()['ollama_url'].rstrip('/')}/api/tags"
-    deadline = time.monotonic() + HEALTH_TIMEOUT
-
-    while time.monotonic() < deadline:
-        try:
-            resp = urllib.request.urlopen(url, timeout=3)
-            if resp.status == 200:
-                print("OK")
-                _log_install_event(
-                    "6/10", "ok",
-                    "Ollama is ready",
-                    data={"url": url},
-                )
-                return
-        except (urllib.error.URLError, OSError):
-            pass
-        time.sleep(2)
-
-    print("TIMEOUT")
-    print(f"  Ollama not ready after {HEALTH_TIMEOUT}s at {url}")
-    print("  Check container logs.")
-    _log_install_event(
-        "6/10", "error",
-        f"Ollama not ready after {HEALTH_TIMEOUT}s",
-        data={"url": url, "timeout_s": HEALTH_TIMEOUT},
-    )
+    """Step 6 — shim over :func:`vco_lib.ollama_pull.wait_ready_step`
+    (bounded; raises ``OllamaNotReadyError`` instead of "TIMEOUT, carry on")."""
+    _ollama_pull.wait_ready_step(_service_endpoint_urls()["ollama_url"],
+                                 timeout_s=HEALTH_TIMEOUT, log_event=_log_install_event)
 
 
-class EmbeddingModelPullError(RuntimeError):
-    """Raised when a load-bearing embedding-model pull fails.
+def _ollama_models_step(embed_config: dict, sysinfo, report, folder) -> int | None:
+    """Steps 6+7 (v0.2.100 AD-6): exactly the models in use — the plan runs on
+    the FINAL config (a replayed one included); a typed failure becomes a
+    deferral + exit 1 (None = carry on)."""
+    try:
+        _wait_for_ollama()
+        _pull_ollama_models(_embedding_pull_plan.plan_for_install(
+            PROJECT_ROOT, embed_config, capability_tier=_inference_models_for_capability(sysinfo),
+            code_embed_url=_service_endpoint_urls()["code_embed_url"]), report)
+    except _ollama_pull.OllamaStepError as exc:
+        return _ollama_pull.fail_step(exc, report, folder)
+    return None
 
-    v0.2.49 Bug I: pre-fix ``_pull_ollama_models`` logged-then-continued on
-    every failure. Embedding models are load-bearing — without the active
-    embedding model in the local Ollama cache, KG sync silently breaks.
-    The function now classifies each model as embedding (fail-fast) or
-    other (best-effort) and raises this exception when one or more
-    load-bearing models fail to pull.
-    """
 
-
-def _pull_ollama_models(
-    models: list[str],
-    embedding_models: set[str] | None = None,
-) -> None:
-    """Pull required Ollama models.
-
-    v0.2.49 Bug I: ``embedding_models`` names the subset of ``models`` that
-    are load-bearing (the active text/code embedding models). If any of
-    them fail to pull, this function raises
-    :class:`EmbeddingModelPullError` AFTER attempting all remaining pulls
-    so the user gets the full picture in one shot rather than a per-model
-    interactive bail. Non-embedding models (summary/chat tiers) remain
-    best-effort and only emit a WARN log + manual-pull hint on failure.
-
-    Backward-compat: callers that don't pass ``embedding_models`` get a
-    heuristic fallback — any model name containing ``"embed"`` in
-    lowercase is treated as load-bearing. Callers that DO pass the set
-    get a precise answer; the heuristic is the safety net.
-    """
-    print("[7/10] Pulling Ollama models ... ", flush=True)
-    _log_install_event(
-        "7/10", "start",
-        f"pulling {len(models)} Ollama model(s)",
-        data={"models": list(models)},
-    )
-    base = _service_endpoint_urls()["ollama_url"].rstrip("/")  # the row, never env
-
-    if embedding_models is None:
-        # Heuristic fallback for callers that don't pass the precise set
-        # (back-compat). Embedding-model names canonically contain
-        # "embed" in lowercase: qwen3-embedding, snowflake-arctic-embed2,
-        # text-embedding-3-small, unclemusclez/jina-embeddings-v2-base-code.
-        embedding_models = {
-            m for m in models
-            if "embed" in m.lower()
-        }
-
-    failed: list[str] = []
-    failed_embedding: list[str] = []
-    for model in models:
-        print(f"  Pulling {model} ... ", end="", flush=True)
-        try:
-            data = json.dumps({"name": model}).encode()
-            req = urllib.request.Request(
-                f"{base}/api/pull",
-                data=data,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            resp = urllib.request.urlopen(req, timeout=600)
-            # Read streaming response to completion
-            while True:
-                chunk = resp.read(4096)
-                if not chunk:
-                    break
-            print("OK")
-        except (urllib.error.URLError, OSError) as e:
-            print(f"WARN ({e})")
-            print(f"    Pull manually: curl -X POST "
-                  f"{base}/api/pull "
-                  f"-d '{{\"name\": \"{model}\"}}'")
-            failed.append(model)
-            if model in embedding_models:
-                failed_embedding.append(model)
-
-    if failed_embedding:
-        _log_install_event(
-            "7/10", "error",
-            f"{len(failed_embedding)} load-bearing embedding-model pull(s) "
-            f"failed; KG sync will be broken until resolved",
-            data={
-                "failed_embedding": failed_embedding,
-                "failed_all": failed,
-            },
-        )
-        raise EmbeddingModelPullError(
-            "Load-bearing embedding model pull(s) failed: "
-            f"{', '.join(failed_embedding)}. The Knowledge Graph cannot "
-            "function without these models — install aborted. Resolve "
-            f"manually (curl -X POST {base}/api/pull "
-            "-d '{\"name\": \"<model>\"}') then re-run install."
-        )
-    if failed:
-        _log_install_event(
-            "7/10", "warn",
-            f"{len(failed)} non-load-bearing model pull(s) failed",
-            data={"failed": failed},
-        )
-    else:
-        _log_install_event("7/10", "ok", "all Ollama models pulled")
+def _pull_ollama_models(pull_plan, deferral_report=None) -> None:
+    """Step 7 — shim over :func:`vco_lib.ollama_pull.ensure_plan_step`
+    (raises ``OllamaPullError`` when an embedding model is not present)."""
+    _ollama_pull.ensure_plan_step(pull_plan, _service_endpoint_urls(), deferral_report,
+                                  log_event=_log_install_event)
 
 
 def _probe_dual_ollama_instances(
@@ -18114,13 +17955,13 @@ def _emit_update_resume_required_deferral(
 
     v0.2.51 fix
     -----------
-    The Rust ``update_orchestrator`` / ``merge_orchestrator_*`` /
-    ``rebase_orchestrator_*`` commands now write a sentinel at
-    ``.claude/state/orchestrator-update-resume-needed.json`` whenever they
-    surface the conflict modal. The launcher's MenuBar UpdateBadge polls
+    The launcher's update (since v0.2.100 the one pipeline,
+    ``run_orchestrator_update``) writes a sentinel at
+    ``.claude/state/orchestrator-update-resume-needed.json`` whenever it
+    surfaces the conflict modal. The launcher's MenuBar UpdateBadge polls
     ``check_for_updates``; when sentinel-present AND ``.git/MERGE_HEAD``
-    is gone, the badge surfaces "Continue Update" → calls the new
-    ``resume_orchestrator_update`` Tauri command to re-enter steps 2-4.
+    is gone, the badge surfaces "Continue Update" → a ``Resume`` run of
+    the pipeline re-enters steps 2-4.
 
     This deferral entry mirrors that state into ``UPDATE_DEFERRED.md`` so
     the same condition is visible to Claude sessions that don't have the
@@ -18128,7 +17969,7 @@ def _emit_update_resume_required_deferral(
     (the deferral writer injects a reminder block into CLAUDE.md too) and
     can prompt the user before any other work.
 
-    Self-clears: when ``resume_orchestrator_update`` succeeds it deletes
+    Self-clears: when the ``Resume`` run succeeds it deletes
     the sentinel; the next ``install.py --update --apply-deferred`` run
     treats this entry as resolved and removes it (no auto-apply needed —
     install.py itself ran during the resume).
@@ -18148,7 +17989,7 @@ def _emit_update_resume_required_deferral(
         condition_id="update_resume_required",
         title="Orchestrator update halted at a conflict — resume needed",
         detected=(
-            f"A previous `update_orchestrator` ({op_phrase} on "
+            f"A previous orchestrator update ({op_phrase} on "
             f"`{branch}`) was halted at a conflict, the conflict was "
             f"resolved outside the launcher (CLI `git add` + "
             f"`git commit`), but `install.py --update` and the binary "
@@ -18163,7 +18004,7 @@ def _emit_update_resume_required_deferral(
             "session start — the sentinel is launcher state, not "
             "install state. The user must either click `Continue "
             "Update` in the launcher's MenuBar UpdateBadge (which "
-            "runs `resume_orchestrator_update` → install.py --update "
+            "resumes the update → install.py --update "
             "+ binary refresh + auto-restart) OR run `python "
             "install.py --update` manually from a terminal to finish "
             "the install. Either path bumps `last_installed_version` "
@@ -18394,7 +18235,7 @@ def _refresh_dist_binary_after_rebuild(
     binary is held open), try rename-then-write before giving up; on total
     failure emit ``launcher_binary_swap_failed_locked``. The launcher's
     "old PID" is read from the ``VCT_LAUNCHER_PID`` env var when present
-    (set by the Tauri ``update_orchestrator`` command before spawning
+    (set by the launcher's update pipeline (``update_run::run_update``) before spawning
     install.py).
 
     Args:
@@ -18443,7 +18284,7 @@ def _refresh_dist_binary_after_rebuild(
 
     # Skip the running-vs-disk emit entirely when the Rust caller has
     # opted into auto-restart (VCT_AUTO_RESTART_LAUNCHER=1 set by
-    # `update_orchestrator` v0.2.17). The deferral is redundant in
+    # the launcher's update pipeline, since v0.2.17). The deferral is redundant in
     # that path — the Rust handler spawns the new binary detached and
     # exits the current process.
     auto_restart_handled_externally = (
@@ -18659,13 +18500,13 @@ def _refresh_dist_binary_after_rebuild(
                     # v0.2.54 Track C (C-5): when the LAUNCHER drove this
                     # install.py run (VCT_AUTO_RESTART_LAUNCHER=1), do NOT
                     # spawn vct-updater here. The launcher's own update
-                    # tail (`finalize_update_and_restart` →
-                    # `prepare_windows_update_handoff`) picks up the
+                    # relaunch (`restart::relaunch` → the stage-1 handoff,
+                    # v0.2.100) picks up the
                     # `.new` sibling we just staged and spawns the
                     # updater right before it exits. Spawning here too
                     # produced updater #1 whose 30 s parent-wait
                     # deterministically timed out (the launcher was
-                    # still mid-WaitForBinaryRefresh, up to 5 min) and
+                    # still mid-update, then waiting up to 5 min) and
                     # — pre-C-5 — left an orphaned update.lock.json
                     # behind, plus a brief two-updaters window once the
                     # launcher spawned updater #2.
@@ -18925,7 +18766,7 @@ def _ensure_launcher_binary(
 #       behaviour conservative — most users don't want a background
 #       service auto-starting on boot without explicit consent.
 #   8g. Stopping vct-hub before --update is owned by the launcher's
-#       Rust `update_orchestrator` (Step 12). By the time install.py
+#       Rust update pipeline (``update_run::run_update``, phase 5). By the time install.py
 #       runs under --update, the hub is already stopped; install.py
 #       just deploys and re-starts it.
 # ---------------------------------------------------------------------------
@@ -19304,7 +19145,7 @@ def _stop_running_vct_hub_for_update(binary: Optional[Path]) -> bool:
 
     This is the install.py mirror of the launcher GUI's
     ``ensure_hub_stopped_for_update`` (``installer.rs``). The GUI's
-    ``update_orchestrator`` stops the hub BEFORE invoking install.py, so
+    update pipeline (``update_run::run_update``) stops the hub BEFORE invoking install.py, so
     the GUI path already lands with the hub down. A MANUAL
     ``python install.py --update`` has no such caller — without this
     step the OLD hub stays alive, ``--start-if-not-running`` sees a live
@@ -19446,8 +19287,8 @@ def _deploy_and_start_vct_hub(
     contradicts our consent-first philosophy for background
     services.
 
-    Step 8g (stop-before-update): the launcher's
-    `update_orchestrator` (Step 12) stops vct-hub BEFORE invoking
+    Step 8g (stop-before-update): the launcher's update pipeline
+    (`update_run::run_update`, phase 5) stops vct-hub BEFORE invoking
     install.py. By the time we run, the hub is already down and we
     can deploy the new binary without ERROR_SHARING_VIOLATION on
     Windows. install.py then re-starts it via 8c above.

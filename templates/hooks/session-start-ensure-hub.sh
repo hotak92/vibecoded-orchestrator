@@ -50,7 +50,7 @@ debug() {
 # ---------------------------------------------------------------------------
 # v0.2.54 Track C (C-7): respect the orchestrator update gate.
 #
-# During `update_orchestrator` the launcher writes
+# During an orchestrator update (`run_orchestrator_update`) the launcher writes
 # `<vct_root>/.update-in-progress.json` and explicitly STOPS vct-hub so
 # the binary can be swapped (Windows mandatory locks). A Claude Code
 # session starting mid-update would otherwise respawn the hub right

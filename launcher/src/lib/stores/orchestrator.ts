@@ -75,8 +75,8 @@ export interface UpdateStatus {
   remote_ahead: boolean;
   install_stale: boolean;
   binary_stale: boolean;
-  /** v0.2.51 (Bug A): a prior `update_orchestrator` / `merge_*` / `rebase_*`
-   *  surfaced a conflict modal and the user resolved the conflict outside
+  /** v0.2.51 (Bug A): a prior orchestrator update (pull / merge / rebase —
+   *  since v0.2.100 `run_orchestrator_update`) surfaced a conflict modal and the user resolved the conflict outside
    *  the launcher (CLI `git add` + `git commit`) without re-entering the
    *  install flow. Detected via a sentinel file at
    *  `.claude/state/orchestrator-update-resume-needed.json` AND absence of

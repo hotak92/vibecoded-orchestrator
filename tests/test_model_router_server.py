@@ -67,7 +67,9 @@ def qwen_catalog_id(model_id: str) -> str:
     window, which v0.2.98 corrected. ``test_model_router_catalog`` derives the
     same spelling the same way for the same reason.
     """
-    row = load_seed().lookup(model_id)
+    # v0.2.100 (F-W1-19): vendor-keyed — a model the Token Plan serves at a
+    # smaller documented window than another endpoint reads ITS figures.
+    row = load_seed().lookup(model_id, "qwen")
     suffix = ONE_M_SUFFIX if row is not None and row.window_1m else ""
     return f"claude-gw/qwen/{model_id}{suffix}"
 

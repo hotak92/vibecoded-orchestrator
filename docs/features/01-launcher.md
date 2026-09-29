@@ -515,8 +515,7 @@ Twenty-one commands wired in `lib.rs` cover the orchestrator-installer surface u
 - `preview_install(config)` — diff-style preview of what an install would change. Read-only.
 - `preflight_install_safety_check(config)` — hard-path-whitelist enforcement; refuses installs that would touch user code outside whitelisted dirs.
 - `install_orchestrator(config, window)` — runs the install, emits `installer://progress` events.
-- `update_orchestrator(window)` — re-runs install in update mode (preserves `.env`, restarts services).
-- `update_orchestrator_at(path, window)` — variant that targets a specific existing install path.
+- `run_orchestrator_update(window, kind)` — THE orchestrator update (v0.2.100): one thirteen-phase pipeline for every kind (`PullFf`, `Merge`, `Rebase`, `Resume`, `ApplyOnly`, `ResetHard`) — git operation, `install.py --update`, version-guarded relaunch. It replaced `update_orchestrator` and the other per-surface update commands; `update_orchestrator_at` was retired.
 
 ### GitHub PAT (OS keychain)
 - `has_github_pat()` — boolean: is a PAT stored in the OS keychain under `vct.global.github`?

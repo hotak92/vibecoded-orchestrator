@@ -3,7 +3,8 @@
 
 Bug I
 -----
-``install.py::_pull_ollama_models`` previously logged-then-continued on
+``install.py::_pull_ollama_models`` (since v0.2.100 a shim over
+``vco_lib.ollama_pull.ensure``) previously logged-then-continued on
 EVERY model-pull failure. Embedding models are load-bearing — without
 the active embedding model present in the local Ollama cache, the KG
 silently cannot function (sync_knowledge_graph.py crashes downstream).
@@ -12,7 +13,7 @@ KG.
 
 Post-fix the function classifies models as either "embedding"
 (load-bearing) or "other" (best-effort). Embedding-model pull failures
-raise :class:`EmbeddingModelPullError` AFTER attempting all remaining
+raise :class:`OllamaPullError` AFTER attempting all remaining
 pulls; non-embedding failures still emit a WARN log + manual-pull hint
 and continue.
 
@@ -34,7 +35,6 @@ from __future__ import annotations
 
 import sys
 import urllib.error
-import urllib.request
 from pathlib import Path
 from typing import Dict
 
@@ -51,24 +51,6 @@ import install  # noqa: E402 — late import, after sys.path mutation
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-class _FakeOllamaPullResponse:
-    """Minimal urlopen-result substitute used for the success path."""
-
-    def __init__(self) -> None:
-        # Two reads: first returns a chunk, second returns empty (EOF) so
-        # the while-loop in _pull_ollama_models terminates.
-        self._chunks = [b'{"status":"success"}\n', b""]
-
-    def read(self, _size: int = 4096) -> bytes:
-        return self._chunks.pop(0) if self._chunks else b""
-
-    def __enter__(self):  # noqa: D401 — context-manager protocol
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        return False
 
 
 class _FakeTagsResponse:
@@ -91,30 +73,29 @@ class _FakeTagsResponse:
         return False
 
 
-def _make_pull_urlopen(failing_models: set[str]):
-    """Build a urlopen replacement that fails for specific model names.
+class _FakePullHttp:
+    """v0.2.100: the pull moved to ``vco_lib.ollama_pull`` behind an injectable
+    HTTP layer; this fake fails the pulls of ``failing_models``."""
 
-    The /api/pull request body is JSON `{"name": "<model>"}`. We decode
-    the request's body to decide whether to raise URLError (simulating
-    a pull failure) or return a success response.
-    """
+    def __init__(self, failing_models: set[str]) -> None:
+        self.failing = failing_models
+        self.present: set[str] = set()
 
-    def _urlopen(req, timeout: int = 600):  # noqa: ARG001
-        # The pull-request always has a JSON body naming the model.
-        try:
-            body = req.data.decode("utf-8") if req.data else ""
-        except Exception:
-            body = ""
-        for model in failing_models:
-            # crude but sufficient: the model name appears in the JSON
-            # body as `"name": "<model>"`. Match the suffix to avoid
-            # collisions between e.g. "qwen3-embedding:0.6b" and other
-            # qwen3-prefixed models.
-            if f'"{model}"' in body:
-                raise urllib.error.URLError(f"simulated failure for {model}")
-        return _FakeOllamaPullResponse()
+    def get_json(self, url: str, timeout: float):  # noqa: ARG002
+        return {"models": [{"name": m} for m in self.present]}
 
-    return _urlopen
+    def post_lines(self, url: str, payload, timeout: float):  # noqa: ARG002
+        if payload["name"] in self.failing:
+            raise urllib.error.URLError(f"simulated failure for {payload['name']}")
+        self.present.add(payload["name"])
+        yield b'{"status":"success"}\n'
+
+
+def _pull(models, embedding_models, failing):
+    from vco_lib import ollama_pull
+
+    return ollama_pull.ensure("http://127.0.0.1:1", models, load_bearing=embedding_models,
+                              http=_FakePullHttp(failing))
 
 
 # ---------------------------------------------------------------------------
@@ -122,80 +103,38 @@ def _make_pull_urlopen(failing_models: set[str]):
 # ---------------------------------------------------------------------------
 
 
-def test_bug_i_embedding_only_failure_raises(monkeypatch, capsys):
-    """Single load-bearing embedding model fails → raises
-    EmbeddingModelPullError.
+def test_bug_i_embedding_only_failure_raises():
+    """Single load-bearing embedding model fails → raises OllamaPullError
+    (v0.2.100 name of EmbeddingModelPullError)."""
+    from vco_lib.ollama_pull import OllamaPullError
 
-    Pre-fix: function returned None silently (KG silently broken).
-    Post-fix: raises so install aborts with a clear diagnostic.
-    """
-    failing = {"qwen3-embedding:0.6b"}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _make_pull_urlopen(failing)
-    )
-    with pytest.raises(install.EmbeddingModelPullError) as excinfo:
-        install._pull_ollama_models(
-            ["qwen3-embedding:0.6b"],
-            embedding_models={"qwen3-embedding:0.6b"},
-        )
+    with pytest.raises(OllamaPullError) as excinfo:
+        _pull(["qwen3-embedding:0.6b"], {"qwen3-embedding:0.6b"}, {"qwen3-embedding:0.6b"})
     msg = str(excinfo.value)
     assert "qwen3-embedding:0.6b" in msg, msg
-    assert "Knowledge Graph" in msg or "KG" in msg.upper(), msg
+    assert "Knowledge Graph" in msg, msg
 
 
-def test_bug_i_non_embedding_only_failure_continues(monkeypatch, capsys):
-    """Single non-load-bearing model fails → logs + returns without raising.
-
-    Both pre-fix and post-fix should NOT raise; post-fix additionally
-    classifies this as a "non-load-bearing" warn.
-    """
-    failing = {"gemma4:e4b"}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _make_pull_urlopen(failing)
-    )
-    # Empty embedding_models set — gemma4 is explicitly non-load-bearing.
-    install._pull_ollama_models(
-        ["gemma4:e4b"],
-        embedding_models=set(),
-    )
-    out = capsys.readouterr().out
-    assert "WARN" in out, out
+def test_bug_i_non_embedding_only_failure_continues(capsys):
+    """Single non-load-bearing model fails → reported, not raised."""
+    res = _pull(["gemma4:e4b"], set(), {"gemma4:e4b"})
+    assert set(res.failed) == {"gemma4:e4b"}
+    assert "FAILED" in capsys.readouterr().out
 
 
-def test_bug_i_mixed_only_non_embedding_fails(monkeypatch):
-    """Mixed list, only the non-embedding model fails → no raise.
-
-    Confirms the classifier doesn't over-trigger (i.e. the function
-    doesn't raise just because *something* failed; it only raises when a
-    LOAD-BEARING model failed).
-    """
-    failing = {"gemma4:e4b"}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _make_pull_urlopen(failing)
-    )
-    # Must NOT raise.
-    install._pull_ollama_models(
-        ["qwen3-embedding:0.6b", "gemma4:e4b"],
-        embedding_models={"qwen3-embedding:0.6b"},
-    )
+def test_bug_i_mixed_only_non_embedding_fails():
+    """Mixed list, only the non-embedding model fails → no raise."""
+    res = _pull(["qwen3-embedding:0.6b", "gemma4:e4b"], {"qwen3-embedding:0.6b"}, {"gemma4:e4b"})
+    assert res.pulled == ["qwen3-embedding:0.6b"]
 
 
-def test_bug_i_mixed_only_embedding_fails(monkeypatch):
-    """Mixed list, only the embedding model fails → raises.
+def test_bug_i_mixed_only_embedding_fails():
+    """Mixed list, only the embedding model fails → raises, after the rest."""
+    from vco_lib.ollama_pull import OllamaPullError
 
-    Confirms the classifier correctly fires when the load-bearing
-    member of the list fails (even though other models in the list
-    succeeded).
-    """
-    failing = {"qwen3-embedding:0.6b"}
-    monkeypatch.setattr(
-        "urllib.request.urlopen", _make_pull_urlopen(failing)
-    )
-    with pytest.raises(install.EmbeddingModelPullError) as excinfo:
-        install._pull_ollama_models(
-            ["qwen3-embedding:0.6b", "gemma4:e4b"],
-            embedding_models={"qwen3-embedding:0.6b"},
-        )
+    with pytest.raises(OllamaPullError) as excinfo:
+        _pull(["qwen3-embedding:0.6b", "gemma4:e4b"], {"qwen3-embedding:0.6b"},
+              {"qwen3-embedding:0.6b"})
     assert "qwen3-embedding:0.6b" in str(excinfo.value)
 
 

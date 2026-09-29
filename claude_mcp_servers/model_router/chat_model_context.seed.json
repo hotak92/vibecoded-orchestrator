@@ -24,7 +24,16 @@
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.z.ai/guides/llm/glm-5.2"
+      "source": "https://docs.z.ai/guides/llm/glm-5.2",
+      "vendor_overrides": {
+        "qwen": {
+          "context_window": 198000,
+          "max_output": 0,
+          "window_1m": false,
+          "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
+          "source_note": "v0.2.100 (F-W1-19): the QwenCloud per-model table lists glm-5.2 at '198k' on its endpoint (read 2026-09-29), so the copy that route serves must not be advertised as '[1m]' — the z.ai figure above is the model's window on z.ai's endpoint, not on this one. '198k' is read as 198,000 (the decimal reading, which never overstates; the vendor multiplies some figures by 1024). max_output 0 = not stated in the cited line: no output figure is published for this route rather than borrowing z.ai's."
+        }
+      }
     },
     "glm-5.1": {
       "vendor": "zai",

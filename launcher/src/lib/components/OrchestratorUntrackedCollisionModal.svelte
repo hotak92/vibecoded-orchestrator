@@ -1,7 +1,7 @@
 <script lang="ts">
   // SPDX-License-Identifier: AGPL-3.0-or-later
   // v0.2.88 (DEFECT 1 / FIELD DEFECT): untracked-collision "Resolve & retry"
-  // modal. Surfaced when `update_orchestrator`'s inline pull aborts because a
+  // modal. Surfaced when the update's pull aborts because a
   // local UNTRACKED file sits at a path this release ADDS ("untracked working
   // tree files would be overwritten by merge"). Pre-fix, this routed to the
   // generic conflict modal with an EMPTY file list — a dead-end. Now the parsed
@@ -12,10 +12,15 @@
   //   - byte-identical files → deleted (content is exactly what upstream ships)
   //   - divergent files → copied to .claude/state/update-collision-backups-<ts>/
   //     then deleted, so nothing is lost.
-  // then re-enters update_orchestrator (which now proceeds past the collision).
+  // then continues the update through the ONE pipeline (`PullFf`, under the
+  // claim the resolution took), which now proceeds past the collision.
+  // v0.2.100 (W3-FIX): the command rejects with the pipeline's JSON error
+  // contract, so the invoke is bracketed by `updater.beginOp` / `endOp` and a
+  // failure goes through `updater.failOp` (the store's error router).
 
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { modalFailure, updater } from '$lib/stores/updater';
   import type { OrchestratorUntrackedCollisionResolvablePayload } from '$lib/stores/updater';
 
   let {
@@ -49,6 +54,7 @@
     if (resolving || resolved) return;
     resolving = true;
     error = null;
+    updater.beginOp('update');
     try {
       // The backend auto-restarts on a successful retry, so we usually don't
       // return here. The `resolved` flag covers the crash-recovery path.
@@ -57,12 +63,19 @@
         files: allFiles,
       });
       resolved = true;
+      updater.endOp();
       toast.success(
         `Resolved ${allFiles.length} colliding file(s) — the update is retrying.`
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      error = `Resolve & retry failed: ${e}`;
+      const outcome = modalFailure(
+        updater.failOp(e),
+        'Resolve & retry failed',
+        'untrackedCollision'
+      );
+      error = outcome.inline;
+      if (outcome.closeSelf) onClose();
     } finally {
       resolving = false;
     }

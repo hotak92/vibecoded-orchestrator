@@ -558,6 +558,9 @@ pub(crate) fn read_ledger(
 
 /// Resolve a project's folder + display name from the DB.
 fn project_target(db: &Db, project_id: &str) -> Result<(PathBuf, String), String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    let db = db.ensure_live()?;
     let row = db
         .get_project(project_id)?
         .ok_or_else(|| format!("project {project_id} not found"))?;
@@ -566,6 +569,9 @@ fn project_target(db: &Db, project_id: &str) -> Result<(PathBuf, String), String
 
 /// Resolve the orchestrator clone root (DB cache first, then the walk-up).
 fn root_target(db: &Db) -> Result<PathBuf, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    let db = db.ensure_live()?;
     crate::services::vco_lib_bridge::resolve_orchestrator_root(db).ok_or_else(|| {
         "orchestrator root unresolvable (no DB-cached install path and no clone \
          discoverable from the launcher binary) — the global deferral ledger \
@@ -1343,4 +1349,35 @@ mod tests {
             Some(0)
         );
     }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn root_and_project_targets_stand_down_in_standby() {
+        let db = standby_db();
+        assert_typed_standby(&root_target(&db).unwrap_err());
+        assert_typed_standby(&project_target(&db, "p1").unwrap_err());
+    }
+
 }

@@ -51,7 +51,8 @@ function Write-Debug-Line {
 
 # ---------------------------------------------------------------------------
 # v0.2.54 Track C (C-7): respect the orchestrator update gate (parity with
-# the .sh sibling). During `update_orchestrator` the launcher writes
+# the .sh sibling). During an orchestrator update (`run_orchestrator_update`)
+# the launcher writes
 # `<vct_root>\.update-in-progress.json` and explicitly STOPS vct-hub so the
 # binary can be swapped (Windows mandatory locks). Respawning the hub here
 # mid-update would re-lock vct-hub.exe between the stop and the swap. MCP

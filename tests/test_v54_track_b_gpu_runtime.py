@@ -4,7 +4,7 @@
 
 Covers:
   * gpu-audit C-5 — `_apply_tier_overrides` keeps `code_dims` /
-    `text_dims` / `active_embedding` / pull list in lockstep with the
+    `text_dims` / `active_embedding` in lockstep with the
     swapped model (pre-v0.2.54 only the model NAME was replaced, so
     ``CODE_EMBED_DIMS=768`` was written for the 1024-dim qwen3 pick).
   * gpu-audit C-2 — AMD >=12 GB hosts are routed OFF the "gpu"
@@ -65,22 +65,10 @@ class ApplyTierOverridesTests(unittest.TestCase):
         self.assertEqual(config["text_dims"], 1024)
         self.assertEqual(config["active_embedding"], "arctic")
 
-    def test_override_appends_ollama_model_to_pull_list(self):
-        # low_resource pull list is [arctic, jina]; a qwen3 code
-        # override must land qwen3 in the pull list or the host embeds
-        # against a model Ollama never pulled.
-        config = dict(install.EMBEDDING_CONFIGS["low_resource"])
-        install._apply_tier_overrides(
-            config,
-            code_pick="qwen3-embedding:0.6b",
-            kg_pick=config["text_model"],
-        )
-        self.assertIn("qwen3-embedding:0.6b", config["embedding_models"])
-
     def test_override_does_not_mutate_shared_profile(self):
-        # config is a SHALLOW copy of the module-level profile dict —
-        # the pull-list append must be copy-on-write.
-        before = list(install.EMBEDDING_CONFIGS["low_resource"]["embedding_models"])
+        # config is a SHALLOW copy of the module-level profile dict — the
+        # override must never write through to the shared profile.
+        before = dict(install.EMBEDDING_CONFIGS["low_resource"])
         config = dict(install.EMBEDDING_CONFIGS["low_resource"])
         install._apply_tier_overrides(
             config,
@@ -88,10 +76,14 @@ class ApplyTierOverridesTests(unittest.TestCase):
             kg_pick=config["text_model"],
         )
         self.assertEqual(
-            install.EMBEDDING_CONFIGS["low_resource"]["embedding_models"],
+            install.EMBEDDING_CONFIGS["low_resource"],
             before,
             "tier override must not mutate the shared EMBEDDING_CONFIGS profile",
         )
+        # v0.2.100: the pull list is no longer carried on the config — it is
+        # derived from the final code/text model by vco_lib.embedding_pull_plan
+        # (see tests/test_v02100_embedding_pull_plan.py for the exact sets).
+        self.assertNotIn("embedding_models", config)
 
     def test_noop_when_picks_match_stock(self):
         config = dict(install.EMBEDDING_CONFIGS["cpu"])

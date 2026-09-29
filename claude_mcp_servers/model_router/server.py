@@ -1717,7 +1717,10 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
             is_anthropic=True,
         )
     else:
-        decision = route_model(requested_model, gateway.vendors, gateway.anthropic)
+        decision = route_model(
+            requested_model, gateway.vendors, gateway.anthropic,
+            known_ids=gateway.catalog.known_vendor_ids(),
+        )
     if isinstance(decision, RouteError):
         logger.info(
             _access_line(

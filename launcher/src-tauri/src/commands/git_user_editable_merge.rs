@@ -3,8 +3,9 @@
 //!
 //! Background
 //! ----------
-//! `update_orchestrator` / `merge_orchestrator_with_upstream` shell out
-//! to `git pull` against `vco_upstream/<branch>`. git refuses the pull
+//! The orchestrator update (`update_run::run_update`; its git operations
+//! live in `update_pipeline`) shells out to `git pull` against
+//! `vco_upstream/<branch>`. git refuses the pull
 //! with "Your local changes to the following files would be overwritten
 //! by merge" whenever a tracked file is BOTH locally-modified AND
 //! changed upstream.
@@ -16,9 +17,9 @@
 //!
 //! What this module does
 //! ---------------------
-//! This module sits between the `update_orchestrator` /
-//! `merge_orchestrator_with_upstream` command bodies and the bare
-//! `git pull` they currently run. It:
+//! This module sits between the update pipeline's git operations
+//! (`update_pipeline::{reconcile_and_pull, merge_upstream}`) and the bare
+//! `git pull` they run. It:
 //!
 //!   1. Walks the diff `<merge-base>..<upstream-tip>`.
 //!   2. For each file ALSO in `git status --porcelain` (locally edited)
@@ -124,7 +125,7 @@ use vct_launcher_core::process::CommandExt as _;
 ///
 /// The set is intentionally narrow. Adding entries here is a deliberate
 /// trust decision — once a path is on the list, divergent edits won't
-/// block `update_orchestrator` (they'll merge or sidecar). Files NOT
+/// block the orchestrator update (they'll merge or sidecar). Files NOT
 /// on the list fall through to git's default behaviour, which is what
 /// we want for protected paths like `vco_lib/*.py`, `launcher/**/*.rs`,
 /// etc. (the user should NOT routinely edit those, so a divergent pull
@@ -689,9 +690,9 @@ pub(crate) async fn classify_untracked_collisions(
 ///
 /// This is the tracked-file sibling of the F2 untracked auto-remove — both gate
 /// the mutation on the SAME byte-identity check (`local_matches_incoming_blob`).
-/// Called by BOTH update surfaces (installer::update_orchestrator +
-/// self_update::apply_launcher_update) right before `resolve_divergence_pull_plan`
-/// so the two can't drift.
+/// Called by the update pipeline's pull sequence
+/// (`update_pipeline::reconcile_and_pull`, v0.2.100: the ONE update surface)
+/// right before `resolve_divergence_pull_plan`.
 ///
 /// DATA-SAFETY: only touches files where working-tree bytes == incoming blob
 /// (nothing is lost — the discarded content is byte-for-byte the merge target).
@@ -2770,9 +2771,10 @@ async fn pop_probe_all_clean(
 
 /// Which `git pull`/`git rebase` strategy the update flow should use once
 /// the A0 pre-merge step has run. This is the SINGLE source of truth for the
-/// pull-strategy decision shared by BOTH update surfaces:
-///   - `installer::update_orchestrator` (the MenuBar badge), and
-///   - `self_update::apply_launcher_update` (the Preferences → Updates page).
+/// pull-strategy decision of the orchestrator update. Until v0.2.100 two
+/// surfaces shared it (the MenuBar badge's `installer::update_orchestrator`
+/// and the Preferences → Updates page's `self_update::apply_launcher_update`);
+/// both are now the one pipeline (`update_run::run_update`).
 ///
 /// Before v0.2.71 the decision lived inline only in `update_orchestrator`;
 /// the self-update surface did a blind `--ff-only` and routed ANY committed
@@ -3047,8 +3049,8 @@ pub(crate) fn parse_untracked_overwrite_files(err: &str) -> Vec<String> {
 }
 
 /// Decide the pull strategy for a divergence-aware update. This is the SINGLE
-/// source of truth shared by both update surfaces (installer::update_orchestrator
-/// and self_update::apply_launcher_update).
+/// source of truth, read by the update pipeline's pull sequence
+/// (`update_pipeline::reconcile_and_pull`).
 ///
 /// Decision tree (v0.2.79 §A — the pop-probe generalises the v0.2.58 gate):
 ///   - `pre_merge_committed && !generated_reconcile_committed` (the A0 pre-merge
@@ -3242,11 +3244,11 @@ pub(crate) async fn resolve_divergence_pull_plan(
 /// empty sets (the caller then does nothing and the existing modal flow
 /// surfaces — never worse than today).
 ///
-/// v0.2.89: the classify/act/emit family is WIRED into all three live update
-/// surfaces — `resolve_generated_files_to_upstream` runs inside
-/// `installer::update_orchestrator`, `installer::merge_orchestrator_with_upstream`,
-/// and `self_update::apply_launcher_update`, with `emit_generated_reconcile_deferrals`
-/// called by each surface AFTER the pull succeeds (MINOR-1). No `allow(dead_code)`
+/// v0.2.89: the classify/act/emit family is WIRED into the update's git
+/// operations — since v0.2.100 `resolve_generated_files_to_upstream` runs
+/// inside `update_pipeline::reconcile_and_pull` and `update_pipeline::merge_upstream`,
+/// with `emit_generated_reconcile_deferrals` called AFTER the pull succeeds
+/// (MINOR-1). No `allow(dead_code)`
 /// is needed — these are reachable from non-test code.
 pub(crate) struct GeneratedDivergence {
     /// `HEAD:path` differs from `base:path` (the fork COMMITTED changes) AND
@@ -3941,11 +3943,10 @@ pub(crate) fn build_generated_reconcile_deferral_text(
 // Launcher-side update divergence deferral (relocated v0.2.71 Sweep-A#3)
 // ---------------------------------------------------------------------------
 //
-// RELOCATED from installer.rs (was installer.rs-private) so BOTH update
-// surfaces share ONE durable-deferral writer:
-//   - the MenuBar-badge orchestrator-clone update (`installer::update_orchestrator`
-//     and its binary-refresh tail), and
-//   - the launcher SELF-update (`self_update::apply_launcher_update`).
+// RELOCATED from installer.rs (was installer.rs-private) so the two update
+// surfaces of the time shared ONE durable-deferral writer. Since v0.2.100 its
+// callers are the one pipeline: `update_pipeline` (non-FF / pull failures) and
+// `update_run`'s post-install binary check (phase 11).
 //
 // Pre-Sweep-A#3 only the installer surface wrote a durable
 // `UPDATE_DEFERRED.md` trace on a non-FF / git-pull failure; the self-update
@@ -3972,18 +3973,22 @@ pub(crate) enum LauncherUpdateDivergedKind {
         remote_sha: Option<String>,
         detail: String,
     },
-    /// `WaitForBinaryRefresh` timed out but the on-disk dist binary is
-    /// NEWER than the running launcher — we restarted into it anyway
-    /// (v0.2.55 "update in any case"), and record that the update may be
-    /// one step behind the absolute source target.
+    /// The update pipeline's post-install binary check
+    /// (`update_run::decide_binary_refresh`, `BinaryCheck::Partial`) found
+    /// the dist launcher below the source version but NEWER than the running
+    /// launcher — the pipeline relaunches into it anyway (v0.2.55 "update in
+    /// any case"), and records that the update may be one step behind the
+    /// absolute source target.
     PartialBinaryRefresh {
         running: String,
         on_disk: String,
         detail: String,
     },
-    /// `WaitForBinaryRefresh` timed out and there is NO newer binary on
-    /// disk — the restart was (correctly) aborted because re-execing the
-    /// same old binary helps nothing. The durable record makes the stuck
+    /// The update pipeline's post-install binary check
+    /// (`update_run::decide_binary_refresh`, `BinaryCheck::NotPublished`)
+    /// found NO binary newer than the running launcher on disk — the restart
+    /// is (correctly) skipped because re-execing the same old binary helps
+    /// nothing. The durable record makes the stuck
     /// state diagnosable at session start.
     BinaryRefreshTimeout {
         running: String,
@@ -4012,10 +4017,9 @@ pub(crate) enum LauncherUpdateDivergedKind {
 /// the terminal Claude. This closes that asymmetry.
 ///
 /// v0.2.71 Sweep-A#3: relocated from installer.rs to this shared module
-/// (was installer.rs-private) so the launcher SELF-update surface
-/// (`self_update::apply_launcher_update`) can call the SAME writer rather
-/// than growing a second copy. Both surfaces now leave an identical
-/// durable trace on a failed update.
+/// (was installer.rs-private) so the launcher SELF-update surface of the
+/// time could call the SAME writer rather than growing a second copy. Since
+/// v0.2.100 the one update pipeline is its only caller family.
 ///
 /// Standalone Rust writer (does NOT depend on install.py firing) — the
 /// whole point is that install.py / the binary swap did NOT complete.
@@ -4115,12 +4119,12 @@ pub(crate) fn write_launcher_update_diverged_deferral(
             "Orchestrator updated, but the launcher binary may be one step behind target"
                 .to_string(),
             format!(
-                "`WaitForBinaryRefresh` timed out before the on-disk launcher binary reached \
-                 the exact source target, but a NEWER binary than the running one was present \
+                "After install.py finished, the update's binary check found the on-disk \
+                 launcher binary below the source version, but NEWER than the running one \
                  (running v{running}, on-disk v{on_disk}), so the launcher restarted into it \
                  anyway (v0.2.55 \"update in any case\"). The remaining gap is usually the \
                  binary-refresh commit (`chore(binary): refresh … [skip ci]`) not yet pushed \
-                 by the Release workflow, or a transient pull failure. Underlying: `{d}`",
+                 by the Release workflow. Underlying: `{d}`",
                 running = running,
                 on_disk = on_disk,
                 d = detail.trim(),
@@ -4150,12 +4154,12 @@ pub(crate) fn write_launcher_update_diverged_deferral(
             (
                 "Orchestrator update did not deliver a new launcher binary".to_string(),
                 format!(
-                    "`WaitForBinaryRefresh` timed out and NO binary newer than the running \
-                     launcher (v{running}) is on disk (on-disk v{od}). Restarting was aborted \
-                     because re-execing the same old binary would not help. This usually means \
-                     the source pull did not land the binary-refresh commit (a non-FF \
-                     divergence that the re-pull kept failing on, or the Release workflow has \
-                     not pushed the refreshed binaries yet). Underlying: `{d}`",
+                    "After install.py finished, the update's binary check found NO binary \
+                     newer than the running launcher (v{running}) on disk (on-disk v{od}). \
+                     Restarting was skipped because re-execing the same old binary would not \
+                     help. This usually means the pulled source does not yet carry the \
+                     binary-refresh commit (the Release workflow has not pushed the refreshed \
+                     binaries yet). Underlying: `{d}`",
                     running = running,
                     od = od,
                     d = detail.trim(),
@@ -5246,11 +5250,11 @@ pub(crate) mod tests {
         //     vice versa), so `--ff-only` ALWAYS fails post-pre-merge
         //     with a NON-FAST-FORWARD error (a different, expected
         //     failure mode, not the BLOCKER).
-        //   - The non-FF error is handled by `update_orchestrator`'s
-        //     existing B4 modal flow at installer.rs:3423, which
-        //     surfaces a "Merge / Rebase / Cancel" prompt. Choosing
-        //     "Merge" calls `merge_orchestrator_with_upstream` which
-        //     uses `git pull --no-rebase` and lands both edits.
+        //   - The non-FF error is handled by the update's B4 divergence
+        //     modal, which surfaces a "Merge / Rebase / Cancel" prompt.
+        //     Choosing "Merge" runs `run_orchestrator_update({kind:
+        //     Merge})` → `update_pipeline::merge_upstream`, which uses
+        //     `git pull --no-rebase` and lands both edits.
         //
         // This test verifies:
         //   1. The dirty-tree BLOCKER is GONE (pull's stderr no longer
@@ -5379,7 +5383,7 @@ pub(crate) mod tests {
         }
 
         // Follow-up merge pull (the production fallback via the B4
-        // modal → merge_orchestrator_with_upstream) must succeed and
+        // modal → `update_pipeline::merge_upstream`) must succeed and
         // land both edits.
         let merge_pull = StdCommand::new("git").silent()
             .args([
@@ -5476,7 +5480,7 @@ pub(crate) mod tests {
             claude.kind,
         );
 
-        // Non-FF merge pull (matches merge_orchestrator_with_upstream
+        // Non-FF merge pull (matches `update_pipeline::merge_upstream`'s
         // invocation: --no-rebase --no-edit).
         let pull = StdCommand::new("git").silent()
             .args([
@@ -6905,28 +6909,39 @@ pub(crate) mod tests {
             "non-overlapping content edit must pop-probe Clean (the optimisation)"
         );
 
-        // (b) the post-pull backstop is the safety net of record — assert BOTH
-        // update surfaces still detect a conflicted autostash-pop after the fact.
-        // Pinning the source presence makes the A.3 data-safety argument a
-        // regression-tested contract, not just a comment.
+        // (b) the post-pull backstop is the safety net of record — assert the
+        // ONE update pipeline (v0.2.100 WP-03b: `update_pipeline.rs`, which
+        // replaced the per-surface pulls in installer.rs / self_update.rs)
+        // still detects a conflicted autostash-pop after an exit-0 pull and
+        // routes it to the pop deferral. Scanned on CODE ONLY (comments and
+        // string literals blanked by the update_run allowlist scanner), so a
+        // name surviving in a comment cannot satisfy it.
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let installer_src =
-            std::fs::read_to_string(manifest_dir.join("src/commands/installer.rs")).unwrap();
-        let self_update_src =
-            std::fs::read_to_string(manifest_dir.join("src/commands/self_update.rs")).unwrap();
-        assert!(
-            installer_src.contains("--diff-filter=U")
-                || installer_src.contains("collect_conflicted_files")
-                || installer_src.contains("autostash"),
-            "installer.rs must retain the post-pull autostash-pop conflict backstop \
-             (A.3 safety net of record for pop-probe false-CLEANs)"
+        let code_only = crate::commands::update_run::tests::code_only;
+        let pipeline_src = code_only(
+            &std::fs::read_to_string(manifest_dir.join("src/commands/update_pipeline.rs"))
+                .unwrap(),
+        );
+        let installer_src = code_only(
+            &std::fs::read_to_string(manifest_dir.join("src/commands/installer.rs")).unwrap(),
         );
         assert!(
-            self_update_src.contains("--diff-filter=U")
-                || self_update_src.contains("autostash"),
-            "self_update.rs must retain the post-pull autostash-pop conflict backstop \
-             (A.3 safety net of record for pop-probe false-CLEANs)"
+            installer_src.contains("fn collect_conflicted_files("),
+            "installer.rs must keep the unmerged-index reader the backstop uses"
         );
+        for needle in [
+            "let autostash_pop_failed",
+            "collect_conflicted_files(&install_path)",
+            "autostash_pop_failed && merge_succeeded",
+            "write_autostash_pop_conflict_deferral(&install_path",
+        ] {
+            assert!(
+                pipeline_src.contains(needle),
+                "update_pipeline.rs must retain the post-pull autostash-pop conflict \
+                 backstop (A.3 safety net of record for pop-probe false-CLEANs): \
+                 `{needle}` missing from code"
+            );
+        }
     }
 
     /// (vii) A.6 dist-binary allowlist: a dirtied `launcher/dist/**` file is
@@ -7159,14 +7174,14 @@ pub(crate) mod tests {
 
     // ─── v0.2.71 Sweep-A#3: self_update surface durable-trace coverage ────
     //
-    // The whole point of relocating the writer is that the launcher
-    // SELF-update path (`self_update::apply_launcher_update`) can now leave
-    // the SAME durable `UPDATE_DEFERRED.md` trace the installer path already
-    // does. `apply_launcher_update` itself is `#[command]` (needs a Tauri
-    // AppHandle + a real git checkout), so we can't unit-test the command
-    // end-to-end here. Instead we pin the contract self_update relies on:
-    // the SHARED writer, called with the EXACT argument shapes the
-    // self_update failure branches pass (a branch name + a NonFastForward
+    // The whole point of relocating the writer was that the launcher
+    // SELF-update path could leave the SAME durable `UPDATE_DEFERRED.md`
+    // trace the installer path did. v0.2.100: both are the one pipeline,
+    // whose non-FF branch (`update_pipeline`, reached from the
+    // `run_orchestrator_update` #[command] — AppHandle + a real checkout) is
+    // not unit-testable end-to-end here. Instead we pin the contract it
+    // relies on: the SHARED writer, called with the EXACT argument shapes the
+    // pipeline's failure branches pass (a branch name + a NonFastForward
     // kind whose detail is the combined git output and whose SHAs come from
     // `current_sha` / `ls_remote_sha`), produces the frontmatter +
     // condition-id + recovery shape a terminal Claude can find. If this ever
@@ -7178,8 +7193,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let install = dir.path().to_path_buf();
 
-        // Mirror exactly what `apply_launcher_update`'s non-FF / conflict
-        // return path passes: a NonFastForward kind built from the combined
+        // Mirror exactly what the pipeline's non-FF / conflict return path
+        // passes: a NonFastForward kind built from the combined
         // git output (`e`) + best-effort local/remote SHAs.
         let combined_git_output =
             "Auto-merging launcher/src\nCONFLICT (content): Merge conflict in launcher/src";

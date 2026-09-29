@@ -309,8 +309,10 @@ _V02100_OWNED_ADDITIONS = frozenset({
     "ollama_not_ready_at_update",
     "ollama_model_pull_failed",
     "code_embed_backend_unavailable",
-    "gated_delivery_skipped",
-    "gated_delivery_unknown",
+    # gated_delivery_skipped / gated_delivery_unknown left this set in WP-10
+    # (F-W1-12): their emitter runs INSIDE an install.py run (the root bundle),
+    # so install ownership would drop the row in that run's own finalize; they
+    # are paired-resolution rows owned by vco_lib.module_gated_delivery.
     "watchdog_foreign_container",
     "services_stop_incomplete",
     "bundle_leftover_removed",

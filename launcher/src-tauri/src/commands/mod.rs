@@ -90,9 +90,9 @@ pub mod env_cmd;
 // here.
 pub mod git_cmd;
 // v0.2.24 §A0 (2026-05-22): per-path 3-way merge for known
-// user-editable files during orchestrator-root updates. Sits between
-// `installer::{update_orchestrator, merge_orchestrator_with_upstream}`
-// and their `git pull` invocations.
+// user-editable files during orchestrator-root updates. Sits between the
+// update pipeline's git operations (`update_pipeline::{reconcile_and_pull,
+// merge_upstream}`, driven by `update_run::run_update`) and their `git pull`.
 pub mod git_user_editable_merge;
 pub mod hub_proxy;
 pub mod installed_modules;
@@ -241,7 +241,8 @@ pub mod restart;
 // gained the Windows branch (10/10 failed Windows codegraph builds).
 pub mod script_invocation;
 // v0.2.52 V52-AH: Windows binary lock fix via stage1 updater handoff.
-// Companion to `commands::restart`. On Windows, `update_orchestrator`
+// Companion to `commands::restart`. On Windows, the update pipeline's
+// relaunch (`restart::relaunch`, phase 13 of `update_run::run_update`)
 // writes a lock file describing pending binary swaps + spawns
 // `vct-updater.exe` DETACHED, which performs the swap after the
 // launcher exits. POSIX no-op (the rename pattern in installer.rs
@@ -261,7 +262,8 @@ pub mod self_update;
 pub mod session_autostart;
 // v0.2.91 decision #26: named process-wide single-flight guard. Refuses (does
 // NOT queue) a second concurrent run of a long-running destructive command —
-// `update_all_projects` and `update_orchestrator_at` today. Lives in its own
+// `update_all_projects` and the orchestrator update (`run_orchestrator_update`
+// and the conflict resolvers that hand it their claim). Lives in its own
 // file rather than inside either 12k-line command module.
 pub mod single_flight;
 pub mod storage_ux;
@@ -284,8 +286,8 @@ pub mod update_gate;
 // surfaces had been extracted over six releases, but never the sequence, so
 // the two commands still drifted in twelve places on the SAME git clone
 // (`.claude/context/reviews/UPDATE-SURFACES-DUPLICATION-2026-09-18.md`).
-// `self_update::apply_launcher_update` is NOT rewired onto it yet — that is a
-// behaviour change (it gains install.py) and belongs to the follow-up.
+// v0.2.100 WP-03b: both surfaces are gone; `update_run::run_update` is the
+// one driver and this module holds its git operations.
 pub mod update_pipeline;
 // v0.2.100 WP-03a (AD-1): the ONE orchestrator-update pipeline — thirteen
 // fixed phases with a phase ledger, one command (`run_orchestrator_update`),

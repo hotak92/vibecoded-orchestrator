@@ -3107,7 +3107,7 @@ where
 {
     // v0.2.60: stand down while an orchestrator update is in progress —
     // this opens its OWN launcher.db connection (below), bypassing the
-    // managed-connection close `update_orchestrator` does for the
+    // managed-connection close the update pipeline does for the
     // install.py window. See `update_gate::skip_if_update_in_progress`.
     if crate::commands::update_gate::skip_if_update_in_progress("module_service_poll") {
         return;

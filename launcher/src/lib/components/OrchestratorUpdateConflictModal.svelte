@@ -9,8 +9,8 @@
   //   Abort (with a confirmation) instead of silent dismissal so the
   //   user can never finish a session with a half-applied update.
   //
-  // Surfaced when `merge_orchestrator_with_upstream` or
-  // `rebase_orchestrator_onto_upstream` return a structured error with
+  // Surfaced when `run_orchestrator_update` (kind Merge / Rebase, or the
+  // pull's own merge) rejects with a `Conflict` error carrying
   // `event: "orchestrator_update_conflict"` — the merge/rebase started
   // but produced unresolved conflicts in one or more files.
   //
@@ -265,9 +265,9 @@
   }
 
   // V52-B: one-click resolution handlers. Both invoke the Tauri command,
-  // which performs the git checkout + commit/continue + delegates to
-  // resume_orchestrator_update for install.py --update + binary refresh
-  // + auto-restart. The auto-restart kills the launcher mid-call so we
+  // which performs the git checkout + commit/continue + hands its claim to
+  // the update pipeline's Resume kind for install.py --update + binary
+  // refresh + auto-restart. The auto-restart kills the launcher mid-call so we
   // rarely reach the `resolved = true` line — it's there for the
   // crash-recovery path where the restart hop fails.
   async function keepLocal() {

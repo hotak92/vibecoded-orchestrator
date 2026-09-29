@@ -157,10 +157,15 @@ class SeedTests(unittest.TestCase):
                 self.assertEqual(row.context_window, 1_000_000)
                 self.assertTrue(row.window_1m)
                 self.assertIsNotNone(self.seed.lookup(model_id))
-        # The Token-Plan endpoint's own 1M support for them is unverified,
-        # but that is a property of the OTHER endpoint's docs, not of these
-        # ids' verified window: the rows must not be narrowed to match the
-        # weaker citation.
+        # v0.2.100 (F-W1-19) refines the ruling where the other endpoint
+        # DOCUMENTS a smaller window: the row stays the model's (above), and
+        # the endpoint's own cited figure rides in `vendor_overrides`, read
+        # only when the caller names that vendor.
+        qwen_glm52 = self.seed.lookup("glm-5.2", "qwen")
+        assert qwen_glm52 is not None
+        self.assertLessEqual(qwen_glm52.context_window, 198_000)
+        self.assertFalse(qwen_glm52.window_1m)
+        self.assertTrue(qwen_glm52.source)
 
     def test_token_plan_rows_carry_the_vendors_per_model_windows(self) -> None:
         """Each row is pinned to the figure the vendor's OWN per-model table

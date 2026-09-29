@@ -38,7 +38,9 @@
   //    "dialog"` + `aria-modal` + `aria-labelledby`, Escape closes,
   //    focus is parked on a sensible primary action on mount.
 
+  import { invoke } from '@tauri-apps/api/core';
   import { updater, type OrchestratorNonFfPayload } from '$lib/stores/updater';
+  import { resetConfirmLines, resetResultText, runResetToUpstream } from './divergence-reset-logic';
   // v0.2.100 (WP-08): errors are parsed ONCE, by the updater store's
   // `routeUpdateError` (inside `updater.run`); this modal reads the route.
 
@@ -68,7 +70,13 @@
   } = $props();
 
   let busy = $state(false);
-  let busyOp = $state<'merge' | 'rebase' | null>(null);
+  let busyOp = $state<'merge' | 'rebase' | 'reset' | null>(null);
+  // v0.2.100 (WP-03b, owner ruling F-W2-03): the third choice. The confirm
+  // step names BOTH backup locations before anything runs; `resetResult` is
+  // the backend's own sentence naming them exactly afterwards.
+  let confirmingReset = $state(false);
+  let vctRoot = $state<string | null>(null);
+  let resetResult = $state<string | null>(null);
   // v0.2.27: retry state. Tracks which operations the user has tried
   // AND seen fail in this modal session. Drives button priority.
   let mergeFailed = $state(false);
@@ -158,6 +166,40 @@
 
   async function runRebase() {
     await runKind('Rebase');
+  }
+
+  /** Open the reset confirmation; resolve the launcher state dir so the
+   *  dialog can name where the bundle will be written. */
+  async function askReset() {
+    if (busy) return;
+    lastError = null;
+    confirmingReset = true;
+    try {
+      vctRoot = await invoke<string>('get_resolved_vct_root_dir');
+    } catch {
+      vctRoot = null; // named generically — the backup still happens
+    }
+  }
+
+  /** Confirmed: back up, then reset through the ONE update action. */
+  async function confirmReset() {
+    busy = true;
+    busyOp = 'reset';
+    lastError = null;
+    try {
+      const result = await runResetToUpstream((kind) => updater.run(kind));
+      confirmingReset = false;
+      if (result.ok) {
+        resetResult = resetResultText(result.outcome);
+        return;
+      }
+      if (result.routed.to === 'failed') {
+        lastError = { title: 'Reset refused or failed', detail: result.routed.message };
+      }
+    } finally {
+      busy = false;
+      busyOp = null;
+    }
   }
 
   /**
@@ -441,6 +483,40 @@
         </div>
       {/if}
 
+      {#if resetResult}
+        <div class="dvg-manual-prompt" role="status">
+          <strong>Reset to upstream done.</strong>
+          <span class="dvg-reset-result">{resetResult}</span>
+        </div>
+        <div class="dvg-actions">
+          <button type="button" class="dvg-btn dvg-btn-primary" onclick={cancel}>Close</button>
+        </div>
+      {:else if confirmingReset}
+        <div class="dvg-reset-confirm" role="alertdialog" aria-labelledby="dvg-reset-title">
+          <strong id="dvg-reset-title">Reset to upstream — discard local commits?</strong>
+          {#each resetConfirmLines(vctRoot) as line (line)}
+            <span>{line}</span>
+          {/each}
+        </div>
+        <div class="dvg-actions">
+          <button
+            type="button"
+            class="dvg-btn"
+            disabled={busy}
+            onclick={() => (confirmingReset = false)}
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            class="dvg-btn dvg-btn-danger"
+            disabled={busy}
+            onclick={confirmReset}
+          >
+            {busyOp === 'reset' ? 'Backing up and resetting…' : 'Back up, then reset'}
+          </button>
+        </div>
+      {:else}
       <div class="dvg-actions">
         <button
           type="button"
@@ -450,6 +526,19 @@
           title="Dismiss this dialog. You can resolve manually with `git pull` or `git rebase` in a terminal."
         >
           Cancel
+        </button>
+
+        <button
+          type="button"
+          class="dvg-btn dvg-btn-with-sub"
+          disabled={busy}
+          onclick={askReset}
+          title="Saves your local commits and changes to a backup branch + git bundle, then resets the clone to the upstream release and runs the update."
+        >
+          <span class="dvg-btn-label">Reset to upstream (discard local commits)</span>
+          <span class="dvg-btn-sub">
+            Backs up everything local first; asks before resetting
+          </span>
         </button>
 
         <button
@@ -502,6 +591,8 @@
           </span>
         </button>
       </div>
+
+      {/if}
 
       {#if !bothFailed}
         <div class="dvg-manual-link">
@@ -760,6 +851,29 @@
     color: var(--color-text);
     font-size: 11.5px;
     line-height: 1.55;
+  }
+
+  .dvg-reset-confirm {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    background: rgba(255, 79, 160, 0.08); /* --color-pink at 8% */
+    border: 1px solid rgba(255, 79, 160, 0.3);
+    border-radius: 4px;
+    color: var(--color-text);
+    font-size: 11.5px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .dvg-reset-result {
+    display: block;
+    margin-top: 4px;
+    word-break: break-word;
+  }
+  .dvg-btn-danger {
+    border-color: rgba(255, 79, 160, 0.55);
+    color: var(--color-pink);
   }
 
   .dvg-actions {

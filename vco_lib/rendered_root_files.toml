@@ -66,7 +66,8 @@
 #
 # The three sibling tables there (`bundled_mcp_versions.toml`,
 # `mcp_scan_rules.toml`, `deferral_conditions.toml`) are whitelisted so the
-# copy-based `update_orchestrator_at` path propagates table edits. This one is
+# copy-based install path (`copy_orchestrator_to_sync`; until v0.2.100 also
+# the retired `update_orchestrator_at`) carries table edits. This one is
 # not, on purpose: that path copies no `vco_lib/*.py`, so a whitelisted table
 # could arrive NEWER than the `rendered_root_files.py` that reads it, and a
 # format-version mismatch is a loud RuntimeError that would stop CLAUDE.md being

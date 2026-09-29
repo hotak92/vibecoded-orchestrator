@@ -40,8 +40,9 @@
 #
 # ## Propagation
 #
-# Listed in `orchestrator-managed-paths.txt` so `update_orchestrator_at`
-# pushes new editions of this table into every existing install (same as
+# Listed in `orchestrator-managed-paths.txt` so a copy-based install
+# (`installer/file_ops.rs::copy_orchestrator_to_sync`; until v0.2.100 also the retired
+# `update_orchestrator_at`) carries new editions of this table along (same as
 # bundled_mcp_versions.toml).
 #
 # ═══════════════════════════════════════════════════════════════════════════

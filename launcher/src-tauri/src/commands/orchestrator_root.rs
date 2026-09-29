@@ -85,29 +85,10 @@ pub const ORCHESTRATOR_ROOT_NAME: &str = "VibeCoded Orchestrator";
 // — it's an inherent method on Db now imported via the core re-export
 // at the top of lib.rs.
 
-/// Strip Windows' `\\?\` verbatim prefix (and the `\\?\UNC\` UNC
-/// variant) from a path-string, leaving the conventional `C:\...` /
-/// `\\server\share\...` form. No-op on non-Windows / no-prefix input.
-///
-/// `std::fs::canonicalize` on Windows always returns a `\\?\`-prefixed
-/// path. That form is technically equivalent and works for any Win32
-/// API call, but it confuses display, comparison against
-/// non-canonicalized paths stored elsewhere, and shell-friendliness.
-/// The launcher's other path-storing code uses unprefixed absolute
-/// paths, so we normalize here for consistency.
-fn strip_windows_verbatim_prefix(s: &str) -> String {
-    // Match the two Windows verbatim forms used by canonicalize:
-    //   \\?\C:\foo\bar         (drive form)
-    //   \\?\UNC\server\share   (UNC form, must rebuild as \\server\share)
-    if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
-        // UNC: replace `\\?\UNC\` with `\\`.
-        format!(r"\\{}", rest)
-    } else if let Some(rest) = s.strip_prefix(r"\\?\") {
-        rest.to_string()
-    } else {
-        s.to_string()
-    }
-}
+// Windows' `\\?\` verbatim prefix stripped from a canonicalized path.
+// v0.2.100 (F-W1-08): ONE home — the install-root resolver's function; the
+// private copy this file carried predated it.
+use vct_launcher_core::services::install_root::strip_windows_verbatim_prefix;
 
 /// Canonicalize a folder path to its absolute form and return as a
 /// String. On Windows, strips the `\\?\` verbatim prefix returned by

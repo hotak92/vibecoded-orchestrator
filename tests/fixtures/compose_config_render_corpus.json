@@ -1,0 +1,254 @@
+{
+  "_doc": [
+    "v0.2.100 review W2R-04: the `compose config` render shapes vco_lib.data_identity.render_mount must read,",
+    "consumed by tests/test_v02100_data_identity.py::test_compose_config_render_corpus.",
+    "PROVENANCE: these renders are RECONSTRUCTED from each engine's documented `config` output shape for VCO's own",
+    "infrastructure/docker-compose.yml stanzas (`${VCT_<SVC>_DATA_SOURCE:-<key>}:<dest>` + a top-level volumes map",
+    "whose `name:` is `${VCT_<SVC>_VOLUME_NAME:-vco_<svc>_...}`): docker compose v2 normalises every entry to the long",
+    "syntax (type/source/target + bind:/volume: sub-keys) and prints every volume's resolved `name:`; podman-compose",
+    "prints the merged file as written (short strings, a volumes map that may lack `name:` or be null). They were NOT",
+    "captured from a live engine by the lane that wrote them (no container command may run there) — the v0.2.100",
+    "dogfood step 3 captures real renders on BOTH providers and any divergence is added here as a new case.",
+    "Fields: render (YAML text of the `config` stdout), service, project (the -p value; null = unknown), live (one",
+    "`inspect .Mounts` entry of the running container, or null), expect_mount (the parsed mount; `{infra}` = the",
+    "compose dir), expect_verdict (recreate_preserves_data against `live`), expect_error (substrings of the precise",
+    "fail-closed reason: which field, which service)."
+  ],
+  "cases": [
+    {
+      "name": "docker compose v2, Linux, the owner's bind (long syntax, create_host_path, selinux)",
+      "service": "ollama", "project": "infrastructure",
+      "render": "name: infrastructure\nservices:\n  ollama:\n    container_name: vco_ollama\n    image: docker.io/ollama/ollama:latest\n    networks:\n      default: null\n    ports:\n      - mode: ingress\n        target: 11434\n        published: \"11435\"\n        protocol: tcp\n    volumes:\n      - type: bind\n        source: /home/user/podman_volumes/ollama/models\n        target: /root/.ollama\n        bind:\n          selinux: Z\n          create_host_path: true\nnetworks:\n  default:\n    name: infrastructure_default\nvolumes:\n  ollama_data:\n    name: vco_ollama_data\n",
+      "live": {"Type": "bind", "Source": "/home/user/podman_volumes/ollama/models", "Destination": "/root/.ollama", "Mode": "Z", "RW": true},
+      "expect_mount": {"kind": "bind", "source": "/home/user/podman_volumes/ollama/models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "docker compose v2, Linux, the default named volume (long syntax, volume: {})",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "name: infrastructure\nservices:\n  weaviate:\n    container_name: vco_weaviate\n    volumes:\n      - type: volume\n        source: weaviate_data\n        target: /var/lib/weaviate\n        volume: {}\nvolumes:\n  weaviate_data:\n    name: vco_weaviate_data\n",
+      "live": {"Type": "volume", "Name": "vco_weaviate_data", "Source": "/home/user/.local/share/containers/storage/volumes/vco_weaviate_data/_data", "Destination": "/var/lib/weaviate", "Driver": "local"},
+      "expect_mount": {"kind": "volume", "source": "vco_weaviate_data", "destination": "/var/lib/weaviate"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "docker compose v2, a VCT_<SVC>_VOLUME_NAME knob (volume: {nocopy: true})",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  code_embed:\n    volumes:\n      - type: volume\n        source: code_embed_cache\n        target: /cache\n        volume:\n          nocopy: true\nvolumes:\n  code_embed_cache:\n    name: legacy_embed_cache\n",
+      "live": {"Type": "volume", "Name": "legacy_embed_cache", "Source": "/var/lib/docker/volumes/legacy_embed_cache/_data", "Destination": "/cache"},
+      "expect_mount": {"kind": "volume", "source": "legacy_embed_cache", "destination": "/cache"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "docker compose v2, the render names the default volume while the data is on a bind",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: volume\n        source: ollama_data\n        target: /root/.ollama\n        volume: {}\nvolumes:\n  ollama_data:\n    name: vco_ollama_data\n",
+      "live": {"Type": "bind", "Source": "/home/user/podman_volumes/ollama/models", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "volume", "source": "vco_ollama_data", "destination": "/root/.ollama"},
+      "expect_verdict": "refuse_different"
+    },
+    {
+      "name": "podman-compose, short-form bind string with :Z",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    container_name: vco_ollama\n    image: docker.io/ollama/ollama:latest\n    ports:\n    - 11435:11434\n    volumes:\n    - /home/user/podman_volumes/ollama/models:/root/.ollama:Z\nvolumes:\n  ollama_data:\n    name: vco_ollama_data\n",
+      "live": {"Type": "bind", "Source": "/home/user/podman_volumes/ollama/models", "Destination": "/root/.ollama", "Options": ["rbind"], "Mode": "Z"},
+      "expect_mount": {"kind": "bind", "source": "/home/user/podman_volumes/ollama/models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "podman-compose, short-form named volume through the volumes map's name:",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n  weaviate_data:\n    name: vco_weaviate_data\n",
+      "live": {"Type": "volume", "Name": "vco_weaviate_data", "Source": "/x/_data", "Destination": "/var/lib/weaviate"},
+      "expect_mount": {"kind": "volume", "source": "vco_weaviate_data", "destination": "/var/lib/weaviate"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "podman-compose, a volume declared with no name: gets the <project>_ prefix",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n  weaviate_data: {}\n",
+      "live": {"Type": "volume", "Name": "infrastructure_weaviate_data", "Source": "/x/_data", "Destination": "/var/lib/weaviate"},
+      "expect_mount": {"kind": "volume", "source": "infrastructure_weaviate_data", "destination": "/var/lib/weaviate"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "podman-compose, a bare (null) volume declaration gets the <project>_ prefix",
+      "service": "code_embed", "project": "vibecoded",
+      "render": "services:\n  code_embed:\n    volumes:\n    - code_embed_cache:/cache\nvolumes:\n  code_embed_cache: null\n",
+      "live": {"Type": "volume", "Name": "vibecoded_code_embed_cache", "Source": "/x/_data", "Destination": "/cache"},
+      "expect_mount": {"kind": "volume", "source": "vibecoded_code_embed_cache", "destination": "/cache"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "an external volume keeps its own name",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n    - models:/root/.ollama\nvolumes:\n  models:\n    external: true\n",
+      "live": {"Type": "volume", "Name": "models", "Source": "/x/_data", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "volume", "source": "models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "the legacy external: {name: ...} form",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n    - models:/root/.ollama\nvolumes:\n  models:\n    external:\n      name: shared_ollama_models\n",
+      "live": {"Type": "volume", "Name": "shared_ollama_models", "Source": "/x/_data", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "volume", "source": "shared_ollama_models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "podman-compose, a relative bind resolves against the compose directory",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  code_embed:\n    volumes:\n    - ./hf-cache:/cache\n",
+      "live": {"Type": "bind", "Source": "{infra}/hf-cache", "Destination": "/cache"},
+      "expect_mount": {"kind": "bind", "source": "{infra}/hf-cache", "destination": "/cache"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "a trailing separator on the rendered bind is the same directory",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: bind\n        source: /srv/models/\n        target: /root/.ollama\n",
+      "live": {"Type": "bind", "Source": "/srv/models", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "bind", "source": "/srv/models/", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "Docker Desktop on Windows (WSL2 backend): C:\\ render, /run/desktop/mnt/host live Source",
+      "service": "ollama", "project": "infrastructure",
+      "render": "name: infrastructure\nservices:\n  ollama:\n    volumes:\n      - type: bind\n        source: C:\\Users\\user\\ollama\\models\n        target: /root/.ollama\n        bind:\n          create_host_path: true\nvolumes:\n  ollama_data:\n    name: vco_ollama_data\n",
+      "live": {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/user/ollama/models", "Destination": "/root/.ollama", "Mode": "", "RW": true, "Propagation": "rprivate"},
+      "expect_mount": {"kind": "bind", "source": "C:\\Users\\user\\ollama\\models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "Docker Desktop on Windows (Hyper-V backend): short-form C:\\ render, /host_mnt live Source",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  code_embed:\n    volumes:\n    - C:\\Users\\user\\hf-cache:/cache\n",
+      "live": {"Type": "bind", "Source": "/host_mnt/c/Users/user/hf-cache", "Destination": "/cache"},
+      "expect_mount": {"kind": "bind", "source": "C:\\Users\\user\\hf-cache", "destination": "/cache"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "compose inside a WSL2 distro: /mnt/c render, Docker Desktop live Source",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: bind\n        source: /mnt/c/Users/user/ollama/models\n        target: /root/.ollama\n",
+      "live": {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/user/ollama/models", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "bind", "source": "/mnt/c/Users/user/ollama/models", "destination": "/root/.ollama"},
+      "expect_verdict": "preserves"
+    },
+    {
+      "name": "Windows: a path differing only in the case of its body is NOT proven the same (refuses)",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: bind\n        source: C:\\Users\\User\\Models\n        target: /root/.ollama\n",
+      "live": {"Type": "bind", "Source": "/run/desktop/mnt/host/c/Users/user/models", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "bind", "source": "C:\\Users\\User\\Models", "destination": "/root/.ollama"},
+      "expect_verdict": "refuse_different"
+    },
+    {
+      "name": "a /mnt/<dir> that is not a drive letter is an ordinary Linux path",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n    - /mnt/data/models:/root/.ollama\n",
+      "live": {"Type": "bind", "Source": "/run/desktop/mnt/host/d/models", "Destination": "/root/.ollama"},
+      "expect_mount": {"kind": "bind", "source": "/mnt/data/models", "destination": "/root/.ollama"},
+      "expect_verdict": "refuse_different"
+    },
+    {
+      "name": "other mounts only: compose mounts nothing at the data destination",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: bind\n        source: /etc/localtime\n        target: /etc/localtime\n        read_only: true\n",
+      "live": {"Type": "bind", "Source": "/srv/models", "Destination": "/root/.ollama"},
+      "expect_mount": null,
+      "expect_verdict": "refuse_different"
+    },
+    {
+      "name": "FAIL CLOSED: a tmpfs at the data destination",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: tmpfs\n        target: /root/.ollama\n        tmpfs:\n          size: 1024\n",
+      "live": null,
+      "expect_error": ["services.ollama.volumes[0]", "'tmpfs'", "/root/.ollama"]
+    },
+    {
+      "name": "FAIL CLOSED: a Windows named pipe at the data destination",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n      - type: npipe\n        source: \\\\.\\pipe\\x\n        target: /var/lib/weaviate\n",
+      "live": null,
+      "expect_error": ["services.weaviate.volumes[0]", "'npipe'"]
+    },
+    {
+      "name": "FAIL CLOSED: a long-syntax entry with no target",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      - type: bind\n        source: /srv/models\n",
+      "live": null,
+      "expect_error": ["services.ollama.volumes[0]", "no string `target`", "source, type"]
+    },
+    {
+      "name": "FAIL CLOSED: a long-syntax volume with no source (anonymous)",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  code_embed:\n    volumes:\n      - type: volume\n        target: /cache\n",
+      "live": null,
+      "expect_error": ["services.code_embed.volumes[0]", "no `source`"]
+    },
+    {
+      "name": "FAIL CLOSED: a short-form anonymous volume at the data destination",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  code_embed:\n    volumes:\n    - /cache\n",
+      "live": null,
+      "expect_error": ["services.code_embed.volumes[0]", "anonymous volume at /cache"]
+    },
+    {
+      "name": "FAIL CLOSED: a named volume the top-level map does not declare",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n  something_else:\n    name: x\n",
+      "live": null,
+      "expect_error": ["services.weaviate.volumes[0]", "'weaviate_data'", "does not declare"]
+    },
+    {
+      "name": "FAIL CLOSED: a volume with no name: and no known project",
+      "service": "weaviate", "project": null,
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n  weaviate_data: {}\n",
+      "live": null,
+      "expect_error": ["volumes.weaviate_data", "no explicit `name:`", "<project>_weaviate_data"]
+    },
+    {
+      "name": "FAIL CLOSED: a non-string volume name",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n  weaviate_data:\n    name: 42\n",
+      "live": null,
+      "expect_error": ["volumes.weaviate_data.name", "int"]
+    },
+    {
+      "name": "FAIL CLOSED: the service's volumes is a map, not a list",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n      data: /root/.ollama\n",
+      "live": null,
+      "expect_error": ["services.ollama.volumes is a dict"]
+    },
+    {
+      "name": "FAIL CLOSED: an entry that is neither a string nor a mapping",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n    - 42\n",
+      "live": null,
+      "expect_error": ["services.ollama.volumes[0] is a int"]
+    },
+    {
+      "name": "FAIL CLOSED: two entries target the data destination",
+      "service": "ollama", "project": "infrastructure",
+      "render": "services:\n  ollama:\n    volumes:\n    - /srv/a:/root/.ollama\n    - ollama_data:/root/.ollama\nvolumes:\n  ollama_data:\n    name: vco_ollama_data\n",
+      "live": null,
+      "expect_error": ["2 entries of services.ollama.volumes target /root/.ollama", "volumes[0]", "volumes[1]"]
+    },
+    {
+      "name": "FAIL CLOSED: the top-level volumes is a list",
+      "service": "weaviate", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    volumes:\n    - weaviate_data:/var/lib/weaviate\nvolumes:\n- weaviate_data\n",
+      "live": null,
+      "expect_error": ["top-level `volumes` is a list"]
+    },
+    {
+      "name": "FAIL CLOSED: the render has no such service",
+      "service": "code_embed", "project": "infrastructure",
+      "render": "services:\n  weaviate:\n    image: x\n",
+      "live": null,
+      "expect_error": ["no code_embed service"]
+    }
+  ]
+}

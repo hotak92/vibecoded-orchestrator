@@ -466,6 +466,10 @@ class EnsureContainersBuildGateTests(unittest.TestCase):
                   name="${{@: -1}}"
                   case "$name" in
                     {missing}) echo "Error: no such container $name" >&2; exit 125 ;;
+                    # Only VCO's three containers exist here: the guard also
+                    # probes the historical aliases (W2R-05), which are absent.
+                    vco_weaviate|vco_ollama|vco_code_embed) ;;
+                    *) echo "Error: no such container $name" >&2; exit 125 ;;
                   esac
                   case "$5" in
                     *Mounts*) echo '[]' ;;
@@ -562,6 +566,10 @@ class EnsureContainersBuildGatePs1Tests(unittest.TestCase):
                   name="${{@: -1}}"
                   case "$name" in
                     {missing}) echo "Error: no such container $name" >&2; exit 125 ;;
+                    # Only VCO's three containers exist here: the guard also
+                    # probes the historical aliases (W2R-05), which are absent.
+                    vco_weaviate|vco_ollama|vco_code_embed) ;;
+                    *) echo "Error: no such container $name" >&2; exit 125 ;;
                   esac
                   case "$5" in
                     *Mounts*) echo '[]' ;;

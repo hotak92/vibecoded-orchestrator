@@ -2,7 +2,7 @@
 //!
 //! Verbatim extraction (v0.2.77 Part 7d) of the config-health inspection
 //! (`ConfigHealth`, `OrchestratorState`, `read_bundled_version`,
-//! `version_is_outdated`, `check_file_health`, `inspect_orchestrator_at`),
+//! `check_file_health`, `inspect_orchestrator_at`),
 //! the project-leftovers scan (`ProjectLeftovers`, `inspect_project_leftovers`),
 //! and the third-party project detection (`ManifestStatus`,
 //! `classify_vco_manifest`, `ThirdPartyDetection`,
@@ -57,33 +57,6 @@ pub fn read_bundled_version() -> Option<String> {
     v.get("version").and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-/// `true` iff `installed < bundled` under the ONE comparator,
-/// `vct_launcher_core::version` (strict `X.Y.Z`, v0.2.100 owner ruling Q7).
-///
-/// Superseded (v0.2.100): this used to take each dotted part's leading digit
-/// run and its docstring promised it "falls back to lexicographic if the
-/// strings don't parse" — it never did; garbage read as `0`. Both are gone.
-///
-/// **Parse error → `false`, with a WARN naming the strings.** This bool
-/// shape exists for the `installer.rs` direction sites that still call it
-/// (WP-03b moves them onto `version::is_older` / `is_newer` with their own
-/// tri-state mapping); new code must call `vct_launcher_core::version`
-/// directly so it can tell "not older" from "could not read". This module's
-/// own caller, [`classify_version_status`], does exactly that.
-pub(crate) fn version_is_outdated(installed: &str, bundled: &str) -> bool {
-    match vct_launcher_core::version::is_older(installed, bundled) {
-        Ok(older) => older,
-        Err(e) => {
-            tracing::warn!(
-                "[version] cannot order {:?} against {:?}: {} — not reported as outdated",
-                installed,
-                bundled,
-                e
-            );
-            false
-        }
-    }
-}
 
 /// `"current" | "outdated" | "unknown"` for an installed vs bundled version.
 ///
@@ -514,7 +487,6 @@ mod v02100_version_status_tests {
         assert_eq!(classify_version_status(Some("0.2.100-rc1"), Some("0.2.100")), "unknown");
         assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.100.1")), "unknown");
         assert_eq!(classify_version_status(Some("0.2.100"), None), "unknown");
-        assert!(!version_is_outdated("0.2", "0.2.100"), "bool shape: unreadable is not 'outdated'");
     }
 
     #[test]
@@ -522,7 +494,5 @@ mod v02100_version_status_tests {
         assert_eq!(classify_version_status(Some("0.2.99"), Some("0.2.100")), "outdated");
         assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.100")), "current");
         assert_eq!(classify_version_status(Some("0.2.100"), Some("0.2.99")), "current");
-        assert!(version_is_outdated("0.2.99", "0.2.100"));
-        assert!(!version_is_outdated("0.2.100", "0.2.99"));
     }
 }

@@ -450,11 +450,15 @@ class DeliveryAuditTests(unittest.TestCase):
         checked `test_install_main_ratchet.py` and did not find this second,
         differently-named gate. Two ratchets guard two files; a change that
         touches both must re-measure both.
+
+        v0.2.100 (W3-FIX, F-W3-08) — LOWERED 15_635 -> 15_526, the measured
+        size after the wave-2/3 lanes shrank the file. A ratchet that is not lowered when the
+        file shrinks silently re-admits the lines that left.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_635,
+            n, 15_526,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

@@ -88,8 +88,9 @@ PR-4 fixes both:
 
 ## 4. The `copy_recursive_sync` gitignore-aware contract
 
-The launcher's `update_orchestrator_at` Tauri command copies one
-orchestrator install over another (cross-clone update flow). Pre-PR-4
+The launcher's copy-based install (`copy_orchestrator_to_sync`; until
+v0.2.100 also the retired `update_orchestrator_at` cross-clone update)
+copies one orchestrator tree into another. Pre-PR-4
 the walker was gitignore-blind, so machine-local files inside kept
 allowlist entries (`tools/`, `.claude/`, `infrastructure/`) silently
 propagated cross-clone. Specifically:
@@ -165,8 +166,8 @@ Adding a new path to either column requires:
    ignored, with the source-of-truth either generated (template
    under `templates/`) or external (e.g. `~/.vct-secrets/`).
 2. Updating both `.gitignore` AND this doc in the same PR.
-3. If the file should be re-distributed cross-clone via
-   `update_orchestrator_at`, double-check that
+3. If the file should be carried by a copy-based install
+   (`copy_orchestrator_to_sync`), double-check that
    `copy_recursive_sync`'s gitignore-aware walker won't drop it
    (write a test if non-obvious).
 

@@ -1616,6 +1616,54 @@ pub async fn model_gateway_check() -> Result<String, String> {
     }
 }
 
+// ─── Gateway agent delivery gate (v0.2.100, AD-7) ─────────────────────────
+
+/// The argv tail of the ONE home for "is the gateway configured on this
+/// machine, and does this project get the gateway agent definitions?":
+/// `python -m vco_lib.module_gated_delivery status --json [--folder <f>]`.
+/// Split out so the argv shape is unit-testable without a Python.
+fn agents_gate_args(folder: Option<&str>) -> Vec<String> {
+    let mut args = vec!["status".to_string(), "--json".to_string()];
+    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+        args.push("--folder".to_string());
+        args.push(f.to_string());
+    }
+    args
+}
+
+/// Machine signal + (with `folder`) the project's tri-state gate verdict +
+/// agent definitions naming a gateway id the router does not know.
+///
+/// Rust decides nothing here (rule A): the payload is the Python module's
+/// JSON, passed through. A spawn failure or non-JSON answer is an `Err` the
+/// card renders as "could not ask" — never as "not configured".
+#[command]
+pub async fn model_gateway_agents_gate(
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let python = python_or_err()?;
+        let root = crate::commands::installer::find_local_repo_root().ok();
+        let mut cmd =
+            python_module_command(&python, "vco_lib.module_gated_delivery", root.as_deref());
+        for a in agents_gate_args(folder.as_deref()) {
+            cmd.arg(a);
+        }
+        let (code, stdout, stderr) =
+            run_to_completion(cmd, "vco_lib.module_gated_delivery")?;
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
+            format!(
+                "vco_lib.module_gated_delivery exited {} and did not return JSON ({}): {}",
+                code,
+                e,
+                stderr.trim()
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("agents-gate task failed: {}", e))?
+}
+
 // ─── VS Code panel wiring ─────────────────────────────────────────────────
 
 #[command]
@@ -1804,6 +1852,16 @@ mod tests {
     /// to prevent.
     fn scratch_root() -> vct_launcher_core::test_env::StateDirGuard {
         state_dir_guard_with(&[(PORT_ENV, None)])
+    }
+
+    #[test]
+    fn agents_gate_asks_the_python_home_with_and_without_a_folder() {
+        assert_eq!(agents_gate_args(None), vec!["status", "--json"]);
+        assert_eq!(agents_gate_args(Some("   ")), vec!["status", "--json"]);
+        assert_eq!(
+            agents_gate_args(Some("/p/x")),
+            vec!["status", "--json", "--folder", "/p/x"]
+        );
     }
 
     #[test]

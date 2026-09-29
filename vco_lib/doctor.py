@@ -217,8 +217,10 @@ CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
 #: that this install's ``.claude/.vco-manifest.json`` — written ONLY by the
 #: bundle engine — does not corroborate. The v0.2.95 surface map's H1/H2/H3:
 #: the launcher's ``apply_launcher_update`` / ``force_resync_launcher`` /
-#: ``update_orchestrator_at`` each advance the source and refresh the marker
-#: without running install.py, so ``installed: true`` at the NEW version is
+#: ``update_orchestrator_at`` each advanced the source and refreshed the marker
+#: without running install.py (all three retired in v0.2.100 — the one update
+#: pipeline always runs install.py; the probe stays for installs a launcher
+#: ≤ 0.2.99 left in that state), so ``installed: true`` at the NEW version is
 #: written over a venv/hooks/templates/MCP/KG/schema set still at the old one.
 #: Registered ``action_required`` + install-owned (the ``vco_lib_shadowed``
 #: precedent): the exit is an install/update run, which rewrites BOTH records
@@ -3026,8 +3028,8 @@ def probe_last_update_run(folder: Path, res: DoctorResolvers, ctx: dict) -> list
 INSTALL_MANIFEST_REL = ("state", "install-manifest.json")
 
 #: ``install_method`` values only the RUST writer
-#: (``launcher/src-tauri/src/commands/manifest.rs::refresh_install_manifest``)
-#: produces. install.py's own writer spells ``install.py`` / ``update`` /
+#: (``manifest.rs::refresh_install_manifest``, launchers ≤ 0.2.99; retired in
+#: v0.2.100) produced. install.py's own writer spells ``install.py`` / ``update`` /
 #: ``lightweight``, so seeing one of these means the LAST hand on the marker
 #: was a path that never ran install.py. Carried in the summary as the
 #: EXPLANATION; never the conviction on its own — a resync that pulled nothing
@@ -3071,6 +3073,11 @@ def probe_install_completeness(
     folder: Path, res: DoctorResolvers, ctx: dict
 ) -> list[Finding]:
     """Does ``install-manifest.json``'s claim rest on an installer run?
+
+    v0.2.100: the three launcher paths below and their Rust manifest writer
+    are retired — the one update pipeline always runs install.py — so no
+    CURRENT launcher produces this state. The probe stays for installs a
+    launcher ≤ 0.2.99 left in it; the history below is why it looks as it does.
 
     The state this exists for (the v0.2.95 surface map's H1/H2/H3): the
     launcher's ``apply_launcher_update`` / ``force_resync_launcher`` advance
@@ -4612,20 +4619,21 @@ def _install_marker_unbacked_entry(finding: Finding):
             "the `.claude/` bundle, re-registers the MCPs and may re-seed the "
             "KG), so VCO reports it rather than starting one from a read-only "
             "health check. It is reported because the failure is QUIET by "
-            "construction: `apply_launcher_update`, `force_resync_launcher` "
-            "and `update_orchestrator_at` advance the whole source tree, "
-            "rebuild only the launcher, and then re-assert `installed: true` "
-            "over a venv, hooks, templates, MCP registrations, KG seed and "
-            "schema none of them touched — after which the checkout is "
+            "construction: on launchers up to v0.2.99, "
+            "`apply_launcher_update`, `force_resync_launcher` and "
+            "`update_orchestrator_at` (all retired in v0.2.100) advanced the "
+            "whole source tree, rebuilt only the launcher, and then re-asserted "
+            "`installed: true` over a venv, hooks, templates, MCP registrations, "
+            "KG seed and schema none of them touched — after which the checkout is "
             "0-behind upstream, so the currency probe reports health and the "
             "install-age reading is dropped as not decision-relevant. Since "
-            "v0.2.95 that write leaves `version` alone (install.py owns it) "
-            "and stamps `post_source_only` instead, which does light the "
+            "v0.2.95 that write left `version` alone (install.py owns it) "
+            "and stamped `post_source_only` instead, which does light the "
             "launcher's Updates badge — but a badge is a running launcher's "
             "affordance, and the states this catches include a CLI-only "
             "install and a SECOND clone updated in place by "
             "`update_orchestrator_at`, whose launcher may never start. The "
-            "evidence used here needs none of that: the install manifest is "
+            "evidence used here needs none of that: the install manifest was "
             "written by those paths and says so, while the `.claude/` bundle "
             "manifest is written only by the bundle engine an installer run "
             "reaches. "

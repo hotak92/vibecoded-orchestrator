@@ -375,17 +375,17 @@ notes = "v0.2.100: the configured code-embedding backend is not available on thi
 
 [conditions.gated_delivery_skipped]
 class = "informational_record"
-owner = "install.py"
-clear_probe = "owned-drop-when-absent"
+owner = "vco_lib.module_gated_delivery"
+clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-7): gated bundle items (gateway agents) were skipped because the machine signal says the gate is closed — a by-design skip, recorded so it is visible. Registered ahead of its emitter (WP-10)."
+notes = "v0.2.100 (AD-7, L5-F04; F-W1-12): the gateway agent definitions were skipped for a project that explicitly switched the model_gateway module OFF while this machine's gateway IS configured — a by-design skip, recorded so it is visible. Emitted into the TARGET folder's own ledger by `module_gated_delivery.record_gate_outcomes`, which runs inside EVERY bundle run (project `install-bundle` and the root bundle inside install.py alike) and resolves the row in the same call whenever the verdict no longer produces it. NOT install.py-owned: owned-drop-when-absent would drop a root row in that run's own finalize and never clear a project row."
 
 [conditions.gated_delivery_unknown]
 class = "auto_retryable"
-owner = "install.py"
-clear_probe = "owned-drop-when-absent"
+owner = "vco_lib.module_gated_delivery"
+clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-7): the gate for gated bundle items could not be evaluated (tri-state unknown); delivery is retried on the next run. Registered ahead of its emitter (WP-10)."
+notes = "v0.2.100 (AD-7, L5-F02; F-W1-12): the gateway agent gate could not be evaluated (launcher.db unreadable/locked, or the machine signal could not be read); previously delivered definitions were carried forward untouched. Retried by the next bundle update (no retry handler: the bundle run IS the retry), whose `module_gated_delivery.record_gate_outcomes` resolves the row once the gate decides. Same ownership reasoning as gated_delivery_skipped."
 
 [conditions.watchdog_foreign_container]
 class = "environmental"
@@ -826,7 +826,10 @@ owner = "vco_lib.doctor"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = """v0.2.95 WP-2 — the detector the half-executed install states lacked. \
-`state/install-manifest.json` has TWO writers: install.py, and \
+v0.2.100: the three launcher paths and the Rust writer below are RETIRED (the \
+one update pipeline always runs install.py), so no current launcher produces \
+this state; the row stays for installs a launcher <= 0.2.99 left in it. \
+`state/install-manifest.json` had TWO writers: install.py, and \
 `manifest.rs::refresh_install_manifest`, which the launcher's \
 `apply_launcher_update`, `force_resync_launcher` and `update_orchestrator_at` \
 each call. Those three advance the whole source tree, rebuild only the \

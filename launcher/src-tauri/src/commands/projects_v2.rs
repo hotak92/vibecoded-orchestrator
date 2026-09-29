@@ -337,6 +337,9 @@ pub async fn create_project_v2(
     db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<CreateProjectResult, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let folder = Path::new(&req.folder_path);
     let mut warnings: Vec<String> = Vec::new();
 
@@ -865,6 +868,11 @@ pub(crate) async fn apply_post_bundle_steps(
     is_initial_create: bool,
     kg_or_docs_content_changed: bool,
 ) -> Vec<String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    if let Err(standby) = db.ensure_live() {
+        return vec![format!("post-bundle steps skipped: {}", standby)];
+    }
     let mut warnings: Vec<String> = Vec::new();
     let folder_path_str = folder.to_string_lossy().to_string();
 
@@ -3546,6 +3554,9 @@ fn apply_project_env_via_python(
     folder: &Path,
     db: &Db,
 ) -> Result<(), String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let python = resolve_python_for_vco_lib_local().ok_or_else(|| {
         "no python interpreter found for vco_lib.config_projection apply \
          (checked: $VCT_VENV, <VCT_INSTALL_ROOT>/.venv, \
@@ -3834,6 +3845,9 @@ pub async fn rename_project_v2(
     new_name: String,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     // v0.2.46 KG-AUTO-HEAL adversarial-review H3 follow-up: reject
     // rename when host='orchestrator_root'. The orchestrator-root
     // project's slug ('orchestrator-root') is canonical and used by
@@ -5283,6 +5297,9 @@ pub async fn delete_project_v2(
     options: Option<UnregisterOptions>,
     db: State<'_, Db>,
 ) -> Result<UnregisterReport, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let opts = options.unwrap_or_default();
 
     // Read the row first so we have the project name for collection
@@ -5539,7 +5556,7 @@ pub(crate) use editor_launch::*;
 // `perform_hard_cut` is INERT in v0.2.60: it exists + is registered but is
 // reachable ONLY when the (Piece-5) version-floor check returns below-floor,
 // which never happens with the inert `min_upgradable_from = "0.0.0"`. The
-// normal update path (`update_orchestrator`) does NOT call it — proven by
+// normal update path (`update_run::run_update`) does NOT call it — proven by
 // `test_perform_hard_cut_not_wired_into_update_orchestrator`.
 // ===========================================================================
 
@@ -5847,7 +5864,7 @@ pub async fn apply_stale_derived_choice(
 /// INERT (v0.2.60): the §7 hard-cut driver. EXISTS + is registered, but is
 /// reachable ONLY when the Piece-5 version-floor check returns below-floor —
 /// which NEVER happens while `min_upgradable_from` is the inert `"0.0.0"`. The
-/// normal update path (`update_orchestrator`) does NOT call this. v0.3.0 raises
+/// normal update path (`update_run::run_update`) does NOT call this. v0.3.0 raises
 /// the floor to activate it.
 ///
 /// Subprocess-calls the Python primitive `vco_lib.hard_cut` (built + tested in
@@ -6220,13 +6237,21 @@ mod tests {
     }
 
     /// Source-level proof that the normal update path does NOT invoke the
-    /// hard cut. `update_orchestrator` (the launcher "Update orchestrator"
-    /// button) lives in installer.rs; it must contain no `perform_hard_cut` /
+    /// hard cut. The launcher's orchestrator update (v0.2.100: the one
+    /// pipeline, `update_run.rs` + `update_pipeline.rs`, whose recovery
+    /// commands live in installer.rs) must contain no `perform_hard_cut` /
     /// `hard_cut(` call. This is the INERT guarantee at the wiring layer
     /// (mirrors the Python test_hard_cut_not_invoked_by_normal_update).
     #[test]
     fn test_perform_hard_cut_not_wired_into_update_orchestrator() {
-        let installer_src = include_str!("installer.rs");
+        // v0.2.100 WP-03b: the update flow moved out of installer.rs into the
+        // one pipeline; all three files are scanned as ONE source.
+        let installer_src = [
+            include_str!("installer.rs"),
+            include_str!("update_run.rs"),
+            include_str!("update_pipeline.rs"),
+        ]
+        .join("\n");
         // The hard cut must not be WIRED (called) from the update flow. We
         // check for a CALL, not a bare mention: Piece 5's `update_orchestrator`
         // floor-gate carries a prose comment naming `perform_hard_cut` (the
@@ -6236,7 +6261,7 @@ mod tests {
         // the comment, a false positive).
         assert!(
             !installer_src.contains("perform_hard_cut("),
-            "installer.rs (home of update_orchestrator) must NOT CALL \
+            "the update flow (installer.rs / update_run.rs / update_pipeline.rs) must NOT CALL \
              perform_hard_cut(...) in v0.2.60 — the hard cut is INERT"
         );
         // And no direct call into the §7 Python primitive `hard_cut(...)`
@@ -11024,4 +11049,35 @@ pub async fn rename_collections_v2(
         preview: rename_preview_from_json(&value),
         summary: if dry_run { None } else { Some(value.clone()) },
     })
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn env_projection_stands_down_in_standby() {
+        let db = standby_db();
+        let tmp = tempfile::tempdir().unwrap();
+        assert_typed_standby(&apply_project_env_via_python("p1", tmp.path(), &db).unwrap_err());
+    }
+
 }

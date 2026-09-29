@@ -431,9 +431,11 @@ class ModuleGatewayAgentDeliveryTests(unittest.TestCase):
     """v0.2.96 WP-10 — `templates/agents/module-gateway/` delivery legs.
 
     The gated set (tests/common/module_gateway.py is the ONE home for its
-    file list) carries hardcoded `claude-gw/*` frontmatter model ids, so it
-    must reach a project ONLY when that project's `model_gateway` module row
-    says active. The gate resolves folder→UUID before the active-check
+    file list) carries hardcoded `claude-gw/*` frontmatter model ids. v0.2.100
+    (WP-10): an explicit `model_gateway` row decides (on → deliver, off →
+    skip); with NO row — including an unregistered folder — the MACHINE
+    gateway signal decides (`vco_lib.module_gated_delivery`'s table). The
+    gate resolves folder→UUID before the active-check
     (survey §2 key-divergence; the resolver itself is pinned in
     test_conditional_template.py::ModuleGatewayDeliveryKeyTests). These are
     the DELIVERY legs: enumerate → install → on-disk bytes.
@@ -523,16 +525,44 @@ class ModuleGatewayAgentDeliveryTests(unittest.TestCase):
             result["actions"]["create"],
         )
 
-    def test_unregistered_folder_does_not_deliver(self):
-        """Module row for another project's UUID + this folder unregistered
-        → conservative NOT-active (fails toward less materialization)."""
-        self._fixture_db(enabled=1, register=False)
-        result = project_init.install_project_bundle(
-            self.proj, orchestrator_root=self.orch, update_mode=False,
+    def _with_machine_signal(self, configured):
+        """Pin the machine gateway signal — never the real machine's."""
+        from types import SimpleNamespace
+
+        from vco_lib import module_gated_delivery
+
+        return mock.patch.object(
+            module_gated_delivery, "_default_machine_signal",
+            return_value=SimpleNamespace(configured=configured, reason="test"),
         )
+
+    def test_unregistered_folder_does_not_deliver(self):
+        """A module row for ANOTHER project's UUID never leaks onto this
+        folder: unregistered here, so no per-project row applies and the
+        MACHINE gateway signal decides (v0.2.100 WP-10). A machine that does
+        not route through the gateway → SKIP, whatever the other project's
+        row says. (The configured-machine leg is the next test.)"""
+        self._fixture_db(enabled=1, register=False)
+        with self._with_machine_signal(False):
+            result = project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=False,
+            )
         for name in self.GATED:
             self.assertNotIn(self._dest(name), result["actions"]["create"])
             self.assertFalse((self.proj / ".claude" / "agents" / name).exists())
+
+    def test_unregistered_folder_follows_a_configured_machine(self):
+        """The other leg of the same rule: unregistered + a machine that
+        DOES route through the gateway → the definitions follow the machine.
+        The foreign project's row (enabled=0 here) is still never consulted."""
+        self._fixture_db(enabled=0, register=False)
+        with self._with_machine_signal(True):
+            result = project_init.install_project_bundle(
+                self.proj, orchestrator_root=self.orch, update_mode=False,
+            )
+        for name in self.GATED:
+            self.assertIn(self._dest(name), result["actions"]["create"])
+            self.assertTrue((self.proj / ".claude" / "agents" / name).exists())
 
 
 class InstallBundleUpdateModeTests(unittest.TestCase):

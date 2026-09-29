@@ -926,9 +926,10 @@ pub fn run() {
             // returns an error — at worst PATH is left unchanged.
             vct_launcher_core::services::runtime::augment_path_for_graphical_launch();
 
-            // Windows-only: clean up the previous launcher's .old.exe
-            // left behind by `apply_launcher_update`'s rename-then-build
-            // workaround for the running-binary lock. Best effort —
+            // Windows-only: clean up a previous launcher's .old.exe left
+            // behind by the (pre-v0.2.100) self-update's rename-then-build
+            // workaround for the running-binary lock — an upgraded install
+            // may still carry one. Best effort —
             // silently swallow errors (file missing, still locked, etc).
             #[cfg(windows)]
             {
@@ -940,7 +941,7 @@ pub fn run() {
 
             // v0.2.17 (plan 0.0): cross-OS sweep of stale `<binary>.old-<pid>`
             // and `<binary>.pending-<pid>` siblings left behind by the
-            // pre-pull-rename path in `update_orchestrator` (Windows path)
+            // pre-pull-rename path of the update pipeline (Windows path)
             // or a failed-to-revert pull on any OS. Per file:
             //   1. Parse the pid suffix.
             //   2. Check whether that PID is still alive.
@@ -974,7 +975,7 @@ pub fn run() {
             // recovery probe for the Windows stage1 updater handoff.
             //
             // On Windows, `prepare_windows_update_handoff` (invoked by
-            // the prior launcher process during update_orchestrator)
+            // the prior launcher process during its update's relaunch)
             // writes `~/.vct/update.lock.json` and spawns vct-updater.exe
             // to perform the binary swap. The updater deletes the lock
             // file when it completes successfully.
@@ -1407,8 +1408,8 @@ pub fn run() {
 
             // v0.2.34 (Agent B): if the previous launcher process flagged
             // the next boot as "needs a fresh hardware redetect" (set by
-            // `self_update::finish_apply_after_pull` right before
-            // restart), consume the flag here and spawn a background
+            // the update pipeline's bookkeeping, phase 12 of
+            // `update_run::run_update`, right before restart), consume the flag here and spawn a background
             // redetect job. Catches v0.2.20-style schema gaps where a
             // newly-shipped field needs to be backfilled on the user's
             // existing snapshot. Soft-fails — the manual Preferences
@@ -3064,6 +3065,7 @@ pub fn run() {
             commands::model_gateway::model_gateway_clear_default_model,
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
+            commands::model_gateway::model_gateway_agents_gate,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::gateway_usage::model_gateway_usage_windows,
@@ -3346,33 +3348,20 @@ pub fn run() {
             // discoverability surface (renders the resolved path +
             // tooltip explaining VCT_STATE_DIR override).
             commands::storage_ux::get_resolved_vct_root_dir,
-            commands::installer::update_orchestrator,
-            // v0.2.23 (B4 / D19): divergence-recovery commands for
-            // update_orchestrator. When the user's local clone has
-            // diverged from upstream (typical: local edits to
-            // CLAUDE.md, CONTEXT_STATE.md, KG nodes), `git pull
-            // --ff-only` fails. update_orchestrator surfaces a
-            // structured "orchestrator_update_non_ff" error; the
-            // frontend then offers Merge / Rebase / Cancel. These
-            // three commands are the resolvers.
-            commands::installer::merge_orchestrator_with_upstream,
-            commands::installer::rebase_orchestrator_onto_upstream,
+            // v0.2.23 (B4 / D19): when an update hits a diverged clone the
+            // frontend offers Merge / Rebase / Cancel — since v0.2.100 those
+            // are kinds of `run_orchestrator_update`; abort stays its own
+            // command (it touches no install, only the stalled git state).
             commands::installer::abort_orchestrator_merge_or_rebase,
             // v0.2.93 (field incident 2026-09-07): reopen the conflict modal
             // on a STALLED merge/rebase after a launcher restart. Pairs with
             // `UpdateStatus::merge_in_progress`; read-only.
             commands::installer::get_pending_conflict_payload,
-            // v0.2.51 Bug A: resume an orchestrator-update flow that
-            // halted at a merge/rebase conflict. The user resolved the
-            // conflict in their editor (or via CLI) and the launcher
-            // re-enters the post-pull tail (install.py --update + binary
-            // refresh + auto-restart). Without this, the modal's
-            // "Resolve manually" path silently abandoned the update.
-            commands::installer::resume_orchestrator_update,
             // v0.2.52 V52-B: one-click conflict resolution from the
             // OrchestratorUpdateConflictModal. "Keep local" runs
             // `git checkout --ours` on every conflicted file then
-            // commits + delegates to resume_orchestrator_update.
+            // commits + continues through `run_orchestrator_update`'s
+            // `Resume` kind (v0.2.100), handing over its claim.
             // "Accept upstream" is the symmetric `--theirs` variant.
             // Orientation flips between merge and rebase — the helper
             // `resolve_checkout_flag` in installer.rs handles that.
@@ -3382,29 +3371,20 @@ pub fn run() {
             // enriched orchestrator_untracked_collision modal. Deletes
             // byte-identical colliding untracked files, backs up + deletes
             // divergent ones (to .claude/state/update-collision-backups-<ts>/),
-            // then re-enters update_orchestrator. Refuses tracked / out-of-root
-            // paths; per-file soft-fail.
+            // then re-runs the update (`PullFf`, claim handed over). Refuses
+            // tracked / out-of-root paths; per-file soft-fail.
             commands::installer::resolve_untracked_collision_and_retry,
             // v0.2.88 (DEFECT 2 / FIELD DEFECT): "keep updated / keep local"
             // resolver for the orchestrator_autostash_pop_conflict modal. The
             // merge succeeded but the --autostash pop of local WIP conflicted;
             // this resolves each file (checkout --ours/--theirs, backing up the
             // updated version first for keep-local), drops the stash, then
-            // delegates to resume_orchestrator_update to finish install.py.
+            // finishes through the `Resume` kind (install.py etc.).
             commands::installer::resolve_autostash_pop_and_retry,
-            // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
-            // "Pulled-but-not-installed" banner state (source updated
-            // via `git pull` outside the launcher; install-manifest
-            // still records the previous version). Runs install.py
-            // --update WITHOUT a preceding git pull. Distinct from
-            // update_orchestrator (git pull + install) so we don't
-            // waste ~30s pulling an already-current source tree.
-            commands::installer::apply_pending_install,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::inspect_project_leftovers,
             commands::installer::detect_third_party_project_signals,
-            commands::installer::update_orchestrator_at,
             // GitHub PAT lifecycle. `register_github_pat` is wired in the
             // OnboardingWizard (Bug 22) for first-run capture, AND in the
             // /preferences "GitHub access token" section for ongoing
@@ -3601,12 +3581,14 @@ pub fn run() {
             commands::audit::list_audit_events,
             // Launcher self-update (git-pull based, daily check)
             commands::self_update::check_for_launcher_update,
-            // v0.2.100 WP-03a (AD-1): THE orchestrator update — every kind,
-            // one pipeline. The legacy update commands below delegate to it
-            // from WP-03b and leave this list once no caller remains.
+            // v0.2.100 (AD-1): THE orchestrator update — every kind
+            // (PullFf, Merge, Rebase, Resume, ApplyOnly, ResetHard), one
+            // pipeline. The per-surface commands it replaced (update_
+            // orchestrator, merge_/rebase_/resume_*, apply_pending_install,
+            // apply_launcher_update, force_resync_launcher, update_
+            // orchestrator_at) were removed in WP-03b once the invoke census
+            // (`update-invoke-census.test.ts`) showed no caller.
             commands::update_run::run_orchestrator_update,
-            commands::self_update::apply_launcher_update,
-            commands::self_update::force_resync_launcher,
             // v0.2.92 WP-13: the ONLY path-less `git checkout <branch>` in
             // the launcher. Before it existed there was no in-GUI way out of
             // a detached HEAD at all — every other checkout in this codebase
@@ -3617,10 +3599,6 @@ pub fn run() {
             commands::self_update::reattach_orchestrator_branch,
             commands::self_update::get_user_owned_paths,
             commands::self_update::get_cached_update_status,
-            // v0.2.93: repo-aware cached status for the Updates page only
-            // (async; the sync `get_cached_update_status` stays a pure file
-            // read for the tray).
-            commands::self_update::get_cached_update_status_refreshed,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
             // v0.2.35 (Agent K): running-version display + post-update
@@ -3688,7 +3666,7 @@ pub(crate) use vct_launcher_core::process::pid_is_alive;
 /// v0.2.17 (plan 0.0): sweep stale `<binary>.old-<pid>` and
 /// `<binary>.pending-<pid>` siblings from the launcher dist
 /// directory. These are left behind by the pre-pull-rename path in
-/// `update_orchestrator` (Windows) or a failed-revert path on any
+/// the update pipeline (Windows) or a failed-revert path on any
 /// OS. The PID suffix is parsed; files whose PID is no longer alive
 /// are deleted. Files with malformed names, unparseable PIDs, or
 /// alive PIDs are skipped.

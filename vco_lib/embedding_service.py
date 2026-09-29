@@ -304,8 +304,16 @@ def _to_openai_api_model(catalog_id: str) -> str:
 # Ollama with model id ``codesage-large-v2`` — and Ollama doesn't have
 # that model pulled. Net: every embed call raises RuntimeError.
 #
-# This fallback chain probes available backends at construction time
-# and picks the FIRST reachable one. Order is locked by the v0.2.18
+# v0.2.100 (L1-F13, owner rule "one code graph, exactly one embedder"): the
+# chain below NO LONGER runs by default. Switching codesage → qwen3/jina at
+# construction left one code graph holding vectors from two embedders. A down
+# code_embed service now raises :class:`NoEmbeddingBackendError` for CODE
+# embeds and records ``code_embed_backend_unavailable``; the KG is unaffected.
+# The old behaviour survives only as an explicit, loud developer opt-in:
+# ``VCO_CODE_EMBED_ALLOW_FALLBACK=1`` (see ``CODE_EMBED_ALLOW_FALLBACK_ENV``).
+#
+# With the opt-in set, the chain probes available backends at construction
+# time and picks the FIRST reachable one. Order is locked by the v0.2.18
 # plan (user direction 2026-05-19):
 #
 #   1. CodeEmbed FastAPI service (``/health`` → 200) — preferred,
@@ -328,6 +336,16 @@ def _to_openai_api_model(catalog_id: str) -> str:
 # in isolation.
 _FALLBACK_QWEN3_MODEL = "qwen3-embedding:0.6b"
 _FALLBACK_JINA_MODEL = "unclemusclez/jina-embeddings-v2-base-code:latest"
+
+#: Developer opt-in (truthy) that restores the pre-0.2.100 silent switch of a
+#: CodeSage code graph to an Ollama embedder when code_embed is down. Off by
+#: default; when on, every switch prints a WARNING naming this variable.
+CODE_EMBED_ALLOW_FALLBACK_ENV = "VCO_CODE_EMBED_ALLOW_FALLBACK"
+
+
+def _code_fallback_opted_in() -> bool:
+    raw = os.environ.get(CODE_EMBED_ALLOW_FALLBACK_ENV, "").strip().lower()
+    return raw in ("1", "true", "yes", "on")
 
 
 def _ollama_has_model(ollama: "OllamaAdapter", needle: str) -> bool:
@@ -381,6 +399,10 @@ def _resolve_code_model_with_fallback(
         what was picked and why (empty when the requested codesage
         path is fully reachable, since that's the no-op case the user
         configured).
+
+    Raises:
+        NoEmbeddingBackendError: the codesage slot's service is down and
+            ``VCO_CODE_EMBED_ALLOW_FALLBACK`` is not set (v0.2.100 default).
     """
     # Off-chain slots: don't second-guess the user's explicit choice.
     if requested_slot != "codesage_embed":
@@ -392,6 +414,18 @@ def _resolve_code_model_with_fallback(
         # and the existing routing logic will dispatch to CodeEmbed.
         return requested_model_id, requested_slot, requested_dim, ""
 
+    # v0.2.100: no silent embedder switch unless a developer opted in.
+    if not _code_fallback_opted_in():
+        where = getattr(codeembed, "base_url", "the configured CODE_EMBED_SERVICE_URL")
+        raise NoEmbeddingBackendError(
+            f"CodeEmbed service unreachable at {where}; the code graph "
+            f"is configured for {requested_model_id} and is NOT switched to another "
+            f"embedder (set {CODE_EMBED_ALLOW_FALLBACK_ENV}=1 to allow that).",
+            attempted_backends=["codeembed"],
+            error_per_backend={"codeembed": f"{where}/health did not answer"},
+            capture=False,
+        )
+
     # 2. Ollama qwen3-embedding:0.6b — universal fallback.
     if _ollama_has_model(ollama, _FALLBACK_QWEN3_MODEL):
         return (
@@ -399,8 +433,10 @@ def _resolve_code_model_with_fallback(
             "qwen3_embed",
             1024,
             (
-                f"CodeEmbed service unreachable at {codeembed.base_url}; "
-                f"using ollama:{_FALLBACK_QWEN3_MODEL} (slot=qwen3_embed)"
+                f"WARNING ({CODE_EMBED_ALLOW_FALLBACK_ENV}=1): CodeEmbed service "
+                f"unreachable at {codeembed.base_url}; "
+                f"using ollama:{_FALLBACK_QWEN3_MODEL} (slot=qwen3_embed) — "
+                "this code graph now mixes embedders"
             ),
         )
 
@@ -413,8 +449,9 @@ def _resolve_code_model_with_fallback(
             "jina_embed",
             768,
             (
-                "CodeEmbed + qwen3 both unavailable; "
-                "using ollama:jina-embeddings-v2-base-code (slot=jina_embed)"
+                f"WARNING ({CODE_EMBED_ALLOW_FALLBACK_ENV}=1): CodeEmbed + qwen3 "
+                "both unavailable; using ollama:jina-embeddings-v2-base-code "
+                "(slot=jina_embed) — this code graph now mixes embedders"
             ),
         )
 
@@ -764,7 +801,22 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
         logger.warning("Failed to write embedding failure deferral entry: %s", e)
 
 
-def _clear_failure_deferral(install_root: Path | None) -> None:
+def _emit_code_backend_deferral(install_root: Path | None, detail: str) -> None:
+    """Record ``code_embed_backend_unavailable`` (the entry has ONE home:
+    :func:`vco_lib.embedding_pull_plan.code_embed_unavailable_entry`). Soft-fail."""
+    if install_root is None:
+        return
+    try:
+        from vco_lib.deferral_emit import emit
+        from vco_lib.embedding_pull_plan import code_embed_unavailable_entry
+
+        emit(install_root, code_embed_unavailable_entry(detail), log=logger,
+             keep_first_detected=True)
+    except Exception as e:  # noqa: BLE001 — soft-fail on the error path
+        logger.warning("Failed to write code-backend deferral entry: %s", e)
+
+
+def _clear_failure_deferral(install_root: Path | None, *, code_backend_ok: bool = True) -> None:
     """Mark the ``kg_summary_no_backend`` entry resolved (paired with success).
 
     No-op if there's no deferral file or no matching entry. Soft-fail.
@@ -778,7 +830,12 @@ def _clear_failure_deferral(install_root: Path | None) -> None:
         # resolve_conditions is a safe no-op when the entry isn't present.
         from vco_lib.deferral_emit import resolve_conditions
 
-        resolve_conditions(install_root, (_DEFERRAL_CONDITION_ID,), log=logger)
+        ids = (_DEFERRAL_CONDITION_ID,)
+        if code_backend_ok:
+            from vco_lib.embedding_pull_plan import CODE_EMBED_UNAVAILABLE_CID
+
+            ids += (CODE_EMBED_UNAVAILABLE_CID,)
+        resolve_conditions(install_root, ids, log=logger)
     except Exception as e:  # noqa: BLE001 — soft-fail; success path must not fail
         logger.debug("Failed to clear embedding failure deferral entry: %s", e)
 
@@ -932,6 +989,13 @@ def _resolve_embed_request_timeout() -> float:
 # neural nets can have their embedding spaces filled. It is a REAL feature,
 # not waste — but it doubles embed cost, so per user decision it is now
 # **opt-in, DEFAULT OFF**.
+#
+# ``DUAL_EMBEDDING_ENABLED`` (default true in sync_knowledge_graph.py,
+# analyze_code_graph.py, search_knowledge.py) is NOT a dual-WRITING switch
+# despite its name (L1-F25): it selects the named-vector LAYOUT (target_vector
+# on reads, a named-vector dict on writes). Whether a second embedder is
+# written — and therefore pulled (vco_lib.embedding_pull_plan) — is decided
+# only by ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` and ``DUAL_EMBEDDING_ARCTIC_SECONDARY``.
 #
 # WHY A DEDICATED FLAG (not flipping ``DUAL_EMBEDDING_ENABLED``): in the MCP
 # server + sync scripts, ``DUAL_EMBEDDING_ENABLED`` ALSO selects named-vector
@@ -1674,21 +1738,19 @@ def configured_text_models() -> "list[str]":
     if not _resolve_write_all_slots():
         return models
 
-    # Secondary qwen3 enrichment slot (unless active is already qwen3).
-    if active_model != DEFAULT_TEXT_MODEL:
-        models.append(DEFAULT_TEXT_MODEL)
+    # Secondary qwen3 enrichment slot (unless active is already qwen3) and the
+    # WP-O arctic secondary (opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY, unless
+    # arctic is already active). ONE rule, shared with the Ollama pull plan
+    # (v0.2.100 AD-6) so the models written are exactly the models pulled. The
+    # Ollama-reachability check in ``embed_text_all_configured`` is a runtime
+    # soft-fail; for the write-set we assume the configured slot is live. The
+    # arctic entry only adds to the WRITE fan-out — the active chunk boundary
+    # is not clamped to arctic's 4 096 num_ctx (WP-O rework, see above).
+    from vco_lib.embedding_pull_plan import kg_secondary_models
 
-    # Secondary arctic slot (WP-O) — opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY,
-    # unless arctic is already the active slot. Mirrors the write-side condition
-    # in ``embed_text_all_configured`` exactly (the Ollama-reachability check
-    # there is a runtime soft-fail; for the write-set we assume the configured
-    # slot is live, same as the qwen3 secondary). Arctic's 4 096 num_ctx is
-    # tighter than qwen3's 10 240, but the WP-O rework does NOT clamp the active
-    # chunk to it — the arctic slot is embedded from a bounded, tagged sub-window
-    # instead (see the module note above). This entry only adds arctic to the
-    # WRITE fan-out; it does not size the active chunk boundary.
-    if _resolve_arctic_secondary() and "arctic" not in active_model.lower():
-        models.append(ARCTIC_SECONDARY_MODEL)
+    models.extend(kg_secondary_models(
+        active_model, write_all=True, arctic_secondary=_resolve_arctic_secondary()
+    ))
 
     # Secondary OpenAI slot (unless active is already OpenAI) when a key exists.
     # Presence of the key is the config signal; validity is a runtime concern.
@@ -1964,6 +2026,9 @@ class EmbeddingService:
         # ``truncated_slots`` chunk property and derives the secondary-only
         # view from it (see the WP-O block above).
         self._last_truncated_slots: dict[str, bool] = {}
+        # v0.2.100: set by ``for_project`` when the configured CodeSage
+        # backend is down (no silent switch) — code embeds raise it.
+        self._code_backend_error: Optional[NoEmbeddingBackendError] = None
 
     # ---- construction --------------------------------------------------
 
@@ -2074,13 +2139,25 @@ class EmbeddingService:
         # The chain only fires for the codesage_embed slot — other slots
         # (qwen3_embed CPU fallback, jina_embed explicit, openai_code_embed)
         # reflect explicit user/preset intent and are left alone.
-        new_model, new_slot, new_dim, reason = _resolve_code_model_with_fallback(
-            requested_model_id=svc.code_model_id,
-            requested_slot=svc.code_vector_slot,
-            requested_dim=svc.code_dim,
-            ollama=svc.ollama,
-            codeembed=svc.codeembed,
-        )
+        # v0.2.100: a down code_embed no longer switches embedders; the
+        # typed error is kept for CODE embeds only (text/KG unaffected) and
+        # recorded as ``code_embed_backend_unavailable``.
+        try:
+            new_model, new_slot, new_dim, reason = _resolve_code_model_with_fallback(
+                requested_model_id=svc.code_model_id,
+                requested_slot=svc.code_vector_slot,
+                requested_dim=svc.code_dim,
+                ollama=svc.ollama,
+                codeembed=svc.codeembed,
+            )
+        except NoEmbeddingBackendError as exc:
+            print(f"[vct] {exc}", file=sys.stderr)
+            svc._code_backend_error = exc
+            svc._code_ready = False
+            _emit_code_backend_deferral(resolved_root, str(exc))
+            new_model, new_slot, new_dim, reason = (
+                svc.code_model_id, svc.code_vector_slot, svc.code_dim, ""
+            )
         if reason:
             # Fallback fired — surface the chosen backend in stderr so
             # operators and tests can see what was selected. We use a
@@ -2121,9 +2198,12 @@ class EmbeddingService:
                 env_snapshot=_redacted_env_snapshot(),
             )
 
-        # Success — clear any stale failure markdown + deferral entry.
+        # Success — clear any stale failure markdown + deferral entry (and the
+        # code-backend entry when this construction found the backend up).
         _clear_failure_markdown(resolved_root)
-        _clear_failure_deferral(resolved_root)
+        _clear_failure_deferral(
+            resolved_root, code_backend_ok=svc._code_backend_error is None
+        )
         return svc
 
     def _collect_backend_errors(self) -> dict[str, str]:
@@ -2740,6 +2820,7 @@ class EmbeddingService:
             return self._retry_once_on_503(
                 self.openai.embed_batch, self.code_model_id, codes
             )
+        self._raise_if_code_backend_down()
         if self._code_slot in ("codesage_embed", "jina_embed"):
             # Service when reachable (bounded + isolated, W1); otherwise
             # fall through to the Ollama leg using the configured code model
@@ -3073,6 +3154,13 @@ class EmbeddingService:
         self._last_truncated_slots[self._text_slot] = sent < len(text)
         return vec
 
+    def _raise_if_code_backend_down(self) -> None:
+        """v0.2.100: the configured CodeSage backend was down at construction
+        and no substitute embedder is allowed — raise the typed error (not an
+        Ollama call for a model Ollama does not serve) until it answers again."""
+        if self._code_backend_error is not None and not self.codeembed.is_reachable():
+            raise self._code_backend_error
+
     def _embed_code_via_active(self, code: str) -> list[float]:
         """Route a single code embed to the configured backend.
 
@@ -3125,6 +3213,7 @@ class EmbeddingService:
             return self.openai.embed(
                 _to_openai_api_model(self.code_model_id), code
             )
+        self._raise_if_code_backend_down()
         if self._code_slot in ("codesage_embed", "jina_embed"):
             if self.codeembed.is_reachable():
                 # W1: through the ONE shared shrink loop — see docstring.

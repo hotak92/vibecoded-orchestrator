@@ -324,6 +324,11 @@ pub async fn bundle_staleness_census(db: State<'_, Db>) -> Result<BundleStalenes
 }
 
 async fn run_census(db: &Db) -> BundleStalenessCensus {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    if let Err(standby) = db.ensure_live() {
+        return BundleStalenessCensus::undetermined(standby.to_string());
+    }
     let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
         return BundleStalenessCensus::undetermined(
             "no vco_lib-capable python interpreter resolved (VCT_VENV / \
@@ -652,4 +657,36 @@ mod tests {
         );
         assert!(src.contains(&json_arg), "the census must run in --json mode");
     }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn census_is_undetermined_with_the_typed_reason_in_standby() {
+        let db = standby_db();
+        let c = run_census(&db).await;
+        assert!(!c.determined);
+        assert_typed_standby(c.error.as_deref().unwrap_or(""));
+    }
+
 }

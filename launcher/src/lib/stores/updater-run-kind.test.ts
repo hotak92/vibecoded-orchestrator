@@ -219,6 +219,22 @@ describe('decision-modal payloads across a run', () => {
     expect(get(U.updater).nonFf).toBeNull();
   });
 
+  it('ResetHard from the divergence modal keeps nonFf while running AND after success (the modal names the backup)', async () => {
+    behaviour.run_orchestrator_update = async () => {
+      throw JSON.stringify({ kind: 'NonFastForward', message: 'diverged', ...NONFF });
+    };
+    await U.updater.run('PullFf');
+    let nonFfDuring: unknown = 'unset';
+    behaviour.run_orchestrator_update = async () => {
+      nonFfDuring = get(U.updater).nonFf;
+      return null;
+    };
+    const r = await U.updater.run('ResetHard');
+    expect(r.ok).toBe(true);
+    expect(nonFfDuring).not.toBeNull();
+    expect(get(U.updater).nonFf?.branch).toBe('main');
+  });
+
   it('a fresh PullFf drops a stale nonFf', async () => {
     behaviour.run_orchestrator_update = async () => {
       throw JSON.stringify({ kind: 'NonFastForward', message: 'diverged', ...NONFF });

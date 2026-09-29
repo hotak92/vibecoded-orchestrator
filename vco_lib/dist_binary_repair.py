@@ -295,11 +295,11 @@ def run_repair_leg(
 
     ``launcher_driven`` is ``VCT_AUTO_RESTART_LAUNCHER=1`` — the v0.2.54 C-5
     guard. When the LAUNCHER drove this install.py run it owns both the restart
-    and the stage1 handoff: its finalize tail picks up any ``<target>.new`` we
-    staged and spawns ``vct-updater`` right before exiting. Spawning here as
-    well reproduces the pre-v0.2.54 bug where updater #1's 30 s parent-wait
-    deterministically timed out against the launcher's up-to-5-min
-    ``WaitForBinaryRefresh``, orphaning ``update.lock.json`` and briefly running
+    and the stage1 handoff: its relaunch (``restart::relaunch``) picks up any
+    ``<target>.new`` we staged and spawns ``vct-updater`` right before exiting.
+    Spawning here as well reproduces the pre-v0.2.54 bug where updater #1's
+    30 s parent-wait deterministically timed out against the launcher's (then
+    up-to-5-min) binary-refresh wait, orphaning ``update.lock.json`` and briefly running
     two updaters. The restart deferral is redundant on that path for the same
     reason.
 

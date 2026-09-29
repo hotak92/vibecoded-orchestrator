@@ -744,6 +744,11 @@ def migrate_managed_service(
     if guard.verdict == _di.NOTHING_TO_LOSE:
         result.lines.append(f"{tag} no container to migrate; the next compose up creates it.")
         return result
+    if identity_base.data_mount is None and guard.live.mount is not None:
+        # The live mount was just observed (and projected into .env): a
+        # restore must never write the NULL row back over it (W2R-01).
+        env_state["restore"] = {**db_rows, service: dataclasses.replace(
+            identity_base, data_mount=dict(guard.live.mount))}
     if guard.verdict != _di.PRESERVES:
         return refuse(guard.reason)
     mount = dict(guard.mount or {})
@@ -753,7 +758,7 @@ def migrate_managed_service(
                                   container_name=row.container_name or canonical)
     env_state["restore"] = {**db_rows, service: dataclasses.replace(identity_base, data_mount=mount)}
     _files, effective = _effective_mount(infra, service, destination, live.has_devices, overlay)
-    if effective is None or effective.key() != data_key:
+    if _di.mount_key(effective) != data_key:
         return refuse(
             f"the installer's effective config would mount {_describe_mount(effective, destination)} "
             f"at {destination}, not the live {_di.describe(mount)}"
@@ -780,7 +785,7 @@ def migrate_managed_service(
         if after is None:
             return f"could not re-read container '{ref}' after the up"
         after_data = _mount_at(after, destination)
-        if after_data is None or after_data.key() != data_key:
+        if _di.mount_key(after_data) != data_key:
             return (f"the new container mounts {_describe_mount(after_data, destination)} at "
                     f"{destination}, not {described}")
         return (_published_problem(new_row, after)
@@ -957,23 +962,38 @@ def up_services(
 
     _run = run or _tsd.run  # finds the runtime outside PATH too (v0.2.97 R9 H5)
     infra = Path(compose_dir)
+    registry_error = ""
     if rows is None:
         try:
             rows = _se.load_rows(db_path)
-        except Exception:  # noqa: BLE001 — no rows: the guard proves from the runtime alone
-            rows = {}
+        except Exception as exc:  # noqa: BLE001 — no rows: ownership is unknown (below)
+            rows, registry_error = {}, str(exc) or type(exc).__name__
     files = _di.compose_files(infra)
     project = _containers.compose_project_of(files[0])
     result = UpVerbResult()
+    # The batch map carries each guard's recorded mount into the NEXT
+    # service's .env projection (W2R-01); the caller's mapping is not mutated.
+    current: dict[str, "_se.EndpointRow"] = dict(rows)
     for service in dict.fromkeys(services):
-        row = rows.get(service)
+        row = current.get(service)
         if row is not None and row.mode != "vco_managed":
             out(f"  [{service}] not VCO-managed ({row.mode}) — never composed")
             result.refused.append(service)
             continue
         g = _di.guard_recreate(service, runtime=runtime, infra_dir=infra, compose_argv=compose_argv,
-                               row=row, rows=rows, db_path=db_path, run=_run, files=files,
+                               row=row, rows=current, db_path=db_path, run=_run, files=files,
                                project=project)
+        if g.row is not None:
+            current[service] = g.row
+        if registry_error and g.ok and g.live.state == _di.LIVE_PRESENT:
+            # Ownership could not be read, and a container exists: whether VCO
+            # may recreate it is not known — do nothing (W2R-09). A service
+            # with no container at all may still be created.
+            out(f"  [{service}] launcher.db could not be read ({registry_error}) and container "
+                f"'{g.live.ref}' exists — whether VCO manages it is not known; left as it is.")
+            result.refused.append(service)
+            continue
+        _di.compose_name_conflict(g, will_remove=service in recreate)
         for note in g.notes:
             out(f"  [{service}] {note}")
         if not g.ok:

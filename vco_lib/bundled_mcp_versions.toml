@@ -34,9 +34,10 @@
 #                   (older npm cli versions).
 #
 # Self-reference: this file is listed in `orchestrator-managed-paths.txt`
-# so that `update_orchestrator_at` propagates new editions of the
-# manifest into every existing install when the user pulls a new VCO
-# clone — same fail-safe pattern the allowlist file uses.
+# so that a copy-based install (`installer/file_ops.rs::copy_orchestrator_to_sync`;
+# until v0.2.100 also the retired `update_orchestrator_at`) carries new
+# editions of the manifest along — same fail-safe pattern the allowlist
+# file uses.
 
 [npm.mermaid_mcp]
 package = "claude-mermaid"

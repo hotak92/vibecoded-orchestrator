@@ -382,7 +382,13 @@ _MAIN_SPAN_MAX = 1645
 # surfacing) moved to `vco_lib.install_services_up`, the podman machine
 # helper to `vco_lib.compose_provider`, and the reachability / podman-start
 # helpers became thin calls into `compose_provider`. Measured with `wc -l`.
-_TOTAL_LINES_MAX = 22671
+#
+# v0.2.100 WP-09 — re-pinned DOWN 22671 -> 22512 (-159). The Ollama wait +
+# pull moved to `vco_lib.ollama_pull` (install.py keeps two thin shims and the
+# testable `_ollama_models_step`), the pull list to `vco_lib.embedding_pull_plan`
+# (`_build_ollama_pull_list`, the profiles' static `embedding_models` and
+# `_OLLAMA_SERVED_EMBEDDING_MODELS` removed). Measured with `wc -l`.
+_TOTAL_LINES_MAX = 22512
 
 
 def _measure() -> tuple:

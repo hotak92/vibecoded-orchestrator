@@ -14,8 +14,7 @@
 //!     That works because each guards work that already owns a row
 //!     (`project_setups`, `module_installs`) with a status and a start
 //!     timestamp, which also survives a launcher restart. `update_all_projects`
-//!     and `update_orchestrator_at` own no such row: the run is a traversal,
-//!     not an entity.
+//!     owns no such row: the run is a traversal, not an entity.
 //!   * `self_update::UPSTREAM_FETCH_LOCK` — a `tokio::sync::Mutex` held
 //!     across the work, which SERIALISES (the second caller queues, then
 //!     runs). Wrong semantics here: a queued second update-all would run the
@@ -42,11 +41,12 @@
 //! ## Deliberately NOT one key for every update
 //!
 //! `update_all_projects` (manifest-driven bundle reconcile over registered
-//! projects) and `update_orchestrator_at` (orchestrator-clone refresh, gated
-//! by `validate_source_repo`) are SEPARATE operations on separate targets —
-//! see the boundary note at `installer.rs`'s `update_orchestrator_at`. They
+//! projects) and the orchestrator update (`update_run::run_update`, the
+//! launcher's own clone) are SEPARATE operations on separate targets. They
 //! get separate keys, so guarding one never blocks the other. Do not merge
-//! them into a single "an update is running" flag.
+//! them into a single "an update is running" flag. (v0.2.100, owner Q1: a
+//! third key, for the per-clone file-copy command, was retired with that
+//! command.)
 //!
 //! ## Scope of the guarantee
 //!
@@ -71,26 +71,18 @@ use std::sync::{LazyLock, Mutex};
 /// Operation key: the update-all-projects traversal (`projects_v2.rs`).
 pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
 
-/// Operation key: the orchestrator-clone refresh (`installer.rs`).
-pub const OP_UPDATE_ORCHESTRATOR_AT: &str = "update_orchestrator_at";
-
 /// Operation key: the post-update model-gateway restart
 /// (`gateway_freshness::model_gateway_restart_stale`). A second Continue while
 /// one restart is in flight would end every agent session a second time.
 pub const OP_GATEWAY_RESTART: &str = "model_gateway_restart";
 
-/// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by BOTH
-/// `installer::update_orchestrator` (the MenuBar badge) and
-/// `self_update::apply_launcher_update` (Preferences → Launcher updates).
-///
-/// ONE key for two commands, which is the opposite of the split above, and the
-/// difference is the TARGET rather than the command: `update_all_projects` and
-/// `update_orchestrator_at` act on different trees, so guarding one must not
-/// block the other. These two act on the SAME clone — the launcher's own
-/// checkout — and both `git pull` it and then run `install.py --update` against
-/// it. Two keys would let a MenuBar click and a Preferences click interleave
-/// those on one tree, which is the catastrophic case (prior review §4.8) rather
-/// than an inconvenience.
+/// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by
+/// `update_run::run_update` (every surface and every kind since v0.2.100) and
+/// by the conflict resolvers that hand their claim over to it
+/// (`update_run::run_update_claimed`). One key for the launcher's own clone:
+/// two would let a badge click and a Preferences click interleave a `git pull`
+/// and an `install.py --update` on one tree — the catastrophic case (prior
+/// review §4.8), not an inconvenience.
 ///
 /// The pipeline's `UpdateInProgressGuard` does NOT close this: its lockfile is
 /// a signal the MCP servers read to exit 75, written soft-fail and never
@@ -373,13 +365,8 @@ mod tests {
     /// are deliberately separate operations).
     #[test]
     fn guarded_operations_have_distinct_keys() {
-        assert_ne!(OP_UPDATE_ALL_PROJECTS, OP_UPDATE_ORCHESTRATOR_AT);
         // A gateway restart must never block (or be blocked by) an update.
-        for other in [
-            OP_UPDATE_ALL_PROJECTS,
-            OP_UPDATE_ORCHESTRATOR_AT,
-            OP_UPDATE_ORCHESTRATOR_CLONE,
-        ] {
+        for other in [OP_UPDATE_ALL_PROJECTS, OP_UPDATE_ORCHESTRATOR_CLONE] {
             assert_ne!(OP_GATEWAY_RESTART, other);
         }
     }
@@ -440,12 +427,11 @@ mod tests {
         drop(second);
     }
 
-    /// The shared claim must not collide with the two per-target keys, or a
+    /// The orchestrator claim must not collide with the update-all key, or a
     /// running orchestrator update would block an unrelated update-all.
     #[test]
-    fn the_orchestrator_update_key_is_distinct_from_the_per_target_ones() {
+    fn the_orchestrator_update_key_is_distinct_from_update_all() {
         assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ALL_PROJECTS);
-        assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ORCHESTRATOR_AT);
     }
 
     // ---- v0.2.100 WP-03a: the cross-process update.lock --------------------

@@ -19,7 +19,7 @@
 //! | 3 | `preflight` | git, Python + `install.py`, kind routed, tree state, hub-stop pre-check, remote pin — **before any mutation** |
 //! | 4 | `sweep_and_gate` | MCP kill-sweep + update gate — only after every refusal (L2-F14) |
 //! | 5 | `hub_stop_and_renames` | stop vct-hub, rename binaries aside (Windows) |
-//! | 6 | `git_op` | by kind: fast-forward pull / hard reset / none |
+//! | 6 | `git_op` | by kind: fast-forward pull / merge / rebase / resume check / backed-up hard reset / none |
 //! | 7 | `head_advance` | HEAD reached upstream (the v0.2.62 crash class) |
 //! | 8 | `install_py` | `install.py --update` inside `DbUpdateClosedGuard`, streamed to the modal |
 //! | 9 | `db_reopen_and_refresh` | cached update state refreshed |
@@ -36,11 +36,13 @@
 //! guarantees are unit-tested with a recording fake (`tests` below): a
 //! preflight refusal is proven to perform no mutation at all.
 //!
-//! Kinds `Merge`, `Rebase` and `Resume` are part of the enum (the contract
-//! WP-08 builds against) but their git operation still lives inline in
-//! `installer.rs`; until WP-03b extracts it they are REFUSED in preflight —
-//! before any mutation — with code `kind_not_routed`. See
-//! [`kind_is_routed`].
+//! Every kind is routed (WP-03b): `Merge` / `Rebase` / `Resume` run their
+//! git operation from `update_pipeline` (`merge_upstream`,
+//! `rebase_onto_upstream`, `classify_resume`); the legacy per-surface
+//! commands that used to own them — each with its own tail — are gone.
+//! `ResetHard` saves the local commits (a `git bundle` under
+//! `<vct_root>/backups/` + a `vco-backup/<stamp>` branch) BEFORE the reset and
+//! refuses the reset when that backup cannot be made ([`create_reset_backup`]).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -67,30 +69,22 @@ pub(crate) const RUNNING_VERSION: &str = env!("CARGO_PKG_VERSION");
 pub enum UpdateKind {
     /// Fast-forward (or conflict-free A0 merge) to the upstream tip.
     PullFf,
-    /// Merge upstream into a diverged clone (WP-03b routes it).
+    /// Merge upstream into a diverged clone.
     Merge,
-    /// Rebase a diverged clone onto upstream (WP-03b routes it).
+    /// Rebase a diverged clone onto upstream.
     Rebase,
-    /// Continue an update halted at a resolved conflict (WP-03b routes it).
+    /// Continue an update halted at a resolved conflict.
     Resume,
     /// No git operation: re-apply `install.py --update` to the current tree.
     ApplyOnly,
-    /// `git reset --hard vco_upstream/<branch>` — the diverged-clone rescue.
+    /// `git reset --hard vco_upstream/<branch>` — the diverged-clone rescue,
+    /// after the local commits are saved ([`create_reset_backup`]).
     ResetHard,
 }
 
 /// The command argument's type name in the contract.
 pub type UpdateKindDto = UpdateKind;
 
-/// Whether `run_update` can perform `kind` today. `Merge`/`Rebase`/`Resume`
-/// are refused in preflight (no mutation) until WP-03b moves their git
-/// operation out of `installer.rs` into [`UpdateOps::git_op`].
-pub(crate) fn kind_is_routed(kind: UpdateKind) -> bool {
-    matches!(
-        kind,
-        UpdateKind::PullFf | UpdateKind::ApplyOnly | UpdateKind::ResetHard
-    )
-}
 
 // ---------------------------------------------------------------------------
 // The phase ledger
@@ -204,6 +198,56 @@ pub struct UpdateOutcome {
     /// launcher was not restarted when it was not.
     pub message: String,
     pub(crate) phases: Vec<PhaseRecord>,
+    /// `ResetHard` only: where the discarded local commits were saved.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reset_backup: Option<ResetBackup>,
+}
+
+/// What `ResetHard` saved before discarding the clone's local work (owner
+/// ruling F-W2-03). Named in the confirm dialog (by pattern) and in the
+/// result (exactly).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ResetBackup {
+    /// `vco-backup/<stamp>` — the pre-reset HEAD.
+    pub branch: String,
+    /// `vco-backup/<stamp>-uncommitted` — a commit of the tracked changes
+    /// that were not committed, when there were any (`git stash create`).
+    pub uncommitted_branch: Option<String>,
+    /// `<vct_root>/backups/orchestrator-reset-<stamp>.bundle` holding both
+    /// branches' commits that upstream does not have. `None` only when there
+    /// was nothing local to save (no local commit, no uncommitted change).
+    pub bundle: Option<PathBuf>,
+    /// Commits on HEAD that upstream does not have.
+    pub local_commits: u32,
+}
+
+impl ResetBackup {
+    /// The sentence the result carries.
+    pub(crate) fn describe(&self) -> String {
+        let mut refs = self.branch.clone();
+        if let Some(u) = &self.uncommitted_branch {
+            refs.push_str(" and ");
+            refs.push_str(u);
+        }
+        match &self.bundle {
+            Some(b) => format!(
+                "Your {} local commit(s){} were saved to branch {} and to {}.",
+                self.local_commits,
+                if self.uncommitted_branch.is_some() {
+                    " and uncommitted changes"
+                } else {
+                    ""
+                },
+                refs,
+                b.display()
+            ),
+            None => format!(
+                "There were no local commits or uncommitted changes to lose; the pre-reset \
+                 HEAD is kept as branch {}.",
+                refs
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -219,6 +263,8 @@ pub(crate) struct GitOpOutcome {
     /// running one (a relaunch is owed).
     pub dist_binary_stale: bool,
     pub branch: String,
+    /// `ResetHard` only: what was saved before the reset.
+    pub reset_backup: Option<ResetBackup>,
 }
 
 /// A failed git operation. `restored` = the failing leg already reverted the
@@ -237,13 +283,18 @@ pub(crate) enum BinaryCheck {
     RunningCurrent,
     /// The dist launcher (and hub, when it has a sidecar) reached the source.
     Ready,
-    /// The dist is below the source but newer than the running launcher —
+    /// The dist launcher is below the source but newer than the running one —
     /// relaunching into it is strictly better (deferral records the gap).
     Partial {
         running: String,
         dist: String,
         source: String,
     },
+    /// The dist launcher reached the source; the dist vct-hub sidecar did not
+    /// (a release whose hub build did not land, a hand-copied hub). The
+    /// relaunch goes ahead; the note names the hub, and no launcher-divergence
+    /// row is written (W2R-02: that row claimed the LAUNCHER was behind).
+    HubLagging { hub: String, source: String },
     /// No dist binary newer than the running one exists yet (the release has
     /// not committed it). The launcher keeps running; deferral recorded.
     NotPublished {
@@ -256,51 +307,64 @@ pub(crate) enum BinaryCheck {
     Unknown { reason: String },
 }
 
-/// Pure decision for phase 11. `caught_up` is the existing
-/// `installer::WaitForBinaryRefresh` answer ("launcher and hub sidecars are
-/// at or above source"), asked ONCE with its re-pull disabled.
+/// Pure decision for phase 11, from ONE read of the three versions: the
+/// source (`vct-module.json`), the dist launcher sidecar and the dist hub
+/// sidecar (absent or empty = no hub sidecar, which never blocks). Every
+/// comparison goes through the version SSOT; each binary is compared with
+/// the SOURCE, so "below the source" is only ever said of a binary that is.
+/// v0.2.100 WP-03b: replaces the `WaitForBinaryRefresh` poll (and its
+/// `git pull` behind install.py's back, L2-F11).
 pub(crate) fn decide_binary_refresh(
     running: &str,
     source: Option<&str>,
-    caught_up: bool,
     dist: Option<&str>,
+    hub: Option<&str>,
 ) -> BinaryCheck {
-    use vct_launcher_core::version;
+    use vct_launcher_core::version::is_older;
+    let unknown = |e: vct_launcher_core::version::VersionParseError| BinaryCheck::Unknown {
+        reason: e.to_string(),
+    };
     let Some(source) = source else {
         return BinaryCheck::Unknown {
             reason: "the source version (vct-module.json) could not be read".into(),
         };
     };
-    match version::is_older(running, source) {
-        Err(e) => {
-            return BinaryCheck::Unknown {
-                reason: e.to_string(),
-            }
-        }
+    match is_older(running, source) {
+        Err(e) => return unknown(e),
         Ok(false) => return BinaryCheck::RunningCurrent,
         Ok(true) => {}
     }
-    if caught_up {
-        return BinaryCheck::Ready;
-    }
-    let dist_s = dist.unwrap_or("").to_string();
-    match dist.map(|d| version::is_older(running, d)) {
-        Some(Ok(true)) => BinaryCheck::Partial {
-            running: running.into(),
-            dist: dist_s,
-            source: source.into(),
-        },
-        Some(Err(e)) => BinaryCheck::Unknown {
-            reason: e.to_string(),
-        },
-        _ => BinaryCheck::NotPublished {
-            running: running.into(),
-            dist: if dist_s.is_empty() {
-                "<unknown>".into()
-            } else {
-                dist_s
+    let not_published = |dist: &str| BinaryCheck::NotPublished {
+        running: running.into(),
+        dist: if dist.is_empty() { "<unknown>".into() } else { dist.into() },
+        source: source.into(),
+    };
+    let Some(dist) = dist.filter(|d| !d.trim().is_empty()) else {
+        return not_published("");
+    };
+    match is_older(dist, source) {
+        Err(e) => unknown(e),
+        // The dist launcher is below the source.
+        Ok(true) => match is_older(running, dist) {
+            Ok(true) => BinaryCheck::Partial {
+                running: running.into(),
+                dist: dist.into(),
+                source: source.into(),
             },
-            source: source.into(),
+            Ok(false) => not_published(dist),
+            Err(e) => unknown(e),
+        },
+        // The dist launcher reached the source: the hub decides Ready.
+        Ok(false) => match hub.filter(|h| !h.trim().is_empty()) {
+            None => BinaryCheck::Ready,
+            Some(h) => match is_older(h, source) {
+                Ok(true) => BinaryCheck::HubLagging {
+                    hub: h.into(),
+                    source: source.into(),
+                },
+                Ok(false) => BinaryCheck::Ready,
+                Err(e) => unknown(e),
+            },
         },
     }
 }
@@ -494,6 +558,7 @@ async fn drive_phases<O: UpdateOps + Send>(
             already_up_to_date: false,
             dist_binary_stale: false,
             branch,
+            reset_backup: None,
         }
     } else {
         match ops.git_op(&root, kind, &renames, head_before.clone()).await {
@@ -558,6 +623,7 @@ async fn drive_phases<O: UpdateOps + Send>(
             log_path,
             message,
             phases: ledger.entries.clone(),
+            reset_backup: None,
         });
     }
 
@@ -643,6 +709,15 @@ async fn drive_phases<O: UpdateOps + Send>(
             ledger.done_with(Phase::BinaryRefresh, n.clone());
             Some(n)
         }
+        BinaryCheck::HubLagging { hub, source } => {
+            let n = format!(
+                "the vct-hub binary on disk (v{}) is below the source (v{}); the hub keeps \
+                 running that binary until its release build lands",
+                hub, source
+            );
+            ledger.done_with(Phase::BinaryRefresh, n.clone());
+            Some(n)
+        }
         BinaryCheck::Unknown { reason } => {
             ledger.done_with(
                 Phase::BinaryRefresh,
@@ -672,15 +747,16 @@ async fn drive_phases<O: UpdateOps + Send>(
     // ── 13. relaunch into the dist binary (version-guarded) ───────────────
     let (restarted, relaunch_note) = relaunch_phase(ops, &root, ledger).await;
 
-    let message = compose_message(
-        if restarted {
-            "Orchestrator updated; relaunching into the new launcher binary."
-        } else {
-            "Orchestrator updated."
-        },
-        binary_note.as_deref(),
-        relaunch_note.as_deref(),
-    );
+    let head_line = if restarted {
+        "Orchestrator updated; relaunching into the new launcher binary."
+    } else {
+        "Orchestrator updated."
+    };
+    let head_line = match &git.reset_backup {
+        Some(b) => format!("{} {}", head_line, b.describe()),
+        None => head_line.to_string(),
+    };
+    let message = compose_message(&head_line, binary_note.as_deref(), relaunch_note.as_deref());
     // The modal's completion signal when this process keeps running (a
     // relaunch exits it, and the new launcher is the signal).
     if !restarted {
@@ -695,6 +771,7 @@ async fn drive_phases<O: UpdateOps + Send>(
         log_path,
         message,
         phases: ledger.entries.clone(),
+        reset_backup: git.reset_backup,
     })
 }
 
@@ -706,16 +783,6 @@ async fn preflight<O: UpdateOps + Send>(
     root: &Path,
     kind: UpdateKind,
 ) -> Result<String, UpdateSurfaceError> {
-    if !kind_is_routed(kind) {
-        return Err(UpdateSurfaceError::Refused {
-            code: "kind_not_routed",
-            reason: format!(
-                "The {:?} update is not available through {} yet — nothing was changed. Use \
-                 the Merge / Rebase / Continue buttons of the update modal.",
-                kind, SURFACE
-            ),
-        });
-    }
     if !ops.git_available().await {
         return Err(UpdateSurfaceError::Refused {
             code: "git_missing",
@@ -851,11 +918,18 @@ pub(crate) struct LiveOps<'w, R: Runtime> {
 }
 
 impl<'w, R: Runtime> LiveOps<'w, R> {
-    fn new(app: AppHandle<R>, window: Option<&'w Window>) -> Self {
+    /// `flight`: a single-flight claim the CALLER already holds (a conflict
+    /// resolver that did destructive work under it) — handed over so ONE
+    /// claim spans that work and the update it unblocks.
+    fn new(
+        app: AppHandle<R>,
+        window: Option<&'w Window>,
+        flight: Option<crate::commands::single_flight::SingleFlightGuard>,
+    ) -> Self {
         Self {
             app,
             window,
-            flight: None,
+            flight,
             machine_lock: None,
             gate: None,
             started_ms: chrono::Utc::now().timestamp_millis(),
@@ -902,18 +976,20 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
     }
 
     fn claim(&mut self, _root: &Path) -> Result<(), UpdateSurfaceError> {
-        let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
-            .map_err(|reason| UpdateSurfaceError::Refused {
-                code: "already_running",
-                reason,
-            })?;
+        if self.flight.is_none() {
+            let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
+                .map_err(|reason| UpdateSurfaceError::Refused {
+                    code: "already_running",
+                    reason,
+                })?;
+            self.flight = Some(flight);
+        }
         let lock = crate::commands::single_flight::acquire_update_lock().map_err(|reason| {
             UpdateSurfaceError::Refused {
                 code: "already_running",
                 reason,
             }
         })?;
-        self.flight = Some(flight);
         self.machine_lock = Some(lock);
         Ok(())
     }
@@ -977,13 +1053,9 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
                 // merge is not a refusal here — identity is.
                 return reset_hard_identity_refusal(&root);
             }
-            match crate::commands::update_pipeline::run_preflight_refusals(
-                &root,
-                SURFACE,
-                &crate::commands::update_pipeline::ExtraPreflight::None,
-            )
-            .await
+            match crate::commands::update_pipeline::run_preflight_refusals(&root, SURFACE).await
             {
+                Ok(()) if kind == UpdateKind::Resume => resume_refusal(&root).await,
                 Ok(()) => None,
                 Err(err) => {
                     if let Some(db) = app.try_state::<crate::db::Db>() {
@@ -1018,15 +1090,18 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         root: &Path,
         kind: UpdateKind,
     ) -> Result<PrePullRenames, String> {
-        let before = match kind {
-            UpdateKind::ResetHard => Some("git reset --hard"),
-            UpdateKind::ApplyOnly => Some("install.py --update"),
-            _ => Some("git pull"),
+        let (operation, before) = match kind {
+            UpdateKind::ResetHard => ("update", Some("git reset --hard")),
+            UpdateKind::ApplyOnly => ("update", Some("install.py --update")),
+            UpdateKind::Merge => ("merge", Some("git pull")),
+            UpdateKind::Rebase => ("rebase", Some("git rebase")),
+            UpdateKind::Resume => ("resume", None),
+            UpdateKind::PullFf => ("update", Some("git pull")),
         };
         let window = self.window;
         crate::commands::update_pipeline::stop_hub_and_rename_binaries_aside(
             root,
-            "update",
+            operation,
             before,
             |stage: &str, message: &str, pct: f32| {
                 if let Some(w) = window {
@@ -1068,14 +1143,19 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
                 UpdateKind::PullFf => {
                     pull_ff_git_op(&app, window, &root, &renames, head_before, started_ms).await
                 }
-                UpdateKind::ResetHard => reset_hard_git_op(&root).await,
-                // Refused in preflight (`kind_is_routed`) / handled by the
-                // driver (ApplyOnly) — reaching here is a driver bug, worded.
-                other => Err(GitOpFailure {
-                    error: UpdateSurfaceError::Raw(format!(
-                        "internal: {:?} reached the git operation phase unrouted",
-                        other
-                    )),
+                UpdateKind::ResetHard => {
+                    let backups = vct_launcher_core::paths::vct_root_dir().join("backups");
+                    reset_hard_git_op(&root, &backups).await
+                }
+                UpdateKind::Merge | UpdateKind::Rebase | UpdateKind::Resume => {
+                    let op = recovery_git_op(&root, kind, window).await;
+                    finish_recovery_git_op(&app, &root, &renames, op).await
+                }
+                // The driver never asks ApplyOnly for a git operation.
+                UpdateKind::ApplyOnly => Err(GitOpFailure {
+                    error: UpdateSurfaceError::Raw(
+                        "internal: ApplyOnly reached the git operation phase".into(),
+                    ),
                     restored: false,
                 }),
             }
@@ -1085,9 +1165,18 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
     fn head_advance(&mut self, root: &Path) -> impl Future<Output = Result<(), String>> + Send {
         let root = root.to_path_buf();
         async move {
-            crate::commands::installer::assert_head_reached_upstream(&root)
-                .await
-                .map(|_| ())
+            use crate::commands::installer::HeadAdvanceOutcome;
+            match crate::commands::installer::assert_head_reached_upstream(&root).await? {
+                HeadAdvanceOutcome::Reached => {}
+                // Not blocking, but recorded (v0.2.92 WP-13 item 8).
+                HeadAdvanceOutcome::Unverified { error } => {
+                    let branch = crate::commands::installer::resolve_pull_branch(&root).await;
+                    crate::commands::git_user_editable_merge::write_launcher_update_post_pull_unverified_deferral(
+                        &root, &branch, &error,
+                    );
+                }
+            }
+            Ok(())
         }
     }
 
@@ -1171,25 +1260,14 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         let root = root.to_path_buf();
         let branch = branch.to_string();
         async move {
-            // The existing "sidecars caught up with source" rule, asked ONCE:
-            // zero timeout, re-pull disabled (L2-F11 — no git here).
-            let caught_up = crate::commands::installer::WaitForBinaryRefresh {
-                install_path: &root,
-                branch: &branch,
-                timeout: std::time::Duration::ZERO,
-                interval: std::time::Duration::ZERO,
-                disable_git_pull: true,
-            }
-            .run()
-            .await
-            .is_ok();
             let source = crate::commands::installer::read_source_version(&root);
             let dist = crate::commands::installer::read_on_disk_binary_version(&root);
+            let hub = crate::commands::installer::read_on_disk_hub_version(&root);
             let check = decide_binary_refresh(
                 RUNNING_VERSION,
                 source.as_deref(),
-                caught_up,
                 dist.as_deref(),
+                hub.as_deref(),
             );
             use crate::commands::git_user_editable_merge::{
                 write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
@@ -1277,6 +1355,11 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
         root: &Path,
     ) -> impl Future<Output = Result<RelaunchOutcome, RelaunchError>> + Send {
         self.emit("restart", "Update applied — restarting launcher...", 98.0);
+        // W2R-06: a relaunch ends in `app.exit(0)`, which never drops `self`
+        // — release both claims NOW (the update is applied and audited), so
+        // no `update.lock` naming a dead pid is left behind.
+        self.machine_lock = None;
+        self.flight = None;
         let root = root.to_path_buf();
         let app = self.app.clone();
         async move {
@@ -1338,7 +1421,6 @@ async fn pull_ff_git_op<R: Runtime>(
         start_branch: &start_branch,
         head_sha_before: head_before,
         update_start_ms: started_ms,
-        extra_preflight: crate::commands::update_pipeline::ExtraPreflight::None,
     };
     let audit = |rows: AuditRows| {
         if let Some(db) = app.try_state::<crate::db::Db>() {
@@ -1354,6 +1436,7 @@ async fn pull_ff_git_op<R: Runtime>(
                 already_up_to_date: pulled.already_up_to_date,
                 dist_binary_stale: pulled.dist_binary_stale,
                 branch: pulled.pull_branch,
+                reset_backup: None,
             })
         }
         Err(err) => {
@@ -1367,11 +1450,250 @@ async fn pull_ff_git_op<R: Runtime>(
     }
 }
 
+/// `Merge` / `Rebase` / `Resume`'s git operation (phase 6), as the pipeline
+/// condition: `update_pipeline` owns the git work; nothing here restores.
+async fn recovery_git_op(
+    root: &Path,
+    kind: UpdateKind,
+    window: Option<&Window>,
+) -> Result<crate::commands::update_pipeline::RecoveryGitOp, RecoveryFailure> {
+    use crate::commands::update_pipeline::{self as pipeline, RecoveryGitOp, ResumeVerdict};
+    match kind {
+        UpdateKind::Merge => pipeline::merge_upstream(root, SURFACE, window)
+            .await
+            .map_err(RecoveryFailure::Pipeline),
+        UpdateKind::Rebase => pipeline::rebase_onto_upstream(root, SURFACE, window)
+            .await
+            .map_err(RecoveryFailure::Pipeline),
+        _ => match pipeline::classify_resume(root).await {
+            // The resume consumes its record either way.
+            ResumeVerdict::Proceed { branch } => {
+                pipeline::clear_prior_resume_state(root);
+                Ok(RecoveryGitOp {
+                    already_up_to_date: false,
+                    branch,
+                })
+            }
+            ResumeVerdict::NothingPending { branch } => {
+                pipeline::clear_prior_resume_state(root);
+                Ok(RecoveryGitOp {
+                    already_up_to_date: true,
+                    branch,
+                })
+            }
+            // Preflight refused these; the tree moved in between.
+            ResumeVerdict::Refuse { code, message, .. } => {
+                Err(RecoveryFailure::Surface(UpdateSurfaceError::Refused {
+                    code,
+                    reason: message,
+                }))
+            }
+        },
+    }
+}
+
+/// Why a recovery git operation stopped.
+enum RecoveryFailure {
+    Pipeline(crate::commands::update_pipeline::UpdatePipelineError),
+    Surface(UpdateSurfaceError),
+}
+
+/// Map a recovery git operation onto the driver's [`GitOpOutcome`]. The
+/// driver restores on failure (`restored: false`); "already up to date"
+/// restores HERE, because the driver's up-to-date leg expects the git
+/// operation to have put the binaries and the hub back (as the pull sequence
+/// does) — then reconciles the dist binary at rest like the pull does.
+async fn finish_recovery_git_op<R: Runtime>(
+    app: &AppHandle<R>,
+    root: &Path,
+    renames: &PrePullRenames,
+    op: Result<crate::commands::update_pipeline::RecoveryGitOp, RecoveryFailure>,
+) -> Result<GitOpOutcome, GitOpFailure> {
+    match op {
+        Ok(done) if done.already_up_to_date => {
+            crate::commands::installer::abort_update_restore_binaries_and_hub(
+                root,
+                renames.launcher.as_deref(),
+                renames.hub.as_deref(),
+            );
+            let heal = crate::services::binary_freshness::reconcile_dist_at_rest(root).await;
+            Ok(GitOpOutcome {
+                already_up_to_date: true,
+                dist_binary_stale: heal.is_stale(),
+                branch: done.branch,
+                reset_backup: None,
+            })
+        }
+        Ok(done) => Ok(GitOpOutcome {
+            already_up_to_date: false,
+            dist_binary_stale: false,
+            branch: done.branch,
+            reset_backup: None,
+        }),
+        Err(RecoveryFailure::Surface(error)) => Err(GitOpFailure {
+            error,
+            restored: false,
+        }),
+        Err(RecoveryFailure::Pipeline(err)) => {
+            let (error, rows) = update_failure::from_pipeline_error(err);
+            if let Some(db) = app.try_state::<crate::db::Db>() {
+                for (op, detail) in rows {
+                    let _ = db.audit(&op, None, None, &detail);
+                }
+            }
+            Err(GitOpFailure {
+                error,
+                restored: false,
+            })
+        }
+    }
+}
+
+/// Phase 3 for `Resume`: every refusal [`update_pipeline::classify_resume`]
+/// can decide from the sentinel and git state, before any mutation. A
+/// provably stale sentinel (HEAD never moved past the conflict) is cleared
+/// with the refusal so the badge stops offering a resume that cannot happen.
+///
+/// [`update_pipeline::classify_resume`]: crate::commands::update_pipeline::classify_resume
+async fn resume_refusal(root: &Path) -> Option<UpdateSurfaceError> {
+    use crate::commands::update_pipeline::{classify_resume, clear_prior_resume_state, ResumeVerdict};
+    match classify_resume(root).await {
+        ResumeVerdict::Refuse {
+            code,
+            message,
+            stale_sentinel,
+        } => {
+            if stale_sentinel {
+                clear_prior_resume_state(root);
+            }
+            Some(UpdateSurfaceError::Refused {
+                code,
+                reason: message,
+            })
+        }
+        ResumeVerdict::Proceed { .. } | ResumeVerdict::NothingPending { .. } => None,
+    }
+}
+
+/// Run one git command in `root` for the reset backup (through the one git
+/// runner, `git_cmd::run_git_raw_env`); stdout trimmed, or the failure worded
+/// with the command.
+async fn backup_git(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<String, String> {
+    let out = crate::commands::git_cmd::run_git_raw_env(root, args, env).await?;
+    if !out.status.success() {
+        return Err(format!(
+            "`git {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// Save everything `git reset --hard <upstream_ref>` could destroy, BEFORE it
+/// runs (owner ruling F-W2-03 + review W2R-03). Nothing in the working tree
+/// or the index is modified:
+///
+/// 1. `vco-backup/<stamp>` → the current HEAD (the local commits).
+/// 2. `vco-backup/<stamp>-wip` → a commit of the WHOLE working tree — tracked
+///    modifications, deletions AND untracked (non-ignored) files — built in a
+///    throwaway index (`GIT_INDEX_FILE`), so the user's index and files stay
+///    exactly as they are. Only when the tree differs from HEAD. (Chosen over
+///    `git stash push --include-untracked`, which REMOVES untracked files from
+///    disk — files the reset itself would leave alone.)
+/// 3. `<backups_dir>/orchestrator-reset-<stamp>.bundle` holding both refs'
+///    commits that upstream lacks, then `git bundle verify`.
+///
+/// Any failure is an `Err` and the caller REFUSES the reset. With no local
+/// commit and a clean tree there is nothing to lose: the HEAD branch is still
+/// created, no bundle is written (git refuses an empty bundle).
+pub(crate) async fn create_reset_backup(
+    root: &Path,
+    upstream_ref: &str,
+    backups_dir: &Path,
+    stamp: &str,
+) -> Result<ResetBackup, String> {
+    let head = backup_git(root, &["rev-parse", "--verify", "HEAD"], &[]).await?;
+    let range = format!("{}..{}", upstream_ref, head);
+    let local_commits: u32 = backup_git(root, &["rev-list", "--count", range.as_str()], &[])
+        .await?
+        .parse()
+        .map_err(|e| format!("could not count the local commits: {}", e))?;
+
+    // The working-tree snapshot, through a throwaway index.
+    let scratch = tempfile::tempdir().map_err(|e| format!("scratch dir: {}", e))?;
+    let index = scratch.path().join("index").to_string_lossy().to_string();
+    let env = [("GIT_INDEX_FILE", index.as_str())];
+    backup_git(root, &["read-tree", head.as_str()], &env).await?;
+    backup_git(root, &["add", "--all", "--", "."], &env).await?;
+    let tree = backup_git(root, &["write-tree"], &env).await?;
+    let head_tree = format!("{}^{{tree}}", head);
+    let head_tree = backup_git(root, &["rev-parse", head_tree.as_str()], &[]).await?;
+    let wip = if tree != head_tree {
+        let msg = format!(
+            "vco-backup {}: uncommitted and untracked changes before the reset",
+            stamp
+        );
+        Some(
+            backup_git(
+                root,
+                &["commit-tree", tree.as_str(), "-p", head.as_str(), "-m", msg.as_str()],
+                &[],
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
+
+    let branch = format!("vco-backup/{}", stamp);
+    backup_git(root, &["branch", branch.as_str(), head.as_str()], &[]).await?;
+    let wip_branch = match &wip {
+        Some(sha) => {
+            let b = format!("{}-wip", branch);
+            backup_git(root, &["branch", b.as_str(), sha.as_str()], &[]).await?;
+            Some(b)
+        }
+        None => None,
+    };
+    if local_commits == 0 && wip_branch.is_none() {
+        return Ok(ResetBackup {
+            branch,
+            uncommitted_branch: None,
+            bundle: None,
+            local_commits,
+        });
+    }
+
+    std::fs::create_dir_all(backups_dir)
+        .map_err(|e| format!("could not create {}: {}", backups_dir.display(), e))?;
+    let bundle = backups_dir.join(format!("orchestrator-reset-{}.bundle", stamp));
+    let bundle_s = bundle.to_string_lossy().to_string();
+    let exclude = format!("^{}", upstream_ref);
+    let mut args = vec!["bundle", "create", bundle_s.as_str(), branch.as_str()];
+    if let Some(b) = &wip_branch {
+        args.push(b.as_str());
+    }
+    args.push(exclude.as_str());
+    backup_git(root, &args, &[]).await?;
+    backup_git(root, &["bundle", "verify", bundle_s.as_str()], &[]).await?;
+    Ok(ResetBackup {
+        branch,
+        uncommitted_branch: wip_branch,
+        bundle: Some(bundle),
+        local_commits,
+    })
+}
+
 /// `ResetHard`'s git operation: identity re-asserted, fetch, abort any
-/// in-progress merge/rebase (a reset does not clear them), then
+/// in-progress merge/rebase (a reset does not clear them), the local work
+/// saved ([`create_reset_backup`] — a failure REFUSES the reset), then
 /// `git reset --hard vco_upstream/<branch>`. Failures leave the restore to
 /// the driver (`restored: false`).
-async fn reset_hard_git_op(root: &Path) -> Result<GitOpOutcome, GitOpFailure> {
+pub(crate) async fn reset_hard_git_op(
+    root: &Path,
+    backups_dir: &Path,
+) -> Result<GitOpOutcome, GitOpFailure> {
     let fail = |error: UpdateSurfaceError| GitOpFailure {
         error,
         restored: false,
@@ -1379,7 +1701,6 @@ async fn reset_hard_git_op(root: &Path) -> Result<GitOpOutcome, GitOpFailure> {
     if let Some(refusal) = reset_hard_identity_refusal(root) {
         return Err(fail(refusal));
     }
-    crate::commands::update_pipeline::clear_prior_resume_state(root);
     let branch = crate::commands::git_cmd::resolve_branch(root)
         .await
         .map_err(|e| {
@@ -1414,20 +1735,37 @@ async fn reset_hard_git_op(root: &Path) -> Result<GitOpOutcome, GitOpFailure> {
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         branch
     );
+    let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+    let backup = create_reset_backup(root, &target, backups_dir, &stamp)
+        .await
+        .map_err(|e| {
+            fail(UpdateSurfaceError::Refused {
+                code: "reset_backup_failed",
+                reason: format!(
+                    "Refusing `git reset --hard`: your local commits and changes could not be \
+                     backed up first ({}). Nothing was reset.",
+                    e
+                ),
+            })
+        })?;
+    tracing::info!("[vct] {}: reset backup: {}", SURFACE, backup.describe());
+    crate::commands::update_pipeline::clear_prior_resume_state(root);
     let out = crate::commands::git_cmd::run_git_raw(root, &["reset", "--hard", target.as_str()])
         .await
         .map_err(|e| fail(UpdateSurfaceError::Raw(e)))?;
     if !out.status.success() {
         return Err(fail(UpdateSurfaceError::Raw(format!(
-            "git reset --hard {} failed: {}",
+            "git reset --hard {} failed: {}. {}",
             target,
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(&out.stderr).trim(),
+            backup.describe()
         ))));
     }
     Ok(GitOpOutcome {
         already_up_to_date: false,
         dist_binary_stale: false,
         branch,
+        reset_backup: Some(backup),
     })
 }
 
@@ -1450,7 +1788,29 @@ pub(crate) async fn run_update<R: Runtime>(
         kind,
         surface
     );
-    let mut ops = LiveOps::new(app, window);
+    let mut ops = LiveOps::new(app, window, None);
+    run_update_with(&mut ops, kind).await
+}
+
+/// [`run_update`] for a caller that ALREADY holds the orchestrator-update
+/// single-flight claim — the conflict resolvers (`keep_local_…`,
+/// `accept_upstream_…`, `resolve_autostash_pop_and_retry`,
+/// `resolve_untracked_collision_and_retry`) do destructive git work under it
+/// and hand it over, so ONE claim spans that work and the update it unblocks.
+pub(crate) async fn run_update_claimed<R: Runtime>(
+    app: AppHandle<R>,
+    window: Option<&Window>,
+    kind: UpdateKind,
+    surface: &'static str,
+    flight: crate::commands::single_flight::SingleFlightGuard,
+) -> Result<UpdateOutcome, UpdateSurfaceError> {
+    tracing::info!(
+        "[vct] {}: {:?} update requested by {} (claim handed over)",
+        SURFACE,
+        kind,
+        surface
+    );
+    let mut ops = LiveOps::new(app, window, Some(flight));
     run_update_with(&mut ops, kind).await
 }
 
@@ -1489,7 +1849,7 @@ pub async fn run_orchestrator_update<R: Runtime>(
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// A recording fake: every op appends its name; outcomes are scripted.
@@ -1508,6 +1868,9 @@ mod tests {
         install: Result<InstallPyRun, String>,
         binary: BinaryCheck,
         relaunch: Result<RelaunchOutcome, RelaunchError>,
+        /// When set, Merge/Rebase/Resume run their REAL git operation on this
+        /// temp repo (everything else stays fake — install.py included).
+        real_repo: Option<PathBuf>,
     }
 
     fn ok_run() -> InstallPyRun {
@@ -1537,6 +1900,7 @@ mod tests {
                     already_up_to_date: false,
                     dist_binary_stale: false,
                     branch: "main".into(),
+                    reset_backup: None,
                 }),
                 head: Ok(()),
                 install: Ok(ok_run()),
@@ -1544,6 +1908,7 @@ mod tests {
                 relaunch: Ok(RelaunchOutcome::Spawned {
                     exe: PathBuf::from("/fake/root/launcher/dist/x/vct-launcher"),
                 }),
+                real_repo: None,
             }
         }
         fn rec(&mut self, name: &str) {
@@ -1638,13 +2003,33 @@ mod tests {
         fn git_op(
             &mut self,
             _root: &Path,
-            _kind: UpdateKind,
+            kind: UpdateKind,
             _renames: &PrePullRenames,
             _head_before: Option<String>,
         ) -> impl Future<Output = Result<GitOpOutcome, GitOpFailure>> + Send {
             self.rec("git_op");
+            self.rec(&format!("git_op:{:?}", kind));
             let v = self.git_op.clone();
-            async move { v }
+            let real = self.real_repo.clone();
+            async move {
+                let Some(repo) = real else { return v };
+                match recovery_git_op(&repo, kind, None).await {
+                    Ok(done) => Ok(GitOpOutcome {
+                        already_up_to_date: done.already_up_to_date,
+                        dist_binary_stale: false,
+                        branch: done.branch,
+                        reset_backup: None,
+                    }),
+                    Err(RecoveryFailure::Surface(error)) => Err(GitOpFailure {
+                        error,
+                        restored: false,
+                    }),
+                    Err(RecoveryFailure::Pipeline(e)) => Err(GitOpFailure {
+                        error: update_failure::from_pipeline_error(e).0,
+                        restored: false,
+                    }),
+                }
+            }
         }
         fn head_advance(
             &mut self,
@@ -1763,7 +2148,7 @@ mod tests {
     }
 
     /// Every preflight refusal leg is mutation-free — git missing, a wedged
-    /// tree, an unreadable hub.pid, an unrouted kind, and (last, being the one
+    /// tree (every kind), an unreadable hub.pid, and (last, being the one
     /// git-config write) the remote pin: its failure leaves the sweep unrun.
     #[tokio::test]
     async fn every_preflight_refusal_performs_no_mutation() {
@@ -1779,17 +2164,16 @@ mod tests {
         let mut o = FakeOps::happy();
         o.precheck = Err("hub.pid unreadable".into());
         cases.push(("hub precheck", o, UpdateKind::PullFf));
-        cases.push(("merge kind not routed", FakeOps::happy(), UpdateKind::Merge));
-        cases.push((
-            "rebase kind not routed",
-            FakeOps::happy(),
-            UpdateKind::Rebase,
-        ));
-        cases.push((
-            "resume kind not routed",
-            FakeOps::happy(),
-            UpdateKind::Resume,
-        ));
+        // Every kind refuses a wedged tree before any mutation (WP-03b routed
+        // Merge / Rebase / Resume; the refusal is the same phase-3 leg).
+        for kind in [UpdateKind::Merge, UpdateKind::Rebase, UpdateKind::Resume] {
+            let mut o = FakeOps::happy();
+            o.tree = Some(UpdateSurfaceError::Refused {
+                code: "resume_not_pending",
+                reason: "no resume pending".into(),
+            });
+            cases.push(("tree refusal", o, kind));
+        }
         for (name, mut ops, kind) in cases {
             let (r, ledger) = run(&mut ops, kind).await;
             assert!(r.is_err(), "{name}");
@@ -1927,6 +2311,7 @@ mod tests {
                 already_up_to_date: true,
                 dist_binary_stale: stale,
                 branch: "main".into(),
+                reset_backup: None,
             });
             let (r, ledger) = run(&mut ops, UpdateKind::PullFf).await;
             let out = r.expect("up to date is success");
@@ -1953,37 +2338,84 @@ mod tests {
         assert!(ops.failure_rows().is_empty());
     }
 
-    /// Phase 11's pure decision, both directions (AD-8 tri-state).
+    /// Phase 11's pure decision, both directions (AD-8 tri-state), from the
+    /// three versions alone — no poll, no `git pull` (L2-F11).
     #[test]
     fn decide_binary_refresh_table() {
+        let d = decide_binary_refresh;
+        assert_eq!(d("0.2.100", Some("0.2.100"), None, None), BinaryCheck::RunningCurrent);
+        // A running binary AHEAD of source is current too — never "restart".
+        assert_eq!(d("0.2.100", Some("0.2.99"), Some("0.2.99"), None), BinaryCheck::RunningCurrent);
+        assert_eq!(d("0.2.99", Some("0.2.100"), Some("0.2.100"), None), BinaryCheck::Ready);
         assert_eq!(
-            decide_binary_refresh("0.2.100", Some("0.2.100"), false, None),
-            BinaryCheck::RunningCurrent
-        );
-        assert_eq!(
-            decide_binary_refresh("0.2.99", Some("0.2.100"), true, Some("0.2.100")),
+            d("0.2.99", Some("0.2.100"), Some("0.2.100"), Some("0.2.100")),
             BinaryCheck::Ready
         );
+        // A dist AHEAD of source satisfies it (the v0.2.48 pin-stale case).
+        assert_eq!(d("0.2.9", Some("0.2.9"), Some("0.2.10"), None), BinaryCheck::RunningCurrent);
+        assert_eq!(d("0.2.8", Some("0.2.9"), Some("0.2.10"), None), BinaryCheck::Ready);
         assert!(matches!(
-            decide_binary_refresh("0.2.98", Some("0.2.100"), false, Some("0.2.99")),
+            d("0.2.98", Some("0.2.100"), Some("0.2.99"), None),
             BinaryCheck::Partial { .. }
         ));
         assert!(matches!(
-            decide_binary_refresh("0.2.99", Some("0.2.100"), false, Some("0.2.99")),
+            d("0.2.99", Some("0.2.100"), Some("0.2.99"), None),
             BinaryCheck::NotPublished { .. }
         ));
         assert!(matches!(
-            decide_binary_refresh("0.2.99", Some("0.2.100"), false, None),
+            d("0.2.99", Some("0.2.100"), None, None),
             BinaryCheck::NotPublished { .. }
         ));
+        assert!(matches!(d("0.2.99", None, None, None), BinaryCheck::Unknown { .. }));
         assert!(matches!(
-            decide_binary_refresh("0.2.99", None, false, None),
+            d("0.2.99", Some("0.2.100-rc1"), None, None),
             BinaryCheck::Unknown { .. }
         ));
         assert!(matches!(
-            decide_binary_refresh("0.2.99", Some("0.2.100-rc1"), false, None),
+            d("0.2.99", Some("0.2.100"), Some("garbage"), None),
             BinaryCheck::Unknown { .. }
         ));
+    }
+
+    /// W2R-02: a launcher dist AT source with a LAGGING hub sidecar is not
+    /// "the launcher is below the source" — it is `HubLagging`, whose note
+    /// names the hub, and no launcher-divergence verdict. Leave-alone: an
+    /// empty/absent hub sidecar never blocks, a caught-up hub is Ready, and a
+    /// genuinely older launcher dist is still `Partial`.
+    #[test]
+    fn a_lagging_hub_is_named_as_the_hub_not_a_partial_launcher() {
+        let d = decide_binary_refresh;
+        assert_eq!(
+            d("0.2.99", Some("0.2.100"), Some("0.2.100"), Some("0.2.99")),
+            BinaryCheck::HubLagging {
+                hub: "0.2.99".into(),
+                source: "0.2.100".into()
+            }
+        );
+        assert_eq!(d("0.2.99", Some("0.2.100"), Some("0.2.100"), Some("")), BinaryCheck::Ready);
+        assert_eq!(
+            d("0.2.99", Some("0.2.100"), Some("0.2.100"), Some("0.2.101")),
+            BinaryCheck::Ready
+        );
+        assert!(matches!(
+            d("0.2.98", Some("0.2.100"), Some("0.2.99"), Some("0.2.99")),
+            BinaryCheck::Partial { .. }
+        ));
+    }
+
+    /// The ledger/message for a lagging hub says the HUB is behind — never
+    /// "the launcher binary on disk (vX) is below the source (vX)".
+    #[tokio::test]
+    async fn hub_lagging_note_names_the_hub() {
+        let mut ops = FakeOps::happy();
+        ops.binary = BinaryCheck::HubLagging {
+            hub: "0.2.99".into(),
+            source: "0.2.100".into(),
+        };
+        let (r, _) = run(&mut ops, UpdateKind::PullFf).await;
+        let out = r.expect("applied");
+        assert!(out.message.contains("vct-hub binary on disk (v0.2.99)"), "{}", out.message);
+        assert!(!out.message.contains("launcher binary on disk"), "{}", out.message);
     }
 
     /// ResetHard's identity assertion: ACT (a non-clone is refused) and
@@ -2078,11 +2510,11 @@ mod tests {
     /// `#[command]`s that MUST reach `run_update` (AD-1 revised: exactly one).
     const REACHES_RUN_UPDATE: [&str; 1] = ["run_orchestrator_update"];
 
-    /// Legacy update commands that do NOT yet reach `run_update`. WP-03b
-    /// migrates each to delegate (moving it to the list above) or removes it
-    /// (`update_orchestrator_at`, owner Q1). Shrinking this list is the point;
-    /// a name that starts reaching `run_update` must move up.
-    const PENDING_WP03B: [&str; 8] = [
+    /// The per-surface update commands the one pipeline replaced (WP-03b),
+    /// and the retired `update_orchestrator_at` (owner Q1). None may exist as
+    /// a `#[command]` nor be registered — the GUI invoke census
+    /// (`launcher/src/lib/update-invoke-census.test.ts`) proves no caller.
+    const RETIRED: [&str; 9] = [
         "update_orchestrator",
         "merge_orchestrator_with_upstream",
         "rebase_orchestrator_onto_upstream",
@@ -2091,6 +2523,7 @@ mod tests {
         "apply_pending_install",
         "force_resync_launcher",
         "update_orchestrator_at",
+        "get_cached_update_status_refreshed",
     ];
 
     const SCANNED: [&str; 3] = [
@@ -2101,7 +2534,7 @@ mod tests {
 
     /// Blank out comments and string/char literal CONTENTS (keeping offsets),
     /// so a name in a comment or a string cannot satisfy the scan.
-    fn code_only(src: &str) -> String {
+    pub(crate) fn code_only(src: &str) -> String {
         let b: Vec<char> = src.chars().collect();
         let mut out = String::with_capacity(src.len());
         let mut i = 0;
@@ -2256,11 +2689,36 @@ mod tests {
         files.iter().find_map(|(_, code)| command_body(code, name))
     }
 
-    /// Every allowlisted `#[command]` reaches `run_update(` in its own CODE
-    /// (comments and strings blanked), is registered in `generate_handler!`,
-    /// and every pending legacy name still exists and does NOT yet reach it
-    /// (a migrated one must move to the allowlist). Red-proof: delete the
-    /// `run_update(` call from `run_orchestrator_update` → red.
+    /// Identifier tokens of `code` (for exact-name matching).
+    fn tokens(code: &str) -> Vec<&str> {
+        code.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .filter(|t| !t.is_empty())
+            .collect()
+    }
+
+    /// Names of every `#[command]` fn in `code`.
+    fn command_names(code: &str) -> Vec<String> {
+        let mut out = vec![];
+        let mut search = 0;
+        while let Some(at) = code[search..].find("#[command]") {
+            let start = search + at;
+            if let Some(fn_at) = code[start..].find("fn ") {
+                let ident: String = code[start + fn_at + 3..]
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_')
+                    .collect();
+                out.push(ident);
+            }
+            search = start + "#[command]".len();
+        }
+        out
+    }
+
+    /// The ONE update command: exactly the allowlist's `#[command]`s reach
+    /// `run_update(` in their own CODE (comments and strings blanked), and it
+    /// is registered. Red-proof: delete the `run_update(` call from
+    /// `run_orchestrator_update` → red; add a `#[command]` whose body calls
+    /// `run_update(` → red.
     #[test]
     fn allowlisted_update_commands_reach_run_update() {
         let files = scanned_code();
@@ -2272,6 +2730,17 @@ mod tests {
                 "#[command] {name} must reach run_update — body:\n{body}"
             );
         }
+        let mut reaching: Vec<String> = files
+            .iter()
+            .flat_map(|(_, code)| {
+                command_names(code)
+                    .into_iter()
+                    .filter(|n| command_body(code, n).is_some_and(|b| b.contains("run_update(")))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        reaching.sort();
+        assert_eq!(reaching, REACHES_RUN_UPDATE.to_vec(), "exactly one command reaches run_update");
         let lib = code_only(
             &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
                 .unwrap(),
@@ -2280,13 +2749,54 @@ mod tests {
             lib.contains("commands::update_run::run_orchestrator_update"),
             "run_orchestrator_update must be registered in generate_handler!"
         );
-        for name in PENDING_WP03B {
-            let body = find_body(&files, name).unwrap_or_else(|| {
-                panic!("pending #[command] {name} is gone — remove it from PENDING_WP03B")
-            });
+    }
+
+    /// The retired commands are GONE — neither defined as a `#[command]` in
+    /// the scanned files nor named anywhere in `lib.rs`'s code (the
+    /// `generate_handler!` list). Red-proof: re-add any one of them as a
+    /// `#[command]` → red.
+    #[test]
+    fn retired_update_commands_are_neither_defined_nor_registered() {
+        let files = scanned_code();
+        let lib = code_only(
+            &std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs"))
+                .unwrap(),
+        );
+        let lib_tokens = tokens(&lib);
+        for name in RETIRED {
+            for (rel, code) in &files {
+                assert!(
+                    !command_names(code).iter().any(|n| n == name),
+                    "retired #[command] {name} is still defined in {rel}"
+                );
+            }
             assert!(
-                !body.contains("run_update("),
-                "{name} now reaches run_update — move it to REACHES_RUN_UPDATE"
+                !lib_tokens.contains(&name),
+                "retired command {name} is still named in lib.rs code"
+            );
+        }
+    }
+
+    /// WP-03b (F-W2-01/F-W2-06): Merge, Rebase and Resume are ROUTED — each
+    /// runs all thirteen phases through the same driver: its git operation
+    /// (by kind), the HEAD-advance backstop, install.py and the relaunch.
+    #[tokio::test]
+    async fn merge_rebase_resume_run_the_one_pipeline() {
+        for kind in [UpdateKind::Merge, UpdateKind::Rebase, UpdateKind::Resume] {
+            let mut ops = FakeOps::happy();
+            let (r, ledger) = run(&mut ops, kind).await;
+            let out = r.unwrap_or_else(|e| panic!("{kind:?}: {}", e.message()));
+            assert!(out.install_py_ran, "{kind:?}");
+            assert!(ops.called(&format!("git_op:{:?}", kind)), "{kind:?}: {:?}", ops.calls);
+            for op in ["head_advance", "run_install_py", "relaunch"] {
+                assert!(ops.called(op), "{kind:?}: `{op}` did not run");
+            }
+            let phases: Vec<Phase> = ledger.entries.iter().map(|e| e.phase).collect();
+            assert_eq!(phases, PHASE_ORDER.to_vec(), "{kind:?}");
+            assert!(
+                ledger.entries.iter().all(|e| e.status == PhaseStatus::Done),
+                "{kind:?}: {:?}",
+                ledger
             );
         }
     }
@@ -2302,5 +2812,287 @@ mod tests {
         assert!(command_body(&code_only(src), "f")
             .unwrap()
             .contains("run_update("));
+    }
+    // ---- WP-03b: the real git operations, on temp repos --------------------
+
+    mod real_git {
+        use super::*;
+        use crate::commands::git_user_editable_merge::tests::{
+            init_repo_pair, push_upstream_change, run_git,
+        };
+        use crate::commands::update_pipeline::{classify_resume, ResumeVerdict};
+
+        fn git_missing() -> bool {
+            std::process::Command::new("git")
+                .arg("--version")
+                .output()
+                .map(|o| !o.status.success())
+                .unwrap_or(true)
+        }
+
+        fn out(repo: &Path, args: &[&str]) -> String {
+            let o = std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .expect("git");
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        }
+
+        fn head(repo: &Path) -> String {
+            out(repo, &["rev-parse", "HEAD"])
+        }
+
+        fn commit_local(repo: &Path, file: &str, body: &str) {
+            let p = repo.join(file);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, body).unwrap();
+            run_git(repo, &["add", file]);
+            run_git(repo, &["commit", "-m", "local change"]);
+        }
+
+        fn is_ancestor(repo: &Path, a: &str, b: &str) -> bool {
+            std::process::Command::new("git")
+                .args(["merge-base", "--is-ancestor", a, b])
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success()
+        }
+
+        /// A diverged clone: one local-only commit, one upstream-only commit.
+        fn diverged() -> (tempfile::TempDir, PathBuf) {
+            let (tmp, _remote, local) = init_repo_pair();
+            commit_local(&local, "LOCAL.md", "mine\n");
+            push_upstream_change(&tmp.path().join("seed"), &local, "UP.md", "theirs\n");
+            (tmp, local)
+        }
+
+        fn orchestrator_identity(dir: &Path) {
+            std::fs::write(
+                dir.join("vct-module.json"),
+                r#"{"id":"orchestrator","version":"0.2.100","description":"x"}"#,
+            )
+            .unwrap();
+        }
+
+        fn backup_branches(repo: &Path) -> Vec<String> {
+            out(repo, &["branch", "--list", "vco-backup/*", "--format=%(refname:short)"])
+                .lines()
+                .map(str::to_string)
+                .collect()
+        }
+
+        /// Merge through the driver: the REAL merge on a diverged clone, a
+        /// fake install.py — every phase runs, the tree holds both sides.
+        #[tokio::test]
+        async fn merge_kind_merges_a_diverged_clone_through_the_pipeline() {
+            if git_missing() {
+                return;
+            }
+            let (_tmp, local) = diverged();
+            let mut ops = FakeOps::happy();
+            ops.real_repo = Some(local.clone());
+            let (r, _) = run(&mut ops, UpdateKind::Merge).await;
+            let out_ = r.unwrap_or_else(|e| panic!("{}", e.message()));
+            assert!(out_.install_py_ran && ops.called("run_install_py"));
+            assert!(is_ancestor(&local, "vco_upstream/main", "HEAD"), "upstream merged");
+            assert!(local.join("LOCAL.md").is_file() && local.join("UP.md").is_file());
+        }
+
+        /// Rebase through the driver: local commits replayed on upstream.
+        #[tokio::test]
+        async fn rebase_kind_replays_local_commits_through_the_pipeline() {
+            if git_missing() {
+                return;
+            }
+            let (_tmp, local) = diverged();
+            let mut ops = FakeOps::happy();
+            ops.real_repo = Some(local.clone());
+            let (r, _) = run(&mut ops, UpdateKind::Rebase).await;
+            r.unwrap_or_else(|e| panic!("{}", e.message()));
+            assert!(ops.called("run_install_py"));
+            assert!(is_ancestor(&local, "vco_upstream/main", "HEAD"));
+            assert_eq!(out(&local, &["rev-list", "--count", "vco_upstream/main..HEAD"]), "1");
+        }
+
+        /// A merge that conflicts stops at phase 6 as a typed `Conflict`
+        /// (the modal's payload), writes the resume sentinel, and never runs
+        /// install.py; the driver restores the binaries.
+        #[tokio::test]
+        async fn a_conflicting_merge_is_a_conflict_and_install_never_runs() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            commit_local(&local, "vco_lib/foo.py", "def local(): pass\n");
+            push_upstream_change(&tmp.path().join("seed"), &local, "vco_lib/foo.py", "def up(): pass\n");
+            let mut ops = FakeOps::happy();
+            ops.real_repo = Some(local.clone());
+            let (r, ledger) = run(&mut ops, UpdateKind::Merge).await;
+            let e = r.expect_err("conflict");
+            assert_eq!(e.kind(), "Conflict", "{}", e.message());
+            let v = e.to_json_value();
+            assert_eq!(v["operation"], "merge");
+            assert_eq!(v["conflicted_files"][0], "vco_lib/foo.py");
+            assert!(!ops.called("run_install_py"));
+            assert!(ops.called("abort_restore"));
+            assert_eq!(ledger.failed_phase(), Some(Phase::GitOp));
+            assert!(crate::commands::installer::read_update_resume_sentinel(&local).is_some());
+            let _ = std::process::Command::new("git")
+                .args(["merge", "--abort"])
+                .current_dir(&local)
+                .status();
+        }
+
+        /// Resume's verdicts, both arms of each gate: no record → refused;
+        /// HEAD never moved + not behind → nothing pending (a no-op
+        /// success); HEAD never moved + behind → refused AS stale; HEAD
+        /// advanced past the record → proceed.
+        #[tokio::test]
+        async fn resume_verdicts() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            assert!(matches!(
+                classify_resume(&local).await,
+                ResumeVerdict::Refuse { code: "resume_not_pending", .. }
+            ));
+            let h = head(&local);
+            crate::commands::installer::write_update_resume_sentinel(&local, "merge", "main", &h);
+            assert!(matches!(
+                classify_resume(&local).await,
+                ResumeVerdict::NothingPending { .. }
+            ));
+            push_upstream_change(&tmp.path().join("seed"), &local, "UP.md", "x\n");
+            assert!(matches!(
+                classify_resume(&local).await,
+                ResumeVerdict::Refuse { stale_sentinel: true, .. }
+            ));
+            commit_local(&local, "LOCAL.md", "resolved\n");
+            assert!(matches!(
+                classify_resume(&local).await,
+                ResumeVerdict::Proceed { .. }
+            ));
+        }
+
+        /// ResetHard ACT (owner F-W2-03 + W2R-03): the local commit, a
+        /// tracked modification and untracked files — one of them at a path
+        /// the reset will overwrite — are saved to a `vco-backup/<stamp>`
+        /// branch, a `-wip` branch and a verified bundle BEFORE the reset;
+        /// the reset lands; the untracked file the reset does not touch is
+        /// still on disk.
+        #[tokio::test]
+        async fn reset_hard_saves_commits_and_the_whole_working_tree_first() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            orchestrator_identity(&local);
+            commit_local(&local, "LOCAL.md", "my commit\n");
+            let local_head = head(&local);
+            push_upstream_change(&tmp.path().join("seed"), &local, "NEW.md", "upstream\n");
+            std::fs::write(local.join("vco_lib/foo.py"), "def edited(): pass\n").unwrap();
+            std::fs::write(local.join("NEW.md"), "mine, untracked\n").unwrap();
+            std::fs::write(local.join("notes.txt"), "untracked notes\n").unwrap();
+            let backups = tmp.path().join("vct_root").join("backups");
+
+            let g = reset_hard_git_op(&local, &backups).await.unwrap_or_else(|f| {
+                panic!("{}", f.error.message())
+            });
+            let b = g.reset_backup.expect("backup recorded");
+            // The reset happened.
+            assert_eq!(head(&local), out(&local, &["rev-parse", "vco_upstream/main"]));
+            // The commit is saved (branch points at the pre-reset HEAD).
+            assert_eq!(out(&local, &["rev-parse", &b.branch]), local_head);
+            assert_eq!(b.local_commits, 1);
+            // The working tree is saved: the tracked edit and BOTH untracked
+            // files, including the one the reset overwrote.
+            let wip = b.uncommitted_branch.clone().expect("dirty tree → wip branch");
+            assert_eq!(out(&local, &["show", &format!("{wip}:NEW.md")]), "mine, untracked");
+            assert_eq!(out(&local, &["show", &format!("{wip}:vco_lib/foo.py")]), "def edited(): pass");
+            assert_eq!(out(&local, &["show", &format!("{wip}:notes.txt")]), "untracked notes");
+            // The bundle exists and verifies.
+            let bundle = b.bundle.clone().expect("bundle");
+            assert!(bundle.starts_with(&backups) && bundle.is_file());
+            assert!(std::process::Command::new("git")
+                .args(["bundle", "verify", bundle.to_str().unwrap()])
+                .current_dir(&local)
+                .output()
+                .unwrap()
+                .status
+                .success());
+            // The reset left the untracked file it does not own alone.
+            assert!(local.join("notes.txt").is_file());
+            assert!(b.describe().contains(&b.branch));
+        }
+
+        /// ResetHard LEAVE-ALONE: when the backup cannot be written, the reset
+        /// is REFUSED — HEAD, the tracked edit and the index are untouched.
+        #[tokio::test]
+        async fn reset_hard_is_refused_when_the_backup_fails() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            orchestrator_identity(&local);
+            commit_local(&local, "LOCAL.md", "my commit\n");
+            let local_head = head(&local);
+            push_upstream_change(&tmp.path().join("seed"), &local, "NEW.md", "upstream\n");
+            std::fs::write(local.join("vco_lib/foo.py"), "def edited(): pass\n").unwrap();
+            // `backups` is a FILE, so the bundle directory cannot be created.
+            let backups = tmp.path().join("not_a_dir");
+            std::fs::write(&backups, "x").unwrap();
+
+            let f = reset_hard_git_op(&local, &backups).await.expect_err("refused");
+            assert!(matches!(
+                f.error,
+                UpdateSurfaceError::Refused { code: "reset_backup_failed", .. }
+            ));
+            assert!(!f.restored);
+            assert_eq!(head(&local), local_head, "nothing was reset");
+            assert_eq!(
+                std::fs::read_to_string(local.join("vco_lib/foo.py")).unwrap(),
+                "def edited(): pass\n"
+            );
+        }
+
+        /// ResetHard on a repository that is NOT an orchestrator clone is
+        /// refused before the backup and before the reset.
+        #[tokio::test]
+        async fn reset_hard_refuses_a_non_orchestrator_repo() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            commit_local(&local, "LOCAL.md", "my commit\n");
+            let local_head = head(&local);
+            let f = reset_hard_git_op(&local, &tmp.path().join("b"))
+                .await
+                .expect_err("not a clone");
+            assert!(matches!(
+                f.error,
+                UpdateSurfaceError::Refused { code: "reset_target_not_orchestrator", .. }
+            ));
+            assert_eq!(head(&local), local_head);
+            assert!(backup_branches(&local).is_empty(), "no backup branch either");
+        }
+
+        /// Nothing local to lose: the HEAD branch is kept, no bundle is made
+        /// (git refuses an empty one) and the reset proceeds.
+        #[tokio::test]
+        async fn reset_hard_with_nothing_local_needs_no_bundle() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            let b = create_reset_backup(&local, "vco_upstream/main", &tmp.path().join("b"), "T1")
+                .await
+                .expect("backup");
+            assert_eq!(b.local_commits, 0);
+            assert!(b.bundle.is_none() && b.uncommitted_branch.is_none());
+            assert_eq!(backup_branches(&local), vec!["vco-backup/T1".to_string()]);
+        }
     }
 }

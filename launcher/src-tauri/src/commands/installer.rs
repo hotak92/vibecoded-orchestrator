@@ -4,9 +4,6 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use tauri::{command, AppHandle, Emitter, Manager, Runtime, State, Window};
 
-use crate::commands::git_user_editable_merge::{
-    write_launcher_update_diverged_deferral, LauncherUpdateDivergedKind,
-};
 use crate::commands::git_cmd::{run_git_raw, run_git_raw_env};
 use crate::db::Db;
 use crate::secrets::{self, SecretScope};
@@ -343,11 +340,11 @@ pub struct InstallDiff {
 /// is read at compile time (NOT runtime) so the launcher binary stays
 /// self-contained and can't drift from the orchestrator clone it was
 /// built against. Updates to the launcher binary are how new entries
-/// reach existing installs of the launcher; the file at the user's
-/// orchestrator clone is then copied across via `update_orchestrator_at`
-/// (which itself reads ORCHESTRATOR_MANAGED_PATHS — see the entry for
-/// `orchestrator-managed-paths.txt` in the file, which makes the
-/// propagation self-referential and fail-safe).
+/// reach existing installs of the launcher; a plain-copy install
+/// (`copy_orchestrator_to_sync`, which itself reads
+/// ORCHESTRATOR_MANAGED_PATHS — see the entry for
+/// `orchestrator-managed-paths.txt` in the file) carries the list along,
+/// which makes the propagation self-referential and fail-safe.
 ///
 /// Path: 4 levels up from this file (commands → src → src-tauri →
 /// launcher → repo root).
@@ -390,8 +387,8 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// (`.claude/`, `docs/`, `tools/`, `infrastructure/`), (b) the
 /// version-pinning manifest the launcher reads to detect an existing
 /// install (`vct-module.json`), or (c) the source-of-truth file itself
-/// (`orchestrator-managed-paths.txt`) so `update_orchestrator_at`
-/// propagates new editions of the list into every existing install.
+/// (`orchestrator-managed-paths.txt`) so a copy install carries new
+/// editions of the list along.
 ///
 /// 2026-05-16 (PR-31 / v0.2.12): `CLAUDE.md` was REMOVED from the
 /// whitelist. The root CLAUDE.md is the orchestrator-self's own
@@ -437,8 +434,8 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// own Python deps), `BOOTSTRAP.md` (orchestrator setup doc), `config/`
 /// (legacy entry, directory does not exist in the repo).
 ///
-/// Used by `copy_orchestrator_to_sync` (`update_orchestrator_at` +
-/// `install_orchestrator`'s plain-copy path), `apply_conflict_strategy`,
+/// Used by `copy_orchestrator_to_sync` (`install_orchestrator`'s
+/// plain-copy path), `apply_conflict_strategy`,
 /// `classify_install_target`, and `diff_install`. The frontend mirrors a
 /// humanized version in the confirm modal.
 pub static ORCHESTRATOR_MANAGED_PATHS: LazyLock<Vec<&'static str>> =
@@ -843,31 +840,39 @@ pub async fn get_installed_version(path: String) -> Result<String, String> {
 /// Each boolean is independent — the banner renders the
 /// highest-priority state (binary_stale > install_stale > remote_ahead).
 ///
-/// - `remote_ahead`: existing v0.2.x behaviour — git index is behind
-///   `origin/main`. Resolved by `update_orchestrator` (git pull +
+/// - `remote_ahead`: the git index is behind `vco_upstream/<branch>`.
+///   Resolved by `run_orchestrator_update` kind `PullFf` (git pull +
 ///   install.py --update).
 /// - `install_stale`: source tree on disk (vct-module.json::version) is
 ///   AHEAD of the last successful install (state/install-manifest.json::version).
 ///   Happens when the user `git pull`-s manually instead of clicking
-///   "Update orchestrator". Resolved by `apply_pending_install`
-///   (install.py --update, no git pull — source is already current).
-/// - `binary_stale`: the running launcher's compiled version differs
-///   from `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`
+///   "Update orchestrator". Resolved by kind `ApplyOnly` (install.py
+///   --update, no git operation — source is already current).
+/// - `binary_stale`: the running launcher is OLDER than
+///   `launcher/dist/<arch>/<launcher-binary>.metadata.json::launcher_version`
 ///   on disk (`vct-launcher.metadata.json` on Linux/macOS,
-///   `vct-launcher.exe.metadata.json` on Windows). Happens when a
-///   newer binary lands via `git pull` without install.py running its
-///   binary-swap path. Resolved by `restart_launcher` (re-exec the
-///   on-disk binary).
+///   `vct-launcher.exe.metadata.json` on Windows). Happens when a newer
+///   binary lands via `git pull` without install.py running its binary-swap
+///   path. Resolved by `restart_launcher` (re-exec the on-disk binary).
+///   v0.2.100 (AD-8, U3): direction-aware — a running launcher NEWER than the
+///   dist sidecar is `binary_newer_than_disk` (informational), never
+///   `binary_stale`: it must not be offered a restart into an older binary.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct UpdateStatus {
     /// Existing v0.2.x semantics: local branch is behind `origin/main`.
     pub remote_ahead: bool,
     /// NEW v0.2.16: source version > installed manifest version.
     pub install_stale: bool,
-    /// NEW v0.2.16: running binary version != on-disk binary version.
+    /// NEW v0.2.16: the running binary is OLDER than the on-disk dist
+    /// binary (v0.2.100: ordered by the version SSOT; was `!=`).
     pub binary_stale: bool,
-    /// NEW v0.2.51: a prior `update_orchestrator` / `merge_*` /
-    /// `rebase_*` invocation hit a merge conflict and surfaced the
+    /// NEW v0.2.100: the running binary is NEWER than the on-disk dist
+    /// binary (a dev build, or a dist that has not caught up). Informational
+    /// only — never a restart offer.
+    #[serde(default)]
+    pub binary_newer_than_disk: bool,
+    /// NEW v0.2.51: a prior orchestrator update (pull / merge / rebase)
+    /// hit a merge conflict and surfaced the
     /// conflict modal; the user resolved the conflict in their editor
     /// (or via CLI `git commit`) but never re-entered the launcher to
     /// finish stage 2 (install.py --update + binary refresh + restart).
@@ -875,7 +880,8 @@ pub struct UpdateStatus {
     /// `.claude/state/orchestrator-update-resume-needed.json` combined
     /// with `.git/MERGE_HEAD` being absent (= merge state cleared, so
     /// the conflict has been resolved or aborted from outside the
-    /// launcher). Resolved by `resume_orchestrator_update`. Highest
+    /// launcher). Resolved by the update pipeline's `Resume` kind
+    /// (`run_orchestrator_update`, `update_pipeline::classify_resume`). Highest
     /// priority kind in the UpdateBadge (above binary_stale): leaving
     /// this unattended means the install manifest, hook bundle, and
     /// possibly the launcher binary are all out of sync with the
@@ -1174,9 +1180,10 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
     // fields are install.py / the upload-artifact step, both of which
     // write the same canonical string. Mismatch == stale.
     //
-    // v0.2.95 WP-1: a SECOND, independent trigger. `post_source_only` is
-    // written by `manifest::refresh_install_manifest`, i.e. by a path that
-    // advanced the source tree WITHOUT running install.py, and it catches the
+    // v0.2.95 WP-1: a SECOND, independent trigger. `post_source_only` was
+    // written by the (v0.2.100: retired) Rust manifest writer, i.e. by a
+    // launcher path that advanced the source tree WITHOUT running install.py;
+    // a manifest from a launcher ≤ 0.2.99 may still carry it. It catches the
     // case the version comparison structurally cannot: two commits carrying the
     // same version string — every mid-cycle commit on a release branch — leave
     // `source_version == installed_version` while the venv, hooks, templates,
@@ -1190,13 +1197,13 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         || (!source_version.is_empty()
             && !installed_version.is_empty()
             && source_version != installed_version);
-    let binary_stale = !on_disk_binary_version.is_empty()
-        && on_disk_binary_version != running_version;
+    let (binary_stale, binary_newer_than_disk) =
+        binary_direction(&running_version, &on_disk_binary_version);
 
     // v0.2.51 Bug A: detect "merge-resolved-but-update-incomplete" state.
-    // The sentinel is written by update_orchestrator / merge_orchestrator_*
-    // / rebase_orchestrator_* whenever they surface the conflict modal. It
-    // is cleared by `resume_orchestrator_update` on success AND by
+    // The sentinel is written by the update pipeline's git operations
+    // (`update_pipeline`) whenever they surface the conflict modal. It
+    // is cleared by a `Resume` run of the pipeline AND by
     // `abort_orchestrator_merge_or_rebase`. So the sentinel being present
     // means SOMETHING is awaiting follow-up. The further .git/MERGE_HEAD
     // check distinguishes "user is still mid-conflict" (don't badge —
@@ -1229,6 +1236,7 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         remote_ahead,
         install_stale,
         binary_stale,
+        binary_newer_than_disk,
         merge_resolved_incomplete,
         resume_operation,
         resume_branch,
@@ -1241,6 +1249,31 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
         merge_in_progress,
         binary_ahead_of_install,
     })
+}
+
+/// `(binary_stale, binary_newer_than_disk)` for the running launcher vs the
+/// dist sidecar, through the version SSOT. An absent sidecar is neither; a
+/// version that is not strict `X.Y.Z` is neither (logged — AD-8 tri-state:
+/// never "restart", never "fresh" on a value nobody could read).
+pub(crate) fn binary_direction(running: &str, on_disk: &str) -> (bool, bool) {
+    if on_disk.trim().is_empty() {
+        return (false, false);
+    }
+    match vct_launcher_core::version::cmp(running, on_disk.trim()) {
+        Ok(std::cmp::Ordering::Less) => (true, false),
+        Ok(std::cmp::Ordering::Greater) => (false, true),
+        Ok(std::cmp::Ordering::Equal) => (false, false),
+        Err(e) => {
+            tracing::warn!(
+                "[vct] check_for_updates: running launcher v{} vs dist sidecar {:?} not \
+                 ranked: {}",
+                running,
+                on_disk,
+                e
+            );
+            (false, false)
+        }
+    }
 }
 
 /// The four merge-state fields of `UpdateStatus`, decided in one place.
@@ -1310,7 +1343,10 @@ pub(crate) fn binary_ahead_of_install_core(
 ) -> Option<BinaryAheadOfInstall> {
     let cause = cause?;
     let installed_version = installed_version?;
-    if installed_version.is_empty() || installed_version == running_version {
+    // v0.2.100 (AD-8): "ahead" is a direction — the running binary NEWER than
+    // the install (was `!=`, which also fired for a running binary BEHIND the
+    // install). An unreadable version is not ranked.
+    if !vct_launcher_core::version::is_newer(running_version, &installed_version).unwrap_or(false) {
         return None;
     }
     Some(BinaryAheadOfInstall {
@@ -1875,8 +1911,8 @@ pub(crate) async fn ensure_fresh_hardware_snapshot_for_install(
 }
 
 /// v0.2.34 (Agent B): mark the next launcher boot as needing a hardware
-/// re-detection. Called from `self_update::finish_apply_after_pull` right
-/// before the new launcher process is spawned. Soft-fails: a write error
+/// re-detection. Called from the update pipeline's bookkeeping (phase 12 of
+/// `update_run::run_update`), before the new launcher process is spawned. Soft-fails: a write error
 /// here only means the next boot won't auto-re-detect — the user can
 /// still hit the Preferences button.
 pub(crate) fn mark_hardware_redetect_pending_after_update(db: &Db) {
@@ -2890,9 +2926,11 @@ pub async fn install_orchestrator(
 /// before this existed, each hand-rolling the same `Command` setup:
 /// `install_orchestrator` (fresh install), `run_install_orchestrator_lightweight`
 /// (`--lightweight`), `apply_hardware_reconfig` (`--update` + hardware flags),
-/// `finalize_update_and_restart`'s deferral-fallback re-run,
-/// `apply_pending_install` (the `install_stale` repair) and
-/// `update_pipeline::run_install_py_update` (the three update surfaces).
+/// the (v0.2.100: retired) `finalize_update_and_restart` deferral-fallback
+/// re-run and `apply_pending_install` (the `install_stale` repair), and
+/// `update_pipeline::run_install_py_update` (since v0.2.100 the ONE update
+/// pipeline's phase 8, every kind — `ApplyOnly` is the `install_stale`
+/// repair).
 ///
 /// THE DIVERGENCE THIS EXISTS TO END, with its cost. Five of the six carried
 /// `PYTHONIOENCODING` + `PYTHONUTF8` with a comment (v0.2.27, `a5b2971`)
@@ -3594,8 +3632,8 @@ pub(crate) fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<Path
     // Suffix with the LAUNCHER's pid (not the hub's — the hub is
     // already stopped by now). The boot sweep cleans up `.old-<pid>`
     // files whose pid is no longer alive; the launcher's own pid will
-    // be dead by next boot since we restart at the end of
-    // update_orchestrator.
+    // be dead by next boot since we restart at the end of the update
+    // (`update_run::run_update`, phase 13).
     let pid = std::process::id();
     let backup_name = format!(
         "{}.old-{}",
@@ -3851,7 +3889,7 @@ fn start_found_hub_after_update(
             );
             // Synchronous poll — the post-install finalize path is not
             // latency-sensitive (the launcher is about to restart anyway).
-            poll_hub_health_for_30s(&root);
+            poll_hub_health(&root, HUB_HEALTH_WINDOW);
             Ok(())
         }
         HubRestartContext::AbortRecovery => {
@@ -3876,7 +3914,7 @@ fn start_found_hub_after_update(
             if let Err(e) = std::thread::Builder::new()
                 .name("vct-hub-abort-health-poll".to_string())
                 .spawn(move || {
-                    if poll_hub_health_for_30s(&root_owned) {
+                    if poll_hub_health(&root_owned, HUB_HEALTH_WINDOW) {
                         return; // hub came back healthy — nothing to report.
                     }
                     tracing::warn!(
@@ -3898,41 +3936,44 @@ fn start_found_hub_after_update(
     }
 }
 
-/// v0.2.89 §7.5 — poll up to 30 s for the hub's `hub.port` + `hub.token` to
-/// appear under `root` and for `/health` to answer 200. Returns `true` on a
-/// healthy probe, `false` on timeout. The hub spawns a detached child and
-/// returns quickly; the child does the actual bind + DB migration. Extracted so
-/// both the synchronous (PostInstall) and background-thread (AbortRecovery)
-/// arms share ONE poll implementation.
-fn poll_hub_health_for_30s(root: &Path) -> bool {
-    let port_path = root.join(vct_launcher_core::services::hub_port::HUB_PORT_FILE);
-    let token_path = root.join("hub.token");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-    while std::time::Instant::now() < deadline {
-        if port_path.exists() && token_path.exists() {
-            // Both files there — try the /health probe.
-            let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(root).ok();
-            let token = std::fs::read_to_string(&token_path)
-                .ok()
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            if let (Some(port), Some(token)) = (port, token) {
-                if probe_hub_health(port, &token) {
-                    tracing::info!(
-                        "[vct] update_orchestrator: vct-hub /health OK on 127.0.0.1:{}",
-                        port
-                    );
-                    return true;
-                }
-            }
+/// How long the post-update / abort-recovery poll waits for the hub to
+/// answer. The hub's `--start-if-not-running` returns once the detached child
+/// is forked; the child then opens (and migrates) the hub DB and binds. 30 s
+/// covers that on a loaded machine.
+const HUB_HEALTH_WINDOW: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// v0.2.100 (I-03): poll `GET /api/v1/health` — the hub's unauthenticated
+/// liveness route — on the port the hub-port resolver names, re-read every
+/// attempt (a restarting hub may rewrite `hub.port`). Returns `true` on a
+/// 200, `false` when `window` elapses. Shared by the synchronous
+/// (PostInstall) and background-thread (AbortRecovery) arms.
+///
+/// The pre-0.2.100 poll probed `GET /health`, a path the hub does not mount
+/// (its API is nested under `/api/v1`), and waited for `hub.token` too, so it
+/// could NEVER succeed: every abort recovery reported "vct-hub did not become
+/// healthy within 30 s" and wrote the durable `hub_restart_failed_after_abort`
+/// row while the hub was listening (field log 2026-09-29 16:09:39 vs
+/// 16:10:09).
+fn poll_hub_health(root: &Path, window: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + window;
+    let port = loop {
+        let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(root)
+            .unwrap_or_else(|_| vct_launcher_core::services::hub_port::resolve_hub_port());
+        if probe_hub_health(port) {
+            tracing::info!("[vct] update: vct-hub /api/v1/health OK on 127.0.0.1:{}", port);
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break port;
         }
         std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-
+    };
     tracing::warn!(
-        "[vct] update_orchestrator: vct-hub did not become healthy within 30 s; \
-         launcher will start in hub-unavailable degraded mode. \
-         User can retry via Stop menu → 'Start vct-hub'."
+        "[vct] update: vct-hub did not answer /api/v1/health on 127.0.0.1:{} within {} s; \
+         launcher will start in hub-unavailable degraded mode. User can retry via Stop \
+         menu → 'Start vct-hub'.",
+        port,
+        window.as_secs()
     );
     false
 }
@@ -4008,10 +4049,9 @@ fn emit_hub_restart_failed_after_abort_deferral(install_path: &Path) {
 // UPDATE_DEFERRED.md regenerated by install.py's own writer with NO row saying
 // the update did not complete. The user believed the install had finished.
 //
-// FIX: every launcher-driven `install.py --update` (the update_orchestrator
-// inline tail, the shared post-pull tail used by merge / rebase / resume, and
-// the install_stale retry `apply_pending_install`) now routes its exit through
-// `handle_install_phase_exit`: a non-zero exit logs at ERROR (exit code +
+// FIX: every launcher-driven `install.py --update` (at the time three call
+// sites; since v0.2.100 the one pipeline's phase 8, `update_run::run_update`,
+// every kind) routes its exit through `handle_install_phase_exit`: a non-zero exit logs at ERROR (exit code +
 // stderr tail) and appends an `update_install_phase_failed` action_required
 // row through the ONE Rust deferral bridge (`services::deferral`); a zero exit
 // settles that row (the next SUCCESSFUL install.py run clears it — from Rust
@@ -4222,17 +4262,14 @@ fn settle_update_install_phase_failed_row(vco_lib_root: &Path, install_path: &Pa
     }
 }
 
-/// Best-effort blocking `GET http://127.0.0.1:<port>/health` probe.
-/// Returns true on HTTP 200. Used only by
-/// `ensure_hub_started_after_update`.
+/// Best-effort blocking `GET http://127.0.0.1:<port>/api/v1/health` probe
+/// (unauthenticated — the hub's `is_exempt_path`). Returns true on HTTP 200.
 ///
-/// Why a hand-rolled TCP+HTTP write rather than `reqwest`: this
-/// function runs from inside a Tauri `#[command]` (so we're on the
-/// async runtime), but we want a tight, dependency-free probe that
-/// doesn't pull blocking-reqwest features. A raw socket read of the
-/// HTTP status line is < 30 lines and has no failure modes worth
-/// surfacing.
-fn probe_hub_health(port: u16, token: &str) -> bool {
+/// Why a hand-rolled TCP+HTTP write rather than `reqwest`: it runs on a plain
+/// `std::thread` (the abort-recovery arm) as well as inline, and a raw socket
+/// read of the HTTP status line needs no runtime and no blocking-reqwest
+/// feature.
+fn probe_hub_health(port: u16) -> bool {
     use std::io::{Read, Write};
     use std::net::TcpStream;
 
@@ -4251,8 +4288,8 @@ fn probe_hub_health(port: u16, token: &str) -> bool {
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
 
     let request = format!(
-        "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
-        port, token
+        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
+        port
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -4293,266 +4330,15 @@ fn probe_hub_health(port: u16, token: &str) -> bool {
 // through `update_pipeline::stop_hub_and_rename_binaries_aside`, the one home
 // for the hub stop + both pre-pull renames.
 use crate::services::binary_freshness::RevertOutcome;
+use crate::commands::update_run::{UpdateKind, UpdateOutcome};
+use crate::commands::update_pipeline::UpdatePipelineError;
 
-/// Update an existing orchestrator installation.
-///
-/// v0.2.17 (plan 0.0 + 0.0.B): the flow auto-restarts the launcher on
-/// success. The launcher is a process manager / dashboard, not an
-/// editor — no in-flight user work lives in this process — so the
-/// "banner + user-clicks-Restart" ceremony from v0.2.16 W4 is
-/// replaced by an automatic relaunch. Sequence:
-///
-///   1. (Windows only) Rename the running launcher's binary aside
-///      so `git pull` can overwrite the canonical path.
-///   2. `git pull --ff-only`.
-///   3. `install.py --update`.
-///   4. Spawn the new launcher detached + exit current process.
-///
-/// On any error before step 4, return the error to the GUI (and
-/// revert the pre-pull rename if applicable). The current launcher
-/// keeps running, so the user can retry.
-/// v0.2.44 V44-G4 helper: bucket `RetryReport`s by decision into a
-/// JSON-friendly summary the audit log can carry alongside the raw
-/// per-row payload. Keeps the audit detail compact while still
-/// allowing downstream tooling to reconstruct the per-decision
-/// breakdown without parsing every row.
-fn retry_summary_counts(
-    reports: &[crate::commands::module_service::RetryReport],
-) -> serde_json::Value {
-    use std::collections::BTreeMap;
-    let mut counts: BTreeMap<&str, u32> = BTreeMap::new();
-    for r in reports {
-        *counts.entry(r.decision.as_str()).or_insert(0) += 1;
-    }
-    serde_json::to_value(counts).unwrap_or(serde_json::json!({}))
-}
 
-// =====================================================================
-// v0.2.45 V45-B: wait_for_binary_refresh
-//
-// Release-workflow ordering bug: every tag ships in TWO steps.
-//   1. Source tag commit (e.g. `f7682a3` at 23:54 UTC) bumps
-//      `vct-module.json::version` to v0.2.X.
-//   2. Auto-committed `chore(binary): refresh dist binaries for v0.2.X`
-//      (e.g. `88f9758` at 00:43 UTC, ~49 min later) replaces the
-//      `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
-//      and the actual binary blob.
-//
-// Inside that ~49-min window, `vco_upstream/main` advertises the new
-// source version via `vct-module.json` (what `read_source_version`
-// reads) but the on-disk `vct-launcher.metadata.json::launcher_version`
-// still carries the previous version + the old binary blob.
-//
-// `check_for_updates` sees `remote_ahead`; the user clicks Update;
-// `update_orchestrator` runs `git pull --ff-only` + install.py; then
-// `restart_launcher` faithfully re-execs the ON-DISK binary — which
-// is the previous version. Post-restart UI banner says "Current
-// v0.2.X" but the running process is v0.2.X-1.
-//
-// Fix: before re-execing, poll for the on-disk binary version to
-// catch up with the source version. If the binary-refresh commit
-// hasn't landed within `WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS`,
-// surface a clear error so the user retries later instead of
-// relaunching into a stale binary.
-//
-// Structural fix (tag the binary-refresh commit, not the source
-// commit) is deferred to v0.2.46-46-1.
-// =====================================================================
+// v0.2.45 V45-B's binary-refresh wait (a 5-minute poll that re-ran
+// `git pull --ff-only` behind install.py's back every 15 s) is gone since
+// v0.2.100 (WP-03b, L2-F11): the update pipeline reads the dist sidecars ONCE
+// and decides with the version SSOT — `update_run::decide_binary_refresh`.
 
-/// Production timeout for `WaitForBinaryRefresh`. Conservative
-/// 5-minute cap: the historical binary-refresh window is ~49 min, but
-/// blocking the user that long is worse UX than surfacing a clear
-/// "retry in a few minutes" error.
-pub(crate) const WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS: u64 = 300;
-
-/// Production poll interval. 15 s is a deliberate balance between
-/// responsiveness (binary-refresh commits usually appear within a
-/// minute or two once CI kicks off) and not hammering the remote
-/// (one `git pull` per iteration).
-pub(crate) const WAIT_FOR_BINARY_REFRESH_INTERVAL_SECS: u64 = 15;
-
-/// Config + entry point for the binary-refresh poll loop.
-///
-/// Held as a struct so tests can swap the timeout / interval / skip
-/// the real `git pull` without parameterizing the production call
-/// sites. `disable_git_pull` is set true only inside the unit tests
-/// below — production always pulls.
-pub(crate) struct WaitForBinaryRefresh<'a> {
-    pub install_path: &'a Path,
-    pub branch: &'a str,
-    pub timeout: std::time::Duration,
-    pub interval: std::time::Duration,
-    pub disable_git_pull: bool,
-}
-
-impl<'a> WaitForBinaryRefresh<'a> {
-    /// Production constructor: 5-min timeout, 15-s interval, real
-    /// `git pull` enabled.
-    pub(crate) fn default_production(install_path: &'a Path, branch: &'a str) -> Self {
-        Self {
-            install_path,
-            branch,
-            timeout: std::time::Duration::from_secs(WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS),
-            interval: std::time::Duration::from_secs(WAIT_FOR_BINARY_REFRESH_INTERVAL_SECS),
-            disable_git_pull: false,
-        }
-    }
-
-    /// Poll until `read_on_disk_binary_version` is at least
-    /// `read_source_version` (semver-aware) or the timeout elapses.
-    ///
-    /// Soft-fail on transient git-pull errors (network blip, brief
-    /// 503 from the remote) — the next iteration retries.
-    /// Hard-fail on timeout: returns Err with a user-facing message
-    /// naming both versions so the caller can surface it verbatim
-    /// in the UI.
-    ///
-    /// v0.2.48: changed exit-condition from `on_disk == source` to
-    /// `on_disk >= source` (numeric semver compare). The old equality
-    /// check deadlocked the user's update flow when on-disk was
-    /// AHEAD of source — exactly what happened post-v0.2.47 when the
-    /// `vct-module.json` version-pin bump was missed but the binary
-    /// refresh for v0.2.47 had already landed (on_disk=0.2.47,
-    /// source=0.2.46). The newer binary is what the user wants to
-    /// restart into anyway — there's no `dist/` revision to "wait for"
-    /// in that case, so the loop would just time out at 300s with a
-    /// misleading "still building" modal. The `>=` rule is also the
-    /// only correct invariant: the source-pin says "binary must be at
-    /// least version X to satisfy this update"; if it's past X, the
-    /// update has already over-satisfied.
-    pub(crate) async fn run(&self) -> Result<(), String> {
-        use std::time::Instant;
-        let deadline = Instant::now() + self.timeout;
-        let mut iteration: u32 = 0;
-        loop {
-            iteration += 1;
-            let source_version = read_source_version(self.install_path).ok_or_else(|| {
-                "Could not read source version from vct-module.json".to_string()
-            })?;
-            let on_disk_version =
-                read_on_disk_binary_version(self.install_path).unwrap_or_default();
-            // v0.2.55 (hub-freshness gap, decision #2 — close fully): also
-            // require the on-disk vct-hub binary to have caught up before
-            // declaring the refresh landed. Pre-v0.2.55 the gate watched
-            // ONLY the launcher binary, so a partial refresh (launcher new,
-            // hub stale) could restart into a launcher that then started a
-            // STALE hub. One Release commit refreshes all three binaries
-            // together, so in practice they advance in lock-step — but the
-            // gate now enforces it rather than assuming it. CAVEAT: if the
-            // hub sidecar is ABSENT (older installs predating hub metadata)
-            // we must NOT block forever — treat absent as "hub OK" so the
-            // gate degrades to the pre-v0.2.55 launcher-only behaviour
-            // instead of deadlocking.
-            let hub_version_opt = read_on_disk_hub_version(self.install_path);
-            let hub_caught_up = match &hub_version_opt {
-                None => true, // no hub sidecar → don't block on it
-                Some(hv) if hv.is_empty() => true,
-                Some(hv) => !version_is_outdated(hv, &source_version),
-            };
-            if !on_disk_version.is_empty()
-                && !version_is_outdated(&on_disk_version, &source_version)
-                && hub_caught_up
-            {
-                // on_disk >= source — either equal (the normal
-                // "binary refresh landed" case) or ahead (the
-                // version-pin-stale case fixed in v0.2.48). Both
-                // are valid exit states. AND the hub binary (when its
-                // sidecar exists) is at/above source too.
-                if iteration > 1 {
-                    tracing::info!(
-                        "[v0.2.45 V45-B] binary refresh landed after {} poll(s): on-disk now v{} (source v{})",
-                        iteration, on_disk_version, source_version,
-                    );
-                } else if on_disk_version != source_version {
-                    tracing::warn!(
-                        "[v0.2.48] on-disk binary v{} is ahead of source v{} — proceeding (newer binary is what the user wants to run)",
-                        on_disk_version, source_version,
-                    );
-                }
-                return Ok(());
-            }
-            if Instant::now() >= deadline {
-                let displayed = if on_disk_version.is_empty() {
-                    "<unknown>".to_string()
-                } else {
-                    on_disk_version
-                };
-                // v0.2.55: name the hub version too — a partial refresh
-                // (launcher caught up, hub still stale) now also times out
-                // here (so we don't start a stale hub), and the message
-                // should make that diagnosable rather than blaming only the
-                // launcher binary.
-                let hub_displayed = match &hub_version_opt {
-                    Some(hv) if !hv.is_empty() => hv.clone(),
-                    _ => "<no hub sidecar>".to_string(),
-                };
-                return Err(format!(
-                    "Binary refresh for v{} did not land within {} sec. \
-                     On-disk launcher is v{}, hub is v{}. The Release workflow \
-                     is still building/committing the new dist binaries. Wait a \
-                     few minutes and click Update again.",
-                    source_version,
-                    self.timeout.as_secs(),
-                    displayed,
-                    hub_displayed,
-                ));
-            }
-            tracing::warn!(
-                "[v0.2.45 V45-B] waiting for binary refresh: source=v{} on_disk=v{} (iteration {})",
-                source_version,
-                if on_disk_version.is_empty() {
-                    "<unknown>".to_string()
-                } else {
-                    on_disk_version
-                },
-                iteration,
-            );
-            // Re-pull main to pick up the binary-refresh commit if
-            // it landed since the last iteration. Soft-fail: a
-            // transient network error MUST NOT terminate the wait —
-            // the next iteration retries. Tests skip the pull
-            // entirely (no git remote in tmpdirs) and mutate
-            // `vct-launcher.metadata.json` directly between
-            // iterations to simulate the commit arriving.
-            if !self.disable_git_pull {
-                if let Err(e) =
-                    run_git_pull_ff_only(self.install_path, self.branch).await
-                {
-                    tracing::warn!(
-                        "[v0.2.45 V45-B] git pull warning (will retry next iteration): {}",
-                        e
-                    );
-                }
-            }
-            tokio::time::sleep(self.interval).await;
-        }
-    }
-}
-
-/// Minimal git-pull helper for the binary-refresh poll loop.
-///
-/// Runs `git pull --ff-only <VCO_UPSTREAM_REMOTE> <branch>` in the
-/// install path. Returns Err with the trimmed stderr tail on
-/// non-success — the caller already treats this as transient and
-/// retries on the next iteration. Same `.silent()` wrapper the rest
-/// of installer.rs uses so the Windows console window stays hidden.
-async fn run_git_pull_ff_only(install_path: &Path, branch: &str) -> Result<(), String> {
-    let out = run_git_raw(
-        install_path,
-        &[
-            "pull",
-            "--ff-only",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            branch,
-        ],
-    )
-    .await?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        return Err(stderr.trim().to_string());
-    }
-    Ok(())
-}
 
 /// v0.2.60: RAII guard that closes the launcher's managed `launcher.db`
 /// connection for the `install.py --update` window and reopens it on drop.
@@ -4639,483 +4425,11 @@ impl<R: Runtime> Drop for DbUpdateClosedGuard<R> {
     }
 }
 
-/// Ledger step 40 (v0.2.95 phase 2): takes the SAME claim
-/// `self_update::apply_launcher_update` takes — one key, because both commands
-/// pull and then `install.py --update` the same clone, and until then neither
-/// was single-flighted at all (the frontend disabled its own button, which
-/// v0.2.91 decision #26 already judged insufficient for a guard over
-/// destructive work). Held for the whole command, install.py and the restart
-/// hop included; released by RAII on every exit path.
-///
-/// v0.2.95 phase 3 split the claim from the body so a caller that ALREADY
-/// holds it can hand it over instead of deadlocking against itself — see
-/// [`update_orchestrator_with_claim`] and its one such caller,
-/// `resolve_untracked_collision_and_retry`.
-#[command]
-pub async fn update_orchestrator<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-) -> Result<InstallResult, String> {
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
-    update_orchestrator_with_claim(app, path, window, flight).await
-}
-
-/// [`update_orchestrator`]'s body, with the single-flight claim passed IN.
-///
-/// It exists for one caller: `resolve_untracked_collision_and_retry` deletes
-/// colliding untracked files and then re-enters the full update. Those
-/// deletions are destructive work on the same clone, so they must happen UNDER
-/// the claim — but the retry cannot then take a claim that is already held.
-/// Taking it, releasing it, and letting the tail call re-take it would leave a
-/// window precisely where the tree is at its most inconsistent (files just
-/// removed, pull not yet started). Handing the guard over closes it: ONE claim
-/// spans the deletions and the update they exist to unblock.
-///
-/// `_flight` is held, not read: its `Drop` at the end of this function is the
-/// release, and that is the whole contract.
-pub(crate) async fn update_orchestrator_with_claim<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-    _flight: crate::commands::single_flight::SingleFlightGuard,
-) -> Result<InstallResult, String> {
-    let install_path = PathBuf::from(&path);
-    let system = detect_system().await?;
-
-    if !install_path.join(".git").exists() {
-        return Err("Not a git repository — cannot update".to_string());
-    }
-
-    // v0.2.60 (Piece 5): version-floor gate. If the installed version is
-    // below the source manifest's `min_upgradable_from`, an in-place pull
-    // is not supported and the update must route to the guided hard-cut
-    // (git-bundle backup + git reset --hard + reinstall, preserving all
-    // ~/.vct DBs + Weaviate vectors + knowledge/ + .claude/state/).
-    //
-    // INERT in v0.2.60: the shipped floor is "0.0.0" (vct-module.json), so
-    // `update_requires_hard_cut` ALWAYS returns false here today — the check
-    // is LIVE (exercised every update, dogfoodable) but never opens the
-    // gate. v0.3.0 raises the floor to declare the first real hard-cut
-    // boundary; the routing to `perform_hard_cut` is wired then (the
-    // primitive + its Tauri command already exist, gated by
-    // `_allow_below_floor`). We only LOG the decision now so the floor logic
-    // is proven in practice before v0.3.0 relies on it.
-    if update_requires_hard_cut(&install_path) {
-        // Unreachable in v0.2.60 (floor=0.0.0). When v0.3.0 raises the floor,
-        // replace this log with the routing to the hard-cut flow.
-        tracing::info!(
-            "[vct] update_orchestrator: installed version is below \
-             min_upgradable_from — a guided hard-cut is required (v0.3.0 \
-             activation; not wired in v0.2.60)"
-        );
-    }
-
-    // v0.2.43 V0243-15: audit_log coverage for the update flow.
-    // Capture the pre-pull state (old SHA + branch) so the `_start` row
-    // carries the full context for forensic analysis. Best-effort: any
-    // failure here is logged but must NOT block the update.
-    let update_start_ms = chrono::Utc::now().timestamp_millis();
-    let old_sha = read_head_sha(&install_path).await;
-    let old_version = env!("CARGO_PKG_VERSION").to_string();
-    // Helper closure: soft-write a single audit row via the app's Db.
-    // Captures a clone of the AppHandle so it doesn't prevent the
-    // original `app` from being moved into `restart_launcher` later.
-    let audit_app = app.clone();
-    let write_audit = move |operation: &str, detail: serde_json::Value| {
-        use tauri::Manager as _;
-        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
-            let _ = db.audit(operation, None, None, &detail);
-        }
-    };
-    // Capture pull_branch for the _start entry (read before the pull so the
-    // row is accurate even if the pull later fails).
-    // v0.2.92 WP-13: through the ONE resolver (was an inline copy of the
-    // `HEAD → main` rule).
-    let start_branch = crate::commands::git_cmd::resolve_branch(&install_path)
-        .await
-        .map(|s| s.name)
-        .unwrap_or_else(|_| crate::commands::git_cmd::FALLBACK_BRANCH.to_string());
-    write_audit(
-        "update_orchestrator_start",
-        serde_json::json!({
-            "old_version": old_version,
-            "source_commit": old_sha,
-            "branch": start_branch,
-            "install_path": path,
-        }),
-    );
-
-    // v0.2.95 phase 1 (pure extraction): everything from the in-progress-merge
-    // pre-flight through the HEAD-advance backstop now lives in ONE place,
-    // `commands::update_pipeline` — same steps, same order, same side effects.
-    // The review that produced this split is
-    // `.claude/context/reviews/UPDATE-SURFACES-DUPLICATION-2026-09-18.md` §5.
-    //
-    // What stays HERE is what is genuinely this surface's own: the audit rows
-    // (this command owns the Db handle), the payload SHAPES its three Svelte
-    // modals parse, `install.py`, the finalize/restart tail and the module
-    // auto-retry sweep.
-    let prepared = match crate::commands::update_pipeline::prepare_and_pull_orchestrator_repo(
-        &install_path,
-        crate::commands::update_pipeline::UpdatePipelineOptions {
-            surface: "update_orchestrator",
-            emit_progress_to: Some(&window),
-            install_path_label: &path,
-            start_branch: &start_branch,
-            head_sha_before: old_sha,
-            update_start_ms,
-            // v0.2.58 removed this surface's dirty-tree refusal on purpose:
-            // its forward action out of a divergence is a Merge / Rebase /
-            // Cancel modal, none of which destroys local content. The launcher
-            // self-update surface keeps one because ITS only forward action is
-            // `git reset --hard`. See `ExtraPreflight`.
-            extra_preflight: crate::commands::update_pipeline::ExtraPreflight::None,
-        },
-    )
-    .await
-    {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            use crate::commands::update_pipeline::UpdatePipelineError as PipelineErr;
-            // ONE classification, rendered into THIS surface's payload shapes.
-            // Every `serialize_*` below is the same function, called with the
-            // same values, as before the extraction — the modals cannot tell.
-            return Err(match err {
-                PipelineErr::MergeInProgress {
-                    payload,
-                    at_preflight,
-                } => {
-                    if at_preflight {
-                        write_audit(
-                            "update_orchestrator_refused_merge_in_progress",
-                            serde_json::json!({
-                                "install_path": path,
-                                "branch": start_branch,
-                            }),
-                        );
-                    }
-                    payload
-                }
-                PipelineErr::UntrackedCollision { payload } => payload,
-                // Unreachable for this surface — it passes `ExtraPreflight::None`,
-                // which is the only producer of this variant. Worded rather than
-                // `unreachable!()` so a future option change degrades to a message
-                // instead of panicking inside a Tauri command.
-                PipelineErr::DirtyTrackedAtRisk { path } => format!(
-                    "Uncommitted changes on tracked file '{}' would be lost — this update \
-                     also changes it. Commit, stash, or revert it before updating.",
-                    path
-                ),
-                PipelineErr::Conflict {
-                    operation,
-                    branch,
-                    conflicted,
-                    detail,
-                    record_binary_clobber_averted,
-                } => {
-                    // v0.2.91 WI-3/WI-7: the abort tail kept the freshly-pulled
-                    // binary rather than renaming the old exe back over it.
-                    if record_binary_clobber_averted {
-                        write_audit(
-                            "update_binary_clobber_averted",
-                            serde_json::json!({
-                                "branch": branch,
-                                "pop_conflict_after_success": false,
-                                "note": "abort tail kept the freshly-pulled binary (WI-3)",
-                            }),
-                        );
-                    }
-                    serialize_orchestrator_conflict_error(operation, &branch, &conflicted, &detail)
-                }
-                PipelineErr::AutostashPopConflict {
-                    branch,
-                    conflicted,
-                    detail,
-                    record_binary_clobber_averted,
-                } => {
-                    if record_binary_clobber_averted {
-                        write_audit(
-                            "update_binary_clobber_averted",
-                            serde_json::json!({
-                                "branch": branch,
-                                "pop_conflict_after_success": true,
-                                "note": "abort tail kept the freshly-pulled binary (WI-3)",
-                            }),
-                        );
-                    }
-                    serialize_autostash_pop_conflict_error(&branch, &conflicted, &detail)
-                }
-                PipelineErr::NonFastForward {
-                    branch,
-                    local_sha,
-                    remote_sha,
-                    diverged,
-                    upstream_only,
-                    local_only,
-                    detail,
-                } => serialize_orchestrator_non_ff_error(
-                    &branch,
-                    local_sha.as_deref(),
-                    remote_sha.as_deref(),
-                    &diverged,
-                    &upstream_only,
-                    &local_only,
-                    &detail,
-                ),
-                PipelineErr::HeadDidNotAdvance { detail } => {
-                    write_audit(
-                        "update_orchestrator_complete",
-                        serde_json::json!({
-                            "success": false,
-                            "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
-                            "note": "head_did_not_advance_post_pull",
-                            "branch": start_branch,
-                        }),
-                    );
-                    detail
-                }
-                PipelineErr::Raw(message) => message,
-            });
-        }
-    };
-
-    let crate::commands::update_pipeline::UpdatePipelineOutcome {
-        already_up_to_date,
-        dist_binary_stale,
-        pull_branch,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        gate_guard: mut update_gate_guard,
-        db_audit,
-    } = prepared;
-    // The pipeline DECIDED these rows at the point the pre-extraction code
-    // wrote them; the Db handle is ours, so the write is ours.
-    for (operation, detail) in db_audit {
-        write_audit(&operation, detail);
-    }
-
-    if already_up_to_date {
-        let message = if dist_binary_stale {
-            "Already up to date — but the launcher binary on disk is newer than the running \
-             one. Quit and relaunch to pick it up."
-                .to_string()
-        } else {
-            "Already up to date".to_string()
-        };
-        return Ok(InstallResult {
-            success: true,
-            install_path: path,
-            message,
-            system,
-        });
-    }
-
-    // Stage 2: Re-run install.py with --update flag
-    emit_progress(&window, "install", "Applying updates...", 40.0);
-
-    // V52-AI: advance lockfile phase so future hub-side observers can
-    // see we've moved past git_pull.
-    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
-
-    // v0.2.60: close the launcher's managed launcher.db connection for the
-    // install.py window so install.py can take the SQLite writer lock
-    // (Windows holds it exclusively — the launcher-self-db-lock bug). The
-    // fresh-conn pollers stand down via the `.update-in-progress` lockfile
-    // (set above by `UpdateInProgressGuard`) + `skip_if_update_in_progress`.
-    // RAII: reopens on EVERY exit path below (incl. the install-fail
-    // early-return), and force-restarts if reopen fails.
-    let mut db_close_guard = DbUpdateClosedGuard::new(app.clone());
-
-    let python_cmd = &system.python_cmd;
-    // v0.2.95 phase 2: the spawn + the `[VCO-EVENT]` sub-progress stream +
-    // the spawn-failure record + `handle_install_phase_exit` are ONE home
-    // (`update_pipeline::run_install_py_update`), shared with the post-pull
-    // tail and with the launcher self-update surface. What stays here is what
-    // is genuinely this call site's: the DB-close guard around the window and
-    // the recovery it owes on failure.
-    let install_run = match crate::commands::update_pipeline::run_install_py_update(
-        &install_path,
-        python_cmd,
-        "update_orchestrator",
-        Some(&window),
-    )
-    .await
-    {
-        Ok(run) => run,
-        Err(msg) => {
-            // A spawn failure lands here AFTER a successful pull: the tree is
-            // at the new commit with the old artefacts, the hub is stopped and
-            // the binaries are renamed aside. Put them back, exactly as the
-            // non-zero-exit leg below does — pre-v0.2.95 this leg returned
-            // without reverting, while its sibling in
-            // `run_post_pull_install_and_restart` had carried the revert since
-            // its own review round (R2 #4) called the omission out.
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            // db_close_guard drops here on the early-return → reopens.
-            return Err(msg);
-        }
-    };
-
-    if !install_run.success {
-        // v0.2.17: install.py failed — don't restart. Revert the pre-pull
-        // rename so the canonical path is usable again. v0.2.21 Step 12:
-        // same for the hub binary, then attempt to bring the hub back up so
-        // the user isn't left without it (install.py failed AFTER git pull
-        // succeeded, so the on-disk vct-hub may be the new version — the
-        // launcher's discovery chain still finds it via find_hub_binary()).
-        // v0.2.71: shared tail.
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        // db_close_guard drops here on the early-return → reopens (or
-        // force-restarts if reopen fails). No explicit call needed.
-        return Err(format!("Update failed: {}", install_run.stderr));
-    }
-
-    // v0.2.60: install.py is done with launcher.db — reopen the managed
-    // connection now (explicitly, before the binary-refresh/finalize tail
-    // which may read/write the DB). On reopen failure this force-restarts.
-    db_close_guard.reopen();
-
-    // v0.2.93 (stale status cache): the pull + install landed — refresh
-    // `~/.vct/launcher-update-state.json` NOW, before the restart hop kills
-    // this process, so the Settings → Updates card does not keep saying
-    // "N commits behind / Last checked <hours ago>" from the pre-update
-    // check. Soft-fail; the next daily check would repair it anyway.
-    crate::commands::self_update::refresh_cached_state_after_pull(&install_path, &pull_branch)
-        .await;
-
-    // V52-AI: advance lockfile phase. install.py has finished; we're
-    // now in the binary-refresh + hub-restart window. MCPs that try to
-    // spawn during this window still see the lockfile and exit cleanly.
-    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
-
-    // v0.2.54 Track C (P0-7 / C-1 / C-2): shared finalize tail —
-    // V45-B binary wait, V52-AI disarm, V52-AH staging + handoff,
-    // hub restart (no-handoff path only; C-1 reorder so a freshly-
-    // restarted hub can't hold a Windows lock on vct-hub.exe while
-    // the stage1 updater tries to swap it), legacy restart + deferral
-    // fallback. Shared with merge/rebase/resume via
-    // `run_post_pull_install_and_restart` so the four entry paths
-    // can't drift apart again.
-    //
-    // v0.2.44 V44-G4: clone the AppHandle here so the post-restart
-    // retry block (Trigger B sweep + final audit) can still reach
-    // `app.try_state::<Db>()` after the finalize tail consumes its
-    // owned copy. AppHandle is Clone (cheap reference-counted handle).
-    let post_restart_app = app.clone();
-    let finalize = finalize_update_and_restart(
-        app,
-        &install_path,
-        &path,
-        &window,
-        python_cmd,
-        &pull_branch,
-        &mut update_gate_guard,
-    )
-    .await?;
-
-    if finalize.handoff_exit {
-        return Ok(InstallResult {
-            success: true,
-            install_path: path.clone(),
-            message: "Update applied — vct-updater is performing the binary swap. \
-                      The launcher will relaunch automatically."
-                .to_string(),
-            system,
-        });
-    }
-    emit_progress(&window, "done", "Orchestrator updated successfully!", 100.0);
-
-    // v0.2.44 V44-G4 (RL-chat ask 2026-06-01): Trigger B — auto-retry
-    // stuck module_installs rows across ALL projects after a successful
-    // orchestrator update. Gated by the per-user toggle (default ON).
-    // Disabled by users who keep deliberately-failed modules and don't
-    // want them auto-reinstalled on launcher updates.
-    //
-    // Non-blocking: emits its own audit row; any retry failure is
-    // recorded but never poisons the orchestrator-update result. The
-    // launcher restart at the end of this function happens unconditionally.
-    //
-    // Note 1: we use try_state because the DB may not be registered
-    // when `update_orchestrator` is invoked via `update_orchestrator_at`
-    // (an early-boot recovery surface that runs before app setup).
-    //
-    // Note 2: we pass `None` for the AppHandle. Here's why — the
-    // orchestrator-update path culminates in a launcher restart (see
-    // `restart_launcher` call below), which means any in-process install
-    // we kick off would run in the OLD binary that's about to exit.
-    // Instead we let the self-heal branch flip rows whose container is
-    // already healthy (the common case for stuck rows after a binary
-    // upgrade), and audit-log the rest as `retried_unavailable`. The
-    // post-restart binary's `resume_containers_on_startup` sweep then
-    // picks up where this stops. For rows requiring an actual install
-    // re-run, the user clicks the per-project Update button (Trigger A,
-    // which DOES pass `Some(&app)` since no restart follows).
-    {
-        use tauri::Manager as _;
-        if let Some(db) = post_restart_app.try_state::<crate::db::Db>() {
-            let enabled =
-                crate::commands::module_service::auto_retry_on_orchestrator_update_enabled(&db);
-            if enabled {
-                let reports =
-                    crate::commands::module_service::retry_failed_module_installs(
-                        None, &db, None,
-                    )
-                    .await;
-                let summary = retry_summary_counts(&reports);
-                write_audit(
-                    "module_install_auto_retry_sweep",
-                    serde_json::json!({
-                        "trigger": "update_orchestrator",
-                        "total": reports.len(),
-                        "summary": summary,
-                    }),
-                );
-            } else {
-                write_audit(
-                    "module_install_auto_retry_sweep",
-                    serde_json::json!({
-                        "trigger": "update_orchestrator",
-                        "skipped": "disabled_by_setting",
-                    }),
-                );
-            }
-        }
-    }
-
-    // v0.2.43 V0243-15: audit_log complete entry (success path).
-    let new_sha = read_head_sha(&install_path).await;
-    write_audit(
-        "update_orchestrator_complete",
-        serde_json::json!({
-            "success": true,
-            "duration_ms": chrono::Utc::now().timestamp_millis() - update_start_ms,
-            "old_version": old_version,
-            "new_sha": new_sha,
-            "branch": start_branch,
-        }),
-    );
-
-    Ok(InstallResult {
-        success: true,
-        install_path: path,
-        message: "Orchestrator updated successfully".to_string(),
-        system,
-    })
-}
 
 // ---------------------------------------------------------------------------
 // v0.2.23 (B4 / D19): divergence-recovery commands.
 //
-// When `update_orchestrator`'s ff-only pull fails because the local clone
+// When the update's ff-only pull fails because the local clone
 // has diverged from upstream (the user has local commits to CLAUDE.md,
 // CONTEXT_STATE.md, KG nodes, etc.), the frontend renders a modal asking
 // the user to choose merge / rebase / cancel. These commands are the
@@ -5123,16 +4437,16 @@ pub(crate) async fn update_orchestrator_with_claim<R: Runtime>(
 // the merge/rebase produces conflicts.
 //
 // Design notes:
-//   - We re-use the same pre-pull-rename + hub-stop choreography as
-//     `update_orchestrator` so binary swaps and Windows file locks are
-//     handled the same way regardless of which pull variant the user
-//     chose.
+//   - Merge / rebase run through the SAME pipeline as the plain pull
+//     (v0.2.100: `run_orchestrator_update` with kind Merge / Rebase), so the
+//     pre-pull-rename + hub-stop choreography, binary swaps and Windows file
+//     locks are handled identically whichever variant the user chose.
 //   - On merge/rebase conflict we LEAVE the working tree in the
 //     conflicted state. The user might want to edit files manually in
 //     their editor. The "Abort" frontend button calls
 //     `abort_orchestrator_merge_or_rebase` to bail cleanly.
 //   - Discriminators on the error payloads:
-//       update_orchestrator non-FF             → "orchestrator_update_non_ff"
+//       update non-FF                          → "orchestrator_update_non_ff"
 //       merge/rebase conflict                  → "orchestrator_update_conflict"
 //     The frontend uses these to pick the right modal.
 // ---------------------------------------------------------------------------
@@ -5330,149 +4644,44 @@ pub(crate) async fn collect_conflicted_files(repo: &Path) -> Vec<String> {
         .collect()
 }
 
-/// Serialize the non-fast-forward divergence payload the frontend's
-/// `OrchestratorUpdateDivergenceModal` consumes. Hand-rolled JSON to
-/// match the style used by `self_update::serialize_non_ff_error` — both
-/// surfaces emit error strings from Tauri commands; the frontend tries
-/// `JSON.parse(err)` and falls back to a raw toast when parsing fails.
-///
-/// Schema:
-///   {
-///     "event": "orchestrator_update_non_ff",
-///     "branch": "main",
-///     "local_sha":  "abc..." | null,
-///     "remote_sha": "def..." | null,
-///     "diverged_files": ["path/a", "path/b", ...],   // A ∩ B (v0.2.93: was all of A)
-///     "local_only_files": ["path/c", ...],           // B ∖ A (v0.2.27)
-///     "upstream_only_files": ["path/d", ...],        // A ∖ B (v0.2.93)
-///     "upstream_only_count": 4,                      // len(upstream_only_files)
-///     "git_stderr": "<raw error>"
-///   }
-///
-/// Every pre-v0.2.93 key keeps its name and position so an older frontend
-/// keeps parsing; the two new keys are additive.
-pub(crate) fn serialize_orchestrator_non_ff_error(
-    branch: &str,
-    local: Option<&str>,
-    remote: Option<&str>,
-    diverged_files: &[String],
-    upstream_only_files: &[String],
-    local_only_files: &[String],
-    git_stderr: &str,
-) -> String {
-    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
-    let local_field = match local {
-        Some(s) => format!("\"{}\"", s),
-        None => "null".to_string(),
+
+/// The `orchestrator_update_conflict` payload the conflict modal renders
+/// (`event`, `operation`, `branch`, `conflicted_files`, `git_stderr`, plus the
+/// pipeline's `kind` + `message`). v0.2.100 (WP-03b): rendered by the ONE
+/// renderer, `update_failure::from_pipeline_error` — the hand-built
+/// `serialize_orchestrator_*` JSON writers are retired.
+fn conflict_payload(operation: &str, branch: &str, conflicted: &[String], detail: &str) -> String {
+    let operation: &'static str = match operation {
+        "rebase" => "rebase",
+        "update" => "update",
+        _ => "merge",
     };
-    let remote_field = match remote {
-        Some(s) => format!("\"{}\"", s),
-        None => "null".to_string(),
-    };
-    let to_json_array = |items: &[String]| -> String {
-        let parts: Vec<String> = items
-            .iter()
-            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
-            .collect();
-        format!("[{}]", parts.join(","))
-    };
-    let files_field = to_json_array(diverged_files);
-    let local_only_field = to_json_array(local_only_files);
-    let upstream_only_field = to_json_array(upstream_only_files);
-    // v0.2.27: added `local_only_files` so the modal can render
-    // "files only on your clone" as a separate (collapsible) section
-    // instead of mixing them into the merge-conflict-candidate list.
-    // Forks that track paths the public repo doesn't (e.g. a private
-    // fork's `other_projects_knowledge/`) no longer see those paths flagged
-    // as "diverged" in the modal.
-    // v0.2.93: added `upstream_only_files` + `upstream_only_count` so the
-    // modal can say "8 diverged, 756 coming in from upstream" instead of
-    // "764 diverged".
-    format!(
-        "{{\"event\":\"orchestrator_update_non_ff\",\"branch\":\"{}\",\"local_sha\":{},\"remote_sha\":{},\"diverged_files\":{},\"local_only_files\":{},\"upstream_only_files\":{},\"upstream_only_count\":{},\"git_stderr\":\"{}\"}}",
-        branch,
-        local_field,
-        remote_field,
-        files_field,
-        local_only_field,
-        upstream_only_field,
-        upstream_only_files.len(),
-        stderr_esc
-    )
+    crate::commands::update_failure::from_pipeline_error(UpdatePipelineError::Conflict {
+        operation,
+        branch: branch.to_string(),
+        conflicted: conflicted.to_vec(),
+        detail: detail.to_string(),
+        record_binary_clobber_averted: false,
+    })
+    .0
+    .to_json()
 }
 
-/// Serialize the merge/rebase conflict payload the frontend's
-/// `OrchestratorUpdateConflictModal` consumes.
-///
-/// Schema:
-///   {
-///     "event": "orchestrator_update_conflict",
-///     "operation": "merge" | "rebase",
-///     "branch": "main",
-///     "conflicted_files": ["path/a", "path/b", ...],
-///     "git_stderr": "<raw error>"
-///   }
-fn serialize_orchestrator_conflict_error(
-    operation: &str,
-    branch: &str,
-    conflicted_files: &[String],
-    git_stderr: &str,
-) -> String {
-    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
-    let files_field: String = {
-        let parts: Vec<String> = conflicted_files
-            .iter()
-            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
-            .collect();
-        format!("[{}]", parts.join(","))
-    };
-    format!(
-        "{{\"event\":\"orchestrator_update_conflict\",\"operation\":\"{}\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
-        operation, branch, files_field, stderr_esc
+/// The `orchestrator_autostash_pop_conflict` payload (the merge committed;
+/// only restoring the local WIP clashed), through the same one renderer.
+fn autostash_pop_payload(branch: &str, conflicted: &[String], detail: &str) -> String {
+    crate::commands::update_failure::from_pipeline_error(
+        UpdatePipelineError::AutostashPopConflict {
+            branch: branch.to_string(),
+            conflicted: conflicted.to_vec(),
+            detail: detail.to_string(),
+            record_binary_clobber_averted: false,
+        },
     )
+    .0
+    .to_json()
 }
 
-/// v0.2.88 (DEFECT 2 / FIELD DEFECT) — serialize the AUTOSTASH-POP conflict
-/// payload. This is a DISTINCT event from `orchestrator_update_conflict`: the
-/// merge/rebase itself SUCCEEDED, but `git pull --autostash`'s POP of the local
-/// WIP stash conflicted (a user hand-edited a tracked file that this release also
-/// touched). Labeling this as a "merge failure" is the field bug — the merge is
-/// done; only the local-WIP restore clashed. The user's changes are SAFE in the
-/// stash. The modal lists the pop-conflicted files and offers ONE direction for
-/// the WHOLE set (the backend `resolve_autostash_pop_and_retry` takes a single
-/// `keep_updated: bool` applied to every file — a mixed decision is a
-/// terminal-only path via the deferral):
-///   * keep the UPDATED version (drop the stashed local change), or
-///   * keep LOCAL (take the stashed change).
-/// EITHER way the discarded side is backed up to
-/// `.claude/state/update-collision-backups-<ts>/` first (MAJOR-2), so the choice
-/// is reversible.
-///
-/// Schema:
-///   {
-///     "event": "orchestrator_autostash_pop_conflict",
-///     "branch": "main",
-///     "conflicted_files": ["path/a", ...],
-///     "git_stderr": "<raw output>"
-///   }
-fn serialize_autostash_pop_conflict_error(
-    branch: &str,
-    conflicted_files: &[String],
-    git_stderr: &str,
-) -> String {
-    let stderr_esc = crate::commands::self_update::json_escape(git_stderr);
-    let files_field: String = {
-        let parts: Vec<String> = conflicted_files
-            .iter()
-            .map(|p| format!("\"{}\"", crate::commands::self_update::json_escape(p)))
-            .collect();
-        format!("[{}]", parts.join(","))
-    };
-    format!(
-        "{{\"event\":\"orchestrator_autostash_pop_conflict\",\"branch\":\"{}\",\"conflicted_files\":{},\"git_stderr\":\"{}\"}}",
-        branch, files_field, stderr_esc
-    )
-}
 
 // ---------------------------------------------------------------------------
 // v0.2.93 (field incident 2026-09-07) — stalled merge/rebase handling.
@@ -5514,8 +4723,8 @@ async fn ensure_resume_sentinel_present(
     write_resume_sentinel_and_deferral(install_path, operation, pull_branch).await
 }
 
-/// Pre-pull short-circuit shared by `update_orchestrator`,
-/// `merge_orchestrator_with_upstream` and `rebase_orchestrator_onto_upstream`.
+/// Pre-pull short-circuit shared by every git operation of the update
+/// pipeline (`update_pipeline::run_preflight_refusals`).
 ///
 /// `Some(payload)` when a merge or rebase is already in progress in the
 /// clone: the SAME `orchestrator_update_conflict` payload shape the original
@@ -5546,7 +4755,7 @@ pub(crate) async fn refuse_if_merge_or_rebase_in_progress(
         marker = if op == "merge" { "MERGE_HEAD" } else { "rebase-merge" },
         next = stalled_next_step(&conflicted),
     );
-    Some(serialize_orchestrator_conflict_error(
+    Some(conflict_payload(
         op,
         &branch,
         &conflicted,
@@ -5586,7 +4795,7 @@ pub(crate) async fn handle_merge_in_progress_refusal(
     let sentinel_written = ensure_resume_sentinel_present(install_path, op, pull_branch).await;
     let conflicted = collect_conflicted_files(install_path).await;
     log_conflict_payload_return(surface, op, &conflicted, sentinel_written);
-    serialize_orchestrator_conflict_error(op, pull_branch, &conflicted, combined.trim())
+    conflict_payload(op, pull_branch, &conflicted, combined.trim())
 }
 
 /// Body of the `get_pending_conflict_payload` command (path-injectable so it
@@ -5632,7 +4841,7 @@ pub(crate) async fn build_pending_conflict_payload(install_path: &Path) -> Resul
             conflicted.len(),
             s.written_at,
         );
-        return Ok(serialize_autostash_pop_conflict_error(
+        return Ok(autostash_pop_payload(
             &s.branch,
             &conflicted,
             &explanation,
@@ -5672,7 +4881,7 @@ pub(crate) async fn build_pending_conflict_payload(install_path: &Path) -> Resul
         conflicted.len(),
         stalled_next_step(&conflicted),
     );
-    Ok(serialize_orchestrator_conflict_error(
+    Ok(conflict_payload(
         &operation,
         &branch,
         &conflicted,
@@ -5746,7 +4955,7 @@ pub(crate) fn stderr_tail(s: &str, max_chars: usize) -> String {
 /// `event` from `orchestrator_update_conflict` so the Svelte side does NOT show
 /// the editor-resolve conflict modal (which is inapplicable to untracked files —
 /// there is no `UU`, no `<<<<<<<` marker to edit). Same JSON-escape machinery as
-/// `serialize_orchestrator_conflict_error` (one home for the escaper).
+/// the other hand-built payloads (one home for the escaper).
 fn serialize_untracked_collision_error(
     operation: &str,
     branch: &str,
@@ -5766,8 +4975,9 @@ fn serialize_untracked_collision_error(
 }
 
 /// v0.2.78 ITEM #0 (F2 keystone) — pre-pull untracked-collision handler, the
-/// ONE home shared by `merge_orchestrator_with_upstream` and
-/// `rebase_orchestrator_onto_upstream`. Runs BEFORE the git pull/rebase so a
+/// ONE home shared by the Merge and Rebase git operations
+/// (`update_pipeline::{merge_upstream, rebase_onto_upstream}`). Runs BEFORE
+/// the git pull/rebase so a
 /// new-in-release file present locally UNTRACKED can't make git abort with
 /// "untracked working tree files would be overwritten by merge" (which the old
 /// code mis-routed into the editor-resolve conflict modal).
@@ -5788,7 +4998,7 @@ fn serialize_untracked_collision_error(
 /// mtime/size). Divergent files are NEVER touched here. Best-effort: if base or
 /// theirs can't be resolved, returns `Ok(())` (the subsequent git pull surfaces
 /// any real problem via the existing conflict flow — we never guess).
-async fn handle_untracked_collisions_pre_pull(
+pub(crate) async fn handle_untracked_collisions_pre_pull(
     install_path: &Path,
     operation: &str,
     branch: &str,
@@ -6052,8 +5262,8 @@ fn serialize_untracked_collision_resolvable_error(
 
 /// v0.2.88 (F2-followup / FIELD DEFECT) — POST-pull untracked-overwrite handler.
 ///
-/// `update_orchestrator`'s inline pull is the ONE surface that lacked the
-/// pre-pull `handle_untracked_collisions_pre_pull` guard. When that pull aborts
+/// The plain pull (`update_pipeline::reconcile_and_pull`) is the ONE path
+/// that lacks the pre-pull `handle_untracked_collisions_pre_pull` guard. When that pull aborts
 /// with "untracked working tree files would be overwritten by merge", the
 /// colliding paths are ONLY in the stderr (nothing merged, so the index has no
 /// unmerged entries and `collect_conflicted_files` is empty). We parse them out,
@@ -6181,7 +5391,7 @@ pub(crate) fn is_merge_or_rebase_conflict(err: &str) -> bool {
 /// (`self_update.rs`) disagreed with both. The mirror is gone; there is one
 /// resolver, and the thin wrapper survives only because ~6 call sites want
 /// the name rather than the `BranchState`.
-async fn resolve_pull_branch(install_path: &Path) -> String {
+pub(crate) async fn resolve_pull_branch(install_path: &Path) -> String {
     crate::commands::git_cmd::resolve_branch(install_path)
         .await
         .map(|s| s.name)
@@ -6189,7 +5399,8 @@ async fn resolve_pull_branch(install_path: &Path) -> String {
 }
 
 /// v0.2.24 §A0 (2026-05-22): orchestrate the pre-merge user-editable
-/// step for both `update_orchestrator` and `merge_orchestrator_with_upstream`.
+/// step for the update's pull and merge (`update_pipeline::{reconcile_and_pull,
+/// merge_upstream}`).
 ///
 /// Resolves the base / theirs SHAs, calls
 /// `git_user_editable_merge::pre_merge_user_editable`, stages every
@@ -6415,326 +5626,7 @@ pub(crate) fn maybe_emit_pre_merge_deferrals(
     }
 }
 
-/// Outcome of [`finalize_update_and_restart`]. Distinguishes "the
-/// Windows stage1 handoff fired and the caller must return immediately
-/// (the process is exiting)" from "legacy restart path completed".
-struct UpdateFinalizeOutcome {
-    /// True iff the V52-AH handoff was activated: the update lock was
-    /// written, `vct-updater.exe` was spawned detached, and
-    /// `app.exit(0)` has been requested. The caller MUST return its
-    /// success `InstallResult` without doing further work.
-    handoff_exit: bool,
-}
 
-/// v0.2.54 Track C (P0-7): the SINGLE shared finalize tail for every
-/// orchestrator-update entry path (update, merge, rebase, resume).
-///
-/// Performs, in order:
-///   1. V45-B `WaitForBinaryRefresh` (block restart until the on-disk
-///      binary version catches up with the source version).
-///   2. V52-AI gate disarm (`disarm_and_cleanup`) — MUST happen before
-///      any restart/exit hop because `app.exit(0)` can terminate the
-///      process before the guard's `Drop` runs on Windows (the C-2
-///      bug class: a surviving `.update-in-progress.json` with a fresh
-///      15-min deadline makes every MCP spawn exit 75 until it lapses).
-///   3. V52-AH staging (`stage_locked_binaries_for_handoff`, Windows)
-///      + handoff decision (`prepare_windows_update_handoff`).
-///   4. Hub restart — ONLY on the no-handoff path (C-1 fix, v0.2.54):
-///      pre-v0.2.54 the hub was restarted BEFORE staging, which meant
-///      a freshly-started (stale-binary) hub held a Windows mandatory
-///      lock on `vct-hub.exe` while the updater — which waits only on
-///      the launcher PID — tried to `MoveFileExW` onto it (exit 5,
-///      silent). With the hub start moved AFTER the handoff decision,
-///      the handoff path leaves the hub STOPPED so the updater can
-///      swap `vct-hub.exe.new`; the relaunched launcher's boot
-///      `ensure_hub_running` then starts the NEW hub binary.
-///   5. Legacy `restart_launcher` + the install.py deferral-emit
-///      fallback when the restart hop fails.
-///
-/// Error contract: on `Err` the hub is restarted best-effort first
-/// (the callers stopped it at the top of their flows) so the user is
-/// never left hub-less by a failed finalize. The V52-AI guard is NOT
-/// disarmed on the pre-disarm error paths — the caller still owns it
-/// and its RAII `Drop` cleans the lockfile on the normal Err-return
-/// path (process keeps running, so Drop is reliable there).
-async fn finalize_update_and_restart<R: Runtime>(
-    app: AppHandle<R>,
-    install_path: &Path,
-    path_string: &str,
-    window: &Window,
-    python_cmd: &str,
-    pull_branch: &str,
-    update_gate_guard: &mut crate::commands::update_gate::UpdateInProgressGuard,
-) -> Result<UpdateFinalizeOutcome, String> {
-    emit_progress(
-        window,
-        "restart",
-        "Update applied — restarting launcher...",
-        95.0,
-    );
-
-    // v0.2.45 V45-B: don't restart into a stale on-disk binary.
-    // Block restart until the on-disk `vct-launcher.metadata.json`
-    // version catches up with `vct-module.json` version (poll + re-
-    // pull every 15 s, up to 5 min). On timeout, surface the error
-    // to the GUI — the user retries when CI finishes the binary
-    // commit.
-    emit_progress(window, "update", "Waiting for new launcher binary...", 96.0);
-    if let Err(e) = WaitForBinaryRefresh::default_production(install_path, pull_branch)
-        .run()
-        .await
-    {
-        tracing::error!("[v0.2.45 V45-B] finalize_update_and_restart: {}", e);
-
-        // v0.2.55 (PRIMARY-BUG fix): WaitForBinaryRefresh timed out — the
-        // on-disk dist binary never reached the exact `source_version`
-        // target. PRE-v0.2.55 this `return Err(e)` ABORTED the whole
-        // update with NO restart, so the launcher stayed on the OLD
-        // binary and kept offering the update (the infinite "update
-        // available" loop the user reported). Two ways to time out:
-        //   (a) the re-pull keeps failing (non-FF divergence — the
-        //       maintainer's 2-checkout case) → binary genuinely never
-        //       advances; OR
-        //   (b) the binary-refresh commit simply hasn't been pushed by
-        //       the Release workflow yet (the one-commit ordering window).
-        // In BOTH cases, if a dist binary is present that is NEWER than
-        // the CURRENTLY-RUNNING launcher, restarting into it is strictly
-        // better than staying on the old one — even if it's a hair below
-        // the absolute target. "Update to the new binary in any case."
-        // We still write a durable UPDATE_DEFERRED.md entry so a
-        // terminal Claude can see the update did not fully reach target,
-        // and the next update attempt will close the remaining gap.
-        let running = env!("CARGO_PKG_VERSION");
-        let on_disk = read_on_disk_binary_version(install_path).unwrap_or_default();
-        // version_is_outdated(a, b) == (a < b); here: running < on_disk.
-        let on_disk_beats_running =
-            !on_disk.is_empty() && version_is_outdated(running, &on_disk);
-
-        if on_disk_beats_running {
-            tracing::warn!(
-                "[v0.2.55] binary-refresh did not reach target, but on-disk dist \
-                 binary v{} is NEWER than running v{} — restarting into it anyway \
-                 (strictly better than staying on the old binary). A durable \
-                 deferral is written noting the update may be one step behind \
-                 target; the next update closes the gap.",
-                on_disk, running,
-            );
-            // Durable record: the update advanced but did not fully reach
-            // the source target (likely the binary-refresh ordering
-            // window or a transient pull failure). Non-fatal: continue to
-            // the restart below.
-            write_launcher_update_diverged_deferral(
-                install_path,
-                pull_branch,
-                LauncherUpdateDivergedKind::PartialBinaryRefresh {
-                    running: running.to_string(),
-                    on_disk: on_disk.clone(),
-                    detail: e.clone(),
-                },
-            );
-            // Fall through (do NOT return) — proceed to hub-start +
-            // restart with the newer on-disk binary.
-        } else {
-            // No newer binary on disk at all — restarting would re-exec
-            // the SAME old binary, which doesn't help. Keep the abort,
-            // but now ALSO write a durable deferral so the stuck state is
-            // diagnosable at session start instead of dying in a GUI
-            // modal (the durable-logging gap: pre-v0.2.55 this surfaced
-            // ONLY as a transient "click Update again" error string).
-            tracing::error!(
-                "[v0.2.55] binary-refresh timed out and no newer dist binary is \
-                 available (running v{}, on-disk v{}); writing durable deferral \
-                 and aborting restart.",
-                running,
-                if on_disk.is_empty() { "<unknown>" } else { &on_disk },
-            );
-            write_launcher_update_diverged_deferral(
-                install_path,
-                pull_branch,
-                LauncherUpdateDivergedKind::BinaryRefreshTimeout {
-                    running: running.to_string(),
-                    on_disk: on_disk.clone(),
-                    detail: e.clone(),
-                },
-            );
-            // The hub was stopped at the top of the caller's flow and
-            // (post-C-1 reorder) has not been restarted yet. Bring it
-            // back up so a binary-refresh timeout doesn't leave the user
-            // hub-less. PostInstall: install.py ran on this path, so the
-            // cutover-sentinel skip heuristic is valid (behaviour unchanged).
-            let _ = ensure_hub_started_after_update(install_path, HubRestartContext::PostInstall);
-            return Err(e);
-        }
-    }
-
-    // V52-AI: explicit lockfile cleanup BEFORE the restart hop. We don't
-    // want the lockfile to survive across the launcher restart — if it
-    // did, the freshly-booted launcher's MCPs would still see it as
-    // active and refuse to start until the stale-cleanup window passed
-    // (up to 15 min). Drop on the guard would happen on process exit,
-    // but on Windows the process can terminate before async cleanup
-    // runs cleanly; calling disarm_and_cleanup() now makes the order
-    // deterministic. (v0.2.54 C-2: this used to exist only on the
-    // `update_orchestrator` path; resume/merge/rebase leaked the lock.)
-    update_gate_guard.disarm_and_cleanup();
-
-    // v0.2.52 V52-AH (stale-binary relaunch loop): Windows stage1 handoff.
-    // Detect binaries that git pull silently skipped (file locked by an
-    // antivirus / indexer / racing handle) and stage them as
-    // `<target>.new`, then write `~/.vct/update.lock.json` and spawn
-    // `vct-updater.exe` DETACHED so it can perform the swap once the
-    // running launcher exits.
-    //
-    // Soft-fail throughout: if staging or handoff fails for ANY reason,
-    // fall through to the existing restart_launcher path — that's the
-    // pre-v0.2.52 behaviour and represents the worst case (= same as
-    // not having V52-AH at all).
-    //
-    // POSIX: staging returns empty (no-op) and
-    // prepare_windows_update_handoff returns handoff_active=false with
-    // skip_reason="non-windows", so we fall through unconditionally
-    // to restart_launcher. No behaviour change for Linux/macOS users.
-    //
-    // v0.2.91 WI-4 (one home): the staging + handoff pair now lives in
-    // `services::binary_freshness::stage_and_handoff_after_update`, shared
-    // verbatim with the launcher SELF-update surface
-    // (`self_update::finish_apply_after_pull`), which previously had NO
-    // staging and no handoff at all and therefore relaunched the same stale
-    // exe on Windows by construction. The shared tail also emits the WI-7
-    // "handoff skipped while a dist binary is dirty" record.
-    let handoff_result =
-        crate::services::binary_freshness::stage_and_handoff_after_update(install_path, path_string)
-            .await;
-
-    if handoff_result.handoff_active {
-        tracing::info!(
-            "[vct] finalize_update_and_restart: V52-AH handoff active (lock={:?}); \
-             exiting current launcher — vct-updater.exe will perform the \
-             swap + relaunch. Hub stays stopped so vct-hub.exe is swappable \
-             (v0.2.54 C-1); the relaunched launcher's boot starts the new hub.",
-            handoff_result.lock_path,
-        );
-        // Mirror the tail of restart_launcher: programmatic quit so the
-        // updater can complete the swap on a now-unlocked .exe. The
-        // updater's spawned child will become the new launcher process.
-        crate::quit_dialog::force_quit();
-        app.exit(0);
-        return Ok(UpdateFinalizeOutcome { handoff_exit: true });
-    }
-
-    if let Some(reason) = handoff_result.skip_reason.as_deref() {
-        tracing::warn!(
-            "[vct] finalize_update_and_restart: V52-AH handoff skipped (reason={}); \
-             falling through to legacy restart_launcher",
-            reason,
-        );
-    }
-
-    // v0.2.54 C-1: bring the detached vct-hub back up ONLY on the
-    // no-handoff path, AFTER the staging/handoff decision. See the
-    // function docs for why this ordering is load-bearing on Windows.
-    // Soft-fail: the launcher restart path itself also calls
-    // `hub_launcher::ensure_hub_running` on boot. PostInstall: install.py
-    // completed on the finalize path, so the sentinel-skip heuristic applies.
-    emit_progress(window, "update", "Starting vct-hub...", 97.0);
-    if let Err(e) = ensure_hub_started_after_update(install_path, HubRestartContext::PostInstall) {
-        tracing::warn!(
-            "[vct] finalize_update_and_restart: ensure_hub_started_after_update \
-             returned Err({}); continuing with launcher restart (hub will \
-             retry on next boot)",
-            e
-        );
-    }
-
-    if let Err(e) =
-        crate::commands::restart::restart_launcher(app, path_string.to_string()).await
-    {
-        // Recovery path: re-spawn install.py without
-        // VCT_AUTO_RESTART_LAUNCHER so the launcher_restart_required
-        // deferral gets emitted as a fallback and the banner fires on
-        // the next launcher start.
-        tracing::warn!(
-            "[vct] finalize_update_and_restart: auto-restart failed ({}); re-spawning \
-             install.py to emit the launcher_restart_required deferral as a \
-             fallback so the banner fires on next launcher start.",
-            e,
-        );
-        // v0.2.95 phase 3 (WP-3): the ONE home (see `install_py_command`).
-        // The three env vars below are this surface's OWN: it re-runs install.py
-        // for the sole purpose of making it EMIT the `launcher_restart_required`
-        // deferral, so it must un-tell install.py that Rust handles the restart.
-        let mut fallback = install_py_command(python_cmd, install_path, ["--update"]);
-        fallback.env("VCT_LAUNCHER_PID", std::process::id().to_string());
-        fallback.env_remove("VCT_AUTO_RESTART_LAUNCHER");
-        fallback.env("VCT_FORCE_RESTART_DEFERRAL", "1");
-        match fallback.output().await {
-            Ok(out) if out.status.success() => {
-                tracing::warn!(
-                    "[vct] finalize_update_and_restart: fallback install.py succeeded; \
-                     launcher_restart_required deferral should now be present."
-                );
-            }
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                tracing::warn!(
-                    "[vct] finalize_update_and_restart: fallback install.py exited \
-                     non-zero ({:?}). stderr tail: {}",
-                    out.status.code(),
-                    stderr.lines().rev().take(10).collect::<Vec<_>>().join(" | "),
-                );
-                return Err(format!(
-                    "Update applied but auto-restart failed AND the fallback \
-                     deferral emit failed. Please fully quit the launcher \
-                     (tray → Quit) and relaunch via your usual entrypoint to \
-                     pick up the new binary at {}/launcher/dist/.",
-                    install_path.display(),
-                ));
-            }
-            Err(spawn_err) => {
-                tracing::warn!(
-                    "[vct] finalize_update_and_restart: could not spawn fallback \
-                     install.py: {}. Surfacing the error to the GUI.",
-                    spawn_err,
-                );
-                return Err(format!(
-                    "Update applied but auto-restart failed and the fallback \
-                     install.py could not be spawned: {}. Please fully quit \
-                     the launcher and relaunch manually.",
-                    spawn_err,
-                ));
-            }
-        }
-    }
-
-    Ok(UpdateFinalizeOutcome { handoff_exit: false })
-}
-
-/// Run the post-pull install.py + hub-start + restart sequence. This is
-/// the tail shared by `update_orchestrator` (after `git pull --ff-only`)
-/// and the new merge/rebase commands. Extracted as a free function so
-/// the two callers can't drift apart.
-///
-/// On success: spawns the new launcher detached and exits the current
-/// process (never returns Ok in practice). On error before the restart
-/// hop, returns Err with the install.py stderr tail. On error AT the
-/// restart hop, attempts the install.py fallback to emit a
-/// `launcher_restart_required` deferral so the next session's banner
-/// picks it up.
-///
-/// Caller MUST have already:
-///   - stopped the hub (`ensure_hub_stopped_for_update`)
-///   - pre-pull-renamed binaries if Windows
-///   - confirmed the pull/merge/rebase succeeded
-///   - acquired the V52-AI gate (`pre_update_mcp_kill_sweep` +
-///     `UpdateInProgressGuard::new`) and passed the guard in
-///     (v0.2.54 P0-7: merge/rebase/resume share the gate + staging +
-///     handoff through this tail; pre-v0.2.54 they had neither, so
-///     both v0.2.52-class bugs — the stale-binary relaunch loop AND
-///     the MCP fork-bomb — were reachable verbatim through the
-///     divergence-modal Merge/Rebase buttons).
-/// v0.2.63: after a pull/merge reported success (and wasn't "Already up to
-/// date"), confirm local HEAD actually reached the upstream tip BEFORE running
-/// install.py. If HEAD is still behind `vco_upstream/<branch>`, the upstream
 /// What the post-pull HEAD-advance backstop established. Three outcomes, not
 /// two — see [`assert_head_reached_upstream`]'s `Err` arm for the third.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6746,6 +5638,9 @@ pub(crate) enum HeadAdvanceOutcome {
     Unverified { error: String },
 }
 
+/// v0.2.63: after a pull/merge reported success (and wasn't "Already up to
+/// date"), confirm local HEAD actually reached the upstream tip BEFORE running
+/// install.py. If HEAD is still behind `vco_upstream/<branch>`, the upstream
 /// changes did NOT land (a non-FF that slipped through, an odd partial git
 /// state) and running install.py would execute the STALE source tree — the
 /// exact failure that crashed VCO_dev's v0.2.62 GUI update (old install.py,
@@ -6759,9 +5654,9 @@ pub(crate) enum HeadAdvanceOutcome {
 ///     caller is TOLD rather than left to assume success (v0.2.92 WP-13).
 ///
 /// The pre-existing non-FF modal is the PRIMARY divergence guard; this is the
-/// backstop that the merge actually landed. Called from BOTH install.py choke
-/// points (`update_orchestrator` inline + `run_post_pull_install_and_restart`)
-/// — one concern, one home.
+/// backstop that the merge actually landed. Called from the update pipeline's
+/// phase 7 (`update_run`, every kind that moved HEAD) and the pull sequence
+/// (`update_pipeline`) — one concern, one home.
 pub(crate) async fn assert_head_reached_upstream(
     install_path: &Path,
 ) -> Result<HeadAdvanceOutcome, String> {
@@ -6814,8 +5709,10 @@ pub(crate) async fn assert_head_reached_upstream(
 /// call-sites. v0.2.71 (Piece 3, modularity) made it THE single home for this
 /// trio — the `revert_pre_pull_rename(binary)` + `revert_pre_pull_rename(hub)`
 /// + `let _ = ensure_hub_started_after_update(..)` idiom was hand-repeated 10+
-/// times across `update_orchestrator`, `merge_orchestrator_with_upstream`,
-/// `rebase_orchestrator_onto_upstream`, and `run_post_pull_install_and_restart`.
+/// times across the (since retired) `update_orchestrator`,
+/// `merge_orchestrator_with_upstream`, `rebase_orchestrator_onto_upstream`
+/// and `run_post_pull_install_and_restart`; since v0.2.100 its callers are the
+/// update pipeline (`update_pipeline`, `update_run`).
 /// Behaviour is byte-identical to every inline copy: each `Option<&Path>` is
 /// guarded before reverting, and the hub restart is best-effort (`let _ =`).
 /// Sites that do something extra (emit progress, write a sentinel) keep that
@@ -6871,864 +5768,6 @@ pub(crate) struct AbortRestoreOutcome {
     pub(crate) clobber_averted: bool,
 }
 
-async fn run_post_pull_install_and_restart<R: Runtime>(
-    app: AppHandle<R>,
-    install_path: &Path,
-    path_string: String,
-    window: &Window,
-    system: SystemDetection,
-    pre_pull_renamed: Option<PathBuf>,
-    pre_pull_renamed_hub: Option<PathBuf>,
-    update_gate_guard: &mut crate::commands::update_gate::UpdateInProgressGuard,
-) -> Result<InstallResult, String> {
-    emit_progress(window, "update", "Changes applied", 30.0);
-
-    // v0.2.63: HEAD-advance backstop (shared with update_orchestrator). The
-    // merge/rebase pull in the caller exited 0; confirm HEAD actually reached
-    // the upstream tip before install.py, else we'd run the STALE tree (the
-    // v0.2.62 update-crash class). Abort cleanly — revert binaries + restart
-    // hub — and surface the error to the modal flow instead of running install.
-    match assert_head_reached_upstream(install_path).await {
-        Ok(HeadAdvanceOutcome::Reached) => {}
-        // v0.2.92 WP-13 (item 8): same non-blocking-but-recorded treatment as
-        // the `update_orchestrator` call site. This surface has no `write_audit`
-        // closure in scope, so the durable ledger entry is the whole record.
-        Ok(HeadAdvanceOutcome::Unverified { error }) => {
-            let branch = resolve_pull_branch(install_path).await;
-            crate::commands::git_user_editable_merge::write_launcher_update_post_pull_unverified_deferral(
-                install_path,
-                &branch,
-                &error,
-            );
-        }
-        Err(e) => {
-            abort_update_restore_binaries_and_hub(
-                install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            return Err(e);
-        }
-    }
-
-    emit_progress(window, "install", "Applying updates...", 40.0);
-
-    // V52-AI: advance lockfile phase so future hub-side observers can
-    // see we've moved past git_pull (parity with `update_orchestrator`).
-    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
-
-    let python_cmd = &system.python_cmd;
-
-    // v0.2.95 ship-gate MINOR-8: close the launcher's managed launcher.db
-    // connection for the install.py window, exactly as `update_orchestrator`
-    // (installer.rs) and `apply_launcher_update` (self_update.rs) do around
-    // their own calls to the SAME runner.
-    //
-    // Two of the three call sites had it and this one did not, which is the
-    // whole finding: on Windows SQLite's writer lock is held exclusively by
-    // this process, so install.py's `_self_heal_kg_bindings_on_update` rebind
-    // times out after 5 s → `kg_binding_self_heal_db_error` deferral → the
-    // half-install loop v0.2.60 introduced the guard to end. And the paths
-    // that reach THIS tail — merge, rebase, resume, one-click conflict
-    // resolution, autostash-pop resolution — are precisely the ones a user
-    // takes when an update has already gone wrong, i.e. the worst place to
-    // reintroduce it.
-    //
-    // RAII: reopens on every exit path below, including the abort tails'
-    // early returns, and force-restarts the launcher if the reopen fails
-    // (which is safe here — every path through this function ends in a
-    // restart anyway).
-    let mut db_close_guard = DbUpdateClosedGuard::new(app.clone());
-
-    // v0.2.95 phase 2: ONE home for the spawn + the spawn-failure record +
-    // `handle_install_phase_exit`.
-    //
-    // CORRECTED v0.2.95 phase 3 (WP-3). Phase 2's comment here read "this tail
-    // has no progress window, so it passes `None`" — but this function takes
-    // `window: &Window` and has been emitting through it since its first line
-    // ("Changes applied" at 30 %, "Applying updates…" at 40 % above). It DOES
-    // have a modal; it simply never asked install.py to stream into it. The
-    // consequence is the one the surface map recorded (H6): every modal-driven
-    // recovery — merge, rebase, resume, conflict-resolve, autostash-pop-resolve
-    // (R9–R15), i.e. exactly the paths a user reaches when an update already
-    // went wrong — showed a frozen "Applying updates…" across install.py's
-    // multi-minute re-embed phase, while the badge's own update streamed
-    // sub-steps. `Some(window)` is what the rule actually says: a surface with
-    // a modal must not pretend it has none.
-    let install_run = match crate::commands::update_pipeline::run_install_py_update(
-        install_path,
-        python_cmd,
-        "run_post_pull_install_and_restart",
-        Some(window),
-    )
-    .await
-    {
-        Ok(run) => run,
-        Err(msg) => {
-            // Review R2 #4: same recovery as the non-zero-exit leg — put the
-            // pre-pull binaries and the hub back before reporting.
-            abort_update_restore_binaries_and_hub(
-                install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            return Err(msg);
-        }
-    };
-    if !install_run.success {
-        // v0.2.71: shared recovery tail.
-        abort_update_restore_binaries_and_hub(
-            install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        return Err(format!("Update failed: {}", install_run.stderr));
-    }
-
-    // install.py is done with the DB — reopen explicitly rather than waiting
-    // for the guard's Drop, so the binary-refresh / restart window below runs
-    // with a live connection (same ordering as `update_orchestrator`).
-    db_close_guard.reopen();
-
-    // V52-AI: advance lockfile phase. install.py has finished; we're
-    // now in the binary-refresh + hub-restart window. MCPs that try to
-    // spawn during this window still see the lockfile and exit cleanly.
-    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::BinaryRefresh);
-
-    // Self-contained branch detection so this helper doesn't need
-    // a branch parameter ripped through both call sites
-    // (`merge_orchestrator_with_upstream` /
-    // `rebase_orchestrator_onto_upstream`).
-    // v0.2.92 WP-13: through the ONE resolver (was the fifth inline copy).
-    let v45b_branch = resolve_pull_branch(install_path).await;
-
-    // v0.2.93 (stale status cache): same refresh as `update_orchestrator`'s
-    // inline tail — this helper is the post-pull tail for merge / rebase /
-    // RESUME, so a merge completed from a shell + "Continue Update" also
-    // stops reporting the pre-merge "N commits behind". Soft-fail.
-    crate::commands::self_update::refresh_cached_state_after_pull(install_path, &v45b_branch)
-        .await;
-
-    // v0.2.54 Track C (P0-7): shared finalize tail — V45-B binary wait,
-    // V52-AI disarm, V52-AH staging + handoff, hub restart (no-handoff
-    // path only), legacy restart + deferral fallback.
-    let finalize = finalize_update_and_restart(
-        app,
-        install_path,
-        &path_string,
-        window,
-        python_cmd,
-        &v45b_branch,
-        update_gate_guard,
-    )
-    .await?;
-
-    if finalize.handoff_exit {
-        return Ok(InstallResult {
-            success: true,
-            install_path: path_string,
-            message: "Update applied — vct-updater is performing the binary swap. \
-                      The launcher will relaunch automatically."
-                .to_string(),
-            system,
-        });
-    }
-
-    emit_progress(window, "done", "Orchestrator updated successfully!", 100.0);
-
-    Ok(InstallResult {
-        success: true,
-        install_path: path_string,
-        message: "Orchestrator updated successfully".to_string(),
-        system,
-    })
-}
-
-/// Merge upstream into the local branch without --ff-only. Produces a
-/// merge commit when histories diverge cleanly; surfaces a structured
-/// conflict payload otherwise.
-///
-/// Wire-shape:
-///   - Same input as `update_orchestrator` (path, window).
-///   - Same prep choreography: stop hub, pre-pull-rename binaries.
-///   - Same post-success tail: install.py --update, restart launcher.
-///   - On merge conflict: leaves the working tree conflicted, returns
-///     a structured "orchestrator_update_conflict" error. The frontend
-///     renders the conflict modal; the user resolves manually OR clicks
-///     "Abort" which calls `abort_orchestrator_merge_or_rebase`.
-#[command]
-pub async fn merge_orchestrator_with_upstream<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-) -> Result<InstallResult, String> {
-    // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. This surface stops the hub,
-    // renames both binaries aside and runs `install.py --update` on the SAME
-    // clone `update_orchestrator`, `apply_launcher_update` and
-    // `force_resync_launcher` claim — so it takes the same claim. Before the
-    // `.git` probe and the in-progress refusal, both of which are reads: a
-    // refusal that names the update already running is the more useful answer
-    // when one is, and nothing below may start while it is.
-    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
-
-    let install_path = PathBuf::from(&path);
-    let system = detect_system().await?;
-
-    if !install_path.join(".git").exists() {
-        return Err("Not a git repository — cannot merge".to_string());
-    }
-
-    // v0.2.93 (field incident 2026-09-07): a merge/rebase is ALREADY in
-    // progress → reopen the conflict modal on it instead of running a
-    // second pull that git would only refuse. Before the kill-sweep, hub
-    // stop, binary renames and fetch — none of them apply to a tree we are
-    // not going to touch. See `refuse_if_merge_or_rebase_in_progress`.
-    if let Some(payload) = refuse_if_merge_or_rebase_in_progress(
-        &install_path,
-        "merge_orchestrator_with_upstream",
-    )
-    .await
-    {
-        return Err(payload);
-    }
-
-    // V52-AI (v0.2.54 P0-7): the merge path runs install.py + binary
-    // refresh via the shared post-pull tail — the exact window where
-    // the Windows MCP fork-bomb (V52-AI bug class) historically formed.
-    // Pre-v0.2.54 this path had NEITHER the kill-sweep NOR the gate,
-    // so the fork-bomb was reachable verbatim through the divergence-
-    // modal "Merge" button. Same shape as `update_orchestrator`:
-    // pre-sweep + RAII lockfile guard. The guard is handed to
-    // `run_post_pull_install_and_restart`, which disarms it before the
-    // restart hop; on every early return (conflict modal, pull
-    // failure, already-up-to-date) the guard's Drop removes the
-    // lockfile so MCPs can respawn while the user resolves conflicts.
-    let pre_sweep_count_merge = crate::commands::update_gate::pre_update_mcp_kill_sweep();
-    if pre_sweep_count_merge > 0 {
-        tracing::info!(
-            "[vct] merge_orchestrator_with_upstream: pre-sweep terminated {} \
-             MCP-shaped process(es) before merge",
-            pre_sweep_count_merge
-        );
-    }
-    let (mut update_gate_guard, _gate_write_result) =
-        crate::commands::update_gate::UpdateInProgressGuard::new();
-
-    // Same upstream-pin choreography as update_orchestrator.
-    crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
-
-    // v0.2.95 phase 3: through the ONE home for the hub stop + the two
-    // pre-pull renames (`update_pipeline::stop_hub_and_rename_binaries_aside`).
-    // Same two progress events, same wording, same order — all derived from
-    // `operation`.
-    let renames = crate::commands::update_pipeline::stop_hub_and_rename_binaries_aside(
-        &install_path,
-        "merge",
-        Some("git pull"),
-        |stage: &str, message: &str, pct: f32| emit_progress(&window, stage, message, pct),
-    )?;
-    let pre_pull_renamed_hub = renames.hub;
-    let pre_pull_renamed = renames.launcher;
-
-    let pull_branch = resolve_pull_branch(&install_path).await;
-
-    // v0.2.24 §A0 (2026-05-22): pre-merge user-editable files BEFORE
-    // the merge pull. Same rationale as the `update_orchestrator`
-    // pre-merge: when the user has local uncommitted edits to
-    // CLAUDE.md / knowledge/**/*.md / .claude/CONTEXT_STATE.md /
-    // .claude/MEMORY.md / HANDOFF-*.md, the bare `git pull --no-rebase`
-    // refuses with "Your local changes would be overwritten by merge".
-    // The pre-merge auto-resolves non-overlapping edits and sidecars
-    // conflicting ones so the merge can proceed.
-    //
-    // Best-effort: failures fall through to the bare pull which will
-    // surface the original error via the existing B4 modal flow.
-    emit_progress(&window, "update", "Fetching upstream for pre-merge...", 7.0);
-    // v0.2.83 (D5): single serialized fetch home (Quick, branch refspec).
-    // Soft-fail posture preserved — failures fall through to the bare pull
-    // which surfaces the original error via the existing B4 modal flow.
-    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
-        &install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
-        Some(&pull_branch),
-    )
-    .await
-    {
-        tracing::warn!(
-            "[vct] merge_orchestrator_with_upstream: pre-merge fetch failed: {} — continuing",
-            e
-        );
-    }
-    let pre_merge_outcomes = run_pre_merge_user_editable(&install_path, &pull_branch).await;
-
-    // v0.2.24 §A0 (Q1 fix): emit deferral entries BEFORE the git pull
-    // merge. Rationale: when pre-merge produces sidecars (true 3-way
-    // conflict), the bare `git pull --no-rebase` may STILL fail (the
-    // sidecar leaves the working tree dirty, plus other tracked files
-    // may have committed-divergence conflicts that git's own merge
-    // can't reconcile). User then sees the B4 conflict modal — without
-    // the deferral entries on disk, they lose the audit trail of which
-    // files pre-merge sidecar'd vs auto-merged. Emit unconditionally
-    // so the deferral lands regardless of pull outcome. Best-effort.
-    maybe_emit_pre_merge_deferrals(&install_path, &pre_merge_outcomes, &pull_branch);
-
-    // v0.2.78 ITEM #0 (F2 keystone): handle UNTRACKED-file collisions with
-    // upstream-added files BEFORE the pull. A new-in-release file present
-    // locally untracked makes `git pull` abort ("untracked working tree files
-    // would be overwritten by merge"), which the old code mis-routed into the
-    // editor-resolve conflict modal (inapplicable to untracked files). Here we
-    // auto-remove byte-identical copies (safe — same bytes upstream ships) and
-    // surface a keep-mine/take-upstream modal + deferral for divergent ones.
-    // Err ⇒ divergent collision (or an un-removable identical one): restore the
-    // pre-pull binary renames + hub and return the payload (never proceed on a
-    // tree the pull would abort on).
-    emit_progress(&window, "update", "Checking for untracked-file collisions...", 8.0);
-    if let Err(collision_payload) =
-        handle_untracked_collisions_pre_pull(&install_path, "merge", &pull_branch).await
-    {
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        return Err(collision_payload);
-    }
-
-    // v0.2.89 §4.3 (belt-and-braces): reconcile GENERATED / release-controlled
-    // files to upstream (take-upstream) BEFORE the direct merge pull. There is
-    // no plan resolver on THIS surface — the reconcile simply removes generated
-    // files (lockfiles / package.json / Cargo.lock / dist/**) from the conflict
-    // the `git pull --no-rebase --autostash` below would otherwise hit. Value:
-    // when the modal surfaced for a MIXED reason (a genuine source conflict +
-    // lockfile divergence), "Merge upstream" now conflicts ONLY on the source
-    // file and the conflict modal lists only genuinely-actionable paths. Any
-    // synthetic take-upstream commit it creates is folded by the merge pull's
-    // own 3-way (identical end-tree blobs ⇒ trivially clean). Best-effort: a
-    // per-file failure leaves that file divergent → today's conflict flow still
-    // surfaces (never worse than before). v0.2.89 MINOR-1: the audit deferral
-    // is emitted by THIS surface AFTER the merge pull succeeds (search MINOR-1
-    // below), NOT inside the helper — a pre-pull emit would dirty CLAUDE.md.
-    emit_progress(&window, "update", "Reconciling generated files to upstream...", 9.0);
-    let gen_reconcile =
-        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
-            &install_path,
-            &pull_branch,
-        )
-        .await;
-    if gen_reconcile.reconcile_committed
-        || !gen_reconcile.took_upstream.is_empty()
-        || !gen_reconcile.restored_worktree.is_empty()
-    {
-        tracing::info!(
-            "[vct] merge_orchestrator_with_upstream: reconciled generated/release-controlled \
-             file(s) to upstream — {} committed take-upstream, {} worktree-restored \
-             (reconcile_committed={})",
-            gen_reconcile.took_upstream.len(),
-            gen_reconcile.restored_worktree.len(),
-            gen_reconcile.reconcile_committed
-        );
-    }
-
-    // Pull WITHOUT --ff-only, explicitly as a merge (--no-rebase). The
-    // explicit reconcile flag is REQUIRED on git 2.34+: without it git
-    // refuses a divergent pull with "Need to specify how to reconcile
-    // divergent branches" because the user's `pull.rebase` config could
-    // be anything.
-    //
-    // --no-edit suppresses the editor for the merge commit message — a
-    // Tauri subprocess has no controlling tty and would hang otherwise.
-    // v0.2.71: --autostash is REQUIRED here. This command is reached
-    // precisely from the divergence modal, i.e. AFTER update_orchestrator's
-    // pop-conflict-risk set was non-empty (a tracked-modified file overlapping
-    // upstream, e.g. a dirty .gitignore). Without --autostash, `git pull`
-    // refuses on the dirty tree ("Your local changes ... would be overwritten
-    // by merge") BEFORE merging — a refusal whose wording isn't a "conflict"
-    // phrase, so it fell through to the bare-error branch below and DEAD-ENDED
-    // the modal (Merge fails, Rebase fails, user stuck at "open clone folder").
-    // --autostash stashes the dirty tracked edits, merges, then pops; the
-    // common case (non-overlapping regions, e.g. the .gitignore append) pops
-    // clean. A genuine pop-conflict is caught by the dirty-tree/conflict
-    // detection below and routed to the conflict modal + UPDATE_DEFERRED, not
-    // a bare error. (The update_orchestrator auto-merge arm already proves
-    // --autostash is acceptable on this path.)
-    emit_progress(&window, "update", "Merging upstream into local...", 10.0);
-    let pull = run_git_raw(
-        &install_path,
-        &[
-            "pull",
-            "--no-rebase",
-            "--no-edit",
-            "--autostash",
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            pull_branch.as_str(),
-        ],
-    )
-    .await
-    .map_err(|e| format!("git pull (merge) failed: {}", e))?;
-
-    if !pull.status.success() {
-        let stderr = String::from_utf8_lossy(&pull.stderr);
-        let stdout = String::from_utf8_lossy(&pull.stdout);
-        // Conflicts go to stdout on some git versions (the "CONFLICT
-        // (content): ..." lines). Check both streams.
-        let combined = format!("{}\n{}", stderr, stdout);
-
-        // v0.2.93 (field incident 2026-09-07): THE incident's second click.
-        // git refused the pull because the first click's merge is still in
-        // progress ("You have not concluded your merge (MERGE_HEAD
-        // exists)") — pre-fix this fell to the generic branch below: no
-        // sentinel, no modal, a bare toast. Tested BEFORE the conflict
-        // classifier (see `is_merge_in_progress_refusal`). Same payload
-        // shape as the conflict branch so the modal opens on the stalled
-        // merge; the sentinel is (re)written only if absent.
-        if crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined) {
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            return Err(handle_merge_in_progress_refusal(
-                &install_path,
-                "merge_orchestrator_with_upstream",
-                &pull_branch,
-                "merge",
-                &combined,
-            )
-            .await);
-        }
-
-        if is_merge_or_rebase_conflict(&combined) {
-            // Conflict: leave the working tree in the conflicted state
-            // so the user can edit files manually. Revert the pre-pull
-            // renames (the binaries are still the OLD versions on disk —
-            // git pull didn't get far enough to swap them) so the canonical
-            // paths point at the working binary again, and bring the hub
-            // back up — the user is going to spend time resolving conflicts
-            // and shouldn't be without it. v0.2.71: shared tail.
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-
-            // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
-            // returning the conflict payload. The user's modal flow may
-            // dismiss without aborting; the sentinel + UpdateBadge bring
-            // them back via the launcher GUI, while UPDATE_DEFERRED.md
-            // surfaces the same state to terminal Claude sessions.
-            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
-            let sentinel_written =
-                write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
-
-            let conflicted = collect_conflicted_files(&install_path).await;
-            log_conflict_payload_return(
-                "merge_orchestrator_with_upstream",
-                "merge",
-                &conflicted,
-                sentinel_written,
-            );
-            return Err(serialize_orchestrator_conflict_error(
-                "merge",
-                &pull_branch,
-                &conflicted,
-                combined.trim(),
-            ));
-        }
-
-        // Non-conflict failure (network, refusing unrelated histories
-        // for the very first merge, etc.). Revert + restart hub + bail.
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        log_generic_pull_failure("merge_orchestrator_with_upstream", "git pull (merge)", &stderr);
-        return Err(format!("git pull (merge) failed: {}", stderr));
-    }
-
-    // v0.2.71 (Piece 3.3): success-path autostash-pop backstop — ported from
-    // `update_orchestrator` (the modal merge command lacked it). `git pull
-    // --no-rebase --autostash` can EXIT 0 yet leave the tree broken: it
-    // stashes the dirty tracked edits (the divergence modal is reached
-    // precisely on a dirty-tree-overlapping-upstream case), merges, then POPS
-    // the stash. If the pop conflicts, git prints "Applying autostash resulted
-    // in conflicts." + leaves `UU` markers + a dangling stash but STILL exits
-    // 0 — so `!pull.status.success()` above does NOT catch it, and proceeding
-    // would run install.py + restart on a silently-broken tree. Detect it here
-    // (unmerged files and/or the autostash marker) and route to the conflict
-    // modal + resume sentinel + UPDATE_DEFERRED exactly like the non-zero
-    // conflict branch, so the user gets a guided recovery, never a dead-end.
-    {
-        let pull_combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&pull.stdout),
-            String::from_utf8_lossy(&pull.stderr)
-        );
-        let autostash_pop_failed = pull_combined.contains("autostash resulted in conflicts")
-            || pull_combined.contains("Applying autostash");
-        let unmerged = collect_conflicted_files(&install_path).await;
-        // v0.2.88 (NIT-12): the index is the authority. An autostash marker with
-        // NO unmerged entries means the pop applied clean — do NOT emit an empty
-        // "0 file(s)" conflict modal; fall through to the normal path.
-        if autostash_pop_failed && unmerged.is_empty() {
-            tracing::warn!(
-                "[vct] merge_orchestrator_with_upstream: autostash marker present but the \
-                 index has NO unmerged entries — the pop left the tree clean; continuing."
-            );
-        }
-        if !unmerged.is_empty() {
-            tracing::warn!(
-                "[vct] merge_orchestrator_with_upstream: pull exited 0 but the working tree \
-                 has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
-                 conflict modal instead of proceeding on a broken tree.",
-                unmerged.len(),
-                if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
-            );
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            let sentinel_written =
-                write_resume_sentinel_and_deferral(&install_path, "merge", &pull_branch).await;
-            log_conflict_payload_return(
-                "merge_orchestrator_with_upstream",
-                "merge",
-                &unmerged,
-                sentinel_written,
-            );
-            return Err(serialize_orchestrator_conflict_error(
-                "merge",
-                &pull_branch,
-                &unmerged,
-                pull_combined.trim(),
-            ));
-        }
-    }
-
-    let pull_output = String::from_utf8_lossy(&pull.stdout);
-    if pull_output.contains("Already up to date") {
-        emit_progress(&window, "done", "Already up to date!", 100.0);
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        // v0.2.91 WI-2 (merge sibling of the `update_orchestrator` branch):
-        // an early return here skipped every staging/handoff path, so a stale
-        // dist binary stayed stale forever. Reconcile at rest AFTER the revert
-        // has put a working binary back at the canonical path — see the long
-        // ordering note on the `update_orchestrator` branch.
-        let heal = crate::services::binary_freshness::reconcile_dist_at_rest(&install_path).await;
-        // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE
-        // the pull (see above) — no second call needed here.
-        let message = if heal.is_stale() {
-            "Already up to date — but the launcher binary on disk is newer than the running \
-             one. Quit and relaunch to pick it up."
-                .to_string()
-        } else {
-            "Already up to date".to_string()
-        };
-        return Ok(InstallResult {
-            success: true,
-            install_path: path,
-            message,
-            system,
-        });
-    }
-
-    // v0.2.24 §A0 (Q1 fix): deferrals were already emitted BEFORE the
-    // pull (see above) — no second call needed here.
-
-    // v0.2.89 MINOR-1: emit the generated-file reconcile audit deferral HERE —
-    // AFTER the merge pull succeeded, NOT inside the shared helper. Emitting
-    // injects a reminder block into the tracked CLAUDE.md; doing it pre-pull
-    // would dirty CLAUDE.md. Best-effort (no-op when nothing was reconciled);
-    // self-clears on the install.py --update run inside run_post_pull_* below.
-    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
-        &install_path,
-        &gen_reconcile,
-    );
-
-    run_post_pull_install_and_restart(
-        app,
-        &install_path,
-        path,
-        &window,
-        system,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        &mut update_gate_guard,
-    )
-    .await
-}
-
-/// Rebase the local branch onto upstream. Replays the user's local
-/// commits on top of upstream rather than producing a merge commit;
-/// surfaces a structured conflict payload if any commit doesn't apply
-/// cleanly.
-///
-/// Same wire-shape as `merge_orchestrator_with_upstream`. The flow:
-///   1. Stop hub, pre-pull-rename binaries.
-///   2. `git fetch <upstream>` (rebase needs the upstream ref locally).
-///   3. `git rebase <upstream>/<branch>`.
-///   4. On conflict: surface "orchestrator_update_conflict" error.
-///   5. On success: install.py --update + restart.
-#[command]
-pub async fn rebase_orchestrator_onto_upstream<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-) -> Result<InstallResult, String> {
-    // Ledger step 40 / v0.2.95 ship-gate MAJOR-3 — the merge sibling's claim,
-    // for the identical reason (same clone, same hub stop, same
-    // `install.py --update`). The two modal buttons sit side by side; guarding
-    // one and not the other would guard nothing.
-    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
-
-    let install_path = PathBuf::from(&path);
-    let system = detect_system().await?;
-
-    if !install_path.join(".git").exists() {
-        return Err("Not a git repository — cannot rebase".to_string());
-    }
-
-    // v0.2.93: same pre-flight as the merge sibling — a stalled merge or
-    // rebase reopens the conflict modal instead of starting a second
-    // operation git would refuse. Before any sweep / hub stop / rename.
-    if let Some(payload) = refuse_if_merge_or_rebase_in_progress(
-        &install_path,
-        "rebase_orchestrator_onto_upstream",
-    )
-    .await
-    {
-        return Err(payload);
-    }
-
-    // V52-AI (v0.2.54 P0-7): same fork-bomb gate as the merge path —
-    // see `merge_orchestrator_with_upstream` for the full rationale.
-    // Pre-v0.2.54 the rebase path had neither sweep nor gate.
-    let pre_sweep_count_rebase = crate::commands::update_gate::pre_update_mcp_kill_sweep();
-    if pre_sweep_count_rebase > 0 {
-        tracing::info!(
-            "[vct] rebase_orchestrator_onto_upstream: pre-sweep terminated {} \
-             MCP-shaped process(es) before rebase",
-            pre_sweep_count_rebase
-        );
-    }
-    let (mut update_gate_guard, _gate_write_result) =
-        crate::commands::update_gate::UpdateInProgressGuard::new();
-
-    crate::commands::self_update::ensure_upstream_remote(&install_path).await?;
-
-    // v0.2.95 phase 3: the ONE home (see the merge surface above).
-    let renames = crate::commands::update_pipeline::stop_hub_and_rename_binaries_aside(
-        &install_path,
-        "rebase",
-        Some("git rebase"),
-        |stage: &str, message: &str, pct: f32| emit_progress(&window, stage, message, pct),
-    )?;
-    let pre_pull_renamed_hub = renames.hub;
-    let pre_pull_renamed = renames.launcher;
-
-    let pull_branch = resolve_pull_branch(&install_path).await;
-
-    // Rebase requires a fresh upstream ref. Without --ff-only we use
-    // `git fetch` + `git rebase <remote>/<branch>` rather than `git pull
-    // --rebase` so a partial network failure doesn't leave us with a
-    // half-applied rebase.
-    emit_progress(&window, "update", "Fetching upstream for rebase...", 10.0);
-    // v0.2.83 (D5): single serialized fetch home (Quick, branch refspec).
-    // HARD-fail posture preserved — a rebase needs a fresh upstream ref, so on
-    // fetch failure we restore the pre-pull binary/hub renames and abort rather
-    // than risk a half-applied rebase. `serialized_fetch_upstream` collapses
-    // spawn error + non-zero exit into one error string (the last git stderr
-    // line), so a single failure branch replaces the former two.
-    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
-        &install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
-        Some(&pull_branch),
-    )
-    .await
-    {
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        return Err(format!("git fetch failed: {}", e));
-    }
-
-    // v0.2.78 ITEM #0 (F2 keystone): same untracked-collision handling as the
-    // merge path — one shared home (`handle_untracked_collisions_pre_pull`).
-    // Runs after the fetch (so base/theirs resolve) and before the rebase.
-    emit_progress(&window, "update", "Checking for untracked-file collisions...", 15.0);
-    if let Err(collision_payload) =
-        handle_untracked_collisions_pre_pull(&install_path, "rebase", &pull_branch).await
-    {
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        return Err(collision_payload);
-    }
-
-    // v0.2.89 §4.3 — the generated/release-controlled take-upstream reconcile
-    // (`resolve_generated_files_to_upstream`, wired into `update_orchestrator`
-    // and `merge_orchestrator_with_upstream`) is DELIBERATELY NOT wired here.
-    // `git rebase` replays the fork's ORIGINAL generated-file commits (the local
-    // dep-bump / lockfile / dist commits) one-by-one onto upstream; those
-    // ORIGINAL commits replay BEFORE any synthetic reconcile commit could and
-    // conflict against upstream's changed blocks regardless — so a pre-rebase
-    // reconcile cannot un-conflict the rebase arm (a reconcile commit at the tip
-    // does nothing for commits that replay earlier in the series). The merge arm
-    // works because `git merge-tree`/`git pull --no-rebase` operate on END TREES
-    // (where ours == theirs for every reconciled path). The Rebase modal button
-    // therefore stays the honest surface for the user who explicitly chose to
-    // linearise: it will still conflict on the generated files, resolvable by
-    // hand or by re-running from the (auto-resolving) merge path.
-    emit_progress(&window, "update", "Rebasing local onto upstream...", 20.0);
-    let upstream_ref = format!(
-        "{}/{}",
-        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-        pull_branch
-    );
-    // v0.2.71: --autostash here too (sibling to the merge command's fix). The
-    // rebase modal button is reached on the same dirty-tree-overlapping-upstream
-    // path; without --autostash, bare `git rebase` refuses ("cannot rebase: You
-    // have unstaged changes") and dead-ended the modal. --autostash stashes,
-    // rebases, then pops; a pop-conflict is caught as a conflict below and
-    // routed to the conflict modal + UPDATE_DEFERRED, not a bare error.
-    let rebase = run_git_raw(
-        &install_path,
-        &["rebase", "--autostash", upstream_ref.as_str()],
-    )
-    .await
-    .map_err(|e| format!("git rebase failed: {}", e))?;
-
-    if !rebase.status.success() {
-        let stderr = String::from_utf8_lossy(&rebase.stderr);
-        let stdout = String::from_utf8_lossy(&rebase.stdout);
-        let combined = format!("{}\n{}", stderr, stdout);
-
-        if is_merge_or_rebase_conflict(&combined) {
-            // Conflict — leave the rebase in progress so the user can
-            // resolve manually. Revert pre-pull renames (binaries are
-            // still old on disk) + restart hub for productivity.
-            // v0.2.71: shared tail.
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-
-            // v0.2.51 Bug A: write the resume sentinel + deferral BEFORE
-            // returning the conflict payload (see merge_orchestrator_with_upstream
-            // for the rationale). The rebase leaves HEAD at the original
-            // SHA + a partially-applied series in .git/rebase-{merge,apply}/;
-            // the sentinel captures that SHA so resume can verify HEAD
-            // actually moved before re-entering install.py. The deferral
-            // mirrors the state into UPDATE_DEFERRED.md for terminal
-            // Claude sessions.
-            // v0.2.53 DEDUP-14: paired writer so one cannot be forgotten.
-            let sentinel_written =
-                write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
-
-            let conflicted = collect_conflicted_files(&install_path).await;
-            log_conflict_payload_return(
-                "rebase_orchestrator_onto_upstream",
-                "rebase",
-                &conflicted,
-                sentinel_written,
-            );
-            return Err(serialize_orchestrator_conflict_error(
-                "rebase",
-                &pull_branch,
-                &conflicted,
-                combined.trim(),
-            ));
-        }
-
-        abort_update_restore_binaries_and_hub(
-            &install_path,
-            pre_pull_renamed.as_deref(),
-            pre_pull_renamed_hub.as_deref(),
-        );
-        log_generic_pull_failure("rebase_orchestrator_onto_upstream", "git rebase", &stderr);
-        return Err(format!("git rebase failed: {}", stderr));
-    }
-
-    // v0.2.71 (Piece 3.3): success-path autostash-pop backstop — sibling to
-    // the merge command's. `git rebase --autostash` can complete the rebase
-    // (exit 0) yet leave the tree broken when the final autostash POP
-    // conflicts ("could not apply autostash" / "Applying autostash resulted
-    // in conflicts" + `UU` markers + a dangling stash). The
-    // `!rebase.status.success()` branch above does NOT catch that, and
-    // proceeding would run install.py + restart on a silently-broken tree.
-    // Detect it here and route to the conflict modal + resume sentinel +
-    // UPDATE_DEFERRED, never a dead-end.
-    {
-        let rebase_combined = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&rebase.stdout),
-            String::from_utf8_lossy(&rebase.stderr)
-        );
-        let autostash_pop_failed = rebase_combined.contains("autostash resulted in conflicts")
-            || rebase_combined.contains("Applying autostash")
-            || rebase_combined.contains("could not apply autostash");
-        let unmerged = collect_conflicted_files(&install_path).await;
-        // v0.2.88 (NIT-12): the index is the authority. An autostash marker with
-        // NO unmerged entries means the pop applied clean — do NOT emit an empty
-        // "0 file(s)" conflict modal; fall through to the normal path.
-        if autostash_pop_failed && unmerged.is_empty() {
-            tracing::warn!(
-                "[vct] rebase_orchestrator_onto_upstream: autostash marker present but the \
-                 index has NO unmerged entries — the pop left the tree clean; continuing."
-            );
-        }
-        if !unmerged.is_empty() {
-            tracing::info!(
-                "[vct] rebase_orchestrator_onto_upstream: rebase exited 0 but the working tree \
-                 has {} unmerged file(s){} — an --autostash pop conflict. Routing to the \
-                 conflict modal instead of proceeding on a broken tree.",
-                unmerged.len(),
-                if autostash_pop_failed { " + autostash-conflict marker" } else { "" },
-            );
-            abort_update_restore_binaries_and_hub(
-                &install_path,
-                pre_pull_renamed.as_deref(),
-                pre_pull_renamed_hub.as_deref(),
-            );
-            let sentinel_written =
-                write_resume_sentinel_and_deferral(&install_path, "rebase", &pull_branch).await;
-            log_conflict_payload_return(
-                "rebase_orchestrator_onto_upstream",
-                "rebase",
-                &unmerged,
-                sentinel_written,
-            );
-            return Err(serialize_orchestrator_conflict_error(
-                "rebase",
-                &pull_branch,
-                &unmerged,
-                rebase_combined.trim(),
-            ));
-        }
-    }
-
-    run_post_pull_install_and_restart(
-        app,
-        &install_path,
-        path,
-        &window,
-        system,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        &mut update_gate_guard,
-    )
-    .await
-}
 
 /// Abort an in-progress merge or rebase, restoring the working tree to
 /// the state it was in before the merge/rebase started. Best-effort:
@@ -7759,7 +5798,8 @@ pub async fn abort_orchestrator_merge_or_rebase(path: String) -> Result<(), Stri
 ///
 /// Two callers, and the split is what lets them coexist:
 ///   * the `#[command]` above, which takes the claim first;
-///   * `self_update::force_resync_launcher`, which is ALREADY holding the
+///   * the update pipeline's `ResetHard` git operation
+///     (`update_run::reset_hard_git_op`), which is ALREADY holding the
 ///     claim when it needs to abort (v0.2.95 ship-gate MINOR-4 — a
 ///     `git reset --hard` does not clear `.git/rebase-merge`, so a resync over
 ///     a mid-rebase tree would leave the clone wedged in a rebase that no
@@ -7851,12 +5891,12 @@ pub(crate) async fn abort_merge_or_rebase_unclaimed(install_path: &Path) -> Resu
 //   2. `check_for_updates` reads the sentinel + the `.git/MERGE_HEAD`
 //      state to compute a new `merge_resolved_incomplete` flag — true
 //      once the user has finished the merge but install.py hasn't run.
-//   3. The new `resume_orchestrator_update` Tauri command verifies the
-//      working tree is clean (no `<<<<<<<` markers, no in-flight merge)
-//      and then re-enters the post-pull tail via
-//      `run_post_pull_install_and_restart`.
+//   3. A `Resume` run of the update pipeline (v0.2.100:
+//      `run_orchestrator_update`, `update_pipeline::classify_resume`)
+//      verifies the working tree is clean (no `<<<<<<<` markers, no
+//      in-flight merge) and then runs install.py + the relaunch.
 //   4. Both `abort_orchestrator_merge_or_rebase` and a successful
-//      `resume_orchestrator_update` clear the sentinel.
+//      resume clear the sentinel.
 //
 // The sentinel lives under `.claude/state/`, NOT `.git/` (we don't want
 // to pollute the git directory; the file is launcher state, not git state).
@@ -7879,8 +5919,8 @@ pub(crate) struct UpdateResumeSentinel {
     pub operation: String,
     /// Branch the conflict happened on (e.g. `main`).
     pub branch: String,
-    /// HEAD SHA at the moment of the conflict. Used by
-    /// `resume_orchestrator_update` to refuse a resume when HEAD hasn't
+    /// HEAD SHA at the moment of the conflict. Used by the pipeline's resume
+    /// (`update_pipeline::classify_resume`) to refuse a resume when HEAD hasn't
     /// advanced (= user aborted via CLI; sentinel is stale).
     pub sha_at_conflict: String,
     /// ISO-8601 UTC timestamp the sentinel was written.
@@ -7891,7 +5931,7 @@ pub(crate) struct UpdateResumeSentinel {
 /// when the file is absent, malformed, or the schema is unknown — the
 /// caller treats any of those as "no resume pending" so a broken
 /// sentinel never wedges the UpdateBadge.
-fn read_update_resume_sentinel(install_path: &Path) -> Option<UpdateResumeSentinel> {
+pub(crate) fn read_update_resume_sentinel(install_path: &Path) -> Option<UpdateResumeSentinel> {
     let path = install_path.join(UPDATE_RESUME_SENTINEL_REL);
     let txt = std::fs::read_to_string(&path).ok()?;
     let parsed: UpdateResumeSentinel = serde_json::from_str(&txt).ok()?;
@@ -8009,8 +6049,8 @@ pub(crate) fn clear_update_resume_sentinel(install_path: &Path) {
 ///
 /// The Markdown shape mirrors what `vco_lib/deferral_report.py`
 /// produces (`_render_frontmatter` + `_render_header` + `_render_entry`),
-/// so when install.py eventually runs (whether via resume_orchestrator_update
-/// or a manual `python install.py --update`), `DeferralReport.read()`
+/// so when install.py eventually runs (whether via the launcher's Continue
+/// Update — a `Resume` run of the pipeline — or a manual `python install.py --update`), `DeferralReport.read()`
 /// parses our entry, recognizes it by condition_id, and treats it as
 /// resolved on the next write (since install.py running IS the
 /// resolution).
@@ -8083,7 +6123,7 @@ Each section below names a condition and the exact command to apply it.\n\
 \n\
 **Title**: Orchestrator update halted at a conflict — resume needed\n\
 \n\
-**Detected**: A previous `update_orchestrator` ({op_phrase} on `{branch}`) halted at \
+**Detected**: A previous orchestrator update ({op_phrase} on `{branch}`) halted at \
 a conflict, and the conflict was resolved outside the launcher (CLI `git add` + \
 `git commit`, or editor save + commit). However, `install.py --update` and the \
 launcher binary refresh never ran, so the install manifest (`state/install-manifest.json::version`) \
@@ -8161,15 +6201,14 @@ next successful install.py run, so the resolution is one command.\n\
 // v0.2.55 (durable-logging fix): the launcher-side update-diverged deferral
 // writer + its `LauncherUpdateDivergedKind` enum were RELOCATED in v0.2.71
 // Sweep-A#3 to `git_user_editable_merge` (a shared module) so the launcher
-// SELF-update surface (`self_update::apply_launcher_update`) can write the
-// SAME durable `UPDATE_DEFERRED.md` trace this installer surface already
-// emits — without a circular import and without a second copy of the writer.
+// update pipeline (`update_run`) writes the SAME durable `UPDATE_DEFERRED.md`
+// trace — without a circular import and without a second copy of the writer.
 // installer.rs refers to them via the top-level
 // `use crate::commands::git_user_editable_merge::{…}` import; the
 // behaviour/output is unchanged (the body moved verbatim).
 
 /// v0.2.51 Bug A: best-effort clear of the `update_resume_required`
-/// deferral entry. Called from `resume_orchestrator_update` (after
+/// deferral entry. Called from the pipeline's resume (after
 /// v0.2.53 DEDUP-14 (PROMOTED from `rust-installer-dedup-2026-06-10.md`
 /// §Finding E): paired sentinel + deferral writer.
 ///
@@ -8303,14 +6342,15 @@ pub(crate) fn clear_update_resume_deferral_if_solo(install_path: &Path) {
 }
 
 /// Best-effort: scan tracked files for live conflict markers
-/// (`<<<<<<< `, `=======`, `>>>>>>> `). Used by `resume_orchestrator_update`
+/// (`<<<<<<< `, `=======`, `>>>>>>> `). Used by the pipeline's resume
+/// (`update_pipeline::classify_resume`)
 /// to refuse a resume when the user committed without actually
 /// resolving (e.g. they `git commit -a` with markers still in place).
 ///
 /// Returns the list of paths that still contain markers, empty when
 /// the tree is clean. Reads file contents via `git grep` so the scan
 /// covers tracked files only (no node_modules / target / etc).
-async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
+pub(crate) async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
     let out = run_git_raw(repo, &["grep", "--name-only", "-E", "^(<{7}|={7}|>{7}) "]).await;
     let out = match out {
         Ok(o) => o,
@@ -8329,25 +6369,6 @@ async fn detect_remaining_conflict_markers(repo: &Path) -> Vec<String> {
         .collect()
 }
 
-/// SUPERSEDED (v0.2.95 ship-gate MAJOR-3) by
-/// [`crate::commands::single_flight::begin_orchestrator_update_or_refuse`],
-/// which `resume_orchestrator_update` now takes like every other surface that
-/// writes this clone.
-///
-/// Kept as the SECOND line of defence, not as the first, and the distinction
-/// is the reason the claim had to arrive: this is a `tokio::sync::Mutex`, so
-/// it SERIALISES — a second "Continue Update" click queued here and then ran
-/// its own `install.py --update` a moment later. `single_flight.rs`'s module
-/// docs name exactly that as the wrong semantics for destructive work. Its
-/// stated purpose ("don't race two install.py runs") is delivered by the claim
-/// refusing, not by this queueing.
-///
-/// It stays because it costs nothing (with the claim in front it can never be
-/// contended) and because it is keyed differently — if a future caller reaches
-/// the claim-free body without a claim, this still prevents two overlapping
-/// runs. Do not treat it as the guard; the guard is the claim.
-static RESUME_IN_FLIGHT: LazyLock<tokio::sync::Mutex<()>> =
-    LazyLock::new(|| tokio::sync::Mutex::new(()));
 
 /// v0.2.78 ITEM #0 (F4) — decide whether a resume request is a benign no-op:
 /// the recorded conflict SHA is non-empty AND HEAD still equals it, i.e. the
@@ -8356,7 +6377,7 @@ static RESUME_IN_FLIGHT: LazyLock<tokio::sync::Mutex<()>> =
 /// AppHandle. An EMPTY `sha_at_conflict` (older sentinels that didn't record
 /// it) is NOT a benign no-op — we can't prove HEAD didn't move, so we let the
 /// normal resume path run its other guards (conservative).
-fn resume_head_unchanged_is_benign_noop(sha_at_conflict: &str, head_sha: &str) -> bool {
+pub(crate) fn resume_head_unchanged_is_benign_noop(sha_at_conflict: &str, head_sha: &str) -> bool {
     !sha_at_conflict.is_empty() && head_sha == sha_at_conflict
 }
 
@@ -8373,7 +6394,7 @@ fn resume_head_unchanged_is_benign_noop(sha_at_conflict: &str, head_sha: &str) -
 ///     honest here (the badge really will clear).
 ///   * `UpdateStillPending` — HEAD == conflict SHA BUT upstream IS still ahead:
 ///     the update never landed. Route the user back to the NORMAL update (a full
-///     `update_orchestrator`), never a fake success.
+///     `PullFf` run of the pipeline), never a fake success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ResumeNoopKind {
     TrulyNothingPending,
@@ -8392,424 +6413,6 @@ pub(crate) fn classify_resume_noop(behind: u32) -> ResumeNoopKind {
     }
 }
 
-/// Resume an `update_orchestrator` flow that halted at a merge/rebase
-/// conflict. The user has already resolved the conflict (manually OR via
-/// CLI `git add` + `git commit` / `git rebase --continue`); this command
-/// re-enters the post-merge tail to run install.py --update + binary
-/// refresh + auto-restart.
-///
-/// Refuses to act when:
-///   - The path isn't a git repo.
-///   - `.git/MERGE_HEAD` / `.git/rebase-merge/` / `.git/rebase-apply/`
-///     still exist (= merge IS in progress; modal flow not yet complete).
-///   - Tracked files still contain `<<<<<<<` / `=======` / `>>>>>>>`
-///     markers (= user committed without resolving; refuse and surface
-///     the offending paths).
-///   - No sentinel is present (= no resume to perform). This isn't an
-///     error per se but we return a structured rejection so the GUI can
-///     distinguish "already resumed" from "system broken".
-///
-/// On success: clears the sentinel + audit-logs `update_orchestrator_resumed`
-/// + returns the same `InstallResult` shape as `update_orchestrator`. In
-/// practice the auto-restart inside `run_post_pull_install_and_restart`
-/// terminates the process before this `Ok` is observed by the GUI.
-#[command]
-pub async fn resume_orchestrator_update<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-) -> Result<InstallResult, String> {
-    // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. THE surface the gap was
-    // provable on: phase 2 leaves a conflicted tree standing with the paired
-    // sentinel AND renders the resync modal, so "Continue Update" (this, via
-    // the MenuBar) and "Resync now" (`force_resync_launcher`'s
-    // `git reset --hard`) are offered at the same time. Until now only the
-    // second took the claim, so the reset could land under this command's
-    // running `install.py --update`.
-    let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
-    resume_orchestrator_update_with_claim(app, path, window, flight).await
-}
-
-/// [`resume_orchestrator_update`]'s body, with the claim passed IN.
-///
-/// Three callers already hold it by the time they get here, and each reached
-/// this tail after doing destructive work of its own that had to happen under
-/// the SAME claim (not a fresh one taken here, which would refuse against the
-/// caller's):
-///   * `resolve_autostash_pop_and_retry` — resolves pop conflicts and drops
-///     the stash, then resumes;
-///   * `keep_local_and_continue_update` / `accept_upstream_and_continue_update`
-///     — `git checkout --ours|--theirs` plus a commit, then resume.
-///
-/// Same shape, same reason, as `update_orchestrator_with_claim`: one claim
-/// spans the preparation and the resume it exists to unblock, so there is no
-/// window between them where the tree is half-resolved and unguarded.
-///
-/// `_flight` is held, not read — its `Drop` at the end of this function is the
-/// release.
-pub(crate) async fn resume_orchestrator_update_with_claim<R: Runtime>(
-    app: AppHandle<R>,
-    path: String,
-    window: Window,
-    _flight: crate::commands::single_flight::SingleFlightGuard,
-) -> Result<InstallResult, String> {
-    let install_path = PathBuf::from(&path);
-    let system = detect_system().await?;
-
-    if !install_path.join(".git").exists() {
-        return Err("Not a git repository — cannot resume update".to_string());
-    }
-
-    // Second line of defence only — see `RESUME_IN_FLIGHT`. The claim above is
-    // what refuses a concurrent run; this merely cannot be contended once it
-    // is held.
-    let _guard = RESUME_IN_FLIGHT.lock().await;
-
-    let audit_app = app.clone();
-    let resume_start_ms = chrono::Utc::now().timestamp_millis();
-    let write_audit = move |operation: &str, detail: serde_json::Value| {
-        if let Some(db) = audit_app.try_state::<crate::db::Db>() {
-            let _ = db.audit(operation, None, None, &detail);
-        }
-    };
-
-    let sentinel = match read_update_resume_sentinel(&install_path) {
-        Some(s) => s,
-        None => {
-            write_audit(
-                "update_orchestrator_resume_rejected",
-                serde_json::json!({
-                    "reason": "no_sentinel",
-                    "install_path": path,
-                }),
-            );
-            return Err(
-                "No resume pending: the orchestrator update flow did not \
-                 record a conflict checkpoint. If you reached this from a \
-                 stale UpdateBadge, click Restart Launcher or refresh the \
-                 status."
-                    .to_string(),
-            );
-        }
-    };
-
-    // v0.2.53 NEW-11: defensive empty-sha refusal. If the sentinel was
-    // written with an empty `sha_at_conflict` (because `read_head_sha`
-    // failed at conflict-write time — e.g. .git/HEAD missing or
-    // unreadable), we have NO baseline to verify HEAD has advanced past.
-    // The "head_unchanged" guard at line 6553 silently skips its check
-    // in that case, which would let us resume against a possibly-
-    // unrelated tree state. Refuse explicitly with a clear remediation
-    // path instead: the user should re-trigger the update from the
-    // launcher (which re-writes the sentinel with a fresh sha) OR clear
-    // the sentinel manually.
-    //
-    // Without this guard, the v0.2.51 Bug A class can re-appear in a
-    // subtler form: the user runs Continue Update, install.py re-merges
-    // against an unknown baseline, and the working tree may end up in
-    // a state neither the launcher nor install.py expected.
-    if sentinel.sha_at_conflict.is_empty() {
-        write_audit(
-            "update_orchestrator_resume_rejected",
-            serde_json::json!({
-                "reason": "empty_sha_at_conflict",
-                "install_path": path,
-                "operation": sentinel.operation,
-                "branch": sentinel.branch,
-            }),
-        );
-        return Err(
-            "Resume sentinel is missing the conflict-time SHA — the original \
-             conflict-handling write could not read .git/HEAD. We cannot \
-             verify the working tree's baseline, so the resume is refused. \
-             Either re-trigger the update from the launcher (which will \
-             write a fresh sentinel with a valid SHA), OR run \
-             `git status` + manually finish/abort any merge, then click \
-             Restart Launcher to clear this banner."
-                .to_string(),
-        );
-    }
-
-    // Probe in-flight merge/rebase state. If still mid-merge we refuse —
-    // the user should finish the merge (or abort it) first.
-    // v0.2.93: through the ONE shared probe.
-    let still_mid_merge =
-        crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&install_path)
-            .is_some();
-    if still_mid_merge {
-        write_audit(
-            "update_orchestrator_resume_rejected",
-            serde_json::json!({
-                "reason": "merge_still_in_progress",
-                "install_path": path,
-            }),
-        );
-        return Err(
-            "Merge or rebase is still in progress. Finish it with `git add \
-             <file>` + `git merge --continue` (or `git rebase --continue`), \
-             OR click Abort & restore to discard it. Then click Continue \
-             Update again."
-                .to_string(),
-        );
-    }
-
-    // Verify HEAD actually advanced past the conflict SHA. If it didn't,
-    // the user aborted the merge/rebase (via CLI or the modal's Abort) — the
-    // sentinel is stale but the state is BENIGN: there is simply nothing to
-    // resume. v0.2.78 ITEM #0 (F4): pre-v0.2.78 this returned an `Err`, which
-    // the Svelte `resumeUpdate()` catch rendered as a RED "Update FAILED"
-    // banner + told the user to manually refresh — a scary dead-end for a
-    // no-op. Now we self-clear the sentinel + solo deferral (as before) AND
-    // return a SUCCESS-shaped result so the caller's success path runs
-    // `orchestrator.checkStatus()`, which re-detects the (now-clean) state and
-    // clears the UpdateBadge automatically — no red banner, no manual refresh.
-    let head_sha = read_head_sha(&install_path).await.unwrap_or_default();
-    if resume_head_unchanged_is_benign_noop(&sentinel.sha_at_conflict, &head_sha) {
-        // v0.2.88 (DEFECT 3 / FIELD DEFECT): HEAD didn't advance past the
-        // conflict SHA — nothing to RESUME. But that is TWO different states,
-        // and conflating them produced the field bug (fake 100% "done" while a
-        // real update was still pending). VERIFY the actual end state before
-        // declaring anything: is upstream still ahead of HEAD?
-        let resume_branch = if sentinel.branch.is_empty() {
-            resolve_pull_branch(&install_path).await
-        } else {
-            sentinel.branch.clone()
-        };
-        // v0.2.88 (MINOR-6): DISTINGUISH an Err from Ok(0). Pre-fix this was
-        // `.unwrap_or(0)`, which collapsed a behind-count ERROR (missing upstream
-        // ref, corrupted git) into `behind == 0` → TrulyNothingPending →
-        // success-shaped "already up to date" — the exact fake-success shape
-        // DEFECT 3 exists to kill, resurfacing on the error path. An
-        // unverifiable end state must be treated as NOT-verified, not as
-        // up-to-date. Capture the Result and branch on Err below.
-        let behind_res = crate::commands::git_cmd::commits_behind(
-            &install_path,
-            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-            &resume_branch,
-        )
-        .await;
-        // Clear the stale sentinel + solo deferral in ALL sub-cases (the merge
-        // never advanced, so this sentinel is not resumable regardless — even
-        // when we cannot verify the behind-count).
-        clear_update_resume_sentinel(&install_path);
-        clear_update_resume_deferral_if_solo(&install_path);
-
-        let behind = match behind_res {
-            Ok(b) => b,
-            Err(e) => {
-                // Could NOT verify the end state → do NOT claim success. Tell the
-                // user honestly and route them to the normal update to be sure.
-                write_audit(
-                    "update_orchestrator_resume_rejected",
-                    serde_json::json!({
-                        "reason": "behind_count_unverifiable",
-                        "sha_at_conflict": sentinel.sha_at_conflict,
-                        "branch": resume_branch,
-                        "error": e,
-                        "install_path": path,
-                    }),
-                );
-                return Err(format!(
-                    "Nothing was resumed, and the update state could not be verified \
-                     (couldn't count commits behind {}/{}: {}). This was NOT confirmed as \
-                     a completed update. Click the update badge and run the normal update \
-                     to be sure you're on the latest version.",
-                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-                    resume_branch,
-                    e,
-                ));
-            }
-        };
-
-        match classify_resume_noop(behind) {
-            ResumeNoopKind::TrulyNothingPending => {
-                write_audit(
-                    "update_orchestrator_resume_resolved_noop",
-                    serde_json::json!({
-                        "reason": "head_unchanged_up_to_date",
-                        "sha_at_conflict": sentinel.sha_at_conflict,
-                        "install_path": path,
-                    }),
-                );
-                return Ok(InstallResult {
-                    success: true,
-                    install_path: path,
-                    message: "No resume needed — the merge/rebase was aborted and you are \
-                              already up to date. The update badge will clear automatically."
-                        .to_string(),
-                    system,
-                });
-            }
-            ResumeNoopKind::UpdateStillPending { behind } => {
-                // HONEST: nothing was resumed AND a real update is still pending.
-                // Do NOT return success (that was the fake-100% field bug). Tell
-                // the user to re-run the NORMAL update.
-                write_audit(
-                    "update_orchestrator_resume_rejected",
-                    serde_json::json!({
-                        "reason": "nothing_to_resume_but_update_pending",
-                        "sha_at_conflict": sentinel.sha_at_conflict,
-                        "behind": behind,
-                        "branch": resume_branch,
-                        "install_path": path,
-                    }),
-                );
-                return Err(format!(
-                    "Nothing to resume — the earlier update never applied (HEAD is still {} \
-                     commit(s) behind {}/{}), so there is no in-progress merge to continue. \
-                     This was NOT a completed update. Click the update badge and run the \
-                     normal update again to fetch and install the new version.",
-                    behind,
-                    crate::commands::self_update::VCO_UPSTREAM_REMOTE,
-                    resume_branch,
-                ));
-            }
-        }
-    }
-
-    // Scan for stray conflict markers. If the user committed a file with
-    // markers still in it, refuse — we'd otherwise ship a broken update.
-    let with_markers = detect_remaining_conflict_markers(&install_path).await;
-    if !with_markers.is_empty() {
-        write_audit(
-            "update_orchestrator_resume_rejected",
-            serde_json::json!({
-                "reason": "conflict_markers_remain",
-                "files": with_markers,
-                "install_path": path,
-            }),
-        );
-        let head = with_markers.iter().take(8).cloned().collect::<Vec<_>>();
-        let more = if with_markers.len() > head.len() {
-            ", …"
-        } else {
-            ""
-        };
-        // v0.2.88 (MINOR-9): the remediation differs by operation. A
-        // merge/rebase conflict is resolved by editing out the markers + `git
-        // add` + `git commit --amend`. An AUTOSTASH-POP conflict is a
-        // stash-apply conflict — `commit --amend` is WRONG (the merge already
-        // committed; the markers are in the working tree from the stash pop).
-        // The correct steps are `checkout --ours|--theirs` + `git add` + drop the
-        // specific stash entry (the deferral carries the full form). Route the
-        // pop case to those steps instead of misdirecting to `commit --amend`.
-        if sentinel.operation == "autostash-pop" {
-            return Err(format!(
-                "Found unresolved conflict markers from the local-change restore in {} \
-                 file(s): {}{}. For EACH file pick one side — `git checkout --ours -- \
-                 <file>` (keep the update) or `git checkout --theirs -- <file>` (keep your \
-                 edit) — then `git add -- <file>`, and finally `git stash drop 'stash@{{0}}'` \
-                 (see .claude/context/UPDATE_DEFERRED.md for the exact, re-probe-guarded \
-                 steps). Then click Finish Update again. Do NOT `git commit --amend` — the \
-                 merge already committed.",
-                with_markers.len(),
-                head.join(", "),
-                more,
-            ));
-        }
-        return Err(format!(
-            "Found unresolved conflict markers in {} file(s): {}{}. Open \
-             each file, remove the `<<<<<<<` / `=======` / `>>>>>>>` \
-             markers, `git add` + `git commit --amend` (or commit a fix), \
-             then click Continue Update again.",
-            with_markers.len(),
-            head.join(", "),
-            more,
-        ));
-    }
-
-    // All preconditions satisfied. Audit-log the resume start.
-    write_audit(
-        "update_orchestrator_resumed",
-        serde_json::json!({
-            "operation": sentinel.operation,
-            "branch": sentinel.branch,
-            "sha_at_conflict": sentinel.sha_at_conflict,
-            "head_sha": head_sha,
-            "install_path": path,
-        }),
-    );
-
-    // V52-AI (v0.2.52): acquire the MCP fork-bomb gate before any
-    // file-touching work. Same shape as update_orchestrator —
-    // pre-sweep + RAII guard. Resume runs install.py + binary
-    // refresh, which is the exact window where the fork-bomb
-    // historically formed; protecting it is just as important.
-    let pre_sweep_count_resume = crate::commands::update_gate::pre_update_mcp_kill_sweep();
-    if pre_sweep_count_resume > 0 {
-        tracing::info!(
-            "[vct] resume_orchestrator_update: pre-sweep terminated {} \
-             MCP-shaped process(es) before resume",
-            pre_sweep_count_resume
-        );
-    }
-    let (mut update_gate_guard, _gate_write_result) =
-        crate::commands::update_gate::UpdateInProgressGuard::new();
-    // Resume starts mid-flow; the lockfile claims InstallPy directly
-    // because we're skipping the git-pull stage (the user already
-    // resolved the merge before clicking Continue Update).
-    update_gate_guard.advance_phase(crate::commands::update_gate::Phase::InstallPy);
-
-    // The on-disk source is already current (the user finished the merge),
-    // so we mirror the `merge_orchestrator_with_upstream` post-pull tail.
-    // We stop the hub + pre-pull-rename binaries first so install.py +
-    // the binary swap don't race the old hub's file handles.
-    // v0.2.95 phase 3: the ONE home (see the merge surface above). `None` for
-    // the "before" clause: resume runs no git command — the user already
-    // finished the merge and the next step is install.py — so this surface's
-    // refusal has always been the bare "could not stop vct-hub".
-    let renames = crate::commands::update_pipeline::stop_hub_and_rename_binaries_aside(
-        &install_path,
-        "resume",
-        None,
-        |stage: &str, message: &str, pct: f32| emit_progress(&window, stage, message, pct),
-    )?;
-    let pre_pull_renamed_hub = renames.hub;
-    let pre_pull_renamed = renames.launcher;
-
-    // Clear the sentinel + deferral BEFORE install.py runs so a crash
-    // during the install.py phase doesn't loop us forever. If install.py
-    // fails, the user retries via the existing install_stale path
-    // (install.py --update only, no git pull) which is the right next
-    // step anyway — the source is already merged, only the manifest is
-    // stale. install.py's own deferral writer will replace UPDATE_DEFERRED.md
-    // with the actual install outcome.
-    clear_update_resume_sentinel(&install_path);
-    clear_update_resume_deferral_if_solo(&install_path);
-
-    // v0.2.54 C-2: hand the V52-AI guard to the shared tail. The tail
-    // calls `disarm_and_cleanup()` BEFORE the restart hop — pre-v0.2.54
-    // the resume path relied on the guard's Drop, which never runs when
-    // `restart_launcher` ends in `app.exit(0)` on Windows. Result was a
-    // surviving `.update-in-progress.json` with a fresh 15-min deadline:
-    // every MCP spawn after the resumed update exited 75 until it lapsed.
-    let result = run_post_pull_install_and_restart(
-        app,
-        &install_path,
-        path.clone(),
-        &window,
-        system,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        &mut update_gate_guard,
-    )
-    .await;
-
-    // run_post_pull_install_and_restart re-enters the auto-restart path,
-    // so we rarely reach here — but if the restart hop fails the helper
-    // returns Err. Surface the error to the eprintln stream for forensic
-    // completeness; the GUI sees the Err via the Tauri return.
-    if let Err(e) = &result {
-        tracing::error!(
-            "[vct] resume_orchestrator_update: post-pull tail failed \
-             ({}); duration_ms={}",
-            e,
-            chrono::Utc::now().timestamp_millis() - resume_start_ms,
-        );
-    }
-
-    result
-}
 
 // ---------------------------------------------------------------------------
 // v0.2.52 V52-A / V52-B — one-click conflict resolution from the modal.
@@ -8827,9 +6430,10 @@ pub(crate) async fn resume_orchestrator_update_with_claim<R: Runtime>(
 //      conflicted file. Orientation flips between merge and rebase — see
 //      the resolve_checkout_flag helper for details.
 //   3. `git add` + `git commit` (merge) or `git rebase --continue` (rebase).
-//   4. Delegates to `resume_orchestrator_update` for the post-merge tail
-//      (install.py --update + binary refresh + auto-restart). The resume
-//      function's own preconditions (sentinel present, HEAD advanced,
+//   4. Hands its claim to the update pipeline's `Resume` kind
+//      (`continue_update_under_claim` → `update_run::run_update_claimed`) for
+//      the post-merge tail (install.py --update + binary refresh +
+//      auto-restart). The resume's own preconditions (sentinel present, HEAD advanced,
 //      no markers, no in-flight merge state) all pass by construction
 //      after the commit/continue above.
 //
@@ -8954,8 +6558,9 @@ pub(crate) async fn finish_merge_or_rebase(install_path: &Path, in_merge: bool) 
 
 /// Shared implementation for both `keep_local_and_continue_update` and
 /// `accept_upstream_and_continue_update`. Performs the conflict resolution
-/// (checkout + add + commit/continue) then delegates to
-/// `resume_orchestrator_update` for the post-merge tail.
+/// (checkout + add + commit/continue) then hands its claim to the update
+/// pipeline's `Resume` kind (`continue_update_under_claim`) for the
+/// post-merge tail.
 ///
 /// The two public commands are thin wrappers that pick the side enum
 /// variant; centralising the body here keeps git invocation, audit logging,
@@ -8972,7 +6577,7 @@ async fn resolve_conflict_and_resume<R: Runtime>(
     // fixed once for the untracked-collision resolver, where the deletions ran
     // outside the claim and only the retry was inside it.
     flight: crate::commands::single_flight::SingleFlightGuard,
-) -> Result<InstallResult, String> {
+) -> Result<UpdateOutcome, String> {
     let install_path = PathBuf::from(&path);
 
     if !install_path.join(".git").exists() {
@@ -9109,7 +6714,7 @@ async fn resolve_conflict_and_resume<R: Runtime>(
                     "install_path": path,
                 }),
             );
-            return resume_orchestrator_update_with_claim(app, path, window, flight).await;
+            return continue_update_under_claim(app, &window, UpdateKind::Resume, "one_click_conflict_resolution", flight).await;
         }
         OneClickState::NothingToResolve => {
             // MERGE_HEAD/rebase-* present but git reports neither unmerged
@@ -9279,10 +6884,10 @@ async fn resolve_conflict_and_resume<R: Runtime>(
     //        replaced the markered content wholesale; we never asked the user
     //        to edit anything).
     //
-    //    resume_orchestrator_update will stop the hub, pre-pull rename
-    //    binaries, clear the sentinel + deferral, then run install.py
-    //    --update + binary refresh + auto-restart.
-    resume_orchestrator_update_with_claim(app, path, window, flight).await
+    //    The pipeline's `Resume` stops the hub, renames the binaries aside,
+    //    clears the sentinel + deferral, then runs install.py --update, the
+    //    binary check and the relaunch.
+    continue_update_under_claim(app, &window, UpdateKind::Resume, "one_click_conflict_resolution", flight).await
 }
 
 /// V52-B: keep local versions of every conflicted file, then continue the
@@ -9301,7 +6906,7 @@ pub async fn keep_local_and_continue_update<R: Runtime>(
     app: AppHandle<R>,
     path: String,
     window: Window,
-) -> Result<InstallResult, String> {
+) -> Result<UpdateOutcome, String> {
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. NOT in the review's list of
     // six, and found by making the wiring gate closed-world: this command
     // runs `git checkout --ours` over every conflicted path and commits, then
@@ -9321,7 +6926,7 @@ pub async fn accept_upstream_and_continue_update<R: Runtime>(
     app: AppHandle<R>,
     path: String,
     window: Window,
-) -> Result<InstallResult, String> {
+) -> Result<UpdateOutcome, String> {
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3 — the sibling button, same
     // claim. See `keep_local_and_continue_update`.
     let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
@@ -9405,15 +7010,16 @@ async fn file_trackedness(install_path: &Path, rel_path: &str) -> Trackedness {
 ///     (it stays `Refused`), never proceeding to delete without a backup.
 ///
 /// After the per-file pass, if ANY file was actually removed (Deleted or
-/// BackedUpAndDeleted), re-enter the FULL `update_orchestrator` (fresh fetch +
-/// pull that now succeeds because the colliding untracked files are gone). If
+/// BackedUpAndDeleted), re-enter the FULL update (the pipeline's `PullFf` kind
+/// under the held claim: fresh fetch + pull that now succeeds because the
+/// colliding untracked files are gone). If
 /// NOTHING was removed (every file Refused), return an honest error listing the
 /// refusals rather than a fake retry.
 /// Claim the orchestrator-update single-flight, refresh the upstream tip, then
 /// delete the colliding untracked files — in that order, as ONE step.
 ///
 /// v0.2.95 phase 3, closing the gap phase 2 named (§8 item 5): the retry below
-/// re-enters `update_orchestrator`, which has taken the claim since phase 2 —
+/// re-enters the update (then `update_orchestrator`), which has taken the claim since phase 2 —
 /// so the PULL was guarded and the DELETIONS that precede it were not.
 ///
 /// WHAT THAT COSTS, concretely. The paths deleted here are by construction the
@@ -9482,7 +7088,7 @@ pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
     path: String,
     window: Window,
     files: Vec<String>,
-) -> Result<InstallResult, String> {
+) -> Result<UpdateOutcome, String> {
     let install_path = PathBuf::from(&path);
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot resolve collision".to_string());
@@ -9585,7 +7191,7 @@ pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
     // modal — which is correct). The claim taken above travels WITH it, so the
     // deletions and the pull they unblock are one guarded operation rather
     // than two, with no window in between.
-    update_orchestrator_with_claim(app, path, window, flight).await
+    continue_update_under_claim(app, &window, UpdateKind::PullFf, "resolve_untracked_collision_and_retry", flight).await
 }
 
 /// v0.2.88 (F2-followup / FIELD DEFECT) — the pure per-file decision+I/O for
@@ -9762,9 +7368,9 @@ pub(crate) fn should_drop_autostash(resolved_count: usize, stash_present: bool) 
 /// `.claude/state/update-collision-backups-<ts>/`, then `git checkout
 /// --ours|--theirs -- <f>` + `git add -- <f>`. Only after ≥1 file is resolved
 /// AND a stash entry still exists is the autostash dropped (MAJOR-1); the
-/// dropped stash SHA is recorded in the audit event. Finally delegates to
-/// `resume_orchestrator_update` (install.py --update + binary refresh +
-/// auto-restart).
+/// dropped stash SHA is recorded in the audit event. Finally hands its claim
+/// to the update pipeline's `Resume` kind (`continue_update_under_claim`:
+/// install.py --update + binary refresh + auto-restart).
 ///
 /// Refuses tracked-outside / traversal paths defensively; per-file soft-fail.
 #[command]
@@ -9774,7 +7380,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
     window: Window,
     files: Vec<String>,
     keep_updated: bool,
-) -> Result<InstallResult, String> {
+) -> Result<UpdateOutcome, String> {
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. Taken BEFORE the per-file
     // `git checkout --ours|--theirs`, the `git add`, and the `git stash drop`
     // below — not merely by the resume this tail-calls. The claim is handed
@@ -10020,147 +7626,25 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
     // Finish the update: install.py --update + binary refresh + auto-restart.
     // The merge already advanced HEAD past the sentinel's sha_at_conflict, and
     // the conflict markers are gone, so resume's preconditions are satisfied.
-    resume_orchestrator_update_with_claim(app, path, window, flight).await
+    continue_update_under_claim(app, &window, UpdateKind::Resume, "resolve_autostash_pop_and_retry", flight).await
 }
 
-/// v0.2.16 (W4 / 0.5): "Pulled-but-not-installed" resolver. Runs
-/// `install.py --update` against an existing install_path WITHOUT a
-/// preceding `git pull`. Distinct from `update_orchestrator` (which
-/// does both): users who `git pull` manually still need an install.py
-/// pass to refresh `.claude/` hooks/scripts/agents, register MCP
-/// servers, and bump `state/install-manifest.json::version`.
-///
-/// **CRITICAL**: this MUST NOT call `update_orchestrator` (which
-/// `git pull --ff-only`s first). Source is already current by
-/// definition of the install_stale state. Pulling again would waste
-/// ~30s and noise the launcher's git output for no value. If you
-/// catch yourself adding a git step here, route through the existing
-/// `update_orchestrator` command instead.
-///
-/// Cross-OS contract: shells out to `system.python_cmd` (resolved by
-/// `detect_system()` — already handles `python3` vs `python`, Windows
-/// `python.exe`, etc.). Never hardcode `/usr/bin/python3`.
-#[command]
-pub async fn apply_pending_install(
-    path: String,
-    window: Window,
-) -> Result<InstallResult, String> {
-    // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. No `git pull` here (see the
-    // CRITICAL note above) but a full `install.py --update` on the clone, which
-    // is the half of the catastrophic case that takes minutes and rewrites
-    // `.claude/`, the venv, MCP registrations and the schema. It is also the
-    // surface WP-1's `install_stale` badge now sends users to, so it is more
-    // reachable than it was — and reachable concurrently with "Resync now",
-    // whose `git reset --hard` would land underneath it.
-    let _flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
-
-    let install_path = PathBuf::from(&path);
-    let system = detect_system().await?;
-
-    if !install_path.is_dir() {
-        return Err(format!(
-            "install path does not exist or isn't a directory: {}",
-            install_path.display()
-        ));
-    }
-
-    // Sanity: a fully-fresh path with no orchestrator artifacts is
-    // ambiguous (could be a misclick by the user passing the wrong
-    // path). Refuse rather than running install.py on something that
-    // might not be an orchestrator clone.
-    if !install_path.join("vct-module.json").is_file() {
-        return Err(format!(
-            "no vct-module.json at {} — not an orchestrator install root",
-            install_path.display()
-        ));
-    }
-
-    emit_progress(&window, "install", "Applying pending install...", 10.0);
-
-    let python_cmd = &system.python_cmd;
-    // v0.2.95 phase 3 (WP-3): the ONE home — and the site that made WP-3
-    // urgent. This spawn carried ONLY `VCT_LAUNCHER_PID`: it was missing the
-    // `PYTHONIOENCODING`/`PYTHONUTF8` pair that the other five carried with a
-    // comment saying their absence crashes install.py mid-run on a Windows
-    // cp1252 console. This is the `install_stale` REPAIR surface — the one a
-    // user reaches when an update has already gone wrong — so it was the one
-    // that could not finish. It gains the pair by construction now.
-    let mut cmd = install_py_command(python_cmd, &install_path, ["--update"]);
-    // Mirror update_orchestrator: expose running launcher PID so
-    // install.py can include it in any launcher_restart_required
-    // deferral message it emits (binary swap path).
-    cmd.env("VCT_LAUNCHER_PID", std::process::id().to_string());
-
-    emit_progress(&window, "install", "Running install.py --update...", 30.0);
-
-    // v0.2.93 (review round 1, MINOR-3): spawn failure ⇒ same row + ERROR line.
-    let install_output = match cmd.output().await {
-        Ok(o) => o,
-        Err(e) => {
-            let msg = format!("install.py --update failed: {}", e);
-            record_install_spawn_failure(&install_path, &install_path, "apply_pending_install", &msg);
-            return Err(msg);
-        }
-    };
-
-    // v0.2.93: this is the install_stale RETRY surface — a successful run here
-    // is "the next successful install.py run" that settles a prior
-    // update_install_phase_failed row; a failed one keeps it current.
-    handle_install_phase_exit(
-        &install_path,
-        &install_path,
-        "apply_pending_install",
-        install_output.status.success(),
-        install_output.status.code(),
-        &String::from_utf8_lossy(&install_output.stdout),
-        &String::from_utf8_lossy(&install_output.stderr),
-    );
-
-    if !install_output.status.success() {
-        let stderr = String::from_utf8_lossy(&install_output.stderr);
-        let stdout = String::from_utf8_lossy(&install_output.stdout);
-        // Surface the tail of both streams — install.py errors usually
-        // land in stderr but some Python tracebacks slip into stdout.
-        let stderr_tail: String = stderr
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<&str>>()
-            .join("\n");
-        let stdout_tail: String = stdout
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<&str>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<&str>>()
-            .join("\n");
-        return Err(format!(
-            "install.py --update failed (exit {}):\nstderr:\n{}\n\nstdout:\n{}",
-            install_output.status.code().unwrap_or(-1),
-            stderr_tail,
-            stdout_tail
-        ));
-    }
-
-    emit_progress(
-        &window,
-        "done",
-        "Pending install applied successfully!",
-        100.0,
-    );
-
-    Ok(InstallResult {
-        success: true,
-        install_path: path,
-        message: "Pending install applied successfully".to_string(),
-        system,
-    })
+/// Hand a conflict resolver's single-flight claim to THE update pipeline
+/// (v0.2.100 WP-03b): the resolution's destructive git work and the update it
+/// unblocks run under ONE claim. `Err` is the pipeline's JSON contract
+/// (`update_failure`), the same the frontend routes for `run_orchestrator_update`.
+async fn continue_update_under_claim<R: Runtime>(
+    app: AppHandle<R>,
+    window: &Window,
+    kind: UpdateKind,
+    surface: &'static str,
+    flight: crate::commands::single_flight::SingleFlightGuard,
+) -> Result<UpdateOutcome, String> {
+    crate::commands::update_run::run_update_claimed(app, Some(window), kind, surface, flight)
+        .await
+        .map_err(|e| e.to_json())
 }
+
 
 // ---------------------------------------------------------------------------
 // Local-copy install (Bug 17): the launcher binary IS built from the
@@ -11080,81 +8564,6 @@ pub fn clear_github_pat(db: State<'_, Db>) -> Result<(), String> {
     Ok(())
 }
 
-/// Bug 21: update an orchestrator at `path` by re-running the local-copy
-/// install. Skips the classify-target check (we know the path already
-/// has `.claude/`). Emits "install_progress" events.
-///
-/// v0.2.91 decision #26 — SINGLE-FLIGHT. The MenuBar's update-all loop guards
-/// this FRONTEND-side only (a disabled button), which does not survive a
-/// second window, a reopened surface, or any other caller; meanwhile the body
-/// below copies a whole orchestrator tree over `target`, so two concurrent
-/// runs interleave file writes into the same folder. The guard is keyed
-/// SEPARATELY from `update_all_projects` on purpose: that command reconciles
-/// registered PROJECT bundles, this one refreshes an orchestrator CLONE (see
-/// the boundary note in the VCO-clone gate below). Guarding one must never
-/// block the other, and the two must not be merged.
-#[command]
-pub async fn update_orchestrator_at(path: String, window: Window) -> Result<(), String> {
-    let _single_flight = crate::commands::single_flight::begin_or_refuse(
-        crate::commands::single_flight::OP_UPDATE_ORCHESTRATOR_AT,
-    )?;
-    let target = PathBuf::from(&path);
-    if !target.exists() {
-        return Err(format!("update target {} does not exist", target.display()));
-    }
-    // VCO-clone gate: refuse to run against project folders that happen to
-    // have `.claude/` left behind by a non-destructive unregister (PR #150).
-    // `update_orchestrator_at` is a "sync VCO clone from a newer source"
-    // operation; running it against a project folder copies orchestrator-
-    // machinery into the project. The validate_source_repo check (install.py
-    // + first-install.sh) is the canonical VCO-clone discriminator.
-    //
-    // Project-update path is separate: see `update_project_v2` /
-    // `run_install_bundle_update` (`projects_v2.rs:782`) for the bundle-only
-    // update that operates on registered project folders.
-    validate_source_repo(&target)?;
-    emit_progress(&window, "locate", "Locating bundled source...", 5.0);
-    let source = find_local_repo_root()?;
-    emit_progress(&window, "copy", "Copying updated files...", 25.0);
-    let target_clone = target.clone();
-    let source_clone = source.clone();
-    let copy_result = tokio::task::spawn_blocking(move || {
-        copy_orchestrator_to_sync(&source_clone, &target_clone)
-    })
-    .await
-    .map_err(|e| format!("copy task panicked: {}", e))?;
-    copy_result?;
-
-    // C2 (v0.2.6): refresh the desktop shortcut so it points at the
-    // currently-running launcher binary. Critical for users whose
-    // install path moved (e.g. they cloned into a new directory) —
-    // pre-0.2.6 the .desktop file would keep pointing at the stale
-    // binary path silently. Soft-fail: never block "Update complete".
-    if let Ok(exe) = std::env::current_exe() {
-        if let Err(e) = crate::commands::desktop_shortcut::refresh_desktop_shortcut(&target, &exe) {
-            tracing::warn!(
-                "[update_orchestrator_at] desktop shortcut refresh failed (non-fatal): {}",
-                e
-            );
-        }
-    }
-
-    // Bug G (v0.2.8): refresh state/install-manifest.json so the
-    // launcher's "what version is at this path?" reads the just-copied
-    // vct-module.json's version, not the prior one. Soft-fail: never
-    // block "Update complete" — the manifest is diagnostic.
-    if let Err(e) =
-        crate::commands::manifest::refresh_install_manifest(&target, "orchestrator_update")
-    {
-        tracing::warn!(
-            "[update_orchestrator_at] install-manifest refresh failed (non-fatal): {}",
-            e
-        );
-    }
-
-    emit_progress(&window, "done", "Update complete", 100.0);
-    Ok(())
-}
 
 // The installer progress + install-log event emitters (emit_progress,
 // installer_step_to_user_label, append_install_log_event, chrono_iso_z)
@@ -11606,361 +9015,6 @@ mod tests {
         fs::remove_dir_all(&p).ok();
     }
 
-    // ---- v0.2.45 V45-B: wait_for_binary_refresh ------------------------
-    //
-    // The poll loop checks `vct-module.json::version` (source) against
-    // `launcher/dist/<arch>/vct-launcher.metadata.json::launcher_version`
-    // (on-disk binary). These helpers fabricate the minimum on-disk
-    // layout the readers require — no git remote, no real binary blob.
-    // Tests run with `disable_git_pull=true` so they don't try to
-    // contact a remote that doesn't exist for the tmp dir.
-
-    fn write_v0245_source_version(install_path: &Path, version: &str) {
-        let v = serde_json::json!({"version": version}).to_string();
-        fs::write(install_path.join("vct-module.json"), v).unwrap();
-    }
-
-    fn write_v0245_on_disk_version(install_path: &Path, version: &str) {
-        let dist_arch = install_path
-            .join("launcher")
-            .join("dist")
-            .join(launcher_dist_subdir());
-        fs::create_dir_all(&dist_arch).unwrap();
-        let v = serde_json::json!({"launcher_version": version}).to_string();
-        // Use launcher_binary_filename() so the test fixture matches the
-        // exact same per-OS layout the production code looks for. On
-        // Windows that resolves to `vct-launcher.exe.metadata.json`; on
-        // Linux/macOS to `vct-launcher.metadata.json`. Without this the
-        // tests would silently regress to the pre-V45-H hardcoded path
-        // and pass on Linux while masking the Windows bug.
-        let meta_name = format!("{}.metadata.json", launcher_binary_filename());
-        fs::write(dist_arch.join(meta_name), v).unwrap();
-    }
-
-    fn clear_v0245_on_disk_version(install_path: &Path) {
-        let meta_name = format!("{}.metadata.json", launcher_binary_filename());
-        let meta = install_path
-            .join("launcher")
-            .join("dist")
-            .join(launcher_dist_subdir())
-            .join(meta_name);
-        let _ = fs::remove_file(&meta);
-    }
-
-    #[tokio::test]
-    async fn test_v0245_wait_returns_ok_when_versions_match_immediately() {
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.45");
-        write_v0245_on_disk_version(&p, "0.2.45");
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            // Generous timeout to prove the loop returns on the FIRST
-            // iteration without waiting; if it ever hit the sleep
-            // path the test would still pass but take 1 s — keep the
-            // interval tiny so a regression doesn't slip past.
-            timeout: std::time::Duration::from_secs(5),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let started = std::time::Instant::now();
-        let res = waiter.run().await;
-        let elapsed = started.elapsed();
-        assert!(res.is_ok(), "expected Ok, got {:?}", res);
-        // First-iteration return: should be near-instant, certainly
-        // under the interval sleep.
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "expected near-instant return, took {:?}",
-            elapsed
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0245_wait_times_out_when_binary_stays_stale() {
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.45");
-        write_v0245_on_disk_version(&p, "0.2.44");
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            // Short timeout so the test finishes quickly; the interval
-            // is the smallest meaningful value so we cycle a few
-            // times before tripping the deadline.
-            timeout: std::time::Duration::from_millis(300),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let started = std::time::Instant::now();
-        let res = waiter.run().await;
-        let elapsed = started.elapsed();
-        assert!(res.is_err(), "expected timeout Err, got {:?}", res);
-        let err = res.unwrap_err();
-        // Verify the user-facing message names both versions so the
-        // GUI can surface it verbatim. DO NOT change the format
-        // casually — see comment on the helper.
-        assert!(
-            err.contains("v0.2.45"),
-            "error should name source version 0.2.45: {}",
-            err
-        );
-        assert!(
-            err.contains("v0.2.44"),
-            "error should name on-disk version 0.2.44: {}",
-            err
-        );
-        assert!(
-            err.contains("did not land within"),
-            "error should mention the timeout: {}",
-            err
-        );
-        // We should have actually waited (at least one interval) before
-        // returning — not bailed out before even sleeping.
-        assert!(
-            elapsed >= std::time::Duration::from_millis(50),
-            "should have slept at least once, took {:?}",
-            elapsed
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    // v0.2.55 (hub-freshness gap): write the on-disk vct-hub sidecar so
-    // `read_on_disk_hub_version` resolves it. Mirrors
-    // `write_v0245_on_disk_version` but for the hub binary name.
-    fn write_v0255_on_disk_hub_version(install_path: &Path, version: &str) {
-        let dist_arch = install_path
-            .join("launcher")
-            .join("dist")
-            .join(launcher_dist_subdir());
-        fs::create_dir_all(&dist_arch).unwrap();
-        let v = serde_json::json!({"launcher_version": version}).to_string();
-        #[cfg(target_os = "windows")]
-        let hub_meta = "vct-hub.exe.metadata.json";
-        #[cfg(not(target_os = "windows"))]
-        let hub_meta = "vct-hub.metadata.json";
-        fs::write(dist_arch.join(hub_meta), v).unwrap();
-    }
-
-    #[tokio::test]
-    async fn test_v0255_wait_blocks_when_launcher_fresh_but_hub_stale() {
-        // The partial-refresh case the hub-freshness gap closes: launcher
-        // binary caught up to source, but the hub sidecar is still stale.
-        // Pre-v0.2.55 this returned Ok immediately (and could start a
-        // stale hub). Now it must keep waiting (→ time out here).
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.55");
-        write_v0245_on_disk_version(&p, "0.2.55"); // launcher: fresh
-        write_v0255_on_disk_hub_version(&p, "0.2.54"); // hub: STALE
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_millis(250),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        assert!(
-            res.is_err(),
-            "expected timeout because hub is stale, got {:?}",
-            res
-        );
-        let err = res.unwrap_err();
-        // Timeout message should name the hub version so the partial
-        // refresh is diagnosable.
-        assert!(
-            err.contains("hub is v0.2.54"),
-            "error should name the stale hub version: {}",
-            err
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0255_wait_returns_ok_when_both_launcher_and_hub_fresh() {
-        // Both binaries caught up → the normal lock-step refresh → Ok.
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.55");
-        write_v0245_on_disk_version(&p, "0.2.55");
-        write_v0255_on_disk_hub_version(&p, "0.2.55");
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(5),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        assert!(res.is_ok(), "expected Ok when both fresh, got {:?}", res);
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0255_wait_ignores_absent_hub_sidecar() {
-        // Older installs predating hub metadata: NO hub sidecar. The gate
-        // must degrade to launcher-only (don't deadlock waiting for a hub
-        // version that will never appear).
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.55");
-        write_v0245_on_disk_version(&p, "0.2.55"); // launcher fresh
-        // (deliberately NO write_v0255_on_disk_hub_version)
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(5),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        assert!(
-            res.is_ok(),
-            "absent hub sidecar must not block (launcher-only fallback), got {:?}",
-            res
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0245_wait_succeeds_when_binary_appears_mid_poll() {
-        // Simulate the binary-refresh commit arriving mid-poll: start
-        // with source=0.2.45 + no on-disk metadata (initial state
-        // after the source-tag commit), then write on-disk=0.2.45
-        // ~120ms in (simulating the chore(binary) commit landing).
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.45");
-        clear_v0245_on_disk_version(&p);
-
-        let mutator_path = p.clone();
-        let mutator = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(120)).await;
-            write_v0245_on_disk_version(&mutator_path, "0.2.45");
-        });
-
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(2),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        let _ = mutator.await;
-        assert!(
-            res.is_ok(),
-            "expected Ok once binary appears mid-poll, got {:?}",
-            res
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0248_wait_succeeds_when_on_disk_ahead_of_source() {
-        // v0.2.48 regression test: the failure that prompted this fix.
-        //
-        // Scenario: source-version-bump commit forgot to bump
-        // vct-module.json (it stayed at 0.2.46) while the binary
-        // refresh for v0.2.47 already landed (on-disk metadata says
-        // 0.2.47). Old loop expected `on_disk == source`, never
-        // matched, timed out at 300s with misleading "still building"
-        // modal. New loop accepts on_disk >= source (semver-aware).
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.46");
-        write_v0245_on_disk_version(&p, "0.2.47");
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(5),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let started = std::time::Instant::now();
-        let res = waiter.run().await;
-        let elapsed = started.elapsed();
-        assert!(
-            res.is_ok(),
-            "expected Ok when on-disk binary is ahead of source-pin; got {:?}",
-            res
-        );
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "expected near-instant return (no waiting), took {:?}",
-            elapsed,
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0248_wait_succeeds_when_on_disk_ahead_multi_digit() {
-        // Edge case for the numeric (not lexicographic) semver compare:
-        // "0.2.10" must be recognized as ahead of "0.2.9", not behind.
-        // (Lexicographic compare would put "0.2.10" < "0.2.9".)
-        let p = tmp();
-        write_v0245_source_version(&p, "0.2.9");
-        write_v0245_on_disk_version(&p, "0.2.10");
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(5),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        assert!(
-            res.is_ok(),
-            "expected Ok: 0.2.10 (on-disk) >= 0.2.9 (source); got {:?}",
-            res
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[tokio::test]
-    async fn test_v0245_wait_errors_when_source_version_missing() {
-        // Defensive: if vct-module.json is missing or empty, the
-        // helper has nothing to compare against. Surface a clear
-        // error immediately rather than poll forever.
-        let p = tmp();
-        // Intentionally NO vct-module.json written.
-        let waiter = WaitForBinaryRefresh {
-            install_path: &p,
-            branch: "main",
-            timeout: std::time::Duration::from_secs(2),
-            interval: std::time::Duration::from_millis(50),
-            disable_git_pull: true,
-        };
-        let res = waiter.run().await;
-        assert!(res.is_err(), "expected Err for missing source version");
-        let err = res.unwrap_err();
-        assert!(
-            err.contains("source version"),
-            "error should mention source version: {}",
-            err
-        );
-        fs::remove_dir_all(&p).ok();
-    }
-
-    #[test]
-    fn test_v0245_wait_default_production_uses_5_min_timeout() {
-        // Documents the production timeout via the constructor —
-        // shouldn't drift below 5 min without rationale (the comment
-        // on WAIT_FOR_BINARY_REFRESH_TIMEOUT_SECS spells out the
-        // UX-vs-correctness tradeoff).
-        let p = std::path::PathBuf::from("/tmp/dummy");
-        let waiter = WaitForBinaryRefresh::default_production(&p, "main");
-        assert_eq!(
-            waiter.timeout,
-            std::time::Duration::from_secs(300),
-            "production timeout must be 5 min unless explicitly changed",
-        );
-        assert_eq!(
-            waiter.interval,
-            std::time::Duration::from_secs(15),
-            "production interval must be 15 s unless explicitly changed",
-        );
-        assert!(
-            !waiter.disable_git_pull,
-            "production constructor must enable git pull",
-        );
-    }
 
     // ---- install_root_complete_at predicate ----------------------------
     //
@@ -12379,8 +9433,8 @@ mod tests {
     /// via `include_str!`. This test pins (a) the exact post-trim set
     /// the file is expected to contain, (b) the banned-entries
     /// invariant from PR-1, and (c) the self-reference invariant — the
-    /// .txt file lists itself so `update_orchestrator_at` propagates
-    /// new editions of the list across existing installs.
+    /// .txt file lists itself so a copy install carries new editions of
+    /// the list along.
     #[test]
     fn test_managed_paths_matches_source_of_truth() {
         // (a) Exact set: the parsed list must equal the post-trim
@@ -12402,8 +9456,8 @@ mod tests {
             "orchestrator-managed-paths.txt",
             // Phase 0 of the diagrams-integration plan (2026-05-24):
             // pinning manifest for external npm packages. Listed here
-            // so `update_orchestrator_at` propagates new editions of
-            // the manifest to existing installs — same fail-safe
+            // so a copy install carries new editions of the manifest
+            // along — same fail-safe
             // self-reference shape used for
             // `orchestrator-managed-paths.txt` itself.
             //
@@ -12414,8 +9468,8 @@ mod tests {
             // lockstep so update propagation still finds it.
             "vco_lib/bundled_mcp_versions.toml",
             // v0.2.83 WP-B5: the cross-language MCP scan/registration rule
-            // table (WP-B4). Listed here so `update_orchestrator_at` pushes
-            // future EDITS of the table into every existing install — same
+            // table (WP-B4). Listed here so a copy install carries future
+            // EDITS of the table along — same
             // wheel-packaged, self-propagating shape as
             // `bundled_mcp_versions.toml` above.
             "vco_lib/mcp_scan_rules.toml",
@@ -12460,14 +9514,13 @@ mod tests {
         }
 
         // (c) Self-reference invariant: the source-of-truth file lists
-        // itself so `update_orchestrator_at` syncs a freshly-edited
-        // version into every existing install. Dropping this entry
-        // would silently freeze the whitelist at its current contents
-        // for any user who installed before the next launcher release.
+        // itself so a copy install carries a freshly-edited version along.
+        // Dropping this entry would silently freeze the whitelist at its
+        // current contents for a copy-installed tree.
         assert!(
             ORCHESTRATOR_MANAGED_PATHS.contains(&"orchestrator-managed-paths.txt"),
-            "orchestrator-managed-paths.txt must list itself so \
-             update_orchestrator_at propagates edits to existing installs",
+            "orchestrator-managed-paths.txt must list itself so a copy install \
+             carries edits along",
         );
     }
 
@@ -12502,8 +9555,8 @@ infrastructure
     // Re-review of PR-1 flagged that `copy_recursive_sync` was
     // gitignore-blind. Even with `ORCHESTRATOR_MANAGED_PATHS` filtered
     // at the entry level, the kept entries (`tools/`, `.claude/`,
-    // `infrastructure/`) drag in gitignored subpaths verbatim during
-    // `update_orchestrator_at`:
+    // `infrastructure/`) drag in gitignored subpaths verbatim during a
+    // copy install (`copy_orchestrator_to_sync`):
     //   - tools/vct-secrets/*.token  (real secret leak risk)
     //   - .claude/agents/, .claude/skills/, .claude/logs/
     //   - infrastructure/docker-compose.override.yml
@@ -12513,10 +9566,8 @@ infrastructure
     /// Initialize `dir` as a git repo with an empty initial commit.
     /// Skips the test (returns `false`) if `git` is not on PATH —
     /// developer machines without git installed (rare but possible
-    /// on CI shards) shouldn't fail the suite. Production caller
-    /// (`update_orchestrator_at`) only runs when find_local_repo_root
-    /// resolves a real checkout, so the fallback path is exercised by
-    /// the bundle-install case which doesn't need git.
+    /// on CI shards) shouldn't fail the suite. The non-git fallback path
+    /// is exercised by the bundle-install case, which doesn't need git.
     fn try_git_init(dir: &Path) -> bool {
         let init = std::process::Command::new("git").silent()
             .args(["init", "-q", "--initial-branch=main"])
@@ -12785,17 +9836,6 @@ MemAvailable:   23456789 kB
 
     // ─── Bug 20: inspect orchestrator state ────────────────────────
 
-    #[test]
-    fn test_version_is_outdated_basic() {
-        assert!(version_is_outdated("0.0.7", "0.1.0"));
-        assert!(version_is_outdated("0.0.9", "0.0.10"));
-        assert!(!version_is_outdated("0.1.0", "0.1.0"));
-        assert!(!version_is_outdated("0.2.0", "0.1.0"));
-        // Pre-release suffixes are out of scope: "1.0.0-rc1" parses as
-        // [1,0,0] so it equals "1.0.0". This is intentional — we treat
-        // any version mismatch in semver-major/minor/patch as the
-        // signal, and ignore SemVer pre-release ordering.
-    }
 
     #[test]
     fn test_inspect_orchestrator_at_fresh() {
@@ -14294,20 +11334,18 @@ MemAvailable:   23456789 kB
         fs::remove_dir_all(&p).ok();
     }
 
-    // ---- update_orchestrator_at VCO-clone gate (post-PR-#150) -----------
+    // ---- validate_source_repo: the VCO-clone gate (post-PR-#150) --------
     //
     // After PR #150 unregister became non-destructive (preserves
-    // `.claude/agents/` + `.claude/skills/`). The previous existence-only
-    // check (`.claude/` OR `vct-module.json` present) would let a project
-    // folder with leftover `.claude/` slip through and trigger an
-    // orchestrator-machinery copy into the project. update_orchestrator_at
-    // now calls `validate_source_repo` — same gate as install_orchestrator
-    // — so the test surface is identical to the install_orchestrator_*
-    // block above. Project-update is the separate `update_project_v2` /
-    // `run_install_bundle_update` path in projects_v2.rs.
+    // `.claude/agents/` + `.claude/skills/`). An existence-only check
+    // (`.claude/` OR `vct-module.json` present) would let a project folder
+    // with leftover `.claude/` slip through and trigger an orchestrator-
+    // machinery copy into the project; `validate_source_repo` is the gate
+    // install_orchestrator applies. Project-update is the separate
+    // `update_project_v2` / `run_install_bundle_update` path.
 
     #[test]
-    fn test_update_orchestrator_at_refuses_project_folder_with_only_dot_claude() {
+    fn test_validate_source_repo_refuses_project_folder_with_only_dot_claude() {
         // Simulate a project folder post-non-destructive-unregister: leftover
         // `.claude/agents/` + content, but NO install.py / first-install.sh.
         // The new gate must refuse this with the validate_source_repo error.
@@ -14380,12 +11418,10 @@ MemAvailable:   23456789 kB
     }
 
     #[test]
-    fn test_update_orchestrator_at_accepts_vco_clone() {
+    fn test_validate_source_repo_accepts_vco_clone() {
         // A real VCO clone has install.py + first-install.sh side-by-side
         // (plus a `.git/`, but the gate doesn't require it). The gate-pass
-        // is what we test here — the actual copy still runs in the real
-        // command and is exercised by integration / manual QA, not unit
-        // tests (it requires a Window handle and the bundled source repo).
+        // is what we test here.
         let p = tmp();
         fs::write(p.join("install.py"), "# install\n").unwrap();
         fs::write(p.join("first-install.sh"), "#!/usr/bin/env bash\n").unwrap();
@@ -14410,8 +11446,8 @@ MemAvailable:   23456789 kB
     // against an unknown baseline); the v0.2.53 fix refuses resume
     // explicitly with a clear remediation path.
     //
-    // We can test the contract WITHOUT spawning the full
-    // `resume_orchestrator_update` Tauri command by:
+    // We can test the contract WITHOUT spawning the full update pipeline's
+    // `Resume` run (`update_pipeline::classify_resume`) by:
     //   1. Writing a known-shape sentinel on disk.
     //   2. Round-tripping through `read_update_resume_sentinel`.
     //   3. Asserting the parsed value matches the on-disk shape.
@@ -14453,7 +11489,8 @@ MemAvailable:   23456789 kB
 
     #[test]
     fn test_resume_sentinel_empty_sha_predicate_matches_refusal_branch() {
-        // The refusal branch in `resume_orchestrator_update` keys on
+        // The refusal branch of the pipeline's resume
+        // (`update_pipeline::classify_resume`) keys on
         // `sentinel.sha_at_conflict.is_empty()`. This test pins the
         // predicate so a future refactor of `UpdateResumeSentinel`
         // (e.g. switching to `Option<String>`) can't silently regress
@@ -16258,8 +13295,9 @@ MemAvailable:   23456789 kB
             fs::remove_dir_all(&dir).ok();
         }
 
-        /// v0.2.95 WP-1 — the flag `manifest::refresh_install_manifest` writes
-        /// has to be READ, and read conservatively. `install_stale` drives a
+        /// v0.2.95 WP-1 — the flag the (v0.2.100: retired) Rust manifest
+        /// writer set — which a launcher ≤ 0.2.99 may have left behind — has
+        /// to be READ, and read conservatively. `install_stale` drives a
         /// badge whose action is a multi-minute `install.py --update`, so every
         /// unreadable shape must answer "no".
         #[test]
@@ -17214,7 +14252,7 @@ MemAvailable:   23456789 kB
     //
     // Tests cover three layers:
     //   1. Unit tests for the pure helpers (serializers, predicates).
-    //   2. End-to-end git-fixture tests for update_orchestrator's non-FF
+    //   2. End-to-end git-fixture tests for the update pipeline's non-FF
     //      detection branch. We can't drive the full Tauri command from
     //      a unit test (it depends on a Tauri Runtime + Window), so we
     //      cover the path by exercising the raw `git pull --ff-only`
@@ -17250,91 +14288,15 @@ MemAvailable:   23456789 kB
         // Unit tests — pure helpers, no git.
         // ----------------------------------------------------------------
 
-        #[test]
-        fn serialize_orchestrator_non_ff_produces_parseable_json() {
-            let s = serialize_orchestrator_non_ff_error(
-                "main",
-                Some("abc1234"),
-                Some("def5678"),
-                &["CLAUDE.md".to_string(), "knowledge/foo.md".to_string()],
-                &["launcher/dist/x".to_string(), "install.py".to_string(), "README.md".to_string()],
-                &["other_projects_knowledge/local-only.md".to_string()],
-                "fatal: Not possible to fast-forward, aborting.",
-            );
-            // Must start with the canonical discriminator so the frontend's
-            // fast-path recognises it.
-            assert!(s.starts_with("{\"event\":\"orchestrator_update_non_ff\""));
-
-            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
-            assert_eq!(v["event"], "orchestrator_update_non_ff");
-            assert_eq!(v["branch"], "main");
-            assert_eq!(v["local_sha"], "abc1234");
-            assert_eq!(v["remote_sha"], "def5678");
-            let files = v["diverged_files"].as_array().expect("array");
-            assert_eq!(files.len(), 2);
-            assert_eq!(files[0], "CLAUDE.md");
-            assert_eq!(files[1], "knowledge/foo.md");
-            // v0.2.27: local_only_files is a separate category.
-            let local_only = v["local_only_files"].as_array().expect("array");
-            assert_eq!(local_only.len(), 1);
-            assert_eq!(local_only[0], "other_projects_knowledge/local-only.md");
-            // v0.2.93: upstream_only_files + its count are a third category —
-            // the modal can now say "2 diverged, 3 coming in from upstream".
-            let upstream_only = v["upstream_only_files"].as_array().expect("array");
-            assert_eq!(upstream_only.len(), 3);
-            assert_eq!(upstream_only[0], "launcher/dist/x");
-            assert_eq!(v["upstream_only_count"], 3);
-        }
 
         #[test]
-        fn serialize_orchestrator_non_ff_handles_empty_file_list() {
-            let s = serialize_orchestrator_non_ff_error(
-                "main",
-                None,
-                None,
-                &[],
-                &[],
-                &[],
-                "boom",
-            );
-            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
-            assert_eq!(v["diverged_files"].as_array().unwrap().len(), 0);
-            assert_eq!(v["local_only_files"].as_array().unwrap().len(), 0);
-            assert_eq!(v["upstream_only_files"].as_array().unwrap().len(), 0);
-            assert_eq!(v["upstream_only_count"], 0);
-            assert!(v["local_sha"].is_null());
-            assert!(v["remote_sha"].is_null());
-        }
-
-        #[test]
-        fn serialize_orchestrator_non_ff_escapes_special_chars_in_paths() {
-            // File paths can contain quotes on Windows (rare but legal).
-            // The path "weird\"name.md" tests both backslash and quote
-            // escaping.
-            let s = serialize_orchestrator_non_ff_error(
-                "main",
-                None,
-                None,
-                &["weird\"name.md".to_string()],
-                &["up\\stream.md".to_string()],
-                &[],
-                "boom",
-            );
-            let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
-            let files = v["diverged_files"].as_array().unwrap();
-            assert_eq!(files[0], "weird\"name.md");
-            assert_eq!(v["upstream_only_files"][0], "up\\stream.md");
-        }
-
-        #[test]
-        fn serialize_orchestrator_conflict_produces_parseable_json() {
-            let s = serialize_orchestrator_conflict_error(
+        fn conflict_payload_produces_parseable_json() {
+            let s = conflict_payload(
                 "merge",
                 "main",
                 &["CLAUDE.md".to_string(), "CONTEXT_STATE.md".to_string()],
                 "CONFLICT (content): Merge conflict in CLAUDE.md",
             );
-            assert!(s.starts_with("{\"event\":\"orchestrator_update_conflict\""));
 
             let v: serde_json::Value = serde_json::from_str(&s).expect("valid JSON");
             assert_eq!(v["event"], "orchestrator_update_conflict");
@@ -17345,8 +14307,8 @@ MemAvailable:   23456789 kB
         }
 
         #[test]
-        fn serialize_orchestrator_conflict_handles_rebase_operation() {
-            let s = serialize_orchestrator_conflict_error(
+        fn conflict_payload_handles_rebase_operation() {
+            let s = conflict_payload(
                 "rebase",
                 "main",
                 &["a.md".to_string()],
@@ -17832,17 +14794,17 @@ MemAvailable:   23456789 kB
             );
         }
 
-        /// v0.2.78 ITEM #0 (F3) — SOURCE-SHAPE guard: the finalize tail
-        /// (`run_post_pull_install_and_restart`, which runs install.py --update +
-        /// binary refresh + hub restart) MUST remain wired on every post-choice
-        /// success path, so a GUI-only user auto-continues without a terminal:
-        ///   * `merge_orchestrator_with_upstream` success,
-        ///   * `rebase_orchestrator_onto_upstream` success,
-        ///   * `resolve_conflict_and_resume` (both keep-mine/take-upstream) →
-        ///     delegates to `resume_orchestrator_update` which itself finalizes.
-        /// This is the F3 residual: the wiring already exists (verified 2026-07-11);
-        /// this guard catches a future refactor silently dropping it — a
-        /// behavioral test can't reach it without a real install + restart.
+        /// v0.2.78 ITEM #0 (F3) — SOURCE-SHAPE guard, retargeted in v0.2.100
+        /// (WP-03b): every post-choice conflict resolver must CONTINUE the
+        /// update — install.py --update, binary check, relaunch — so a GUI-only
+        /// user auto-continues without a terminal. Since v0.2.100 that
+        /// continuation is the ONE pipeline, reached with the resolver's claim
+        /// handed over (`continue_update_under_claim` → `run_update_claimed`):
+        ///   * `resolve_conflict_and_resume` (the staged-resolution leg and the
+        ///     checkout leg; both keep-mine/take-upstream) → `Resume`,
+        ///   * `resolve_untracked_collision_and_retry` → `PullFf`,
+        ///   * `resolve_autostash_pop_and_retry` → `Resume`.
+        /// Merge / Rebase success is the pipeline's own (tested in `update_run`).
         ///
         /// Needles are ASSEMBLED FROM SPLIT LITERALS so the test's own source
         /// (included via include_str! — this test IS in installer.rs) does not
@@ -17851,36 +14813,17 @@ MemAvailable:   23456789 kB
         #[test]
         fn v0278_f3_finalize_tail_stays_wired_on_success_paths() {
             let src = include_str!("installer.rs");
-            // Split-literal assembly: neither of these string literals, as
-            // written here, equals the runtime call token we count.
-            let finalize_call = concat!("run_post_pull_install", "_and_restart(");
-            // v0.2.95 ship-gate MAJOR-3: the delegation target gained the
-            // handed-down single-flight claim, so the token is now
-            // `..._with_claim(app, path, window, flight)`. The DELEGATION is
-            // what this asserts and it is intact; only the callee's name moved.
-            let resume_call =
-                concat!("resume_orchestrator", "_update_with_claim(app, path, window, flight)");
-
-            let finalize_hits = src.matches(finalize_call).count();
-            // merge success + rebase success + resolve_conflict_and_resume all
-            // call the finalize tail directly (3 call-sites). If a refactor drops
-            // one, this trips.
+            let resume = concat!("continue_update_under", "_claim(app, &window, UpdateKind::Resume");
+            let pull = concat!("continue_update_under", "_claim(app, &window, UpdateKind::PullFf");
             assert!(
-                finalize_hits >= 3,
-                "expected >=3 run_post_pull_install_and_restart call-sites on the \
-                 update success paths (merge, rebase, resolve-resume); found {}. A \
-                 finalize call was likely dropped — GUI-only auto-continue would break.",
-                finalize_hits
+                src.matches(resume).count() >= 3,
+                "the conflict resolvers (staged leg, checkout leg, autostash-pop) must \
+                 continue through the pipeline's Resume; found {}",
+                src.matches(resume).count()
             );
-
-            // resolve_conflict_and_resume's tail must delegate to the resume
-            // command (which finalizes) — the keep-mine/take-upstream → auto-
-            // continue story depends on this exact delegation.
             assert!(
-                src.contains(resume_call),
-                "resolve_conflict_and_resume must delegate to the resume tail \
-                 (`resume_orchestrator_update_with_claim`) so the \
-                 conflict-resolution path auto-continues to finalize",
+                src.matches(pull).count() >= 1,
+                "resolve_untracked_collision_and_retry must re-run the update (PullFf)"
             );
         }
 
@@ -18039,7 +14982,7 @@ MemAvailable:   23456789 kB
             add_local_divergent_commit(&local, "LOCAL.md", "local-only\n");
 
             // Attempt the same `git pull --ff-only` invocation
-            // update_orchestrator runs. It must fail with a non-FF stderr
+            // the update pipeline runs. It must fail with a non-FF stderr
             // pattern that `is_non_fast_forward` recognizes.
             let pull = tokio::process::Command::new("git").silent()
                 .args(["pull", "--ff-only", "vco_upstream", "main"])
@@ -18082,7 +15025,7 @@ MemAvailable:   23456789 kB
 
             // Final: the serialized payload should parse as JSON with the
             // right discriminator.
-            let payload = serialize_orchestrator_non_ff_error(
+            let v = crate::commands::update_failure::non_ff_payload(
                 "main",
                 local_sha.as_deref(),
                 remote_sha.as_deref(),
@@ -18091,8 +15034,6 @@ MemAvailable:   23456789 kB
                 &local_only,
                 stderr.trim(),
             );
-            let v: serde_json::Value =
-                serde_json::from_str(&payload).expect("payload valid JSON");
             assert_eq!(v["event"], "orchestrator_update_non_ff");
             assert_eq!(v["branch"], "main");
             assert!(v["diverged_files"].as_array().unwrap().is_empty());
@@ -18138,7 +15079,7 @@ MemAvailable:   23456789 kB
             );
             assert_eq!(sets.local_only, vec!["LOCAL.md".to_string()], "B ∖ A");
 
-            let payload = serialize_orchestrator_non_ff_error(
+            let v = crate::commands::update_failure::non_ff_payload(
                 "main",
                 None,
                 None,
@@ -18147,7 +15088,6 @@ MemAvailable:   23456789 kB
                 &sets.local_only,
                 "",
             );
-            let v: serde_json::Value = serde_json::from_str(&payload).unwrap();
             assert_eq!(v["diverged_files"].as_array().unwrap().len(), 1);
             assert_eq!(v["upstream_only_count"], 4);
             assert_eq!(v["local_only_files"].as_array().unwrap().len(), 1);
@@ -18163,7 +15103,7 @@ MemAvailable:   23456789 kB
             add_local_divergent_commit(&local, "LOCAL.md", "local-only\n");
 
             // Run the same `git pull --no-rebase --no-edit vco_upstream main`
-            // invocation merge_orchestrator_with_upstream uses.
+            // invocation `update_pipeline::merge_upstream` uses.
             let pull = tokio::process::Command::new("git").silent()
                 .args(["pull", "--no-rebase", "--no-edit", "vco_upstream", "main"])
                 .current_dir(&local)
@@ -18237,7 +15177,7 @@ MemAvailable:   23456789 kB
             );
 
             // Serializer round-trips.
-            let payload = serialize_orchestrator_conflict_error(
+            let payload = conflict_payload(
                 "merge",
                 "main",
                 &conflicted,
@@ -18359,7 +15299,8 @@ MemAvailable:   23456789 kB
             );
         }
 
-        /// THE re-entrancy property `force_resync_launcher` depends on.
+        /// THE re-entrancy property the pipeline's `ResetHard`
+        /// (`update_run::reset_hard_git_op`) depends on.
         ///
         /// It is already holding the claim when MINOR-4's abort-before-reset
         /// runs, so that abort goes through the claim-FREE helper. If the
@@ -18376,9 +15317,9 @@ MemAvailable:   23456789 kB
             let (_tmp, _remote, local) = init_remote_and_clone();
             let _pull = stall_merge_on_readme(&local);
 
-            // Exactly `force_resync_launcher`'s position: claim in hand.
+            // Exactly the `ResetHard` git operation's position: claim in hand.
             let _held = crate::commands::single_flight::begin_orchestrator_update_or_refuse()
-                .expect("the caller takes the claim first, as force_resync does");
+                .expect("the caller takes the claim first, as the pipeline does");
 
             abort_merge_or_rebase_unclaimed(&local)
                 .await
@@ -18397,7 +15338,8 @@ MemAvailable:   23456789 kB
         /// git on the host. First half: reset, and the rebase state SURVIVES
         /// (so a resync over a mid-rebase tree really would leave the clone
         /// believing it is mid-rebase). Second half: the helper
-        /// `stop_hub_then_hard_reset` now runs first does conclude it.
+        /// the `ResetHard` git operation (`update_run::reset_hard_git_op`) now
+        /// runs first (`abort_merge_or_rebase_unclaimed`) does conclude it.
         ///
         /// If a future git ever made `reset --hard` conclude a rebase, the
         /// first assertion fails and tells the next maintainer the
@@ -18489,7 +15431,7 @@ MemAvailable:   23456789 kB
             assert!(
                 in_rebase(),
                 "`git reset --hard` must NOT clear the rebase state — if this \
-                 ever changes, the abort-before-reset in stop_hub_then_hard_reset \
+                 ever changes, the abort-before-reset in update_run::reset_hard_git_op \
                  is no longer needed",
             );
 
@@ -18756,6 +15698,7 @@ MemAvailable:   23456789 kB
                 remote_ahead: false,
                 install_stale: false,
                 binary_stale: false,
+                binary_newer_than_disk: false,
                 merge_resolved_incomplete: false,
                 resume_operation: String::new(),
                 resume_branch: String::new(),
@@ -18801,6 +15744,70 @@ MemAvailable:   23456789 kB
             assert!(binary_ahead_of_install_core(Some("merge"), Some(String::new()), "0.2.92").is_none());
         }
 
+        /// v0.2.100 (AD-8, U3): "ahead" is a DIRECTION. A running binary
+        /// BEHIND the install is not "ahead of install" (it was, under `!=`),
+        /// and the numeric order holds across the digit boundary.
+        #[test]
+        fn binary_ahead_of_install_is_direction_aware() {
+            assert!(binary_ahead_of_install_core(Some("merge"), Some("0.2.99".into()), "0.2.100").is_some());
+            assert!(binary_ahead_of_install_core(Some("merge"), Some("0.2.100".into()), "0.2.99").is_none());
+            assert!(binary_ahead_of_install_core(Some("merge"), Some("0.2.100-rc1".into()), "0.2.100").is_none());
+        }
+
+        /// v0.2.100 (I-03): the post-update poll finds a hub that IS up. A
+        /// fake hub mounts ONLY `/api/v1/health` (like the real router) and
+        /// its port is named by `hub.port` under the state root. The pre-fix
+        /// probe asked `/health` and could never succeed. Leave-alone: nothing
+        /// listening → `false` once the window elapses.
+        #[test]
+        fn hub_health_poll_reaches_the_liveness_route_on_the_resolved_port() {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let server = std::thread::spawn(move || {
+                for stream in listener.incoming().take(1) {
+                    let mut s = stream.unwrap();
+                    let mut buf = [0u8; 512];
+                    let n = s.read(&mut buf).unwrap_or(0);
+                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let status = if req.starts_with("GET /api/v1/health ") {
+                        "200 OK"
+                    } else {
+                        "404 Not Found"
+                    };
+                    let _ = s.write_all(
+                        format!("HTTP/1.1 {status}\r\nContent-Length: 0\r\n\r\n").as_bytes(),
+                    );
+                }
+            });
+            let root = tempfile::tempdir().unwrap();
+            std::fs::write(root.path().join("hub.port"), format!("{port}\n")).unwrap();
+            assert!(poll_hub_health(root.path(), std::time::Duration::from_secs(5)));
+            server.join().unwrap();
+
+            // Nothing listening on the named port → false after the window.
+            let dead = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let dead_port = dead.local_addr().unwrap().port();
+            drop(dead);
+            std::fs::write(root.path().join("hub.port"), format!("{dead_port}\n")).unwrap();
+            assert!(!poll_hub_health(root.path(), std::time::Duration::from_millis(300)));
+        }
+
+        /// v0.2.100 (U3, L2-F01): a running 0.2.100 with an on-disk 0.2.99
+        /// dist sidecar is NEVER `binary_stale` (the "Restart Launcher" badge
+        /// state) — it is `binary_newer_than_disk`. Act: a genuinely newer
+        /// dist is stale. Leave-alone: equal, absent and unreadable are
+        /// neither.
+        #[test]
+        fn binary_direction_never_offers_a_restart_into_an_older_binary() {
+            assert_eq!(binary_direction("0.2.100", "0.2.99"), (false, true));
+            assert_eq!(binary_direction("0.2.99", "0.2.100"), (true, false));
+            assert_eq!(binary_direction("0.2.9", "0.2.10"), (true, false));
+            assert_eq!(binary_direction("0.2.100", "0.2.100"), (false, false));
+            assert_eq!(binary_direction("0.2.100", ""), (false, false));
+            assert_eq!(binary_direction("0.2.100", "0.2.99-dev"), (false, false));
+        }
+
         /// The on-disk reader behind the boot warn + `UpdateStatus` field.
         #[test]
         fn detect_binary_ahead_of_install_reads_manifest_and_git_state() {
@@ -18811,7 +15818,7 @@ MemAvailable:   23456789 kB
             let running = env!("CARGO_PKG_VERSION");
             std::fs::write(
                 root.join("state/install-manifest.json"),
-                format!("{{\"version\":\"{running}-older\"}}"),
+                "{\"version\":\"0.0.1\"}",
             )
             .unwrap();
 
@@ -19369,29 +16376,10 @@ MemAvailable:   23456789 kB
         // enum (and their markdown-shape tests) were RELOCATED to
         // `git_user_editable_merge` so both update surfaces share ONE writer.
         // See `git_user_editable_merge::tests::launcher_update_diverged_*`
-        // for the relocated markdown-shape coverage. The PRIMARY-BUG version-
-        // comparison test below stays here because it exercises
-        // `version_is_outdated`, which is still defined in installer.rs.
+        // for the relocated markdown-shape coverage. (The PRIMARY-BUG
+        // direction test went with `finalize_update_and_restart` in v0.2.100:
+        // the relaunch guard is `restart::relaunch`'s, tested there.)
 
-        #[test]
-        fn primary_bug_on_disk_beats_running_comparison_direction() {
-            // The PRIMARY-BUG fix restarts into the on-disk binary when it
-            // is NEWER than the running launcher. version_is_outdated(a, b)
-            // is true iff a < b, so `version_is_outdated(running, on_disk)`
-            // == "running is older than on_disk" == "restart is worth it".
-            assert!(
-                version_is_outdated("0.2.54", "0.2.55"),
-                "running 0.2.54 < on-disk 0.2.55 → should restart"
-            );
-            assert!(
-                !version_is_outdated("0.2.55", "0.2.55"),
-                "equal versions → no newer binary → keep abort"
-            );
-            assert!(
-                !version_is_outdated("0.2.56", "0.2.55"),
-                "running ahead of on-disk → keep abort (don't downgrade)"
-            );
-        }
 
         // ─── v0.2.53 DEDUP-14: paired sentinel + deferral writer ──────────
         //
@@ -19451,7 +16439,7 @@ MemAvailable:   23456789 kB
             // None → `unwrap_or_default()` gives "". The helper still
             // writes BOTH files; the empty SHA is intentional and is
             // handled by the v0.2.53 NEW-11 empty-sha refusal branch
-            // in `resume_orchestrator_update`.
+            // of the pipeline's resume (`update_pipeline::classify_resume`).
             let dir = tempfile::tempdir().expect("tempdir");
             let install = dir.path().to_path_buf();
 
@@ -19620,7 +16608,7 @@ severity_max: critical\n\
             );
         }
 
-        /// resume_orchestrator_update REFUSES when no sentinel exists —
+        /// The pipeline's resume REFUSES when no sentinel exists —
         /// the GUI should never get a half-baked InstallResult back when
         /// the user clicked Continue Update on a stale badge.
         #[tokio::test]

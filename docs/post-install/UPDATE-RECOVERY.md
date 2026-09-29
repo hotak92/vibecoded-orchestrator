@@ -416,16 +416,21 @@ running.
 
 ## Ordering guarantees (for maintainers)
 
-The shared finalize tail (`installer.rs::finalize_update_and_restart`)
-enforces, in order:
+Since v0.2.100 the ONE update pipeline (`update_run.rs::run_update`, the
+`run_orchestrator_update` command) enforces, in order, after install.py:
 
-1. `WaitForBinaryRefresh` (don't restart into a stale binary, V45-B);
-2. update-gate disarm (BEFORE any exit hop — `app.exit(0)` can kill the
-   process before RAII `Drop` runs on Windows);
-3. stage locked binaries (`<target>.new`) + handoff decision;
-4. **handoff active** → exit with the hub still STOPPED (so
-   `vct-hub.exe` is swappable; the relaunched launcher starts the new
-   hub) — **no handoff** → start the hub, then `restart_launcher`.
+1. update-gate disarm (phase 10, BEFORE any exit hop — `app.exit(0)` can
+   kill the process before RAII `Drop` runs on Windows); on POSIX the hub
+   restarts here, on Windows it waits for the handoff decision;
+2. the binary check (phase 11, `decide_binary_refresh`: one read of the
+   source, dist-launcher and dist-hub versions — no restart into a binary
+   that is not newer, V45-B; a lagging binary is recorded, not waited for);
+3. bookkeeping (phase 12: desktop shortcut, hardware re-detect flag);
+4. the relaunch (phase 13, `restart::relaunch`): version guard, then stage
+   locked binaries (`<target>.new`) + handoff decision — **handoff active**
+   → exit with the hub still STOPPED (so `vct-hub.exe` is swappable; the
+   relaunched launcher starts the new hub) — **no handoff** → start the
+   hub (Windows), then spawn the dist launcher.
 
 `vct-updater` enforces: swaps → write `update.result.json` → delete
 lock iff full success → relaunch → write `update.log`. The result file
@@ -433,10 +438,10 @@ preceding the relaunch is what makes the post-update toast reliable.
 
 ### v0.2.91: one home for the delivery chain, and repair at rest
 
-Step 3's staging + handoff pair now lives in
-`launcher/src-tauri/src/services/binary_freshness.rs` and is called from BOTH
-update surfaces (`installer::finalize_update_and_restart` and
-`self_update::finish_apply_after_pull`), so they cannot drift. The same module
+Step 4's staging + handoff pair lives in
+`launcher/src-tauri/src/services/binary_freshness.rs` (until v0.2.100 it was
+called from both update surfaces, so they could not drift; now from the one
+relaunch). The same module
 owns the Windows pre-pull rename, its **non-clobbering** revert, and the
 at-rest reconcile.
 

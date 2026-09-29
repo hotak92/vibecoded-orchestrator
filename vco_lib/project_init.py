@@ -3698,6 +3698,7 @@ class _BundleFileOp:
 def _enumerate_bundle_files(
     orchestrator_root: Path,
     project_root: Path | None = None,
+    gate_outcomes: list | None = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3720,8 +3721,9 @@ def _enumerate_bundle_files(
       .claude/scripts/<name>               from templates/scripts/  (all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
       .claude/agents/<name>.md             from templates/agents/module-gateway/
-                                           (ONLY when the model_gateway module is
-                                           active for the target — v0.2.96 WP-10)
+                                           (ONLY when the gateway gate says
+                                           DELIVER — v0.2.100 AD-7; each gated
+                                           verdict is appended to `gate_outcomes`)
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
       infrastructure/<name>                from infrastructure/<name>   (only docker/podman compose)
     Settings template handled separately (smart-merge, not a plain copy).
@@ -3823,25 +3825,21 @@ def _enumerate_bundle_files(
                 always_overwrite=False,
             ))
 
-    # v0.2.96 WP-10: model-gateway-gated agents (hardcoded `claude-gw/*`
-    # frontmatter ids) ship ONLY to projects with the model_gateway module
-    # ACTIVE — never via `free/`, the unconditional bucket. The gate, the
-    # folder→UUID key resolution (module rows are UUID-keyed, not
-    # folder-keyed — a folder-keyed gate never fires) and the
-    # runnability-posture rationale live in `vco_lib.module_gated_delivery`
-    # (one home, shared with the env projections' resolvers).
-    # `project_root is None` = orchestrator self-install: the root IS the
-    # target there (same convention as `_agent_subs` /
-    # `_is_root_bundle_target`).
-    from vco_lib.module_gated_delivery import (
-        GATEWAY_AGENTS_DIR,
-        module_gateway_agents_active,
-    )
-    gateway_agents_src = templates / "agents" / GATEWAY_AGENTS_DIR
-    if gateway_agents_src.exists() and module_gateway_agents_active(
-        orchestrator_root if project_root is None else project_root,
-    ):
-        for agent_file in sorted(gateway_agents_src.glob("*.md")):
+    # Model-gateway-gated agents (hardcoded `claude-gw/*` ids) — never via
+    # `free/`. v0.2.100 AD-7: a TRI-STATE gate on the machine signal (explicit
+    # per-project row wins); the verdict goes to `gate_outcomes` so the orphan
+    # loop carries an UNKNOWN bucket forward and the run records every skip.
+    # The table and rationale live in `vco_lib.module_gated_delivery`. Root
+    # installs (`project_root is None`) go through the same gate.
+    from vco_lib import module_gated_delivery as _mgd
+    gateway_agents_src = templates / "agents" / _mgd.GATEWAY_AGENTS_DIR
+    if gateway_agents_src.exists():
+        verdict = _mgd.gateway_agents_gate(
+            orchestrator_root if project_root is None else project_root)
+        if gate_outcomes is not None:
+            gate_outcomes.append((_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict))
+        for agent_file in (sorted(gateway_agents_src.glob("*.md"))
+                           if verdict.delivers else ()):
             ops.append(_BundleFileOp(
                 dest_rel=str(Path(".claude") / "agents" / agent_file.name),
                 source_abs=agent_file,
@@ -5293,17 +5291,12 @@ def merge_managed_region(
 # it is the resolved value for "no launcher has ever expressed an opinion".
 # ---------------------------------------------------------------------------
 
-# v0.2.96 (ship-gate F-N5): the DEFAULT-ON SET, and it is a SET, not a
-# policy. A module NOT named here and with no `project_modules` row is
-# INACTIVE — which is exactly what the WP-10 model-gateway delivery gate
-# relies on (`module_gated_delivery.module_gateway_agents_active`, pinned by
-# `test_install_bundle.py::test_unregistered_folder_does_not_deliver`). The
-# comment here used to say "any module with no row … is considered active",
-# describing a default-on-for-everything policy the code has never had; a
-# reader who believed it would have added a gated module expecting opt-out
-# semantics and shipped it to every install. The constant lives here so the
-# no-DB path and the live-DB path share a single source of truth.
-_DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
+# The DEFAULT-ON SET (v0.2.96 ship-gate F-N5) — a module NOT in it and with no
+# `project_modules` row is INACTIVE. Its one home moved to
+# `vco_lib.module_gated_delivery` in v0.2.100 with the tri-state reader.
+from vco_lib.module_gated_delivery import (  # noqa: E402
+    DEFAULT_ACTIVE_MODULES as _DEFAULT_ACTIVE_MODULES,
+)
 
 
 def _launcher_db_path() -> Path:
@@ -5332,90 +5325,28 @@ def resolve_active_modules(
 ) -> set[str]:
     """Return the set of active module names for ``project_id``.
 
-    The set is ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus
-    every module with an ``enabled=1`` row in the launcher SQLite DB's
-    ``project_modules`` table, minus every default-on module with an
-    ``enabled=0`` row.
+    ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus every module
+    with an ``enabled=1`` row in launcher.db ``project_modules``, minus every
+    default-on module with an ``enabled=0`` row. **A module with NO row is
+    active only if it is in :data:`_DEFAULT_ACTIVE_MODULES`** (v0.2.96 F-N5;
+    pinned by ``tests/test_v0296_lane_python_core.py``).
 
-    **A module with NO row is active only if it is in
-    :data:`_DEFAULT_ACTIVE_MODULES`.** v0.2.96 (ship-gate F-N5): until this
-    release the text here described a default-on-for-everything policy and
-    called the no-DB answer a temporary stub awaiting a migration. Both were
-    false — the migration shipped long ago, and a row-less module outside the
-    default-on set has always resolved INACTIVE. That is load-bearing, not
-    incidental: the WP-10 model-gateway delivery gate is built on it (an
-    unregistered or opinion-less project must NOT receive ``claude-gw/*``
-    agent definitions), so a reader who took the old text at face value and
-    "fixed the code to match" would ship gateway ids onto every stock
-    install. Pinned by ``tests/test_v0296_lane_python_core.py``.
-
-    No-DB / no-table is therefore a RESOLVED answer, not a fallback: a CLI
-    install that never booted the launcher has expressed no opinion, and
-    "no opinion" means the default-on set, exactly as it does for a
-    registered project with no rows.
+    v0.2.100 (AD-7): a thin delegate of
+    :func:`vco_lib.module_gated_delivery.active_modules_verdict`, which opens
+    the DB READ-ONLY and tells "could not ask" apart. This set view — used by
+    the CLAUDE.md renderer, whose output the next render recomputes — maps
+    "could not ask" to the default-on set; a caller that DELETES on the
+    answer (the gated delivery) reads the verdict instead.
 
     Args:
-        project_id: The project's UUID-or-slug as stored in
-            ``project_modules.project_id``. The launcher writes the
-            ``projects``-table UUID; resolve a folder to it with
-            ``vco_lib.module_gated_delivery.resolve_project_id_for_folder``
-            rather than passing ``str(folder)``, which can never match.
-        db_path: Override the default ``~/.vct/launcher.db`` resolution
-            (used by tests to point at a fixture DB).
-
-    Returns:
-        Set of module name strings considered active for this project.
+        project_id: the ``projects``-table UUID the launcher writes (resolve a
+            folder with ``module_gated_delivery.resolve_project_id_for_folder``;
+            ``str(folder)`` can never match).
+        db_path: override the default ``~/.vct/launcher.db`` (tests).
     """
-    import sqlite3
+    from vco_lib.module_gated_delivery import active_modules_verdict
 
-    target = db_path if db_path is not None else _launcher_db_path()
-    if not target.is_file():
-        # No launcher DB: a CLI-only install, or one before the launcher's
-        # first boot. No opinion recorded → the default-on set.
-        return set(_DEFAULT_ACTIVE_MODULES)
-
-    try:
-        conn = sqlite3.connect(str(target))
-    except sqlite3.Error:
-        return set(_DEFAULT_ACTIVE_MODULES)
-    try:
-        # Probe for the table. The launcher's migration set owns it; a DB
-        # written by a build that predates the table (or a foreign-schema
-        # file) carries no opinion either → the default-on set.
-        try:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name='project_modules'"
-            )
-            if cur.fetchone() is None:
-                return set(_DEFAULT_ACTIVE_MODULES)
-        except sqlite3.Error:
-            return set(_DEFAULT_ACTIVE_MODULES)
-
-        try:
-            cur = conn.execute(
-                "SELECT module_name, enabled FROM project_modules "
-                "WHERE project_id = ?",
-                (project_id,),
-            )
-            rows = cur.fetchall()
-        except sqlite3.Error:
-            return set(_DEFAULT_ACTIVE_MODULES)
-    finally:
-        conn.close()
-
-    # Build the active-set: start with defaults, then apply explicit rows.
-    # A row with enabled=0 REMOVES a default-on module from the set; a
-    # row with enabled=1 adds (or keeps) the module.
-    active = set(_DEFAULT_ACTIVE_MODULES)
-    for module_name, enabled in rows:
-        if not isinstance(module_name, str):
-            continue
-        if enabled:
-            active.add(module_name)
-        else:
-            active.discard(module_name)
-    return active
+    return set(active_modules_verdict(project_id, db_path=db_path).active)
 
 
 # v0.2.92 WP-15: the "meaningfully differs" rule moved to
@@ -10112,7 +10043,9 @@ def install_project_bundle(
     # is what makes the entry actionable, and only this site has it.
     backup_failures: list[tuple[str, str]] = []
 
-    ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
+    _gate_outcomes: list = []  # v0.2.100 AD-7: (source_prefix, GateVerdict)
+    ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
+                                  gate_outcomes=_gate_outcomes)
     # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
     # any skipped file-kind BEFORE the classify/write loop, so a skipped kind's
     # files are never touched on disk. `settings` is NOT a file-kind (it is the
@@ -10433,6 +10366,12 @@ def install_project_bundle(
         if _op_kinds_to_skip and _bundle_op_kind(prior_rel) in _op_kinds_to_skip:
             new_files[prior_rel] = prior_entry
             continue
+        # v0.2.100 AD-7 (L5-F02): same carry-forward for a gated bucket whose
+        # gate could not be evaluated — "could not ask" never deletes.
+        from vco_lib.module_gated_delivery import carries_forward
+        if carries_forward(prior_entry, _gate_outcomes):
+            new_files[prior_rel] = prior_entry
+            continue
         # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
         # on a NON-root project the ~115 curated `knowledge/**` entries are
         # no longer shipped, so they'd otherwise fall into the orphan
@@ -10509,6 +10448,10 @@ def install_project_bundle(
 
     result["actions"]["orphan-deleted"] = orphan_deleted
     result["actions"]["orphan-preserved"] = orphan_preserved
+    # v0.2.100 AD-7 (L5-F04): every gated skip is visible (log + ledger row).
+    from vco_lib.module_gated_delivery import record_gate_outcomes
+    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run,
+                         log=lambda m: _log("4.bundle.gated", "info", m))
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file

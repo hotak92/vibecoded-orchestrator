@@ -39,7 +39,8 @@
 //!
 //! ## Lifecycle
 //!
-//! 1. `update_orchestrator` writes the lockfile pre-git-pull via
+//! 1. The update pipeline (`update_run::run_update`, phase 4) writes the
+//!    lockfile before its git operation via
 //!    [`UpdateInProgressGuard::write`].
 //! 2. Throughout the update, `advance_phase` updates the `phase` field.
 //! 3. On Drop (success or failure), the lockfile is deleted.
@@ -240,7 +241,7 @@ pub fn is_update_in_progress() -> bool {
 /// background task that opens its OWN `launcher.db` connection should SKIP
 /// this tick because an orchestrator update is in progress.
 ///
-/// WHY: `update_orchestrator` closes the launcher's managed `Db`
+/// WHY: the update pipeline (`update_run::run_update`) closes the launcher's managed `Db`
 /// connection for the `install.py --update` window so install.py can take
 /// the SQLite writer lock (Windows holds it exclusively — see the
 /// launcher-self-db-lock bug). But several background pollers open their
@@ -300,7 +301,8 @@ pub fn cleanup_if_stale() -> bool {
 
 /// RAII guard: writes the lockfile on `new`, deletes it on `drop`.
 ///
-/// Designed to be held for the entire `update_orchestrator` body. Any
+/// Designed to be held for the whole orchestrator update (phases 4-10 of
+/// `update_run::run_update`). Any
 /// exit path (early return, panic, ?-bail) cleans up the lockfile so
 /// MCPs can be respawned on the next session.
 ///
@@ -368,7 +370,8 @@ impl Drop for UpdateInProgressGuard {
 // is the *prevention* side of the gate; the lockfile itself is the
 // *suppression* side.
 //
-// CRITICAL: this sweep MUST NOT fire outside `update_orchestrator`. We
+// CRITICAL: this sweep MUST NOT fire outside an orchestrator update
+// (`update_run::run_update`). We
 // don't want to kill the user's other Python or Node processes.
 // The filter pattern is strict — only commands matching:
 //   * `claude_mcp_servers/` (path substring) — our own MCPs

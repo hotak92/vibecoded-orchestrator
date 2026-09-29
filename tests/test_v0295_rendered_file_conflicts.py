@@ -56,7 +56,7 @@ from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 MERGE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
 SELF_UPDATE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/self_update.rs"
-INSTALLER_RS = REPO_ROOT / "launcher/src-tauri/src/commands/installer.rs"
+UPDATE_RUN_RS = REPO_ROOT / "launcher/src-tauri/src/commands/update_run.rs"
 # v0.2.95 phase 2: the pull sequence BOTH update surfaces run, and therefore
 # the one place the A0 pre-merge (and with it the rendered reconcile) is wired.
 UPDATE_PIPELINE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/update_pipeline.rs"
@@ -186,7 +186,8 @@ class TestCrossLanguageLockstep(unittest.TestCase):
         )
 
     def test_both_update_surfaces_reach_the_same_reconcile(self) -> None:
-        """Both update surfaces must reach the rendered reconcile.
+        """The orchestrator update must reach the rendered reconcile (there
+        were two update surfaces until v0.2.100; WP-03b left one pipeline).
 
         v0.2.95 phase 2 — the property is unchanged; the WAY the launcher
         self-update surface satisfies it is not. It used to have no A0 step and
@@ -225,18 +226,29 @@ class TestCrossLanguageLockstep(unittest.TestCase):
             pipeline_src,
             "the shared update pipeline must run the A0 pre-merge",
         )
-        # … and BOTH surfaces pull through that pipeline, which is how they
-        # reach it. `installer::update_orchestrator` and
-        # `self_update::apply_launcher_update` each call it exactly once.
-        for name, src in (
-            ("installer.rs", read_rust_code(INSTALLER_RS)),
-            ("self_update.rs", self_update_src),
-        ):
+        # … and the ONE update pipeline reaches it for the git operations that
+        # merge upstream into the clone. RETARGETED v0.2.100 (WP-03b): the two
+        # surfaces (`installer::update_orchestrator`,
+        # `self_update::apply_launcher_update`) are gone; `run_orchestrator_
+        # update`'s live git op routes `PullFf` to `pull_to_upstream` (→
+        # `reconcile_and_pull`) and `Merge` to `merge_upstream`, and each of
+        # those runs the A0 pre-merge.
+        run_src = read_rust_code(UPDATE_RUN_RS)
+        live = run_src[run_src.index("impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {") :]
+        git_op = live[live.index("    fn git_op(") :]
+        git_op = git_op[: git_op.index("\n    }\n")]
+        self.assertIn("pull_ff_git_op(", git_op)
+        self.assertIn("recovery_git_op(", git_op)
+        self.assertIn("pipeline::merge_upstream(", run_src)
+        self.assertIn("update_pipeline::pull_to_upstream(", run_src)
+        for fn in ("async fn reconcile_and_pull(", "pub(crate) async fn merge_upstream("):
+            start = pipeline_src.index(fn)
+            body = pipeline_src[start : pipeline_src.index("\n}\n", start)]
             self.assertIn(
-                "prepare_and_pull_orchestrator_repo(",
-                src,
-                f"{name}'s update surface must pull through the shared pipeline — "
-                "that is how it reaches the rendered reconcile",
+                "run_pre_merge_user_editable(",
+                body,
+                f"`{fn}` must run the A0 pre-merge — that is how the update "
+                "reaches the rendered reconcile",
             )
         # And the launcher surface must not keep a second, divergent entry
         # point into the same class.

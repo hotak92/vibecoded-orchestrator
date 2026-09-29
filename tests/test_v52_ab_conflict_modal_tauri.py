@@ -33,6 +33,8 @@ import re
 import unittest
 from pathlib import Path
 
+from tests.common.rust_source import read_rust_code
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 INSTALLER_RS = REPO_ROOT / "launcher" / "src-tauri" / "src" / "commands" / "installer.rs"
 LIB_RS = REPO_ROOT / "launcher" / "src-tauri" / "src" / "lib.rs"
@@ -115,10 +117,16 @@ class RustTauriCommandsTests(unittest.TestCase):
             "lib.rs must register accept_upstream_and_continue_update on the invoke_handler",
         )
 
-    def test_commands_delegate_to_resume_orchestrator_update(self) -> None:
-        """V52-A hard guarantee — both commands must call into the existing
-        v0.2.51 `resume_orchestrator_update` machinery so install.py is
-        guaranteed to run after a successful resolution."""
+    def test_commands_delegate_to_the_resume_tail(self) -> None:
+        """V52-A hard guarantee — both commands must reach the resume tail so
+        install.py is guaranteed to run after a successful resolution.
+
+        RETARGETED v0.2.100 (WP-03b): the resume tail is the ONE update
+        pipeline's `Resume` kind (`update_run::run_update_claimed`), reached
+        through `continue_update_under_claim`; the v0.2.51
+        `resume_orchestrator_update` command is gone. Scanned on CODE only
+        (`read_rust_code`) so a name surviving in a comment cannot satisfy it.
+        """
         # Find the shared helper `resolve_conflict_and_resume`. The two
         # public Tauri commands MUST call it; otherwise they could skip
         # the resume tail (which is what we're guarding against).
@@ -136,11 +144,20 @@ class RustTauriCommandsTests(unittest.TestCase):
         # The guarantee this test exists for (a successful resolution always
         # reaches the resume tail, so install.py is guaranteed to run) is
         # unchanged; only the callee's name moved.
+        code = read_rust_code(INSTALLER_RS)
+        start = code.index("async fn resolve_conflict_and_resume<")
+        helper = code[start : code.index("\n}\n", start)]
         self.assertIn(
-            "resume_orchestrator_update_with_claim(app, path, window, flight).await",
-            self.installer,
+            "continue_update_under_claim(app, &window, UpdateKind::Resume,",
+            helper,
             "resolve_conflict_and_resume must delegate to the resume tail "
-            "(`resume_orchestrator_update_with_claim`)",
+            "(the one pipeline's Resume kind, claim handed over)",
+        )
+        start = code.index("async fn continue_update_under_claim<")
+        self.assertIn(
+            "run_update_claimed(",
+            code[start : code.index("\n}\n", start)],
+            "the hand-over must run the one pipeline under the held claim",
         )
 
         # Both public commands must call resolve_conflict_and_resume.

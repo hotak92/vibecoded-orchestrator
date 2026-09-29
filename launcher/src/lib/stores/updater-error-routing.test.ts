@@ -234,3 +234,42 @@ describe('the store applies the route (run + failOp)', () => {
     expect(get(U.updater).failed).toBe(false);
   });
 });
+
+describe('recovery modals render the routed failure (modalFailure, W3-FIX)', () => {
+  // The autostash-pop and untracked-collision modals' commands continue the
+  // update through the one pipeline, so they reject with THIS contract. Every
+  // producer row must render once and unprefixed — never the raw JSON blob.
+  for (const self of ['autostashPop', 'untrackedCollision'] as const) {
+    it(`${self}: every failure row renders "<label>: <message>" once`, () => {
+      for (const row of FIXTURE.surface_errors) {
+        if (ROUTE_FOR_KIND[row.json.kind as string] !== 'failed') continue;
+        U.updater.beginOp('resume');
+        const out = U.modalFailure(U.updater.failOp(JSON.stringify(row.json)), 'Resolve failed', self);
+        expect(out.inline, row.name).toBe(`Resolve failed: ${row.json.message}`);
+        expect(out.inline, row.name).not.toContain('{');
+        expect(out.closeSelf, row.name).toBe(false);
+        expect(get(U.updater).error, row.name).toBe(row.json.message);
+      }
+    });
+
+    it(`${self}: a payload row opens its modal; the caller steps aside unless it is its own`, () => {
+      for (const row of FIXTURE.surface_errors) {
+        const to = ROUTE_FOR_KIND[row.json.kind as string];
+        if (to === 'failed') continue;
+        const out = U.modalFailure(U.routeUpdateError(JSON.stringify(row.json)), 'x', self);
+        expect(out.inline, row.name).toBeNull();
+        expect(out.closeSelf, row.name).toBe(to !== self);
+      }
+    });
+  }
+
+  it('an empty or double-prefixed plain rejection still renders one clean message', () => {
+    expect(U.modalFailure(U.routeUpdateError(''), 'Resolve failed', 'autostashPop').inline).toBe(
+      `Resolve failed: ${U.EMPTY_FAILURE_TEXT}`,
+    );
+    expect(
+      U.modalFailure(U.routeUpdateError('Update failed: Update failed: boom'), 'L', 'untrackedCollision')
+        .inline,
+    ).toBe('L: boom');
+  });
+});

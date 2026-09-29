@@ -8,7 +8,7 @@
 //! Two independent subsystems answered the question "which branch is this
 //! repo on?" and answered it DIFFERENTLY:
 //!
-//! * `installer.rs` — `check_for_updates`, `update_orchestrator`,
+//! * `installer.rs` — `check_for_updates`, the (since retired) `update_orchestrator`,
 //!   `resolve_pull_branch`, and two more sites — each inlined
 //!   `if b.is_empty() || b == "HEAD" { "main" } else { b }`. Five copies of
 //!   one rule, correct in all five.

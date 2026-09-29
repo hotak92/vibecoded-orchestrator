@@ -402,8 +402,10 @@ pub(crate) async fn probe_freshness(install_path: &Path) -> FreshnessInputs {
 // ---------------------------------------------------------------------------
 
 /// v0.2.17 (plan 0.0.B): pre-pull rename helper for Windows. Relocated to this
-/// module in v0.2.91 so BOTH update surfaces (`installer::update_orchestrator`
-/// and `self_update::apply_launcher_update`) call one implementation.
+/// module in v0.2.91 so both update surfaces called one implementation; since
+/// v0.2.100 its caller is the one update pipeline
+/// (`update_pipeline::stop_hub_and_rename_binaries_aside`, phase 5 of
+/// `update_run::run_update`).
 ///
 /// On Windows, `git pull` fails with ERROR_SHARING_VIOLATION when it tries to
 /// overwrite the running launcher's binary. Windows DOES allow renaming a
@@ -894,10 +896,11 @@ pub(crate) struct HandoffTail {
 
 /// The shared "we just pulled; make sure the binaries actually land" tail.
 ///
-/// v0.2.91 WI-4: `installer::finalize_update_and_restart` and
-/// `self_update::finish_apply_after_pull` both call THIS instead of carrying
-/// their own copy (Surface B previously had no staging and no handoff at all,
-/// so on Windows it relaunched the same stale exe by construction).
+/// v0.2.91 WI-4: the two update surfaces' tails both called THIS instead of
+/// carrying their own copy (Surface B previously had no staging and no handoff
+/// at all, so on Windows it relaunched the same stale exe by construction).
+/// Since v0.2.100 the one caller is the update pipeline's relaunch
+/// (`restart::relaunch`, phase 13 of `update_run::run_update`).
 ///
 /// Uses the RELAUNCHING handoff (`prepare_windows_update_handoff`): the user
 /// clicked Update, so a restart is expected and consented-to. The at-rest path
@@ -1007,8 +1010,9 @@ impl ReconcileOutcome {
 /// the process-wide `VCT_STATE_DIR`.
 ///
 /// * `gate_lock` — `<vct_root>/.update-in-progress.json`, the RAII lockfile
-///   `update_orchestrator` arms (installer.rs, `UpdateInProgressGuard::new()`)
-///   before the pull and drops after install.py. Read through the EXISTING
+///   the update pipeline arms (`update_pipeline::arm_update_gate`, phase 4 of
+///   `update_run::run_update`) before the git operation and drops after
+///   install.py. Read through the EXISTING
 ///   `update_gate::skip_if_update_in_progress_at` so this stand-down inherits
 ///   its deadline-based self-healing (a crashed update cannot wedge the
 ///   reconcile forever) and logs in the same voice as every other poller that
@@ -1018,7 +1022,7 @@ impl ReconcileOutcome {
 ///   own the binaries until the updater consumes it.
 ///
 /// **Our OWN update is not a stand-down** (`started_by_pid == this pid`). WI-2's
-/// whole point is that `update_orchestrator`'s "Already up to date" early
+/// whole point is that the update pipeline's "Already up to date" early
 /// returns still reconcile the binary — and those returns happen INSIDE the
 /// window where this process holds the gate. A pid-blind check would stand
 /// WI-2 down against itself and quietly restore the RC-2 dead end this release

@@ -387,7 +387,7 @@ pub fn spawn_module_update_check_loop<R: Runtime>(app: AppHandle<R>) {
             // v0.2.60: stand down while an orchestrator update is in
             // progress. This poller opens its OWN launcher.db connection
             // (below), which bypasses the managed-connection close
-            // `update_orchestrator` performs for the install.py window —
+            // the update pipeline performs for the install.py window —
             // so without this gate a tick here would re-contend with
             // install.py for the SQLite writer lock (the launcher-self-db-
             // lock bug). Reuses the `.update-in-progress` lockfile.

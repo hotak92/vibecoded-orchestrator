@@ -114,9 +114,7 @@ pub fn walk_from_exe(exe: &Path) -> Option<PathBuf> {
 /// Strip Windows' `\\?\` verbatim prefix (and rebuild the `\\?\UNC\` form
 /// as `\\server\share`). No-op on any other input.
 ///
-/// NOTE: `launcher::commands::orchestrator_root` holds a private copy of
-/// this (`strip_windows_verbatim_prefix`) that predates this module; it
-/// should delegate here (not in WP-02's file set — reported).
+/// The ONE home: `launcher::commands::orchestrator_root` imports it.
 pub fn strip_windows_verbatim_prefix(s: &str) -> String {
     if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
         format!(r"\\{}", rest)

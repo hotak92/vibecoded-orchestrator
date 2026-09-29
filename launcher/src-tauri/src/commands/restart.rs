@@ -361,51 +361,53 @@ fn extract_section(content: &str, condition_id: &str) -> Option<String> {
 }
 
 /// Tauri command: restart the launcher process to load a freshly-swapped
-/// binary. Invoked by the green "Restart now" banner the GUI renders for
-/// `launcher_restart_required` deferral entries.
+/// binary. Invoked by the "Restart now" banner (`updater.runRestart`) for
+/// `launcher_restart_required` deferral entries and the `binary_stale` badge.
 ///
-/// `install_root` is the path of the orchestrator clone whose update
-/// just landed (passed by the frontend; it comes from the same store
-/// the "Update orchestrator" button uses). Used to locate UPDATE_DEFERRED.md
-/// and the dist binary.
+/// `install_root` is the path of the orchestrator clone whose update just
+/// landed. v0.2.100 (L2-F01/F12): the restart goes through the relaunch
+/// VERSION GUARD ([`restart_to_dist`]) — only a dist binary strictly newer
+/// than the running launcher is started, and never `current_exe()` (which
+/// re-executed the OLD binary whenever the running exe was not the dist
+/// file). A refusal is returned to the GUI as a worded error; the launcher
+/// keeps running.
 #[command]
 pub async fn restart_launcher<R: Runtime>(
     app: AppHandle<R>,
     install_root: String,
 ) -> Result<(), String> {
-    let install_root_path = PathBuf::from(&install_root);
-
-    // Step 1: clear the launcher_restart_required entry from
-    // UPDATE_DEFERRED.md so the next launcher start doesn't re-render
-    // the banner. Best-effort: failures here are logged but don't block
-    // the restart.
-    if let Err(e) = clear_restart_deferral(&install_root_path) {
-        tracing::warn!(
-            "[restart_launcher] failed to clear deferral (non-fatal): {}",
-            e
-        );
-    }
-
-    // Step 2: pick the binary path to spawn. Prefer the dist path under
-    // install_root (this is what install.py just refreshed). Fall back
-    // to current_exe() if dist is missing — exotic case (someone
-    // deleted the dist tree between install + restart click).
-    let exe = resolve_target_binary(&install_root_path)
-        .or_else(|_| std::env::current_exe().map_err(|e| e.to_string()))?;
-
-    if !exe.is_file() {
-        return Err(format!("launcher binary not found at {}", exe.display()));
-    }
-
-    // Step 3: spawn the new launcher detached.
-    spawn_detached_launcher(&exe)?;
-
-    // Step 4: programmatic quit. Bypass the Quit-confirmation dialog
-    // (the user already clicked Restart; a second confirmation would
-    // be confusing and could orphan the new launcher if dismissed).
+    restart_to_dist(
+        Path::new(&install_root),
+        env!("CARGO_PKG_VERSION"),
+        &DetachedSpawner,
+    )
+    .map_err(|e| e.to_string())?;
+    // Bypass the Quit-confirmation dialog: the user already clicked Restart.
     crate::quit_dialog::force_quit();
     app.exit(0);
     Ok(())
+}
+
+/// [`restart_launcher`]'s decision + act, testable with a fake spawner:
+/// [`spawn_guarded`] (version guard, then the dist binary), then the
+/// `launcher_restart_required` entry is cleared. The entry is also cleared
+/// when the dist binary is NOT newer — the banner's promise ("a newer
+/// launcher is waiting") is then false; any other refusal leaves it.
+pub(crate) fn restart_to_dist(
+    install_root: &Path,
+    running: &str,
+    spawner: &dyn Spawner,
+) -> Result<PathBuf, RelaunchError> {
+    let result = spawn_guarded(install_root, running, spawner);
+    if matches!(
+        result,
+        Ok(_) | Err(RelaunchError::Refused(RelaunchRefusal::NotNewer { .. }))
+    ) {
+        if let Err(e) = clear_restart_deferral(install_root) {
+            tracing::warn!("[restart_launcher] failed to clear deferral (non-fatal): {}", e);
+        }
+    }
+    result
 }
 
 /// Read `<install_root>/.claude/context/UPDATE_DEFERRED.md`, strip the
@@ -582,11 +584,6 @@ fn frontmatter_has_stub_flag(content: &str) -> bool {
         .any(|line| matches!(line.trim(), "stub: true" | "stub:true"))
 }
 
-/// Resolve the dist binary path under `install_root` for the current OS.
-/// Mirrors `install.py::_launcher_binary_relative_path`.
-fn resolve_target_binary(install_root: &Path) -> Result<PathBuf, String> {
-    Ok(dist_launcher_path(install_root))
-}
 
 /// `<install_root>/launcher/dist/<os-arch>/vct-launcher[.exe]` — the binary
 /// `install.py` refreshes and the release commits.
@@ -1310,6 +1307,24 @@ stub: true
             );
             assert!(spawner.spawned.borrow().is_empty(), "{dist}: nothing may be spawned");
         }
+    }
+
+    /// v0.2.100 (L2-F01): the USER-facing restart goes through the same
+    /// guard. Leave-alone: a dist not newer than the running launcher (a
+    /// running 0.2.100 over an on-disk 0.2.99 — the field case) spawns
+    /// nothing and is a worded refusal. Act: a newer dist is spawned.
+    #[test]
+    fn restart_launcher_refuses_a_not_newer_dist_and_spawns_a_newer_one() {
+        let td = root_with_dist(Some("0.2.99"));
+        let spawner = RecordingSpawner::default();
+        let err = restart_to_dist(td.path(), "0.2.100", &spawner).expect_err("older dist");
+        assert!(err.to_string().contains("not newer"), "{err}");
+        assert!(spawner.spawned.borrow().is_empty(), "nothing may be spawned");
+
+        let td = root_with_dist(Some("0.2.101"));
+        let exe = restart_to_dist(td.path(), "0.2.100", &spawner).expect("newer dist");
+        assert_eq!(exe, dist_launcher_path(td.path()));
+        assert_eq!(spawner.spawned.borrow().len(), 1);
     }
 
     /// Tri-state: an absent sidecar or a non-X.Y.Z version is never "newer".

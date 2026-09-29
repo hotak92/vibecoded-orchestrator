@@ -38,9 +38,25 @@
 //! The DB write is the authoritative operation. Env re-projection runs after
 //! it and its warnings ride in the result — a projection hiccup NEVER rolls
 //! back the write.
+//!
+//! ## Turning a flag ON ensures the models it needs (v0.2.100 AD-6)
+//!
+//! A dual opt-in can need a second KG embedder (arctic, or qwen3 on an
+//! arctic-active install) that no install ever pulled — the slot was then
+//! silently skipped at write time (L1-F11). Enabling a flag now runs
+//! `python -m vco_lib.embedding_pull_plan ensure --json` — the SAME plan
+//! install.py step 7 runs (rule A, no Rust mirror) — in the background: a
+//! pull can take minutes and must not hold the toggle. The outcome is logged,
+//! and a failure lands in UPDATE_DEFERRED (`ollama_model_pull_failed` /
+//! `ollama_not_ready_at_update`, written by the Python side), which the
+//! deferral badge shows. Present models are skipped, never re-pulled.
 
-use serde::Serialize;
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde::{Deserialize, Serialize};
 use tauri::{command, State};
+use vct_launcher_core::process::CommandExt as _;
 
 use crate::db::Db;
 use vct_launcher_core::db::settings::{DualFlag, DualFlagGlobalDefaults, DualFlagsState};
@@ -65,6 +81,109 @@ pub struct DualFlagGlobalWriteResult {
     pub warnings: usize,
     /// Projects skipped because their folder no longer exists on disk.
     pub skipped: usize,
+    /// Whether enabling the flag started the background model ensure (the
+    /// outcome is logged; a failure is recorded in UPDATE_DEFERRED).
+    #[serde(default)]
+    pub model_ensure_started: bool,
+}
+
+/// Parsed `python -m vco_lib.embedding_pull_plan ensure --json` result.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ModelEnsureOutcome {
+    #[serde(default)]
+    pub ok: bool,
+    #[serde(default)]
+    pub present: Vec<String>,
+    #[serde(default)]
+    pub pulled: Vec<String>,
+    #[serde(default)]
+    pub failed: BTreeMap<String, String>,
+    #[serde(default)]
+    pub deferral: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// The one argv for the ensure CLI (cwd = install root, so `vco_lib` resolves).
+pub fn model_ensure_command(python: &Path, install_root: &Path) -> std::process::Command {
+    let mut cmd = std::process::Command::new(python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.embedding_pull_plan")
+        .arg("ensure")
+        .arg("--json")
+        .arg("--root")
+        .arg(install_root)
+        .current_dir(install_root)
+        .stdin(std::process::Stdio::null());
+    cmd
+}
+
+/// Interpret the CLI's output. Unparseable output is a failure carrying the
+/// stderr tail — never "ok" by default.
+pub fn parse_model_ensure_output(
+    success: bool,
+    stdout: &[u8],
+    stderr: &[u8],
+) -> ModelEnsureOutcome {
+    let text = String::from_utf8_lossy(stdout);
+    let parsed = text
+        .lines()
+        .rev()
+        .find_map(|l| serde_json::from_str::<ModelEnsureOutcome>(l.trim()).ok());
+    match parsed {
+        Some(mut o) => {
+            o.ok = o.ok && success;
+            if !o.ok && o.error.is_none() {
+                o.error = Some("model ensure exited non-zero".into());
+            }
+            o
+        }
+        None => {
+            let err = String::from_utf8_lossy(stderr);
+            let tail: String = err.lines().rev().take(3).collect::<Vec<_>>().join(" | ");
+            ModelEnsureOutcome {
+                error: Some(format!("model ensure produced no result: {tail}")),
+                ..Default::default()
+            }
+        }
+    }
+}
+
+/// Start the background ensure; `false` when python or the install root
+/// cannot be resolved (logged — the next install run still derives the plan).
+fn start_model_ensure(db: &Db) -> bool {
+    let Some(root) = crate::commands::installer::resolve_install_root_sync(db) else {
+        tracing::warn!("[vct] dual-flag model ensure skipped: install root not resolvable");
+        return false;
+    };
+    let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
+        tracing::warn!("[vct] dual-flag model ensure skipped: no python for vco_lib");
+        return false;
+    };
+    std::thread::spawn(move || {
+        let outcome = match model_ensure_command(&python, &root).output() {
+            Ok(o) => parse_model_ensure_output(o.status.success(), &o.stdout, &o.stderr),
+            Err(e) => ModelEnsureOutcome {
+                error: Some(format!("spawn failed: {e}")),
+                ..Default::default()
+            },
+        };
+        if outcome.ok {
+            tracing::info!(
+                "[vct] dual-flag model ensure: present={:?} pulled={:?}",
+                outcome.present,
+                outcome.pulled
+            );
+        } else {
+            tracing::warn!(
+                "[vct] dual-flag model ensure FAILED: {:?} (failed={:?}, deferral={:?})",
+                outcome.error,
+                outcome.failed,
+                outcome.deferral
+            );
+        }
+    });
+    true
 }
 
 /// Resolve all three dual flags for one project, WITH provenance.
@@ -102,6 +221,11 @@ pub async fn set_dual_flag_for_project(
     db.set_dual_flag_for_project(&project_id, flag, value)?;
     // Soft-fail: warnings ride along, the DB write is never rolled back.
     let _ = crate::commands::projects_v2::reproject_env_soft(&db, &project_id);
+    // Enabling (explicitly, or by clearing into an enabled default) may need
+    // a second KG embedder — ensure it (background; see module docs).
+    if value != Some(false) {
+        start_model_ensure(&db);
+    }
     // Return the RESOLVED state so the panel re-renders from the truth
     // (the coherence cascade may have moved a second flag).
     Ok(db.resolve_dual_flags(&project_id))
@@ -142,6 +266,7 @@ pub fn set_dual_flag_global_default_with_db(
         reprojected: report.refreshed.len() + report.refreshed_with_warnings.len(),
         warnings: report.refreshed_with_warnings.len() + report.failed.len(),
         skipped: report.skipped.len(),
+        model_ensure_started: false,
     })
 }
 
@@ -157,7 +282,11 @@ pub async fn set_dual_flag_global_default(
     db: State<'_, Db>,
 ) -> Result<DualFlagGlobalWriteResult, String> {
     let flag = DualFlag::from_wire(&flag)?;
-    set_dual_flag_global_default_with_db(&db, flag, value)
+    let mut result = set_dual_flag_global_default_with_db(&db, flag, value)?;
+    if value {
+        result.model_ensure_started = start_model_ensure(&db);
+    }
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -220,6 +349,61 @@ mod tests {
             "the GUI must be told the prerequisite moved too, not left to \
              guess from what it asked for",
         );
+    }
+
+    /// The ensure argv is the Python plan CLI (rule A — no Rust mirror of the
+    /// pull rule), run from the install root so `vco_lib` resolves.
+    #[test]
+    fn model_ensure_command_runs_the_python_plan() {
+        let cmd = model_ensure_command(Path::new("/py"), Path::new("/root/vco"));
+        let args: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-m",
+                "vco_lib.embedding_pull_plan",
+                "ensure",
+                "--json",
+                "--root",
+                "/root/vco"
+            ]
+        );
+        assert_eq!(cmd.get_current_dir(), Some(Path::new("/root/vco")));
+    }
+
+    /// Success needs BOTH a parsed `ok: true` and a zero exit; a failure keeps
+    /// the Python side's error + deferral id; garbage is never "ok".
+    #[test]
+    fn model_ensure_output_is_parsed_strictly() {
+        let ok = parse_model_ensure_output(
+            true,
+            br#"{"ok": true, "present": ["qwen3-embedding:0.6b"], "pulled": ["snowflake-arctic-embed2:latest"], "failed": {}, "deferral": null, "error": null, "plan": {}}"#,
+            b"",
+        );
+        assert!(ok.ok);
+        assert_eq!(
+            ok.pulled,
+            vec!["snowflake-arctic-embed2:latest".to_string()]
+        );
+
+        let failed = parse_model_ensure_output(
+            false,
+            br#"{"ok": false, "failed": {"snowflake-arctic-embed2:latest": "boom"}, "deferral": "ollama_model_pull_failed", "error": "x"}"#,
+            b"",
+        );
+        assert!(!failed.ok);
+        assert_eq!(failed.deferral.as_deref(), Some("ollama_model_pull_failed"));
+
+        let lying = parse_model_ensure_output(false, br#"{"ok": true}"#, b"");
+        assert!(!lying.ok, "a non-zero exit is never ok");
+        assert!(lying.error.is_some());
+
+        let garbage = parse_model_ensure_output(true, b"Traceback ...", b"ImportError: x");
+        assert!(!garbage.ok);
+        assert!(garbage.error.unwrap().contains("ImportError"));
     }
 
     /// The per-project setter's `None` really clears, and the returned state
