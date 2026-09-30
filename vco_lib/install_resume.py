@@ -27,8 +27,11 @@ step      work skipped                      verifier
 4/10      pip install + editable installs   recorded dependency fingerprint unchanged
                                             (requirements*, both pyprojects, dev flag),
                                             ``pip check`` clean, editable-import probe
-                                            (``vco_lib`` resolves inside the checkout,
-                                            weaviate_mcp submodules import)
+                                            run isolated (``-I``) from a cwd outside
+                                            the checkout: ``vco_lib`` resolves and
+                                            loads from the checkout with no
+                                            site-packages copy; weaviate_mcp
+                                            submodules import
 7/10      model pulls                       ``/api/tags`` lists every planned model
                                             (``vco_lib.ollama_pull.ensure``)
 ========  ================================  ===========================================
@@ -48,6 +51,7 @@ import hashlib
 import json
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -231,44 +235,102 @@ def deps_fingerprint(root: Path, *, dev: bool) -> dict:
     return {"deps_fingerprint": {"dev": bool(dev), "files": files}}
 
 
-#: The editable-import probe: vco_lib must resolve INSIDE the checkout (a
-#: frozen copy in site-packages is the v0.2.92 shadow-copy breakage).
+#: The editable-import probe. It REPORTS where ``vco_lib`` resolves (as one
+#: JSON line) and :func:`vco_lib_resolution_verdict` decides — the decision
+#: stays in this process, where it is unit-testable. ``find_spec`` names the
+#: file and every package directory the import system would serve ``vco_lib``
+#: from; the import then proves the package actually loads from there.
+#: A frozen copy in site-packages is the v0.2.92 shadow-copy breakage.
 _EDITABLE_PROBE = (
-    "import sys, pathlib, vco_lib\n"
-    "root = pathlib.Path(sys.argv[1]).resolve()\n"
-    "here = pathlib.Path(vco_lib.__file__).resolve()\n"
-    "sys.exit(0 if root in here.parents else 3)\n"
+    "import sys, json, importlib, importlib.util\n"
+    "out = {'origin': None, 'locations': [], 'file': None, 'error': None}\n"
+    "try:\n"
+    "    spec = importlib.util.find_spec('vco_lib')\n"
+    "    if spec is not None:\n"
+    "        out['origin'] = spec.origin\n"
+    "        out['locations'] = list(spec.submodule_search_locations or [])\n"
+    "        out['file'] = getattr(importlib.import_module('vco_lib'), '__file__', None)\n"
+    "except Exception as exc:\n"
+    "    out['error'] = '%s: %s' % (type(exc).__name__, exc)\n"
+    "print(json.dumps(out))\n"
 )
+
+#: Directory names that mark an installed (non-editable) copy.
+_SITE_DIRS = frozenset({"site-packages", "dist-packages"})
+
+
+def _under(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def vco_lib_resolution_verdict(probe_stdout: str, root: Path) -> "tuple[bool, str]":
+    """Decide from the probe's report whether ``vco_lib`` is served by the
+    checkout: its origin, its loaded ``__file__`` and EVERY package location
+    must lie under ``root``, and none may be a site-packages directory."""
+    lines = (probe_stdout or "").strip().splitlines()
+    try:
+        rep = json.loads(lines[-1]) if lines else None
+    except ValueError:
+        rep = None
+    if not isinstance(rep, dict):
+        return False, "the vco_lib editable-import probe printed no report"
+    if rep.get("error"):
+        return False, f"vco_lib does not import ({rep['error']})"
+    places = [p for p in [rep.get("origin"), rep.get("file"), *(rep.get("locations") or [])]
+              if p]
+    if not rep.get("origin") and not rep.get("locations"):
+        return False, "vco_lib is not installed in the venv (no editable install)"
+    root = Path(root).resolve()
+    for raw in places:
+        path = Path(str(raw)).resolve()
+        if _SITE_DIRS.intersection(path.parts) and not _under(path, root):
+            return False, f"vco_lib resolves from a site-packages copy ({path}), not the checkout"
+        if not _under(path, root):
+            return False, f"vco_lib resolves outside the checkout ({path})"
+    return True, ""
 
 
 def deps_verifier(root: Path, venv_python: Path, *, dev: bool,
                   weaviate_mcp_probe: str,
                   run: Callable[..., Any] = subprocess.run) -> Verifier:
-    """Step 4/10: fingerprint unchanged + ``pip check`` + editable imports."""
+    """Step 4/10: fingerprint unchanged + ``pip check`` + editable imports.
 
-    def _ok(argv: list, what: str) -> "tuple[bool, str]":
+    Every probe runs ISOLATED (``python -I``: no cwd / script dir on
+    ``sys.path``, no ``PYTHONPATH``, no user site) from an EMPTY temporary
+    cwd outside the checkout — so it sees only what the venv itself serves,
+    exactly as an MCP subprocess whose cwd is some other project folder does.
+    Run from ``cwd=root`` instead, ``import vco_lib`` would resolve from the
+    cwd whether the editable install exists or a shadow copy wins, and the
+    probe could never fail (review W4R-02)."""
+
+    def _ok(argv: list, what: str, cwd: str) -> "tuple[bool, str, str]":
         try:
-            res = run(argv, capture_output=True, text=True, timeout=300, cwd=str(root))
+            res = run(argv, capture_output=True, text=True, timeout=300, cwd=cwd)
         except (OSError, subprocess.TimeoutExpired) as exc:
-            return False, f"{what} could not run ({exc})"
+            return False, f"{what} could not run ({exc})", ""
         if getattr(res, "returncode", 1) != 0:
             tail = ((res.stdout or "") + (res.stderr or "")).strip().splitlines()[-1:]
-            return False, f"{what} failed{': ' + tail[0] if tail else ''}"
-        return True, ""
+            return False, f"{what} failed{': ' + tail[0] if tail else ''}", ""
+        return True, "", res.stdout or ""
 
     def verify(recorded: Mapping[str, Any]) -> "tuple[bool, str]":
         want = deps_fingerprint(root, dev=dev)["deps_fingerprint"]
         if recorded.get("deps_fingerprint") != want:
             return False, "the dependency files (or --dev) changed since"
         py = str(venv_python)
-        for argv, what in (
-            ([py, "-m", "pip", "check"], "`pip check`"),
-            ([py, "-c", _EDITABLE_PROBE, str(root)], "the vco_lib editable-import probe"),
-            ([py, "-c", weaviate_mcp_probe], "the weaviate_mcp import probe"),
-        ):
-            ok, why = _ok(argv, what)
-            if not ok:
-                return False, why
+        with tempfile.TemporaryDirectory(prefix="vco-resume-probe-") as cwd:
+            probes: "tuple[tuple[list, str, Optional[Callable[[str], tuple[bool, str]]]], ...]" = (
+                ([py, "-I", "-m", "pip", "check"], "`pip check`", None),
+                ([py, "-I", "-c", _EDITABLE_PROBE], "the vco_lib editable-import probe",
+                 lambda out: vco_lib_resolution_verdict(out, root)),
+                ([py, "-I", "-c", weaviate_mcp_probe], "the weaviate_mcp import probe", None),
+            )
+            for argv, what, judge in probes:
+                ok, why, stdout = _ok(argv, what, cwd)
+                if ok and judge is not None:
+                    ok, why = judge(stdout)
+                if not ok:
+                    return False, why
         return True, "dependencies unchanged, pip check OK, editable imports OK"
 
     return verify

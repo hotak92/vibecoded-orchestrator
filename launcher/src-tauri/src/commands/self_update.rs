@@ -845,7 +845,9 @@ impl FetchAttemptError {
 }
 
 /// stderr substrings (lower-cased) that mark a failure retrying can fix: the
-/// network, the server, or a lock another process holds for a moment.
+/// network, the server, or a lock another process holds for a moment. (A lock
+/// that is NOT momentary — older than one attempt — is reclassified by
+/// [`reclassify_stale_ref_lock`], W4R-03.)
 const TRANSIENT_FETCH_MARKERS: &[&str] = &[
     "could not resolve host",
     "could not resolve proxy",
@@ -927,6 +929,82 @@ fn describe_failed_fetch(status: &std::process::ExitStatus, stderr: &str) -> Fet
     }
 }
 
+/// v0.2.100 (W4R-03): the lock file a ref-lock failure names, resolved on
+/// disk. Two shapes of git's message: `Unable to create '<path>.lock': File
+/// exists` (the path as git printed it — absolute, or relative to git's cwd,
+/// i.e. `repo`, else to the git dir) and `cannot lock ref '<refname>'` with no
+/// path (→ `<gitdir>/<refname>.lock`). `None` when stderr names no lock.
+fn ref_lock_path_from_stderr(repo: &Path, stderr: &str) -> Option<std::path::PathBuf> {
+    fn quoted_after<'s>(s: &'s str, low: &str, marker: &str) -> Option<&'s str> {
+        let at = low.find(marker)? + marker.len();
+        let rest = &s[at..];
+        let end = rest.find('\'')?;
+        Some(&rest[..end])
+    }
+    let low = stderr.to_ascii_lowercase();
+    let git_dir = git_dir_of(repo);
+    if let Some(p) = quoted_after(stderr, &low, "unable to create '") {
+        if p.ends_with(".lock") {
+            let path = Path::new(p);
+            if path.is_absolute() {
+                return Some(path.to_path_buf());
+            }
+            let from_cwd = repo.join(path);
+            return Some(if from_cwd.exists() { from_cwd } else { git_dir.join(path) });
+        }
+    }
+    let refname = quoted_after(stderr, &low, "cannot lock ref '")?;
+    if refname.is_empty() || refname.contains("..") {
+        return None;
+    }
+    Some(git_dir.join(format!("{refname}.lock")))
+}
+
+/// `<repo>/.git` (a directory, or a `gitdir: <path>` file as in a worktree),
+/// else `repo` itself (a bare repository). No git is spawned.
+fn git_dir_of(repo: &Path) -> std::path::PathBuf {
+    let dot_git = repo.join(".git");
+    if dot_git.is_dir() {
+        return dot_git;
+    }
+    if let Ok(text) = std::fs::read_to_string(&dot_git) {
+        if let Some(target) = text.lines().find_map(|l| l.strip_prefix("gitdir:")) {
+            let target = Path::new(target.trim());
+            return if target.is_absolute() { target.to_path_buf() } else { repo.join(target) };
+        }
+    }
+    repo.to_path_buf()
+}
+
+/// v0.2.100 (W4R-03): a ref-lock failure is transient only while the lock is
+/// FRESH — a live git holds it for a moment. A lock older than one whole
+/// fetch attempt ([`FETCH_ATTEMPT_TIMEOUT`]) was left by a git that crashed
+/// or was killed, and every retry would fail identically (git never removes
+/// another process's lock): reclassify as deterministic and name the file.
+/// A lock that cannot be stat'ed (already gone, unreadable) stays transient.
+fn reclassify_stale_ref_lock(repo: &Path, stderr: &str, err: FetchAttemptError) -> FetchAttemptError {
+    if !err.transient {
+        return err;
+    }
+    let Some(lock) = ref_lock_path_from_stderr(repo, stderr) else {
+        return err;
+    };
+    let age = std::fs::metadata(&lock)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok());
+    match age {
+        Some(age) if age > FETCH_ATTEMPT_TIMEOUT => FetchAttemptError::deterministic(format!(
+            "{} — {} is a stale lock file (last modified {} s ago) left by an earlier git that \
+             did not finish; it can be deleted once no git process is running in this repository",
+            err.message,
+            lock.display(),
+            age.as_secs()
+        )),
+        _ => err,
+    }
+}
+
 /// One `git fetch` attempt. `kill_on_drop`: when the per-attempt timeout in
 /// [`fetch_with_retry`] drops this future, the child dies with it.
 async fn run_fetch_attempt(
@@ -943,7 +1021,8 @@ async fn run_fetch_attempt(
     if out.status.success() {
         return Ok(());
     }
-    Err(describe_failed_fetch(&out.status, &String::from_utf8_lossy(&out.stderr)))
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    Err(reclassify_stale_ref_lock(repo, &stderr, describe_failed_fetch(&out.status, &stderr)))
 }
 
 /// The ONE production upstream fetch (D5). Coalesces with a covering fetch
@@ -2637,21 +2716,30 @@ mod tests {
 
         let calls = Arc::new(AtomicUsize::new(0));
         let calls_c = calls.clone();
+        let bound = fetch_wait_bound(FetchPolicy::Quick);
         let started = std::time::Instant::now();
-        let result = coalesced_fetch(&repo, FetchTarget::Remote, FetchPolicy::Quick, "test", move || {
-            let calls_c = calls_c.clone();
-            async move {
-                calls_c.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            }
-        })
-        .await;
+        // W4R-12: an outer bound, so a regression that drops the wait bound
+        // FAILS with a message instead of hanging the suite.
+        let result = tokio::time::timeout(
+            bound * 4,
+            coalesced_fetch(&repo, FetchTarget::Remote, FetchPolicy::Quick, "test", move || {
+                let calls_c = calls_c.clone();
+                async move {
+                    calls_c.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                }
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            *slot.holder.lock().unwrap() = None;
+            panic!("the lock wait is unbounded: still queued after {:?} (bound {bound:?})", bound * 4)
+        });
         let elapsed = started.elapsed();
         let err = result.expect_err("a held slot past the bound is busy");
         assert!(err.starts_with(FETCH_BUSY), "got: {err}");
         assert!(err.contains("the-holder.rs:1"), "names the holder: {err}");
         assert_eq!(calls.load(Ordering::SeqCst), 0, "no attempt ran");
-        let bound = fetch_wait_bound(FetchPolicy::Quick);
         assert!(elapsed >= bound, "gave up early: {elapsed:?}");
         assert!(elapsed < bound + Duration::from_secs(2), "waited past the bound: {elapsed:?}");
         *slot.holder.lock().unwrap() = None;
@@ -2837,6 +2925,87 @@ mod tests {
         assert!(err.contains("Could not resolve host"), "got: {err}");
         assert!(err.contains("exit status: 128"), "got: {err}");
         assert_eq!(fake_git_calls(&git).len(), 2, "Quick retries a transient failure once");
+    }
+
+    /// W4R-03: a real temp repo holding a planted ref lock, and git's exact
+    /// "File exists" text for it (the fake git prints it and exits 1).
+    #[cfg(unix)]
+    fn repo_with_ref_lock(age: Duration) -> (tempfile::TempDir, std::path::PathBuf, String) {
+        let repo = tempfile::tempdir().unwrap();
+        let st = StdCommand::new("git").args(["init", "-q"]).current_dir(repo.path()).status().unwrap();
+        assert!(st.success(), "git init");
+        let dir = repo.path().join(".git/refs/remotes/vco_upstream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lock = dir.join("main.lock");
+        let f = std::fs::File::create(&lock).unwrap();
+        f.set_modified(std::time::SystemTime::now() - age).unwrap();
+        drop(f);
+        let msg = format!(
+            "error: cannot lock ref 'refs/remotes/vco_upstream/main': Unable to create '{}': File exists.\n\n\
+             Another git process seems to be running in this repository, e.g.\n\
+             an editor opened by 'git commit'. Please make sure all processes\n\
+             are terminated then try again. If it still fails, a git process\n\
+             may have crashed in this repository earlier:\n\
+             remove the file manually to continue.\n \
+             ! [new branch]      main       -> vco_upstream/main  (unable to update local ref)",
+            lock.display()
+        );
+        (repo, lock, msg)
+    }
+
+    /// W4R-03 (act): a STALE ref lock — older than one attempt — is
+    /// deterministic: ONE spawn even on the Persistent ladder, and the error
+    /// names the lock file and says it can be deleted.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_path_stale_ref_lock_is_not_retried_and_named() {
+        let (repo, lock, msg) = repo_with_ref_lock(Duration::from_secs(3600));
+        let git = fake_git(&format!("printf '%s\\n' \"{}\" >&2; exit 1", msg.replace('"', "\\\"")));
+        let fut = vct_launcher_core::paths::with_lookup_path(Some(git.path().as_os_str()), || {
+            serialized_fetch_upstream(repo.path(), FetchPolicy::Persistent, None)
+        });
+        let err = tokio::time::timeout(Duration::from_secs(20), fut)
+            .await
+            .expect("a stale lock must not climb the Persistent ladder")
+            .expect_err("still failing");
+        assert_eq!(fake_git_calls(&git).len(), 1, "a stale lock must not be retried: {err}");
+        assert!(err.contains(&lock.display().to_string()), "names the lock file: {err}");
+        assert!(err.contains("stale lock") && err.contains("deleted"), "{err}");
+    }
+
+    /// W4R-03 (leave-alone): a FRESH ref lock is a moment's contention —
+    /// still retried (Quick = two spawns).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_path_fresh_ref_lock_is_retried() {
+        let (repo, _lock, msg) = repo_with_ref_lock(Duration::ZERO);
+        let git = fake_git(&format!("printf '%s\\n' \"{}\" >&2; exit 1", msg.replace('"', "\\\"")));
+        let fut = vct_launcher_core::paths::with_lookup_path(Some(git.path().as_os_str()), || {
+            serialized_fetch_upstream(repo.path(), FetchPolicy::Quick, None)
+        });
+        let err = fut.await.expect_err("still failing");
+        assert_eq!(fake_git_calls(&git).len(), 2, "a fresh lock is retried: {err}");
+        assert!(!err.contains("stale lock"), "{err}");
+    }
+
+    /// W4R-03: both message shapes resolve to the lock file on disk — the
+    /// bare `cannot lock ref '<ref>'` form via the git dir — and a lock that
+    /// cannot be stat'ed stays transient.
+    #[cfg(unix)]
+    #[test]
+    fn ref_lock_path_is_resolved_from_either_message_shape() {
+        let (repo, lock, msg) = repo_with_ref_lock(Duration::from_secs(3600));
+        assert_eq!(ref_lock_path_from_stderr(repo.path(), &msg), Some(lock.clone()));
+        let bare = "error: cannot lock ref 'refs/remotes/vco_upstream/main': reference already exists";
+        assert_eq!(
+            ref_lock_path_from_stderr(repo.path(), bare),
+            Some(repo.path().join(".git").join("refs/remotes/vco_upstream/main.lock"))
+        );
+        let stale = reclassify_stale_ref_lock(repo.path(), bare, FetchAttemptError::transient("x"));
+        assert!(!stale.transient, "the bare form finds the stale lock too");
+        let gone = "error: cannot lock ref 'refs/remotes/vco_upstream/nope': x";
+        assert!(reclassify_stale_ref_lock(repo.path(), gone, FetchAttemptError::transient("x")).transient);
+        assert_eq!(ref_lock_path_from_stderr(repo.path(), "fatal: early EOF"), None);
     }
 
     /// Coalescing through the REAL fetch path: two callers arriving together

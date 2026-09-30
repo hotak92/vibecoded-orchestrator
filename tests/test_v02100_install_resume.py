@@ -147,11 +147,28 @@ def test_create_venv_skips_a_verified_venv_and_repairs_a_broken_one(tmp_path, mo
 # ── step 4: fingerprint + pip check + editable-import probe ─────────────────
 
 
-def _deps(root, calls, fail=None):
-    def run(argv, **_k):
+def _report(**kw):
+    rep = {"origin": None, "locations": [], "file": None, "error": None}
+    rep.update(kw)
+    return json.dumps(rep) + "\n"
+
+
+def _checkout_report(root):
+    pkg = root / "vco_lib"
+    return _report(origin=str(pkg / "__init__.py"), locations=[str(pkg)],
+                   file=str(pkg / "__init__.py"))
+
+
+def _deps(root, calls, fail=None, report=None, cwds=None):
+    def run(argv, **k):
         calls.append(argv)
+        if cwds is not None:
+            cwds.append(k.get("cwd"))
         rc = 1 if fail and fail in " ".join(argv) else 0
-        return subprocess.CompletedProcess(argv, rc, "", "broken: x" if rc else "")
+        out = ""
+        if rc == 0 and ir._EDITABLE_PROBE in argv:
+            out = report if report is not None else _checkout_report(root)
+        return subprocess.CompletedProcess(argv, rc, out, "broken: x" if rc else "")
     return ir.deps_verifier(root, Path("/v/python"), dev=False, weaviate_mcp_probe="import x",
                             run=run)
 
@@ -162,8 +179,119 @@ def test_step_4_verified_skip_runs_real_verifiers(tmp_path):
     calls = []
     skipped, out, _ = _skip(s, "4/10", _deps(root, calls))
     assert skipped and "pip check OK" in out
-    assert ["/v/python", "-m", "pip", "check"] in calls
-    assert any("vco_lib" in " ".join(c) for c in calls)  # the editable-import probe ran
+    assert ["/v/python", "-I", "-m", "pip", "check"] in calls
+    assert ["/v/python", "-I", "-c", ir._EDITABLE_PROBE] in calls  # the editable-import probe ran
+
+
+def test_step_4_probes_run_isolated_from_a_cwd_outside_the_checkout(tmp_path):
+    """W4R-02: with ``cwd=root`` and no ``-I``, ``sys.path[0]`` is the cwd and
+    ``import vco_lib`` resolves from the checkout on every machine."""
+    root = _root(tmp_path)
+    calls, cwds = [], []
+    ok, _ = _deps(root, calls, cwds=cwds)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert ok and len(calls) == 3
+    for argv, cwd in zip(calls, cwds):
+        assert argv[1] == "-I", argv
+        assert cwd is not None
+        here = Path(cwd).resolve()
+        assert here != root.resolve() and root.resolve() not in here.parents
+
+
+@pytest.mark.parametrize("report, expect", [
+    ("site", "site-packages copy"),
+    ("elsewhere", "outside the checkout"),
+    ("missing", "not installed"),
+    ("error", "does not import"),
+    ("garbage", "no report"),
+])
+def test_step_4_reruns_when_vco_lib_is_not_served_by_the_checkout(tmp_path, report, expect):
+    """ACT: the probe reports a shadow copy / no editable install → run step 4."""
+    root = _root(tmp_path)
+    shadow = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "vco_lib"
+    rep = {
+        "site": _report(origin=str(shadow / "__init__.py"), locations=[str(shadow)],
+                        file=str(shadow / "__init__.py")),
+        "elsewhere": _report(origin=str(tmp_path / "other" / "vco_lib" / "__init__.py"),
+                             locations=[str(tmp_path / "other" / "vco_lib")]),
+        "missing": _report(),
+        "error": _report(origin=str(root / "vco_lib" / "__init__.py"),
+                         error="ImportError: boom"),
+        "garbage": "not json\n",
+    }[report]
+    s = ir.load_session(_failed_at_step_5_log(tmp_path, root))
+    skipped, out, events = _skip(s, "4/10", _deps(root, [], report=rep))
+    assert not skipped and expect in out and events == []
+
+
+def test_step_4_skips_when_vco_lib_resolves_in_the_checkout(tmp_path):
+    """LEAVE-ALONE: an editable install that serves the checkout verifies."""
+    root = _root(tmp_path)
+    s = ir.load_session(_failed_at_step_5_log(tmp_path, root))
+    skipped, out, _ = _skip(s, "4/10", _deps(root, [], report=_checkout_report(root)))
+    assert skipped and "editable imports OK" in out
+
+
+def _real_venv(tmp_path: Path) -> "tuple[Path, Path]":
+    """A real (pip-less) venv; returns (interpreter, purelib)."""
+    import os
+    import venv
+    env = tmp_path / "venv"
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(env)
+    py = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
+    purelib = subprocess.run(
+        [str(py), "-I", "-c", "import sysconfig; print(sysconfig.get_paths()['purelib'])"],
+        capture_output=True, text=True, check=True, timeout=60).stdout.strip()
+    return py, Path(purelib)
+
+
+def _real_deps(root, py):
+    """Real interpreter for the probes; ``pip check`` faked (the venv has no pip)."""
+    def run(argv, **k):
+        if argv[-3:] == ["-m", "pip", "check"]:
+            return subprocess.CompletedProcess(argv, 0, "No broken requirements found.\n", "")
+        return subprocess.run(argv, **k)
+    return ir.deps_verifier(root, py, dev=False, weaviate_mcp_probe="import sys", run=run)
+
+
+def _checkout_with_vco_lib(tmp_path):
+    root = _root(tmp_path)
+    (root / "vco_lib").mkdir()
+    (root / "vco_lib" / "__init__.py").write_text("WHERE = 'checkout'\n", encoding="utf-8")
+    return root
+
+
+def test_step_4_real_interpreter_detects_a_site_packages_shadow_copy(tmp_path):
+    """ACT, against a real interpreter: a frozen ``vco_lib`` in the venv's
+    site-packages (no editable install) must fail the verifier even though the
+    checkout has its own ``vco_lib`` — the case ``cwd=root`` could never see."""
+    root = _checkout_with_vco_lib(tmp_path)
+    py, purelib = _real_venv(tmp_path)
+    (purelib / "vco_lib").mkdir()
+    (purelib / "vco_lib" / "__init__.py").write_text("WHERE = 'shadow'\n", encoding="utf-8")
+    ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert not ok and "site-packages copy" in why, why
+
+
+def test_step_4_real_interpreter_accepts_an_editable_install(tmp_path):
+    """LEAVE-ALONE, against a real interpreter: a ``.pth`` editable install
+    pointing at the checkout verifies."""
+    root = _checkout_with_vco_lib(tmp_path)
+    py, purelib = _real_venv(tmp_path)
+    (purelib / "__editable__.vco_test.pth").write_text(f"{root}\n", encoding="utf-8")
+    ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert ok, why
+
+
+def test_step_4_real_interpreter_detects_a_missing_editable_install(tmp_path):
+    """ACT: no editable install and no copy — vco_lib is simply not in the venv."""
+    root = _checkout_with_vco_lib(tmp_path)
+    py, _ = _real_venv(tmp_path)
+    ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert not ok and "not installed" in why, why
 
 
 @pytest.mark.parametrize("why", ["pip check", "vco_lib", "requirements"])

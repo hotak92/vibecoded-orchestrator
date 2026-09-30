@@ -1424,7 +1424,8 @@ mod tests {
 
     /// With NO row the service may still be supervised (a missing container
     /// may be created), but ownership of an EXISTING one comes from its labels
-    /// against the installer's project (see the heal tests below).
+    /// against the installer's project — pinned by
+    /// `with_no_row_ownership_is_the_installer_projects_label` (W4R-12).
     #[test]
     fn a_service_without_a_row_is_supervised_with_no_ownership_reference() {
         // About the absent row itself (no request is made): without this the
@@ -1925,6 +1926,32 @@ mod tests {
         assert_eq!(out, HealOutcome::Verified { action: "start" });
         assert!(r.verbs().contains(&"start".to_string()));
         assert!(!r.verbs().iter().any(|v| v == "rm"));
+    }
+
+    /// W4R-12: with NO service row, an existing container's ownership comes
+    /// from its compose label against the INSTALLER's project — a match is
+    /// Owned (started by name, verified), any other project is Foreign
+    /// (nothing touched).
+    #[tokio::test]
+    async fn with_no_row_ownership_is_the_installer_projects_label() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+            panic!("an existing container is never composed")
+        }, QUICK)
+        .await;
+        assert_eq!(out, HealOutcome::Verified { action: "start" });
+
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+            panic!("never composed")
+        }, QUICK)
+        .await;
+        assert!(matches!(&out, HealOutcome::Foreign(why) if why.contains("vibecoded")), "{out:?}");
+        assert_eq!(r.verbs(), vec!["inspect"], "only the read");
     }
 
     /// Paused → `unpause`, never `start`/`up`.

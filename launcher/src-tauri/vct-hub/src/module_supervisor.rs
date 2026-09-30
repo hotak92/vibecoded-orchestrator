@@ -187,7 +187,7 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     // v0.2.97 (lane V): the run argv with the module's listed settings
     // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
-    // in this spawn's env, below). Built before the pre-pull and the `rm -f`
+    // in this spawn's env, below). Built before the pre-pull and the name clear
     // so a refused start — a required secret that did not resolve — leaves
     // the running container alone.
     let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
@@ -228,12 +228,18 @@ pub async fn start_container_for_module_with_gpu_mode(
         }
     }
 
-    let _ = Command::new(&podman).silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    // v0.2.100 (W4R-01): replace a same-named container only when its
+    // launcher label says it is this install's, or it is unlabelled and this
+    // DB records the module install (the ≤0.2.99 upgrade path); another
+    // install's container refuses the start. One rule, shared with the
+    // launcher's `module_service` start.
+    let claimed = vct_launcher_core::services::container_runtime::db_claims_module_install(
+        db, &project.id, &manifest.id,
+    );
+    vct_launcher_core::services::container_runtime::clear_module_name_for_start(
+        &podman, &container_name, claimed,
+    )
+    .await?;
 
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 

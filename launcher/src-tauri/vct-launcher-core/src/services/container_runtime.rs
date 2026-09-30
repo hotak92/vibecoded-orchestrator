@@ -1591,6 +1591,177 @@ where
     }
 }
 
+/// v0.2.100 (W4R-01): what a module START may do with an existing container
+/// that already has the name it is about to `run` under. The reaper's label
+/// gate ([`reap_decision`]) and this are the only two places a module
+/// container is removed, and both read the container's own
+/// [`super::container_ownership::LAUNCHER_LABEL`] before an `rm -f`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreStartRemoval {
+    /// No container has the name: nothing to remove, go ahead.
+    Proceed,
+    /// Remove it (`rm -f`), then run. `unlabelled` = it carries no launcher
+    /// label and is replaced only because the caller's DB claims the name
+    /// (the ≤0.2.99 upgrade path) — logged.
+    Remove { unlabelled: bool },
+    /// Refuse the start and remove nothing; the text names the container
+    /// and why.
+    Refuse(String),
+}
+
+/// Pure: the pre-start removal decision for `name`, from its read
+/// [`super::container_ownership::Identity`], THIS install's `owner_id`
+/// ([`super::container_ownership::launcher_owner_id`]) and whether the
+/// caller's launcher DB records the module install that derives this name
+/// (`claimed`).
+///
+/// * absent → [`PreStartRemoval::Proceed`];
+/// * labelled by this install → `Remove`;
+/// * unlabelled AND claimed → `Remove { unlabelled: true }` (every container
+///   created before v0.2.100 must stay replaceable by its own module);
+/// * labelled by ANOTHER install → `Refuse`, naming the install id;
+/// * unlabelled and unclaimed, or unreadable → `Refuse` (never guess);
+/// * podman storage-only leftover → `Remove` when claimed (nothing runs
+///   under it, and it blocks the name), else `Refuse`.
+pub fn pre_start_removal_decision(
+    name: &str,
+    identity: &super::container_ownership::Identity,
+    owner_id: Option<&str>,
+    claimed: bool,
+) -> PreStartRemoval {
+    use super::container_ownership::{launcher_label_verdict, ContainerState, LabelVerdict};
+    match &identity.state {
+        ContainerState::Missing => return PreStartRemoval::Proceed,
+        ContainerState::Unknown(why) => {
+            return PreStartRemoval::Refuse(format!(
+                "not starting: container '{}' could not be read to check which install created \
+                 it ({}), so it is not removed",
+                name, why
+            ))
+        }
+        ContainerState::StorageOnly => {
+            return if claimed {
+                PreStartRemoval::Remove { unlabelled: true }
+            } else {
+                PreStartRemoval::Refuse(format!(
+                    "not starting: a storage-only container '{}' holds the name and no module \
+                     install in this launcher claims it, so it is not removed",
+                    name
+                ))
+            };
+        }
+        _ => {}
+    }
+    match launcher_label_verdict(&identity.labels, owner_id) {
+        LabelVerdict::Ours => PreStartRemoval::Remove { unlabelled: false },
+        LabelVerdict::Unlabelled if claimed => PreStartRemoval::Remove { unlabelled: true },
+        LabelVerdict::Unlabelled => PreStartRemoval::Refuse(format!(
+            "not starting: container '{}' exists, carries no launcher label and no module \
+             install in this launcher claims it, so it is not removed",
+            name
+        )),
+        LabelVerdict::OtherInstall(id) if owner_id.is_none() => PreStartRemoval::Refuse(format!(
+            "not starting: container '{}' carries launcher install label '{}' and this \
+             launcher's own install root could not be resolved, so it cannot prove the container \
+             is its own — it is not removed",
+            name, id
+        )),
+        LabelVerdict::OtherInstall(id) => PreStartRemoval::Refuse(format!(
+            "not starting: container '{}' was created by another VCO install (install id '{}') \
+             on this machine; it is not removed. Stop it from that install, or give this \
+             project a different slug",
+            name, id
+        )),
+    }
+}
+
+/// Read `name`'s labels and apply [`pre_start_removal_decision`] — no action.
+pub async fn read_pre_start_decision<R: super::container_ownership::ContainerRunner>(
+    runner: &R,
+    name: &str,
+    owner_id: Option<&str>,
+    claimed: bool,
+) -> PreStartRemoval {
+    let identity = super::container_ownership::read_identity(runner, name).await;
+    pre_start_removal_decision(name, &identity, owner_id, claimed)
+}
+
+/// Read `name`, apply [`pre_start_removal_decision`], and act: `rm -f` when
+/// allowed (a failed `rm` is logged; the `run` that follows then reports the
+/// name clash), nothing otherwise. `Err` = the start must be refused. Both
+/// module-start surfaces (the launcher's `module_service` and the hub's
+/// `module_supervisor`) call this — one home for the rule.
+pub async fn clear_name_for_start<R: super::container_ownership::ContainerRunner>(
+    runner: &R,
+    name: &str,
+    owner_id: Option<&str>,
+    claimed: bool,
+) -> Result<(), String> {
+    match read_pre_start_decision(runner, name, owner_id, claimed).await {
+        PreStartRemoval::Proceed => Ok(()),
+        PreStartRemoval::Refuse(msg) => {
+            tracing::warn!(container = %name, "[container_runtime] module start: {}", msg);
+            Err(msg)
+        }
+        PreStartRemoval::Remove { unlabelled } => {
+            if unlabelled {
+                tracing::info!(
+                    container = %name,
+                    "[container_runtime] module start: replacing a container with no launcher \
+                     label (created before v0.2.100) — this launcher's module install claims \
+                     its name"
+                );
+            }
+            match runner.run(&["rm", "-f", name], std::time::Duration::from_secs(60)).await {
+                Ok(o) if o.success => {}
+                Ok(o) => tracing::warn!(
+                    container = %name,
+                    stderr = %o.stderr.chars().take(200).collect::<String>(),
+                    "[container_runtime] module start: `rm -f` exited non-zero"
+                ),
+                Err(e) => tracing::warn!(
+                    container = %name,
+                    error = %e,
+                    "[container_runtime] module start: `rm -f` could not run"
+                ),
+            }
+            Ok(())
+        }
+    }
+}
+
+/// [`clear_name_for_start`] against the real `runtime` binary and THIS
+/// install's owner id; `claimed` from [`db_claims_module_install`].
+pub async fn clear_module_name_for_start(runtime: &str, name: &str, claimed: bool) -> Result<(), String> {
+    let runner = super::container_ownership::RuntimeRunner {
+        binary: std::path::PathBuf::from(runtime),
+        runtime: runtime.to_string(),
+    };
+    let owner = super::container_ownership::launcher_owner_id();
+    clear_name_for_start(&runner, name, owner.as_deref(), claimed).await
+}
+
+/// Check-only form for a caller that must refuse BEFORE it stops anything
+/// (the launcher's restart): `Err` when the start would be refused, `Ok`
+/// otherwise; never removes.
+pub async fn check_module_name_for_start(runtime: &str, name: &str, claimed: bool) -> Result<(), String> {
+    let runner = super::container_ownership::RuntimeRunner {
+        binary: std::path::PathBuf::from(runtime),
+        runtime: runtime.to_string(),
+    };
+    let owner = super::container_ownership::launcher_owner_id();
+    match read_pre_start_decision(&runner, name, owner.as_deref(), claimed).await {
+        PreStartRemoval::Refuse(msg) => Err(msg),
+        _ => Ok(()),
+    }
+}
+
+/// Does this launcher DB record the module install whose container a start
+/// is about to (re)create? An unreadable DB claims nothing.
+pub fn db_claims_module_install(db: &crate::db::Db, project_id: &str, module_id: &str) -> bool {
+    matches!(db.get_module_install(project_id, module_id), Ok(Some(_)))
+}
+
 /// What one reaper pass did.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReapReport {
@@ -5456,6 +5627,95 @@ mod tests {
         assert_eq!(report.reaped, 0);
         assert_eq!(report.unlabelled, vec!["vct-rl-reranker"]);
         assert_eq!(report.other_install, vec!["vct-rl-reranker-old"]);
+    }
+
+    // ─── v0.2.100 W4R-01: the module START clears its name label-gated ───
+
+    const W4R01_OWNER: &str = "ours0123456789ab";
+    const W4R01_NAME: &str = "vct-rl-reranker-proj";
+
+    /// A fake runtime whose `inspect` reports a running container carrying
+    /// `launcher_label` (or none), and whose `rm` succeeds.
+    fn w4r01_runner(launcher_label: Option<&str>) -> crate::services::container_ownership::fake::FakeRunner {
+        use crate::services::container_ownership::fake::{inspect_line, ok, FakeRunner};
+        let labels = match launcher_label {
+            Some(v) => serde_json::json!({ crate::services::container_ownership::LAUNCHER_LABEL: v }),
+            None => serde_json::json!({}),
+        };
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("running", &labels.to_string())));
+        r.on("rm", ok(""));
+        r
+    }
+
+    fn w4r01_rms(r: &crate::services::container_ownership::fake::FakeRunner) -> Vec<Vec<String>> {
+        r.calls.borrow().iter().filter(|c| c[0] == "rm").cloned().collect()
+    }
+
+    /// ACT: this install's container is removed before the run.
+    #[tokio::test]
+    async fn w4r01_start_removes_a_container_this_install_labelled() {
+        let r = w4r01_runner(Some(W4R01_OWNER));
+        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), false).await.unwrap();
+        assert_eq!(w4r01_rms(&r), vec![vec!["rm".to_string(), "-f".into(), W4R01_NAME.into()]]);
+    }
+
+    /// ACT: an unlabelled (≤0.2.99) container is replaced when this
+    /// launcher's DB claims the name — the upgrade path keeps working.
+    #[tokio::test]
+    async fn w4r01_start_replaces_an_unlabelled_container_the_db_claims() {
+        let r = w4r01_runner(None);
+        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap();
+        assert_eq!(w4r01_rms(&r), vec![vec!["rm".to_string(), "-f".into(), W4R01_NAME.into()]]);
+    }
+
+    /// LEAVE-ALONE: another install's container refuses the start, names
+    /// that install and the container, and no `rm` is issued — even when
+    /// this DB claims the name.
+    #[tokio::test]
+    async fn w4r01_start_refuses_and_never_removes_another_installs_container() {
+        let r = w4r01_runner(Some("other-install-id"));
+        let err = clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap_err();
+        assert!(err.contains("other-install-id") && err.contains(W4R01_NAME), "{err}");
+        assert!(w4r01_rms(&r).is_empty(), "no rm may be issued: {:?}", r.calls.borrow());
+    }
+
+    /// LEAVE-ALONE: unlabelled and unclaimed refuses; unreadable refuses.
+    #[tokio::test]
+    async fn w4r01_start_refuses_unclaimed_unlabelled_and_unreadable() {
+        let r = w4r01_runner(None);
+        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), false).await.is_err());
+        assert!(w4r01_rms(&r).is_empty());
+
+        use crate::services::container_ownership::fake::{fail, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: cannot connect to Podman socket"));
+        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.is_err());
+        assert!(w4r01_rms(&r).is_empty());
+    }
+
+    /// An absent name proceeds with nothing removed.
+    #[tokio::test]
+    async fn w4r01_start_with_no_container_proceeds_without_rm() {
+        use crate::services::container_ownership::fake::{fail, ok, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vct-rl-reranker-proj"));
+        r.on("ps", ok("[]"));
+        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap();
+        assert!(w4r01_rms(&r).is_empty());
+    }
+
+    /// With no owner id a labelled container cannot be proven ours.
+    #[test]
+    fn w4r01_no_owner_id_refuses_a_labelled_container() {
+        use crate::services::container_ownership::{ContainerState, Identity, Labels, LAUNCHER_LABEL};
+        let mut labels = Labels::new();
+        labels.insert(LAUNCHER_LABEL.into(), W4R01_OWNER.into());
+        let id = Identity::with_labels(ContainerState::Running, labels);
+        assert!(matches!(
+            pre_start_removal_decision(W4R01_NAME, &id, None, true),
+            PreStartRemoval::Refuse(_)
+        ));
     }
 
     /// With no owner id (root unresolved) nothing is provably ours.

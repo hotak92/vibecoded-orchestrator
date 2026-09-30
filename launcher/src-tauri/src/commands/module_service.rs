@@ -320,6 +320,10 @@ pub(crate) struct PreparedStart {
     container_name: String,
     image: String,
     spawn: vct_launcher_core::services::container_runtime::SpawnArgs,
+    /// v0.2.100 (W4R-01): this launcher's DB records the module install the
+    /// name derives from — what lets an UNLABELLED (pre-0.2.100) container of
+    /// that name be replaced ([`vct_launcher_core::services::container_runtime::pre_start_removal_decision`]).
+    claimed: bool,
 }
 
 /// Everything in a per-project start that can refuse it, with no container
@@ -365,7 +369,10 @@ pub(crate) fn prepare_container_start(
     let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
-    Ok(PreparedStart { podman, container_name, image, spawn })
+    let claimed = vct_launcher_core::services::container_runtime::db_claims_module_install(
+        db, &project.id, &manifest.id,
+    );
+    Ok(PreparedStart { podman, container_name, image, spawn, claimed })
 }
 
 /// The container CLI's fire-and-forget subcommands (`stop`, `rm`) — output
@@ -377,6 +384,33 @@ pub(crate) trait ContainerCli: Sync {
         program: &'a str,
         args: &'a [&'a str],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    /// v0.2.100 (W4R-01): clear `name` for a start through
+    /// [`vct_launcher_core::services::container_runtime::clear_module_name_for_start`] (label-gated
+    /// `rm -f`; `Err` refuses the start).
+    fn clear_name_for_start<'a>(
+        &'a self,
+        program: &'a str,
+        name: &'a str,
+        claimed: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(vct_launcher_core::services::container_runtime::clear_module_name_for_start(
+            program, name, claimed,
+        ))
+    }
+
+    /// Check-only twin of [`ContainerCli::clear_name_for_start`]: `Err` when
+    /// the start would be refused; removes nothing.
+    fn check_name_for_start<'a>(
+        &'a self,
+        program: &'a str,
+        name: &'a str,
+        claimed: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(vct_launcher_core::services::container_runtime::check_module_name_for_start(
+            program, name, claimed,
+        ))
+    }
 }
 
 /// The real [`ContainerCli`]: the runtime binary, output discarded.
@@ -424,8 +458,11 @@ fn build_container_run_command(
     cmd
 }
 
-/// Run a [`PreparedStart`]: pre-pull, `rm -f` any same-named container,
-/// create the volume dirs, `podman run`. Returns the container name.
+/// Run a [`PreparedStart`]: pre-pull, clear the name (v0.2.100 W4R-01: `rm -f`
+/// a same-named container only when its launcher label says it is this
+/// install's, or it is unlabelled and this launcher's DB claims the name —
+/// another install's container refuses the start), create the volume dirs,
+/// `podman run`. Returns the container name.
 async fn launch_prepared_start(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
@@ -434,7 +471,7 @@ async fn launch_prepared_start(
     prepared: PreparedStart,
     cli: &dyn ContainerCli,
 ) -> Result<String, String> {
-    let PreparedStart { podman, container_name, image, spawn } = prepared;
+    let PreparedStart { podman, container_name, image, spawn, claimed } = prepared;
 
     // v0.2.47: pre-pull the variant-correct image with auth context
     // attached, so a cache-evicted host doesn't fall through to
@@ -463,8 +500,10 @@ async fn launch_prepared_start(
         }
     }
 
-    // Idempotency: force-remove any prior container with the same name.
-    cli.run_quiet(&podman, &["rm", "-f", &container_name]).await;
+    // Idempotency: replace a prior container with the same name — but only
+    // one this install may remove (v0.2.100 W4R-01, the one rule shared with
+    // the hub's supervisor). Another install's container refuses the start.
+    cli.clear_name_for_start(&podman, &container_name, claimed).await?;
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
@@ -1285,6 +1324,9 @@ async fn restart_container_with(
     db: &Db,
 ) -> Result<String, String> {
     let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    // v0.2.100 (W4R-01): a name held by another install refuses BEFORE the
+    // stop, so the refused restart leaves that container running.
+    cli.check_name_for_start(&prepared.podman, &prepared.container_name, prepared.claimed).await?;
     stop_container_with(cli, &prepared.podman, container_name).await;
     launch_prepared_start(manifest, ctx, project, rl_port, prepared, cli).await
 }
@@ -3834,6 +3876,28 @@ mod tests {
             self.0.lock().unwrap().push(call);
             Box::pin(async {})
         }
+
+        // Never reach a real runtime from a test: record the label-gated
+        // clear/check (W4R-01) as calls too.
+        fn clear_name_for_start<'a>(
+            &'a self,
+            program: &'a str,
+            name: &'a str,
+            _claimed: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec![program.into(), "clear-name".into(), name.into()]);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn check_name_for_start<'a>(
+            &'a self,
+            program: &'a str,
+            name: &'a str,
+            _claimed: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec![program.into(), "check-name".into(), name.into()]);
+            Box::pin(async { Ok(()) })
+        }
     }
 
     /// A restart whose start is refused — a REQUIRED listed secret that is
@@ -3870,6 +3934,73 @@ mod tests {
 
         assert!(err.contains("RL_API_TOKEN"), "{err}");
         assert!(cli.0.lock().unwrap().is_empty(), "calls: {:?}", cli.0.lock().unwrap());
+    }
+
+    /// A CLI whose label check refuses the name (another install's
+    /// container); records every call.
+    #[derive(Default)]
+    struct OtherInstallCli(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl ContainerCli for OtherInstallCli {
+        fn run_quiet<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [&'a str],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            let mut call = vec![program.to_string()];
+            call.extend(args.iter().map(|a| a.to_string()));
+            self.0.lock().unwrap().push(call);
+            Box::pin(async {})
+        }
+        fn clear_name_for_start<'a>(
+            &'a self,
+            _program: &'a str,
+            name: &'a str,
+            _claimed: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec!["clear-name".into(), name.into()]);
+            Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })
+        }
+        fn check_name_for_start<'a>(
+            &'a self,
+            _program: &'a str,
+            name: &'a str,
+            _claimed: bool,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec!["check-name".into(), name.into()]);
+            Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })
+        }
+    }
+
+    /// v0.2.100 (W4R-01): a restart whose name belongs to another install
+    /// is refused by the label check BEFORE `stop`/`rm` — nothing of the
+    /// other install's container is touched.
+    #[tokio::test]
+    async fn w4r01_restart_refused_by_another_installs_label_stops_nothing() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let db = Db::open_in_memory().unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let cli = OtherInstallCli::default();
+
+        let err = restart_container_with(
+            &cli,
+            "podman".into(),
+            &manifest,
+            &ctx,
+            &project,
+            "vct-rl-reranker-acme-corp",
+            11533,
+            None,
+            &db,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("another VCO install"), "{err}");
+        let calls = cli.0.lock().unwrap().clone();
+        assert_eq!(calls, vec![vec!["check-name".to_string(), "vct-rl-reranker-acme-corp".into()]]);
     }
 
     // ─── resolve_container_name ──────────────────────────────────────
