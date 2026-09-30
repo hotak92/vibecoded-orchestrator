@@ -492,11 +492,16 @@ def test_the_toggle_has_a_real_consumer_end_to_end():
     page = (
         REPO_ROOT / "launcher" / "src" / "routes" / "preferences" / "+page.svelte"
     ).read_text(encoding="utf-8")
-    for command in (
-        "get_launcher_session_autostart",
-        "set_launcher_session_autostart",
+    # v0.2.100 (WP-16): the page's READS go through its loader registry;
+    # the write stays in the page.
+    loaders = (
+        REPO_ROOT / "launcher" / "src" / "lib" / "preferences" / "loaders.ts"
+    ).read_text(encoding="utf-8")
+    for command, src in (
+        ("get_launcher_session_autostart", loaders),
+        ("set_launcher_session_autostart", page),
     ):
-        assert f"'{command}'" in page, f"the page never invokes {command}"
+        assert f"'{command}'" in src, f"the Preferences page never invokes {command}"
         assert (
             f"commands::session_autostart::{command}"
             in LIB_RS.read_text(encoding="utf-8")

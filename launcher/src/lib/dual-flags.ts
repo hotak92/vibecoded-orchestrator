@@ -310,3 +310,74 @@ export function globalSaveSummary(
   }`;
   return warnings > 0 ? `${base} (${warnings} warning${warnings === 1 ? '' : 's'}).` : `${base}.`;
 }
+
+// ─── v0.2.100 F-W3-03: the model ensure a toggle starts, shown in the UI ───
+
+/** Mirror of Rust `dual_flags::DualFlagProjectWriteResult`. */
+export interface DualFlagProjectWriteResult {
+  /** The RESOLVED triple after the write. */
+  state: DualFlagsState;
+  /** The write started the background model ensure (`embedding_pull_plan
+   *  ensure`). False when the resolved state needs no second embedder
+   *  (W3R-16) or python / the install root could not be resolved. */
+  model_ensure_started: boolean;
+}
+
+/** Mirror of Rust `dual_flags::ModelEnsureOutcome`. */
+export interface ModelEnsureOutcome {
+  ok: boolean;
+  present: string[];
+  pulled: string[];
+  failed: Record<string, string>;
+  deferral: string | null;
+  error: string | null;
+}
+
+/** Event emitted by Rust when a background model ensure finishes
+ *  (`dual_flags.rs::MODEL_ENSURE_EVENT` — must match). */
+export const MODEL_ENSURE_EVENT = 'vct-dual-flag-model-ensure';
+
+/** Mirror of Rust `dual_flags::ModelEnsureEvent`. */
+export interface ModelEnsureEvent {
+  scope: DualScope;
+  project_id: string | null;
+  outcome: ModelEnsureOutcome;
+}
+
+/** The line shown while the ensure runs (after a write that started it). */
+export const MODEL_ENSURE_RUNNING_TEXT =
+  'Checking that the embedding models this needs are installed (in the background)…';
+
+/** Does this finished ensure belong to THIS panel mount? A project panel
+ *  shows only its own project's run; the global panel only host-wide runs. */
+export function ensureEventIsFor(
+  ev: ModelEnsureEvent,
+  scope: DualScope,
+  projectId: string | undefined,
+): boolean {
+  if (scope === 'global') return ev.project_id === null;
+  return !!projectId && ev.project_id === projectId;
+}
+
+/** One line describing a finished ensure — never empty, never "ok" for a
+ *  failure. A failure names the deferral the badge now shows. */
+export function modelEnsureOutcomeText(o: ModelEnsureOutcome): { ok: boolean; text: string } {
+  if (o.ok) {
+    if (o.pulled.length > 0) {
+      return { ok: true, text: `Embedding models ready — pulled ${o.pulled.join(', ')}.` };
+    }
+    return {
+      ok: true,
+      text:
+        o.present.length > 0
+          ? `Embedding models ready — ${o.present.join(', ')} already installed.`
+          : 'Embedding models ready — nothing needed pulling.',
+    };
+  }
+  const failed = Object.entries(o.failed ?? {}).map(([m, why]) => `${m} (${why})`);
+  const what = failed.length > 0 ? `could not pull ${failed.join(', ')}` : (o.error ?? 'failed');
+  const tail = o.deferral
+    ? ` Recorded as \`${o.deferral}\` in the update-deferral badge.`
+    : '';
+  return { ok: false, text: `Embedding model check failed: ${what}.${tail}` };
+}

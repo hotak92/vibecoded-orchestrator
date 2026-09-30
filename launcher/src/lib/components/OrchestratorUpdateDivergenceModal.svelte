@@ -40,7 +40,7 @@
 
   import { invoke } from '@tauri-apps/api/core';
   import { updater, type OrchestratorNonFfPayload } from '$lib/stores/updater';
-  import { resetConfirmLines, resetResultText, runResetToUpstream } from './divergence-reset-logic';
+  import { resetConfirmLines, resetFailureView, resetResultText, runResetToUpstream } from './divergence-reset-logic';
   // v0.2.100 (WP-08): errors are parsed ONCE, by the updater store's
   // `routeUpdateError` (inside `updater.run`); this modal reads the route.
 
@@ -194,7 +194,7 @@
         return;
       }
       if (result.routed.to === 'failed') {
-        lastError = { title: 'Reset refused or failed', detail: result.routed.message };
+        lastError = resetFailureView(result.routed);
       }
     } finally {
       busy = false;

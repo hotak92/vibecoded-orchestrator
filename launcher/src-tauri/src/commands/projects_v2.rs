@@ -91,9 +91,10 @@ pub struct UpdateSummary {
     /// hash (= user untouched), now overwritten with the new shipped
     /// version.
     pub overwritten: u32,
-    /// Files where the installed content diverged from the prior-shipped
-    /// hash (= user-modified). Preserved on disk; surfaced via the
-    /// `bundle_user_modified_preserved` deferral entry.
+    /// Code files whose adoption BACKUP could not be written, so the user's
+    /// copy was left in place; surfaced via the `bundle_user_modified_preserved`
+    /// deferral entry. v0.2.100 F-W2-08(a): excludes `knowledge/**` nodes, which
+    /// are kept by design and reported as an informational engine note.
     pub preserved: u32,
     /// Files whose installed content already matches what we'd write
     /// (no-op).
@@ -159,10 +160,19 @@ impl UpdateSummary {
                 .map(|a| a.len() as u32)
                 .unwrap_or(0)
         };
+        // v0.2.100 F-W2-08(a): `preserve` also lists divergent `knowledge/**`
+        // nodes, which are the user's data and kept BY DESIGN — not "your edits
+        // kept (backup failed)". The engine names them in `knowledge_kept` (the
+        // knowledge/code split has one home, Python's `_is_knowledge_dest`).
+        let knowledge_kept = v
+            .get("knowledge_kept")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len() as u32)
+            .unwrap_or(0);
         UpdateSummary {
             created: count_for("create"),
             overwritten: count_for("overwrite"),
-            preserved: count_for("preserve"),
+            preserved: count_for("preserve").saturating_sub(knowledge_kept),
             noop: count_for("noop"),
             always_overwritten: count_for("always-overwrite"),
             skipped_existing: count_for("skip-existing"),
@@ -1812,6 +1822,9 @@ async fn run_install_bundle_core(
     orchestrator_root_override: Option<&Path>,
     mode: BundleMode,
 ) -> (Vec<String>, Option<UpdateSummary>) {
+    // v0.2.100 W3R-06: one engine per project folder — the per-project update,
+    // "Update all" and the module toggle all arrive here and take turns.
+    let _engine_turn = crate::commands::single_flight::bundle_engine_turn(folder).await;
     let mut warnings: Vec<String> = Vec::new();
     // Only Update mode carries a summary. v0.2.71 Piece 5b: start CONSERVATIVE
     // — every soft-fail early-return below and the JSON-parse-failure arm leave
@@ -1933,27 +1946,20 @@ async fn run_install_bundle_core(
                     warnings.push(format!("{} file error on {}: {}", prefix, p, msg));
                 }
             }
-            if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
-                for w in ws {
-                    if let Some(s) = w.as_str() {
-                        warnings.push(format!("{}: {}", prefix, s));
+            // v0.2.100 F-W2-08(a): the engine's informational `notes` (knowledge
+            // kept, compose copies / retired files removed) ride the same
+            // channel; `classify_warning` renders them as info. The launcher no
+            // longer writes its own "N user-modified file(s) preserved … see
+            // UPDATE_DEFERRED.md … --force" line: it counted knowledge nodes
+            // (no such entry, `--force` does not apply to them) and the engine
+            // already reports each real backup failure with its own warning.
+            for key in ["notes", "warnings"] {
+                if let Some(ws) = v.get(key).and_then(|x| x.as_array()) {
+                    for w in ws {
+                        if let Some(s) = w.as_str() {
+                            warnings.push(format!("{}: {}", prefix, s));
+                        }
                     }
-                }
-            }
-
-            // Update mode: if preserve > 0, surface a friendly pointer so the
-            // user knows the deferral .md exists with manual-merge instructions.
-            // (Create mode never preserves — first install is skip-existing.)
-            if let Some(s) = summary.as_ref() {
-                if s.preserved > 0 {
-                    warnings.push(format!(
-                        "{} user-modified file(s) preserved during update. \
-                         See {}/.claude/context/UPDATE_DEFERRED.md for the \
-                         `bundle_user_modified_preserved` entry (lists each \
-                         preserved file + the explicit `--force` command to \
-                         accept the orchestrator's shipped versions).",
-                        s.preserved, folder_str
-                    ));
                 }
             }
 
@@ -3476,6 +3482,16 @@ pub async fn update_all_projects(
         }
     }
 
+    // v0.2.100 F-W2-08(b): one line in the launcher log per run (each project's
+    // own result is in its `.claude/logs/bundle-install.log`, written by the
+    // engine itself).
+    tracing::info!(
+        "[vct] update all projects: {} succeeded, {} failed, {} skipped (of {})",
+        total_succeeded,
+        total_failed,
+        total_skipped,
+        total
+    );
     Ok(UpdateAllReport {
         updated: entries,
         total_succeeded,
@@ -7391,8 +7407,8 @@ mod tests {
         // Skill recursively copied.
         assert!(proj.join(".claude").join("skills").join("architect").join("SKILL.md").exists());
 
-        // Infrastructure compose file copied.
-        assert!(proj.join("infrastructure").join("docker-compose.yml").exists());
+        // v0.2.100 (owner Q3, WP-15): compose files no longer ship into a project.
+        assert!(!proj.join("infrastructure").join("docker-compose.yml").exists());
 
         // Settings template smart-merged.
         let settings: serde_json::Value = serde_json::from_str(
@@ -7585,6 +7601,35 @@ mod tests {
     /// Soft-fail discipline: even if `bootstrap-collections` would defer
     /// (no Weaviate in test env), `run_install_bundle_update` itself only
     /// calls install-bundle, which is independent of Weaviate.
+    /// v0.2.100 W3R-06: the bundle engine waits for the per-folder turn, so a
+    /// module toggle can never run a second engine beside "Update all" (or a
+    /// per-project update) on the same manifest.
+    #[test]
+    fn bundle_engine_waits_for_the_folder_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let held = crate::commands::single_flight::bundle_engine_turn(&proj).await;
+            let p = proj.clone();
+            let engine = tokio::spawn(async move {
+                run_install_bundle_update_with_root(&p, Some(&p)).await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(!engine.is_finished(), "engine ran while another held the folder's turn");
+            drop(held);
+            tokio::time::timeout(std::time::Duration::from_secs(120), engine)
+                .await
+                .expect("engine must run once the turn is released")
+                .expect("join");
+        });
+    }
+
     #[test]
     fn update_project_v2_success() {
         let Some(py) = pick_python() else {
@@ -7758,6 +7803,27 @@ mod tests {
         assert_eq!(summary.errors_count, 0);
         // total_ops() now includes adopted (2 adopt + 1 create == 3).
         assert_eq!(summary.total_ops(), 3);
+    }
+
+    /// v0.2.100 F-W2-08(a): knowledge nodes the engine KEPT (the user's data,
+    /// by design) are not "your edits kept (backup failed)" — the tally
+    /// subtracts the engine's `knowledge_kept` list from `preserve`.
+    #[test]
+    fn knowledge_kept_is_not_counted_as_a_preserved_edit() {
+        let envelope = serde_json::json!({
+            "actions": {
+                "preserve": ["knowledge/TAG_HIERARCHY.md", "knowledge/VOCABULARY.md",
+                             ".claude/hooks/foo.sh"],
+            },
+            "knowledge_kept": ["knowledge/TAG_HIERARCHY.md", "knowledge/VOCABULARY.md"],
+            "errors": [],
+        });
+        assert_eq!(UpdateSummary::from_bundle_envelope(&envelope).preserved, 1);
+        let only_knowledge = serde_json::json!({
+            "actions": { "preserve": ["knowledge/VOCABULARY.md"] },
+            "knowledge_kept": ["knowledge/VOCABULARY.md"],
+        });
+        assert_eq!(UpdateSummary::from_bundle_envelope(&only_knowledge).preserved, 0);
     }
 
     /// D9: adopt lives under `knowledge/**` NEVER (D3 carve-out), so the

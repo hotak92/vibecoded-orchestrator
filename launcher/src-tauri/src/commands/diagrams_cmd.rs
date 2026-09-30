@@ -652,19 +652,13 @@ fn schedule_bundle_update_for_project(db: &Db, project_id: &str, run: impl FnOnc
     }
 }
 
-/// Background `install-bundle --update` for one project, single-flighted per
-/// project so two quick toggles cannot run two engines on one manifest.
+/// Background `install-bundle --update` for one project. Never two engines on
+/// one manifest: the engine itself takes the per-folder turn
+/// (`single_flight::bundle_engine_turn`, v0.2.100 W3R-06), which "Update all"
+/// and the per-project update share — a toggle during either WAITS and then
+/// delivers, instead of racing it (or being refused and losing the delivery).
 fn spawn_bundle_update(project_id: String, folder: PathBuf) {
     tauri::async_runtime::spawn(async move {
-        let key = format!("module_toggle_bundle_update:{project_id}");
-        let Some(_guard) = crate::commands::single_flight::try_begin(key) else {
-            tracing::info!(
-                "[vct] module toggle: a bundle update for project {} is already \
-                 running; it (or the next update) delivers",
-                project_id
-            );
-            return;
-        };
         let (warnings, _summary) =
             crate::commands::projects_v2::run_install_bundle_update(&folder).await;
         for w in &warnings {

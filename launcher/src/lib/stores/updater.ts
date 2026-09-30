@@ -160,6 +160,10 @@ export interface ResetBackup {
   branch: string;
   /** `vco-backup/<stamp>-wip` — the uncommitted + untracked changes. */
   uncommitted_branch: string | null;
+  /** `vco-backup/<stamp>-branch` — the update branch's own tip, when HEAD was
+   *  not on it (detached, or mid-rebase) and it held commits neither HEAD nor
+   *  upstream has. Absent otherwise (Rust skips it when `None`). */
+  branch_tip?: string;
   /** `<vct_root>/backups/orchestrator-reset-<stamp>.bundle`; null when there
    *  was nothing local to save. */
   bundle: string | null;
@@ -748,7 +752,16 @@ export type RoutedUpdateError =
   | { to: 'untrackedCollision'; payload: OrchestratorUntrackedCollisionResolvablePayload }
   | { to: 'autostashPop'; payload: OrchestratorAutostashPopConflictPayload }
   | { to: 'conflict'; payload: OrchestratorConflictPayload }
-  | { to: 'failed'; message: string; errorKind: string | null };
+  | {
+      to: 'failed';
+      message: string;
+      errorKind: string | null;
+      /** A `Refused` error's machine code (`reset_backup_failed`,
+       *  `reset_abort_failed`, `reset_state_not_clear`, …) — lets a modal
+       *  title the refusal; the `message` (the backend's reason) is still
+       *  what is rendered. Absent for every other kind. */
+      code?: string;
+    };
 
 export type UpdateRoute = RoutedUpdateError['to'];
 
@@ -839,7 +852,8 @@ function failedFromSurface(obj: Record<string, unknown>, kind: string): RoutedUp
   let message = normalizeFailureText(str(f.message) || str(f.reason));
   const logPath = str(f.log_path);
   if (logPath && !message.includes(logPath)) message = `${message} (log: ${logPath})`;
-  return { to: 'failed', message, errorKind: kind };
+  const code = str(f.code);
+  return code ? { to: 'failed', message, errorKind: kind, code } : { to: 'failed', message, errorKind: kind };
 }
 
 /** Route a typed `{kind, message, ...}` rejection; null if `obj` is not one. */

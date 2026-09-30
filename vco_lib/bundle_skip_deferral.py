@@ -80,8 +80,8 @@ def emit_skipped_existing_deferral(
         title="Pre-existing files preserved during first-install",
         detected=(
             f"During the first-install of this project's bundle, "
-            f"{len(skipped_files)} file(s) under `.claude/` and "
-            f"`infrastructure/` already existed AND differed from the "
+            f"{len(skipped_files)} file(s) under `.claude/` "
+            f"already existed AND differed from the "
             f"orchestrator's shipped versions. They were preserved to "
             f"avoid overwriting user customizations:\n"
             f"{files_md}"

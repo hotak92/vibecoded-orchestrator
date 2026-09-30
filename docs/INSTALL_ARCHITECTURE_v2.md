@@ -493,6 +493,23 @@ for it).
   the gate reads before the tag is pushed. The remedy the gate prints is a
   `workflow_dispatch` run, which is free on the public repo.
 
+**Launcher GUI wiring (v0.2.100).** The launcher frontend's wiring is guarded
+in-repo by two vitest census tests, which run with the rest of
+`cd launcher && npx vitest run` and need no browser:
+`launcher/src/lib/event-census.test.ts` (every event the Rust side emits has
+a frontend listener and vice versa; every `goto`/`href` target and every
+backend-supplied route resolves to a `+page.svelte`) and
+`launcher/src/lib/invoke-names.test.ts` (every literal `invoke` names a
+command registered in `generate_handler!`; every registered command is
+invoked, manifest-dispatchable, or classified in an allowlist with a reason).
+Runtime-named sites and deliberate exceptions are declared in the tests
+themselves, each with a one-line reason, and a stale declaration fails. A
+real-browser harness (Chromium, Tauri IPC mocked, loading the launcher pages
+and asserting no uncaught error — the class of the v0.2.97 `Illegal
+invocation` mount failure, which unit tests with fake timers cannot see) is
+maintained outside this repository by the maintainers and is not part of CI
+or of the shipped artefacts; the census is the in-repo guard.
+
 ---
 
 ## 10. Related references

@@ -317,6 +317,16 @@ _V02100_OWNED_ADDITIONS = frozenset({
     # (F-W1-12): their emitter runs INSIDE an install.py run (the root bundle),
     # so install ownership would drop the row in that run's own finalize; they
     # are paired-resolution rows owned by vco_lib.module_gated_delivery.
+    # bundle_leftover_removed / bundle_compose_copies_removed left in WP-15 for
+    # the same reason — see _V02100_BUNDLE_RECONCILED below.
+})
+
+
+# v0.2.100 WP-15 (F-W1-12): the bundle engine's leftover records are cleared
+# by the bundle reconcile, never by install.py ownership — pinned the other way
+# round so a later edit cannot hand them back (the root bundle runs inside an
+# install.py run whose finalize would drop them).
+_V02100_BUNDLE_RECONCILED = frozenset({
     "bundle_leftover_removed",
     "bundle_compose_copies_removed",
 })
@@ -756,6 +766,13 @@ class TestOwnershipMigrationPin(unittest.TestCase):
         self.assertFalse(leaked, f"install.py would expire these on the next update: {sorted(leaked)}")
         for cid in _V02100_EMITTER_KEPT:
             self.assertEqual(dr.clear_probe_for(cid), "paired-resolution", cid)
+
+    def test_bundle_leftover_rows_are_reconciled_by_the_bundle(self):
+        from vco_lib import deferral_registry as dr  # noqa: PLC0415
+
+        self.assertFalse(_V02100_BUNDLE_RECONCILED & self.owned)
+        for cid in _V02100_BUNDLE_RECONCILED:
+            self.assertEqual(dr.clear_probe_for(cid), "bundle-reconciled", cid)
 
     def test_prefix_families_unchanged(self):
         self.assertEqual(self.prefixes, _V0290_OWNED_PREFIXES)

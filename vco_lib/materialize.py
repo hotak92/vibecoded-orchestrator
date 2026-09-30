@@ -709,6 +709,13 @@ class RenderSpec:
     regions: bool = False
 
 
+#: The spec every bundle-shipped agent / skill Markdown page renders with
+#: (YAML-aware escaping of the frontmatter). One home: the bundle enumeration
+#: and the leftover pass (which re-renders a historical blob to compare it with
+#: an installed copy) must render the same way.
+BUNDLE_MARKDOWN_SPEC = RenderSpec(allowed=GLOBAL_KEYS, escape="yaml")
+
+
 def render_document(
     raw: bytes, spec: RenderSpec, ctx: Mapping[str, Optional[str]], *, filename: str = "",
 ) -> Tuple[bytes, RenderResult]:

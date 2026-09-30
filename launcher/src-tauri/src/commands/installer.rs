@@ -6048,7 +6048,7 @@ fn write_update_resume_deferral(
         return;
     }
     // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock across the tmp-write +
-    // rename so this standalone full-rewrite serializes with every other writer
+    // rename so this standalone read-merge-write serializes with every other writer
     // on `<install_path>/.claude/context/.update-deferred.lock`. Standalone by
     // design (the sentinel's whole point is "install.py never ran" → Python
     // cannot be assumed), so we take the flock directly. Best-effort (real flock
@@ -6130,29 +6130,14 @@ next successful install.py run, so the resolution is one command.\n\
         install_root_display = install_root_display,
     );
 
-    // Atomic write: temp file in the same directory, then rename.
-    let tmp = parent.join(format!(
-        "UPDATE_DEFERRED.md.tmp.{}",
-        std::process::id()
-    ));
-    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
-        tracing::error!(
-            "[vct] update_resume_deferral: write {} failed: {}",
-            tmp.display(),
-            e
-        );
-        let _ = std::fs::remove_file(&tmp);
-        return;
-    }
-    if let Err(e) = std::fs::rename(&tmp, &target) {
-        tracing::error!(
-            "[vct] update_resume_deferral: rename {} → {} failed: {}",
-            tmp.display(),
-            target.display(),
-            e
-        );
-        let _ = std::fs::remove_file(&tmp);
-    }
+    // v0.2.100 (F-W2-08(c)): through the ONE standalone writer, which MERGES
+    // this section into an existing ledger instead of replacing the file.
+    crate::commands::git_user_editable_merge::write_update_deferred_atomically(
+        parent,
+        &target,
+        "update_resume_required",
+        &content,
+    );
 }
 
 // v0.2.55 (durable-logging fix): the launcher-side update-diverged deferral

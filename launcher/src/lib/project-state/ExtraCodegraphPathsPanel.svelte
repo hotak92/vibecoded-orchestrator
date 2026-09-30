@@ -28,14 +28,20 @@
   //
   // Reactive: re-runs `load()` whenever `projectId` changes.
 
-  import { onMount } from 'svelte';
-  import { invoke } from '$lib/tauri';
+  import { onMount, onDestroy } from 'svelte';
+  import { invoke, listen } from '$lib/tauri';
   import { pickDirectory } from '$lib/dialog';
   import { toast } from '$lib/stores/toast';
   import { projects as projectsStore } from '$lib/stores/projects';
   import ExtrasDisambiguationModal from '$lib/components/ExtrasDisambiguationModal.svelte';
   import ExtrasSyncProgressModal from '$lib/components/ExtrasSyncProgressModal.svelte';
   import type { SyncModalState } from '$lib/components/ExtrasSyncProgressModal.svelte';
+  import {
+    EXTRAS_PROGRESS_EVENT,
+    applyExtrasProgress,
+    type ExtrasProgressPayload,
+    type ExtrasSyncProgress,
+  } from '$lib/components/extras-sync-progress';
   import type {
     ExtraPath,
     ProjectMeta,
@@ -71,6 +77,10 @@
   let syncBody = $state('');
   let syncState = $state<SyncModalState>('running');
   let syncError = $state<string | null>(null);
+  // v0.2.100 (F-W2-05): the analyzer's progress for the op in flight, fed by
+  // `vct-codegraph-extras-progress` (reset at the start of every run).
+  let syncProgress = $state<ExtrasSyncProgress | null>(null);
+  let unlistenProgress: (() => void) | null = null;
   // Track the operation that's currently in flight so Retry knows what
   // to re-invoke. Reused across all three flows.
   let pendingOp = $state<null | (() => Promise<SyncOutcome>)>(null);
@@ -112,7 +122,13 @@
 
   onMount(() => {
     void load();
+    void listen<ExtrasProgressPayload>(EXTRAS_PROGRESS_EVENT, (e) => {
+      syncProgress = applyExtrasProgress(syncProgress, e.payload, projectId, syncState === 'running');
+    }).then((u) => {
+      unlistenProgress = u;
+    });
   });
+  onDestroy(() => unlistenProgress?.());
   $effect(() => {
     if (projectId) void load();
   });
@@ -182,6 +198,7 @@
     syncBody = opts.body;
     syncState = 'running';
     syncError = null;
+    syncProgress = null;
     pendingOp = opts.op;
     pillPath = opts.pillPath ?? '';
     syncOpen = true;
@@ -220,6 +237,7 @@
     const op = pendingOp;
     syncState = 'running';
     syncError = null;
+    syncProgress = null;
     try {
       const outcome = await op();
       syncState = 'succeeded';
@@ -559,6 +577,7 @@
     bodyText={syncBody}
     phase={syncState}
     errorMessage={syncError}
+    progress={syncProgress}
     onRetry={pendingOp ? retrySync : undefined}
     onClose={closeSyncModal}
   />

@@ -1059,8 +1059,10 @@ def _cli_up(args: argparse.Namespace) -> int:
         print(f"service_lifecycle: not VCO compose services: {' '.join(unknown)}", file=sys.stderr)
         return 2
     runtime = args.runtime
-    # Split on whitespace exactly like the hooks do ($COMPOSE_CMD word-splitting,
-    # Split-VcoComposeCommand) — a Windows path keeps its backslashes.
+    # Split on whitespace exactly like the bash hooks' $COMPOSE_CMD word-splitting
+    # — a Windows path keeps its backslashes. (This verb is also why the .ps1
+    # hooks' own splitter `_lib/compose-invocation.ps1` was retired in v0.2.100:
+    # they hand the whole string here instead of splatting it themselves.)
     compose_argv = (args.compose_cmd or "").split()
     if not runtime or not compose_argv:
         from vco_lib import containers as _containers  # noqa: PLC0415

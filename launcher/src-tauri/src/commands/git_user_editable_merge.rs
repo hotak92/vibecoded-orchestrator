@@ -4089,7 +4089,7 @@ pub(crate) fn write_launcher_update_diverged_deferral(
         return;
     }
     // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock across the tmp-write +
-    // rename so this standalone full-rewrite serializes with every other writer
+    // rename so this standalone read-merge-write serializes with every other writer
     // (Python `deferral_emit` writers, and the other Rust direct writers) on
     // `<install_path>/.claude/context/.update-deferred.lock`. Standalone by
     // design (install.py did NOT complete → Python cannot be assumed), so we
@@ -4317,19 +4317,30 @@ python install.py --update\n\
 /// Atomic tmp-write + rename of `UPDATE_DEFERRED.md`. Extracted in v0.2.92
 /// (WP-13) so a SECOND standalone Rust emitter
 /// ([`write_launcher_update_post_pull_unverified_deferral`]) reuses the write
-/// mechanics rather than growing a copy of them.
+/// mechanics rather than growing a copy of them. The THIRD standalone emitter,
+/// `installer::write_update_resume_deferral`, joined in v0.2.100.
+///
+/// v0.2.100 (WP-15, owner rule F-W2-08(c)): the ledger is MERGED into, never
+/// clobbered. `content` is the emitter's single-entry document; when the file
+/// already holds entries, only its `## <condition_id> (` section is taken and
+/// appended to the existing text after removing any older section for the same
+/// condition ([`merge_deferral_section`]). Every caller already holds the
+/// shared deferral lock, so the read and the rename cannot straddle another
+/// writer.
 ///
 /// Best-effort throughout: `condition_id` is used only to keep the log lines
 /// attributable to the emitter that failed. Callers must not depend on the
 /// write having happened.
-fn write_update_deferred_atomically(
+pub(crate) fn write_update_deferred_atomically(
     parent: &Path,
     target: &Path,
     condition_id: &str,
     content: &str,
 ) {
+    let existing = std::fs::read_to_string(target).ok();
+    let merged = merge_deferral_section(existing.as_deref(), condition_id, content);
     let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+    if let Err(e) = std::fs::write(&tmp, merged.as_bytes()) {
         tracing::error!(
             "[vct] {}: write {} failed: {}",
             condition_id,
@@ -4349,6 +4360,32 @@ fn write_update_deferred_atomically(
         );
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Merge one emitter's single-entry document into an existing ledger text.
+///
+/// Pure (unit-tested). No existing text, or an existing text with no entry
+/// section (e.g. a pre-v0.2.100 zero-entry stub) → the emitter's document as
+/// is. Otherwise: the existing text minus any section for `condition_id`
+/// (`restart::strip_section`, the one section-stripper), plus the emitter's
+/// section. Every other entry survives byte-for-byte.
+pub(crate) fn merge_deferral_section(
+    existing: Option<&str>,
+    condition_id: &str,
+    fresh_doc: &str,
+) -> String {
+    let header = format!("## {} (", condition_id);
+    let (Some(existing), Some(idx)) = (existing, fresh_doc.find(&header)) else {
+        return fresh_doc.to_string();
+    };
+    let has_entry = existing
+        .lines()
+        .any(|l| l.starts_with("## ") && !l.starts_with("## VCO Update"));
+    if !has_entry {
+        return fresh_doc.to_string();
+    }
+    let kept = crate::commands::restart::strip_section(existing, condition_id);
+    format!("{}\n\n{}", kept.trim_end(), &fresh_doc[idx..])
 }
 
 /// Write a `launcher_update_post_pull_unverified` entry: the post-pull
@@ -7135,6 +7172,49 @@ pub(crate) mod tests {
         assert!(body.contains("aaaa111"), "local sha must appear");
         assert!(body.contains("bbbb222"), "remote sha must appear");
         assert!(body.contains("python install.py --update"), "CLI recovery");
+    }
+
+    /// v0.2.100 (F-W2-08(c)): an existing ledger is MERGED into, never
+    /// clobbered — the other entry survives, an older section for the same
+    /// condition is replaced, and a zero-entry legacy stub is simply replaced.
+    #[test]
+    fn standalone_writer_merges_into_existing_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+        let ctx = install.join(".claude/context");
+        std::fs::create_dir_all(&ctx).expect("mkdir");
+        let target = ctx.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &target,
+            "---\ncondition_ids: [schema_drift_rebuild_required, launcher_update_diverged]\n---\n\n\
+             # VCO Update Deferred\n\n## schema_drift_rebuild_required (warning)\n\n\
+             **Title**: keep me\n\n---\n\n## launcher_update_diverged (warning)\n\n\
+             **Title**: OLD diverged entry\n\n---\n",
+        )
+        .expect("write");
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: Some("aaaa111".into()),
+                remote_sha: Some("bbbb222".into()),
+                detail: "fatal: Not possible to fast-forward".into(),
+            },
+        );
+        let body = std::fs::read_to_string(&target).expect("read");
+        assert!(body.contains("## schema_drift_rebuild_required (warning)"), "{body}");
+        assert!(body.contains("keep me"), "{body}");
+        assert!(!body.contains("OLD diverged entry"), "{body}");
+        assert_eq!(body.matches("## launcher_update_diverged (").count(), 1, "{body}");
+        assert!(body.contains("aaaa111"), "{body}");
+    }
+
+    #[test]
+    fn merge_deferral_section_replaces_a_zero_entry_text() {
+        let fresh = "---\ncondition_ids: [x_cid]\n---\n\n# VCO Update Deferred\n\n## x_cid (warning)\n\nbody\n";
+        let stub = "---\nstub: true\n---\n\n# No deferrals\n";
+        assert_eq!(merge_deferral_section(Some(stub), "x_cid", fresh), fresh);
+        assert_eq!(merge_deferral_section(None, "x_cid", fresh), fresh);
     }
 
     /// WP-B6 (v0.2.83): `write_launcher_update_diverged_deferral` must hold the

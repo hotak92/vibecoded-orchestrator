@@ -331,3 +331,52 @@ describe('global save summary', () => {
     expect(globalSaveSummary(4, 1)).toContain('1 warning');
   });
 });
+
+// ─── v0.2.100 F-W3-03: the ensure outcome reaches the UI ───
+import {
+  MODEL_ENSURE_EVENT,
+  ensureEventIsFor,
+  modelEnsureOutcomeText,
+  type ModelEnsureOutcome,
+} from './dual-flags';
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+describe('model ensure outcome (F-W3-03)', () => {
+  const base: ModelEnsureOutcome = {
+    ok: true, present: [], pulled: [], failed: {}, deferral: null, error: null,
+  };
+
+  it('success names what was pulled, or what was already present', () => {
+    expect(modelEnsureOutcomeText({ ...base, pulled: ['arctic:latest'] })).toEqual({
+      ok: true,
+      text: 'Embedding models ready — pulled arctic:latest.',
+    });
+    expect(modelEnsureOutcomeText({ ...base, present: ['qwen3'] }).text).toMatch(/qwen3 already installed/);
+  });
+
+  it('failure is never ok and names the deferral the badge shows', () => {
+    const r = modelEnsureOutcomeText({
+      ...base, ok: false, failed: { 'arctic:latest': 'boom' }, deferral: 'ollama_model_pull_failed', error: 'x',
+    });
+    expect(r.ok).toBe(false);
+    expect(r.text).toContain('arctic:latest (boom)');
+    expect(r.text).toContain('ollama_model_pull_failed');
+    expect(modelEnsureOutcomeText({ ...base, ok: false, error: 'no python' }).text).toContain('no python');
+  });
+
+  it('a panel renders only its own run', () => {
+    const ev = { scope: 'project' as const, project_id: 'p1', outcome: base };
+    expect(ensureEventIsFor(ev, 'project', 'p1')).toBe(true);
+    expect(ensureEventIsFor(ev, 'project', 'p2')).toBe(false);
+    expect(ensureEventIsFor(ev, 'global', undefined)).toBe(false);
+    expect(ensureEventIsFor({ ...ev, scope: 'global', project_id: null }, 'global', undefined)).toBe(true);
+  });
+
+  it('the event name matches the Rust emitter', () => {
+    const here = dirname(fileURLToPath(import.meta.url));
+    const rs = readFileSync(resolve(here, '../../src-tauri/src/commands/dual_flags.rs'), 'utf8');
+    expect(rs).toContain(`pub const MODEL_ENSURE_EVENT: &str = "${MODEL_ENSURE_EVENT}";`);
+  });
+});

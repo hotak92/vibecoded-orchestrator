@@ -12,9 +12,9 @@
   binary, drive tier-3 explicitly and retry the CLI ONCE with the
   freshly-built binary before falling through to the Python writer.
 
-* Fix 6 (always-touch ``UPDATE_DEFERRED.md`` on ``--update``): when an
-  ``--update`` run produces zero actionable deferral entries, write a
-  stub file so users have a paper trail confirming the run completed.
+* Fix 6 — RETIRED in v0.2.100 (owner rule F-W2-08(c)): ``UPDATE_DEFERRED.md``
+  materializes ONLY when something is deferred. The zero-entry stub is gone;
+  the tests below pin its absence and that a legacy stub is removed.
 
 Mirrors the mocking conventions of
 ``tests/test_install_mcp_registration.py``: patches the helpers, drives
@@ -475,103 +475,57 @@ class RegisterMcpsTier3RetryTests(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Fix 6: UPDATE_DEFERRED.md stub on --update with zero entries
+# Fix 6 retired (v0.2.100): no ledger file without an entry
 # ─────────────────────────────────────────────────────────────────────────
 
 
-class UpdateDeferredStubTests(unittest.TestCase):
-    """Fix 6: ``--update`` always touches UPDATE_DEFERRED.md."""
+class NoZeroEntryLedgerTests(unittest.TestCase):
+    """Owner rule (2026-09-29): UPDATE_DEFERRED.md is never created empty."""
 
-    def test_stub_written_when_no_entries(self):
-        """Zero deferrals on --update → stub file written with timestamp."""
+    def test_install_py_has_no_stub_writer(self):
+        self.assertFalse(hasattr(install, "_write_update_deferred_stub"))
+
+    def test_clean_finalize_writes_no_file_and_removes_a_legacy_stub(self):
+        from vco_lib.install_deferral_flow import InstallDeferralFlow
+
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td) / "project"
-            folder.mkdir()
-            install._write_update_deferred_stub(folder, mode="update")
-            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
-            self.assertTrue(target.is_file(), "stub file must exist")
-            content = target.read_text(encoding="utf-8")
-            self.assertIn("# No deferrals from update at ", content)
-            self.assertIn("stub: true", content)
-            self.assertIn("schema_version: 1", content)
+            ctx = folder / ".claude" / "context"
+            ctx.mkdir(parents=True)
+            fresh = Path(td) / "fresh"
+            fresh.mkdir()
+            flow = InstallDeferralFlow(fresh, owned_ids=(), owned_prefixes=())
+            flow.seed()
+            self.assertFalse(flow.finalize().wrote_entries)
+            self.assertFalse((fresh / ".claude" / "context" / "UPDATE_DEFERRED.md").exists())
+            # A pre-v0.2.100 stub (zero entries) is deleted, not kept.
+            (ctx / "UPDATE_DEFERRED.md").write_text(
+                "---\nschema_version: 1\nentries: 0\nstub: true\n---\n\n# No deferrals\n",
+                encoding="utf-8")
+            flow2 = InstallDeferralFlow(folder, owned_ids=(), owned_prefixes=())
+            flow2.seed()
+            self.assertFalse(flow2.finalize().wrote_entries)
+            self.assertFalse((ctx / "UPDATE_DEFERRED.md").exists())
 
-    def test_stub_idempotent(self):
-        """Writing the stub twice → no error, file overwritten cleanly."""
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td) / "project"
-            folder.mkdir()
-            install._write_update_deferred_stub(folder, mode="update")
-            first_content = (folder / ".claude" / "context" / "UPDATE_DEFERRED.md").read_text(encoding="utf-8")
-            # Sleep briefly so the second-stamp differs (best-effort, not asserted).
-            time.sleep(0.001)
-            install._write_update_deferred_stub(folder, mode="update")
-            target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
-            self.assertTrue(target.is_file())
-            second_content = target.read_text(encoding="utf-8")
-            # Either equal (same-second timestamp) or differ ONLY in the two
-            # timestamp-bearing lines — that is what "overwritten cleanly" means.
-            self.assertIn("# No deferrals from update at ", second_content)
-
-            def _drop_timestamps(text: str) -> list[str]:
-                return [
-                    ln for ln in text.splitlines()
-                    if not ln.startswith("generated_at: ")
-                    and not ln.startswith("# No deferrals from update at ")
-                ]
-
-            self.assertEqual(
-                _drop_timestamps(first_content), _drop_timestamps(second_content),
-                "the rewritten stub must differ from the first only in its timestamps",
-            )
-
-    def test_stub_creates_parent_dirs(self):
-        """``.claude/context/`` may not exist yet — stub creates it."""
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td) / "fresh_project"
-            folder.mkdir()
-            # No .claude/ at all.
-            install._write_update_deferred_stub(folder, mode="update")
-            self.assertTrue((folder / ".claude" / "context" / "UPDATE_DEFERRED.md").is_file())
-
-    def test_real_report_with_entries_does_not_trigger_stub(self):
-        """``DeferralReport.write`` returns True when entries exist; the
-        caller (install.py main flow) only writes a stub when ``write``
-        returns False AND ``args.update``. This asserts the write-True
-        invariant the stub-gate depends on.
-        """
+    def test_foreign_entry_survives_a_clean_run(self):
+        """Merged, never clobbered: an entry another writer left is kept by a
+        run that itself defers nothing."""
         from vco_lib.deferral_report import DeferralEntry
+        from vco_lib.install_deferral_flow import InstallDeferralFlow
 
         with tempfile.TemporaryDirectory() as td:
             folder = Path(td) / "project"
             folder.mkdir()
-            report = DeferralReport()
-            report.add_entry(DeferralEntry(
-                condition_id="fix6_test",
-                title="Test entry",
-                detected="present",
-                why_deferred="test",
-                command_to_apply="echo ok",
-                severity="info",
-            ))
-            wrote = report.write(folder)
-            self.assertTrue(wrote, "non-empty report.write() must return True")
-            real = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
-            self.assertTrue(real.is_file())
-            # The real (non-stub) file does NOT contain the stub marker.
-            self.assertNotIn("stub: true", real.read_text(encoding="utf-8"))
-
-    def test_empty_report_write_returns_false(self):
-        """``DeferralReport.write`` with no entries returns False → that's
-        the signal the stub branch uses on --update."""
-        with tempfile.TemporaryDirectory() as td:
-            folder = Path(td) / "project"
-            folder.mkdir()
-            report = DeferralReport()
-            wrote = report.write(folder)
-            self.assertFalse(wrote, "empty report.write() must return False")
-            # Real path does NOT exist; stub is install.py's job, not DeferralReport's.
-            real = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
-            self.assertFalse(real.exists())
+            prior = DeferralReport()
+            prior.add_entry(DeferralEntry(
+                condition_id="fix6_foreign", title="t", detected="d",
+                why_deferred="w", command_to_apply="echo ok", severity="info"))
+            self.assertTrue(prior.write(folder))
+            flow = InstallDeferralFlow(folder, owned_ids=(), owned_prefixes=())
+            flow.seed()
+            self.assertTrue(flow.finalize().wrote_entries)
+            ids = [e.condition_id for e in DeferralReport.read(folder).entries]
+            self.assertEqual(ids, ["fix6_foreign"])
 
 
 if __name__ == "__main__":

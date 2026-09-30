@@ -398,7 +398,9 @@ _MAIN_SPAN_MAX = 1473
 # hashes) to `vco_lib.install_resume`, the Ollama step-6/7 flow to
 # `vco_lib.ollama_pull.install_step`, the text-generation tier to one model.
 # Measured with `wc -l`.
-_TOTAL_LINES_MAX = 22153
+# v0.2.100 WP-15 — re-pinned DOWN 22153 -> 22082: the zero-entry
+# UPDATE_DEFERRED.md stub writer was retired (owner rule F-W2-08(c)).
+_TOTAL_LINES_MAX = 22082
 
 
 def _measure() -> tuple:

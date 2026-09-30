@@ -169,11 +169,9 @@ class InstallBundleFreshTests(unittest.TestCase):
             "machine-local compose override was replicated into the project",
         )
         self.assertNotIn(shipped, result["actions"]["create"])
-        # The tracked compose files still ship.
-        self.assertTrue(
-            (self.proj / "infrastructure" / "docker-compose.yml").exists(),
-            "regular compose files must keep shipping",
-        )
+        # v0.2.100 (owner Q3, WP-15): no compose file ships into a project at
+        # all any more (the override included, a fortiori).
+        self.assertFalse((self.proj / "infrastructure" / "docker-compose.yml").exists())
 
     def test_fresh_install_creates_all_categories(self):
         result = project_init.install_project_bundle(
@@ -223,19 +221,11 @@ class InstallBundleFreshTests(unittest.TestCase):
             str(Path(".claude") / "skills" / "architect" / "extra.txt"),
             result["actions"]["create"],
         )
-        # Infrastructure compose files (only docker-/podman- yml).
-        self.assertIn(
-            str(Path("infrastructure") / "docker-compose.yml"),
-            result["actions"]["create"],
-        )
-        self.assertIn(
-            str(Path("infrastructure") / "podman-compose.gpu.yml"),
-            result["actions"]["create"],
-        )
-        # README.md in infrastructure must NOT be copied.
-        infra_paths = result["actions"]["create"]
-        self.assertFalse(any("README.md" in p and "infrastructure" in p
-                             for p in infra_paths))
+        # v0.2.100 (owner Q3, WP-15): compose files no longer ship into a
+        # project — nothing under `infrastructure/` is created.
+        self.assertFalse(any(p.replace("\\", "/").startswith("infrastructure/")
+                             for p in result["actions"]["create"]))
+        self.assertFalse((self.proj / "infrastructure").exists())
         # settings.json template merged → "created".
         self.assertEqual(result["settings_action"], "created")
         # Manifest written.

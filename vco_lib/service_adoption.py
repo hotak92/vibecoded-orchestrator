@@ -111,7 +111,6 @@ __all__ = [
     "adopt_services",
     "adopted_row",
     "existing_managed_override",
-    "gpu_overlay_for_form",
     "knob_owned_services",
     "live_http_host_port",
     "merge_compose",
@@ -566,18 +565,6 @@ def infrastructure_env_for_substitution(infra_dir: Path) -> dict:
             k, _, v = line.partition("=")
             env[k.strip()] = v.strip().strip('"').strip("'")
     return env
-
-
-def gpu_overlay_for_form(compose_form: Optional[str]) -> Optional[str]:
-    """The GPU overlay filename for a compose FORM — constraints #11: the
-    file follows the compose that PARSES it, never the runtime's name. Thin
-    over :func:`vco_lib.compose_provider.overlay_for_provider` with the
-    provider the form implies; a caller that has a detected
-    :class:`~vco_lib.compose_provider.ComposeProvider` should pass that
-    instead (a ``podman compose`` delegating to podman-compose breaks the
-    form-only rule). The caller still verifies the chain parses."""
-    provider = _compose_provider.provider_from_form(compose_form)
-    return _compose_provider.overlay_for_provider(provider, "nvidia")
 
 
 def _compose_entrypoints(need_gpu: bool, gpu_overlay: Optional[str],

@@ -510,17 +510,13 @@ class MergeComposeSemanticsTests(unittest.TestCase):
 
 
 class GpuOverlayFormTests(unittest.TestCase):
-    def test_file_selected_by_compose_form_not_runtime_name(self):
-        self.assertEqual(
-            service_adoption.gpu_overlay_for_form("subcommand"),
-            "docker-compose.gpu.yml")
-        self.assertEqual(
-            service_adoption.gpu_overlay_for_form("standalone"),
-            "podman-compose.gpu.yml")
-
-    def test_unknown_form_has_no_overlay(self):
-        self.assertIsNone(service_adoption.gpu_overlay_for_form(None))
-        self.assertIsNone(service_adoption.gpu_overlay_for_form("weird"))
+    def test_form_only_helper_is_retired(self):
+        """v0.2.100 F-W2-15: `gpu_overlay_for_form` had no production caller
+        and is superseded by `compose_provider.overlay_for_provider` (the
+        caller passes the DETECTED provider). Its form rule is pinned in
+        tests/test_v02100_compose_provider.py."""
+        self.assertFalse(hasattr(service_adoption, "gpu_overlay_for_form"))
+        self.assertNotIn("gpu_overlay_for_form", service_adoption.__all__)
 
 
 # ===========================================================================

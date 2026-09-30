@@ -356,6 +356,43 @@ pub fn acquire_update_lock_at(
     ))
 }
 
+// ─── v0.2.100 (WP-15, W3R-06): one bundle engine per project folder ─────────
+//
+// A DIFFERENT question from the claims above, so a different primitive. Every
+// launcher path that runs `install-bundle` on a project folder — the per-project
+// update, "Update all" (which calls it per project) and the module toggle's
+// background delivery — reaches `projects_v2::run_install_bundle_core`, and two
+// engines on one `.claude/.vco-manifest.json` are last-writer-wins: the loser's
+// adoptions and orphan decisions are recorded by neither. Refusing would be
+// wrong here (a toggle refused during "Update all" can lose its delivery when
+// the update already passed that project), and the engine is idempotent, so the
+// second caller WAITS for its turn and then runs against the first one's
+// result. The key is the folder, so different projects never wait on each other.
+
+static BUNDLE_ENGINE_TURNS: LazyLock<
+    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn bundle_engine_key(folder: &Path) -> String {
+    std::fs::canonicalize(folder)
+        .unwrap_or_else(|_| folder.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Wait for, then hold, the bundle-engine turn for `folder` (released on drop).
+pub async fn bundle_engine_turn(folder: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let slot = {
+        let mut map = BUNDLE_ENGINE_TURNS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(bundle_engine_key(folder))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    slot.lock_owned().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -363,6 +400,28 @@ mod tests {
     /// The guarded ops must be distinct keys — one lock for both would let a
     /// running orchestrator update block a project update-all (and the two
     /// are deliberately separate operations).
+    #[tokio::test]
+    async fn bundle_engine_turns_serialise_one_folder_not_two() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let held = bundle_engine_turn(a.path()).await;
+        let a_path = a.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            let _t = bundle_engine_turn(&a_path).await;
+        });
+        // A different project is never held up by `a`.
+        tokio::time::timeout(std::time::Duration::from_secs(5), bundle_engine_turn(b.path()))
+            .await
+            .expect("another folder must not wait");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "same folder must wait for the turn");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("released turn must be taken")
+            .expect("join");
+    }
+
     #[test]
     fn guarded_operations_have_distinct_keys() {
         // A gateway restart must never block (or be blocked by) an update.

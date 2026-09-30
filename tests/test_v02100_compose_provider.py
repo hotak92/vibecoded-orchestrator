@@ -475,7 +475,8 @@ def test_unknown_engine_falls_back_to_the_form_rule():
     assert cp.overlay_for_provider(_prov(cp.ENGINE_UNKNOWN, "subcommand"), "nvidia") == "docker-compose.gpu.yml"
 
 
-def test_service_adoption_overlay_delegates_to_the_one_home():
-    assert service_adoption.gpu_overlay_for_form("subcommand") == cp.overlay_for_provider(
-        cp.provider_from_form("subcommand"), "nvidia")
+def test_service_adoption_has_no_second_overlay_home():
+    # v0.2.100 F-W2-15: the form-only wrapper `gpu_overlay_for_form` is retired
+    # (superseded by overlay_for_provider with the DETECTED provider).
+    assert not hasattr(service_adoption, "gpu_overlay_for_form")
     assert not hasattr(service_adoption, "GPU_OVERLAY_BY_FORM")

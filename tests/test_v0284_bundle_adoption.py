@@ -224,34 +224,37 @@ class BundleAdoptionActTests(unittest.TestCase):
     # ---- A4 container-runtime coverage: compose files adopt without
     #      splitting the launcher-owned C-RT-5 override mirror ----
 
-    def test_docker_and_podman_compose_files_adopt_together(self):
-        """A3/A4: BOTH shipped compose flavours (docker + podman) at a shipped
-        destination adopt when user-edited — identical treatment, no runtime
-        asymmetry."""
+    def test_docker_and_podman_compose_copies_are_retired_together(self):
+        """A3/A4, superseded by owner Q3 (v0.2.100 WP-15): compose files no
+        longer ship into a project; BOTH flavours of an existing edited copy
+        get identical treatment — backed up under the SAME run dir, then
+        removed. No runtime asymmetry."""
+        import json as _json
+
+        from vco_lib.hashing import sha256_bytes as _sha
+
         docker_rel = str(Path("infrastructure") / "docker-compose.yml")
         podman_rel = str(Path("infrastructure") / "podman-compose.gpu.yml")
+        (self.proj / "infrastructure").mkdir(exist_ok=True)
         (self.proj / docker_rel).write_text("services: {user: docker}\n", encoding="utf-8")
         (self.proj / podman_rel).write_text("services: {user: podman}\n", encoding="utf-8")
-        # Orchestrator bumps both.
-        (self.orch / "infrastructure" / "docker-compose.yml").write_text(
-            "services: {v2: docker}\n", encoding="utf-8")
-        (self.orch / "infrastructure" / "podman-compose.gpu.yml").write_text(
-            "services: {v2: podman}\n", encoding="utf-8")
+        mpath = self.proj / ".claude" / ".vco-manifest.json"
+        manifest = _json.loads(mpath.read_text(encoding="utf-8"))
+        for rel in (docker_rel, podman_rel):  # an earlier release shipped them
+            manifest["files"][rel] = {"sha256": _sha(b"services: {}\n"), "source": rel}
+        mpath.write_text(_json.dumps(manifest), encoding="utf-8")
 
         result = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=True,
         )
-        self.assertIn(docker_rel, result["actions"]["adopt"])
-        self.assertIn(podman_rel, result["actions"]["adopt"])
-        # Both refreshed to shipped bytes.
-        self.assertEqual(
-            (self.proj / docker_rel).read_text(encoding="utf-8"), "services: {v2: docker}\n")
-        self.assertEqual(
-            (self.proj / podman_rel).read_text(encoding="utf-8"), "services: {v2: podman}\n")
-        # Both prior copies backed up under the SAME run dir.
-        backup_root = self.proj / result["adopt_backup_dir"]
-        self.assertTrue((backup_root / docker_rel).exists())
-        self.assertTrue((backup_root / podman_rel).exists())
+        self.assertEqual(sorted(result["compose_copies_removed"]),
+                         sorted(r.replace("\\", "/") for r in (docker_rel, podman_rel)))
+        self.assertFalse((self.proj / docker_rel).exists())
+        self.assertFalse((self.proj / podman_rel).exists())
+        backups = list((self.proj / ".claude" / "backups" / "bundle-adoptions").rglob("*.yml"))
+        self.assertEqual(sorted(p.name for p in backups),
+                         ["docker-compose.yml", "podman-compose.gpu.yml"])
+        self.assertEqual(len({p.parent for p in backups}), 1, "same run dir")
 
     def test_crt5_override_mirror_never_in_op_set_so_never_adopted(self):
         """A4 PIN: the launcher-owned dual-name C-RT-5 compose mirror

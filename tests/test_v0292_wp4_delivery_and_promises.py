@@ -468,11 +468,16 @@ class DeliveryAuditTests(unittest.TestCase):
         v0.2.100 (WP-18 review fixes) — LOWERED 15_262 -> 15_216: the moved-clone
         heal's round-trip moved to ``vco_lib.materialize.renders_under_moved_root``
         (review R18-06), leaving a thin caller.
+
+        v0.2.100 (WP-15) — LOWERED 15_216 -> 15_176: the compose bucket left the
+        enumeration (owner Q3), the leftovers policy went to
+        ``vco_lib/bundle_leftovers.py`` and the adoption-backup writer to
+        ``vco_lib/bundle_backup.py``.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_216,
+            n, 15_176,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

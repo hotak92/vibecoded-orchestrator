@@ -15,7 +15,7 @@
 // is only known afterwards, so by pattern); the result names them exactly.
 // Pure helpers, so the wording is tested without mounting the modal.
 
-import type { UpdateOutcome, UpdateRunResult } from '$lib/stores/updater';
+import type { ResetBackup, UpdateOutcome, UpdateRunResult } from '$lib/stores/updater';
 
 /** Where the bundle lands, for the confirm dialog. `vctRoot` null → the
  *  launcher's state dir, named generically. */
@@ -48,12 +48,44 @@ export function resetResultText(outcome: UpdateOutcome | null): string {
   const b = outcome.reset_backup;
   const where = b
     ? b.bundle
-      ? `Saved to branch ${b.branch}${b.uncommitted_branch ? ` and ${b.uncommitted_branch}` : ''} and to ${b.bundle}.`
+      ? `Saved to ${backupBranchList(b)} and to ${b.bundle}.`
       : `Nothing local needed saving; the previous HEAD is kept as branch ${b.branch}.`
     : '';
   const msg = (outcome.message ?? '').trim();
   if (msg && (!b || msg.includes(b.branch))) return msg;
   return [msg || 'Reset to upstream finished.', where].filter(Boolean).join(' ');
+}
+
+/** Every saved branch, in the backend's order (`ResetBackup::describe`):
+ *  HEAD, then the update branch's own tip (F-W4-08), then the wip commit. */
+export function backupBranchList(b: ResetBackup): string {
+  const all = [b.branch, b.branch_tip, b.uncommitted_branch].filter(
+    (x): x is string => typeof x === 'string' && x.length > 0,
+  );
+  const label = all.length === 1 ? 'branch' : 'branches';
+  const joined = all.length <= 1 ? all.join('') : `${all.slice(0, -1).join(', ')} and ${all[all.length - 1]}`;
+  return `${label} ${joined}`;
+}
+
+/** Titles for the reset refusals the backend names by code. The DETAIL is
+ *  always the backend's own reason text (it names the backup and the manual
+ *  step); the title only says which refusal it was. */
+const RESET_REFUSAL_TITLES: Readonly<Record<string, string>> = {
+  reset_backup_failed: 'Reset refused — the backup could not be written',
+  reset_abort_failed: 'Reset refused — the merge/rebase in progress could not be aborted',
+  reset_state_not_clear: 'Reset refused — a merge/rebase is still in progress',
+  reset_target_not_orchestrator: 'Reset refused — the folder is not the orchestrator clone',
+};
+
+/** What the divergence modal shows for a failed reset. */
+export function resetFailureView(routed: {
+  message: string;
+  code?: string;
+}): { title: string; detail: string } {
+  return {
+    title: (routed.code && RESET_REFUSAL_TITLES[routed.code]) || 'Reset refused or failed',
+    detail: routed.message,
+  };
 }
 
 /** Run the reset through the ONE update action (`updater.run('ResetHard')`). */

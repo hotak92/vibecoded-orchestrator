@@ -80,6 +80,7 @@ from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
+from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
@@ -3238,8 +3239,8 @@ def _write_bootstrap_deferral(
 
 
 # ---------------------------------------------------------------------------
-# Bundle install (PR 4) — copy hooks/scripts/agents/skills/settings/
-# infrastructure into a user project folder.
+# Bundle install (PR 4) — copy hooks/scripts/agents/skills/settings into a
+# user project folder (compose files stopped shipping in v0.2.100, owner Q3).
 #
 # Single source of truth for the per-project bundle. `install.py` keeps
 # its own copy logic for the orchestrator-clone case (in-place install);
@@ -3722,15 +3723,16 @@ def _enumerate_bundle_files(
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
       .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
-      .claude/scripts/<name>               from templates/scripts/  (all flavours)
+      .claude/scripts/<rel>                from templates/scripts/<rel>  (recursive, all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
       .claude/agents/<name>.md             from templates/agents/module-gateway/
                                            (ONLY when the gateway gate says
                                            DELIVER — v0.2.100 AD-7; each gated
                                            verdict is appended to `gate_outcomes`)
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
-      infrastructure/<name>                from infrastructure/<name>   (only docker/podman compose)
     Settings template handled separately (smart-merge, not a plain copy).
+    Compose files are NOT shipped (v0.2.100 owner Q3); earlier copies are
+    retired by ``vco_lib.bundle_leftovers.retire_compose_copies``.
     """
     ops: list[_BundleFileOp] = []
     templates = orchestrator_root / "templates"
@@ -3773,14 +3775,17 @@ def _enumerate_bundle_files(
     # generate-workflow wrappers, so project bundles silently skipped them).
     from vco_lib.bundle_globs import script_patterns as _script_patterns
     from vco_lib.rewire import has_rewire_region, rewire_transform
+    # v0.2.100 WP-15 (L5-F08): recursive — a script in a subdirectory ships to
+    # the same subpath under `.claude/scripts/` (never `__pycache__`).
     scripts_src = templates / "scripts"
     if scripts_src.exists():
-        seen: set[str] = set()
+        seen: set[Path] = set()
         for pat in _script_patterns():
-            for script_file in sorted(scripts_src.glob(pat)):
-                if script_file.is_dir() or script_file.name in seen:
+            for script_file in sorted(scripts_src.rglob(pat)):
+                if (script_file.is_dir() or script_file in seen
+                        or "__pycache__" in script_file.relative_to(scripts_src).parts):
                     continue
-                seen.add(script_file.name)
+                seen.add(script_file)
                 # v0.2.92 WP-16 (R4/R21): a script carrying a `VCO-REWIRE`
                 # region gets the install-time rewriter as its transform, so
                 # the installed copy KNOWS its orchestrator root instead of
@@ -3796,7 +3801,8 @@ def _enumerate_bundle_files(
                     _needs_rewire = has_rewire_region(script_file.read_bytes())
                 except OSError:
                     _needs_rewire = True
-                _script_dest = str(Path(".claude") / "scripts" / script_file.name)
+                _script_dest = str(Path(".claude") / "scripts"
+                                   / script_file.relative_to(scripts_src))
                 ops.append(_BundleFileOp(
                     dest_rel=_script_dest,
                     source_abs=script_file,
@@ -3821,7 +3827,7 @@ def _enumerate_bundle_files(
     _md_context = _mz.MaterializeContext(
         orchestrator_root, project_root, project_name=project_name,
     )
-    _md_spec = _mz.RenderSpec(allowed=_mz.GLOBAL_KEYS, escape="yaml")
+    _md_spec = _mz.BUNDLE_MARKDOWN_SPEC
 
     def _apply_subs(dest_rel: str) -> "_mz.Transform":
         return _mz.Transform(dest_rel, _md_spec, _md_context, sink=sink)
@@ -3895,35 +3901,6 @@ def _enumerate_bundle_files(
             transform=None,
             always_overwrite=False,
         ))
-
-    # Infrastructure compose files. Copy all docker-* / podman-* yml at
-    # the top level of `infrastructure/`. The hook `ensure-containers.sh`
-    # picks the right overlay at runtime; we just need the files present.
-    # v0.2.92 delivery audit m7: `*override*` files are EXCLUDED — the
-    # launcher writes `docker-compose.override.yml` into the clone as a
-    # machine-local volume-location config (gitignored, "per-machine"),
-    # and replicating it into every project tree would copy this
-    # machine's paths into other projects' installs.
-    infra_src = orchestrator_root / "infrastructure"
-    if infra_src.exists():
-        for compose_file in sorted(infra_src.iterdir()):
-            if not compose_file.is_file():
-                continue
-            n = compose_file.name
-            if "override" in n:
-                continue
-            if not (
-                (n.startswith("docker-compose") or n.startswith("podman-compose"))
-                and (n.endswith(".yml") or n.endswith(".yaml"))
-            ):
-                continue
-            ops.append(_BundleFileOp(
-                dest_rel=str(Path("infrastructure") / n),
-                source_abs=compose_file,
-                source_rel=str(compose_file.relative_to(orchestrator_root)),
-                transform=None,
-                always_overwrite=False,
-            ))
 
     # v0.2.52 V52-C / v0.2.81: shipped KG nodes live under
     # `templates/knowledge/`. Curated nodes (concepts/tools/models/patterns)
@@ -4329,8 +4306,8 @@ def _bundle_op_kind(dest_rel: str) -> Optional[str]:
     (v0.2.85 PLAN-v0285 D6).
 
     Returns one of `"hooks"`, `"scripts"`, `"agents"`, `"skills"`, or None
-    (for anything not covered by a skip-kind — infrastructure compose files,
-    curated/per-project knowledge nodes, `.vscode/tasks.json`, etc.).
+    (for anything not covered by a skip-kind — curated/per-project knowledge
+    nodes, `.vscode/tasks.json`, etc.).
 
     `hooks` INCLUDES `.claude/hooks/_lib/...` (the always-overwrite lib files
     ship as part of the hooks kind). `settings` is deliberately absent: the
@@ -4564,7 +4541,7 @@ def _file_action(
     # R2 verbatim: "we don't expect users to edit any VCO CODEFILE". The
     # bundle-shipped destination set that R2 covers is the CODE surface:
     # `.claude/hooks/*`, `.claude/scripts/*`, `.claude/agents/*.md`,
-    # `.claude/skills/**`, `infrastructure/` compose (per the P5 anchor). For
+    # `.claude/skills/**` (compose copies too, until v0.2.100 retired them). For
     # those, a divergent copy is a STALE shipped version — the old `preserve`
     # outcome froze them forever + nagged with an eternal deferral (P5 incident:
     # 11 files stuck), so we adopt.
@@ -4654,66 +4631,13 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     return redirect_target
 
 
-def _adopt_backup_timestamp() -> str:
-    """UTC basic-ISO timestamp for the per-run adoption-backup sub-dir.
-
-    Basic ISO (``20260717T031500Z``) rather than extended (with ``:``) so the
-    directory name is filesystem-safe on Windows (``:`` is illegal in NTFS
-    path components). One value is computed per install run and reused for
-    every file adopted in that run (a single ``<ts>`` dir per run per D7).
-    """
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _backup_bytes_for_adoption(
-    folder: Path, dest_rel: str, ts: str, current_bytes: bytes,
-) -> str:
-    """v0.2.84 PLAN-v0284 D7 (P5/R2): copy the CURRENT on-disk bytes of a file
-    about to be ADOPTED into the per-run backup tree, atomically.
-
-    Backup layout::
-
-        <folder>/.claude/backups/bundle-adoptions/<ts>/<dest_rel>
-
-    ``dest_rel`` is the bundle destination-relative path (e.g.
-    ``.claude/hooks/foo.sh``), reused verbatim under the timestamp dir so the
-    backup mirrors the project tree and is trivially discoverable. Uses the
-    shared ``_write_file_atomic`` primitive (parents created, atomic replace,
-    symlink guards apply).
-
-    Returns the backup path RELATIVE to ``folder`` (POSIX-normalised, for the
-    NOTICE / JSONL trail). Raises on any write failure — the caller MUST treat a
-    raise as "do NOT adopt" and fall back to preserve + deferral (never destroy
-    bytes without a captured copy).
-
-    v0.2.84 PLAN-v0284 AMENDMENTS A4: ``dest_rel`` is host-OS-shaped (``_enumerate_bundle_
-    files`` builds it via ``str(Path(...))`` → ``knowledge\\concepts\\foo.md`` on
-    Windows). We normalize the separator to ``/`` via the shared
-    ``vco_lib.paths.to_posix_rel`` helper (the v0.2.81 lesson — never inline a
-    2nd copy) and JOIN via the individual POSIX parts so the backup mirror tree
-    is byte-identical across OSes AND stays path-length-aware (component-wise
-    join, no monolithic string that could overflow a Windows MAX_PATH check).
-    """
-    from vco_lib.paths import to_posix_rel
-    rel_parts = PurePosixPath(to_posix_rel(dest_rel)).parts
-    backup_abs = folder / _ADOPT_BACKUPS_REL / ts
-    for part in rel_parts:
-        backup_abs = backup_abs / part
-    # `_write_file_atomic` may redirect through a symlink-blocking `.vco-new`
-    # sibling; if it does, the ORIGINAL backup destination did not receive the
-    # bytes. Treat a redirect as a backup failure (be conservative — we must
-    # have the bytes at the documented path before we overwrite the original).
-    redirect = _write_file_atomic(backup_abs, current_bytes)
-    if redirect is not None:
-        raise OSError(
-            f"adoption backup for {dest_rel} was redirected to a .vco-new "
-            f"sibling ({redirect}) — refusing to adopt without a captured copy "
-            "at the documented backup path"
-        )
-    backup_rel = PurePosixPath(to_posix_rel(str(_ADOPT_BACKUPS_REL))) / ts
-    for part in rel_parts:
-        backup_rel = backup_rel / part
-    return str(backup_rel)
+# v0.2.100 (WP-15): the adoption-backup writer moved to `vco_lib.bundle_backup`
+# (the leftover pass is its second caller; this module is ratchet-capped). The
+# names stay HERE as the patch point the adoption tests use.
+from vco_lib.bundle_backup import (  # noqa: E402
+    adopt_backup_timestamp as _adopt_backup_timestamp,
+    backup_bytes_for_adoption as _backup_bytes_for_adoption,
+)
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -9981,6 +9905,7 @@ def install_project_bundle(
             }
 
         result["actions"][action].append(op.dest_rel)
+    _bundle_preserve.record_knowledge_kept(result, knowledge_preserved_paths)
 
     # v0.2.24 §A0 audit item #1 (2026-05-22): detect orphans — files
     # the orchestrator previously shipped (recorded in manifest["files"])
@@ -10013,11 +9938,20 @@ def install_project_bundle(
     # retired path the moment it was also preserved. (v0.2.92: this comment
     # described a `new_files_keys` set that was built and never read.)
     seen_in_ops = {op.dest_rel for op in ops}
+    from vco_lib import bundle_leftovers as _bl
+    compose_prior: dict = {}  # v0.2.100 WP-15 (owner Q3)
     for prior_rel, prior_entry in prior_files.items():
         if prior_rel in seen_in_ops:
             # Re-shipped this run; not an orphan. (The allowlisted per-
             # project knowledge files — TAG_HIERARCHY.md etc. — are in ops
             # for every target, so they're excluded from retirement here.)
+            continue
+        # v0.2.100 WP-15 (owner Q3): compose copies are no longer shipped and
+        # `bundle_leftovers.retire_compose_copies` owns their removal. At the
+        # root these paths ARE the live compose files: drop the entry only.
+        if _bl.is_compose_copy(prior_rel):
+            if not is_root_target:
+                compose_prior[prior_rel] = prior_entry
             continue
         # v0.2.85 PLAN-v0285 D6 LEGS 2+3 (exclude from orphan processing +
         # carry manifest entry forward VERBATIM): a prior manifest entry whose
@@ -10153,6 +10087,20 @@ def install_project_bundle(
              f"retired {len(knowledge_retired)} curated knowledge/ manifest "
              f"entries (files left on disk, read via shared collection)",
              data={"count": len(knowledge_retired)})
+
+    # v0.2.100 WP-15: the leftovers policy (compose copies; retired VCO files
+    # outside the manifest) — one home, `vco_lib.bundle_leftovers`.
+    def _backup_ts() -> str:
+        nonlocal _adopt_backup_ts
+        if _adopt_backup_ts is None:
+            _adopt_backup_ts = _adopt_backup_timestamp()
+        return _adopt_backup_ts
+
+    _leftover_outcomes = _bl.run_leftover_policy(
+        folder, orchestrator_root, result, new_files,
+        compose_prior=compose_prior, known_rels=set(prior_files) | seen_in_ops,
+        skip_kinds=_op_kinds_to_skip, update_mode=update_mode, dry_run=dry_run,
+        backup_ts=_backup_ts, log=lambda m: _log("4.bundle.leftovers", "info", m))
 
     # ── v0.2.89 §7 (wave-2): bundled-knowledge residue cleanup +
     # BUG-3 foreign-row repair. NON-root targets only; placed AFTER the
@@ -11236,6 +11184,7 @@ def install_project_bundle(
                 # legacy .vscode MCP_* env detection so a future run
                 # where the user has cleaned the keys clears the entry.
                 still_legacy_vscode_mcp=legacy_vscode_mcp_detected,
+                still_leftovers=_leftover_outcomes,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -11446,6 +11395,8 @@ def install_project_bundle(
             log=_log,
         ))
 
+    from vco_lib.bundle_run_log import append_run  # v0.2.100 F-W2-08(b)
+    append_run(folder, result)
     return result
 
 
@@ -11516,6 +11467,7 @@ def _reconcile_bundle_deferrals(
     still_legacy_vscode_mcp: bool = False,
     still_stale_wrapper: Optional[bool] = None,
     still_user_secret_retained: Optional[bool] = None,
+    still_leftovers: dict = {},  # noqa: B006 — read-only; cid -> removed-this-run
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -11572,6 +11524,11 @@ def _reconcile_bundle_deferrals(
         # the inert keys (via the deferral's command OR the v0.2.83 B-F4
         # auto-prune) the next install sees `action=none` and clears it.
         "legacy_vscode_mcp_env_keys_present": still_legacy_vscode_mcp,
+        # v0.2.100 WP-15: one-shot records, cleared by the next update that
+        # removed nothing (bundle_leftovers.run_leftover_policy).
+        "bundle_leftover_removed": bool(still_leftovers.get("bundle_leftover_removed")),
+        "bundle_compose_copies_removed": bool(
+            still_leftovers.get("bundle_compose_copies_removed")),
     }
 
     report = DeferralReport.read(folder)
@@ -13687,6 +13644,8 @@ def format_bundle_result_lines(result: dict) -> list[str]:
         # byte-for-byte from the pre-v0.2.85 `_cmd_install_bundle` source so the
         # golden byte-parity pin proves a faithful extraction.
         lines.append(f"  manifest written: .claude/.vco-manifest.json")  # noqa: F541
+    for n in result.get("notes", ()):  # v0.2.100: informational, never a warning
+        lines.append(f"  NOTE {n}")
     for w in result["warnings"]:
         lines.append(f"  WARNING {w}")
     for err in result["errors"]:
@@ -13699,7 +13658,8 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
     [--update] [--force] [--dry-run] [--project-folder <path>]
     [--skip-kind KIND ...] --json`
 
-    Copies `templates/` + `infrastructure/` into the user project folder.
+    Copies `templates/` into the user project folder (no compose files since
+    v0.2.100 — earlier copies are retired by `vco_lib.bundle_leftovers`).
     See `install_project_bundle` for full semantics.
 
     Exit 0 on clean install (including update with deferred entries).
@@ -14897,7 +14857,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_bundle = sub.add_parser(
         "install-bundle",
         help=(
-            "Copy hooks/scripts/agents/skills/settings/infrastructure "
+            "Copy hooks/scripts/agents/skills/settings "
             "into a user-project folder. Manifest-driven on --update. "
             "Used by launcher create_project_v2 + (PR 5) update_project_v2."
         ),
@@ -14908,8 +14868,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p_bundle.add_argument(
         "--orchestrator-root", default=None,
-        help="Orchestrator clone root (source of truth for templates/ + "
-             "infrastructure/). Default: walk up from this module looking "
+        help="Orchestrator clone root (source of truth for templates/). "
+             "Default: walk up from this module looking "
              "for vct-module.json.",
     )
     p_bundle.add_argument(

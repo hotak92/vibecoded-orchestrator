@@ -5306,9 +5306,8 @@ def main() -> int:
                         help="Skip pulling Ollama models")
     parser.add_argument("--update", action="store_true",
                         help="Update mode: skip clone, re-install deps + restart services. "
-                             "Always writes .claude/context/UPDATE_DEFERRED.md at the end — "
-                             "either with actionable deferral entries OR a stub confirming "
-                             "the run completed cleanly (Fix 6, v0.2.13).")
+                             "Writes .claude/context/UPDATE_DEFERRED.md only when something "
+                             "is deferred; a clean run leaves none.")
     # v0.2.53: bootstrap mode is short-circuited at top of main() BEFORE
     # argparse runs (so it works on a freshly cloned repo with no .venv).
     # The argparse entries here exist only so `install.py --help` shows
@@ -6641,9 +6640,8 @@ def main() -> int:
     # excluded, mark_resolved tombstones are honored so probe-settled
     # entries don't resurrect) and then performs the single authoritative
     # write. Runs AFTER all deferral-adding steps complete. Full rationale:
-    # vco_lib/install_deferral_flow.py module docstring. On --update runs
-    # that ended with ZERO entries, write a stub UPDATE_DEFERRED.md so the
-    # user has a paper trail confirming the update completed cleanly.
+    # vco_lib/install_deferral_flow.py module docstring. A run that ended
+    # with ZERO entries leaves no UPDATE_DEFERRED.md at all (owner rule).
     try:
         _final = _deferral_flow.finalize()
         if _final.merge_error:
@@ -6659,8 +6657,9 @@ def main() -> int:
                 f"{'y' if _final.late_merged == 1 else 'ies'} "
                 "(P1 TOCTOU close)",
             )
-        if not _final.wrote_entries and args.update:
-            _write_update_deferred_stub(_deferral_folder, mode=mode)
+        if not _final.wrote_entries:  # owner rule F-W2-08(c): no entry, no file
+            _log_install_event("deferral_report", "ok",
+                               f"no deferrals from this {mode} run (no ledger file)")
     except Exception as exc:  # noqa: BLE001 — soft-fail by design
         _log_install_event(
             "deferral_report", "warn",
@@ -6675,73 +6674,6 @@ def main() -> int:
     _print_next_steps(sysinfo, args)
     return 0
 
-
-def _write_update_deferred_stub(folder: Path, *, mode: str) -> None:
-    """Fix 6 (v0.2.13): write a stub ``UPDATE_DEFERRED.md`` for paper-trail.
-
-    Called at end of ``--update`` runs that produced ZERO actionable
-    deferral entries. The stub records the timestamp and mode so users
-    grepping ``.claude/context/`` know an update ran cleanly. Previous
-    behaviour was to write NO file in this case, which made successful
-    updates indistinguishable from "no update happened at all".
-
-    Soft-fail throughout: any OSError is swallowed and logged. The install
-    must complete even when this stub write fails.
-
-    Schema: a single-frontmatter Markdown file with no entries. The
-    :class:`DeferralReport` reader treats unknown / empty payloads as an
-    empty report — so reading this file back via ``DeferralReport.read()``
-    yields ``[]`` and apply-deferred is a no-op. Idempotent: overwrites
-    any prior stub.
-    """
-    from datetime import datetime, timezone
-
-    target = folder / ".claude" / "context" / "UPDATE_DEFERRED.md"
-    try:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        _log_install_event(
-            "deferral_report_stub", "warn",
-            f"could not create parent {target.parent}: {exc}",
-        )
-        return
-
-    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-    content = (
-        "---\n"
-        "schema_version: 1\n"
-        "generated_by: install.py\n"
-        f"generated_at: {ts}\n"
-        "entries: 0\n"
-        "stub: true\n"
-        "---\n\n"
-        f"# No deferrals from update at {ts}\n\n"
-        f"This file is a stub: `install.py --{mode}` completed cleanly "
-        "with zero actionable deferral conditions.\n\n"
-        "If you expected deferral entries (e.g. you re-ran after fixing "
-        "a known issue), they were resolved during this run. Otherwise "
-        "this file confirms the update ran end-to-end without surfacing "
-        "any conditions requiring follow-up.\n\n"
-        "Safe to delete; install.py re-creates it on the next --update.\n"
-    )
-
-    try:
-        target.write_text(content, encoding="utf-8")
-    except OSError as exc:
-        _log_install_event(
-            "deferral_report_stub", "warn",
-            f"could not write {target}: {exc}",
-        )
-        return
-    _log_install_event(
-        "deferral_report_stub", "ok",
-        f"wrote stub UPDATE_DEFERRED.md at {target} (zero entries)",
-    )
-
-
-# ---------------------------------------------------------------------------
-# Post-install probe phase (v0.2.91 WP-B re-probe + WP-D doctor)
-# ---------------------------------------------------------------------------
 
 def _post_install_probe_phase(
     report: DeferralReport,

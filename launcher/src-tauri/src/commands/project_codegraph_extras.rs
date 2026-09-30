@@ -69,8 +69,14 @@ use vct_launcher_core::process::CommandExt as _;
 const ANALYZE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name for progress lines emitted during sync / reindex.
-/// The GUI's "Syncing…" / "Re-indexing…" modal subscribes to this and
-/// updates the progress bar.
+/// `ExtraCodegraphPathsPanel.svelte` subscribes and folds each event
+/// (`extras-sync-progress.ts::applyExtrasProgress`, filtered by
+/// `project_id`) into its "Syncing…" / "Re-syncing…" modal
+/// (`ExtrasSyncProgressModal.svelte`), which renders a determinate bar and
+/// the analyzer's current line (v0.2.100 F-W2-05 — built; before, the modal
+/// only spun). The app shell (`stores/ui.ts`) also turns the finished
+/// `progress >= 1` event into a notice. Must match
+/// `extras-sync-progress.ts::EXTRAS_PROGRESS_EVENT`.
 const PROGRESS_EVENT: &str = "vct-codegraph-extras-progress";
 
 // ─── Types ───────────────────────────────────────────────────────────────

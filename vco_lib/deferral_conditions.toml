@@ -406,16 +406,16 @@ notes = "v0.2.100 (AD-5, L2-F09, WP-06): quit-and-stop could not verify every VC
 [conditions.bundle_leftover_removed]
 class = "informational_record"
 owner = "vco_lib.bundle_leftovers"
-clear_probe = "owned-drop-when-absent"
+clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-12, L5-F06): a file outside the bundle manifest whose bytes match a historical shipped template was backed up and removed. A completed action. Registered ahead of its emitter (WP-15)."
+notes = "v0.2.100 (AD-12, L5-F06, WP-15): a file outside the bundle manifest whose bytes match a version VCO shipped at a template path that no longer ships (deleted, or `_archive/`) was backed up and removed. A completed action. Emitted by `bundle_leftovers.remove_vco_leftovers` inside the bundle engine; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12): the root bundle runs INSIDE an install.py run, whose finalize would drop an install-owned row it did not itself emit."
 
 [conditions.bundle_compose_copies_removed]
 class = "informational_record"
 owner = "vco_lib.bundle_leftovers"
-clear_probe = "owned-drop-when-absent"
+clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-12, owner Q3): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Registered ahead of its emitter (WP-15)."
+notes = "v0.2.100 (AD-12, owner Q3, WP-15): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Emitted by `bundle_leftovers.retire_compose_copies`; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12), same reason as `bundle_leftover_removed`."
 
 [conditions.module_container_unlabelled]
 class = "informational_record"

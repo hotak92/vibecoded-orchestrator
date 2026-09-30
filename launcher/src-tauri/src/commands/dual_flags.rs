@@ -46,16 +46,26 @@
 //! silently skipped at write time (L1-F11). Enabling a flag now runs
 //! `python -m vco_lib.embedding_pull_plan ensure --json` — the SAME plan
 //! install.py step 7 runs (rule A, no Rust mirror) — in the background: a
-//! pull can take minutes and must not hold the toggle. The outcome is logged,
-//! and a failure lands in UPDATE_DEFERRED (`ollama_model_pull_failed` /
-//! `ollama_not_ready_at_update`, written by the Python side), which the
-//! deferral badge shows. Present models are skipped, never re-pulled.
+//! pull can take minutes and must not hold the toggle. Both setters return
+//! `model_ensure_started`, so the panel says the check is running; when the
+//! background run ends its outcome is emitted as [`MODEL_ENSURE_EVENT`] and
+//! the panel that started it renders it (v0.2.100 F-W3-03 — before, the
+//! outcome reached only the log). A failure ALSO lands in UPDATE_DEFERRED
+//! (`ollama_model_pull_failed` / `ollama_not_ready_at_update`, written by the
+//! Python side), which the deferral badge shows. Present models are skipped,
+//! never re-pulled.
+//!
+//! The ensure starts only when the RESOLVED state after the write still has a
+//! dual flag on ([`project_write_needs_model_ensure`], W3R-16): clearing a
+//! per-project row back to an all-off default needs no second embedder, and
+//! must not write an Ollama deferral into the root ledger from a per-project
+//! click.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use tauri::{command, State};
+use tauri::{command, AppHandle, Emitter, State};
 use vct_launcher_core::process::CommandExt as _;
 
 use crate::db::Db;
@@ -82,9 +92,45 @@ pub struct DualFlagGlobalWriteResult {
     /// Projects skipped because their folder no longer exists on disk.
     pub skipped: usize,
     /// Whether enabling the flag started the background model ensure (the
-    /// outcome is logged; a failure is recorded in UPDATE_DEFERRED).
+    /// outcome is logged and emitted as [`MODEL_ENSURE_EVENT`]; a failure is
+    /// also recorded in UPDATE_DEFERRED).
     #[serde(default)]
     pub model_ensure_started: bool,
+}
+
+/// Result of a per-project write: the re-resolved triple plus whether the
+/// write started the background model ensure (F-W3-03 — the panel says so,
+/// and renders the [`MODEL_ENSURE_EVENT`] outcome when it arrives).
+#[derive(Debug, Clone, Serialize)]
+pub struct DualFlagProjectWriteResult {
+    /// The RESOLVED state after the write (the coherence cascade may have
+    /// moved a second flag).
+    pub state: DualFlagsState,
+    pub model_ensure_started: bool,
+}
+
+/// Tauri event carrying a finished background model ensure. Consumed by
+/// `DualWriteFlagsPanel.svelte` (both scopes), which renders the outcome.
+pub const MODEL_ENSURE_EVENT: &str = "vct-dual-flag-model-ensure";
+
+/// Payload of [`MODEL_ENSURE_EVENT`]. `project_id` is `None` for a host-wide
+/// default write, so a project panel only renders its own run.
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelEnsureEvent {
+    pub scope: &'static str,
+    pub project_id: Option<String>,
+    pub outcome: ModelEnsureOutcome,
+}
+
+/// W3R-16: a per-project write starts the model ensure only when it did not
+/// turn a flag OFF and the RESOLVED state still has a dual flag on. A clear
+/// (`None`) into an all-off default resolves to nothing on, so nothing is
+/// ensured (and no Ollama deferral is written from a per-project clear).
+pub fn project_write_needs_model_ensure(value: Option<bool>, resolved: &DualFlagsState) -> bool {
+    value != Some(false)
+        && (resolved.write_all_slots.effective
+            || resolved.rl_log.effective
+            || resolved.arctic_secondary.effective)
 }
 
 /// Parsed `python -m vco_lib.embedding_pull_plan ensure --json` result.
@@ -151,7 +197,8 @@ pub fn parse_model_ensure_output(
 
 /// Start the background ensure; `false` when python or the install root
 /// cannot be resolved (logged — the next install run still derives the plan).
-fn start_model_ensure(db: &Db) -> bool {
+/// The finished outcome is logged AND emitted as [`MODEL_ENSURE_EVENT`].
+fn start_model_ensure(db: &Db, app: AppHandle, project_id: Option<String>) -> bool {
     let Some(root) = crate::commands::installer::resolve_install_root_sync(db) else {
         tracing::warn!("[vct] dual-flag model ensure skipped: install root not resolvable");
         return false;
@@ -182,6 +229,15 @@ fn start_model_ensure(db: &Db) -> bool {
                 outcome.deferral
             );
         }
+        let scope = if project_id.is_some() { "project" } else { "global" };
+        let _ = app.emit(
+            MODEL_ENSURE_EVENT,
+            ModelEnsureEvent {
+                scope,
+                project_id,
+                outcome,
+            },
+        );
     });
     true
 }
@@ -215,20 +271,23 @@ pub async fn set_dual_flag_for_project(
     project_id: String,
     flag: String,
     value: Option<bool>,
+    app: AppHandle,
     db: State<'_, Db>,
-) -> Result<DualFlagsState, String> {
+) -> Result<DualFlagProjectWriteResult, String> {
     let flag = DualFlag::from_wire(&flag)?;
     db.set_dual_flag_for_project(&project_id, flag, value)?;
     // Soft-fail: warnings ride along, the DB write is never rolled back.
     let _ = crate::commands::projects_v2::reproject_env_soft(&db, &project_id);
-    // Enabling (explicitly, or by clearing into an enabled default) may need
-    // a second KG embedder — ensure it (background; see module docs).
-    if value != Some(false) {
-        start_model_ensure(&db);
-    }
     // Return the RESOLVED state so the panel re-renders from the truth
-    // (the coherence cascade may have moved a second flag).
-    Ok(db.resolve_dual_flags(&project_id))
+    // (the coherence cascade may have moved a second flag) — and decide the
+    // ensure from that same resolved state, never from the request (W3R-16).
+    let state = db.resolve_dual_flags(&project_id);
+    let model_ensure_started = project_write_needs_model_ensure(value, &state)
+        && start_model_ensure(&db, app, Some(project_id.clone()));
+    Ok(DualFlagProjectWriteResult {
+        state,
+        model_ensure_started,
+    })
 }
 
 /// Read the three host-wide defaults for the global panel.
@@ -279,12 +338,13 @@ pub fn set_dual_flag_global_default_with_db(
 pub async fn set_dual_flag_global_default(
     flag: String,
     value: bool,
+    app: AppHandle,
     db: State<'_, Db>,
 ) -> Result<DualFlagGlobalWriteResult, String> {
     let flag = DualFlag::from_wire(&flag)?;
     let mut result = set_dual_flag_global_default_with_db(&db, flag, value)?;
     if value {
-        result.model_ensure_started = start_model_ensure(&db);
+        result.model_ensure_started = start_model_ensure(&db, app, None);
     }
     Ok(result)
 }
@@ -404,6 +464,64 @@ mod tests {
         let garbage = parse_model_ensure_output(true, b"Traceback ...", b"ImportError: x");
         assert!(!garbage.ok);
         assert!(garbage.error.unwrap().contains("ImportError"));
+    }
+
+    /// W3R-16: the ensure decision reads the RESOLVED state. Clearing into an
+    /// all-off default (the reported case) starts nothing; clearing into an
+    /// ON default, or explicitly enabling, starts it; an explicit OFF never
+    /// does, even when another flag stays on.
+    #[test]
+    fn project_write_ensure_follows_the_resolved_state() {
+        let (db, p) = db_with_project();
+        // Default OFF, per-project row ON → clear it.
+        db.set_dual_flag_for_project(&p, DualFlag::ArcticSecondary, Some(true))
+            .unwrap();
+        db.set_dual_flag_for_project(&p, DualFlag::ArcticSecondary, None)
+            .unwrap();
+        let cleared = db.resolve_dual_flags(&p);
+        assert!(
+            !project_write_needs_model_ensure(None, &cleared),
+            "a clear into an all-off default must not start a model ensure: {cleared:?}"
+        );
+
+        // Explicit ON → ensure.
+        db.set_dual_flag_for_project(&p, DualFlag::ArcticSecondary, Some(true))
+            .unwrap();
+        let on = db.resolve_dual_flags(&p);
+        assert!(project_write_needs_model_ensure(Some(true), &on));
+
+        // Explicit OFF of another flag while arctic stays on → no ensure.
+        assert!(!project_write_needs_model_ensure(Some(false), &on));
+
+        // Clear into an ON host-wide default → ensure (the models are needed).
+        db.set_dual_flag_global_default(DualFlag::ArcticSecondary, true)
+            .unwrap();
+        db.set_dual_flag_for_project(&p, DualFlag::ArcticSecondary, None)
+            .unwrap();
+        let inherited_on = db.resolve_dual_flags(&p);
+        assert!(project_write_needs_model_ensure(None, &inherited_on));
+    }
+
+    /// The per-project write result serialises the resolved triple under
+    /// `state` and the ensure flag beside it — the shape the panel reads.
+    #[test]
+    fn project_write_result_wire_shape() {
+        let (db, p) = db_with_project();
+        let r = DualFlagProjectWriteResult {
+            state: db.resolve_dual_flags(&p),
+            model_ensure_started: true,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(v["model_ensure_started"], true);
+        assert!(v["state"]["arctic_secondary"]["effective"].is_boolean());
+        let ev = serde_json::to_value(ModelEnsureEvent {
+            scope: "project",
+            project_id: Some(p.clone()),
+            outcome: ModelEnsureOutcome::default(),
+        })
+        .unwrap();
+        assert_eq!(ev["project_id"], p.as_str());
+        assert_eq!(ev["outcome"]["ok"], false);
     }
 
     /// The per-project setter's `None` really clears, and the returned state

@@ -50,6 +50,11 @@ def script_patterns() -> tuple[str, ...]:
     Python modules, shell wrappers (extension-less or ``.sh``), PowerShell
     wrappers, and the named extension-less CLI wrappers. Callers must
     de-duplicate matches across patterns (several overlap by design).
+
+    v0.2.100 (WP-15, L5-F08): the patterns apply RECURSIVELY — a match in a
+    subdirectory of ``templates/scripts/`` ships to the same subpath under
+    ``.claude/scripts/`` (``__pycache__`` excluded), for the orchestrator root
+    and every project alike (one engine, ``project_init._enumerate_bundle_files``).
     """
     return (
         "*.py", "*.sh", "*.ps1", "kg-*", "code-graph-*",

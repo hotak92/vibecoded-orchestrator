@@ -78,11 +78,6 @@ EXISTENCE_EXCLUDED_SUBDIRS = ("lib",)
 # in BOTH places or the two gates disagree about what is allowed.
 PS1_ONLY_LIB = frozenset({
     "resolve-powershell.ps1",
-    # v0.2.92 BLOCKER-1: splits a compose command string into head + args.
-    # POSIX has nothing to mirror — `$COMPOSE_CMD up -d` word-splits correctly
-    # for both `podman-compose` and `podman compose`, while PowerShell needs an
-    # explicit splat whose naive form mis-handles the one-token shape.
-    "compose-invocation.ps1",
     # v0.2.97 R7a F10: the session-start container lock held by a PowerShell
     # FileStream. The bash hooks take the SAME lock by re-running under
     # `python -m vco_lib.service_lifecycle with-session-lock` (a shell cannot

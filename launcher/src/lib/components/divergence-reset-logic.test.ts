@@ -99,3 +99,60 @@ describe('the action', () => {
     expect(src).toMatch(/runResetToUpstream\(\(kind\) => updater\.run\(kind\)\)/);
   });
 });
+
+// v0.2.100 F-W4-08: the saved update-branch tip is named, and the reset
+// refusals render through the backend's reason text under a coded title.
+import { backupBranchList, resetFailureView } from './divergence-reset-logic';
+import { routeUpdateError } from '$lib/stores/updater';
+
+describe('F-W4-08 branch tip + refusal codes', () => {
+  it('names the update-branch tip beside HEAD and the wip branch', () => {
+    const text = resetResultText(
+      outcome({
+        message: '',
+        reset_backup: {
+          branch: 'vco-backup/S',
+          branch_tip: 'vco-backup/S-branch',
+          uncommitted_branch: 'vco-backup/S-wip',
+          bundle: '/v/backups/orchestrator-reset-S.bundle',
+          local_commits: 2,
+        },
+      }),
+    );
+    expect(text).toContain('vco-backup/S-branch');
+    expect(text).toContain('branches vco-backup/S, vco-backup/S-branch and vco-backup/S-wip');
+    expect(
+      backupBranchList({ branch: 'b', uncommitted_branch: null, bundle: null, local_commits: 0 }),
+    ).toBe('branch b');
+  });
+
+  for (const code of ['reset_abort_failed', 'reset_state_not_clear', 'reset_backup_failed']) {
+    it(`${code}: routed to failed with the reason text as the detail`, () => {
+      const reason = `Refusing \`git reset --hard\`: ${code} reason. Nothing was reset. Saved to vco-backup/S.`;
+      const routed = routeUpdateError(JSON.stringify({ kind: 'Refused', code, message: reason }));
+      expect(routed.to).toBe('failed');
+      if (routed.to !== 'failed') return;
+      expect(routed.code).toBe(code);
+      const view = resetFailureView(routed);
+      expect(view.detail).toContain(`${code} reason`);
+      expect(view.detail).toContain('vco-backup/S');
+      expect(view.title).not.toBe('Reset refused or failed');
+      expect(view.title).toMatch(/^Reset refused — /);
+    });
+  }
+
+  it('an unknown code keeps the generic title and still shows the reason', () => {
+    expect(resetFailureView({ message: 'why', code: 'other' })).toEqual({
+      title: 'Reset refused or failed',
+      detail: 'why',
+    });
+  });
+
+  it('the modal renders a reset failure through resetFailureView', () => {
+    const src = readFileSync(
+      fileURLToPath(new URL('./OrchestratorUpdateDivergenceModal.svelte', import.meta.url)),
+      'utf8',
+    );
+    expect(src).toContain('lastError = resetFailureView(result.routed)');
+  });
+});
