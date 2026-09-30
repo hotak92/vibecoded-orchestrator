@@ -180,41 +180,57 @@ function Write-SecurityLine([string]$json) {
 
 # === 1. SSRF GUARD ===
 if ($ToolName -eq "WebFetch") {
-    $url = Get-Field "url"
+    # The URL comes from the payload ConvertFrom-Json already decoded, NOT
+    # from Get-Field: that helper pipes the JSON through a `python -c` child,
+    # which returns nothing when no Python is found (the guard would then be
+    # skipped — the R18F-08 hole) and, under Windows PowerShell 5.1, pipes
+    # with the ASCII $OutputEncoding, turning a non-ASCII host into `?`.
+    $url = ""
+    if ($payload -and $payload.tool_input -and $null -ne $payload.tool_input.url) {
+        $url = ([string]$payload.tool_input.url).Trim()
+    }
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
         # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
         # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
-        # v0.2.100 WP-18B: the host:port pairs are DERIVED at run time from
-        # the projected env (_lib/ssrf-allowlist.ps1). MUST MATCH the .sh
-        # sibling. Reviews R18-04/R18-05: the allow AND block decisions are
-        # the lib's ONE parser (WHATWG-shaped), so the two halves cannot read
-        # one URL two ways. The lib missing (partial install) blocks every
-        # WebFetch: a security guard that cannot run fails closed.
+        # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
+        # implementation for every OS; its docstring is the contract), run
+        # once through _lib/ssrf-allowlist.ps1. MUST MATCH the .sh sibling.
+        # The allowed pairs are DERIVED from the projected env, so a moved
+        # service_endpoints port is allowed and nothing asks the user to
+        # hand-edit this hook. FAIL CLOSED: only the exact words `allow` /
+        # `pass` let the call through. The lib missing (partial install), no
+        # interpreter, vco_lib not importable, or any other output blocks,
+        # and says why.
         $ssrfLib = Join-Path $LibDir "ssrf-allowlist.ps1"
-        $ssrfVerdict = "block"
+        $ssrfVerdict = ""
+        $ssrfPairs = ""
+        $ssrfWhy = "hooks/_lib/ssrf-allowlist.ps1 is missing - run the bundle update to restore it"
         if (Test-Path -LiteralPath $ssrfLib) {
             . $ssrfLib
-            $ssrfVerdict = Get-VcoSsrfVerdict -Url $url -ProjectRoot $ProjectRoot
+            $ssrfCheck = Invoke-VcoSsrfCheck -Url $url -HooksDir $ScriptDir
+            $ssrfVerdict = [string]$ssrfCheck.Verdict
+            $ssrfPairs = [string]$ssrfCheck.Pairs
+            $ssrfErr = if ($ssrfCheck.Error) { [string]$ssrfCheck.Error } else { "unrecognised answer '$ssrfVerdict'" }
+            $ssrfWhy = "the guard could not run ($ssrfErr) - a broken VCO install: re-run the orchestrator's update (``python install.py --update`` in the orchestrator root, or the launcher's Update), which reinstalls vco_lib into the VCO venv"
         }
-        if ($ssrfVerdict -eq "block") {
+        if ($ssrfVerdict -cne "allow" -and $ssrfVerdict -cne "pass") {
             # Route the block message to STDERR (matches pre-tool-use.sh).
-            # Claude Code's PreToolUse runner discards plain stdout — an
+            # Claude Code's PreToolUse runner discards plain stdout - an
             # exit-2 hook with only-stdout renders as "hook error: No
             # stderr output". [Console]::Error.WriteLine goes to the true
             # stderr stream (Write-Output / the PS error stream would not).
-            $ssrfPairs = ""
-            if (Get-Command Get-VcoSsrfAllowedPairs -ErrorAction SilentlyContinue) {
-                $ssrfPairs = ((Get-VcoSsrfAllowedPairs -ProjectRoot $ProjectRoot) |
-                    Where-Object { $_ -notmatch '^(127\.0\.0\.1|\[0:0:0:0:0:0:0:1\]):' }) -join ' '
+            if ($ssrfVerdict -ceq "block") {
+                if (-not $ssrfPairs) { $ssrfPairs = "none" }
+                [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address (or one the guard cannot read).")
+                [Console]::Error.WriteLine("   Allowed local services on this machine: $ssrfPairs")
+                [Console]::Error.WriteLine("   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port - a moved service is")
+                [Console]::Error.WriteLine("   changed with the launcher's Services page or ``python -m vco_lib.service_endpoints move``, never by editing this hook.")
+            } else {
+                [Console]::Error.WriteLine("SSRF guard: '$url' was blocked because $ssrfWhy.")
             }
-            if (-not $ssrfPairs) { $ssrfPairs = "none (hooks/_lib/ssrf-allowlist.ps1 is missing - run the bundle update to restore it)" }
-            [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address (or one the guard cannot read).")
-            [Console]::Error.WriteLine("   Allowed local services on this machine: $ssrfPairs")
-            [Console]::Error.WriteLine("   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port - a moved service is")
-            [Console]::Error.WriteLine("   changed with the launcher's Services page or ``python -m vco_lib.service_endpoints move``, never by editing this hook.")
             $urlEsc = $url -replace '\\', '\\\\' -replace '"', '\"'
             Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":""$urlEsc""}"
             exit 2

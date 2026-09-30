@@ -109,6 +109,8 @@ _WIN_DRIVE = re.compile(r"^([A-Za-z]):[\\/](.*)$", re.DOTALL)
 #: Docker Desktop's WSL2 backend (``/run/desktop/mnt/host/c/…``), its older
 #: Hyper-V backend (``/host_mnt/c/…``), and a WSL2 distro's drvfs mount of the
 #: drive (``/mnt/c/…``). Followed by ONE drive letter and ``/`` or the end.
+# Parsed at build time by launcher/src-tauri/vct-launcher-core (container_runtime.rs) — keep this
+# assignment on ONE line; a unit test there fails if it is reformatted.
 _DRIVE_MOUNT_PREFIXES = ("/run/desktop/mnt/host/", "/host_mnt/", "/mnt/")
 _DRIVE_TAIL = re.compile(r"^([A-Za-z])(?:/(.*))?$", re.DOTALL)
 

@@ -39,6 +39,7 @@ from vco_lib.deferral_report import (  # noqa: E402
     MANAGED_REGION_CLOSE,
     MANAGED_REGION_OPEN,
     DeferralReport,
+    strip_vco_owned_regions,
 )
 
 CID = pt.USER_SECTION_REVIEW_CID
@@ -266,6 +267,78 @@ class TestPreSplitMigration:
         # Idempotent: the next update moves nothing again.
         _bundle(project, orch, update=True)
         assert _live(project) == text and len(_backups(project)) == 1
+
+
+class TestPreSplitDecidedFromContent:
+    """Review R18F-01: pre-split vs split is decided from the CONTENT. A stale
+    or foreign state file (it is untracked, so it survives a git checkout of a
+    branch whose CLAUDE.md is still pre-split) or a user line above the opening
+    marker must never send a pre-split file down the split branch, which
+    replaces the managed body — the user's text included."""
+
+    OLD_TEMPLATE = TestPreSplitMigration.OLD_TEMPLATE
+    _old_install = TestPreSplitMigration._old_install
+    USER_LINES = ("MY REAL OVERVIEW", "## Added below", "mine")
+
+    def _stale_state(self, project: Path) -> None:
+        state = project / pt.USER_SECTION_STATE_REL
+        state.parent.mkdir(parents=True, exist_ok=True)
+        state.write_text(json.dumps({
+            "acknowledged_template_sha256": pt.user_section_template_hash(_template()),
+            "managed_body_sha256": "0" * 64,
+            "recorded_by": "created",
+        }), encoding="utf-8")
+
+    def _assert_kept_and_migrated(self, project: Path, res: dict, extra=()) -> str:
+        text = _live(project)
+        for line in (*self.USER_LINES, *extra):
+            assert line in text, f"user line lost from the live file: {line!r}"
+        assert "MY REAL OVERVIEW" in _user_part(text)
+        assert pt.managed_body(text).startswith("## SESSION START")
+        assert res["templates"]["claude_md_migrated"] == ["migrated-edited"]
+        assert _rows(project)[CID].dismiss_fields["reason"] == "migrated"
+        assert len(_backups(project)) == 1
+        return text
+
+    def test_state_file_present_with_pre_split_content(self, tmp_path):
+        orch, project = self._old_install(tmp_path, edit=True)
+        self._stale_state(project)
+        res = _bundle(project, orch, update=True)
+        self._assert_kept_and_migrated(project, res)
+
+    def test_text_above_the_marker_with_pre_split_content(self, tmp_path):
+        orch, project = self._old_install(tmp_path, edit=True)
+        live = project / "CLAUDE.md"
+        live.write_text("note\n\n" + _live(project), encoding="utf-8")
+        res = _bundle(project, orch, update=True)
+        text = self._assert_kept_and_migrated(project, res, extra=("note",))
+        assert strip_vco_owned_regions(text).lstrip().startswith("note\n"), \
+            "text above the marker stays first (after VCO's own reminder block)"
+
+    def test_both_at_once_through_the_module_toggle(self, tmp_path):
+        orch, project = self._old_install(tmp_path, edit=True)
+        self._stale_state(project)
+        live = project / "CLAUDE.md"
+        live.write_text("note\n\n" + _live(project), encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            out = project_init.render_claude_md(project, orchestrator_root=orch,
+                                                project_name="proj")
+        text = _live(project)
+        for line in (*self.USER_LINES, "note"):
+            assert line in text
+        assert out["user_section_review"] == ["migrated"]
+
+    def test_a_split_file_with_state_stays_on_the_split_branch(self, installed):
+        """Leave-alone twin: a genuinely split file is not 'migrated'."""
+        orch, project = installed
+        live = project / "CLAUDE.md"
+        live.write_text("note\n\n" + _live(project), encoding="utf-8")
+        _set_template(orch, _template(managed=MANAGED_V2))
+        res = _bundle(project, orch, update=True)
+        assert not res["templates"].get("claude_md_migrated")
+        text = _live(project)
+        assert text.startswith("note\n") and text.count("## Project Overview") == 1
+        assert _backups(project) == []
 
 
 class TestModuleTogglePath:

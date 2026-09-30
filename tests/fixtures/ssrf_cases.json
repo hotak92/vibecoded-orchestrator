@@ -1,15 +1,12 @@
 {
- "_doc": "Shared SSRF case table: every case runs against BOTH templates/hooks/_lib/ssrf-allowlist.sh and .ps1 (tests/test_v02100_ssrf_url_parity.py). expect = allow (a VCO service on this machine) | block (private / internal / unreadable) | pass (public). The env marker __NO_PYTHON__ runs that group with a PATH that holds no Python interpreter.",
+ "_doc": "Shared SSRF case table for the ONE URL decision, vco_lib/ssrf_url.py. tests/test_v02100_ssrf_url_parity.py runs every case through the module in-process, through each shell's thin caller (templates/hooks/_lib/ssrf-allowlist.{sh,ps1}) and end-to-end through both pre-tool-use hooks. expect = allow (a VCO service on this machine) | block (private / internal / unreadable) | pass (public). The no-Python case is not a table environment: without an interpreter the hooks block EVERY WebFetch (tested separately).",
  "envs": {
   "moved": {
    "WEAVIATE_URL": "http://127.0.0.1:18081",
    "OLLAMA_URL": "http://localhost:21435",
    "CODE_EMBED_SERVICE_URL": "http://GPU.LAN:11440"
   },
-  "default": {},
-  "nopython": {
-   "__NO_PYTHON__": "1"
-  }
+  "default": {}
  },
  "cases": [
   {
@@ -551,30 +548,6 @@
    "url": "http://%ff.example/",
    "expect": "block",
    "why": "invalid UTF-8 host: conversion fails"
-  },
-  {
-   "env": "nopython",
-   "url": "http://bücher.de/",
-   "expect": "block",
-   "why": "no Python: a non-ASCII host cannot be converted, so it is blocked"
-  },
-  {
-   "env": "nopython",
-   "url": "http://ｌｏｃａｌｈｏｓｔ/",
-   "expect": "block",
-   "why": "no Python: fullwidth localhost blocked"
-  },
-  {
-   "env": "nopython",
-   "url": "https://example.com/",
-   "expect": "pass",
-   "why": "no Python: an ASCII public host is unaffected"
-  },
-  {
-   "env": "nopython",
-   "url": "http://localhost:8081/",
-   "expect": "allow",
-   "why": "no Python: an ASCII allowed pair is unaffected"
   }
  ]
 }

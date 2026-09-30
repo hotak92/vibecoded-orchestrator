@@ -745,14 +745,24 @@ pub fn build_port_arg(
     }
 }
 
+/// `(host, container)` of one manifest volume, resolved exactly as the
+/// `-v` arg [`build_volume_arg`] passes them — also what an unlabelled
+/// container's mounts are compared against ([`recorded_mounts`]).
+pub fn resolve_volume(
+    vol: &VolumeMount,
+    ctx: &PlaceholderCtx,
+    placeholders: &HashMap<String, String>,
+) -> (String, String) {
+    (resolve_value(&vol.host, ctx, placeholders), resolve_value(&vol.container, ctx, placeholders))
+}
+
 /// Build a single `-v` arg value. Format: `host:container[:mode]`.
 pub fn build_volume_arg(
     vol: &VolumeMount,
     ctx: &PlaceholderCtx,
     placeholders: &HashMap<String, String>,
 ) -> String {
-    let host = resolve_value(&vol.host, ctx, placeholders);
-    let container = resolve_value(&vol.container, ctx, placeholders);
+    let (host, container) = resolve_volume(vol, ctx, placeholders);
     match vol.mode.as_deref() {
         Some(m) if !m.is_empty() => format!("{}:{}:{}", host, container, m),
         _ => format!("{}:{}", host, container),
@@ -1612,62 +1622,240 @@ pub enum PreStartRemoval {
     Refuse(String),
 }
 
-/// v0.2.100 (R18-08): what an UNLABELLED container itself says about which
-/// install created it — read only when the DB claims the name and the
-/// container carries no launcher label (the ≤0.2.99 upgrade path).
+/// v0.2.100 (R18-08, R18F-06): what an UNLABELLED container itself says
+/// about where its data comes from — read only when the DB claims the name
+/// and the container carries no launcher label (the ≤0.2.99 upgrade path).
 ///
-/// The DB claim comes from `<state root>/launcher.db`
-/// ([`crate::paths::vct_root_dir`]). A container that mounts data from, or
-/// is pointed by an env path at, that SAME state root was created from the
-/// state the claim describes; one that mounts data from anywhere else keeps
-/// data this install cannot show is its own.
+/// Two sources of evidence are compared against the container's own mounts
+/// and env:
+/// - the state root ([`crate::paths::vct_root_dir`]) whose `launcher.db`
+///   holds the claim;
+/// - the module install's recorded configuration ([`ModuleClaim`]): the
+///   binds and named volumes THIS launcher's manifest for the claimed module
+///   mounts, resolved exactly as the `-v` args it would run it with.
+///
+/// What the evidence proves is the STATE ROOT, not the install: the root is
+/// per user (`~/.vct` unless `VCT_STATE_DIR` differs), so two installs of
+/// one user that share it — and share its `launcher.db`, the claim itself —
+/// cannot be told apart by it. A container whose data comes from anywhere
+/// else, or that feeds a recorded mount point from a different source,
+/// keeps data this install cannot show is its own.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreLabelEvidence {
     /// Not read (the decision did not need it).
     NotRead,
     /// The container could not be inspected for mounts / env.
     Unreadable(String),
-    /// A bind-mount source, or an absolute-path env value, lies under this
-    /// launcher's state root: `what` names it.
+    /// A bind-mount source or an absolute-path env value under this
+    /// launcher's state root, or a mount equal to one the module install's
+    /// recorded configuration declares: `what` names it.
     ThisInstall(String),
+    /// A mount point the recorded configuration declares is fed from a
+    /// different source than the one recorded — the configuration of some
+    /// other state root (another user's `{HOME}`, another `VCT_STATE_DIR`).
+    Contradicts { found: String, recorded: String },
     /// It mounts data (a bind outside this state root, or a named volume)
-    /// and nothing on it points at this state root.
+    /// that neither lies under this state root nor is a mount the recorded
+    /// configuration declares.
     Foreign { source: String, state_root: String },
-    /// No mounts and no path into any state root: it holds no data, and
-    /// nothing on it identifies ANY install (the shipped RL module's shape).
+    /// No bind or volume mounts and no path into any state root: nothing on
+    /// it identifies ANY state root. Replacing it discards whatever it keeps
+    /// in its own writable layer (the shipped RL module keeps nothing there).
     Stateless,
+}
+
+/// One mount the module install's recorded configuration says its container
+/// has: a bind (`source` = host path) or a named volume (`source` = name).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedMount {
+    pub volume: bool,
+    /// The source as the `-v` arg names it, plus (binds) its canonical form
+    /// when that differs — either spelling matches.
+    pub sources: Vec<String>,
+    pub destination: String,
+}
+
+impl RecordedMount {
+    fn describe(&self) -> String {
+        let kind = if self.volume { "named volume" } else { "bind mount" };
+        format!("{} {} at {}", kind, self.sources.first().map(String::as_str).unwrap_or(""), self.destination)
+    }
+}
+
+/// What this launcher's DB says about the module a start is about to
+/// (re)create: whether it records the install (`claimed`), and the mounts the
+/// install's manifest gives its container (the evidence for an unlabelled
+/// ≤0.2.99 container, R18F-06).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ModuleClaim {
+    pub claimed: bool,
+    pub recorded_mounts: Vec<RecordedMount>,
+}
+
+impl ModuleClaim {
+    /// A claim with no recorded mounts (a module that declares none, and tests).
+    pub fn bare(claimed: bool) -> Self {
+        Self { claimed, recorded_mounts: Vec::new() }
+    }
 }
 
 /// `inspect` template for [`PreLabelEvidence`]: the mounts and the env.
 const PRE_LABEL_INSPECT_FORMAT: &str = "{{json .Mounts}}\t{{json .Config.Env}}";
 
+/// The Python home of the bind-identity rules ([`bind_identity`]); its
+/// `_DRIVE_MOUNT_PREFIXES` tuple is parsed from here, so the VM-form prefix
+/// table has ONE copy (A>B>C rung B).
+const DATA_IDENTITY_PY: &str = include_str!("../../../../../vco_lib/data_identity.py");
+
+/// `_DRIVE_MOUNT_PREFIXES` from `vco_lib/data_identity.py`: where a runtime
+/// REPORTS a Windows drive in a bind's `Source` (Docker Desktop WSL2
+/// `/run/desktop/mnt/host/`, Hyper-V `/host_mnt/`, WSL2 drvfs `/mnt/`).
+/// Unparseable → empty (no VM form is folded, so a VM-form source proves
+/// nothing and is refused); a unit test pins the parse.
+fn drive_mount_prefixes() -> &'static [String] {
+    static PREFIXES: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    PREFIXES.get_or_init(|| {
+        let Some(start) = DATA_IDENTITY_PY.find("_DRIVE_MOUNT_PREFIXES = (") else {
+            return Vec::new();
+        };
+        let rest = &DATA_IDENTITY_PY[start + "_DRIVE_MOUNT_PREFIXES = (".len()..];
+        let Some(end) = rest.find(')') else { return Vec::new() };
+        rest[..end]
+            .split(',')
+            .filter_map(|s| {
+                let s = s.trim();
+                s.strip_prefix('"').and_then(|s| s.strip_suffix('"')).map(String::from)
+            })
+            .collect()
+    })
+}
+
+/// One spelling per host directory, for COMPARISON only (never stored).
+/// Must match `vco_lib/data_identity.py::_bind_identity` (control flow
+/// mirrored, prefix table parsed from that file — [`drive_mount_prefixes`]):
+/// a Windows drive path (`C:\x`, `c:/x`) and the VM forms a runtime reports
+/// it in (`/run/desktop/mnt/host/c/x`, `/host_mnt/c/x`, `/mnt/c/x`) all map
+/// to `c:/x` — `/` separators, lower-case drive letter, no trailing `/`.
+/// The case of the path body is NOT folded: an uncertain match refuses.
+pub fn bind_identity(source: &str) -> String {
+    let b = source.as_bytes();
+    if b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/') {
+        let rest = source[3..].replace('\\', "/");
+        return format!("{}:/{}", (b[0] as char).to_ascii_lowercase(), rest.trim_end_matches('/'));
+    }
+    for prefix in drive_mount_prefixes() {
+        if let Some(tail) = source.strip_prefix(prefix.as_str()) {
+            let t = tail.as_bytes();
+            if !t.is_empty() && t[0].is_ascii_alphabetic() && (t.len() == 1 || t[1] == b'/') {
+                let rest = if t.len() > 2 { &tail[2..] } else { "" };
+                return format!("{}:/{}", (t[0] as char).to_ascii_lowercase(), rest.trim_end_matches('/'));
+            }
+        }
+    }
+    let trimmed = source.trim_end_matches('/');
+    if trimmed.is_empty() { source.to_string() } else { trimmed.to_string() }
+}
+
 /// Is `candidate` (a path as the runtime printed it) `root` or inside it?
-/// Separator-agnostic (`\` and `/`), trailing-separator tolerant, and
-/// case-insensitive on Windows. A relative root proves nothing → `false`.
+/// Separator-agnostic (`\` and `/`), trailing-separator tolerant, VM-form
+/// aware ([`bind_identity`]: `/mnt/c/…` ≡ `C:\…`), and case-insensitive on
+/// Windows. A relative root proves nothing → `false`.
 pub fn path_is_under_root(candidate: &str, root: &Path) -> bool {
     fn norm(s: &str) -> String {
-        let s = s.replace('\\', "/");
-        let s = s.trim_end_matches('/').to_string();
+        let s = bind_identity(&s.replace('\\', "/"));
         if cfg!(windows) {
             s.to_lowercase()
         } else {
             s
         }
     }
-    if !root.is_absolute() {
-        return false;
+    fn absolute(s: &str) -> bool {
+        let b = s.as_bytes();
+        s.starts_with('/') || (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/')
     }
     let root = norm(&root.to_string_lossy());
     let cand = norm(candidate);
-    if root.is_empty() || cand.is_empty() {
+    if !absolute(&root) || cand.is_empty() {
         return false;
     }
-    cand == root || cand.starts_with(&format!("{root}/"))
+    let base = root.trim_end_matches('/');
+    cand == root || cand.starts_with(&format!("{base}/"))
+}
+
+/// Is `name` a named volume (not a host path) in a `-v name:/dest` arg?
+/// The runtimes' rule: a volume name starts alphanumeric and holds only
+/// `[A-Za-z0-9_.-]`; anything with a separator or a drive is a bind.
+fn is_volume_name(name: &str) -> bool {
+    let mut chars = name.chars();
+    matches!(chars.next(), Some(c) if c.is_ascii_alphanumeric())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+}
+
+/// The mounts `manifest` gives the container of `project_slug` — the module
+/// install's recorded configuration, resolved exactly as
+/// [`build_podman_run_args`] resolves its `-v` args. A bind also carries its
+/// canonical host path when that differs (a symlinked `{HOME}`).
+pub fn recorded_mounts(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project_slug: &str,
+    rl_port: u16,
+) -> Vec<RecordedMount> {
+    let placeholders = rl_placeholders(rl_port, project_slug);
+    manifest
+        .runtime
+        .volumes
+        .iter()
+        .filter_map(|vol| {
+            let (host, container) = resolve_volume(vol, ctx, &placeholders);
+            if host.is_empty() || container.is_empty() {
+                return None;
+            }
+            let volume = is_volume_name(&host);
+            let mut sources = vec![host.clone()];
+            if !volume {
+                if let Ok(c) = dunce::canonicalize(&host) {
+                    let c = c.to_string_lossy().to_string();
+                    if c != host {
+                        sources.push(c);
+                    }
+                }
+            }
+            Some(RecordedMount { volume, sources, destination: container })
+        })
+        .collect()
+}
+
+/// The [`ModuleClaim`] for a start of `manifest` in `project`: the DB claim
+/// ([`db_claims_module_install`]) and, when claimed, [`recorded_mounts`].
+pub fn module_claim_for_start(
+    db: &crate::db::Db,
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+) -> ModuleClaim {
+    let claimed = db_claims_module_install(db, &project.id, &manifest.id);
+    ModuleClaim {
+        claimed,
+        recorded_mounts: if claimed { recorded_mounts(manifest, ctx, &project.slug, rl_port) } else { Vec::new() },
+    }
 }
 
 /// Pure: classify `inspect --format PRE_LABEL_INSPECT_FORMAT` output against
-/// this launcher's state root(s) (the path as configured and canonicalised).
-pub fn classify_pre_label_evidence(stdout: &str, state_roots: &[PathBuf]) -> PreLabelEvidence {
+/// this launcher's state root(s) (the path as configured and canonicalised)
+/// and the module install's recorded mounts. In order:
+/// 1. unreadable mounts → `Unreadable`;
+/// 2. a bind / volume at a recorded mount point from a different source →
+///    `Contradicts` (checked first: positive evidence never outweighs it);
+/// 3. a bind under the state root, a mount equal to a recorded one, or an
+///    env path under the state root → `ThisInstall`;
+/// 4. any other bind / volume → `Foreign`; none → `Stateless`.
+pub fn classify_pre_label_evidence(
+    stdout: &str,
+    state_roots: &[PathBuf],
+    recorded: &[RecordedMount],
+) -> PreLabelEvidence {
     let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
     let (mounts_json, env_json) = line.split_once('\t').unwrap_or((line, "null"));
     let mounts = match serde_json::from_str::<serde_json::Value>(mounts_json.trim()) {
@@ -1680,22 +1868,51 @@ pub fn classify_pre_label_evidence(stdout: &str, state_roots: &[PathBuf]) -> Pre
         _ => Vec::new(),
     };
     let under_ours = |p: &str| state_roots.iter().any(|r| path_is_under_root(p, r));
-    let mut data_mounts: Vec<String> = Vec::new();
+    let same_dest = |a: &str, b: &str| {
+        let (a, b) = (a.trim_end_matches('/'), b.trim_end_matches('/'));
+        !a.is_empty() && a == b
+    };
+    // (volume?, source as reported, destination, description)
+    let mut data_mounts: Vec<(bool, String, String, String)> = Vec::new();
     for m in &mounts {
         let kind = m.get("Type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
         let source = m.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+        let dest = m.get("Destination").and_then(|v| v.as_str()).unwrap_or("").to_string();
         match kind.as_str() {
-            "bind" => {
-                if under_ours(source) {
-                    return PreLabelEvidence::ThisInstall(format!("bind mount {}", source));
-                }
-                data_mounts.push(format!("bind mount {}", source));
-            }
+            "bind" => data_mounts.push((false, source.to_string(), dest, format!("bind mount {}", source))),
             "volume" => {
-                let vol = m.get("Name").and_then(|v| v.as_str()).unwrap_or(source);
-                data_mounts.push(format!("named volume {}", vol));
+                let vol = m.get("Name").and_then(|v| v.as_str()).filter(|n| !n.is_empty()).unwrap_or(source);
+                data_mounts.push((true, vol.to_string(), dest, format!("named volume {}", vol)));
             }
             _ => {}
+        }
+    }
+    let matches_recorded = |volume: bool, source: &str, dest: &str, r: &RecordedMount| {
+        r.volume == volume
+            && same_dest(&r.destination, dest)
+            && r.sources.iter().any(|s| {
+                if volume {
+                    s == source
+                } else {
+                    bind_identity(&s.replace('\\', "/")) == bind_identity(&source.replace('\\', "/"))
+                }
+            })
+    };
+    for (volume, source, dest, what) in &data_mounts {
+        let at_point: Vec<&RecordedMount> = recorded.iter().filter(|r| same_dest(&r.destination, dest)).collect();
+        if !at_point.is_empty() && !at_point.iter().any(|r| matches_recorded(*volume, source, dest, r)) {
+            return PreLabelEvidence::Contradicts {
+                found: format!("{} at {}", what, dest),
+                recorded: at_point[0].describe(),
+            };
+        }
+    }
+    for (volume, source, dest, what) in &data_mounts {
+        if !*volume && under_ours(source) {
+            return PreLabelEvidence::ThisInstall(what.clone());
+        }
+        if recorded.iter().any(|r| matches_recorded(*volume, source, dest, r)) {
+            return PreLabelEvidence::ThisInstall(format!("{} at {} (the module's recorded mount)", what, dest));
         }
     }
     for kv in &env {
@@ -1706,8 +1923,8 @@ pub fn classify_pre_label_evidence(stdout: &str, state_roots: &[PathBuf]) -> Pre
         }
     }
     match data_mounts.into_iter().next() {
-        Some(source) => PreLabelEvidence::Foreign {
-            source,
+        Some((_, _, _, what)) => PreLabelEvidence::Foreign {
+            source: what,
             state_root: state_roots.first().map(|r| r.display().to_string()).unwrap_or_default(),
         },
         None => PreLabelEvidence::Stateless,
@@ -1731,6 +1948,7 @@ pub async fn read_pre_label_evidence<R: super::container_ownership::ContainerRun
     runner: &R,
     name: &str,
     state_roots: &[PathBuf],
+    recorded: &[RecordedMount],
 ) -> PreLabelEvidence {
     match runner
         .run(
@@ -1739,7 +1957,7 @@ pub async fn read_pre_label_evidence<R: super::container_ownership::ContainerRun
         )
         .await
     {
-        Ok(o) if o.success => classify_pre_label_evidence(&o.stdout, state_roots),
+        Ok(o) if o.success => classify_pre_label_evidence(&o.stdout, state_roots, recorded),
         Ok(o) => PreLabelEvidence::Unreadable(format!("inspect {} failed: {}", name, o.stderr.trim())),
         Err(e) => PreLabelEvidence::Unreadable(e),
     }
@@ -1755,17 +1973,24 @@ pub async fn read_pre_label_evidence<R: super::container_ownership::ContainerRun
 ///
 /// * absent → [`PreStartRemoval::Proceed`];
 /// * labelled by this install → `Remove`;
-/// * unlabelled AND claimed → decided by `pre_label` (R18-08):
-///   - `ThisInstall` (a mount / env path under this launcher's state root)
-///     → `Remove { unlabelled: true }`;
-///   - `Stateless` (no mounts, no state path — nothing identifies ANY
-///     install and no data is at stake) → `Remove { unlabelled: true }`, so
-///     the ≤0.2.99 upgrade of a data-less module keeps working. Residual,
-///     stated: another ≤0.2.99 install's data-less container of the same
-///     name is indistinguishable from ours and is replaced (its service is
-///     interrupted; nothing is lost);
-///   - `Foreign` (it keeps data outside this state root) → `Refuse`, naming
-///     the container, the data it mounts, and how to remove it by hand;
+/// * unlabelled AND claimed → decided by `pre_label` (R18-08, R18F-06):
+///   - `ThisInstall` (a mount / env path under this launcher's state root,
+///     or a mount equal to one the module install's recorded configuration
+///     declares) → `Remove { unlabelled: true }`. This proves the STATE
+///     ROOT, which is per user (`~/.vct` unless `VCT_STATE_DIR` differs):
+///     installs of one user sharing it — and its `launcher.db`, whose claim
+///     this is — are not told apart;
+///   - `Stateless` (no bind or volume mounts, no state path — nothing
+///     identifies ANY state root) → `Remove { unlabelled: true }`, so the
+///     ≤0.2.99 upgrade of a module without mounts keeps working. Residuals,
+///     stated: `rm -f` discards whatever the container kept in its own
+///     writable layer (the shipped RL module keeps nothing there), and
+///     another ≤0.2.99 install's mount-less container of the same name is
+///     indistinguishable from ours and is replaced the same way;
+///   - `Contradicts` (a recorded mount point fed from another source) and
+///     `Foreign` (data neither under this state root nor recorded) →
+///     `Refuse`, naming the container, the data it mounts, and how to
+///     remove it by hand;
 ///   - `Unreadable` / `NotRead` → `Refuse` (never guess);
 /// * labelled by ANOTHER install → `Refuse`, naming the install id;
 /// * unlabelled and unclaimed, or unreadable → `Refuse` (never guess);
@@ -1813,9 +2038,16 @@ pub fn pre_start_removal_decision(
                 PreLabelEvidence::ThisInstall(_) | PreLabelEvidence::Stateless => {
                     PreStartRemoval::Remove { unlabelled: true }
                 }
+                PreLabelEvidence::Contradicts { found, recorded } => PreStartRemoval::Refuse(format!(
+                    "not starting: container '{}' carries no launcher label and has {}, where this \
+                     install's module configuration mounts {} — it may belong to another VCO install \
+                     on this machine, so it is not removed. {}",
+                    name, found, recorded, by_hand
+                )),
                 PreLabelEvidence::Foreign { source, state_root } => PreStartRemoval::Refuse(format!(
                     "not starting: container '{}' carries no launcher label and keeps data in {}, \
-                     outside this launcher's state directory {} — it may belong to another VCO \
+                     outside this launcher's state directory {} and not among the mounts this \
+                     install's module configuration records — it may belong to another VCO \
                      install on this machine, so it is not removed. {}",
                     name, source, state_root, by_hand
                 )),
@@ -1858,9 +2090,9 @@ pub async fn read_pre_start_decision<R: super::container_ownership::ContainerRun
     runner: &R,
     name: &str,
     owner_id: Option<&str>,
-    claimed: bool,
+    claim: &ModuleClaim,
 ) -> PreStartRemoval {
-    read_pre_start_decision_in(runner, name, owner_id, claimed, &launcher_state_roots()).await
+    read_pre_start_decision_in(runner, name, owner_id, claim, &launcher_state_roots()).await
 }
 
 /// [`read_pre_start_decision`] against explicit state roots (tests).
@@ -1868,7 +2100,7 @@ pub async fn read_pre_start_decision_in<R: super::container_ownership::Container
     runner: &R,
     name: &str,
     owner_id: Option<&str>,
-    claimed: bool,
+    claim: &ModuleClaim,
     state_roots: &[PathBuf],
 ) -> PreStartRemoval {
     use super::container_ownership::{launcher_label_verdict, ContainerState, LabelVerdict};
@@ -1877,11 +2109,12 @@ pub async fn read_pre_start_decision_in<R: super::container_ownership::Container
         identity.state,
         ContainerState::Missing | ContainerState::StorageOnly | ContainerState::Unknown(_)
     );
+    let claimed = claim.claimed;
     let needs_evidence = claimed
         && existing
         && matches!(launcher_label_verdict(&identity.labels, owner_id), LabelVerdict::Unlabelled);
     let pre_label = if needs_evidence {
-        read_pre_label_evidence(runner, name, state_roots).await
+        read_pre_label_evidence(runner, name, state_roots, &claim.recorded_mounts).await
     } else {
         PreLabelEvidence::NotRead
     };
@@ -1897,9 +2130,9 @@ pub async fn clear_name_for_start<R: super::container_ownership::ContainerRunner
     runner: &R,
     name: &str,
     owner_id: Option<&str>,
-    claimed: bool,
+    claim: &ModuleClaim,
 ) -> Result<(), String> {
-    clear_name_for_start_in(runner, name, owner_id, claimed, &launcher_state_roots()).await
+    clear_name_for_start_in(runner, name, owner_id, claim, &launcher_state_roots()).await
 }
 
 /// [`clear_name_for_start`] against explicit state roots (tests).
@@ -1907,10 +2140,10 @@ pub async fn clear_name_for_start_in<R: super::container_ownership::ContainerRun
     runner: &R,
     name: &str,
     owner_id: Option<&str>,
-    claimed: bool,
+    claim: &ModuleClaim,
     state_roots: &[PathBuf],
 ) -> Result<(), String> {
-    match read_pre_start_decision_in(runner, name, owner_id, claimed, state_roots).await {
+    match read_pre_start_decision_in(runner, name, owner_id, claim, state_roots).await {
         PreStartRemoval::Proceed => Ok(()),
         PreStartRemoval::Refuse(msg) => {
             tracing::warn!(container = %name, "[container_runtime] module start: {}", msg);
@@ -1922,7 +2155,8 @@ pub async fn clear_name_for_start_in<R: super::container_ownership::ContainerRun
                     container = %name,
                     "[container_runtime] module start: replacing a container with no launcher \
                      label (created before v0.2.100) — this launcher's module install claims \
-                     its name, and its mounts show this launcher's state directory or no data"
+                     its name, and its mounts show this launcher's state directory, the module's \
+                     recorded mounts, or no mounts at all"
                 );
             }
             match runner.run(&["rm", "-f", name], std::time::Duration::from_secs(60)).await {
@@ -1944,26 +2178,26 @@ pub async fn clear_name_for_start_in<R: super::container_ownership::ContainerRun
 }
 
 /// [`clear_name_for_start`] against the real `runtime` binary and THIS
-/// install's owner id; `claimed` from [`db_claims_module_install`].
-pub async fn clear_module_name_for_start(runtime: &str, name: &str, claimed: bool) -> Result<(), String> {
+/// install's owner id; `claim` from [`module_claim_for_start`].
+pub async fn clear_module_name_for_start(runtime: &str, name: &str, claim: &ModuleClaim) -> Result<(), String> {
     let runner = super::container_ownership::RuntimeRunner {
         binary: std::path::PathBuf::from(runtime),
         runtime: runtime.to_string(),
     };
     let owner = super::container_ownership::launcher_owner_id();
-    clear_name_for_start(&runner, name, owner.as_deref(), claimed).await
+    clear_name_for_start(&runner, name, owner.as_deref(), claim).await
 }
 
 /// Check-only form for a caller that must refuse BEFORE it stops anything
 /// (the launcher's restart): `Err` when the start would be refused, `Ok`
 /// otherwise; never removes.
-pub async fn check_module_name_for_start(runtime: &str, name: &str, claimed: bool) -> Result<(), String> {
+pub async fn check_module_name_for_start(runtime: &str, name: &str, claim: &ModuleClaim) -> Result<(), String> {
     let runner = super::container_ownership::RuntimeRunner {
         binary: std::path::PathBuf::from(runtime),
         runtime: runtime.to_string(),
     };
     let owner = super::container_ownership::launcher_owner_id();
-    match read_pre_start_decision(&runner, name, owner.as_deref(), claimed).await {
+    match read_pre_start_decision(&runner, name, owner.as_deref(), claim).await {
         PreStartRemoval::Refuse(msg) => Err(msg),
         _ => Ok(()),
     }
@@ -5869,7 +6103,7 @@ mod tests {
     #[tokio::test]
     async fn w4r01_start_removes_a_container_this_install_labelled() {
         let r = w4r01_runner(Some(W4R01_OWNER));
-        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), false).await.unwrap();
+        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(false)).await.unwrap();
         assert_eq!(w4r01_rms(&r), vec![vec!["rm".to_string(), "-f".into(), W4R01_NAME.into()]]);
     }
 
@@ -5880,7 +6114,7 @@ mod tests {
     async fn w4r01_start_replaces_an_unlabelled_container_the_db_claims() {
         let root = r18_08_root();
         let r = r18_08_runner(&r18_08_mounts(&[("bind", &format!("{}/modules/vct-rl/data", root.display()))], &[]));
-        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap();
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[root]).await.unwrap();
         assert_eq!(w4r01_rms(&r), vec![vec!["rm".to_string(), "-f".into(), W4R01_NAME.into()]]);
     }
 
@@ -5924,7 +6158,7 @@ mod tests {
         let root = r18_08_root();
         let other = if cfg!(windows) { r"D:\other\.vct\modules\vct-rl\data" } else { "/srv/other/.vct/modules/vct-rl/data" };
         let r = r18_08_runner(&r18_08_mounts(&[("bind", other)], &["HOME=/root"]));
-        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap_err();
+        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[root]).await.unwrap_err();
         assert!(err.contains(W4R01_NAME) && err.contains(other), "{err}");
         assert!(err.contains(&format!("podman rm -f {W4R01_NAME}")), "names the hand removal: {err}");
         assert!(w4r01_rms(&r).is_empty(), "no rm may be issued: {:?}", r.calls.borrow());
@@ -5935,7 +6169,7 @@ mod tests {
     #[tokio::test]
     async fn r18_08_named_volume_or_unreadable_evidence_is_refused() {
         let r = r18_08_runner(&r18_08_mounts(&[("volume", "/var/lib/containers/storage/volumes/vol1/_data")], &[]));
-        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.unwrap_err();
+        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[r18_08_root()]).await.unwrap_err();
         assert!(err.contains("named volume vol1"), "{err}");
         assert!(w4r01_rms(&r).is_empty());
 
@@ -5943,7 +6177,7 @@ mod tests {
         let r = FakeRunner::new("podman");
         r.on("inspect", ok(&inspect_line("running", "{}")));
         r.on("inspect", fail("Error: cannot connect to Podman socket"));
-        assert!(clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.is_err());
+        assert!(clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[r18_08_root()]).await.is_err());
         assert!(w4r01_rms(&r).is_empty());
     }
 
@@ -5955,11 +6189,11 @@ mod tests {
         let root = r18_08_root();
         let env = format!("VCT_DATA={}", root.join("data").display());
         let r = r18_08_runner(&r18_08_mounts(&[("bind", "/srv/elsewhere")], &[&env]));
-        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root.clone()]).await.unwrap();
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[root.clone()]).await.unwrap();
         assert_eq!(w4r01_rms(&r).len(), 1);
 
         let r = r18_08_runner(&r18_08_mounts(&[("tmpfs", "")], &["PATH=/usr/bin"]));
-        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap();
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[root]).await.unwrap();
         assert_eq!(w4r01_rms(&r).len(), 1);
     }
 
@@ -5968,7 +6202,7 @@ mod tests {
     #[tokio::test]
     async fn r18_08_evidence_is_not_read_for_a_labelled_container() {
         let r = w4r01_runner(Some(W4R01_OWNER));
-        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.unwrap();
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true), &[r18_08_root()]).await.unwrap();
         assert_eq!(r.verbs().iter().filter(|v| *v == "inspect").count(), 1, "{:?}", r.calls.borrow());
     }
 
@@ -5989,13 +6223,186 @@ mod tests {
         }
     }
 
+    // ─── v0.2.100 R18F-06: the module install's recorded mounts are evidence ───
+
+    /// `{{json .Mounts}}\t{{json .Config.Env}}` for `(type, source-or-volume-name, destination)`.
+    fn r18f06_mounts(mounts: &[(&str, &str, &str)], env: &[&str]) -> String {
+        let m: Vec<serde_json::Value> = mounts
+            .iter()
+            .map(|(t, src, dest)| {
+                if *t == "volume" {
+                    serde_json::json!({"Type": "volume", "Name": src,
+                        "Source": format!("/var/lib/containers/storage/volumes/{src}/_data"), "Destination": dest})
+                } else {
+                    serde_json::json!({"Type": t, "Source": src, "Destination": dest})
+                }
+            })
+            .collect();
+        format!("{}\t{}\n", serde_json::Value::Array(m), serde_json::json!(env))
+    }
+
+    fn r18f06_bind(source: &str, dest: &str) -> RecordedMount {
+        RecordedMount { volume: false, sources: vec![source.into()], destination: dest.into() }
+    }
+
+    fn r18f06_claim(recorded: Vec<RecordedMount>) -> ModuleClaim {
+        ModuleClaim { claimed: true, recorded_mounts: recorded }
+    }
+
+    /// Run the start's name clear for an unlabelled, claimed container whose
+    /// evidence read answers `evidence`; `Ok` iff it was replaced.
+    async fn r18f06_clear(evidence: &str, claim: &ModuleClaim, root: PathBuf) -> (Result<(), String>, usize) {
+        let r = r18_08_runner(evidence);
+        let out = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), claim, &[root]).await;
+        let rms = w4r01_rms(&r).len();
+        (out, rms)
+    }
+
+    /// ACT: a bind under `{HOME}` (outside the state root) equal to the one
+    /// the module's manifest records is this install's → replaced.
+    #[tokio::test]
+    async fn r18f06_home_path_bind_matching_the_recorded_mount_is_replaced() {
+        let claim = r18f06_claim(vec![r18f06_bind("/home/u/vct-rl-data/", "/data")]);
+        let ev = r18f06_mounts(&[("bind", "/home/u/vct-rl-data", "/data/")], &[]);
+        let (out, rms) = r18f06_clear(&ev, &claim, r18_08_root()).await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(rms, 1);
+        // LEAVE-ALONE twin: the same container with NO recorded mount is Foreign.
+        let (out, rms) = r18f06_clear(&ev, &ModuleClaim::bare(true), r18_08_root()).await;
+        assert!(out.unwrap_err().contains("bind mount /home/u/vct-rl-data"));
+        assert_eq!(rms, 0);
+    }
+
+    /// ACT: a named volume the manifest records → replaced; LEAVE-ALONE: an
+    /// unrecorded named volume is still refused.
+    #[tokio::test]
+    async fn r18f06_named_volume_matching_the_recorded_mount_is_replaced() {
+        let claim = r18f06_claim(vec![RecordedMount { volume: true, sources: vec!["vct-rl-data".into()], destination: "/data".into() }]);
+        let (out, rms) = r18f06_clear(&r18f06_mounts(&[("volume", "vct-rl-data", "/data")], &[]), &claim, r18_08_root()).await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(rms, 1);
+        let other = r18f06_claim(vec![RecordedMount { volume: true, sources: vec!["vct-rl-data".into()], destination: "/cache".into() }]);
+        let (out, rms) = r18f06_clear(&r18f06_mounts(&[("volume", "someone-elses", "/data")], &[]), &other, r18_08_root()).await;
+        assert!(out.unwrap_err().contains("named volume someone-elses"));
+        assert_eq!(rms, 0);
+    }
+
+    /// ACT: the VM forms Docker Desktop / podman-machine / WSL2 report a
+    /// Windows bind in match the recorded `C:\…` host path, and a
+    /// Windows-shaped state root proves a `/mnt/c/…` source.
+    #[tokio::test]
+    async fn r18f06_vm_form_bind_sources_match_the_recorded_windows_path() {
+        let claim = r18f06_claim(vec![r18f06_bind(r"C:\Users\u\AppData\Roaming\vct-rl", "/data")]);
+        for src in [
+            "/run/desktop/mnt/host/c/Users/u/AppData/Roaming/vct-rl",
+            "/host_mnt/c/Users/u/AppData/Roaming/vct-rl",
+            "/mnt/c/Users/u/AppData/Roaming/vct-rl/",
+        ] {
+            let (out, rms) = r18f06_clear(&r18f06_mounts(&[("bind", src, "/data")], &[]), &claim, r18_08_root()).await;
+            assert!(out.is_ok(), "{src}: {out:?}");
+            assert_eq!(rms, 1, "{src}");
+        }
+        let win_root = PathBuf::from(r"C:\Users\u\.vct");
+        let ev = r18f06_mounts(&[("bind", "/mnt/c/Users/u/.vct/modules/vct-rl/data", "/state")], &[]);
+        let (out, rms) = r18f06_clear(&ev, &ModuleClaim::bare(true), win_root.clone()).await;
+        assert!(out.is_ok(), "{out:?}");
+        assert_eq!(rms, 1);
+        assert!(matches!(
+            classify_pre_label_evidence(&ev, &[win_root], &[]),
+            PreLabelEvidence::ThisInstall(_)
+        ));
+    }
+
+    /// LEAVE-ALONE: a recorded mount point fed from ANOTHER source (another
+    /// user's home, another volume, a case-different VM path) is refused and
+    /// named — even when an env path points at this state root.
+    #[tokio::test]
+    async fn r18f06_contradicting_mount_is_refused_even_with_positive_env() {
+        let root = r18_08_root();
+        let env = format!("VCT_DATA={}", root.join("data").display());
+        let claim = r18f06_claim(vec![r18f06_bind("/home/u/vct-rl-data", "/data")]);
+        let ev = r18f06_mounts(&[("bind", "/home/other/vct-rl-data", "/data")], &[&env]);
+        let (out, rms) = r18f06_clear(&ev, &claim, root.clone()).await;
+        let err = out.unwrap_err();
+        assert!(err.contains("/home/other/vct-rl-data") && err.contains("/home/u/vct-rl-data"), "{err}");
+        assert!(err.contains(&format!("podman rm -f {W4R01_NAME}")), "{err}");
+        assert_eq!(rms, 0);
+
+        let vol = r18f06_claim(vec![RecordedMount { volume: true, sources: vec!["vct-rl-data".into()], destination: "/data".into() }]);
+        let (out, rms) = r18f06_clear(&r18f06_mounts(&[("volume", "other-rl-data", "/data")], &[]), &vol, root.clone()).await;
+        assert!(out.is_err());
+        assert_eq!(rms, 0);
+
+        let win = r18f06_claim(vec![r18f06_bind(r"C:\Users\u\AppData\Roaming\vct-rl", "/data")]);
+        let ev = r18f06_mounts(&[("bind", "/mnt/c/users/u/appdata/roaming/vct-rl", "/data")], &[]);
+        assert!(matches!(
+            classify_pre_label_evidence(&ev, &[root], &win.recorded_mounts),
+            PreLabelEvidence::Contradicts { .. }
+        ), "an uncertain (case-only) match refuses");
+    }
+
+    /// LEAVE-ALONE: with recorded mounts, an evidence read that fails or
+    /// returns garbage still refuses (never guess).
+    #[tokio::test]
+    async fn r18f06_unreadable_evidence_refuses_with_recorded_mounts() {
+        let claim = r18f06_claim(vec![r18f06_bind("/home/u/vct-rl-data", "/data")]);
+        let (out, rms) = r18f06_clear("not json\tnull\n", &claim, r18_08_root()).await;
+        assert!(out.unwrap_err().contains("could not"));
+        assert_eq!(rms, 0);
+
+        use crate::services::container_ownership::fake::{fail, inspect_line, ok, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("running", "{}")));
+        r.on("inspect", fail("Error: cannot connect to Podman socket"));
+        assert!(clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), &claim, &[r18_08_root()]).await.is_err());
+        assert!(w4r01_rms(&r).is_empty());
+    }
+
+    /// The recorded mounts are the manifest's `-v` args as the start resolves
+    /// them: a `{HOME}` bind and a named volume.
+    #[test]
+    fn r18f06_recorded_mounts_follow_the_manifest_volumes() {
+        let mut m = make_manifest(false, false);
+        m.runtime.volumes = vec![
+            VolumeMount { host: "{HOME}/rl/{project_slug}".into(), container: "/data".into(), mode: Some("rw".into()) },
+            VolumeMount { host: "vct-rl-cache".into(), container: "/cache".into(), mode: None },
+        ];
+        let mut ctx = PlaceholderCtx::new(&m.id);
+        ctx.home = PathBuf::from("/nonexistent-r18f06/u");
+        let rec = recorded_mounts(&m, &ctx, "proj", 11533);
+        assert_eq!(rec.len(), 2);
+        assert_eq!((rec[0].volume, rec[0].sources[0].as_str(), rec[0].destination.as_str()), (false, "/nonexistent-r18f06/u/rl/proj", "/data"));
+        assert_eq!((rec[1].volume, rec[1].sources[0].as_str(), rec[1].destination.as_str()), (true, "vct-rl-cache", "/cache"));
+        let args = build_volume_arg(&m.runtime.volumes[0], &ctx, &rl_placeholders(11533, "proj"));
+        assert_eq!(args, "/nonexistent-r18f06/u/rl/proj:/data:rw", "same resolution as the -v arg");
+    }
+
+    /// Parity with `vco_lib/data_identity.py::_bind_identity`: the prefix
+    /// table is parsed from that file, and the documented cases fold alike.
+    #[test]
+    fn r18f06_bind_identity_matches_the_python_rules() {
+        assert_eq!(drive_mount_prefixes(), ["/run/desktop/mnt/host/", "/host_mnt/", "/mnt/"]);
+        for (input, want) in [
+            (r"C:\Users\u\x\", "c:/Users/u/x"),
+            ("c:/Users/u/x", "c:/Users/u/x"),
+            ("/run/desktop/mnt/host/c/Users/u/x", "c:/Users/u/x"),
+            ("/host_mnt/D/data", "d:/data"),
+            ("/mnt/c", "c:/"),
+            ("/mnt/data/x", "/mnt/data/x"),
+            ("/home/u/x/", "/home/u/x"),
+            ("/", "/"),
+        ] {
+            assert_eq!(bind_identity(input), want, "{input}");
+        }
+    }
+
     /// LEAVE-ALONE: another install's container refuses the start, names
     /// that install and the container, and no `rm` is issued — even when
     /// this DB claims the name.
     #[tokio::test]
     async fn w4r01_start_refuses_and_never_removes_another_installs_container() {
         let r = w4r01_runner(Some("other-install-id"));
-        let err = clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap_err();
+        let err = clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true)).await.unwrap_err();
         assert!(err.contains("other-install-id") && err.contains(W4R01_NAME), "{err}");
         assert!(w4r01_rms(&r).is_empty(), "no rm may be issued: {:?}", r.calls.borrow());
     }
@@ -6004,13 +6411,13 @@ mod tests {
     #[tokio::test]
     async fn w4r01_start_refuses_unclaimed_unlabelled_and_unreadable() {
         let r = w4r01_runner(None);
-        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), false).await.is_err());
+        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(false)).await.is_err());
         assert!(w4r01_rms(&r).is_empty());
 
         use crate::services::container_ownership::fake::{fail, FakeRunner};
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: cannot connect to Podman socket"));
-        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.is_err());
+        assert!(clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true)).await.is_err());
         assert!(w4r01_rms(&r).is_empty());
     }
 
@@ -6021,7 +6428,7 @@ mod tests {
         let r = FakeRunner::new("podman");
         r.on("inspect", fail("Error: no such container vct-rl-reranker-proj"));
         r.on("ps", ok("[]"));
-        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap();
+        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), &ModuleClaim::bare(true)).await.unwrap();
         assert!(w4r01_rms(&r).is_empty());
     }
 

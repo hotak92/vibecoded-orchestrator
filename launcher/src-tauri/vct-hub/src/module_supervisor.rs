@@ -147,6 +147,38 @@ pub async fn start_container_for_module(
     start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode, db).await
 }
 
+/// The pure, runtime-free part of a supervisor start (no container is
+/// touched): the run argv ([`vct_launcher_core::services::container_runtime::spawn_args_for_project`])
+/// and the name-clear claim — whether this DB records the module install,
+/// with the mounts its manifest records (R18F-06,
+/// [`vct_launcher_core::services::container_runtime::module_claim_for_start`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_start_args(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    podman: &str,
+    gpu_mode: Option<GpuMode>,
+    db: &Db,
+) -> Result<
+    (
+        vct_launcher_core::services::container_runtime::SpawnArgs,
+        vct_launcher_core::services::container_runtime::ModuleClaim,
+    ),
+    String,
+> {
+    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+        manifest, ctx, project, rl_port, container_name, image, podman, gpu_mode, db,
+    )?;
+    let claimed = vct_launcher_core::services::container_runtime::module_claim_for_start(
+        db, manifest, ctx, project, rl_port,
+    );
+    Ok((spawn, claimed))
+}
+
 /// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
 /// Used by the resume sweep when the manifest resolver injected at hub
 /// startup already knows the host's GpuMode. Mirrors the launcher's
@@ -189,8 +221,9 @@ pub async fn start_container_for_module_with_gpu_mode(
     // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
     // in this spawn's env, below). Built before the pre-pull and the name clear
     // so a refused start — a required secret that did not resolve — leaves
-    // the running container alone.
-    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+    // the running container alone. The name-clear claim is read here too
+    // ([`prepare_start_args`]).
+    let (spawn, claimed) = prepare_start_args(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
 
@@ -232,12 +265,10 @@ pub async fn start_container_for_module_with_gpu_mode(
     // launcher label says it is this install's, or it is unlabelled and this
     // DB records the module install (the ≤0.2.99 upgrade path); another
     // install's container refuses the start. One rule, shared with the
-    // launcher's `module_service` start.
-    let claimed = vct_launcher_core::services::container_runtime::db_claims_module_install(
-        db, &project.id, &manifest.id,
-    );
+    // launcher's `module_service` start. `claimed` (from
+    // [`prepare_start_args`]) carries the install's recorded mounts (R18F-06).
     vct_launcher_core::services::container_runtime::clear_module_name_for_start(
-        &podman, &container_name, claimed,
+        &podman, &container_name, &claimed,
     )
     .await?;
 
@@ -1956,6 +1987,46 @@ mod tests {
         let p2 = container_weights_path("../../etc", "passwd");
         assert!(p2.starts_with("/data/state/"));
         assert!(!p2.contains("../"));
+    }
+
+    /// v0.2.100 (R18F-06): the supervisor start's claim carries the module
+    /// install's recorded mounts (the manifest's volumes) when this DB
+    /// records the install, and nothing when it does not.
+    #[test]
+    fn prepare_start_args_carries_the_claimed_installs_recorded_mounts() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let manifest = make_manifest(true, true);
+        assert!(!manifest.runtime.volumes.is_empty(), "precondition: the manifest mounts something");
+        let db = Db::open_in_memory().expect("DB");
+        {
+            use rusqlite::params;
+            let now = chrono::Utc::now().timestamp_millis();
+            db.lock()
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, 'acme', '/tmp/acme', 'base', 'acme-corp', ?2, ?2)",
+                    params!["proj-uuid", now],
+                )
+                .expect("insert project");
+        }
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let prep = |db: &Db| {
+            prepare_start_args(&manifest, &ctx, &project, 11533, "vct-rl-reranker-acme-corp", "img:1", "podman", None, db)
+                .unwrap()
+                .1
+        };
+
+        let unclaimed = prep(&db);
+        assert!(!unclaimed.claimed && unclaimed.recorded_mounts.is_empty());
+
+        db.insert_module_install("install-r18f06", "proj-uuid", &manifest.id, "0.1.0", "/tmp/r18f06").unwrap();
+        let claim = prep(&db);
+        assert!(claim.claimed);
+        let dests: Vec<&str> = claim.recorded_mounts.iter().map(|m| m.destination.as_str()).collect();
+        let want: Vec<&str> = manifest.runtime.volumes.iter().map(|v| v.container.as_str()).collect();
+        assert_eq!(dests, want);
     }
 
     #[test]

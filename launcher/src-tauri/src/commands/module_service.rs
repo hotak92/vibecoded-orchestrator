@@ -322,8 +322,9 @@ pub(crate) struct PreparedStart {
     spawn: vct_launcher_core::services::container_runtime::SpawnArgs,
     /// v0.2.100 (W4R-01): this launcher's DB records the module install the
     /// name derives from — what lets an UNLABELLED (pre-0.2.100) container of
-    /// that name be replaced ([`vct_launcher_core::services::container_runtime::pre_start_removal_decision`]).
-    claimed: bool,
+    /// that name be replaced ([`vct_launcher_core::services::container_runtime::pre_start_removal_decision`]),
+    /// with the mounts the install's manifest records (R18F-06 evidence).
+    claimed: vct_launcher_core::services::container_runtime::ModuleClaim,
 }
 
 /// Everything in a per-project start that can refuse it, with no container
@@ -369,8 +370,8 @@ pub(crate) fn prepare_container_start(
     let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
-    let claimed = vct_launcher_core::services::container_runtime::db_claims_module_install(
-        db, &project.id, &manifest.id,
+    let claimed = vct_launcher_core::services::container_runtime::module_claim_for_start(
+        db, manifest, ctx, project, rl_port,
     );
     Ok(PreparedStart { podman, container_name, image, spawn, claimed })
 }
@@ -392,7 +393,7 @@ pub(crate) trait ContainerCli: Sync {
         &'a self,
         program: &'a str,
         name: &'a str,
-        claimed: bool,
+        claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(vct_launcher_core::services::container_runtime::clear_module_name_for_start(
             program, name, claimed,
@@ -405,7 +406,7 @@ pub(crate) trait ContainerCli: Sync {
         &'a self,
         program: &'a str,
         name: &'a str,
-        claimed: bool,
+        claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
         Box::pin(vct_launcher_core::services::container_runtime::check_module_name_for_start(
             program, name, claimed,
@@ -503,7 +504,7 @@ async fn launch_prepared_start(
     // Idempotency: replace a prior container with the same name — but only
     // one this install may remove (v0.2.100 W4R-01, the one rule shared with
     // the hub's supervisor). Another install's container refuses the start.
-    cli.clear_name_for_start(&podman, &container_name, claimed).await?;
+    cli.clear_name_for_start(&podman, &container_name, &claimed).await?;
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
@@ -1326,7 +1327,7 @@ async fn restart_container_with(
     let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
     // v0.2.100 (W4R-01): a name held by another install refuses BEFORE the
     // stop, so the refused restart leaves that container running.
-    cli.check_name_for_start(&prepared.podman, &prepared.container_name, prepared.claimed).await?;
+    cli.check_name_for_start(&prepared.podman, &prepared.container_name, &prepared.claimed).await?;
     stop_container_with(cli, &prepared.podman, container_name).await;
     launch_prepared_start(manifest, ctx, project, rl_port, prepared, cli).await
 }
@@ -3883,7 +3884,7 @@ mod tests {
             &'a self,
             program: &'a str,
             name: &'a str,
-            _claimed: bool,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
             self.0.lock().unwrap().push(vec![program.into(), "clear-name".into(), name.into()]);
             Box::pin(async { Ok(()) })
@@ -3893,11 +3894,38 @@ mod tests {
             &'a self,
             program: &'a str,
             name: &'a str,
-            _claimed: bool,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
             self.0.lock().unwrap().push(vec![program.into(), "check-name".into(), name.into()]);
             Box::pin(async { Ok(()) })
         }
+    }
+
+    /// v0.2.100 (R18F-06): a prepared start carries the module install's
+    /// recorded mounts (the manifest's volumes) when this DB claims the
+    /// install — the evidence an unlabelled ≤0.2.99 container is matched
+    /// against — and nothing when it does not.
+    #[test]
+    fn prepared_start_carries_the_claimed_installs_recorded_mounts() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let manifest = make_manifest(true, true);
+        assert!(!manifest.runtime.volumes.is_empty(), "precondition: the manifest mounts something");
+        let (db, pid) = open_db_with_resume_project();
+        let mut project = make_project();
+        project.id = pid.clone();
+        project.slug = "rs-slug".into();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+
+        let unclaimed = prepare_container_start(&manifest, &ctx, &project, 11533, None, "podman".into(), &db).unwrap();
+        assert!(!unclaimed.claimed.claimed && unclaimed.claimed.recorded_mounts.is_empty());
+
+        db.insert_module_install("install-r18f06", &pid, &manifest.id, "0.1.0", "/tmp/r18f06").unwrap();
+        let prepared = prepare_container_start(&manifest, &ctx, &project, 11533, None, "podman".into(), &db).unwrap();
+        assert!(prepared.claimed.claimed);
+        let dests: Vec<&str> = prepared.claimed.recorded_mounts.iter().map(|m| m.destination.as_str()).collect();
+        let want: Vec<&str> = manifest.runtime.volumes.iter().map(|v| v.container.as_str()).collect();
+        assert_eq!(dests, want);
     }
 
     /// A restart whose start is refused — a REQUIRED listed secret that is
@@ -3956,7 +3984,7 @@ mod tests {
             &'a self,
             _program: &'a str,
             name: &'a str,
-            _claimed: bool,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
             self.0.lock().unwrap().push(vec!["clear-name".into(), name.into()]);
             Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })
@@ -3965,7 +3993,7 @@ mod tests {
             &'a self,
             _program: &'a str,
             name: &'a str,
-            _claimed: bool,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
             self.0.lock().unwrap().push(vec!["check-name".into(), name.into()]);
             Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })

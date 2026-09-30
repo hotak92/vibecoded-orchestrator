@@ -42,7 +42,23 @@ fi
 # Resolve Python portably — bare `python3` is missing on Windows.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
-[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (logging+guards skipped)
+if [ -z "${PY:-}" ]; then
+    # No Python: every branch below needs it to read the payload, so the hook
+    # is a silent no-op — EXCEPT for WebFetch (review R18F-08). The SSRF guard
+    # is Python (vco_lib.ssrf_url), so without an interpreter it cannot judge
+    # any URL, and a security guard that cannot run fails CLOSED: the tool
+    # name is read from the payload by pattern (no JSON parser needed) and
+    # every WebFetch is blocked with the fix named.
+    if grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"WebFetch"'; then
+        {
+            echo "🔒 SSRF guard: no Python interpreter was found, so WebFetch cannot be checked and is blocked."
+            echo "   This is a broken VCO install: put Python 3 on PATH (or re-run the orchestrator's install / update,"
+            echo "   which provides the VCO venv), then retry."
+        } >&2
+        exit 2
+    fi
+    exit 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -207,35 +223,39 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
         # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
         # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
-        # v0.2.100 WP-18B: the host:port pairs are DERIVED at run time from
-        # the projected env (_lib/ssrf-allowlist.sh), so a moved
-        # service_endpoints port is allowed and nothing asks the user to
-        # hand-edit this hook. Reviews R18-04/R18-05: the allow AND block
-        # decisions are the lib's ONE parser (WHATWG-shaped: `\` is `/`,
-        # userinfo at the last `@`, percent-decoded / numeric / IPv6 hosts),
-        # so the two halves cannot read one URL two ways. The lib missing
-        # (partial install) blocks every WebFetch: a security guard that
-        # cannot run fails closed, and says why.
-        _SSRF_VERDICT=block
+        # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
+        # implementation for every OS; its docstring is the contract), run
+        # once through _lib/ssrf-allowlist.sh. The allowed pairs are DERIVED
+        # from the projected env, so a moved service_endpoints port is
+        # allowed and nothing asks the user to hand-edit this hook.
+        # FAIL CLOSED: only the exact words `allow` / `pass` let the call
+        # through. The lib missing (partial install), no interpreter, vco_lib
+        # not importable, or any other output blocks, and says why.
+        _SSRF_VERDICT=""
+        _SSRF_PAIRS=""
+        _SSRF_WHY="hooks/_lib/ssrf-allowlist.sh is missing — run the bundle update to restore it"
         _SSRF_LIB="$SCRIPT_DIR/_lib/ssrf-allowlist.sh"
         if [[ -f "$_SSRF_LIB" ]]; then
             # shellcheck source=_lib/ssrf-allowlist.sh disable=SC1091
             . "$_SSRF_LIB"
-            _SSRF_VERDICT="$(vco_ssrf_verdict "$URL" "$PROJECT_ROOT")"
+            vco_ssrf_run "$URL" "$SCRIPT_DIR"
+            _SSRF_VERDICT="$_vco_ssrf_verdict"
+            _SSRF_PAIRS="$_vco_ssrf_pairs"
+            _SSRF_WHY="the guard could not run (${_vco_ssrf_err:-unrecognised answer '$_vco_ssrf_verdict'}) — a broken VCO install: re-run the orchestrator's update (\`python install.py --update\` in the orchestrator root, or the launcher's Update), which reinstalls vco_lib into the VCO venv"
         fi
-        if [[ "$_SSRF_VERDICT" == block ]]; then
+        if [[ "$_SSRF_VERDICT" != allow && "$_SSRF_VERDICT" != pass ]]; then
             # Block messages route to stderr — see comment in bash-
             # security branch below for why (Claude Code drops plain
             # stdout from PreToolUse hooks).
-            _SSRF_PAIRS=""
-            if command -v vco_ssrf_allowed_pairs >/dev/null 2>&1; then
-                _SSRF_PAIRS="$(vco_ssrf_allowed_pairs "$PROJECT_ROOT" | grep -vE '^(127\.0\.0\.1|\[0:0:0:0:0:0:0:1\]):' | tr '\n' ' ')"
-            fi
             {
-                echo "🔒 SSRF guard: '$URL' targets a private/internal network address (or one the guard cannot read)."
-                echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none (hooks/_lib/ssrf-allowlist.sh is missing — run the bundle update to restore it)}"
-                echo "   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port — a moved service is"
-                echo "   changed with the launcher's Services page or \`python -m vco_lib.service_endpoints move\`, never by editing this hook."
+                if [[ "$_SSRF_VERDICT" == block ]]; then
+                    echo "🔒 SSRF guard: '$URL' targets a private/internal network address (or one the guard cannot read)."
+                    echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none}"
+                    echo "   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port — a moved service is"
+                    echo "   changed with the launcher's Services page or \`python -m vco_lib.service_endpoints move\`, never by editing this hook."
+                else
+                    echo "🔒 SSRF guard: '$URL' was blocked because $_SSRF_WHY."
+                fi
             } >&2
             # JSON-escape `\` and `"` (the backslash URLs above are exactly
             # what this line logs), as the .ps1 sibling does.

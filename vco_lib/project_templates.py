@@ -38,7 +38,7 @@ import json
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable, Optional, Tuple
+from typing import Any, Iterable, List, Optional, Tuple
 
 from vco_lib import project_init as _pi
 from vco_lib.template_divergence import (
@@ -433,6 +433,38 @@ def _notice(message: str) -> None:
     _pi._log_auto(message)
 
 
+def _heading_lines(text: str) -> List[str]:
+    """The Markdown heading lines of ``text`` (trailing whitespace dropped)."""
+    return [ln.rstrip() for ln in text.splitlines() if ln.startswith("#")]
+
+
+def _is_pre_split(current_body: str, fresh_body: str, fresh_top: str, *,
+                  before: str, state: Optional[dict]) -> bool:
+    """Is the live file in the PRE-SPLIT layout (the whole old template inside
+    the markers)? Decided from the CONTENT (review R18F-01), because the
+    bookkeeping can lie: the untracked state file survives a git checkout of
+    a branch whose tracked CLAUDE.md is still pre-split, and a user line above
+    the opening marker does not make a file split.
+
+    * The managed body carries a heading of the user-section template (Project
+      Overview, Tech Stack, Key Paths, …) that the current managed body does
+      not: the old template told the user to write THERE — pre-split,
+      whatever the state file or the text above the marker say.
+    * Otherwise, no recorded state AND nothing of the user's above the marker
+      is still pre-split (a split file always has its user section above) —
+      unless the body already IS the current managed render.
+    """
+    fresh = set(_heading_lines(fresh_body))
+    user_headings = {h for h in _heading_lines(fresh_top) if h not in fresh}
+    live = {ln.rstrip() for ln in current_body.splitlines()}
+    if user_headings & live:
+        return True
+    from vco_lib.deferral_report import strip_vco_owned_regions
+
+    return (state is None and not strip_vco_owned_regions(before).strip()
+            and not _same(current_body, fresh_body))
+
+
 def reconcile_claude_md(
     folder: Path,
     live_target: Path,
@@ -459,16 +491,19 @@ def reconcile_claude_md(
       last acknowledgement, the new version is written to
       :data:`USER_SECTION_SIDECAR_REL` and a ``claude_md_user_section_review``
       row is emitted (see :func:`_settle_user_section_review`).
-    * A PRE-SPLIT file (markers present, no recorded state; before v0.2.100
-      the whole template sat inside the markers) is migrated once: an
-      untouched region — it equals the previous render, OR a render of any
-      template VCO ever released (``vco_lib.legacy_claude_md``, for a project
-      created before 0.2.100 and never updated, which has no previous render)
-      — becomes the split layout (fresh user section above,
-      fresh managed region); an edited one keeps the user's text VERBATIM,
-      moved above the markers, gets the fresh managed region below it, is
-      backed up first, and the review row asks the user to remove the VCO
-      text their section now duplicates. No text is ever dropped.
+    * A PRE-SPLIT file (before v0.2.100 the whole template sat inside the
+      markers) is recognised from its CONTENT (:func:`_is_pre_split`), never
+      from the bookkeeping alone, and migrated once: an untouched region — it
+      equals the previous render, OR is a render of a template VCO released
+      (``vco_lib.legacy_claude_md``: exact with this project's values, else
+      structurally under any roots and name) — becomes the split layout
+      (fresh user section above, fresh managed region); an edited one keeps
+      every section the user wrote or edited VERBATIM, moved above the
+      markers, drops only the sections equal to the released template's
+      (VCO's text, re-rendered in the managed region), gets the fresh managed
+      region below, is backed up WHOLE first, and the review row asks the
+      user to check their section. Text above the opening marker and below
+      the closing one is always kept. No user text ever leaves the live file.
 
     Returns True when the live managed body IS the fresh render afterwards.
     False (file untouched) for a file without markers — the user's own file —
@@ -500,16 +535,17 @@ def reconcile_claude_md(
         state is not None and state.get("managed_body_sha256") == _body_hash(current_body)
     )
 
-    from vco_lib.deferral_report import strip_vco_owned_regions
-
     new_state: Tuple[str, str]
-    if state is None and not strip_vco_owned_regions(before).strip():
+    if _is_pre_split(current_body, body, top, before=before, state=state):
         # PRE-SPLIT layout: the whole old template is the managed body. No
         # previous render to compare with (created, never updated) is NOT
         # evidence of an edit: try every released template first.
-        if not untouched and orchestrator_root is not None:
-            from vco_lib.legacy_claude_md import matches_a_shipped_render
+        from vco_lib.legacy_claude_md import (
+            matches_a_shipped_render,
+            strip_unedited_vco_sections,
+        )
 
+        if not untouched:
             matched = matches_a_shipped_render(
                 current_body, folder=folder, orchestrator_root=orchestrator_root,
                 names=(project_name,), db_path=db_path)
@@ -520,13 +556,21 @@ def reconcile_claude_md(
             merged = before + compose_claude_md(top, body, _join_bottom(bottom, after))
             new_state = (template_hash, "migrated-untouched")
         else:
-            merged = (before + current_body.rstrip("\n") + "\n\n"
+            # Keep every section the user wrote or edited; drop only the
+            # sections equal to a released template's (VCO's text, re-rendered
+            # below in the managed region) so nothing is duplicated
+            # (review R18F-05). The backup below holds the whole original.
+            kept, dropped = strip_unedited_vco_sections(
+                current_body, keep_headings=_heading_lines(top))
+            if dropped:
+                out.setdefault("claude_md_migration_dropped", []).extend(dropped)
+            merged = (before + kept.rstrip("\n") + "\n\n"
                       + compose_claude_md("", body, after))
             new_state = (_MIGRATED_UNACKNOWLEDGED, "migrated-edited")
         out.setdefault("claude_md_migrated", []).append(new_state[1])
     else:
-        # Split layout (or a pre-split file whose recorded state was lost but
-        # which already carries a user section above the markers).
+        # Split layout: the managed body carries none of the user-section
+        # headings, and the user's text is outside the markers.
         merged = before + compose_claude_md("", body, after)
         new_state = ((template_hash, "state-rebuilt") if state is None else
                      (str(state.get("acknowledged_template_sha256") or ""),
@@ -591,14 +635,17 @@ def _review_entry(folder: Path, template_hash: str, reason: str):
             "This project's CLAUDE.md predates the split between YOUR section and "
             "VCO's managed region, and you had edited it. Your text was kept "
             "verbatim and moved ABOVE the `VCO_MANAGED` markers; VCO's current "
-            "sections now sit between the markers below it. The pre-migration file "
-            "is backed up under `.claude/backups/bundle-adoptions/`. Your section "
-            "may still contain VCO's OLD text (SESSION START, KG-first search, "
-            "VCO-Managed Files, …) that the managed region now carries too."
+            "sections now sit between the markers below it. VCO sections you had "
+            "not changed were not copied into your part (the managed region "
+            "carries their current version); every section you edited or added "
+            "was. The whole pre-migration file is backed up under "
+            "`.claude/backups/bundle-adoptions/`."
         )
-        todo = ("Remove from your section (above the markers) whatever the managed "
-                "region now duplicates, and compare the rest with "
-                f"`{sidecar}` — the current template for your section.")
+        todo = ("Check your section (above the markers): a VCO section you had "
+                "edited is still there next to its current version in the managed "
+                "region — keep what is yours, remove what the managed region now "
+                f"covers — and compare the rest with `{sidecar}`, the current "
+                "template for your section.")
     else:
         detected = (
             "This VCO update changed the TEMPLATE text of the part of CLAUDE.md "

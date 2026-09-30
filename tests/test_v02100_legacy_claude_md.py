@@ -135,3 +135,107 @@ class TestNeverUpdatedPreSplitProject:
         assert "Rust + Tauri, really." in text[:text.index(MANAGED_REGION_OPEN)]
         assert len(_backups(project)) == 1
         assert CID in _cids(project)
+
+
+def _old_project_elsewhere(tmp: Path, version: str, *, name: str, modules: set,
+                           edit=None) -> tuple:
+    """Rendered on its creation day under OTHER roots and ANOTHER name (the
+    orchestrator was re-cloned, the folder moved, the project renamed since),
+    then never updated."""
+    orch = _orch(tmp)
+    project = tmp / "my-proj"
+    project.mkdir()
+    body = next(e["body"] for e in _table()["template"] if e["version"] == version)
+    text = _old_renderer(body, name=name, project=Path("/old/place/their-proj"),
+                         orch=Path("/old/clone/orchestrator"), modules=modules)
+    if edit is not None:
+        text = edit(text)
+    (project / "CLAUDE.md").write_text(text + "\n## Added below\nmine\n", encoding="utf-8")
+    return orch, project
+
+
+class TestStructuralMatch:
+    """Review R18F-03: recognition must not depend on today's roots or name."""
+
+    @pytest.mark.parametrize("version,modules", [
+        ("v0.2.33", set()), ("v0.2.86", {"diagrams"}), ("v0.2.98", set()),
+    ])
+    def test_an_old_render_under_other_roots_and_name_is_untouched(
+            self, tmp_path, version, modules):
+        orch, project = _old_project_elsewhere(tmp_path, version, name="Old Name",
+                                               modules=modules)
+        res = _update(project, orch)
+        assert res["templates"]["claude_md_migrated"] == ["migrated-untouched"]
+        assert res["templates"]["claude_md_legacy_match"] == [version]
+        assert _backups(project) == []
+        assert CID not in _cids(project)
+        text = (project / "CLAUDE.md").read_text(encoding="utf-8")
+        assert "/old/clone/orchestrator" not in text
+        assert text.endswith("\n## Added below\nmine\n")
+
+    def test_the_matcher_needs_no_roots(self):
+        body = next(e["body"] for e in _table()["template"] if e["version"] == "v0.2.86")
+        text = _old_renderer(body, name="X Y", project=Path("C:/a b/p"),
+                             orch=Path("/o"), modules=set())
+        assert legacy_claude_md.matches_a_shipped_render(
+            pt.managed_body(text), folder=Path("/elsewhere"), orchestrator_root=None,
+            names=()) == "v0.2.86"
+
+    def test_an_edit_on_a_placeholder_line_is_still_an_edit(self, tmp_path):
+        """A wildcard must not swallow an edit: the same key is ONE value."""
+        orch, project = _old_project_elsewhere(
+            tmp_path, "v0.2.86", name="Old Name", modules={"diagrams"},
+            edit=lambda t: t.replace("- Project root: `/old/place/their-proj`",
+                                     "- Project root: `/old/place/their-proj` (monorepo)", 1))
+        res = _update(project, orch)
+        assert res["templates"]["claude_md_migrated"] == ["migrated-edited"]
+        assert "(monorepo)" in (project / "CLAUDE.md").read_text(encoding="utf-8")
+
+
+def _section(text: str, heading: str) -> str:
+    return next(s for s in legacy_claude_md.split_sections(text)
+                if s.startswith(heading))
+
+
+class TestEditedMigrationDoesNotDuplicateVcoSections:
+    """Review R18F-05: an edited pre-split body keeps every section the user
+    wrote or edited; the sections equal to the released template (VCO's text,
+    re-rendered in the managed region) are not copied into the user part."""
+
+    def _edit(self, text: str) -> str:
+        text = text.replace("## Tech Stack", "## Tech Stack\n\nRust + Tauri, really.", 1)
+        text = text.replace("## SESSION START (always)",
+                            "## SESSION START (always)\n\nMY SESSION RULE.", 1)
+        return text.replace("## VCO-Managed Files",
+                            "## My Own Section\n\nMINE ALONE.\n\n## VCO-Managed Files", 1)
+
+    def test_nothing_the_user_wrote_is_lost_and_no_vco_section_is_duplicated(
+            self, tmp_path):
+        orch, project = _old_project_elsewhere(tmp_path, "v0.2.86", name="Old Name",
+                                               modules={"diagrams"}, edit=self._edit)
+        original = (project / "CLAUDE.md").read_text(encoding="utf-8")
+        res = _update(project, orch)
+        text = (project / "CLAUDE.md").read_text(encoding="utf-8")
+        user = text[:text.index(MANAGED_REGION_OPEN)]
+        managed = pt.managed_body(text)
+        assert res["templates"]["claude_md_migrated"] == ["migrated-edited"]
+        # Everything the user wrote is in the live file, in their part.
+        for mine in ("Rust + Tauri, really.", "MY SESSION RULE.", "## My Own Section",
+                     "MINE ALONE.", "## Project Overview", "## Key Paths"):
+            assert mine in user, mine
+        assert text.endswith("\n## Added below\nmine\n")
+        # The unedited VCO sections exist once — in the managed region.
+        for vco in ("## KG-First Search Policy", "## VCO-Managed Files",
+                    "## KG / Context / Memory / Plans are LOAD-BEARING"):
+            assert vco not in user, vco
+            assert text.count(vco) == 1 and vco in managed
+        assert "## SESSION START (always)" in user, "the EDITED VCO section is kept"
+        assert "/old/clone/orchestrator" not in text.replace(
+            _section(user, "## SESSION START (always)"), "").replace(
+            _section(user, "## Key Paths"), "")
+        dropped = res["templates"]["claude_md_migration_dropped"]
+        assert "## VCO-Managed Files" in dropped and "## Tech Stack" not in dropped
+        # The backup holds the whole original.
+        (backup,) = _backups(project)
+        assert backup.read_text(encoding="utf-8") == original
+        assert CID in _cids(project)
