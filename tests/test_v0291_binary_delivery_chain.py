@@ -470,7 +470,9 @@ class Wi4SurfaceBParityTests(unittest.TestCase):
         self.assertNotIn("return", live_rename, "no kind may skip the hub stop + renames")
         self.assertIn("stop_hub_and_rename_binaries_aside(", live_rename)
 
-        reset = item_body(src, "pub(crate) async fn reset_hard_git_op(")
+        # v0.2.100 W3R-FIX: the body moved into the injectable `_with` variant
+        # (the wrapper only wires the real abort in).
+        reset = item_body(src, "pub(crate) async fn reset_hard_git_op_with<")
         self.assertIn("restored: false,", reset)
         self.assertLess(
             reset.index("create_reset_backup("),

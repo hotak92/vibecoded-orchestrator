@@ -89,6 +89,7 @@ fn ownership_sets_are_stable() {
             "deprecated_mcp_".to_string(),
             "kg_named_vector_slot_error_".to_string(),
             "lowercase_codegraph_residual_".to_string(),
+            "migrate_collections_partial_failure_".to_string(),
             "schema_migration_failed_".to_string(),
             "schema_migration_required_".to_string(),
             "stale_unit_retired_".to_string(),

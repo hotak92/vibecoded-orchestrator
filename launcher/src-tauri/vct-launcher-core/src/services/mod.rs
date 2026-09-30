@@ -28,6 +28,9 @@ pub mod runtime_verdict;
 // on Windows (symmetric with the Python side). `LOCK_REL` is string-pinned to the
 // Python constant by `tests/test_deferral_lock_parity.py`.
 pub mod deferral_lock;
+// v0.2.100 (WP-06): the ONE Rust bridge to `vco_lib.deferral_emit`, shared by
+// the launcher (re-exported from its `services::deferral`) and the hub.
+pub mod deferral_bridge;
 
 // v0.2.97 R12-bis P2-1: the ONE allowlist of env keys a scrubbed child
 // receives after `env_clear()` — the shared home/temp/system family.
@@ -80,6 +83,12 @@ pub mod compose_args;
 // container plumbing (run args, image refs, pulls, the reaper) and the
 // ownership guard.
 pub mod container_runtime;
+// v0.2.100 (WP-06, AD-5/AD-12): container ownership from real labels — the ONE
+// Rust home of the compose/launcher label keys, the watchdog's and the
+// reaper's ownership verdicts, and the guarded compose verb's Rust caller.
+pub mod container_ownership;
+// v0.2.100 (WP-06, F-W3-12): the ONE hub liveness probe.
+pub mod hub_health;
 pub mod gpu_mode;
 
 // v0.2.95: the model gateway's port/file/service constants and the resolution

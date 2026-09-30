@@ -801,21 +801,6 @@ def _write_failure_deferral(exc: "NoEmbeddingBackendError") -> None:
         logger.warning("Failed to write embedding failure deferral entry: %s", e)
 
 
-def _emit_code_backend_deferral(install_root: Path | None, detail: str) -> None:
-    """Record ``code_embed_backend_unavailable`` (the entry has ONE home:
-    :func:`vco_lib.embedding_pull_plan.code_embed_unavailable_entry`). Soft-fail."""
-    if install_root is None:
-        return
-    try:
-        from vco_lib.deferral_emit import emit
-        from vco_lib.embedding_pull_plan import code_embed_unavailable_entry
-
-        emit(install_root, code_embed_unavailable_entry(detail), log=logger,
-             keep_first_detected=True)
-    except Exception as e:  # noqa: BLE001 — soft-fail on the error path
-        logger.warning("Failed to write code-backend deferral entry: %s", e)
-
-
 def _clear_failure_deferral(install_root: Path | None, *, code_backend_ok: bool = True) -> None:
     """Mark the ``kg_summary_no_backend`` entry resolved (paired with success).
 
@@ -2151,10 +2136,17 @@ class EmbeddingService:
                 codeembed=svc.codeembed,
             )
         except NoEmbeddingBackendError as exc:
+            # v0.2.100 W3R-04: NO ledger write from construction — this runs at
+            # every session start (MCP server, KG-sync hook) while the ensure
+            # hook is still starting a code_embed that loads its model for
+            # seconds to minutes; a row here flapped on healthy machines. The
+            # typed error stays on the service (code embeds raise it; the
+            # embed-time re-probe self-heals). The durable
+            # ``code_embed_backend_unavailable`` row is install.py step 7's,
+            # which can afford the bounded wait and the container-state check.
             print(f"[vct] {exc}", file=sys.stderr)
             svc._code_backend_error = exc
             svc._code_ready = False
-            _emit_code_backend_deferral(resolved_root, str(exc))
             new_model, new_slot, new_dim, reason = (
                 svc.code_model_id, svc.code_vector_slot, svc.code_dim, ""
             )

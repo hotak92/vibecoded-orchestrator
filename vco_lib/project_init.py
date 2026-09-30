@@ -6897,56 +6897,12 @@ _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
 )
 
 
-def _classify_compose_override_conflict(legacy_path: Path, canonical_path: Path) -> str:
-    """v0.2.83 PLAN-v0283 B-F2: classify a coexisting legacy+canonical compose
-    override pair for auto-resolution.
-
-    Returns one of:
-      * ``"identical"``     — byte-for-byte identical. The v0.2.54 C-RT-5 mirror
-        (``volumes.rs`` writes the SAME body to BOTH names by design) so this is
-        the SANCTIONED pair. B-F2(i): suppress the deferral, KEEP BOTH FILES.
-      * ``"semantic_equal"`` — bytes differ but ``yaml.safe_load`` of each parses
-        cleanly AND compares equal (comment/whitespace drift only). B-F2(ii):
-        re-mirror the legacy file to the canonical bytes (canonical wins per the
-        user's "update to use the new one" ruling), NO deferral.
-      * ``"divergent"``     — genuinely different (parse failure on either side,
-        yaml unavailable, or parsed-unequal). B-F2(iii): keep today's
-        ``compose_override_filename_conflict`` deferral verbatim.
-
-    Conservative on every uncertainty: unreadable file, import-yaml failure, or
-    a parse error anywhere ⇒ ``"divergent"`` (defer to human judgement).
-    """
-    try:
-        legacy_bytes = legacy_path.read_bytes()
-        canonical_bytes = canonical_path.read_bytes()
-    except OSError:
-        return "divergent"
-    if legacy_bytes == canonical_bytes:
-        return "identical"
-    # Byte-different → try a semantic (YAML-structure) comparison.
-    try:
-        import yaml  # PyYAML — a hard dep of the orchestrator venv.
-    except ImportError:
-        # yaml unavailable → cannot prove semantic equality → conservative.
-        return "divergent"
-    try:
-        legacy_doc = yaml.safe_load(legacy_bytes.decode("utf-8"))
-        canonical_doc = yaml.safe_load(canonical_bytes.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError, ValueError):
-        return "divergent"
-    # Only claim semantic equality for a MEANINGFUL parsed structure. A
-    # comment-only / empty override parses to ``None`` (or a bare scalar), and
-    # two byte-different comment-only files must NOT be read as "identical
-    # config" (that would re-mirror away genuine hand-edits with no config to
-    # prove equivalence). Require BOTH sides to be a non-empty mapping/sequence
-    # (a real compose document is a mapping) before treating them as equal.
-    if not isinstance(legacy_doc, (dict, list)) or not legacy_doc:
-        return "divergent"
-    if not isinstance(canonical_doc, (dict, list)) or not canonical_doc:
-        return "divergent"
-    if legacy_doc == canonical_doc:
-        return "semantic_equal"
-    return "divergent"
+# v0.2.100: the pair classifiers (B-F2 + U16) live in vco_lib.compose_override_pair
+# (project_init.py is past its line ratchet); these names keep their call sites.
+from vco_lib.compose_override_pair import (  # noqa: E402
+    classify_pair as _classify_compose_override_conflict,
+    reconcile_vco_generated_pair as _reconcile_vco_generated_override_pair,
+)
 
 
 def _reconcile_compose_override_deferrals(
@@ -7074,6 +7030,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     # cleared on disk (the resolve_conditions tombstone is per-instance — it
     # lives on the throwaway report inside locked_report, not on the run report).
     auto_resolved_condition_ids: set[str] = set()
+    backup_ts = _adopt_backup_timestamp()  # one backup dir per run (U16)
 
     for subdir in _COMPOSE_OVERRIDE_SEARCH_SUBDIRS:
         legacy_path = install_root / subdir / _LEGACY_COMPOSE_OVERRIDE_NAME
@@ -7134,6 +7091,17 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                     detail,
                     log=_log_auto,
                 )
+                auto_resolved.append(detail)
+                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                continue
+            # U16 (v0.2.100): both halves are VCO's own generated output →
+            # reconcile them here; never ask the user to pick between them.
+            detail = _reconcile_vco_generated_override_pair(
+                install_root, legacy_path, target_path, backup_ts)
+            if detail is not None:
+                _de.record_auto_resolution(
+                    install_root, "compose_override_filename_conflict",
+                    "reconciled_vco_generated_pair", detail, log=_log_auto)
                 auto_resolved.append(detail)
                 auto_resolved_condition_ids.add("compose_override_filename_conflict")
                 continue

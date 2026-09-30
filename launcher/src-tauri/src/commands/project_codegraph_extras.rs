@@ -1102,10 +1102,9 @@ async fn run_analyzer_with_stream(
         } else {
             String::new()
         };
-        let code = status.code().unwrap_or(-1);
         return Err(format!(
-            "analyzer exit {}: {}",
-            code,
+            "analyzer {}: {}",
+            status,
             if stderr_text.is_empty() {
                 "no stderr".to_string()
             } else {

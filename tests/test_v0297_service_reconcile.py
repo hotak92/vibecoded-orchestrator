@@ -555,7 +555,8 @@ def test_awaiting_confirmation_skips_collections(monkeypatch):
     monkeypatch.setattr(install, "_SERVICE_ENDPOINTS", {"rows": {}, "pinned": False, "weaviate_pending": True})
     with mock.patch.object(install, "_wait_for_weaviate_ready") as ready:
         install._ensure_collections({}, decisions={}, args=argparse.Namespace())
-        assert install._seed_weaviate(argparse.Namespace()) is None
+        # v0.2.100 L1-F18: an explicit SKIPPED status, never read as a success
+        assert install._seed_weaviate(argparse.Namespace()) == "skipped"
     ready.assert_not_called()
 
 

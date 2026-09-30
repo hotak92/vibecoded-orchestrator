@@ -186,8 +186,10 @@ class FlowModuleStructureTests(unittest.TestCase):
         self.assertIn("wrote_entries = self.report.write(", lines[0])
 
     def test_finalize_merges_before_the_single_write(self):
+        # v0.2.100 AD-9: the late merge is foreign-only for a completed run
+        # and all-disk for the exit-path (partial) flush — still BEFORE the write.
         merge_idx = self.source.index(
-            "late_merged = self._merge_foreign_from_disk()"
+            "else self._merge_foreign_from_disk()"
         )
         write_idx = self.source.index("wrote_entries = self.report.write(")
         self.assertLess(merge_idx, write_idx)

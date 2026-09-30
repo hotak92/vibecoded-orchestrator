@@ -454,11 +454,15 @@ class DeliveryAuditTests(unittest.TestCase):
         v0.2.100 (W3-FIX, F-W3-08) — LOWERED 15_635 -> 15_526, the measured
         size after the wave-2/3 lanes shrank the file. A ratchet that is not lowered when the
         file shrinks silently re-admits the lines that left.
+
+        v0.2.100 (WP-12) — LOWERED 15_526 -> 15_494: the override-pair
+        classifiers moved to ``vco_lib/compose_override_pair.py`` together
+        with the new U16 reconcile of VCO's own generated pair.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_526,
+            n, 15_494,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

@@ -2188,3 +2188,159 @@ def announce_kg_metadata_repair_leg(log_event: "Optional[Callable]" = None) -> N
         "→ one whole-tree pass; patches properties, embeds nothing",
         data={"reason": "metadata_repair"},
     )
+
+
+# ---------------------------------------------------------------------------
+# v0.2.100 AD-9 / L1-F18 — ONE gate for every Weaviate-writing install step
+# ---------------------------------------------------------------------------
+
+#: The explicit "this step did not run" status (L1-F18: the seed used to report
+#: success when the pending-confirmation gate had skipped it).
+SKIPPED = "skipped"
+SEEDED = "seeded"
+FAILED = "failed"
+#: The seed did not run because Ollama was down at step 6; it is OWED to the
+#: ``ollama_not_ready_at_update`` retry (collections exist — later steps run).
+OWED = "owed"
+
+ADOPTION_CONFIRMATION_CID = "service_adoption_confirmation_required"
+
+
+def weaviate_write_allowed(state: Mapping, *, step: str,
+                           log_event: "Optional[Callable]" = None) -> "tuple[bool, str]":
+    """May ``step`` write into Weaviate this run?  ``(allowed, reason)``.
+
+    ``state`` is install.py's step-[5b] endpoint state (``_SERVICE_ENDPOINTS``):
+    ``weaviate_pending`` is set when an unattended run found a third-party
+    Weaviate holding no VCO data and nobody has answered the adoption question.
+    Until then NOTHING may be created, seeded, migrated, rebuilt or resynced in
+    any Weaviate — and ``--yes`` does not answer that question (it approves
+    prompts VCO asks about ITS data, never adoption of someone else's service).
+
+    Every Weaviate-writing step calls this first (collections, seed, the
+    schema-drift rebuild/migrate prompt, schema migrations, code-graph
+    maintenance), so the rule has one home and a refusal is logged per step.
+    """
+    if not state.get("weaviate_pending"):
+        return True, ""
+    reason = (f"waiting for your choice about the Weaviate already running "
+              f"(UPDATE_DEFERRED.md: {ADOPTION_CONFIRMATION_CID})")
+    print(f"[7b/10] Skipping {step}: {reason}.")
+    _install_log(log_event)("7b/10", SKIPPED, f"{step}: {reason}", data={"step": step})
+    return False, reason
+
+
+def migrate_errors_to_entries(result: "Optional[Mapping]", report) -> bool:
+    """Record ``migrate_collections``' per-collection errors; True when the
+    plan performed a ``rebuild`` (a later seed failure must say the collection
+    was dropped — ``rebuild_pending_seed``). HIGH-1 (2026-05-01), moved out of
+    ``install.py main()`` (v0.2.100)."""
+    from vco_lib.deferral_report import DeferralEntry
+
+    if not result or result.get("dry_run", False):
+        return False
+    rebuilt = any(e.get("action") == "rebuild" for e in result.get("plan", []))
+    for err in result.get("errors", []) or []:
+        coll = err.get("collection") or "unknown"
+        # condition_id carries the collection so failures do not deduplicate.
+        report.add_entry(DeferralEntry(
+            condition_id=f"migrate_collections_partial_failure_{coll}",
+            title=f"Schema migration failed for `{coll}`",
+            detected=(f"Action `{err.get('action') or 'unknown'}` raised: "
+                      f"{err.get('error') or '(no error message)'}"),
+            why_deferred=("Migration partial failure leaves the collection in an "
+                          "inconsistent state; manual recovery required."),
+            command_to_apply=("python install.py --update --rebuild-collections "
+                              "--force-rebuild (last-resort drop+re-embed) OR see logs at "
+                              "state/logs/install.jsonl stage 7b.<action>"),
+            severity="critical",
+            kg_node_refs=[".claude/context/weaviate-schema-port-research-2026-05-01.md"],
+        ))
+    return rebuilt
+
+
+def collections_and_seed(
+    ensure: Callable[[], None],
+    seed: Callable[[], object],
+    *,
+    report,
+    rebuild_performed: bool,
+    runtime: Callable[[], str],
+    run: Optional[Callable] = None,
+    sleep: Optional[Callable[[float], None]] = None,
+) -> str:
+    """Create the missing collections, then seed — ``SEEDED`` / ``SKIPPED`` /
+    ``OWED`` / ``FAILED`` (moved out of ``install.py main()``, v0.2.100).
+
+    ``SKIPPED`` = the write gate refused (``seed`` returned :data:`SKIPPED`):
+    the steps after it must not treat the collections as ready (L1-F18).
+    A Weaviate that raised gets ONE ``<runtime> start <container>`` and a
+    retry (PR 6); still down → ``weaviate_unreachable_at_update`` (+
+    ``rebuild_pending_seed`` when this run dropped a collection, HIGH-4).
+    """
+    try:
+        ensure()
+        return _seed_status(seed())
+    except Exception as exc:  # noqa: BLE001 — Weaviate down → deferral, not a crash
+        down_msg = str(exc)
+    import subprocess
+    import time as _time
+
+    from vco_lib.containers import all_known_names, find_existing_container
+
+    rt = runtime()
+    found = find_existing_container("weaviate", runtime=rt)
+    container = found or "vco_weaviate"  # nothing on host yet — name the canonical
+    try:
+        (run or subprocess.run)([rt, "start", container], capture_output=True, timeout=30)
+        (sleep or _time.sleep)(3)
+        # The readiness gate inside ensure/seed re-runs: a still-closed port
+        # raises (→ deferral) instead of hanging the re-embed.
+        ensure()
+        return _seed_status(seed())
+    except Exception:  # noqa: BLE001 — recovery is best-effort
+        pass
+    hint = container if found else " | ".join(all_known_names("weaviate"))
+    print(f"WARNING: Weaviate unreachable after restart attempt ({down_msg}). "
+          "Collections not bootstrapped. Deferral entry written.")
+    _record_weaviate_down(report, down_msg, rt, container, hint, rebuild_performed)
+    return FAILED
+
+
+def _seed_status(result: object) -> str:
+    return str(result) if result in (SKIPPED, OWED) else SEEDED
+
+
+def _record_weaviate_down(report, down_msg: str, rt: str, container: str, hint: str,
+                          rebuild_performed: bool) -> None:
+    from vco_lib.deferral_report import DeferralEntry
+
+    retry = f"{rt} start {hint} && python install.py --update --skip-rebuild-prompt"
+    report.add_entry(DeferralEntry(
+        condition_id="weaviate_unreachable_at_update",
+        title="Weaviate unreachable at update",
+        detected=(f"Weaviate refused connection during --update ({down_msg}). "
+                  f"Auto-restart via `{rt} start {container}` also failed."),
+        why_deferred=("Collection bootstrap and schema migration require a live "
+                      "Weaviate. Cannot proceed without it."),
+        command_to_apply=retry,
+        severity="critical",
+        kg_node_refs=[],
+    ))
+    if not rebuild_performed:
+        return
+    report.add_entry(DeferralEntry(
+        condition_id="rebuild_pending_seed",
+        title="Rebuild dropped collections; seed pending",
+        detected=("A `rebuild` action dropped one or more collections during this run, "
+                  "and a subsequent ensure/seed step crashed before the collections could "
+                  "be recreated and re-ingested. See `state/logs/install.jsonl` stage "
+                  "`7b.rebuild snapshot` for the per-collection object count + sample "
+                  "UUIDs that were present immediately before the drop."),
+        why_deferred=("Cannot recreate + re-ingest without a live Weaviate. The .md "
+                      "sources in knowledge/ + docs/ are intact and will be re-ingested by "
+                      "the next install.py --update run."),
+        command_to_apply=retry,
+        severity="critical",
+        kg_node_refs=[".claude/context/weaviate-schema-port-research-2026-05-01.md"],
+    ))

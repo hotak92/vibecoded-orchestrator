@@ -3959,7 +3959,7 @@ fn poll_hub_health(root: &Path, window: std::time::Duration) -> bool {
     let port = loop {
         let port = vct_launcher_core::services::hub_port::read_hub_port_file_in(root)
             .unwrap_or_else(|_| vct_launcher_core::services::hub_port::resolve_hub_port());
-        if probe_hub_health(port) {
+        if vct_launcher_core::services::hub_health::probe(port) {
             tracing::info!("[vct] update: vct-hub /api/v1/health OK on 127.0.0.1:{}", port);
             return true;
         }
@@ -4260,49 +4260,6 @@ fn settle_update_install_phase_failed_row(vco_lib_root: &Path, install_path: &Pa
             e
         );
     }
-}
-
-/// Best-effort blocking `GET http://127.0.0.1:<port>/api/v1/health` probe
-/// (unauthenticated — the hub's `is_exempt_path`). Returns true on HTTP 200.
-///
-/// Why a hand-rolled TCP+HTTP write rather than `reqwest`: it runs on a plain
-/// `std::thread` (the abort-recovery arm) as well as inline, and a raw socket
-/// read of the HTTP status line needs no runtime and no blocking-reqwest
-/// feature.
-fn probe_hub_health(port: u16) -> bool {
-    use std::io::{Read, Write};
-    use std::net::TcpStream;
-
-    let addr = format!("127.0.0.1:{}", port);
-    let mut stream = match TcpStream::connect_timeout(
-        &match addr.parse() {
-            Ok(a) => a,
-            Err(_) => return false,
-        },
-        std::time::Duration::from_secs(2),
-    ) {
-        Ok(s) => s,
-        Err(_) => return false,
-    };
-    let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(std::time::Duration::from_secs(2)));
-
-    let request = format!(
-        "GET /api/v1/health HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\r\n",
-        port
-    );
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-
-    // Read the status line. 64 bytes is enough for "HTTP/1.1 200 OK\r\n".
-    let mut buf = [0u8; 64];
-    let n = match stream.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
 }
 
 // v0.2.91 WP-A (modularity, one home): `pre_pull_rename_running_binary`,
@@ -6907,6 +6864,7 @@ pub async fn keep_local_and_continue_update<R: Runtime>(
     path: String,
     window: Window,
 ) -> Result<UpdateOutcome, String> {
+    crate::commands::update_run::require_gui_path_is_resolved_root(app.try_state::<crate::db::Db>().as_deref(), &path)?; // F-W3-14
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. NOT in the review's list of
     // six, and found by making the wiring gate closed-world: this command
     // runs `git checkout --ours` over every conflicted path and commits, then
@@ -6927,6 +6885,7 @@ pub async fn accept_upstream_and_continue_update<R: Runtime>(
     path: String,
     window: Window,
 ) -> Result<UpdateOutcome, String> {
+    crate::commands::update_run::require_gui_path_is_resolved_root(app.try_state::<crate::db::Db>().as_deref(), &path)?; // F-W3-14
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3 — the sibling button, same
     // claim. See `keep_local_and_continue_update`.
     let flight = crate::commands::single_flight::begin_orchestrator_update_or_refuse()?;
@@ -7089,6 +7048,7 @@ pub async fn resolve_untracked_collision_and_retry<R: Runtime>(
     window: Window,
     files: Vec<String>,
 ) -> Result<UpdateOutcome, String> {
+    crate::commands::update_run::require_gui_path_is_resolved_root(app.try_state::<crate::db::Db>().as_deref(), &path)?; // F-W3-14
     let install_path = PathBuf::from(&path);
     if !install_path.join(".git").exists() {
         return Err("Not a git repository — cannot resolve collision".to_string());
@@ -7381,6 +7341,7 @@ pub async fn resolve_autostash_pop_and_retry<R: Runtime>(
     files: Vec<String>,
     keep_updated: bool,
 ) -> Result<UpdateOutcome, String> {
+    crate::commands::update_run::require_gui_path_is_resolved_root(app.try_state::<crate::db::Db>().as_deref(), &path)?; // F-W3-14
     // Ledger step 40 / v0.2.95 ship-gate MAJOR-3. Taken BEFORE the per-file
     // `git checkout --ours|--theirs`, the `git add`, and the `git stash drop`
     // below — not merely by the resume this tail-calls. The claim is handed

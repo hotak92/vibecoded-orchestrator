@@ -5334,19 +5334,22 @@ mod tests {
 
     }
 
-    /// Case 5 (safety net): on-disk version unparseable ("abc"), L0 v0.2.8
-    /// → the version SSOT refuses to order it → l0_is_newer = false →
-    /// phase 1 wins. We never synthesize from L0 when we can't confidently
-    /// compare versions; honour the user's last-installed manifest.
+    /// Case 5: on-disk version unparseable ("abc"), L0 v0.2.8.
+    ///
+    /// v0.2.100 (F-W1-02, owner rule Q7): a manifest whose `version` is not
+    /// X.Y.Z is refused AT PARSE (`ModuleManifest::from_json`) — the producer
+    /// boundary — so it is no longer an "installed manifest" the resolver
+    /// could honour. (Before, `from_json` accepted any non-empty string and
+    /// this case exercised the comparator's "incomparable → on-disk wins"
+    /// net.) The resolver falls through to the validated L0 entry, and the
+    /// invalid file is never read back as the module's identity. No shipped
+    /// producer emits such a version (bump-version.sh pins X.Y.Z; the L0 seed
+    /// and bundled manifests are X.Y.Z).
     #[test]
-    fn test_v0245_on_disk_wins_when_parse_fails() {
+    fn test_v0245_an_invalid_on_disk_version_is_not_honoured() {
         let (_lock, tmp) = isolate_state();
         let db = open_db();
 
-        // Plant an on-disk manifest with an unparseable version string.
-        // ModuleManifest::from_json accepts any non-empty string for
-        // version — the SchemaVersion check is on `manifest_version`, not
-        // on `version` (which is free-form).
         plant_installed_manifest(tmp.path(), "abc");
         let envelope = L0CatalogResponse {
             schema_version: 1,
@@ -5359,20 +5362,14 @@ mod tests {
         )
         .unwrap();
 
-        let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
-                .expect("phase 1 safety-net must succeed when parse fails");
-        match &source {
-            ManifestSource::Installed(_) => {}
-            other => panic!(
-                "unparseable on-disk version → safety net says on-disk \
-                 wins (refuse to synthesize from L0 when versions are \
-                 incomparable), got {:?}",
-                other,
-            ),
-        }
-        assert_eq!(manifest.version, "abc");
-
+        let (manifest, source) = resolve_manifest_for_install(&db, "vct-rl-reranker")
+            .expect("the validated L0 entry resolves");
+        assert!(
+            !matches!(source, ManifestSource::Installed(_)),
+            "a manifest with version \"abc\" must not be honoured as installed, got {:?}",
+            source
+        );
+        assert_eq!(manifest.version, "0.2.8");
     }
 
     // ─── catalog kind for an installed module (v0.2.100 WP-01) ─────────

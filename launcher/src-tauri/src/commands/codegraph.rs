@@ -1505,13 +1505,12 @@ async fn run_build_task(
                     .find(|l| !l.trim().is_empty())
                     .unwrap_or("");
                 let snippet: String = head.chars().take(200).collect();
-                let exit_code = out.status.code().unwrap_or(-1);
                 (
                     build_status::FAILED.to_string(),
                     0,
                     Some(format!(
-                        "code-graph-analyze exited {}: {}",
-                        exit_code,
+                        "code-graph-analyze failed ({}): {}",
+                        out.status,
                         if snippet.is_empty() { "no stderr" } else { &snippet }
                     )),
                     Some(tail),
@@ -2601,9 +2600,9 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(
-                    "[vct] warning: metadata backfill for '{}' exited {}: {}",
+                    "[vct] warning: metadata backfill for '{}' failed ({}): {}",
                     canonical_identity,
-                    out.status.code().unwrap_or(-1),
+                    out.status,
                     stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
                 );
             }

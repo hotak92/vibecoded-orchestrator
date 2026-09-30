@@ -23,6 +23,11 @@ pub struct ModuleManifest {
 
     pub id: String,
     pub name: String,
+    // v0.2.100 (F-W1-02): the one version rule (`crate::version::parse`),
+    // validated in `from_json`; the schema carries the same pattern so a
+    // publisher's CI refuses it before the catalog does.
+    /// Module version: strictly `X.Y.Z` (optional leading `v`, no suffix).
+    #[schemars(regex(pattern = r"^v?\d+\.\d+\.\d+$"))]
     pub version: String,
     #[serde(default)]
     pub description: String,
@@ -1331,7 +1336,9 @@ pub enum ModuleCategory {
 pub struct Compatibility {
     #[serde(default = "default_hosts")]
     pub hosts: Vec<String>,
+    /// Oldest launcher version this module supports: strictly `X.Y.Z`.
     #[serde(default)]
+    #[schemars(regex(pattern = r"^v?\d+\.\d+\.\d+$"))]
     pub min_launcher_version: Option<String>,
 }
 fn default_hosts() -> Vec<String> {
@@ -2085,6 +2092,15 @@ impl ModuleManifest {
         }
         if m.version.is_empty() {
             return Err("manifest.version is required".into());
+        }
+        // v0.2.100 (F-W1-02): a version VCO cannot order is refused at the
+        // producer boundary, never tolerated by the comparator later.
+        crate::version::parse(&m.version)
+            .map_err(|e| format!("manifest.version: {} — module '{}'", e, m.id))?;
+        if let Some(min) = m.compatibility.min_launcher_version.as_deref() {
+            crate::version::parse(min).map_err(|e| {
+                format!("manifest.compatibility.min_launcher_version: {} — module '{}'", e, m.id)
+            })?;
         }
 
         // Drop empty hosts; default kicks in.
@@ -4107,6 +4123,46 @@ mod tests {
         }"#;
         let m = ModuleManifest::from_json(raw).expect("must parse");
         assert!(m.runtime.log_path_template.is_none());
+    }
+
+    // ─── v0.2.100 F-W1-02: versions are strictly X.Y.Z at the producer ───
+
+    fn manifest_with(version: &str, min_launcher: Option<&str>) -> String {
+        let compat = match min_launcher {
+            Some(v) => format!(r#", "compatibility": {{ "min_launcher_version": "{v}" }}"#),
+            None => String::new(),
+        };
+        format!(
+            r#"{{
+            "id": "versioned-mod",
+            "name": "Versioned",
+            "version": "{version}",
+            "category": "community",
+            "license": {{ "min_orchestrator_tier": "free" }},
+            "install": {{ "method": "git_clone", "source": "https://example.com/x.git" }},
+            "runtime": {{ "type": "service", "command": "echo" }}{compat}
+        }}"#
+        )
+    }
+
+    #[test]
+    fn a_suffixed_or_short_version_is_rejected_with_a_precise_error() {
+        let err = ModuleManifest::from_json(&manifest_with("0.2.100-rc1", None)).unwrap_err();
+        assert!(err.contains("manifest.version") && err.contains("0.2.100-rc1") && err.contains("X.Y.Z"), "{err}");
+        let err = ModuleManifest::from_json(&manifest_with("0.2.100", Some("1.2"))).unwrap_err();
+        assert!(
+            err.contains("manifest.compatibility.min_launcher_version") && err.contains("\"1.2\""),
+            "{err}"
+        );
+        for bad in ["0.2.100.1", "0.2", "abc", "0.2.100 "] {
+            assert!(ModuleManifest::from_json(&manifest_with(bad, None)).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn strict_versions_still_parse() {
+        assert!(ModuleManifest::from_json(&manifest_with("0.2.100", Some("0.2.33"))).is_ok());
+        assert!(ModuleManifest::from_json(&manifest_with("v1.0.0", None)).is_ok());
     }
 
     // ─── v0.2.31: module-shipped DB migrations (`db` block) ─────────────

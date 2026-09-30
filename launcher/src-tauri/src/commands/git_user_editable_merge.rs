@@ -2131,14 +2131,31 @@ pub(crate) fn build_deferral_text(
     if actionable.len() > CAP {
         bullets.push(format!("  - ... and {} more", actionable.len() - CAP));
     }
+    // v0.2.100 U17: the COMPLETE sidecar list (never capped), machine-readable,
+    // in the one format the clear probe reads — so the entry and its probe
+    // name the same files.
+    let sidecars: Vec<String> = actionable
+        .iter()
+        .filter_map(|o| match &o.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar { upstream_sidecar_path, .. } => Some(
+                upstream_sidecar_path
+                    .strip_prefix(install_path)
+                    .unwrap_or(upstream_sidecar_path)
+                    .display()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
     let detected = format!(
         "During an orchestrator-root update pulling from `{}/{}`, {} \
          user-editable file(s) had both local and upstream changes. \
-         VCO ran a per-path 3-way merge before `git pull`:\n{}",
+         VCO ran a per-path 3-way merge before `git pull`:\n{}\n{}",
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         pull_branch,
         n,
         bullets.join("\n"),
+        render_sidecar_list_line(&sidecars),
     );
     let why_deferred = String::from(
         "Default-to-safety: when a file in the user-editable allowlist \
@@ -2246,6 +2263,23 @@ pub(crate) fn build_deferral_text(
     );
     let command_to_apply = cmd_lines.join("\n");
     (title, detected, why_deferred, command_to_apply)
+}
+
+/// v0.2.100 U17 — marker of the machine-readable sidecar list line. MUST MATCH
+/// `vco_lib/deferral_probes.py::SIDECAR_LIST_MARKER`; the line format is pinned
+/// for both languages by `tests/fixtures/sidecar_list_line.json`.
+pub(crate) const SIDECAR_LIST_MARKER: &str = "vco-sidecars:";
+
+/// `<!-- vco-sidecars: ["a/b.md.from-upstream-x", …] -->` — an HTML comment
+/// (invisible in the rendered ledger), repo-relative POSIX paths (a Windows
+/// `\` is normalised), JSON array. The clear probe reads exactly these.
+pub(crate) fn render_sidecar_list_line(paths: &[String]) -> String {
+    let posix: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
+    format!(
+        "<!-- {} {} -->",
+        SIDECAR_LIST_MARKER,
+        serde_json::to_string(&posix).unwrap_or_else(|_| "[]".to_string())
+    )
 }
 
 /// POSIX shell-safe quoting (single-quote escape). Shared with the
@@ -4763,6 +4797,49 @@ pub(crate) mod tests {
             "cmd missing sidecar path: {}",
             cmd
         );
+    }
+
+    /// v0.2.100 U17: the machine-readable sidecar line is the SHARED format
+    /// (`tests/fixtures/sidecar_list_line.json`, also read by
+    /// `tests/test_v02100_sidecar_probe_names_match.py`), and the emitted entry
+    /// carries the COMPLETE list — past the 100-bullet display cap too.
+    #[test]
+    fn sidecar_list_line_matches_the_shared_fixture_and_is_never_capped() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            sidecars: Vec<String>,
+            line: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            marker: String,
+            cases: Vec<Case>,
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sidecar_list_line.json");
+        let fx: Fixture = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(fx.marker, SIDECAR_LIST_MARKER);
+        for c in &fx.cases {
+            assert_eq!(render_sidecar_list_line(&c.sidecars), c.line, "case {}", c.name);
+        }
+
+        let install = Path::new("/tmp/install");
+        let outcomes: Vec<MergeOutcome> = (0..105)
+            .map(|i| MergeOutcome {
+                path: PathBuf::from(format!("knowledge/n{i}.md")),
+                kind: MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                    upstream_sidecar_path: install.join(format!("knowledge/n{i}.md.from-upstream-7b255dd")),
+                    ours_sha: "a".to_string(),
+                    theirs_sha: "7b255dd".to_string(),
+                },
+            })
+            .collect();
+        let actionable: Vec<&MergeOutcome> = outcomes.iter().collect();
+        let (_, detected, _, _) = build_deferral_text(install, &actionable, "main");
+        assert!(detected.contains("... and 5 more"), "display list stays capped");
+        let line = detected.lines().find(|l| l.contains(SIDECAR_LIST_MARKER)).expect("sidecar line");
+        assert!(line.contains("knowledge/n104.md.from-upstream-7b255dd"), "{line}");
     }
 
     /// v0.2.91 WP-B: the THIRD exit. `orchestrator_user_modified_preserved`

@@ -154,19 +154,20 @@ def test_record_written_by_install_is_what_the_launcher_reads(tmp_path):
     install._apply_tier_overrides(cfg, code_pick="qwen3-embedding:0.6b", kg_pick=cfg["text_model"])
     pp = epp.plan_for_install(tmp_path, cfg, capability_tier=["gemma4:e4b", "qwen3.5:0.8b"],
                               launcher_db=tmp_path / "absent.db")
-    assert pp.models == ("qwen3-embedding:0.6b", "gemma4:e4b", "qwen3.5:0.8b")
+    # a multi-rung tier (an older run's record) collapses to its ONE model
+    assert pp.models == ("qwen3-embedding:0.6b", "gemma4:e4b")
     assert epp.plan_from_machine(tmp_path, tmp_path / "absent.db") == pp
 
 
 def test_install_probes_code_embed_only_for_codesage(tmp_path):
-    with mock.patch("vco_lib.ollama_pull.code_embed_reachable", return_value=False) as probe:
+    with mock.patch("vco_lib.ollama_pull.code_embed_state", return_value="down") as probe:
         pp = epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["gpu"],
                                   capability_tier=["qwen3.5:0.8b"],
                                   code_embed_url="http://localhost:11440",
                                   launcher_db=tmp_path / "absent.db")
-    probe.assert_called_once_with("http://localhost:11440")
+    assert probe.call_count == 1 and probe.call_args.args == ("http://localhost:11440",)
     assert pp.code_backend_unavailable and pp.embedding == ("qwen3-embedding:0.6b",)
-    with mock.patch("vco_lib.ollama_pull.code_embed_reachable") as probe:
+    with mock.patch("vco_lib.ollama_pull.code_embed_state") as probe:
         epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["cpu"],
                              capability_tier=[], launcher_db=tmp_path / "absent.db")
     probe.assert_not_called()
@@ -180,7 +181,7 @@ def test_cli_show_json(tmp_path, capsys):
     assert rc == 0 and out["ok"]
     assert out["plan"]["models"] == ["snowflake-arctic-embed2:latest",
                                      "unclemusclez/jina-embeddings-v2-base-code:latest",
-                                     "gemma4:e4b", "qwen3.5:0.8b"]
+                                     "qwen3.5:0.8b"]
 
 
 # ── replayed embedding_mode runs through the overrides → the plan ───────────
@@ -237,12 +238,15 @@ def _code_down_service(monkeypatch, tmp_path, *, opt_in: bool):
     return es, svc, emitted, ollama
 
 
-def test_code_embed_down_raises_typed_error_and_records_deferral(monkeypatch, tmp_path):
+def test_code_embed_down_raises_typed_error_and_writes_no_row_at_construction(monkeypatch, tmp_path):
+    """v0.2.100 W3R-04: construction runs at every session start while the
+    container may still be loading its model — it must NOT write the ledger
+    (the durable row is install.py step 7's, with its bounded wait)."""
     es, svc, emitted, ollama = _code_down_service(monkeypatch, tmp_path, opt_in=False)
     try:
         assert svc.code_model_id == "codesage-large-v2"      # not switched
         assert svc.code_vector_slot == "codesage_embed"
-        assert [e.condition_id for e in emitted] == ["code_embed_backend_unavailable"]
+        assert emitted == []
         with pytest.raises(es.NoEmbeddingBackendError):
             svc.embed_code("def f(): pass")
         with pytest.raises(es.NoEmbeddingBackendError):

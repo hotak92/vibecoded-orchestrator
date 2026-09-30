@@ -823,8 +823,9 @@ class CodeFallbackChainTests(unittest.TestCase):
     Ollama jina before giving up.
 
     v0.2.100 (L1-F13): that switch is no longer the default — a down
-    CodeEmbed now raises for code embeds and records
-    ``code_embed_backend_unavailable`` (tests/test_v02100_embedding_pull_plan.py).
+    CodeEmbed now raises for code embeds; the ``code_embed_backend_unavailable``
+    row is install.py step 7's, never construction's (W3R-04 —
+    tests/test_v02100_embedding_pull_plan.py).
     The chain survives as the explicit developer opt-in
     ``VCO_CODE_EMBED_ALLOW_FALLBACK=1``, which this class sets.
     """

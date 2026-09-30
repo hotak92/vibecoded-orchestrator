@@ -152,7 +152,7 @@ def test_try_start_podman_daemon_routes_through_helper_on_darwin(install_module)
     """_try_start_podman_daemon on Darwin uses the new auto-init helper."""
     src = INSTALL_PY.read_text(encoding="utf-8")
     # The Darwin/Windows branch should call _podman_machine_auto_init_and_start.
-    func_start = src.find("def _try_start_podman_daemon(")
+    func_start = src.find("def _heal_podman_reachability(")
     assert func_start > 0
     func_end = src.find("\ndef ", func_start + 1)
     body = src[func_start:func_end]

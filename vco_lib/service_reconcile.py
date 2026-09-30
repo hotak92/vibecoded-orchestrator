@@ -1123,6 +1123,20 @@ def _find_choice_candidate(inp: ServiceInputs) -> Optional[_det.Candidate]:
                  if c.port == port and _norm_host(c.host) == _norm_host(host)), None)
 
 
+def _recorded_mount_is_the_containers(inp: ServiceInputs,
+                                      row: _se.EndpointRow) -> Optional[bool]:
+    """Was ``row.data_mount`` OBSERVED on the adopted container? ``True`` its
+    live mount is exactly the recorded one; ``False`` the container is there
+    and mounts something else or nothing (the recorded mount is VCO's, kept by
+    :func:`vco_lib.service_endpoints.keep_recorded_mount`); ``None`` the
+    container is not in the listing (gone, or not looked at) — nothing proves
+    whose data the mount is, so the caller keeps the conservative clear."""
+    live = next((c for c in inp.containers if c.name == row.container_name), None)
+    if live is None:
+        return None
+    return _mount_of(inp.service, live) == dict(row.data_mount or {})
+
+
 def _decide_choice(inp: ServiceInputs) -> Outcome:
     svc = inp.service
     ch = inp.choice
@@ -1130,14 +1144,18 @@ def _decide_choice(inp: ServiceInputs) -> Outcome:
     out = Outcome(svc, how="explicit")
     if ch.kind == "vco":
         # VCO's copy keeps VCO's recorded data mount (v0.2.100 AD-4): a
-        # vco_managed row's own, or the one an adopted_external row still
-        # carries from when VCO ran it. An adopted CONTAINER's mount is that
-        # container's data — never given to VCO's copy (two services on one
-        # data directory), so it is cleared explicitly.
+        # vco_managed row's own, or the one an adopted row still carries from
+        # when VCO ran it. An adopted CONTAINER's OWN mount is that container's
+        # data — never given to VCO's copy (two services on one data
+        # directory), so only THAT is cleared (W2R-11: adopting a container
+        # with no data mount kept VCO's old bind on the row; clearing every
+        # adopted row's mount threw VCO's bind away on the way back).
         existing = inp.existing
-        mount = (existing.data_mount if existing is not None
-                 and existing.mode != "adopted_container" else None)
-        out.clear_mount = existing is not None and existing.mode == "adopted_container"
+        theirs = (existing is not None and existing.mode == "adopted_container"
+                  and existing.data_mount is not None
+                  and _recorded_mount_is_the_containers(inp, existing) is not False)
+        mount = existing.data_mount if existing is not None and not theirs else None
+        out.clear_mount = theirs
         if ch.value:
             port = int(ch.value)
             if port in inp.taken_ports or not inp.port_free(port):

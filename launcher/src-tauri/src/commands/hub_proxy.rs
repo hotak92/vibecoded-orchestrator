@@ -100,13 +100,8 @@ pub async fn hub_info(db: State<'_, Db>) -> Result<HubInfo, String> {
     // probe used to decide whether the hub is up at all, and a stale
     // hub.token shouldn't make the GUI think the hub is down.
     let port = hub_port()?;
-    let client = hub_client()?;
-    let reachable = client
-        .get(format!("http://127.0.0.1:{}/api/v1/health", port))
-        .send()
-        .await
-        .map(|r| r.status().is_success())
-        .unwrap_or(false);
+    // v0.2.100 (F-W3-12): the ONE liveness probe.
+    let reachable = vct_launcher_core::services::hub_health::probe_async(port).await;
     Ok(HubInfo { port, reachable })
 }
 

@@ -176,6 +176,7 @@ from vco_lib.deferral_report import (  # noqa: E402
     safe_emit_entry as _safe_emit_deferral,
 )
 from vco_lib.install_deferral_flow import InstallDeferralFlow  # noqa: E402
+from vco_lib import install_deferral_flow as _install_deferral_flow, install_resume as _install_resume  # noqa: E402
 from vco_lib.install_update_gate import InstallUpdateGate  # noqa: E402
 
 # ── A-2 (v0.2.73) / WP-B (v0.2.91): install.py's deferral-ownership set ────
@@ -440,9 +441,9 @@ EMBEDDING_CONFIGS = {
         "code_backend": "ollama",
         "code_model": "unclemusclez/jina-embeddings-v2-base-code:latest",
         "code_dims": 768,
-        # Hard-cap inference models for this profile — user opted in.
-        # qwen3.5:0.8b is the canonical always-fits floor on main.
-        "inference_models_override": ["gemma4:e4b", "qwen3.5:0.8b"],
+        # Hard-cap inference to the always-fits floor — the ONE model this
+        # profile uses (owner 2026-09-29: no lower/higher rungs beside it).
+        "inference_models_override": ["qwen3.5:0.8b"],
         # arctic → ollama_embed slot in the named-vector schema.
         # Maps to ACTIVE_EMBEDDING=arctic in weaviate_mcp/server.py.
         "active_embedding": "arctic",
@@ -500,11 +501,11 @@ class SystemInfo(NamedTuple):
 #     after install.py exits — so we don't need a file lock.
 # ---------------------------------------------------------------------------
 
-# Resume state, populated by _load_resume_state() at start of main().
-# Maps step-id -> last terminal phase ("ok" | "skip" | "error" | "warn") seen
-# in the most-recent install session. Only "ok"/"skip" steps qualify as
-# candidates for skip-on-resume; the per-step verification still runs.
-_RESUME_STATE: dict[str, str] = {}
+# Resume state (vco_lib.install_resume), loaded at the start of main(): the
+# last session's per-step phases + recorded data. Only "ok"/"skip" steps are
+# candidates, and each skip also needs its side-effect verifier to pass.
+_RESUME_SESSION = _install_resume.Session()
+_RESUME_STATE: dict[str, str] = _RESUME_SESSION.phases
 _RESUME_ENABLED: bool = True
 
 # In-memory buffer for events emitted BEFORE Step 8 creates state/logs/.
@@ -1718,99 +1719,22 @@ def _run_bootstrap(argv: list[str]) -> int:
 
 
 def _load_resume_state() -> dict[str, str]:
-    """Parse state/logs/install.jsonl and return {step: last_phase} for the
-    most-recent install session that's no older than 24 hours.
-
-    A "session" begins with `actor=install.py, step=1/10, phase=start`.
-    Only events from the *latest* session are considered. Sessions older
-    than 24h are treated as stale and ignored entirely. Any later "error"
-    on a step within the same session demotes that step out of the
-    skip-eligible set (we set its last_phase = "error" so the caller will
-    re-run it).
-    """
-    path = _install_log_path()
-    if path is None or not path.is_file():
-        return {}
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-
-    events: list[dict] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-
-    if not events:
-        return {}
-
-    # Find the index of the most-recent session start.
-    last_session_start = -1
-    for i, ev in enumerate(events):
-        if (ev.get("actor") == "install.py"
-                and ev.get("step") == "1/10"
-                and ev.get("phase") == "start"):
-            last_session_start = i
-    if last_session_start < 0:
-        return {}
-
-    session_events = events[last_session_start:]
-
-    # Stale-session check (>24h).
-    start_ts = session_events[0].get("ts", "")
-    if start_ts:
-        from datetime import datetime, timezone, timedelta
-        try:
-            # Strip trailing 'Z' for fromisoformat (3.11 supports Z; we
-            # accept both for portability with older ts strings).
-            ts_clean = start_ts.replace("Z", "+00:00")
-            start_dt = datetime.fromisoformat(ts_clean)
-            now = datetime.now(timezone.utc)
-            if now - start_dt > timedelta(hours=24):
-                return {}
-        except (ValueError, TypeError):
-            # Unparseable timestamp → treat as stale (safer than resuming
-            # on a malformed log).
-            return {}
-
-    # Reduce session events to {step: last_phase}. "ok" / "skip" only count
-    # if no later "error" appears for the same step.
-    state: dict[str, str] = {}
-    for ev in session_events:
-        step = ev.get("step")
-        phase = ev.get("phase")
-        if not isinstance(step, str) or not isinstance(phase, str):
-            continue
-        if ev.get("actor") != "install.py":
-            # Cross-actor events (post-install-launcher.sh, launcher) are
-            # not consulted by install.py's resume — they describe phases
-            # install.py doesn't own.
-            continue
-        # Latest phase wins.
-        state[step] = phase
-    return state
+    """{step: last_phase} of the most recent install session (<24 h) — the
+    ONE parser is :func:`vco_lib.install_resume.load_session`."""
+    return _install_resume.load_session(_install_log_path()).phases
 
 
 def _should_skip_step(step: str) -> bool:
-    """Return True iff resume is enabled AND the log says this step
-    completed (ok/skip) in the current session.
+    """True iff resume is enabled AND the log says ``step`` completed (ok/skip).
+    A HINT only: :func:`_resume_verified` adds the side-effect verifier."""
+    return _install_resume.Session(enabled=_RESUME_ENABLED, phases=_RESUME_STATE).completed(step)
 
-    NOTE: This is a HINT — callers MUST still verify the actual side
-    effect (venv exists, .env exists, collection has the schema we expect)
-    before declaring the step a no-op. The log is necessary but not
-    sufficient — Weaviate may have been wiped between runs, the user may
-    have deleted .venv, etc.
-    """
-    if not _RESUME_ENABLED:
-        return False
-    return _RESUME_STATE.get(step) in ("ok", "skip")
+
+def _resume_verified(step: str, label: str, verify) -> bool:
+    """Owner Q5 (v0.2.100): skip ``step`` only when the last session completed
+    it AND ``verify`` proves its side effect (vco_lib.install_resume)."""
+    return _install_resume.verified_skip(_RESUME_SESSION, step, label, verify,
+                                         log_event=_log_install_event)
 
 
 # ---------------------------------------------------------------------------
@@ -1868,79 +1792,17 @@ def _record_install_choice(name: str, value, extra: dict | None = None) -> None:
 
 
 def _load_previous_choices() -> dict[str, dict]:
-    """Read install.jsonl and return {choice_name: {value, ...extra}}
-    for the most-recent install.py session.
+    """{choice_name: {value, ...extra}} recorded by the most recent install.py
+    session (<24 h; ``{}`` when none) — :func:`vco_lib.install_resume.load_session`.
 
-    Returns an empty dict when:
-      - The log file doesn't exist yet (first install).
-      - The most-recent session is older than 24h (stale-session rule).
-      - No "choices" events were recorded that session.
-
-    Reuses the session-detection logic from `_load_resume_state`
-    (session = events between consecutive `step="1/10", phase="start"`
-    markers from `actor=install.py`). The choice with the latest
-    timestamp wins if a name was recorded twice in one session.
-    """
-    path = _install_log_path()
-    if path is None or not path.is_file():
-        return {}
-
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-
-    events: list[dict] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-
-    if not events:
-        return {}
-
-    last_session_start = -1
-    for i, ev in enumerate(events):
-        if (ev.get("actor") == "install.py"
-                and ev.get("step") == "1/10"
-                and ev.get("phase") == "start"):
-            last_session_start = i
-    if last_session_start < 0:
-        return {}
-
-    session_events = events[last_session_start:]
-
-    # Stale check (>24h).
-    start_ts = session_events[0].get("ts", "")
-    if start_ts:
-        from datetime import datetime, timezone, timedelta
-        try:
-            ts_clean = start_ts.replace("Z", "+00:00")
-            start_dt = datetime.fromisoformat(ts_clean)
-            now = datetime.now(timezone.utc)
-            if now - start_dt > timedelta(hours=24):
-                return {}
-        except (ValueError, TypeError):
-            return {}
-
-    out: dict[str, dict] = {}
-    for ev in session_events:
-        if ev.get("step") != "choices" or ev.get("phase") != "ok":
-            continue
-        name = ev.get("detail")
-        data = ev.get("data") or {}
-        if not isinstance(name, str) or not name:
-            continue
-        if not isinstance(data, dict):
-            continue
-        out[name] = data
-    return out
+    main() snapshots the session BEFORE this run logs its own ``1/10 start``;
+    that snapshot is returned here, because a read AFTER the marker finds only
+    this run's (still empty) session — the reason an ``--update`` never
+    replayed its recorded embedding profile before v0.2.100. ``--no-resume``
+    snapshots nothing, so nothing replays."""
+    if _RESUME_SESSION.loaded:
+        return dict(_RESUME_SESSION.choices)
+    return _install_resume.load_session(_install_log_path()).choices
 
 
 def _md5_file(path: Path) -> str | None:
@@ -2021,46 +1883,16 @@ def _record_state_hashes(install_path: Path) -> None:
 
 
 def _load_previous_state_hashes() -> dict[str, str | None]:
-    """Return the most-recent state-hash snapshot from install.jsonl,
-    or {} if none. Like `_load_previous_choices`, only reads from the
-    most-recent session and honours the 24h stale-session rule.
-    """
-    path = _install_log_path()
-    if path is None or not path.is_file():
-        return {}
+    """The most recent state-hash snapshot in install.jsonl, or ``{}``.
 
-    try:
-        raw = path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return {}
-
-    events: list[dict] = []
-    for line in raw.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            obj = json.loads(line)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(obj, dict):
-            events.append(obj)
-
-    if not events:
-        return {}
-
-    # Find latest "state-hashes" event globally — these are written
-    # exactly once per successful install at the very end, so the
-    # latest one is always the "last good install" baseline. We do NOT
-    # apply the 24h stale rule here: a state-hash baseline from 3
-    # months ago is still a perfectly valid drift reference (the user
-    # hasn't reinstalled since then; we want to know what changed).
-    for ev in reversed(events):
+    The latest ``state-hashes`` event GLOBALLY (written once per successful
+    install, at its very end) — no 24 h rule: a months-old baseline is still
+    the right drift reference."""
+    for ev in reversed(_install_resume.read_events(_install_log_path())):
         if ev.get("step") == "state-hashes" and ev.get("phase") == "ok":
             data = ev.get("data") or {}
             if isinstance(data, dict):
-                return {k: v for k, v in data.items()
-                        if isinstance(k, str)}
+                return {k: v for k, v in data.items() if isinstance(k, str)}
     return {}
 
 
@@ -5436,9 +5268,11 @@ def main() -> int:
     # (permission/readonly fs) — same discipline as V44-I.
     global _MAIN_ENTRY_LOCK_HANDLE
     if "--update" in sys.argv:
-        _MAIN_ENTRY_LOCK_HANDLE = _install_singleton_lock_or_die(
-            timeout_seconds=15.0
-        )
+        # W2R-06: the launcher's machine-wide <vct_root>/update.lock — refuse
+        # while ANOTHER process updates this tree; the launcher's own child runs.
+        from vco_lib.update_lock import refuse_if_foreign_update_running
+        refuse_if_foreign_update_running()
+        _MAIN_ENTRY_LOCK_HANDLE = _install_singleton_lock_or_die(timeout_seconds=15.0)
 
     parser = argparse.ArgumentParser(
         description="VibeCoded Tools — Orchestrator Installer",
@@ -6023,14 +5857,16 @@ def main() -> int:
     # from "stale from weeks ago".
     global _INSTALL_START_TS
     _INSTALL_START_TS = time.time()
+    _deferral_flow.arm()  # AD-9: from here on, EVERY exit path writes the deferral report
 
     # Configure resume-from-log behaviour. Loaded BEFORE any step runs so
     # individual step functions can consult _should_skip_step(). The log
     # is at state/logs/install.jsonl — only present once Step 8 has run
     # at least once (i.e. on second+ install attempts on this checkout).
-    global _RESUME_ENABLED, _RESUME_STATE
+    global _RESUME_ENABLED, _RESUME_STATE, _RESUME_SESSION
     _RESUME_ENABLED = not args.no_resume
-    _RESUME_STATE = _load_resume_state() if _RESUME_ENABLED else {}
+    _RESUME_SESSION = _install_resume.load_session(_install_log_path(), enabled=_RESUME_ENABLED)
+    _RESUME_STATE = _RESUME_SESSION.phases
 
     print()
     print("=" * 62)
@@ -6062,9 +5898,10 @@ def main() -> int:
               "argv": _install_companions.redact_secret_argv(sys.argv[1:])},
     )
 
-    # Step 1: Check Python
-    _check_python_version()
-    _check_prerequisites()
+    # Step 1: Check Python (resume: skipped only when the SAME interpreter passed it)
+    if not _resume_verified("1/10", "Python + prerequisites", _install_resume.python_verifier()):
+        _check_python_version()
+        _check_prerequisites()
 
     # Step 2: Detect system
     sysinfo = _detect_system(args, _deferral_report)
@@ -6192,7 +6029,7 @@ def main() -> int:
         _start_services(sysinfo, args, embed_config, decisions,
                         deferral_report=_deferral_report)
         if not args.skip_models:
-            _rc = _ollama_models_step(embed_config, sysinfo, _deferral_report, _deferral_folder)
+            _rc = _ollama_models_step(embed_config, sysinfo, _deferral_report)
             if _rc is not None:
                 return _rc
             # v0.2.49 Bug J: probe for dual Ollama instances now that
@@ -6238,58 +6075,10 @@ def main() -> int:
             if getattr(args, "force_rebuild", False):
                 _rebuild_collections(args)
                 _rebuild_was_performed = True
-            else:
-                # HIGH-1 fix (2026-05-01): capture migrate_collections result
-                # and emit a per-collection deferral entry for every entry in
-                # result["errors"]. Previously the dict was discarded silently.
-                _migrate_result = _project_init.migrate_collections(
-                    args,
-                    dry_run=getattr(args, "migrate_dry_run", False),
-                    log_event=_log_install_event,
-                )
-                if _migrate_result and not _migrate_result.get("dry_run", False):
-                    if any(
-                        entry.get("action") == "rebuild"
-                        for entry in _migrate_result.get("plan", [])
-                    ):
-                        _rebuild_was_performed = True
-                    for err in _migrate_result.get("errors", []) or []:
-                        _err_collection = err.get("collection") or "unknown"
-                        _err_action = err.get("action") or "unknown"
-                        _err_msg = err.get("error") or "(no error message)"
-                        # condition_id includes the collection name so multiple
-                        # failures across collections do NOT deduplicate.
-                        _deferral_report.add_entry(
-                            DeferralEntry(
-                                condition_id=(
-                                    f"migrate_collections_partial_failure_"
-                                    f"{_err_collection}"
-                                ),
-                                title=(
-                                    f"Schema migration failed for "
-                                    f"`{_err_collection}`"
-                                ),
-                                detected=(
-                                    f"Action `{_err_action}` raised: {_err_msg}"
-                                ),
-                                why_deferred=(
-                                    "Migration partial failure leaves the "
-                                    "collection in an inconsistent state; "
-                                    "manual recovery required."
-                                ),
-                                command_to_apply=(
-                                    "python install.py --update "
-                                    "--rebuild-collections --force-rebuild "
-                                    "(last-resort drop+re-embed) OR see logs at "
-                                    "state/logs/install.jsonl stage 7b.<action>"
-                                ),
-                                severity="critical",
-                                kg_node_refs=[
-                                    ".claude/context/"
-                                    "weaviate-schema-port-research-2026-05-01.md",
-                                ],
-                            )
-                        )
+            else:  # HIGH-1: every per-collection error becomes a deferral entry
+                _rebuild_was_performed = _install_weaviate.migrate_errors_to_entries(
+                    _project_init.migrate_collections(args, dry_run=getattr(args, "migrate_dry_run", False),
+                                                      log_event=_log_install_event), _deferral_report)
 
         # v0.2.18 Commit 10: seed the launcher's app_state with the
         # default text/code embedding-model IDs derived from this
@@ -6329,135 +6118,16 @@ def main() -> int:
                 f"{_rl_default_err}",
             )
 
-        # PR 6 + MEDIUM-9 + HIGH-4 fix (2026-05-01): wrap _ensure_collections
-        # AND _seed_weaviate in the same try/except so Weaviate-down conditions
-        # emit a deferral entry instead of crashing the install. Includes a
-        # podman-restart soft-recovery attempt. If a rebuild action dropped a
-        # collection earlier this run AND seed/ensure later crashes, the
-        # deferral entry includes `rebuild_pending_seed` so the operator knows
-        # what was lost.
-        # v0.2.89 FIX 1: the two calls below begin with a bounded readiness gate
-        # → an unreachable Weaviate raises here (soft-fail-to-deferral) instead
-        # of hanging the unbounded re-embed subprocess forever.
-        _seed_succeeded = False
-        try:
-            _ensure_collections(embed_config, decisions=decisions, args=args)
-            # Seed Weaviate with bundled knowledge/ + docs/. Idempotent;
-            # safe to re-run on update.
-            _seed_weaviate(args, deferral_report=_deferral_report)
-            _seed_succeeded = True
-        except Exception as _weaviate_err:
-            # PR 6: Weaviate is unreachable (or refused connection) after the
-            # containers were started. Attempt a soft-recovery restart
-            # via podman before emitting a deferral.
-            _weaviate_down_msg = str(_weaviate_err)
-            _restarted = False
-            # Discover the actual Weaviate container name + runtime on
-            # this host. v0.2.15: stopped hardcoding `weaviate_claude`
-            # (maintainer-machine leak) AND stopped hardcoding `podman`
-            # in the recovery hints (docker-only users got useless
-            # advice). Runtime honors VCT_CONTAINER_RUNTIME with
-            # podman→docker fallback per the install.py contract.
-            from vco_lib.containers import (
-                all_known_names as _all_known_names,
-                find_existing_container as _find_existing_container,
-            )
-            _self_heal_runtime = (
-                _detect_container_runtime()
-                or _runtime_preference_from_env()
-                or "podman"  # last-resort label when neither is on PATH
-            )
-            _weaviate_container = (
-                _find_existing_container("weaviate", runtime=_self_heal_runtime)
-                or "vco_weaviate"  # nothing on host yet — name the canonical
-            )
-            try:
-                subprocess.run(
-                    [_self_heal_runtime, "start", _weaviate_container],
-                    capture_output=True, timeout=30,
-                )
-                import time as _time
-                _time.sleep(3)  # brief settle
-                # v0.2.89 FIX 1: the readiness gate inside these two re-runs, so
-                # a still-unreachable port raises TimeoutError (→ deferral below)
-                # rather than hanging the re-embed after a no-op `podman start`.
-                _ensure_collections(embed_config, decisions=decisions, args=args)
-                _seed_weaviate(args, deferral_report=_deferral_report)
-                _restarted = True
-                _seed_succeeded = True
-            except Exception:
-                pass
-            if not _restarted:
-                # Build a user-facing "which name to use" hint. If we
-                # found one on the host, name it. Otherwise list all the
-                # candidates so the user can try whichever they have.
-                _candidates_hint = (
-                    _weaviate_container
-                    if _find_existing_container("weaviate", runtime=_self_heal_runtime)
-                    else " | ".join(_all_known_names("weaviate"))
-                )
-                print(
-                    f"WARNING: Weaviate unreachable after restart attempt "
-                    f"({_weaviate_down_msg}). Collections not bootstrapped. "
-                    "Deferral entry written."
-                )
-                _deferral_report.add_entry(
-                    DeferralEntry(
-                        condition_id="weaviate_unreachable_at_update",
-                        title="Weaviate unreachable at update",
-                        detected=(
-                            f"Weaviate refused connection during --update "
-                            f"({_weaviate_down_msg}). Auto-restart via "
-                            f"`{_self_heal_runtime} start {_weaviate_container}` also failed."
-                        ),
-                        why_deferred=(
-                            "Collection bootstrap and schema migration require "
-                            "a live Weaviate. Cannot proceed without it."
-                        ),
-                        command_to_apply=(
-                            f"{_self_heal_runtime} start {_candidates_hint} && "
-                            "python install.py --update --skip-rebuild-prompt"
-                        ),
-                        severity="critical",
-                        kg_node_refs=[],
-                    )
-                )
-                # HIGH-4: if a rebuild action dropped collections this run,
-                # warn the operator that the collection is GONE and needs
-                # re-seed once Weaviate is back.
-                if _rebuild_was_performed:
-                    _deferral_report.add_entry(
-                        DeferralEntry(
-                            condition_id="rebuild_pending_seed",
-                            title="Rebuild dropped collections; seed pending",
-                            detected=(
-                                "A `rebuild` action dropped one or more "
-                                "collections during this run, and a "
-                                "subsequent ensure/seed step crashed before "
-                                "the collections could be recreated and "
-                                "re-ingested. See `state/logs/install.jsonl` "
-                                "stage `7b.rebuild snapshot` for the per-"
-                                "collection object count + sample UUIDs that "
-                                "were present immediately before the drop."
-                            ),
-                            why_deferred=(
-                                "Cannot recreate + re-ingest without a live "
-                                "Weaviate. The .md sources in knowledge/ + "
-                                "docs/ are intact and will be re-ingested by "
-                                "the next install.py --update run."
-                            ),
-                            command_to_apply=(
-                                f"{_self_heal_runtime} start {_candidates_hint} && "
-                                "python install.py --update "
-                                "--skip-rebuild-prompt"
-                            ),
-                            severity="critical",
-                            kg_node_refs=[
-                                ".claude/context/"
-                                "weaviate-schema-port-research-2026-05-01.md",
-                            ],
-                        )
-                    )
+        # PR 6 + MEDIUM-9 + HIGH-4 (vco_lib.install_weaviate.collections_and_seed):
+        # a Weaviate-down run gets one soft restart, then a deferral — never a
+        # crash, never an unbounded hang (v0.2.89 FIX 1 readiness gate). A seed
+        # the write gate refused is SKIPPED, not a success (L1-F18).
+        _seed_succeeded = _install_weaviate.collections_and_seed(
+            lambda: _ensure_collections(embed_config, decisions=decisions, args=args),
+            lambda: _seed_weaviate(args, deferral_report=_deferral_report),
+            report=_deferral_report, rebuild_performed=_rebuild_was_performed,
+            runtime=lambda: _detect_container_runtime() or _runtime_preference_from_env() or "podman",
+        ) in (_install_weaviate.SEEDED, _install_weaviate.OWED)
 
         # A-6: seed/collections phase done — re-extend the update-gate
         # deadline before the schema-migration + resync + binary-refresh
@@ -7698,23 +7368,15 @@ def _apply_deferred_entries(
                 )
                 on_disk_hub_version = _read_dist_meta_version(hub_meta_name)
 
-                # Was a hand-written copy of the same comparison, NESTED in
-                # this function body — so it was redefined on every call and
-                # could be neither imported nor tested. One home now:
-                # vco_lib.version_compare (v0.2.96).
-                from vco_lib.version_compare import version_ge as _ge
-
-                launcher_ok = bool(
-                    source_version and on_disk_version
-                    and _ge(on_disk_version, source_version)
-                )
+                # ONE comparison home (vco_lib.version_compare via
+                # deferral_probes.version_reached): a non-X.Y.Z value is
+                # "not reached" + a logged line (F-W1-01), never a traceback.
+                launcher_ok = bool(source_version and on_disk_version and _deferral_probes.version_reached(
+                    on_disk_version, source_version, what=f"{cid} launcher sidecar"))
                 # Hub: absent sidecar → don't block on it (degrade to
                 # launcher-only, matching the Rust gate's caveat).
-                hub_ok = (
-                    on_disk_hub_version is None
-                    or (source_version is not None
-                        and _ge(on_disk_hub_version, source_version))
-                )
+                hub_ok = on_disk_hub_version is None or bool(source_version and _deferral_probes.version_reached(
+                    on_disk_hub_version, source_version, what=f"{cid} hub sidecar"))
                 resolved = launcher_ok and hub_ok
 
                 if resolved:
@@ -8512,52 +8174,21 @@ def _probe_system_ram_gb() -> float:
 # the runtime selector now lives in `templates/scripts/generate-kg-summary.py`
 # (which also calls `select_summary_backend` via the consolidated path).
 def _inference_models_for_capability(sysinfo: SystemInfo) -> list[str]:
-    """Return inference models to pull given detected capability.
-
-    v0.2.23 C10 consolidation: this function used to maintain its OWN
-    VRAM/RAM thresholds (vram >= 7.5 / 5.0 / 1.0; ram >= 24.0 / 12.0)
-    that DIVERGED from `select_summary_backend`'s thresholds (vram >=
-    16.0 / 6.0; ram >= 12.0 AND cores >= 6). The drift meant some hosts
-    pulled models they'd never use (qwen3.5:9b pulled at 8 GB VRAM but
-    runtime selector picks gemma) — wasted bandwidth + disk. The pull
-    list now derives from the SAME selector that runtime uses, so the
-    set of pulled models always matches the set runtime can pick.
-
-    Returns at minimum ["qwen3.5:0.8b"] — the floor model that fits down
-    to 4 GB RAM and is the universal fallback for any inference need.
-    The summary-backend's pick is added when it's a local Ollama model
-    (qwen3.5:9b / gemma4:e4b). For "cli" / "openai" / None picks, only
-    the floor is pulled — no local-summary model needed.
+    """The ONE text-generation model this host's tier uses (owner 2026-09-29:
+    no lower rungs — a missing lower rung at runtime degrades to the next
+    summary backend, never a pull). Derived from the SAME selector the runtime
+    uses (v0.2.23 C10), local tier only (CLI/OpenAI are not Ollama models):
+    ``qwen3.5:9b`` / ``gemma4:e4b``, else the always-fits floor ``qwen3.5:0.8b``.
     """
-    floor = "qwen3.5:0.8b"
-    cores = _probe_cpu_cores()
     summary_pick = select_summary_backend(
-        gpu_vram_gb=float(sysinfo.vram_gb or 0.0),
-        ram_gb=float(sysinfo.ram_gb or 0.0),
-        cores=cores,
-        # `claude_cli_available=False` for the pull-list derivation:
-        # even when the CLI is available, the runtime falls back to
-        # local models if the CLI fails mid-summary, so we still want
-        # the highest-tier local model available on disk as a safety
-        # net. Passing False here gives us the local-model pick that
-        # runtime WOULD use if CLI fell through.
-        claude_cli_available=False,
-        # `openai_consent=False` / `openai_key_available=False`: the
-        # same reasoning — when local hardware is the fallback, we
-        # need it pulled regardless of OpenAI availability.
-        openai_consent=False,
-        openai_key_available=False,
-    )
-    # Map the summary-backend ID back to its Ollama tag. CLI / OpenAI /
-    # None don't add to the pull list.
+        gpu_vram_gb=float(sysinfo.vram_gb or 0.0), ram_gb=float(sysinfo.ram_gb or 0.0),
+        cores=_probe_cpu_cores(), claude_cli_available=False,
+        openai_consent=False, openai_key_available=False)
     if summary_pick == _SUMMARY_BACKEND_QWEN35_9B:
-        return ["qwen3.5:9b", "gemma4:e4b", floor]
+        return ["qwen3.5:9b"]
     if summary_pick == _SUMMARY_BACKEND_GEMMA:
-        return ["gemma4:e4b", floor]
-    # summary_pick is None (no local viable) OR "cli" / "openai" (no
-    # local needed for the primary path; floor still pulled as the
-    # safety net for any other inference need).
-    return [floor]
+        return ["gemma4:e4b"]
+    return ["qwen3.5:0.8b"]
 
 
 # ---------------------------------------------------------------------------
@@ -8756,15 +8387,23 @@ def _container_runtime_reachable(container_cmd: str) -> bool:
 _podman_machine_auto_init_and_start = _compose_provider.podman_machine_init_and_start
 
 
-def _try_start_podman_daemon() -> tuple[bool, str]:
+def _heal_podman_reachability():
     """Start / heal podman's reachability — thin over
     :func:`vco_lib.compose_provider.heal_socket`: Linux `systemctl --user
     restart podman.socket` when the unit is active but the socket FILE is gone,
     `start` when it is down; macOS / Windows `_podman_machine_auto_init_and_start`.
-    Then `podman info` must answer. ``(success, detail)``; never raises."""
+    Then `podman info` must answer (folded into the REAL HealResult, W1R-03)."""
+    from vco_lib.compose_recovery import CID_SOCKET_HEAL_FAILED
     res = _compose_provider.heal_socket("podman", machine_start=_podman_machine_auto_init_and_start)
     if res.healed and _containers.daemon_responsive("podman") is not True:
-        return False, f"{res.reason}, but `podman info` still does not answer"
+        return _compose_provider.HealResult(False, res.actions, f"{res.reason}, but `podman info` still "
+                                            "does not answer", CID_SOCKET_HEAL_FAILED, res.details)
+    return res
+
+
+def _try_start_podman_daemon() -> tuple[bool, str]:
+    """``(success, detail)`` view of :func:`_heal_podman_reachability`; never raises."""
+    res = _heal_podman_reachability()
     return res.healed, res.reason
 
 
@@ -9872,6 +9511,7 @@ def _choose_embedding_config(sysinfo: SystemInfo, args: argparse.Namespace) -> d
     # the pull plan (step 7) then derives from this FINAL config.
     prior = _load_previous_choices().get("embedding_mode") or {}
     if prior.get("value") in EMBEDDING_CONFIGS:
+        print(f"[3] Embedding profile: verified, skipped (recorded profile '{prior['value']}' replayed)")
         config = dict(EMBEDDING_CONFIGS[prior["value"]])
         _apply_tier_overrides(config, code_pick=prior.get("code_model") or config["code_model"],
                               kg_pick=prior.get("text_model") or config["text_model"])
@@ -10940,16 +10580,13 @@ def _create_venv(project_root: Path) -> Path:
     else:
         venv_python = venv_dir / "bin" / "python"
 
-    if venv_python.exists():
-        # Verification beats log signal: even if resume says ok, the
-        # venv-python file is what matters. If it's gone, fall through to
-        # re-create. Resume log is a hint, not a contract.
-        print("already exists")
-        _log_install_event(
-            "3/10", "skip",
-            "venv already present",
-            data={"venv_python": str(venv_python)},
-        )
+    # Verification beats the log: the venv interpreter must exist AND run; a
+    # broken one falls through to `python -m venv` (which repairs in place).
+    _venv_ok, _venv_detail = _install_resume.venv_python_runs(venv_python) if venv_python.exists() else (False, "")
+    if _venv_ok:
+        print(f"verified, skipped ({_venv_detail})")
+        _log_install_event("3/10", "skip", "venv already present",
+                           data={"venv_python": str(venv_python), "resume_verified": _venv_detail})
         return venv_python
 
     # Don't use check=True with capture_output — we want to surface stderr on failure.
@@ -11266,6 +10903,10 @@ def _run_logged_subprocess(
 
 
 def _install_requirements(venv_python: Path, *, dev: bool) -> None:
+    from vco_lib.install_mcp import build_weaviate_mcp_import_verify_script
+    if _resume_verified("4/10", "Dependencies", _install_resume.deps_verifier(
+            PROJECT_ROOT, venv_python, dev=dev, weaviate_mcp_probe=build_weaviate_mcp_import_verify_script())):
+        return
     label = "with dev extras" if dev else "production"
     print(f"[4/10] Installing dependencies ({label}) ... ", flush=True)
     _log_install_event(
@@ -11439,7 +11080,6 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
     # surfaces later as an opaque crash; loud-fail with the missing list instead.
     print("[4/10] Verifying weaviate_mcp submodules import ... ", end="", flush=True)
     _log_install_event("4/10", "start", "verify weaviate_mcp submodule imports (FN-5b)")
-    from vco_lib.install_mcp import build_weaviate_mcp_import_verify_script
     _run_logged_subprocess(
         [str(venv_python), "-c", build_weaviate_mcp_import_verify_script()],
         step="4/10", phase_label="verify-weaviate_mcp-submodule-imports",
@@ -11456,7 +11096,8 @@ def _install_requirements(venv_python: Path, *, dev: bool) -> None:
         ],
     )
     print("OK")
-    _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)")
+    _log_install_event("4/10", "ok", "weaviate_mcp submodule imports verified (FN-5b)",
+                       data=_install_resume.deps_fingerprint(PROJECT_ROOT, dev=dev))  # the resume verifier's evidence
 
 
 def _materialize_orchestrator_self_claude_md(
@@ -11957,14 +11598,12 @@ def _service_endpoint_urls() -> dict:
     return _service_endpoints.machine_service_urls()
 
 
-def _weaviate_awaits_confirmation() -> bool:
+def _weaviate_awaits_confirmation(step: str = "Weaviate collections + seed") -> bool:
     """Unattended run, a third-party Weaviate without VCO data, no answer yet:
-    nothing may be created in (or seeded into) any Weaviate this run."""
-    if not _SERVICE_ENDPOINTS["weaviate_pending"]:
-        return False
-    print("[7b/10] Skipping Weaviate collections + seed: waiting for your choice about the "
-          "Weaviate already running (UPDATE_DEFERRED.md: service_adoption_confirmation_required).")
-    return True
+    nothing may be written into any Weaviate this run — the ONE gate,
+    :func:`vco_lib.install_weaviate.weaviate_write_allowed` (L1-F18)."""
+    return not _install_weaviate.weaviate_write_allowed(
+        _SERVICE_ENDPOINTS, step=step, log_event=_log_install_event)[0]
 
 
 def _verify_service_endpoints(deferral_report) -> None:
@@ -12360,7 +11999,7 @@ def _start_services(
             install_root=PROJECT_ROOT),
         _isu.Step5Hooks(
             log_event=_log_install_event, reachable=_container_runtime_reachable,
-            try_start_podman=_try_start_podman_daemon, try_start_docker=_try_start_docker_daemon,
+            heal_podman=_heal_podman_reachability, try_start_docker=_try_start_docker_daemon,
             emit_podman_start_failed=_emit_podman_daemon_start_failed_deferral,
             get_compose_command=_get_compose_command, write_infra_env=_write_infrastructure_env,
             compose_subst_env=_compose_substitution_env, gpu_tool_live=_gpu_tool_reports_live,
@@ -12387,32 +12026,27 @@ def _get_compose_command(container_cmd: str) -> list[str]:
     return [container_cmd, "compose"]
 
 
-def _wait_for_ollama() -> None:
-    """Step 6 — shim over :func:`vco_lib.ollama_pull.wait_ready_step`
-    (bounded; raises ``OllamaNotReadyError`` instead of "TIMEOUT, carry on")."""
-    _ollama_pull.wait_ready_step(_service_endpoint_urls()["ollama_url"],
-                                 timeout_s=HEALTH_TIMEOUT, log_event=_log_install_event)
+def _wait_for_ollama(recover=None):
+    """Step 6 — shim over :func:`vco_lib.ollama_pull.wait_ready_step` (bounded;
+    returns the typed ``OllamaNotReadyError`` instead of "TIMEOUT, carry on")."""
+    return _ollama_pull.wait_ready_step(_service_endpoint_urls()["ollama_url"], timeout_s=HEALTH_TIMEOUT,
+                                        log_event=_log_install_event, recover=recover)
 
 
-def _ollama_models_step(embed_config: dict, sysinfo, report, folder) -> int | None:
-    """Steps 6+7 (v0.2.100 AD-6): exactly the models in use — the plan runs on
-    the FINAL config (a replayed one included); a typed failure becomes a
-    deferral + exit 1 (None = carry on)."""
-    try:
-        _wait_for_ollama()
-        _pull_ollama_models(_embedding_pull_plan.plan_for_install(
+def _ollama_models_step(embed_config: dict, sysinfo, report) -> int | None:
+    """Steps 6+7 (v0.2.100 AD-6 + owner answers): exactly the models in use, the
+    plan on the FINAL config; Ollama down → restart it only if VCO owns it, else
+    continue with pulls + the KG seed owed to the retry driver; an embedding
+    pull failure → deferral + exit 1 (None = carry on)."""
+    out = _ollama_pull.install_step(
+        _service_endpoint_urls(), report, log_event=_log_install_event, timeout_s=HEALTH_TIMEOUT,
+        resume=_RESUME_ENABLED, plan=lambda: _embedding_pull_plan.plan_for_install(
             PROJECT_ROOT, embed_config, capability_tier=_inference_models_for_capability(sysinfo),
-            code_embed_url=_service_endpoint_urls()["code_embed_url"]), report)
-    except _ollama_pull.OllamaStepError as exc:
-        return _ollama_pull.fail_step(exc, report, folder)
-    return None
-
-
-def _pull_ollama_models(pull_plan, deferral_report=None) -> None:
-    """Step 7 — shim over :func:`vco_lib.ollama_pull.ensure_plan_step`
-    (raises ``OllamaPullError`` when an embedding model is not present)."""
-    _ollama_pull.ensure_plan_step(pull_plan, _service_endpoint_urls(), deferral_report,
-                                  log_event=_log_install_event)
+            code_embed_url=_service_endpoint_urls()["code_embed_url"], runtime=getattr(sysinfo, "container_cmd", "")),
+        recover=lambda: _ollama_pull.restart_owned_ollama(
+            PROJECT_ROOT, getattr(sysinfo, "container_cmd", ""), _SERVICE_ENDPOINTS["rows"].get("ollama")))
+    _SERVICE_ENDPOINTS["ollama_owed"] = out.owed
+    return out.rc
 
 
 def _probe_dual_ollama_instances(
@@ -12950,7 +12584,7 @@ def _ensure_collections(embed_config: dict,
     The resolved per-project / shared names are propagated back to
     `os.environ` so `_write_env_config` writes them into `.env`.
     """
-    if _weaviate_awaits_confirmation():
+    if _weaviate_awaits_confirmation("Weaviate collections"):
         return
     # Honor --skip-seed / --skip-collections: if the user opted out of
     # seeding, they almost certainly don't want us mutating schema either.
@@ -13406,8 +13040,8 @@ def _maybe_prompt_rebuild_collections(
       - non-interactive shell with no --yes — fail safe; no destructive
         action without confirmation
     """
-    if not args.update:
-        return False
+    if not args.update or _weaviate_awaits_confirmation("schema-drift rebuild / migrate"):
+        return False  # the gate first: neither --rebuild-collections nor --yes answers it
     if args.rebuild_collections:
         # Explicit opt-in. No prompt needed.
         return True
@@ -14155,7 +13789,7 @@ _SEED_OWED_WORK_CONDITION_ID = _install_weaviate.SEED_OWED_WORK_CONDITION_ID
 def _seed_weaviate(
     args: argparse.Namespace,
     deferral_report: "Optional[DeferralReport]" = None,
-) -> None:
+) -> "Optional[str]":
     """v0.2.44 V44-I: thin wrapper around :func:`_seed_weaviate_impl`
     that guarantees the ``_DUAL_CLONE_DETECTED_THIS_RUN`` module-level
     flag is reset to False after the call returns (even if the impl
@@ -14168,8 +13802,11 @@ def _seed_weaviate(
     cleanup is a no-op in normal operation.
     """
     global _DUAL_CLONE_DETECTED_THIS_RUN
-    if _weaviate_awaits_confirmation():
-        return None
+    if _weaviate_awaits_confirmation("Weaviate seed"):
+        return _install_weaviate.SKIPPED  # explicit — never read as a success (L1-F18)
+    if _SERVICE_ENDPOINTS.get("ollama_owed"):  # step 6: Ollama down → the retry driver seeds
+        print(f"[7c/10] Skipping the KG seed: Ollama is down ({_ollama_pull.NOT_READY_CID}).")
+        return _install_weaviate.OWED
     try:
         _DUAL_CLONE_DETECTED_THIS_RUN = False
         return _seed_weaviate_impl(args, deferral_report=deferral_report)
@@ -14793,6 +14430,8 @@ def _run_schema_migration_scripts(deferral_report: "DeferralReport") -> None:
 
     Soft-fail throughout: a runner exception never aborts install.py.
     """
+    if _weaviate_awaits_confirmation("schema migrations"):
+        return
     print("[7d/10] Running schema-correctness migrations ... ", flush=True)
     _log_install_event("7d/10", "start", "version-gated schema migrations")
 
@@ -14959,6 +14598,8 @@ def _trigger_codegraph_maintenance(deferral_report: "DeferralReport") -> None:
     owed gate honours the queued marker). One call site keeps main()'s span
     flat. All steps soft-fail.
     """
+    if _weaviate_awaits_confirmation("code-graph maintenance"):
+        return
     _trigger_codegraph_identity_sweep(deferral_report)
     try:  # v0.2.96 (M-2): truncation-exposure detection — logic in vco_lib
         from vco_lib.code_embed_exposure import detect_and_queue
@@ -22509,4 +22150,4 @@ def _run_uninstall(args: argparse.Namespace) -> int:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_install_deferral_flow.run_main(main))  # AD-9: every exit path flushes

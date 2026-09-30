@@ -1282,7 +1282,9 @@ def dogfood_gateway(
     if _time.monotonic() - started > DOGFOOD_TOTAL_BUDGET_S:
         return finish("skipped", None, "the dogfood budget ran out")
     version_ok, version_detail = _dogfood_version(port, timeout)
-    record("version", version_ok, version_detail)
+    record("version", version_ok is True, version_detail)
+    if version_ok is None:  # freshness UNKNOWN is never "fresh" (W1R-12)
+        return finish("skipped", None, version_detail)
     if not version_ok:
         return finish("refused", "dogfood:version", version_detail)
 
@@ -1416,8 +1418,12 @@ def _dogfood_vendor_model_id(
     return None
 
 
-def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
+def _dogfood_version(port: int, timeout: float) -> "tuple[Optional[bool], str]":
     """The daemon answering must not be older than this package.
+
+    Tri-state (v0.2.100 W1R-12): ``True`` fresh, ``False`` older (refuse),
+    ``None`` freshness UNKNOWN — a side is absent or not ``X.Y.Z`` — which the
+    caller reports as ``skipped``, never as a pass.
 
     A gateway left running from a previous install answers happily and
     without any of this release's fixes — the exact shape of the 2026-09-09
@@ -1438,7 +1444,7 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
     running = str(payload.get("version") or "")
     mine = _this_package_version()
     if not running or not mine:
-        return True, f"version comparison unavailable (running={running or '?'})"
+        return None, f"version comparison unavailable (running={running or '?'})"
     running_key, mine_key = _version_tuple(running), _version_tuple(mine)
     if running_key is None or mine_key is None:
         # Freshness UNKNOWN — the same answer as an absent version above,
@@ -1447,7 +1453,7 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
         # sees which side is malformed.
         bad = running if running_key is None else mine
         side = "running daemon" if running_key is None else "this install"
-        return True, (
+        return None, (
             f"version comparison unavailable: the {side} reports {bad!r}, "
             "which is not X.Y.Z"
         )

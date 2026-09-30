@@ -698,8 +698,8 @@ fn run_dismiss_cli(
         let stderr = String::from_utf8_lossy(&output.stderr);
         let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr");
         return Err(format!(
-            "dismiss-deferral exited {}: {}",
-            output.status.code().unwrap_or(-1),
+            "dismiss-deferral failed ({}): {}",
+            output.status,
             first,
         ));
     }
@@ -1380,4 +1380,40 @@ mod standby_tests {
         assert_typed_standby(&project_target(&db, "p1").unwrap_err());
     }
 
+}
+
+/// v0.2.100 WP-05 (I-06): a failed `dismiss-deferral` spawn names its exit
+/// status — a silent `exit 1` and a signal kill both carry evidence. Pre-fix
+/// the message was `exited 1: no stderr` / `exited -1: no stderr` (the -1 a
+/// signal erased into a made-up code).
+#[cfg(all(test, unix))]
+mod spawn_evidence_tests {
+    use super::*;
+
+    fn fake_python(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("python");
+        std::fs::write(&py, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dismiss_cli_failure_carries_the_exit_status() {
+        for (body, want) in [("exit 1", "exit status: 1"), ("kill -9 $$", "signal: 9")] {
+            let py = fake_python(body);
+            let interp = py.path().join("python");
+            let work = tempfile::tempdir().unwrap();
+            let err = {
+                let _env = vct_launcher_core::test_env::env_guard(&[(
+                    "VCT_VENV",
+                    Some(interp.to_str().unwrap()),
+                )]);
+                run_dismiss_cli(work.path(), work.path(), "some_condition")
+                    .expect_err("a failing CLI is an Err")
+            };
+            assert!(err.contains(want), "`{body}` → {err}");
+        }
+    }
 }

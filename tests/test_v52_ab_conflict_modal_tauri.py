@@ -257,17 +257,45 @@ class RustTauriCommandsTests(unittest.TestCase):
         # can inject a fake `git` per thread) and applies `.silent()`.
         git_cmd = (INSTALLER_RS.parent / "git_cmd.rs").read_text(encoding="utf-8")
         constructor = self._function_body(git_cmd, "pub(crate) fn git_command()")
+        # v0.2.100 WP-05: the program comes from ONE resolver, `git_program()`
+        # (which names "git"); the constructor still applies `.silent()`.
         self.assertRegex(
             constructor,
-            r'TokioCommand::new\([^\n]*"git"[^\n]*\)\.silent\(\)',
+            r'TokioCommand::new\(git_program\(\)\)\.silent\(\)',
             "the git_cmd runner must apply .silent() — every caller, including "
             "resolve_conflict_and_resume, inherits the Windows-console "
             "suppression from it",
         )
+        self.assertIn(
+            'spawn_program("git")',
+            self._function_body(git_cmd, "pub(crate) fn git_program()"),
+            "git_program() must resolve the git executable",
+        )
+        # v0.2.100 WP-05: run_git builds through `run_git_command` (adds
+        # kill_on_drop for the timeout) which itself calls git_command().
+        self.assertIn(
+            "TokioCommand::new(program).silent()",
+            self._function_body(git_cmd, "pub(crate) fn git_network_command("),
+            "git_network_command must apply .silent()",
+        )
+        self.assertIn(
+            "git_command()",
+            self._function_body(git_cmd, "fn run_git_command("),
+            "run_git_command must build its command through git_command()",
+        )
+        # v0.2.100 WP-05: the raw runners build through `raw_git_command`
+        # (adds kill_on_drop for network verbs), which calls git_command().
+        self.assertIn(
+            "git_command()",
+            self._function_body(git_cmd, "fn raw_git_command<"),
+            "raw_git_command must build its command through git_command()",
+        )
         for runner in ("pub(crate) async fn run_git(", "pub(crate) async fn run_git_raw_env<"):
-            self.assertIn(
-                "git_command()",
-                self._function_body(git_cmd, runner),
+            body = self._function_body(git_cmd, runner)
+            self.assertTrue(
+                "git_command()" in body or "run_git_command(" in body
+                or "raw_git_command(" in body
+                or "git_network_command(" in body,  # WP-05: silent + kill_on_drop
                 f"{runner} must build its command through git_command()",
             )
         self.assertNotIn(

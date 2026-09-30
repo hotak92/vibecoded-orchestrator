@@ -500,3 +500,128 @@ def test_sourcing_does_not_run_main(tmp_path: Path):
     # Log file MUST NOT have been touched — main() would have written
     # the "starting" line on entry.
     assert not log.exists(), f"sourcing wrote to log: {log.read_text()}"
+
+
+# ---------------------------------------------------------------------------
+# v0.2.100 WP-06: overlay by the compose ENGINE's label family (F-W1-14),
+# compose's exit status passed through (L2-F08), the data guard before compose
+# (F-W2-14), bash 3.2-safe empty arrays (L2-F16).
+# ---------------------------------------------------------------------------
+
+
+def _call_pick_family(runtime: str, gpu_mode: str, working_dir: str, family: str):
+    cmd = [
+        BASH or "bash", "-c",
+        f'source "{SCRIPT}"; OVERLAY_MISSING_WARNED=0; pick_compose_invocation "$1" "$2" "$3" "$4"',
+        "_", runtime, gpu_mode, working_dir, family,
+    ]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+    return proc.returncode, proc.stdout.strip()
+
+
+def test_the_overlay_follows_the_engine_family_not_the_runtime_name(tmp_path: Path):
+    """`podman compose` delegating to docker-compose parses the DOCKER
+    overlay; podman-compose (family podman) the podman one. Red against the
+    name-only pick (`podman compose` → podman overlay regardless)."""
+    infra = tmp_path / "infrastructure"
+    infra.mkdir()
+    (infra / "docker-compose.gpu.yml").write_text("services: {}\n")
+    (infra / "podman-compose.gpu.yml").write_text("services: {}\n")
+    rc, out = _call_pick_family("podman compose", "gpu", str(tmp_path), "docker")
+    assert rc == 0
+    assert out == "podman compose -f compose.yaml -f infrastructure/docker-compose.gpu.yml"
+    rc, out = _call_pick_family("podman compose", "gpu", str(tmp_path), "podman")
+    assert out == "podman compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml"
+    rc, out = _call_pick_family("docker", "gpu", str(tmp_path), "podman")
+    assert out == "docker compose -f compose.yaml -f infrastructure/podman-compose.gpu.yml"
+
+
+def test_the_family_comes_from_the_python_provider_rule(tmp_path: Path):
+    """detect_label_family asks vco_lib.compose_provider (no shell copy of
+    the rule): a standalone podman-compose is the podman family, `docker
+    compose` the docker family."""
+    fake = tmp_path / "bin"
+    fake.mkdir()
+    for name in ("podman-compose", "docker", "podman"):
+        (fake / name).write_text("#!/usr/bin/env bash\nexit 0\n")
+        (fake / name).chmod(0o755)
+    import os
+    import sys
+    env = {**os.environ, "PATH": f"{fake}{os.pathsep}{os.environ.get('PATH', '')}",
+           "PYTHONPATH": str(REPO_ROOT)}
+    for rt, cmd, want in (("podman", "podman-compose", "podman"), ("docker", "docker compose", "docker")):
+        proc = subprocess.run(
+            [BASH or "bash", "-c",
+             f'source "{SCRIPT}"; STACK_PY="{sys.executable}"; detect_label_family "$1" "$2"',
+             "_", rt, cmd],
+            capture_output=True, text=True, timeout=60, env=env)
+        assert proc.returncode == 0, proc.stderr
+        assert proc.stdout.strip() == want, (rt, cmd, proc.stdout, proc.stderr)
+
+
+def test_every_possibly_empty_array_expansion_is_bash32_safe():
+    """macOS /bin/bash 3.2 with `set -u` errors on `"${arr[@]}"` of an EMPTY
+    array (bash >= 4.4 does not, so no runtime here can show it). Every array
+    that can be empty must use `${arr[@]+"${arr[@]}"}`; `up_args` is the one
+    array expanded only after a non-empty check."""
+    import re
+    text = SCRIPT.read_text(encoding="utf-8")
+    bare = set(re.findall(r'(?<!\+)"\$\{(\w+)\[@\]\}"', text))
+    guarded = set(re.findall(r'\$\{(\w+)\[@\]\+"\$\{\1\[@\]\}"\}', text))
+    assert bare - guarded <= {"up_args"}, sorted(bare - guarded)
+    assert {"candidates", "build_flag"} <= guarded
+
+
+def _wrapper_machine(tmp_path: Path, compose_up_exit: int, config_exit: int = 0):
+    from tests.test_v0297_lifecycle_hooks import _Machine, _row
+    m = _Machine(tmp_path, [_row("weaviate"), _row("ollama"), _row("code_embed")],
+                 {"vco_weaviate": "exited"})
+    for fake in ("vco-fake-compose", "podman-compose"):
+        body = (m.bin / fake).read_text()
+        body = body.replace('  exit 0\nfi\n', f'  exit {config_exit}\nfi\n', 1)
+        body = body.rstrip().rsplit("exit 0", 1)[0] + f"exit {compose_up_exit}\n"
+        (m.bin / fake).write_text(body)
+        (m.bin / fake).chmod(0o755)
+    return m
+
+
+def _run_stack(m, shell: str, services: str):
+    from tests.test_v0297_lifecycle_hooks import PWSH, WRAPPER_PS1, WRAPPER_SH
+    argv = (["bash", str(WRAPPER_SH), "start"] if shell == "bash" else
+            [PWSH, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(WRAPPER_PS1), "start"])
+    return subprocess.run(argv, env={**m.env(), "VCO_COMPOSE_SERVICES": services},
+                          capture_output=True, text=True, timeout=240, cwd=str(m.tmp))
+
+
+def _shells():
+    from tests.test_v0297_lifecycle_hooks import IS_WINDOWS, PWSH
+    return (["bash"] if not IS_WINDOWS else []) + (["pwsh"] if PWSH else [])
+
+
+@pytest.mark.parametrize("shell", _shells())
+def test_compose_exit_125_is_passed_through(tmp_path: Path, shell: str):
+    """L2-F08: podman-compose exit 125 ("a container failed to start") is the
+    wrapper's exit status — never mapped to 0 (the watchdog booked exactly
+    that as "restart issued successfully"). Red against `0|125) exit 0`."""
+    m = _wrapper_machine(tmp_path, compose_up_exit=125)
+    proc = _run_stack(m, shell, "ollama")
+    assert m.compose_calls(), proc.stdout + proc.stderr
+    assert proc.returncode == 125, proc.stdout + proc.stderr
+
+
+@pytest.mark.parametrize("shell", _shells())
+def test_the_data_guard_runs_before_compose_and_a_refusal_composes_nothing(tmp_path: Path, shell: str):
+    """F-W2-14: the wrapper composes only what the guarded verb cleared. With
+    an existing Weaviate container whose compose render cannot be read, the
+    guard refuses: nothing is composed, nothing removed, exit 6."""
+    m = _wrapper_machine(tmp_path, compose_up_exit=0, config_exit=1)
+    proc = _run_stack(m, shell, "weaviate")
+    assert m.compose_calls() == [], proc.stdout + proc.stderr
+    assert proc.returncode == 6, proc.stdout + proc.stderr
+    assert not any(c[:1] == ["rm"] for c in m.runtime_calls()), m.runtime_calls()
+    # … and a service with nothing to lose is cleared and composed.
+    (tmp_path / "m2").mkdir()
+    m2 = _wrapper_machine(tmp_path / "m2", compose_up_exit=0)
+    proc = _run_stack(m2, shell, "ollama")
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert len(m2.compose_calls()) == 1

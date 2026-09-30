@@ -966,6 +966,9 @@ pub fn build_podman_run_args_with_env(
     args.push("-d".into());
     args.push("--name".into());
     args.push(container_name.to_string());
+    // v0.2.100 (WP-06, L2-F17): the launcher's creation label — the ONLY
+    // thing the orphan reaper accepts as "this install made it".
+    args.extend(super::container_ownership::launcher_label_args());
 
     if runtime.auto_restart {
         args.push("--restart=unless-stopped".into());
@@ -1142,6 +1145,9 @@ pub fn build_podman_run_args_global_inheriting(
     args.push("-d".into());
     args.push("--name".into());
     args.push(container_name.to_string());
+    // v0.2.100 (WP-06, L2-F17): the launcher's creation label — the ONLY
+    // thing the orphan reaper accepts as "this install made it".
+    args.extend(super::container_ownership::launcher_label_args());
 
     if runtime.auto_restart {
         args.push("--restart=unless-stopped".into());
@@ -1411,6 +1417,9 @@ pub struct ContainerSnapshot {
     pub image: String,
     /// The container's CMD as podman reports it (string-joined argv).
     pub cmd: String,
+    /// v0.2.100 (WP-06): the container's labels — the reaper removes only a
+    /// container carrying THIS install's launcher label.
+    pub labels: super::container_ownership::Labels,
 }
 
 /// v0.2.52 V52-D.2: classify a single container snapshot against the
@@ -1530,178 +1539,330 @@ pub fn parse_podman_ps_json(json_str: &str) -> Result<Vec<ContainerSnapshot>, St
             // No usable name → cannot reap by name; skip.
             continue;
         }
+        let labels = super::container_ownership::labels_from_ps_row(entry);
         out.push(ContainerSnapshot {
             name,
             image,
             cmd: cmd_parts,
+            labels,
         });
     }
     Ok(out)
 }
 
+/// v0.2.100 (WP-06, L2-F17): what the reaper may do with one examined
+/// container. The DB verdict alone never removes anything any more: the
+/// container must ALSO carry THIS install's launcher label
+/// ([`super::container_ownership::LAUNCHER_LABEL`]), set at creation by
+/// [`build_podman_run_args_with_env`] / [`build_podman_run_args_global_inheriting`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapDecision {
+    /// Healthy — nothing to do.
+    Keep,
+    /// Pathological AND labelled by this install: `rm -f`.
+    Remove(ReaperVerdict),
+    /// Pathological by the DB, but unlabelled (pre-0.2.100 or not ours):
+    /// never removed; logged once and recorded (`module_container_unlabelled`).
+    LeaveUnlabelled(ReaperVerdict),
+    /// Pathological by the DB, but labelled by ANOTHER install: never removed.
+    LeaveOtherInstall(ReaperVerdict, String),
+}
+
+/// Pure: the reaper's decision for one snapshot (name filter already
+/// passed). Requires the DB verdict AND the launcher label.
+pub fn reap_decision<F>(
+    snap: &ContainerSnapshot,
+    claimed_names: &std::collections::HashSet<String>,
+    expected_image_for: F,
+    owner_id: Option<&str>,
+) -> ReapDecision
+where
+    F: Fn(&str) -> Option<String>,
+{
+    use super::container_ownership::{launcher_label_verdict, LabelVerdict};
+    let verdict = classify_container_for_reaper(snap, claimed_names, expected_image_for);
+    if verdict == ReaperVerdict::Healthy {
+        return ReapDecision::Keep;
+    }
+    match launcher_label_verdict(&snap.labels, owner_id) {
+        LabelVerdict::Ours => ReapDecision::Remove(verdict),
+        LabelVerdict::Unlabelled => ReapDecision::LeaveUnlabelled(verdict),
+        LabelVerdict::OtherInstall(id) => ReapDecision::LeaveOtherInstall(verdict, id),
+    }
+}
+
+/// What one reaper pass did.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReapReport {
+    pub reaped: usize,
+    pub errors: usize,
+    /// Pathological-by-DB containers left alone because they carry no
+    /// launcher label (the `module_container_unlabelled` record).
+    pub unlabelled: Vec<String>,
+    /// … left alone because another install's launcher created them.
+    pub other_install: Vec<String>,
+}
+
 /// v0.2.52 V52-D.2: top-level reaper entry point. Enumerates all
-/// containers via `<runtime> ps -a --format json`, classifies each
-/// against the supplied DB-state lookups, and issues `<runtime> rm -f`
-/// on every BrokenCmd / Orphan / StaleImage verdict.
+/// containers via `<runtime> ps -a --format json`, and for every one the
+/// `name_filter` admits, removes it (`rm -f`) ONLY when the DB verdict is
+/// BrokenCmd / Orphan / StaleImage AND (v0.2.100) it carries THIS install's
+/// launcher label — see [`reap_decision`]. An unlabelled or
+/// foreign-labelled container of the same name shape is never removed and is
+/// logged once.
 ///
-/// Soft-fail throughout:
-/// * `<runtime> ps` failure: log + return (no reaping this pass).
-/// * `<runtime> rm` failure: log per-container + continue.
-///
-/// Returns `(reaped_count, error_count)` for forensic visibility.
+/// Soft-fail throughout: a `ps` failure reaps nothing this pass; an `rm`
+/// failure is logged per container.
 ///
 /// Args:
 /// * `runtime`: `"podman"` or `"docker"`.
-/// * `claimed_names`: set of container_names referenced by at least
-///   one `module_installs` row.
-/// * `expected_image_for`: lookup mapping container_name to expected
-///   image:tag for the DB-claimed containers.
-/// * `name_filter`: optional predicate that says whether a container
-///   name should be examined at all. The reaper is scoped — it
-///   should NEVER touch containers from unrelated software (Weaviate,
-///   Ollama, user's own podman work). Default callers pass a filter
-///   that matches launcher-managed module name patterns.
+/// * `claimed_names`: container_names referenced by `module_installs` rows.
+/// * `expected_image_for`: container_name → expected image:tag.
+/// * `name_filter`: which names are examined at all (launcher-managed module
+///   name patterns — never Weaviate / Ollama / the user's own containers).
+/// * `owner_id`: THIS install's id ([`super::container_ownership::launcher_owner_id`]);
+///   `None` reaps nothing.
 pub async fn reap_pathological_containers<F, G>(
     runtime: &str,
     claimed_names: &std::collections::HashSet<String>,
     expected_image_for: F,
     name_filter: G,
-) -> (usize, usize)
+    owner_id: Option<&str>,
+) -> ReapReport
 where
     F: Fn(&str) -> Option<String>,
     G: Fn(&str) -> bool,
 {
-    use crate::process::CommandExt as _;
-    use std::process::Stdio;
-    use tokio::process::Command;
+    let runner = super::container_ownership::RuntimeRunner {
+        binary: std::path::PathBuf::from(runtime),
+        runtime: runtime.to_string(),
+    };
+    reap_with(&runner, claimed_names, expected_image_for, name_filter, owner_id).await
+}
 
-    let ps_output = match Command::new(runtime)
-        .silent()
-        .args(["ps", "-a", "--format", "json"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
+/// [`reap_pathological_containers`] over any runner (tests script a fake).
+pub async fn reap_with<R, F, G>(
+    runner: &R,
+    claimed_names: &std::collections::HashSet<String>,
+    expected_image_for: F,
+    name_filter: G,
+    owner_id: Option<&str>,
+) -> ReapReport
+where
+    R: super::container_ownership::ContainerRunner,
+    F: Fn(&str) -> Option<String>,
+    G: Fn(&str) -> bool,
+{
+    use super::container_ownership::first_time;
+    let runtime = runner.runtime_name().to_string();
+    let mut report = ReapReport::default();
+
+    let ps_output = match runner
+        .run(&["ps", "-a", "--format", "json"], std::time::Duration::from_secs(30))
         .await
     {
         Ok(o) => o,
         Err(e) => {
             tracing::warn!(
-                runtime,
+                runtime = %runtime,
                 error = %e,
-                "[container_runtime] V52-D.2 reaper: spawn `ps` failed"
+                "[container_runtime] V52-D.2 reaper: `ps` could not run"
             );
-            return (0, 1);
+            report.errors = 1;
+            return report;
         }
     };
-
-    if !ps_output.status.success() {
+    if !ps_output.success {
         tracing::warn!(
-            runtime,
-            exit_code = ps_output.status.code().unwrap_or(-1),
-            stderr = %String::from_utf8_lossy(&ps_output.stderr).chars().take(300).collect::<String>(),
+            runtime = %runtime,
+            stderr = %ps_output.stderr.chars().take(300).collect::<String>(),
             "[container_runtime] V52-D.2 reaper: `ps` exited non-zero"
         );
-        return (0, 1);
+        report.errors = 1;
+        return report;
     }
 
-    let stdout = String::from_utf8_lossy(&ps_output.stdout);
     // Podman's `--format json` returns `null` (not `[]`) when no
-    // containers exist on a fresh machine. Treat that as "no rows
-    // to scan".
-    if stdout.trim() == "null" || stdout.trim().is_empty() {
-        return (0, 0);
+    // containers exist on a fresh machine. Treat that as "no rows".
+    let stdout = ps_output.stdout.trim();
+    if stdout == "null" || stdout.is_empty() {
+        return report;
     }
-    let snapshots = match parse_podman_ps_json(&stdout) {
+    let snapshots = match parse_podman_ps_json(stdout) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(
-                runtime,
+                runtime = %runtime,
                 error = %e,
                 "[container_runtime] V52-D.2 reaper: parse `ps` json failed"
             );
-            return (0, 1);
+            report.errors = 1;
+            return report;
         }
     };
-
-    let mut reaped = 0usize;
-    let mut errors = 0usize;
 
     for snap in &snapshots {
         if !name_filter(&snap.name) {
             continue;
         }
-        let verdict =
-            classify_container_for_reaper(snap, claimed_names, &expected_image_for);
-        match verdict {
-            ReaperVerdict::Healthy => continue,
-            ReaperVerdict::BrokenCmd => {
-                tracing::info!(
-                    container = %snap.name,
-                    image = %snap.image,
-                    "[container_runtime] V52-D.2 reaper: reaping BrokenCmd container \
-                     (cmd contains '{{module_image}}')"
-                );
+        let verdict = match reap_decision(snap, claimed_names, &expected_image_for, owner_id) {
+            ReapDecision::Keep => continue,
+            ReapDecision::LeaveUnlabelled(v) => {
+                if first_time(&format!("reaper-unlabelled:{}", snap.name)) {
+                    tracing::info!(
+                        container = %snap.name,
+                        verdict = ?v,
+                        "[container_runtime] reaper: NOT removing — the container carries no \
+                         launcher ownership label (created before v0.2.100, or not by this \
+                         launcher). Remove it yourself if it is a leftover."
+                    );
+                }
+                report.unlabelled.push(snap.name.clone());
+                continue;
             }
-            ReaperVerdict::Orphan => {
-                tracing::info!(
-                    container = %snap.name,
-                    image = %snap.image,
-                    "[container_runtime] V52-D.2 reaper: reaping Orphan container \
-                     (no DB row claims this name)"
-                );
+            ReapDecision::LeaveOtherInstall(v, id) => {
+                if first_time(&format!("reaper-other:{}", snap.name)) {
+                    tracing::info!(
+                        container = %snap.name,
+                        verdict = ?v,
+                        other_install = %id,
+                        "[container_runtime] reaper: NOT removing — another VCO install's \
+                         launcher created this container"
+                    );
+                }
+                report.other_install.push(snap.name.clone());
+                continue;
             }
-            ReaperVerdict::StaleImage => {
-                let expected = expected_image_for(&snap.name).unwrap_or_default();
-                tracing::info!(
-                    container = %snap.name,
-                    running = %snap.image,
-                    expected = %expected,
-                    "[container_runtime] V52-D.2 reaper: reaping StaleImage container"
-                );
-            }
-        }
-
-        let rm_status = Command::new(runtime)
-            .silent()
-            .args(["rm", "-f", &snap.name])
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .output()
-            .await;
-        match rm_status {
-            Ok(o) if o.status.success() => {
-                reaped += 1;
-            }
+            ReapDecision::Remove(v) => v,
+        };
+        tracing::info!(
+            container = %snap.name,
+            image = %snap.image,
+            verdict = ?verdict,
+            "[container_runtime] V52-D.2 reaper: removing a pathological container this \
+             launcher created"
+        );
+        match runner
+            .run(&["rm", "-f", &snap.name], std::time::Duration::from_secs(60))
+            .await
+        {
+            Ok(o) if o.success => report.reaped += 1,
             Ok(o) => {
-                errors += 1;
+                report.errors += 1;
                 tracing::warn!(
-                    runtime,
+                    runtime = %runtime,
                     container = %snap.name,
-                    exit_code = o.status.code().unwrap_or(-1),
-                    stderr = %String::from_utf8_lossy(&o.stderr).chars().take(200).collect::<String>(),
+                    stderr = %o.stderr.chars().take(200).collect::<String>(),
                     "[container_runtime] V52-D.2 reaper: `rm -f` exited non-zero"
                 );
             }
             Err(e) => {
-                errors += 1;
+                report.errors += 1;
                 tracing::warn!(
-                    runtime,
+                    runtime = %runtime,
                     container = %snap.name,
                     error = %e,
-                    "[container_runtime] V52-D.2 reaper: spawn `rm` failed"
+                    "[container_runtime] V52-D.2 reaper: `rm` could not run"
                 );
             }
         }
     }
 
-    if reaped > 0 || errors > 0 {
+    if report.reaped > 0 || report.errors > 0 {
         tracing::info!(
-            reaped,
-            errors,
+            reaped = report.reaped,
+            errors = report.errors,
             "[container_runtime] V52-D.2 reaper: pass complete"
         );
     }
-    (reaped, errors)
+    report
+}
+
+/// The module-container reaper pass both surfaces run before their resume
+/// sweep (the launcher's `module_service` and the hub's `module_supervisor`
+/// — v0.2.100 WP-06: one home for the inputs they used to build twice).
+/// `claimed` = `(project_id, module_id, container_name)` rows;
+/// `expected` = container_name → expected image:tag. Examines only names
+/// equal to a claimed module id or `<module id>-…`, and removes only what
+/// [`reap_decision`] allows for THIS install's owner id.
+pub async fn reap_module_containers(
+    runtime: &str,
+    claimed: &[(Option<String>, String, String)],
+    expected: std::collections::HashMap<String, String>,
+) -> ReapReport {
+    use std::collections::HashSet;
+    let claimed_names: HashSet<String> = claimed.iter().map(|(_p, _m, c)| c.clone()).collect();
+    let prefixes: HashSet<String> = claimed.iter().map(|(_p, m, _c)| m.clone()).collect();
+    let name_filter = move |name: &str| -> bool { module_name_matches(&prefixes, name) };
+    let owner = super::container_ownership::launcher_owner_id();
+    if owner.is_none() && super::container_ownership::first_time("reaper-no-owner") {
+        tracing::warn!(
+            "[container_runtime] reaper: this install's root could not be resolved, so no \
+             container can be proven ours — nothing is removed"
+        );
+    }
+    reap_pathological_containers(
+        runtime,
+        &claimed_names,
+        move |n: &str| expected.get(n).cloned(),
+        name_filter,
+        owner.as_deref(),
+    )
+    .await
+}
+
+/// v0.2.100 (WP-06, L2-F17): keep the `module_container_unlabelled` record
+/// true after a reaper pass — written (one row, the names) while a pass
+/// leaves unlabelled module containers alone, resolved by the first pass
+/// that finds none. Paired-resolution: this is the site the registry row
+/// names. Both reaper surfaces call it; best-effort (a ledger failure is
+/// logged, never blocks the resume sweep).
+pub fn record_unlabelled_modules(unlabelled: &[String]) {
+    let Ok(root) = super::install_root::resolve_current_exe_without_db() else {
+        return;
+    };
+    let root = root.path;
+    let result = if unlabelled.is_empty() {
+        super::deferral_bridge::resolve_deferral_conditions(&root, &root, &["module_container_unlabelled"])
+    } else {
+        let detected = format!(
+            "Module container(s) {} match a module the launcher manages and look like leftovers \
+             (orphaned, stale image, or a broken command), but carry no launcher ownership label \
+             ({}) — they were created before v0.2.100 or not by this launcher.",
+            unlabelled.join(", "),
+            super::container_ownership::LAUNCHER_LABEL
+        );
+        let command = format!(
+            "Nothing is required. The launcher never removes a container it cannot prove it \
+             created. If these are your leftovers, remove them yourself (`podman rm -f {}` or \
+             the docker equivalent); the module's next start creates a labelled one.",
+            unlabelled.join(" ")
+        );
+        super::deferral_bridge::emit_deferral_entry(
+            &root,
+            &root,
+            &super::deferral_bridge::DeferralEntryFields {
+                condition_id: "module_container_unlabelled",
+                title: "Unlabelled module container(s) left alone by the reaper",
+                detected: &detected,
+                why_deferred: "Removal requires proof of ownership (the launcher label set at \
+                               creation); a database claim alone is not proof.",
+                command_to_apply: &command,
+                severity: "info",
+            },
+        )
+    };
+    if let Err(e) = result {
+        tracing::warn!("[container_runtime] module_container_unlabelled record not updated: {}", e);
+    }
+}
+
+/// Is `name` a module container name for one of `module_ids`
+/// (`<id>` or `<id>-<suffix>`)?
+pub fn module_name_matches(module_ids: &std::collections::HashSet<String>, name: &str) -> bool {
+    module_ids
+        .iter()
+        .any(|p| name == p.as_str() || name.strip_prefix(p.as_str()).is_some_and(|r| r.starts_with('-')))
 }
 
 // ─── Per-pull auth (v0.2.47 cross-runtime) ─────────────────────────────
@@ -4870,6 +5031,7 @@ mod tests {
             name: name.into(),
             image: image.into(),
             cmd: cmd.into(),
+            labels: Default::default(),
         }
     }
 
@@ -5234,6 +5396,99 @@ mod tests {
         let json = r#"{"9000/tcp":[{"HostPort":"22000"}],"11438/tcp":[{"HostPort":"11450"}]}"#;
         // Keys sort lexicographically: "11438/tcp" < "9000/tcp".
         assert_eq!(parse_published_host_port(json), Some(11450));
+    }
+
+    // ─── v0.2.100 WP-06 (L2-F17): the reaper needs the launcher label ───
+
+    fn ps_row(name: &str, launcher_label: Option<&str>) -> serde_json::Value {
+        let mut labels = serde_json::Map::new();
+        if let Some(v) = launcher_label {
+            labels.insert(
+                crate::services::container_ownership::LAUNCHER_LABEL.into(),
+                serde_json::Value::String(v.into()),
+            );
+        }
+        serde_json::json!({
+            "Names": [name],
+            "Image": "ghcr.io/x/vct-rl-reranker:0.1.0",
+            "Command": ["python", "-m", "rl_server"],
+            "Labels": labels,
+        })
+    }
+
+    async fn reap_rows(rows: Vec<serde_json::Value>) -> (ReapReport, Vec<Vec<String>>) {
+        use crate::services::container_ownership::fake::{ok, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("ps", ok(&serde_json::Value::Array(rows).to_string()));
+        r.on("rm", ok(""));
+        let claimed = claimed_set(&["vct-rl-reranker-proj"]);
+        let ids: std::collections::HashSet<String> = ["vct-rl-reranker".to_string()].into_iter().collect();
+        let report = reap_with(
+            &r,
+            &claimed,
+            |_| None,
+            move |n: &str| module_name_matches(&ids, n),
+            Some("ours0123456789ab"),
+        )
+        .await;
+        let rms = r.calls.borrow().iter().filter(|c| c[0] == "rm").cloned().collect();
+        (report, rms)
+    }
+
+    /// ACT: an orphan this install labelled is removed.
+    #[tokio::test]
+    async fn v02100_reaper_removes_a_labelled_orphan() {
+        let (report, rms) = reap_rows(vec![ps_row("vct-rl-reranker", Some("ours0123456789ab"))]).await;
+        assert_eq!(report.reaped, 1);
+        assert_eq!(rms, vec![vec!["rm".to_string(), "-f".into(), "vct-rl-reranker".into()]]);
+    }
+
+    /// LEAVE-ALONE: the same name shape, unlabelled or labelled by another
+    /// install, is never `rm -f`'d — reported instead.
+    #[tokio::test]
+    async fn v02100_reaper_never_removes_unlabelled_or_foreign_labelled() {
+        let (report, rms) = reap_rows(vec![
+            ps_row("vct-rl-reranker", None),
+            ps_row("vct-rl-reranker-old", Some("another-install")),
+        ])
+        .await;
+        assert!(rms.is_empty(), "nothing may be removed: {rms:?}");
+        assert_eq!(report.reaped, 0);
+        assert_eq!(report.unlabelled, vec!["vct-rl-reranker"]);
+        assert_eq!(report.other_install, vec!["vct-rl-reranker-old"]);
+    }
+
+    /// With no owner id (root unresolved) nothing is provably ours.
+    #[test]
+    fn v02100_no_owner_id_reaps_nothing() {
+        let mut s = snap("vct-rl-reranker", "img:1", "python");
+        s.labels.insert(crate::services::container_ownership::LAUNCHER_LABEL.into(), "x".into());
+        let d = reap_decision(&s, &claimed_set(&[]), |_| None, None);
+        assert!(matches!(d, ReapDecision::LeaveOtherInstall(ReaperVerdict::Orphan, _)), "{d:?}");
+    }
+
+    #[test]
+    fn v02100_module_name_filter_is_exact_or_dash_suffixed() {
+        let ids: std::collections::HashSet<String> = ["vct-rl".to_string()].into_iter().collect();
+        assert!(module_name_matches(&ids, "vct-rl"));
+        assert!(module_name_matches(&ids, "vct-rl-proj"));
+        assert!(!module_name_matches(&ids, "vct-rlx"));
+        assert!(!module_name_matches(&ids, "vco_ollama"));
+    }
+
+    /// Module containers carry the launcher label from creation.
+    #[test]
+    fn v02100_run_args_carry_the_launcher_label_when_the_root_resolves() {
+        let manifest = make_manifest(true, true);
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let args = build_podman_run_args_global(&manifest, &ctx, 11450, "c", "img:1", "podman", None, &[]).unwrap();
+        let want = crate::services::container_ownership::launcher_label_args();
+        if want.is_empty() {
+            eprintln!("skipping: no install root resolves from this test binary");
+            return;
+        }
+        let at = args.iter().position(|a| a == "--label").expect("--label present");
+        assert_eq!(args[at..at + 2].to_vec(), want);
     }
 }
 

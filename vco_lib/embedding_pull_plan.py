@@ -10,7 +10,8 @@ Owner rule (2026-09-29): pull ONLY the models VCO actually uses —
 * **code graph** — exactly ONE embedder, never dual: CodeSage runs in the
   code_embed service (NO Ollama model); otherwise jina or qwen3 (shared with
   the KG);
-* **text generation** — the host's capability tier;
+* **text generation** — the ONE model of the host's capability tier (no
+  lower rungs);
 * nothing else.
 
 Before v0.2.100 the pull list had four homes (``EMBEDDING_CONFIGS``' static
@@ -181,7 +182,12 @@ def plan(
     else:
         code = code_model
         why.append(f"code embedder: {code_model}")
-    inference = tuple(profile_override) if profile_override else tuple(capability_tier)
+    # Owner 2026-09-29: text generation pulls ONLY the single model the tier
+    # uses — never the lower rungs. The ladder's first entry is that model (a
+    # multi-rung tier recorded by an older run collapses to it here, the ONE
+    # home of the rule); an absent lower rung at runtime degrades to the next
+    # summary backend (summary_backends.ollama_available), never a pull.
+    inference = (tuple(profile_override) if profile_override else tuple(capability_tier))[:1]
     why.append(
         ("text generation (profile cap): " if profile_override else "text generation tier: ")
         + (", ".join(inference) or "none")
@@ -354,18 +360,26 @@ def plan_for_install(
     capability_tier: Sequence[str],
     code_embed_url: Optional[str] = None,
     launcher_db: Optional[Path] = None,
+    runtime: str = "",
 ) -> PullPlan:
     """install.py step 7: record this run's profile, then derive the machine
     plan exactly as the launcher toggle does. Applied to the FINAL config —
     after tier overrides and on a replayed ``embedding_mode`` alike. A
     CodeSage config probes the code_embed service (bounded) so an outage is
-    reported instead of being papered over with another embedder."""
+    reported instead of being papered over with another embedder — and a
+    service still LOADING its model (a running container, or a port that
+    accepts but has not answered yet) is not an outage (W3R-04)."""
     record_profile(root, embed_config, capability_tier)
     reachable: Optional[bool] = None
     if embed_config.get("code_model") == CODE_CODESAGE:
-        from vco_lib.ollama_pull import code_embed_reachable
+        from vco_lib import ollama_pull as _op
 
-        reachable = code_embed_reachable(code_embed_url)
+        state = _op.code_embed_state(
+            code_embed_url, container_running=lambda: _op.code_embed_container_running(runtime))
+        if state == _op.CODE_EMBED_WARMING:
+            print("    - code_embed is loading its model (first start downloads it) — "
+                  "warming, not down; nothing to do")
+        reachable = None if state is None else state != _op.CODE_EMBED_DOWN
     return plan_from_machine(root, launcher_db, code_embed_reachable=reachable)
 
 
@@ -373,8 +387,9 @@ def plan_for_install(
 
 
 def code_embed_unavailable_entry(detail: str) -> Any:
-    """``code_embed_backend_unavailable`` — shared by install step 7 and the
-    embedding service's construction-time probe."""
+    """``code_embed_backend_unavailable`` — written by install step 7 only, for a
+    code_embed that is DOWN (never for one still loading its model, and never
+    from the embedding service's construction — W3R-04)."""
     from vco_lib.deferral_report import DeferralEntry
 
     return DeferralEntry(

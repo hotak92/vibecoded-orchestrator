@@ -91,6 +91,13 @@ def looks_like_orchestrator_root(repo_path: "str | Path") -> bool:
 
     Never raises — returns False on any filesystem error (conservative:
     unknown → treat as a user project → exclude ``.claude``).
+
+    NOT the install-root identity rule (v0.2.100 F-W1-05): that is
+    :func:`vco_lib.orchestrator_identity.is_orchestrator_clone` (manifest id
+    ``orchestrator``). This structural heuristic answers a different question
+    — "is ``.claude/`` first-party source here" — and must stay true for a
+    development tree without a manifest; use the identity rule wherever the
+    answer is WRITTEN or trusted as "this is the orchestrator install".
     """
     try:
         root = Path(repo_path)

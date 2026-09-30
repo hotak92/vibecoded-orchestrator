@@ -83,7 +83,9 @@ class Step5Hooks:
 
     log_event: LogEvent
     reachable: Callable[[str], bool]
-    try_start_podman: Callable[[], "tuple[bool, str]"]
+    #: the podman start/heal: the REAL :class:`HealResult` (W1R-03) — the ledger
+    #: row then names only the commands that actually ran
+    heal_podman: Callable[[], "_cp.HealResult"]
     try_start_docker: Callable[[], "tuple[bool, str]"]
     emit_podman_start_failed: Callable[..., None]
     get_compose_command: Callable[[str], list]
@@ -119,6 +121,25 @@ def compose_timeout_s(env: Optional[dict] = None) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _rerun_cmd(plan: Step5Plan) -> str:
+    """The re-run a ledger row prints: ``--update`` only for an update run — a
+    fresh install that never completed is re-run as an install (W1R-03)."""
+    return "python install.py --update" if getattr(plan.args, "update", False) else "python install.py"
+
+
+def _info_stderr(rt: str, hooks: Step5Hooks) -> str:
+    """The last stderr line of ``<rt> info`` — the ACTUAL reason a runtime does
+    not answer (storage mismatch, permissions), shown instead of "(ok)" (W1R-09)."""
+    import subprocess
+
+    try:
+        res = (hooks.run or subprocess.run)([rt, "info"], capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return f"`{rt} info` could not run ({exc})"
+    lines = (getattr(res, "stderr", "") or "").strip().splitlines()
+    return lines[-1] if lines else f"`{rt} info` does not answer"
+
+
 def _preflight(plan: Step5Plan, hooks: Step5Hooks) -> None:
     """Before compose-up: a runtime that does not answer (or a podman whose
     API socket is known broken) is started / healed with the per-OS recipe,
@@ -134,21 +155,19 @@ def _preflight(plan: Step5Plan, hooks: Step5Hooks) -> None:
             print(f"  [!] podman answers, but its API socket file {sock.path} is missing while "
                   f"{sock.unit} is active. Restarting the socket unit (containers keep running)...")
         else:
-            print("  [!] podman is installed but it is not reachable "
-                  f"({sock.detail or sock.kind}). Attempting auto-start...")
-        ok, detail = hooks.try_start_podman()
-        if ok:
+            why = sock.detail or (_info_stderr(rt, hooks) if sock.kind == _cp.SOCKET_OK else sock.kind)
+            print(f"  [!] podman is installed but it is not reachable ({why}). Attempting auto-start...")
+        res = hooks.heal_podman()
+        if res.healed:
             print("      [OK] Podman is reachable again.")
             return
-        print(f"      [!] Auto-start failed: {detail}")
-        if sock.kind == _cp.SOCKET_UNIT_ACTIVE_FILE_MISSING:
+        print(f"      [!] Auto-start failed: {res.reason}")
+        entry = _cr.heal_deferral_entry(res, manual_cmd=_rerun_cmd(plan)) if res.deferral_cid else None
+        if entry is not None:
             if plan.deferral_report is not None:
-                plan.deferral_report.add_entry(_cr.heal_deferral_entry(
-                    _cp.HealResult(False, [f"systemctl --user restart {sock.unit}"], detail,
-                                   _cr.CID_SOCKET_HEAL_FAILED),
-                    manual_cmd="python install.py --update"))
+                plan.deferral_report.add_entry(entry)
         else:
-            hooks.emit_podman_start_failed(plan.deferral_report, detail=detail)
+            hooks.emit_podman_start_failed(plan.deferral_report, detail=res.reason)
         print("      A deferral entry has been written to UPDATE_DEFERRED.md with the manual "
               "recovery recipe.")
         print("      compose-up below may fail; re-run install.py once podman is reachable.")
@@ -316,6 +335,10 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
         print("  Or bump the timeout: VCT_INSTALL_DOCKER_TIMEOUT=1800 python install.py ...")
         hooks.log_event("5/10", "error", f"compose up timed out after {timeout // 60} min",
                         data={"runtime": plan.runtime, "timeout_sec": timeout})
+        if plan.deferral_report is not None:
+            plan.deferral_report.add_entry(_hard_stop_entry(
+                124, f"compose up timed out after {timeout // 60} min (daemon hung?)",
+                f"cd {plan.infra_dir} && {manual}", _rerun_cmd(plan)))
         return FAIL
     if result.ok:
         if result.build_dropped:
@@ -331,7 +354,10 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
         hooks.log_event("5/10", "ok", "compose up completed")
         return OK
 
-    _print_failure(result, plan, manual)
+    # W1R-10: "Try starting manually" names the LAST argv (after a rejected
+    # `--build` was dropped); the rebuild hint keeps the original on purpose.
+    manual_last = shlex.join(result.argv) if getattr(result, "argv", None) else manual
+    _print_failure(result, plan, manual_last)
     first = result.failure
     hooks.log_event(
         "5/10", "error", f"compose up failed (exit {result.returncode})",
@@ -346,9 +372,33 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
         args=plan.args, detected=plan.detected, has_gpu=plan.has_gpu,
         deferral_report=plan.deferral_report, exit_code=result.returncode or 1,
         stderr=result.first_stderr or result.stderr,
-        manual_cmd=f"cd {plan.infra_dir} && {manual}",
+        manual_cmd=f"cd {plan.infra_dir} && {manual_last}",
         log_event=hooks.log_event, install_root=plan.install_root,
         persist_on_hard_stop=plan.guard_rows,
     ):
         return CONTINUE
+    # The hard stop (install.py exits 1): the failure row goes into the run
+    # report, which the exit-path flush writes (AD-9, L1-F09).
+    if plan.deferral_report is not None:
+        plan.deferral_report.add_entry(_hard_stop_entry(
+            result.returncode or 1, result.first_stderr or result.stderr,
+            f"cd {plan.infra_dir} && {manual_last}", _rerun_cmd(plan)))
     return FAIL
+
+
+def _hard_stop_entry(exit_code: int, stderr: str, manual_cmd: str, rerun: str) -> DeferralEntry:
+    """``services_compose_up_failed`` for the STOPPED run (the continued-update
+    wording lives in ``install_services_guard.emit_compose_up_failed_deferral``)."""
+    tail = "\n".join(f"  {ln}" for ln in (stderr or "").strip().splitlines()[-8:])
+    return DeferralEntry(
+        condition_id=_svc_guard.CID_COMPOSE_UP_FAILED,
+        title="`compose up` failed — the install/update stopped at step 5",
+        detected=f"`compose up` exited {exit_code} and a required service was not answering, "
+                 f"so the run stopped. Last lines of its stderr:\n{tail}",
+        why_deferred="Steps after 5 need the services; the run stopped instead of continuing "
+                     "half-applied. Nothing was removed.",
+        command_to_apply=("# Re-run compose by hand to see the full error, fix it, then re-run:\n"
+                          f"{manual_cmd}\n{rerun}"),
+        severity="critical",
+        kg_node_refs=[],
+    )

@@ -40,9 +40,12 @@
 //! git operation from `update_pipeline` (`merge_upstream`,
 //! `rebase_onto_upstream`, `classify_resume`); the legacy per-surface
 //! commands that used to own them — each with its own tail — are gone.
-//! `ResetHard` saves the local commits (a `git bundle` under
-//! `<vct_root>/backups/` + a `vco-backup/<stamp>` branch) BEFORE the reset and
-//! refuses the reset when that backup cannot be made ([`create_reset_backup`]).
+//! `ResetHard` saves the local commits and the whole working tree (a verified
+//! `git bundle` under `<vct_root>/backups/` + `vco-backup/<stamp>` branches)
+//! BEFORE any merge/rebase abort and before the reset, refuses the reset when
+//! that backup cannot be made ([`create_reset_backup`]) or the abort does not
+//! leave a clear tree, and leaves HEAD attached to the update branch
+//! ([`reset_hard_git_op`]).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -210,34 +213,47 @@ pub struct UpdateOutcome {
 pub struct ResetBackup {
     /// `vco-backup/<stamp>` — the pre-reset HEAD.
     pub branch: String,
-    /// `vco-backup/<stamp>-uncommitted` — a commit of the tracked changes
-    /// that were not committed, when there were any (`git stash create`).
+    /// `vco-backup/<stamp>-wip` — a commit of the whole working tree
+    /// (tracked edits and deletions, conflict-marked files, untracked
+    /// non-ignored files; the launcher's own `.old-<pid>` rename artefacts
+    /// excluded), built in a throwaway index so nothing on disk or in the
+    /// user's index changes. `None` when the tree matched HEAD.
     pub uncommitted_branch: Option<String>,
-    /// `<vct_root>/backups/orchestrator-reset-<stamp>.bundle` holding both
-    /// branches' commits that upstream does not have. `None` only when there
-    /// was nothing local to save (no local commit, no uncommitted change).
+    /// `vco-backup/<stamp>-branch` — the update branch's own tip, when HEAD
+    /// was not on it (detached, or mid-rebase) and it held commits neither
+    /// HEAD nor upstream has; the reset moves that branch.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_tip: Option<String>,
+    /// `<vct_root>/backups/orchestrator-reset-<stamp>.bundle` holding every
+    /// saved branch's commits that upstream does not have, verified with
+    /// `git bundle verify`. `None` only when there was nothing local to save
+    /// (no local commit, no uncommitted change).
     pub bundle: Option<PathBuf>,
-    /// Commits on HEAD that upstream does not have.
+    /// Commits on HEAD (and on the saved branch tip) that upstream does not
+    /// have.
     pub local_commits: u32,
 }
 
 impl ResetBackup {
     /// The sentence the result carries.
     pub(crate) fn describe(&self) -> String {
-        let mut refs = self.branch.clone();
-        if let Some(u) = &self.uncommitted_branch {
-            refs.push_str(" and ");
-            refs.push_str(u);
-        }
+        let mut all = vec![self.branch.as_str()];
+        all.extend(self.branch_tip.as_deref());
+        all.extend(self.uncommitted_branch.as_deref());
+        let refs = match all.split_last() {
+            Some((last, rest)) if !rest.is_empty() => format!("{} and {}", rest.join(", "), last),
+            _ => self.branch.clone(),
+        };
         match &self.bundle {
             Some(b) => format!(
-                "Your {} local commit(s){} were saved to branch {} and to {}.",
+                "Your {} local commit(s){} were saved to {} {} and to {}.",
                 self.local_commits,
                 if self.uncommitted_branch.is_some() {
                     " and uncommitted changes"
                 } else {
                     ""
                 },
+                if all.len() > 1 { "branches" } else { "branch" },
                 refs,
                 b.display()
             ),
@@ -1145,7 +1161,12 @@ impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {
                 }
                 UpdateKind::ResetHard => {
                     let backups = vct_launcher_core::paths::vct_root_dir().join("backups");
-                    reset_hard_git_op(&root, &backups).await
+                    let progress = |message: &str| {
+                        if let Some(w) = window {
+                            crate::commands::installer::emit_progress(w, "update", message, 10.0);
+                        }
+                    };
+                    reset_hard_git_op(&root, &backups, &progress).await
                 }
                 UpdateKind::Merge | UpdateKind::Rebase | UpdateKind::Resume => {
                     let op = recovery_git_op(&root, kind, window).await;
@@ -1590,42 +1611,211 @@ async fn backup_git(root: &Path, args: &[&str], env: &[(&str, &str)]) -> Result<
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+/// The canonical path of a Windows phase-5 rename artefact, or `None` when
+/// `rel` is not one (review W3R-03). Pure.
+///
+/// The launcher itself writes exactly one shape before the git operation
+/// (`binary_freshness::pre_pull_rename_running_binary`, the hub rename in
+/// `installer.rs`): `launcher/dist/<platform>/<binary>.old-<pid>` next to the
+/// tracked `<binary>` it was renamed from. So an artefact is: directly inside
+/// `launcher/dist/<platform>/`, named `<stem>.old-<digits>` (the stem parsed
+/// by `binary_freshness::canonical_path_for_backup`, the PID digits-only as
+/// the boot sweep requires), AND `launcher/dist/<platform>/<stem>` tracked at
+/// HEAD. Anything else — `vct-launcher.old-may7`, a `.old-<pid>` elsewhere,
+/// one whose canonical file is not tracked — is not ours and is snapshotted
+/// like any other untracked file.
+pub(crate) fn launcher_rename_artefact_canonical(
+    rel: &str,
+    tracked_at_head: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let parts: Vec<&str> = rel.split('/').collect();
+    let [launcher, dist, platform, fname] = parts.as_slice() else {
+        return None;
+    };
+    if *launcher != "launcher" || *dist != "dist" || platform.is_empty() {
+        return None;
+    }
+    let (_, pid) = fname.rsplit_once(".old-")?;
+    if pid.is_empty() || !pid.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let stem =
+        crate::services::binary_freshness::canonical_path_for_backup(Path::new(fname))?;
+    let canonical = format!("launcher/dist/{}/{}", platform, stem.to_str()?);
+    tracked_at_head.contains(&canonical).then_some(canonical)
+}
+
+/// Split a `-z` git listing into paths.
+fn nul_paths(raw: &str) -> Vec<String> {
+    raw.split('\0')
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// What the `-wip` snapshot must NOT record (W3R-03): every launcher rename
+/// artefact among the untracked files, and — when the artefact's canonical
+/// file is missing from disk because it was renamed — that canonical path
+/// too, so the snapshot keeps HEAD's copy instead of recording a deletion.
+async fn rename_artefact_exclusions(
+    root: &Path,
+    untracked: &[String],
+) -> Result<Vec<String>, String> {
+    if !untracked.iter().any(|p| p.starts_with("launcher/dist/")) {
+        return Ok(Vec::new());
+    }
+    let tracked: std::collections::HashSet<String> = nul_paths(
+        &backup_git(
+            root,
+            &["ls-tree", "-r", "--name-only", "-z", "HEAD", "--", "launcher/dist"],
+            &[],
+        )
+        .await?,
+    )
+    .into_iter()
+    .collect();
+    let mut out: Vec<String> = Vec::new();
+    for rel in untracked {
+        if let Some(canonical) = launcher_rename_artefact_canonical(rel, &tracked) {
+            out.push(rel.clone());
+            if !root.join(&canonical).exists() && !out.contains(&canonical) {
+                out.push(canonical);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Remove what a failed backup had already created (W3R-17), so a refusal
+/// leaves no half-made `vco-backup/*` branch or unverified bundle behind and a
+/// retry is not blocked by "branch already exists". Best effort; the returned
+/// sentence says what was (or could not be) removed.
+async fn discard_partial_backup(root: &Path, branches: &[String], bundle: Option<&Path>) -> String {
+    let mut removed = Vec::new();
+    let mut left = Vec::new();
+    for b in branches {
+        match backup_git(root, &["branch", "-D", b.as_str()], &[]).await {
+            Ok(_) => removed.push(b.clone()),
+            Err(_) => left.push(b.clone()),
+        }
+    }
+    if let Some(p) = bundle {
+        if p.exists() {
+            match std::fs::remove_file(p) {
+                Ok(()) => removed.push(p.display().to_string()),
+                Err(_) => left.push(p.display().to_string()),
+            }
+        }
+    }
+    match (removed.is_empty(), left.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => format!(" The partial backup ({}) was removed.", removed.join(", ")),
+        _ => format!(
+            " The partial backup could not be fully removed: {} remain(s).",
+            left.join(", ")
+        ),
+    }
+}
+
 /// Save everything `git reset --hard <upstream_ref>` could destroy, BEFORE it
-/// runs (owner ruling F-W2-03 + review W2R-03). Nothing in the working tree
-/// or the index is modified:
+/// runs — and before any merge/rebase abort, which can itself discard hand
+/// edits (owner ruling F-W2-03 + reviews W2R-03, W3R-01). Nothing in the
+/// working tree or the index is modified:
 ///
 /// 1. `vco-backup/<stamp>` → the current HEAD (the local commits).
-/// 2. `vco-backup/<stamp>-wip` → a commit of the WHOLE working tree — tracked
-///    modifications, deletions AND untracked (non-ignored) files — built in a
-///    throwaway index (`GIT_INDEX_FILE`), so the user's index and files stay
-///    exactly as they are. Only when the tree differs from HEAD. (Chosen over
+/// 2. `vco-backup/<stamp>-branch` → the tip of `update_branch` when HEAD is
+///    NOT on it (a detached HEAD, a rebase in progress) and that tip holds
+///    commits neither HEAD nor upstream has (W3R-02: the reset moves that
+///    branch, so its commits must be saved too).
+/// 3. `vco-backup/<stamp>-wip` → a commit of the WHOLE working tree — tracked
+///    modifications, deletions, conflict-marked files AND untracked
+///    (non-ignored) files — built in a throwaway index (`GIT_INDEX_FILE`), so
+///    the user's index and files stay exactly as they are. Only when the tree
+///    differs from HEAD. The launcher's own Windows rename artefacts are
+///    excluded ([`launcher_rename_artefact_canonical`], W3R-03). (Chosen over
 ///    `git stash push --include-untracked`, which REMOVES untracked files from
 ///    disk — files the reset itself would leave alone.)
-/// 3. `<backups_dir>/orchestrator-reset-<stamp>.bundle` holding both refs'
+/// 4. `<backups_dir>/orchestrator-reset-<stamp>.bundle` holding those refs'
 ///    commits that upstream lacks, then `git bundle verify`.
 ///
-/// Any failure is an `Err` and the caller REFUSES the reset. With no local
-/// commit and a clean tree there is nothing to lose: the HEAD branch is still
-/// created, no bundle is written (git refuses an empty bundle).
+/// Any failure is an `Err` and the caller REFUSES the reset; whatever this
+/// call had already created is removed first (W3R-17). With no local commit
+/// and a clean tree there is nothing to lose: the HEAD branch is still
+/// created, no bundle is written (git refuses an empty bundle). `progress`
+/// receives one line naming what is being saved (the snapshot has no size
+/// bound — it saves everything — so the user is told how much).
 pub(crate) async fn create_reset_backup(
     root: &Path,
     upstream_ref: &str,
+    update_branch: &str,
     backups_dir: &Path,
     stamp: &str,
+    progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<ResetBackup, String> {
     let head = backup_git(root, &["rev-parse", "--verify", "HEAD"], &[]).await?;
-    let range = format!("{}..{}", upstream_ref, head);
-    let local_commits: u32 = backup_git(root, &["rev-list", "--count", range.as_str()], &[])
+    let not_upstream = format!("^{}", upstream_ref);
+
+    // The update branch's own tip, when HEAD is not on it and it holds
+    // commits that neither HEAD nor upstream has.
+    let branch_ref = format!("refs/heads/{}", update_branch);
+    let tip = match backup_git(root, &["rev-parse", "--verify", "--quiet", branch_ref.as_str()], &[])
+        .await
+    {
+        Ok(t) if !t.is_empty() && t != head => {
+            let not_head = format!("^{}", head);
+            let only_there: u32 = backup_git(
+                root,
+                &["rev-list", "--count", t.as_str(), not_head.as_str(), not_upstream.as_str()],
+                &[],
+            )
+            .await?
+            .parse()
+            .map_err(|e| format!("could not count the branch's own commits: {}", e))?;
+            (only_there > 0).then_some(t)
+        }
+        _ => None,
+    };
+    let mut count_args = vec!["rev-list", "--count", head.as_str()];
+    if let Some(t) = &tip {
+        count_args.push(t.as_str());
+    }
+    count_args.push(not_upstream.as_str());
+    let local_commits: u32 = backup_git(root, &count_args, &[])
         .await?
         .parse()
         .map_err(|e| format!("could not count the local commits: {}", e))?;
+
+    // What the snapshot will hold, and what it must leave out.
+    let untracked = nul_paths(
+        &backup_git(root, &["ls-files", "--others", "--exclude-standard", "-z"], &[]).await?,
+    );
+    let exclusions = rename_artefact_exclusions(root, &untracked).await?;
+    let captured: Vec<&String> = untracked.iter().filter(|p| !exclusions.contains(p)).collect();
+    let bytes: u64 = captured
+        .iter()
+        .filter_map(|p| std::fs::metadata(root.join(p)).ok())
+        .map(|m| m.len())
+        .sum();
+    progress(&format!(
+        "Saving your work before the reset: {} local commit(s), uncommitted changes and {} \
+         untracked file(s) ({:.1} MB)...",
+        local_commits,
+        captured.len(),
+        bytes as f64 / 1_048_576.0
+    ));
 
     // The working-tree snapshot, through a throwaway index.
     let scratch = tempfile::tempdir().map_err(|e| format!("scratch dir: {}", e))?;
     let index = scratch.path().join("index").to_string_lossy().to_string();
     let env = [("GIT_INDEX_FILE", index.as_str())];
     backup_git(root, &["read-tree", head.as_str()], &env).await?;
-    backup_git(root, &["add", "--all", "--", "."], &env).await?;
+    let excludes: Vec<String> = exclusions
+        .iter()
+        .map(|p| format!(":(exclude,literal){}", p))
+        .collect();
+    let mut add_args = vec!["add", "--all", "--", "."];
+    add_args.extend(excludes.iter().map(String::as_str));
+    backup_git(root, &add_args, &env).await?;
     let tree = backup_git(root, &["write-tree"], &env).await?;
     let head_tree = format!("{}^{{tree}}", head);
     let head_tree = backup_git(root, &["rev-parse", head_tree.as_str()], &[]).await?;
@@ -1646,20 +1836,75 @@ pub(crate) async fn create_reset_backup(
         None
     };
 
+    // Refs and bundle; on any failure, remove what was created.
     let branch = format!("vco-backup/{}", stamp);
-    backup_git(root, &["branch", branch.as_str(), head.as_str()], &[]).await?;
-    let wip_branch = match &wip {
+    let mut created: Vec<String> = Vec::new();
+    let mut bundle_written: Option<PathBuf> = None;
+    let saved = save_backup_refs_and_bundle(
+        root,
+        backups_dir,
+        stamp,
+        &branch,
+        &head,
+        tip.as_deref(),
+        wip.as_deref(),
+        local_commits,
+        upstream_ref,
+        &mut created,
+        &mut bundle_written,
+    )
+    .await;
+    match saved {
+        Ok(backup) => Ok(backup),
+        Err(e) => {
+            let cleanup = discard_partial_backup(root, &created, bundle_written.as_deref()).await;
+            Err(format!("{}.{}", e, cleanup))
+        }
+    }
+}
+
+/// [`create_reset_backup`]'s ref + bundle half. Records every branch it
+/// creates in `created` and the bundle path in `bundle_written` BEFORE the
+/// step that could fail after it, so the caller can undo exactly that.
+#[allow(clippy::too_many_arguments)]
+async fn save_backup_refs_and_bundle(
+    root: &Path,
+    backups_dir: &Path,
+    stamp: &str,
+    branch: &str,
+    head: &str,
+    tip: Option<&str>,
+    wip: Option<&str>,
+    local_commits: u32,
+    upstream_ref: &str,
+    created: &mut Vec<String>,
+    bundle_written: &mut Option<PathBuf>,
+) -> Result<ResetBackup, String> {
+    backup_git(root, &["branch", branch, head], &[]).await?;
+    created.push(branch.to_string());
+    let tip_branch = match tip {
+        Some(sha) => {
+            let b = format!("{}-branch", branch);
+            backup_git(root, &["branch", b.as_str(), sha], &[]).await?;
+            created.push(b.clone());
+            Some(b)
+        }
+        None => None,
+    };
+    let wip_branch = match wip {
         Some(sha) => {
             let b = format!("{}-wip", branch);
-            backup_git(root, &["branch", b.as_str(), sha.as_str()], &[]).await?;
+            backup_git(root, &["branch", b.as_str(), sha], &[]).await?;
+            created.push(b.clone());
             Some(b)
         }
         None => None,
     };
     if local_commits == 0 && wip_branch.is_none() {
         return Ok(ResetBackup {
-            branch,
+            branch: branch.to_string(),
             uncommitted_branch: None,
+            branch_tip: None,
             bundle: None,
             local_commits,
         });
@@ -1670,30 +1915,76 @@ pub(crate) async fn create_reset_backup(
     let bundle = backups_dir.join(format!("orchestrator-reset-{}.bundle", stamp));
     let bundle_s = bundle.to_string_lossy().to_string();
     let exclude = format!("^{}", upstream_ref);
-    let mut args = vec!["bundle", "create", bundle_s.as_str(), branch.as_str()];
-    if let Some(b) = &wip_branch {
+    let mut args = vec!["bundle", "create", bundle_s.as_str(), branch];
+    for b in [&tip_branch, &wip_branch].into_iter().flatten() {
         args.push(b.as_str());
     }
     args.push(exclude.as_str());
+    *bundle_written = Some(bundle.clone());
     backup_git(root, &args, &[]).await?;
     backup_git(root, &["bundle", "verify", bundle_s.as_str()], &[]).await?;
     Ok(ResetBackup {
-        branch,
+        branch: branch.to_string(),
         uncommitted_branch: wip_branch,
+        branch_tip: tip_branch,
         bundle: Some(bundle),
         local_commits,
     })
 }
 
-/// `ResetHard`'s git operation: identity re-asserted, fetch, abort any
-/// in-progress merge/rebase (a reset does not clear them), the local work
-/// saved ([`create_reset_backup`] — a failure REFUSES the reset), then
-/// `git reset --hard vco_upstream/<branch>`. Failures leave the restore to
-/// the driver (`restored: false`).
+/// The branch `ResetHard` lands on (W3R-02). The attached branch; for a
+/// detached HEAD in a rebase, the branch the rebase is rewriting (its
+/// `head-name`); otherwise the update branch every surface uses for a
+/// detached HEAD (`resolve_branch`'s name — [`git_cmd::FALLBACK_BRANCH`]).
+///
+/// [`git_cmd::FALLBACK_BRANCH`]: crate::commands::git_cmd::FALLBACK_BRANCH
+fn reset_branch(root: &Path, state: &crate::commands::git_cmd::BranchState) -> String {
+    if !state.detached {
+        return state.name.clone();
+    }
+    for dir in ["rebase-merge", "rebase-apply"] {
+        if let Ok(s) = std::fs::read_to_string(root.join(".git").join(dir).join("head-name")) {
+            if let Some(b) = s.trim().strip_prefix("refs/heads/") {
+                if !b.is_empty() {
+                    return b.to_string();
+                }
+            }
+        }
+    }
+    state.name.clone()
+}
+
+/// `ResetHard`'s git operation: identity re-asserted, fetch, the local work
+/// saved and verified ([`create_reset_backup`] — a failure REFUSES the reset),
+/// THEN any in-progress merge/rebase aborted (a reset does not clear them; an
+/// abort that fails, or leaves the state behind, REFUSES the reset — W3R-01),
+/// then `git reset --hard vco_upstream/<branch>` with HEAD left ATTACHED to
+/// `<branch>` (W3R-02). Failures leave the restore to the driver
+/// (`restored: false`).
 pub(crate) async fn reset_hard_git_op(
     root: &Path,
     backups_dir: &Path,
+    progress: &(dyn Fn(&str) + Send + Sync),
 ) -> Result<GitOpOutcome, GitOpFailure> {
+    reset_hard_git_op_with(root, backups_dir, progress, |p: PathBuf| async move {
+        crate::commands::installer::abort_merge_or_rebase_unclaimed(&p).await
+    })
+    .await
+}
+
+/// [`reset_hard_git_op`] with the merge/rebase abort injected — the seam the
+/// ordering (backup before abort) and the abort-failed leg are tested through.
+pub(crate) async fn reset_hard_git_op_with<A, F>(
+    root: &Path,
+    backups_dir: &Path,
+    progress: &(dyn Fn(&str) + Send + Sync),
+    abort: A,
+) -> Result<GitOpOutcome, GitOpFailure>
+where
+    A: FnOnce(PathBuf) -> F + Send,
+    F: Future<Output = Result<(), String>> + Send,
+{
+    use crate::commands::git_user_editable_merge::merge_or_rebase_in_progress;
     let fail = |error: UpdateSurfaceError| GitOpFailure {
         error,
         restored: false,
@@ -1701,15 +1992,15 @@ pub(crate) async fn reset_hard_git_op(
     if let Some(refusal) = reset_hard_identity_refusal(root) {
         return Err(fail(refusal));
     }
-    let branch = crate::commands::git_cmd::resolve_branch(root)
+    let state = crate::commands::git_cmd::resolve_branch(root)
         .await
         .map_err(|e| {
             fail(UpdateSurfaceError::Raw(format!(
                 "git rev-parse failed: {}",
                 e
             )))
-        })?
-        .name;
+        })?;
+    let branch = reset_branch(root, &state);
     crate::commands::self_update::serialized_fetch_upstream(
         root,
         crate::commands::self_update::FetchPolicy::Quick,
@@ -1722,21 +2013,13 @@ pub(crate) async fn reset_hard_git_op(
             e
         )))
     })?;
-    if let Err(e) = crate::commands::installer::abort_merge_or_rebase_unclaimed(root).await {
-        tracing::warn!(
-            "[vct] {}: could not abort the in-progress merge/rebase before the reset ({}) — \
-             resetting anyway",
-            SURFACE,
-            e
-        );
-    }
     let target = format!(
         "{}/{}",
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         branch
     );
     let stamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
-    let backup = create_reset_backup(root, &target, backups_dir, &stamp)
+    let backup = create_reset_backup(root, &target, &branch, backups_dir, &stamp, progress)
         .await
         .map_err(|e| {
             fail(UpdateSurfaceError::Refused {
@@ -1749,6 +2032,43 @@ pub(crate) async fn reset_hard_git_op(
             })
         })?;
     tracing::info!("[vct] {}: reset backup: {}", SURFACE, backup.describe());
+
+    // Only now — with the work saved — conclude an in-progress merge/rebase.
+    // A reset over one leaves the clone wedged (`reset --hard` does not clear
+    // `.git/rebase-merge`), so an abort that fails, or that leaves the state
+    // behind, refuses the reset instead of resetting anyway.
+    let in_progress = merge_or_rebase_in_progress(root);
+    if let Some(op) = in_progress {
+        progress(&format!("Aborting the {} in progress...", op));
+    }
+    if let Err(e) = abort(root.to_path_buf()).await {
+        return Err(fail(UpdateSurfaceError::Refused {
+            code: "reset_abort_failed",
+            reason: format!(
+                "Refusing `git reset --hard`: the {} in progress could not be aborted ({}), and \
+                 resetting over it would leave the clone stuck in it. Nothing was reset. {} \
+                 Conclude it by hand (`git merge --abort` or `git rebase --abort` in {}), then \
+                 try again.",
+                in_progress.unwrap_or("merge/rebase"),
+                e,
+                backup.describe(),
+                root.display()
+            ),
+        }));
+    }
+    if let Some(op) = merge_or_rebase_in_progress(root) {
+        return Err(fail(UpdateSurfaceError::Refused {
+            code: "reset_state_not_clear",
+            reason: format!(
+                "Refusing `git reset --hard`: a {} is still in progress in {} after the abort, and \
+                 resetting over it would leave the clone stuck in it. Nothing was reset. {}",
+                op,
+                root.display(),
+                backup.describe()
+            ),
+        }));
+    }
+
     crate::commands::update_pipeline::clear_prior_resume_state(root);
     let out = crate::commands::git_cmd::run_git_raw(root, &["reset", "--hard", target.as_str()])
         .await
@@ -1760,6 +2080,37 @@ pub(crate) async fn reset_hard_git_op(
             String::from_utf8_lossy(&out.stderr).trim(),
             backup.describe()
         ))));
+    }
+    // A detached HEAD was moved, not the branch: point `<branch>` here and
+    // attach to it, so the next PullFf advances the branch (the old branch
+    // tip is in the backup when it held anything).
+    let now = crate::commands::git_cmd::resolve_branch(root).await.ok();
+    if now.as_ref().is_none_or(|s| s.detached || s.name != branch) {
+        let out = crate::commands::git_cmd::run_git_raw(root, &["checkout", "-B", branch.as_str()])
+            .await
+            .map_err(|e| fail(UpdateSurfaceError::Raw(e)))?;
+        let attached = crate::commands::git_cmd::resolve_branch(root)
+            .await
+            .is_ok_and(|s| !s.detached && s.name == branch);
+        if !out.status.success() || !attached {
+            return Err(fail(UpdateSurfaceError::Raw(format!(
+                "the reset to {} landed but HEAD could not be re-attached to branch {}: {}. Run \
+                 `git checkout -B {} {}` in {}. {}",
+                target,
+                branch,
+                String::from_utf8_lossy(&out.stderr).trim(),
+                branch,
+                target,
+                root.display(),
+                backup.describe()
+            ))));
+        }
+        tracing::info!(
+            "[vct] {}: HEAD was detached; re-attached to branch {} at {}",
+            SURFACE,
+            branch,
+            target
+        );
     }
     Ok(GitOpOutcome {
         already_up_to_date: false,
@@ -1842,6 +2193,70 @@ pub async fn run_orchestrator_update<R: Runtime>(
     run_update(app, Some(&window), kind, SURFACE)
         .await
         .map_err(|e| e.to_json())
+}
+
+// ---------------------------------------------------------------------------
+// F-W3-14: a conflict resolver acts only on the root the pipeline updates
+// ---------------------------------------------------------------------------
+
+/// Does the GUI-supplied `gui` path name the same directory as the resolved
+/// install `root`? Compared after canonicalisation (symlinks, `..`, the
+/// Windows verbatim prefix); an unresolvable GUI path never matches. Pure
+/// apart from the filesystem reads.
+pub(crate) fn gui_path_matches_root(gui: &Path, root: &Path) -> bool {
+    use vct_launcher_core::services::install_root::strip_windows_verbatim_prefix;
+    let canon = |p: &Path| -> Option<String> {
+        dunce::canonicalize(p).ok().map(|c| strip_windows_verbatim_prefix(&c.to_string_lossy()))
+    };
+    match (canon(gui), canon(root)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// The typed refusal for a GUI path that is not the resolved root.
+pub(crate) fn check_gui_path(gui: &Path, root: &Path) -> Result<(), UpdateSurfaceError> {
+    if gui_path_matches_root(gui, root) {
+        return Ok(());
+    }
+    Err(UpdateSurfaceError::Refused {
+        code: "path_not_install_root",
+        reason: format!(
+            "the conflict was reported for {}, but this launcher updates {} — nothing was \
+             changed. Resolve it from the launcher that belongs to {} (or run `python install.py \
+             --update` there).",
+            gui.display(),
+            root.display(),
+            gui.display()
+        ),
+    })
+}
+
+/// F-W3-14 (v0.2.100 WP-06): every conflict resolver does git/file work on
+/// the GUI-supplied `path` and then hands its claim to the ONE pipeline,
+/// which updates the RESOLVED install root. If the two differ, the
+/// resolution would change one tree and the update another. So each
+/// resolver command calls this as its FIRST statement — before any git or
+/// file work — and refuses on a mismatch with the pipeline's typed
+/// `Refused` JSON. `db = None` (no launcher database) refuses too.
+pub(crate) fn require_gui_path_is_resolved_root(
+    db: Option<&crate::db::Db>,
+    gui_path: &str,
+) -> Result<PathBuf, String> {
+    let refused = |code: &'static str, reason: String| UpdateSurfaceError::Refused { code, reason }.to_json();
+    let db = db.ok_or_else(|| {
+        refused(
+            "no_database",
+            "The launcher database is not available, so the install root cannot be resolved. \
+             Restart the launcher and try again."
+                .into(),
+        )
+    })?;
+    let root = crate::commands::installer::resolve_root_with_db(db)
+        .map_err(|e| refused("root_unresolved", e.to_string()))?
+        .path;
+    check_gui_path(Path::new(gui_path), &root).map_err(|e| e.to_json())?;
+    Ok(root)
 }
 
 // ---------------------------------------------------------------------------
@@ -2815,6 +3230,42 @@ pub(crate) mod tests {
     }
     // ---- WP-03b: the real git operations, on temp repos --------------------
 
+    /// W3R-03: the artefact matcher — ACT on the exact shape and location,
+    /// LEAVE-ALONE on everything else.
+    #[test]
+    fn launcher_rename_artefact_matcher_is_exact() {
+        let tracked: std::collections::HashSet<String> = [
+            "launcher/dist/windows-x64/vct-launcher.exe",
+            "launcher/dist/windows-x64/vct-hub.exe",
+            "launcher/dist/linux-x64/vct-launcher",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let m = |p: &str| launcher_rename_artefact_canonical(p, &tracked);
+        assert_eq!(
+            m("launcher/dist/windows-x64/vct-launcher.exe.old-4242").as_deref(),
+            Some("launcher/dist/windows-x64/vct-launcher.exe")
+        );
+        assert_eq!(
+            m("launcher/dist/windows-x64/vct-hub.exe.old-1").as_deref(),
+            Some("launcher/dist/windows-x64/vct-hub.exe")
+        );
+        assert!(m("launcher/dist/linux-x64/vct-launcher.old-99").is_some());
+        for not_ours in [
+            "launcher/dist/linux-x64/vct-launcher.old-may7",
+            "launcher/dist/windows-x64/vct-launcher.exe.old-",
+            "launcher/dist/windows-x64/vct-launcher.exe.old-12a",
+            "launcher/dist/windows-x64/notes.txt.old-12",
+            "launcher/dist/vct-launcher.exe.old-12",
+            "launcher/dist/windows-x64/sub/vct-launcher.exe.old-12",
+            "other/dist/windows-x64/vct-launcher.exe.old-12",
+            "vct-launcher.exe.old-12",
+        ] {
+            assert_eq!(m(not_ours), None, "{not_ours}");
+        }
+    }
+
     mod real_git {
         use super::*;
         use crate::commands::git_user_editable_merge::tests::{
@@ -2875,6 +3326,8 @@ pub(crate) mod tests {
             )
             .unwrap();
         }
+
+        fn quiet(_: &str) {}
 
         fn backup_branches(repo: &Path) -> Vec<String> {
             out(repo, &["branch", "--list", "vco-backup/*", "--format=%(refname:short)"])
@@ -2998,7 +3451,7 @@ pub(crate) mod tests {
             std::fs::write(local.join("notes.txt"), "untracked notes\n").unwrap();
             let backups = tmp.path().join("vct_root").join("backups");
 
-            let g = reset_hard_git_op(&local, &backups).await.unwrap_or_else(|f| {
+            let g = reset_hard_git_op(&local, &backups, &quiet).await.unwrap_or_else(|f| {
                 panic!("{}", f.error.message())
             });
             let b = g.reset_backup.expect("backup recorded");
@@ -3045,7 +3498,7 @@ pub(crate) mod tests {
             let backups = tmp.path().join("not_a_dir");
             std::fs::write(&backups, "x").unwrap();
 
-            let f = reset_hard_git_op(&local, &backups).await.expect_err("refused");
+            let f = reset_hard_git_op(&local, &backups, &quiet).await.expect_err("refused");
             assert!(matches!(
                 f.error,
                 UpdateSurfaceError::Refused { code: "reset_backup_failed", .. }
@@ -3056,6 +3509,14 @@ pub(crate) mod tests {
                 std::fs::read_to_string(local.join("vco_lib/foo.py")).unwrap(),
                 "def edited(): pass\n"
             );
+            // W3R-17: the refusal leaves no half-made backup branch behind.
+            assert!(backup_branches(&local).is_empty(), "{:?}", backup_branches(&local));
+            match f.error {
+                UpdateSurfaceError::Refused { reason, .. } => {
+                    assert!(reason.contains("partial backup"), "{}", reason)
+                }
+                other => panic!("{:?}", other),
+            }
         }
 
         /// ResetHard on a repository that is NOT an orchestrator clone is
@@ -3068,7 +3529,7 @@ pub(crate) mod tests {
             let (tmp, _remote, local) = init_repo_pair();
             commit_local(&local, "LOCAL.md", "my commit\n");
             let local_head = head(&local);
-            let f = reset_hard_git_op(&local, &tmp.path().join("b"))
+            let f = reset_hard_git_op(&local, &tmp.path().join("b"), &quiet)
                 .await
                 .expect_err("not a clone");
             assert!(matches!(
@@ -3087,12 +3548,316 @@ pub(crate) mod tests {
                 return;
             }
             let (tmp, _remote, local) = init_repo_pair();
-            let b = create_reset_backup(&local, "vco_upstream/main", &tmp.path().join("b"), "T1")
+            let b = create_reset_backup(&local, "vco_upstream/main", "main", &tmp.path().join("b"), "T1", &quiet)
                 .await
                 .expect("backup");
             assert_eq!(b.local_commits, 0);
             assert!(b.bundle.is_none() && b.uncommitted_branch.is_none());
             assert_eq!(backup_branches(&local), vec!["vco-backup/T1".to_string()]);
         }
+
+        // ----- W3R-01 / W3R-02 / W3R-03 (the W3R-FIX lane) -----
+
+        fn git_ok(repo: &Path, args: &[&str]) -> bool {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        }
+
+        /// Local and upstream both change README.md; `op` ("merge" or
+        /// "rebase") is started and stops on the conflict; the user then
+        /// hand-edits the conflicted file.
+        fn stalled(op: &str) -> (tempfile::TempDir, PathBuf) {
+            let (tmp, _remote, local) = init_repo_pair();
+            orchestrator_identity(&local);
+            commit_local(&local, "README.md", "LOCAL\n");
+            push_upstream_change(&tmp.path().join("seed"), &local, "README.md", "UPSTREAM\n");
+            assert!(!git_ok(&local, &[op, "vco_upstream/main"]), "the {op} must conflict");
+            assert!(
+                crate::commands::git_user_editable_merge::merge_or_rebase_in_progress(&local)
+                    .is_some()
+            );
+            std::fs::write(local.join("README.md"), "hand-resolved\n").unwrap();
+            (tmp, local)
+        }
+
+        fn wip_of(repo: &Path) -> Option<String> {
+            backup_branches(repo).into_iter().find(|b| b.ends_with("-wip"))
+        }
+
+        /// W3R-01 ACT: the abort FAILS on a mid-rebase tree → the reset is
+        /// refused; HEAD, `refs/heads/main`, `rebase-merge/` and the hand
+        /// edit are untouched, and the saved work is named.
+        #[tokio::test]
+        async fn reset_hard_is_refused_when_the_abort_fails() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, local) = stalled("rebase");
+            let head_before = head(&local);
+            let main_before = out(&local, &["rev-parse", "refs/heads/main"]);
+            let f = reset_hard_git_op_with(
+                &local,
+                &tmp.path().join("backups"),
+                &quiet,
+                |_p: PathBuf| async { Err("index.lock exists".to_string()) },
+            )
+            .await
+            .expect_err("refused");
+            let reason = match &f.error {
+                UpdateSurfaceError::Refused { code: "reset_abort_failed", reason } => reason.clone(),
+                other => panic!("{:?}", other),
+            };
+            assert!(!f.restored);
+            assert!(reason.contains("Nothing was reset") && reason.contains("vco-backup/"), "{reason}");
+            assert_eq!(head(&local), head_before, "HEAD untouched");
+            assert_eq!(out(&local, &["rev-parse", "refs/heads/main"]), main_before);
+            assert!(
+                local.join(".git").join("rebase-merge").exists()
+                    || local.join(".git").join("rebase-apply").exists(),
+                "the rebase state is untouched"
+            );
+            assert_eq!(std::fs::read_to_string(local.join("README.md")).unwrap(), "hand-resolved\n");
+            let _ = git_ok(&local, &["rebase", "--abort"]);
+        }
+
+        /// W3R-01 ACT: the abort reports success but leaves the merge
+        /// state behind → refused as `reset_state_not_clear`.
+        #[tokio::test]
+        async fn reset_hard_is_refused_when_the_abort_leaves_the_state_behind() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, local) = stalled("merge");
+            let head_before = head(&local);
+            let f = reset_hard_git_op_with(
+                &local,
+                &tmp.path().join("backups"),
+                &quiet,
+                |_p: PathBuf| async { Ok(()) },
+            )
+            .await
+            .expect_err("refused");
+            assert!(
+                matches!(f.error, UpdateSurfaceError::Refused { code: "reset_state_not_clear", .. }),
+                "{:?}",
+                f.error
+            );
+            assert_eq!(head(&local), head_before);
+            assert!(local.join(".git").join("MERGE_HEAD").exists());
+            let _ = git_ok(&local, &["merge", "--abort"]);
+        }
+
+        /// W3R-01 ORDER + LEAVE-ALONE: when the abort runs, the backup
+        /// already exists AND verifies, and its `-wip` holds the hand edit
+        /// the abort is about to discard; the real abort then succeeds and
+        /// the reset proceeds to upstream, attached to main.
+        #[tokio::test]
+        async fn reset_hard_backs_up_before_the_abort_then_proceeds() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, local) = stalled("merge");
+            let backups = tmp.path().join("backups");
+            let seen: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+            let rec = seen.clone();
+            let bdir = backups.clone();
+            let g = reset_hard_git_op_with(&local, &backups, &quiet, move |p: PathBuf| async move {
+                let wip = wip_of(&p).expect("wip branch exists before the abort");
+                assert_eq!(out(&p, &["show", &format!("{wip}:README.md")]), "hand-resolved");
+                let bundle = std::fs::read_dir(&bdir)
+                    .expect("backups dir")
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|p| p.extension().is_some_and(|x| x == "bundle"))
+                    .expect("bundle written before the abort");
+                assert!(git_ok(&p, &["bundle", "verify", bundle.to_str().unwrap()]));
+                rec.lock().unwrap().push("abort".into());
+                crate::commands::installer::abort_merge_or_rebase_unclaimed(&p).await
+            })
+            .await
+            .unwrap_or_else(|f| panic!("{}", f.error.message()));
+            assert_eq!(*seen.lock().unwrap(), vec!["abort".to_string()], "abort ran once");
+            assert!(!local.join(".git").join("MERGE_HEAD").exists());
+            assert_eq!(head(&local), out(&local, &["rev-parse", "vco_upstream/main"]));
+            assert_eq!(out(&local, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+            let b = g.reset_backup.expect("backup");
+            assert_eq!(b.local_commits, 1);
+            let wip = b.uncommitted_branch.expect("wip");
+            assert_eq!(out(&local, &["show", &format!("{wip}:README.md")]), "hand-resolved");
+        }
+
+        /// W3R-02 ACT: from a DETACHED HEAD (holding its own commit, while
+        /// `main` holds a different local commit), ResetHard leaves the clone
+        /// on `main`, attached, at upstream; both local commits are saved;
+        /// and the pipeline's own PullFf command then advances `main`.
+        #[tokio::test]
+        async fn reset_hard_from_a_detached_head_lands_attached_on_the_update_branch() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, _remote, local) = init_repo_pair();
+            orchestrator_identity(&local);
+            commit_local(&local, "LOCAL.md", "on main\n");
+            let main_tip = head(&local);
+            run_git(&local, &["checkout", "--quiet", "--detach", "HEAD~1"]);
+            commit_local(&local, "DETACHED.md", "on a detached HEAD\n");
+            let detached_tip = head(&local);
+            let seed = tmp.path().join("seed");
+            push_upstream_change(&seed, &local, "UP.md", "upstream\n");
+            assert_eq!(out(&local, &["rev-parse", "--abbrev-ref", "HEAD"]), "HEAD");
+
+            let g = reset_hard_git_op(&local, &tmp.path().join("backups"), &quiet)
+                .await
+                .unwrap_or_else(|f| panic!("{}", f.error.message()));
+            assert_eq!(g.branch, "main");
+            let upstream = out(&local, &["rev-parse", "vco_upstream/main"]);
+            assert_eq!(out(&local, &["rev-parse", "--abbrev-ref", "HEAD"]), "main", "attached");
+            assert_eq!(out(&local, &["rev-parse", "refs/heads/main"]), upstream);
+            assert_eq!(head(&local), upstream);
+            let b = g.reset_backup.expect("backup");
+            assert_eq!(out(&local, &["rev-parse", &b.branch]), detached_tip);
+            let tip = b.branch_tip.clone().expect("main's own commit is saved");
+            assert_eq!(out(&local, &["rev-parse", &tip]), main_tip);
+            assert_eq!(b.local_commits, 2);
+            assert!(b.describe().contains(&tip));
+
+            // The next PullFf (the pipeline's exact argv) advances `main`.
+            push_upstream_change(&seed, &local, "UP2.md", "later\n");
+            let args = crate::commands::git_user_editable_merge::PullPlan::FfOnly
+                .pull_args(crate::commands::self_update::VCO_UPSTREAM_REMOTE, "main");
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            assert!(git_ok(&local, &args), "PullFf after the reset");
+            let later = out(&local, &["rev-parse", "vco_upstream/main"]);
+            assert_eq!(out(&local, &["rev-parse", "refs/heads/main"]), later, "the branch advanced");
+            assert_eq!(out(&local, &["rev-parse", "--abbrev-ref", "HEAD"]), "main");
+        }
+
+        /// A clone whose HEAD tracks the two Windows binaries (nothing local).
+        fn with_tracked_binaries() -> (tempfile::TempDir, PathBuf) {
+            let (tmp, _remote, local) = init_repo_pair();
+            let seed = tmp.path().join("seed");
+            push_upstream_change(&seed, &local, "launcher/dist/windows-x64/vct-launcher.exe", "L\n");
+            push_upstream_change(&seed, &local, "launcher/dist/windows-x64/vct-hub.exe", "H\n");
+            run_git(&local, &["merge", "--ff-only", "vco_upstream/main"]);
+            (tmp, local)
+        }
+
+        /// Phase 5's renames, by hand: canonical → `<binary>.old-<pid>`.
+        fn rename_aside(local: &Path) {
+            let d = local.join("launcher/dist/windows-x64");
+            for b in ["vct-launcher.exe", "vct-hub.exe"] {
+                std::fs::rename(d.join(b), d.join(format!("{b}.old-4242"))).unwrap();
+            }
+        }
+
+        /// W3R-03 ACT: a tree whose only change is the launcher's own rename
+        /// artefacts has nothing to lose — no `-wip`, no bundle.
+        #[tokio::test]
+        async fn rename_artefacts_alone_are_nothing_to_lose() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, local) = with_tracked_binaries();
+            rename_aside(&local);
+            // A stale artefact from an earlier run (canonical present).
+            std::fs::write(local.join("launcher/dist/windows-x64/vct-launcher.exe.old-17"), "x").unwrap();
+            let b = create_reset_backup(&local, "vco_upstream/main", "main", &tmp.path().join("b"), "T2", &quiet)
+                .await
+                .expect("backup");
+            assert_eq!(b.uncommitted_branch, None, "no -wip for artefacts only");
+            assert_eq!(b.bundle, None);
+            assert!(b.describe().contains("no local commits or uncommitted changes"));
+            assert_eq!(backup_branches(&local), vec!["vco-backup/T2".to_string()]);
+        }
+
+        /// W3R-03 LEAVE-ALONE: real user files — a note, and a hand-made
+        /// `vct-launcher.old-may7` copy (not the `.old-<pid>` shape) — ARE
+        /// captured in `-wip` and in the bundle; the artefacts are not, and
+        /// the renamed-away binary is kept at HEAD's copy, not deleted.
+        #[tokio::test]
+        async fn user_files_are_captured_next_to_excluded_artefacts() {
+            if git_missing() {
+                return;
+            }
+            let (tmp, local) = with_tracked_binaries();
+            rename_aside(&local);
+            std::fs::write(local.join("notes.txt"), "mine\n").unwrap();
+            std::fs::write(local.join("launcher/dist/windows-x64/vct-launcher.old-may7"), "copy\n").unwrap();
+            let bdir = tmp.path().join("b");
+            let b = create_reset_backup(&local, "vco_upstream/main", "main", &bdir, "T3", &quiet)
+                .await
+                .expect("backup");
+            let wip = b.uncommitted_branch.clone().expect("user files → wip");
+            let files = out(&local, &["ls-tree", "-r", "--name-only", &wip]);
+            assert!(files.lines().any(|l| l == "notes.txt"), "{files}");
+            assert!(files.lines().any(|l| l == "launcher/dist/windows-x64/vct-launcher.old-may7"));
+            assert!(!files.contains(".old-4242"), "artefacts excluded: {files}");
+            assert!(files.lines().any(|l| l == "launcher/dist/windows-x64/vct-launcher.exe"));
+            assert!(files.lines().any(|l| l == "launcher/dist/windows-x64/vct-hub.exe"));
+
+            // The bundle carries it: fetch it into a fresh repo that has upstream.
+            let bundle = b.bundle.expect("bundle");
+            let fresh = tmp.path().join("fresh");
+            std::fs::create_dir_all(&fresh).unwrap();
+            run_git(&fresh, &["init", "--quiet"]);
+            let remote = tmp.path().join("remote.git");
+            run_git(&fresh, &["fetch", "--quiet", remote.to_str().unwrap(), "main:refs/remotes/up/main"]);
+            run_git(&fresh, &["fetch", "--quiet", bundle.to_str().unwrap(), "refs/heads/*:refs/remotes/b/*"]);
+            assert_eq!(out(&fresh, &["show", "b/vco-backup/T3-wip:notes.txt"]), "mine");
+        }
+    }
+
+    // ----- F-W3-14: resolvers act only on the resolved root -----
+
+    fn git(dir: &Path, args: &[&str]) -> String {
+        let o = std::process::Command::new("git").args(args).current_dir(dir).output().unwrap();
+        String::from_utf8_lossy(&o.stdout).to_string()
+    }
+
+    /// ACT: a GUI path that is not the resolved root is refused with the
+    /// typed Refused error, and the tree it names is left exactly as it was.
+    #[test]
+    fn a_resolver_path_that_is_not_the_resolved_root_is_refused_and_nothing_changes() {
+        let other = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        git(other.path(), &["init", "-q"]);
+        std::fs::write(other.path().join("f.txt"), "a\n").unwrap();
+        git(other.path(), &["add", "f.txt"]);
+        git(other.path(), &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "x"]);
+        let head = git(other.path(), &["rev-parse", "HEAD"]);
+        let err = check_gui_path(other.path(), root.path()).unwrap_err();
+        assert_eq!(err.kind(), "Refused");
+        assert!(err.to_json().contains("path_not_install_root"), "{}", err.to_json());
+        assert_eq!(git(other.path(), &["rev-parse", "HEAD"]), head, "HEAD untouched");
+        assert_eq!(git(other.path(), &["status", "--porcelain"]), "", "tree untouched");
+    }
+
+    /// LEAVE-ALONE: the same directory (also through a `..` detour or a
+    /// symlink) proceeds.
+    #[test]
+    fn a_resolver_path_equal_to_the_resolved_root_proceeds() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("sub")).unwrap();
+        assert!(check_gui_path(root.path(), root.path()).is_ok());
+        assert!(check_gui_path(&root.path().join("sub").join(".."), root.path()).is_ok());
+        #[cfg(unix)]
+        {
+            let link = tempfile::tempdir().unwrap();
+            let l = link.path().join("root-link");
+            std::os::unix::fs::symlink(root.path(), &l).unwrap();
+            assert!(check_gui_path(&l, root.path()).is_ok());
+        }
+        assert!(!gui_path_matches_root(Path::new("/nonexistent/vco"), root.path()));
+    }
+
+    /// No database → refused (never "assume the GUI path").
+    #[test]
+    fn no_database_refuses() {
+        let err = require_gui_path_is_resolved_root(None, "/tmp").unwrap_err();
+        assert!(err.contains("no_database"), "{err}");
     }
 }

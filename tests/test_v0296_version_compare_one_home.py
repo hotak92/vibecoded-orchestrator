@@ -43,8 +43,10 @@ class EveryCallSiteUsesTheOneHomeTests(unittest.TestCase):
     """
 
     def test_deferral_probes_delegates(self):
-        self.assertFalse(deferral_probes._version_ge("0.2.99", "0.2.100"))
-        self.assertTrue(deferral_probes._version_ge("0.2.100", "0.2.99"))
+        self.assertFalse(deferral_probes.version_reached("0.2.99", "0.2.100"))
+        self.assertTrue(deferral_probes.version_reached("0.2.100", "0.2.99"))
+        # v0.2.100 F-W1-01: a non-X.Y.Z side is NOT probed (None), never ranked.
+        self.assertIsNone(deferral_probes.version_reached("0.2.95rc1", "0.2.100"))
 
     def test_vscode_settings_delegates(self):
         # This is the one that was wrong in v0.2.95: it returned (0, 2, 951).

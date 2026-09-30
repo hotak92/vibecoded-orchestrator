@@ -511,8 +511,6 @@ async fn reap_pathological_containers_for_resume(
     db: &Db,
     resolve_manifest: &ManifestResolver,
 ) {
-    use std::collections::HashSet;
-
     let claimed = match db.list_module_installs_with_containers() {
         Ok(v) => v,
         Err(e) => {
@@ -523,9 +521,6 @@ async fn reap_pathological_containers_for_resume(
             return;
         }
     };
-    let claimed_names: HashSet<String> =
-        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
-
     let mut expected_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let gpu_mode = read_persisted_gpu_mode_for_supervisor();
@@ -548,14 +543,6 @@ async fn reap_pathological_containers_for_resume(
         }
     }
 
-    let prefixes: HashSet<String> = claimed
-        .iter()
-        .map(|(_pid, mid, _cn)| mid.clone())
-        .collect();
-    let name_filter = move |name: &str| -> bool {
-        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
-    };
-
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
@@ -567,22 +554,22 @@ async fn reap_pathological_containers_for_resume(
         }
     };
 
-    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
-    let (reaped, errors) =
-        vct_launcher_core::services::container_runtime::reap_pathological_containers(
-            &runtime,
-            &claimed_names,
-            expected_lookup,
-            name_filter,
-        )
-        .await;
-    if reaped > 0 || errors > 0 {
+    // v0.2.100 (WP-06, L2-F17): the ONE reaper pass (core) — module-name
+    // filter AND the DB verdict AND this install's launcher label.
+    let report = vct_launcher_core::services::container_runtime::reap_module_containers(
+        &runtime,
+        &claimed,
+        expected_map,
+    )
+    .await;
+    if report.reaped > 0 || report.errors > 0 {
         tracing::info!(
-            reaped,
-            errors,
+            reaped = report.reaped,
+            errors = report.errors,
             "[module_supervisor] V52-D.2 reaper: pass complete"
         );
     }
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules(&report.unlabelled);
 }
 
 /// Test-friendly variant of [`resume_containers_on_startup`] that takes

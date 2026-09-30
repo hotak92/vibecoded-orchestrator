@@ -67,7 +67,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # v0.2.97 SE-2: re-pinned DOWN (1652 → 1645) — step [5b] is one shim call
 # (+ the post-start verify and the --no-containers reconcile, one line each),
 # and --compose-working-dir's help lost the superseded legacy legs.
-_MAIN_SPAN_MAX = 1645
+# v0.2.100 WP-12: re-pinned DOWN (1645 → 1473). The collections/seed block
+# with its Weaviate-down recovery and the migrate-error deferral loop moved to
+# `vco_lib.install_weaviate` (`collections_and_seed`, `migrate_errors_to_entries`).
+_MAIN_SPAN_MAX = 1473
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -388,7 +391,14 @@ _MAIN_SPAN_MAX = 1645
 # testable `_ollama_models_step`), the pull list to `vco_lib.embedding_pull_plan`
 # (`_build_ollama_pull_list`, the profiles' static `embedding_models` and
 # `_OLLAMA_SERVED_EMBEDDING_MODELS` removed). Measured with `wc -l`.
-_TOTAL_LINES_MAX = 22512
+#
+# v0.2.100 WP-12 — re-pinned DOWN 22512 -> 22153 (-359). The seed phase and
+# the Weaviate write gate moved to `vco_lib.install_weaviate`, the resume/log
+# session parser (three hand copies: resume state, previous choices, state
+# hashes) to `vco_lib.install_resume`, the Ollama step-6/7 flow to
+# `vco_lib.ollama_pull.install_step`, the text-generation tier to one model.
+# Measured with `wc -l`.
+_TOTAL_LINES_MAX = 22153
 
 
 def _measure() -> tuple:

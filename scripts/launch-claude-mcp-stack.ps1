@@ -51,14 +51,19 @@
 # to probe; out of scope for v0.2.14.
 #
 # Exit codes (mirror the bash wrapper):
-#   0   success (or compose returned 125 → some containers failed,
-#       restart policy will recover)
+#   0   success
 #   2   FATAL: working directory does not exist / cd failed
 #   3   FATAL: no container runtime found, or the pinned one is refused —
 #       recorded as `container_runtime_unusable` in the own clone's
 #       UPDATE_DEFERRED ledger (R8 G6)
 #   4   FATAL: pick_compose_invocation rejected runtime/gpu combo
-#   *   compose's own non-zero exit code is propagated as-is
+#   5   FATAL: a vco_lib step (plan / provider / guard / compose-args)
+#       could not run — nothing composed
+#   6   the data-identity guard refused a service (nothing removed; the
+#       cleared ones were composed)
+#   *   compose's own exit code is propagated as-is — 125 included
+#       (v0.2.100 L2-F08: mapping it to 0 let callers book a failed heal
+#       as success)
 #
 # Soft-fail discipline: every non-fatal failure path logs + falls
 # through to a graceful default (mirrors `set +e` semantics in bash).
@@ -648,7 +653,11 @@ function Get-ComposeInvocation {
         # parameter naturally. v0.2.15 fix.
         [Parameter(Mandatory=$true)][AllowEmptyString()][string] $Runtime,
         [Parameter(Mandatory=$true)][AllowEmptyString()][string] $GpuMode,
-        [Parameter(Mandatory=$false)][string] $WorkingDir = ''
+        [Parameter(Mandatory=$false)][string] $WorkingDir = '',
+        # v0.2.100 (F-W1-14): the label family of the compose engine that
+        # will PARSE the overlay (Get-LabelFamily). Empty → the runtime name
+        # decides (the historical contract the pick tests pin).
+        [Parameter(Mandatory=$false)][string] $Family = ''
     )
     if ([string]::IsNullOrEmpty($WorkingDir)) { $WorkingDir = (Get-Location).Path }
 
@@ -660,6 +669,10 @@ function Get-ComposeInvocation {
         'podman compose'   { $overlay = $script:VctStackGpuOverlay }
         ''                 { return @{ Ok = $false; ErrorCode = 1 } }
         default            { return @{ Ok = $false; ErrorCode = 2 } }
+    }
+    switch ($Family) {
+        'podman' { $overlay = $script:VctStackGpuOverlay }
+        'docker' { $overlay = $script:VctStackGpuOverlayDocker }
     }
 
     # Resolve overlay path against working_dir for existence-check, but
@@ -891,6 +904,68 @@ function Invoke-StackPy {
 }
 
 # ---------------------------------------------------------------------------
+# Get-RuntimeParts :: the runtime binary and the compose command for a
+# Find-Runtime token. Mirrors bash runtime_parts. $null for an unknown token.
+# ---------------------------------------------------------------------------
+function Get-RuntimeParts {
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string] $Runtime)
+    switch ($Runtime) {
+        'docker'         { return @{ Bin = 'docker'; Compose = 'docker compose' } }
+        'podman-compose' { return @{ Bin = 'podman'; Compose = 'podman-compose' } }
+        'podman compose' { return @{ Bin = 'podman'; Compose = 'podman compose' } }
+    }
+    return $null
+}
+
+# ---------------------------------------------------------------------------
+# Get-LabelFamily :: podman | docker — the label family of the compose engine
+# that will run, from the ONE rule (vco_lib.compose_provider: detect +
+# overlay_candidates). Mirrors bash detect_label_family. '' when Python
+# cannot say.
+# ---------------------------------------------------------------------------
+function Get-LabelFamily {
+    param(
+        [Parameter(Mandatory=$true)][string] $Python,
+        [Parameter(Mandatory=$true)][string] $RuntimeBin,
+        [Parameter(Mandatory=$true)][string] $ComposeCmd
+    )
+    $code = @'
+import sys
+from vco_lib import compose_provider as cp
+p = cp.detect(sys.argv[1], argv=sys.argv[2].split())
+print("" if p is None else
+      "podman" if cp.overlay_candidates(p, None)[0].startswith("podman-compose") else "docker")
+'@
+    $root = if ($script:VctScriptDir) { Split-Path -Parent $script:VctScriptDir } else { '' }
+    $sep = [System.IO.Path]::PathSeparator
+    $saved = $env:PYTHONPATH
+    try {
+        if ($root) { $env:PYTHONPATH = if ($saved) { "$root$sep$saved" } else { $root } }
+        $out = & $Python -c $code $RuntimeBin $ComposeCmd 2>$null
+        if ($LASTEXITCODE -ne 0) { return '' }
+    } finally {
+        $env:PYTHONPATH = $saved
+    }
+    return (($out | Out-String).Trim())
+}
+
+# ---------------------------------------------------------------------------
+# ConvertFrom-UpShell :: the `vco_up_<key>=<shell-quoted list>` lines of
+# `service_lifecycle up --shell` → @{ cleared; refused; removed } arrays.
+# ---------------------------------------------------------------------------
+function ConvertFrom-UpShell {
+    param([Parameter(Mandatory=$true)][AllowEmptyString()][string] $Text)
+    $result = @{ cleared = @(); refused = @(); removed = @() }
+    foreach ($line in ($Text -split "`n")) {
+        if ($line -match '^vco_up_(cleared|refused|removed)=(.*)$') {
+            $value = $Matches[2].Trim().Trim("'")
+            $result[$Matches[1]] = @($value -split '\s+' | Where-Object { $_ })
+        }
+    }
+    return $result
+}
+
+# ---------------------------------------------------------------------------
 # Invoke-Main :: orchestrate the boot-safe compose-up. Mirrors bash main().
 #
 # Returns the exit code the script should propagate.
@@ -1018,7 +1093,19 @@ function Invoke-Main {
             }
         }
 
-        $invocation = Get-ComposeInvocation -Runtime $runtime -GpuMode $gpuMode -WorkingDir $script:VctStackWorkingDir
+        $parts = Get-RuntimeParts -Runtime $runtime
+        if ($null -eq $parts) {
+            Write-StackLog "FATAL: unknown runtime token '$runtime' - nothing composed"
+            return 4
+        }
+        $family = Get-LabelFamily -Python $stackPy -RuntimeBin $parts.Bin -ComposeCmd $parts.Compose
+        if ([string]::IsNullOrEmpty($family)) {
+            Write-StackLog "FATAL: vco_lib.compose_provider could not name the compose engine for '$($parts.Compose)' - nothing composed"
+            return 5
+        }
+        Write-StackLog "compose engine label family: $family"
+
+        $invocation = Get-ComposeInvocation -Runtime $runtime -GpuMode $gpuMode -WorkingDir $script:VctStackWorkingDir -Family $family
         if (-not $invocation.Ok) {
             Write-StackLog "FATAL: Get-ComposeInvocation rejected runtime=$runtime gpu_mode=$gpuMode (error_code=$($invocation.ErrorCode))"
             return 4
@@ -1030,7 +1117,7 @@ function Invoke-Main {
         # Adopted containers (somebody else's, started BY NAME, never
         # composed) come up on the boot path only.
         if ($fromPlan) {
-            $rtBin = if ($runtime -eq 'docker') { 'docker' } else { 'podman' }
+            $rtBin = $parts.Bin
             foreach ($name in $adopted) {
                 & $rtBin start $name *> $null
                 if ($LASTEXITCODE -eq 0) {
@@ -1038,6 +1125,35 @@ function Invoke-Main {
                 } else {
                     Write-StackLog "WARNING: could not start adopted container $name"
                 }
+            }
+        }
+
+        # The data-identity guard FIRST (v0.2.100 F-W2-14): each selected
+        # service is cleared by the guarded verb before this wrapper composes
+        # it; a refused one is never composed and nothing is removed. The
+        # wrapper composes itself because only it knows the GPU overlay (the
+        # verb's documented --guard-only contract). Mirrors bash guard_services.
+        $guardRefused = @()
+        if ($selected.Count -gt 0) {
+            $guardRun = Invoke-StackPy -Python $stackPy -Arguments @('vco_lib.service_lifecycle', 'up', '--shell',
+                '--guard-only', '--services', ($selected -join ' '), '--compose-dir', $script:VctStackWorkingDir,
+                '--compose-cmd', $parts.Compose, '--runtime', $parts.Bin)
+            if ($guardRun.Rc -ne 0 -and $guardRun.Rc -ne 3) {
+                Write-StackLog "FATAL: vco_lib.service_lifecycle up --guard-only could not run for '$($selected -join ' ')' (rc=$($guardRun.Rc)) - nothing composed: $($guardRun.Stderr)"
+                return 5
+            }
+            foreach ($line in ($guardRun.Stdout -split "`n")) {
+                if ($line -and $line -notmatch '^vco_up_') { Write-StackLog "guard: $($line.TrimEnd())" }
+            }
+            $verdict = ConvertFrom-UpShell -Text $guardRun.Stdout
+            $selected = @($verdict.cleared)
+            $guardRefused = @($verdict.refused)
+            if ($guardRefused.Count -gt 0) {
+                Write-StackLog "the data-identity guard refused: $($guardRefused -join ' ') (left exactly as it is; see UPDATE_DEFERRED.md)"
+            }
+            if ($selected.Count -eq 0) {
+                Write-StackLog "nothing cleared to compose"
+                return 6
             }
         }
 
@@ -1105,9 +1221,9 @@ function Invoke-Main {
         }
 
         Write-StackLog "compose exited rc=$rc"
-        # Exit 125 from podman-compose means "one or more containers
-        # failed to start" — tolerated at the unit level.
-        if ($rc -eq 0 -or $rc -eq 125) { return 0 }
+        # v0.2.100 (L2-F08): passed through as it is — 125 ("one or more
+        # containers failed to start") included. Mirrors the bash wrapper.
+        if ($rc -eq 0 -and $guardRefused.Count -gt 0) { return 6 }
         return $rc
     } finally {
         Pop-Location -ErrorAction SilentlyContinue

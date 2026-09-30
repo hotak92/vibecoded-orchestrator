@@ -320,8 +320,8 @@ async fn run_enrichment_with_stream(
             String::new()
         };
         return Err(format!(
-            "enrichment exit {}: {}",
-            status.code().unwrap_or(-1),
+            "enrichment failed ({}): {}",
+            status,
             if stderr_text.is_empty() {
                 "no stderr"
             } else {

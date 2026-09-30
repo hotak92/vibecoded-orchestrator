@@ -8,10 +8,14 @@ use crate::services::runtime::{
 };
 use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
 use vct_launcher_core::process::CommandExt as _;
+use vct_launcher_core::services::container_ownership::{
+    guarded_up, installer_compose_project, ownership, read_identity, stop_by_name, ContainerRunner,
+    ContainerState, Ownership, RuntimeRunner, UpReply, UpRequest,
+};
 use vct_launcher_core::services::service_endpoints::{
     adopted_autostart_container, awaits_choice, compose_managed_services, is_compose_managed,
-    lifecycle_container, machine_row_from_disk, machine_rows_from_disk, zombie_action, CoreService,
-    ZombieAction,
+    lifecycle_container, machine_row_from_disk, machine_rows_from_disk, zombie_action,
+    zombie_action_given, CoreService, ZombieAction,
 };
 use vct_launcher_core::services::service_status::{health_url, service_state};
 
@@ -105,9 +109,10 @@ fn compose_dir() -> Result<PathBuf, String> {
 }
 
 /// PR-15 G3 (v0.2.11): the `launch-claude-mcp-stack` wrapper shipped with
-/// the install. PREFERRED over direct compose: it owns the CDI-readiness
-/// wait (the `vco_code_embed` GPU boot race), runtime.txt resolution and
-/// daemon-access validation. `None` when not shipped (caller falls back).
+/// the install. PREFERRED for composing: it owns the CDI-readiness wait (the
+/// `vco_code_embed` GPU boot race), runtime.txt resolution, daemon-access
+/// validation and (v0.2.100) the data-identity guard before its compose.
+/// `None` when not shipped (the caller uses the guarded verb).
 fn find_stack_wrapper() -> Option<PathBuf> {
     let root = crate::commands::installer::find_local_repo_root().ok()?;
     let script_name = if cfg!(target_os = "windows") {
@@ -168,59 +173,10 @@ async fn run_stack_wrapper(subcommand: &str, services: &[&str]) -> Result<(), St
     Ok(())
 }
 
-/// Run `<runtime> compose <args>` in the compose dir, capturing stderr so
-/// the frontend shows the real failure.
-async fn run_compose<I, S>(info: &RuntimeInfo, args: I) -> Result<(), String>
-where
-    I: IntoIterator<Item = S>,
-    S: AsRef<std::ffi::OsStr>,
-{
-    let dir = compose_dir()?;
-    let mut cmd = info.compose_command();
-    cmd.args(args);
-    cmd.current_dir(&dir);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("spawn {} compose: {}", info.runtime.display_name(), e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "{} compose failed (status {}): {}",
-            info.runtime.display_name(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    Ok(())
-}
-
-/// The `compose up` argv for `services` — the ONE Python rule
-/// (`vco_lib.service_lifecycle.compose_up_args`, via
-/// `vct_launcher_core::services::compose_args`): `--no-deps` always (code_embed's
-/// `depends_on: ollama` must never create an Ollama next to an adopted one),
-/// `--profile gpu` with code_embed, and `None` — no compose call — for an
-/// empty list. `build` rebuilds code_embed's image from the checkout (v0.2.92
-/// BLOCKER-1: `up -d` alone builds only a MISSING image, so a source fix could
-/// stay absent from the running service through every update).
-async fn up_argv_with(
-    python: &std::path::Path,
-    root: &std::path::Path,
-    services: &[&str],
-    build: bool,
-) -> Result<Option<Vec<String>>, String> {
-    let args =
-        vct_launcher_core::services::compose_args::compose_up_args(python, root, services, build).await?;
-    Ok(if args.is_empty() { None } else { Some(args) })
-}
-
-/// [`up_argv_with`] for this install (its clone root and vco_lib Python).
-async fn up_argv(services: &[&str], build: bool) -> Result<Option<Vec<String>>, String> {
-    if services.is_empty() {
-        return Ok(None);
-    }
-    let root = crate::commands::installer::find_local_repo_root()?;
-    let python = vct_launcher_core::services::compose_args::rule_python()?;
-    up_argv_with(&python, &root, services, build).await
+/// The runtime as a [`ContainerRunner`] (the ownership module's reads,
+/// by-name verbs and verified post-conditions).
+fn runner_for(info: &RuntimeInfo) -> RuntimeRunner {
+    RuntimeRunner { binary: info.binary_path.clone(), runtime: info.runtime.binary().to_string() }
 }
 
 /// The services "Start all" brings up through compose: the compose-managed
@@ -229,45 +185,214 @@ fn start_all_compose_services(rows: &[(CoreService, Option<ServiceEndpointRow>)]
     compose_managed_services(rows)
 }
 
-/// Bring `services` up: the wrapper first when `prefer_wrapper` (CDI-wait for
-/// GPU containers; it takes the list as `VCO_COMPOSE_SERVICES`), else / then
-/// direct compose with the rule's argv. An empty list does nothing.
-async fn start_managed(info: &RuntimeInfo, services: &[&str], build: bool, prefer_wrapper: bool) -> Result<(), String> {
+/// The guarded-verb request for bringing `services` up (v0.2.100 WP-06):
+/// `recreate` = zombies removed only after their data guard passed;
+/// `guard_only` when the wrapper composes afterwards. Pure.
+fn start_request<'a>(
+    infra: &'a std::path::Path,
+    runtime: &'a str,
+    services: &'a [&'a str],
+    recreate: &'a [&'a str],
+    build: bool,
+    guard_only: bool,
+) -> UpRequest<'a> {
+    UpRequest { services, recreate, guard_only, build, compose_dir: infra, runtime: Some(runtime) }
+}
+
+/// Bring `services` up through the GUARDED path only (v0.2.100 WP-06, AD-4:
+/// every compose the launcher runs is cleared by the data-identity guard of
+/// `python -m vco_lib.service_lifecycle up` first — a refused service is
+/// never removed or composed):
+///   * wrapper preferred and no zombie to remove → the wrapper (GPU overlay,
+///     CDI wait), which runs the guard itself before composing;
+///   * wrapper preferred with `recreate` → the verb guards and removes the
+///     cleared zombies (`--guard-only`), then the wrapper composes them;
+///   * otherwise (or when the wrapper fails) → the verb guards AND composes.
+/// An empty list does nothing.
+async fn start_managed_guarded(
+    info: &RuntimeInfo,
+    services: &[&str],
+    recreate: &[&str],
+    build: bool,
+    prefer_wrapper: bool,
+) -> Result<(), String> {
     if services.is_empty() {
         return Ok(());
     }
-    if prefer_wrapper && find_stack_wrapper().is_some() {
+    let root = crate::commands::installer::find_local_repo_root()?;
+    let infra = root.join("infrastructure");
+    let python = vct_launcher_core::services::compose_args::rule_python()?;
+    let runtime = info.runtime.binary();
+    let wrapper = prefer_wrapper && find_stack_wrapper().is_some();
+    if wrapper && recreate.is_empty() {
         match run_stack_wrapper("start", services).await {
             Ok(()) => return Ok(()),
             Err(e) => tracing::warn!(
-                "[lifecycle] launch-claude-mcp-stack start failed, falling back to direct compose: {}",
+                "[lifecycle] launch-claude-mcp-stack start failed, retrying through the guarded verb: {}",
                 e
             ),
         }
+    } else if wrapper {
+        let reply = guarded_up(&python, &root, &start_request(&infra, runtime, services, recreate, build, true)).await?;
+        let cleared: Vec<&str> = reply.cleared.iter().map(String::as_str).collect();
+        if !cleared.is_empty() {
+            run_stack_wrapper("start", &cleared).await?;
+        }
+        return refusal_error(&reply);
     }
-    match up_argv(services, build).await? {
-        Some(args) => run_compose(info, args).await,
-        None => Ok(()),
+    let reply = guarded_up(&python, &root, &start_request(&infra, runtime, services, recreate, build, false)).await?;
+    if reply.code == Some(1) {
+        return Err(format!("compose up failed: {}", reply.output.trim()));
+    }
+    refusal_error(&reply)
+}
+
+/// `Err` naming the services the data guard refused (their containers were
+/// left exactly as they were), else `Ok`.
+fn refusal_error(reply: &UpReply) -> Result<(), String> {
+    if reply.refused.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "not started — the data-identity guard refused {} (nothing was removed): {}",
+        reply.refused.join(", "),
+        reply.output.trim()
+    ))
+}
+
+/// Tri-state presence (L2-F09): `inspect` failing for any reason other than
+/// the runtime's exact "no such container" is NOT "missing".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Presence {
+    Exists,
+    Missing,
+    Unknown(String),
+}
+
+/// Presence of `name`, from [`read_identity`] (a podman storage-only
+/// leftover counts as existing: the name is taken).
+pub(crate) async fn container_presence<R: ContainerRunner>(runner: &R, name: &str) -> Presence {
+    match read_identity(runner, name).await.state {
+        ContainerState::Missing => Presence::Missing,
+        ContainerState::Unknown(why) => Presence::Unknown(why),
+        _ => Presence::Exists,
+    }
+}
+
+/// Grace period handed to `stop --time` (then the runtime kills).
+const STOP_GRACE_SECS: u32 = 30;
+
+/// Stop ONE container and prove it (L2-F09): a missing one is nothing to
+/// stop; an unreadable one is an error, never a silent success; after `stop
+/// --time` the state is read back — still running (or unreadable) is an
+/// error. Never removes anything.
+pub(crate) async fn stop_verified<R: ContainerRunner>(runner: &R, container: &str) -> Result<(), String> {
+    match read_identity(runner, container).await.state {
+        ContainerState::Missing => return Ok(()),
+        ContainerState::Stopped(_) => return Ok(()),
+        ContainerState::Unknown(why) => return Err(format!("{container}: state unreadable ({why})")),
+        ContainerState::StorageOnly => {
+            return Err(format!(
+                "{container}: only the runtime's storage holds this name (a failed unmount left it)"
+            ))
+        }
+        ContainerState::Running | ContainerState::Paused | ContainerState::Transitioning(_) => {}
+    }
+    stop_by_name(runner, container, STOP_GRACE_SECS)
+        .await
+        .map_err(|e| format!("{container}: {e}"))?;
+    match read_identity(runner, container).await.state {
+        ContainerState::Stopped(_) | ContainerState::Missing => Ok(()),
+        other => Err(format!("{container}: still {other:?} after `stop --time {STOP_GRACE_SECS}`")),
+    }
+}
+
+/// Quit-and-stop's loop (L2-F09): the pause markers for EVERY service first
+/// (so the hub never races a half-done stop), then every container is
+/// stopped and verified — one failure never skips the rest. Returns the
+/// failures (`"<container>: why"`).
+pub(crate) async fn stop_all_verified<R: ContainerRunner>(
+    runner: &R,
+    targets: &[(&'static str, String)],
+) -> Vec<String> {
+    let names: Vec<&str> = targets.iter().map(|(svc, _)| *svc).collect();
+    set_pause_markers(&names, true);
+    let mut failures = Vec::new();
+    for (_svc, container) in targets {
+        if let Err(e) = stop_verified(runner, container).await {
+            failures.push(e);
+        }
+    }
+    failures
+}
+
+/// The `services_stop_incomplete` entry text for `failures` (pure). The
+/// command it prints is non-destructive — `stop` and a listing, never `rm`.
+pub(crate) fn stop_incomplete_entry(runtime_bin: &str, containers: &[String], failures: &[String]) -> (String, String) {
+    let detected = format!("Quit-and-stop could not verify these containers stopped: {}", failures.join("; "));
+    let command = format!(
+        "Stop them by name and check nothing is left behind: `{rt} stop --time {g} {names}` then \
+         `{rt} ps -a{ext}`. VCO does not remove them; the watchdog stays paused for them until you \
+         start the services again.",
+        rt = runtime_bin,
+        g = STOP_GRACE_SECS,
+        names = containers.join(" "),
+        ext = if runtime_bin == "podman" { " --external" } else { "" },
+    );
+    (detected, command)
+}
+
+/// Keep `services_stop_incomplete` true (paired-resolution: this function is
+/// the site its registry row names) — written when a stop could not be
+/// verified, resolved when a quit-and-stop verified every stop or the
+/// services were deliberately started again. Best-effort.
+fn record_stop_outcome(runtime_bin: &str, containers: &[String], failures: &[String]) {
+    let Ok(root) = crate::commands::installer::find_local_repo_root() else { return };
+    let result = if failures.is_empty() {
+        crate::services::deferral::resolve_deferral_conditions(&root, &root, &["services_stop_incomplete"])
+    } else {
+        let (detected, command) = stop_incomplete_entry(runtime_bin, containers, failures);
+        crate::services::deferral::emit_deferral_entry(
+            &root,
+            &root,
+            &crate::services::deferral::DeferralEntryFields {
+                condition_id: "services_stop_incomplete",
+                title: "Some VCO containers could not be verified stopped",
+                detected: &detected,
+                why_deferred: "Quit-and-stop never removes a container; a stop that did not take \
+                               effect (for example a failed unmount) is reported instead.",
+                command_to_apply: &command,
+                severity: "warning",
+            },
+        )
+    };
+    if let Err(e) = result {
+        tracing::warn!("[lifecycle] services_stop_incomplete record not updated: {}", e);
     }
 }
 
 /// Stop or restart ONE compose-managed service BY ITS CONTAINER NAME — no
-/// compose invocation, so no dependency is pulled in and no profile is
-/// needed. A restart of a container that does not exist yet creates it
-/// (the `up` rule). A stop of a missing container is a no-op.
+/// compose invocation for a stop. A restart of a container that does not
+/// exist yet creates it (guarded). A stop of a missing container is a no-op;
+/// an unreadable one is an error.
 async fn stop_or_restart_managed(info: &RuntimeInfo, service: CoreService, action: &str) -> Result<(), String> {
     let row = machine_row_from_disk(service);
     let container = lifecycle_container(service, row.as_ref()).unwrap_or_else(|| {
         vct_launcher_core::services::service_endpoints::canonical_container_name(service).to_string()
     });
     validate_container_name(&container)?;
-    if container_exists(info, &container).await? {
-        return control_container(info, &container, action).await;
+    let runner = runner_for(info);
+    if action == "stop" {
+        return stop_verified(&runner, &container).await;
     }
-    if action == "restart" {
-        return start_managed(info, &[service.name()], service == CoreService::CodeEmbed, false).await;
+    match container_presence(&runner, &container).await {
+        Presence::Exists => control_container(info, &container, action).await,
+        Presence::Missing if action == "restart" => {
+            start_managed_guarded(info, &[service.name()], &[], service == CoreService::CodeEmbed, false).await
+        }
+        Presence::Missing => Ok(()),
+        Presence::Unknown(why) => Err(format!("{container}: state unreadable ({why})")),
     }
-    Ok(())
 }
 
 /// What a lifecycle verb does for one service, decided from its row. Pure,
@@ -382,9 +507,12 @@ pub async fn services_get_endpoints() -> Result<Vec<(String, Option<ServiceEndpo
 /// PR-15 G2 (v0.2.11) + v0.2.97: recover a stuck (zombie) service.
 ///
 /// Row-gated (plan §4b, [`zombie_route`]):
-///   * `vco_managed` — force-remove the stale record of VCO's OWN container,
-///     then bring THIS service back up (`up -d <service>` through the
-///     wrapper — CDI-wait preserved — else direct compose).
+///   * `vco_managed` AND (v0.2.100 AD-5) the container's own labels say it
+///     is VCO's — removed only after the data-identity guard of
+///     `service_lifecycle up --recreate` passed, then THIS service is brought
+///     back up (the wrapper — CDI-wait preserved — else the guarded verb).
+///     A container whose labels name another project is only started by
+///     name, never removed.
 ///   * `adopted_container`, or NO row yet (ownership unknown) — NEVER
 ///     removed: a `rm` would let compose recreate the service on VCO's
 ///     default (empty) data volume. VCO only tries `<runtime> start <name>`;
@@ -403,24 +531,27 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
             let container = lifecycle_container(service, row.as_ref())
                 .unwrap_or_else(|| vct_launcher_core::services::service_endpoints::canonical_container_name(service).to_string());
             validate_container_name(&container)?;
-            let rm_out = tokio::process::Command::new(&info.binary_path)
-                .silent()
-                .args(["rm", "--force", &container])
-                .output()
-                .await
-                .map_err(|e| format!("spawn {} rm --force: {}", info.runtime.display_name(), e))?;
-            if !rm_out.status.success() {
-                let stderr = String::from_utf8_lossy(&rm_out.stderr).to_lowercase();
-                if !stderr.contains("no such container") && !stderr.contains("not found") {
-                    return Err(format!(
-                        "{} rm --force {} failed: {}",
-                        info.runtime.display_name(),
-                        container,
-                        stderr.trim()
-                    ));
-                }
+            // v0.2.100 (WP-06, AD-5): the row allows a recreate; the
+            // container's OWN labels decide whether it is VCO's to remove.
+            let runner = runner_for(&info);
+            let identity = read_identity(&runner, &container).await;
+            let installer_project = compose_dir().ok().and_then(|d| installer_compose_project(&d));
+            let own = ownership(row.as_ref(), &identity, installer_project.as_deref());
+            match zombie_action_given(row.as_ref(), &own) {
+                // Removed ONLY after its data guard passed, then re-created.
+                ZombieAction::Recreate => start_managed_guarded(&info, &[svc], &[svc], false, true).await,
+                _ => control_container(&info, &container, "start").await.map_err(|e| {
+                    let why = match &own {
+                        Ownership::Foreign { why } | Ownership::Unknown { why } => why.clone(),
+                        Ownership::Owned => String::new(),
+                    };
+                    format!(
+                        "{} (VCO does not remove {}: it {} — clear it with whoever created it, \
+                         keeping its data mount)",
+                        e, container, why
+                    )
+                }),
             }
-            start_managed(&info, &[svc], false, true).await
         }
         LifecycleRoute::Container { name: container } => {
             let unowned = row.is_none();
@@ -462,7 +593,7 @@ pub async fn services_start_all() -> Result<(), String> {
     set_pause_markers(&managed, false);
 
     let mut errors: Vec<String> = Vec::new();
-    if let Err(e) = start_managed(&info, &managed, false, true).await {
+    if let Err(e) = start_managed_guarded(&info, &managed, &[], false, true).await {
         errors.push(e);
     }
     for (_, row) in &rows {
@@ -473,29 +604,47 @@ pub async fn services_start_all() -> Result<(), String> {
         }
     }
     if errors.is_empty() {
+        // The services were deliberately started again: a pending "could
+        // not verify the stop" record no longer describes the machine.
+        record_stop_outcome(info.runtime.binary(), &[], &[]);
         Ok(())
     } else {
         Err(errors.join("; "))
     }
 }
 
-/// Stop VCO's compose-managed services WITHOUT removing volumes (no `-v`).
-/// Adopted containers belong to someone else and keep running — the same
-/// behaviour the pre-v0.2.97 project-scoped `compose stop` had for them.
-/// Used by Quit-confirmation's "Quit and stop services".
+/// Stop VCO's compose-managed services WITHOUT removing anything. Adopted
+/// containers belong to someone else and keep running. Used by
+/// Quit-confirmation's "Quit and stop services".
 ///
-/// BLOCKER-1 (v0.2.62): on success, drop a watchdog pause marker for each
-/// stopped service so the hub's watchdog knows the stop was deliberate.
+/// v0.2.100 (WP-06, L2-F09): the watchdog pause markers are written FIRST
+/// for every service (intent before action, so the hub never restarts a
+/// half-stopped stack), then EVERY container is stopped with `stop --time`
+/// and verified — one failure no longer aborts the rest. Anything not
+/// verified stopped is reported as `services_stop_incomplete` with a
+/// non-destructive command, and returned as the error.
 #[command]
 pub async fn services_stop_all() -> Result<(), String> {
     let info = require_runtime().await?;
-    let managed = compose_managed_services(&machine_rows_from_disk());
-    for name in &managed {
-        let service = CoreService::from_name(name).ok_or("unknown service")?;
-        stop_or_restart_managed(&info, service, "stop").await?;
+    let rows = machine_rows_from_disk();
+    let targets: Vec<(&'static str, String)> = compose_managed_services(&rows)
+        .into_iter()
+        .filter_map(|name| {
+            let service = CoreService::from_name(name)?;
+            let row = rows.iter().find(|(s, _)| *s == service).and_then(|(_, r)| r.clone());
+            let container = lifecycle_container(service, row.as_ref())?;
+            validate_container_name(&container).ok()?;
+            Some((service.name(), container))
+        })
+        .collect();
+    let failures = stop_all_verified(&runner_for(&info), &targets).await;
+    let containers: Vec<String> = targets.iter().map(|(_, c)| c.clone()).collect();
+    record_stop_outcome(info.runtime.binary(), &containers, &failures);
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("not every service could be verified stopped: {}", failures.join("; ")))
     }
-    set_pause_markers(&managed, true);
-    Ok(())
 }
 
 /// Restart VCO's compose-managed services — each by its container name (a
@@ -585,7 +734,7 @@ async fn route_service_action(info: &RuntimeInfo, name: &str, action: &str) -> R
     match lifecycle_route(service, machine_row_from_disk(service).as_ref()) {
         LifecycleRoute::Compose { service: svc } => {
             if action == "start" {
-                start_managed(info, &[svc], svc == "code_embed", false).await
+                start_managed_guarded(info, &[svc], &[], svc == "code_embed", false).await
             } else {
                 stop_or_restart_managed(info, service, action).await
             }
@@ -602,7 +751,11 @@ pub(crate) async fn control_container(info: &RuntimeInfo, container: &str, actio
         return Err(format!("invalid action '{}' (expected start | stop | restart)", action));
     }
     validate_container_name(container)?;
-    if !container_exists(info, container).await? {
+    let presence = container_presence(&runner_for(info), container).await;
+    if let Presence::Unknown(why) = &presence {
+        return Err(format!("{container}: state unreadable ({why})"));
+    }
+    if presence == Presence::Missing {
         return Err(structured_err(
             ERR_KIND_CONTAINER_MISSING,
             format!(
@@ -649,17 +802,6 @@ pub const ERR_KIND_NO_LIFECYCLE: &str = "no_lifecycle";
 /// `"<kind>: <human message>"`.
 pub(crate) fn structured_err(kind: &str, msg: impl AsRef<str>) -> String {
     format!("{}: {}", kind, msg.as_ref())
-}
-
-/// `Ok(true)` when `<runtime> inspect <name>` finds the container.
-pub(crate) async fn container_exists(info: &RuntimeInfo, name: &str) -> Result<bool, String> {
-    let mut cmd = tokio::process::Command::new(&info.binary_path).silent();
-    cmd.args(["inspect", "--format", "{{.Id}}", name]);
-    let out = cmd
-        .output()
-        .await
-        .map_err(|e| format!("spawn {} inspect: {}", info.runtime.binary(), e))?;
-    Ok(out.status.success())
 }
 
 /// Only the three canonical services are valid targets — no arbitrary
@@ -1170,18 +1312,12 @@ mod services_lifecycle_tests {
         r
     }
 
-    fn python() -> std::path::PathBuf {
-        vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3")
-    }
-
-    /// SE-4 × SE-3 red-proof: EVERY compose `up` argv the launcher builds
-    /// carries `--no-deps` and names no adopted service — with Weaviate and
-    /// Ollama adopted, "Start all" composes code_embed alone (profile gpu,
-    /// no-deps: its `depends_on: ollama` must not create an Ollama next to the
-    /// adopted one). Red against a hand-built `up -d <svc>` or a list that
-    /// includes adopted services.
-    #[tokio::test]
-    async fn no_compose_up_argv_lacks_no_deps_or_names_an_adopted_service() {
+    /// SE-4 × SE-3 (v0.2.100: through the guarded verb): with Weaviate and
+    /// Ollama adopted, "Start all" asks the verb for code_embed ALONE — the
+    /// verb's argv rule (`--no-deps`, `--profile gpu`) is pinned on the
+    /// Python side. Red if an adopted service reaches the request.
+    #[test]
+    fn start_all_requests_only_the_managed_services_through_the_guarded_verb() {
         let mut w = row("weaviate", EndpointMode::AdoptedContainer, 8081);
         w.container_name = Some("their_weaviate".into());
         let rows = vec![
@@ -1189,19 +1325,87 @@ mod services_lifecycle_tests {
             (CoreService::Ollama, Some(row("ollama", EndpointMode::AdoptedExternal, 11434))),
             (CoreService::CodeEmbed, Some(row("code_embed", EndpointMode::VcoManaged, 11440))),
         ];
-        let root = crate::services::vco_lib_bridge::test_checkout_root();
         let services = start_all_compose_services(&rows);
-        let argv = up_argv_with(&python(), &root, &services, false).await.unwrap().expect("code_embed");
-        assert!(argv.iter().any(|a| a == "--no-deps"), "{:?}", argv);
-        assert!(!argv.iter().any(|a| a == "weaviate" || a == "ollama"), "adopted services named: {:?}", argv);
-        assert_eq!(argv, vec!["--profile", "gpu", "up", "-d", "--no-deps", "code_embed"]);
+        assert_eq!(services, vec!["code_embed"]);
+        let infra = std::path::Path::new("/opt/vco/infrastructure");
+        let argv = vct_launcher_core::services::container_ownership::guarded_up_args(&start_request(
+            infra, "podman", &services, &[], false, false,
+        ));
+        assert_eq!(&argv[..3], &["-m", "vco_lib.service_lifecycle", "up"]);
+        let at = argv.iter().position(|a| a == "--services").unwrap();
+        assert_eq!(argv[at + 1], "code_embed");
+        // A zombie recovery removes only after the guard, then the wrapper composes.
+        let argv = vct_launcher_core::services::container_ownership::guarded_up_args(&start_request(
+            infra, "podman", &["ollama"], &["ollama"], false, true,
+        ));
+        assert!(argv.windows(2).any(|w| w == ["--recreate", "ollama"]));
+        assert!(argv.iter().any(|a| a == "--guard-only"));
+    }
 
-        // The single-service start of code_embed rebuilds its image.
-        let one = up_argv_with(&python(), &root, &["code_embed"], true).await.unwrap().unwrap();
-        assert!(one.contains(&"--build".to_string()) && one.contains(&"--no-deps".to_string()));
+    // ----- v0.2.100 WP-06 (L2-F09): quit-and-stop -----
 
-        // Nothing managed → no compose call at all.
-        assert_eq!(up_argv_with(&python(), &root, &[], false).await.unwrap(), None);
+    use vct_launcher_core::services::container_ownership::fake::{fail, inspect_line, ok, FakeRunner};
+
+    /// A failing FIRST stop still leaves every pause marker written (before
+    /// any stop ran) and every other container stopped and verified.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn a_failing_first_stop_still_marks_everything_and_stops_the_rest() {
+        let _g = vct_launcher_core::test_env::state_dir_guard();
+        let r = FakeRunner::new("podman");
+        // weaviate: running → stop fails (the unmount error);
+        // ollama: running → stop ok → exited; code_embed: running → stop ok → exited.
+        r.on("inspect", ok(&inspect_line("running", "null")));
+        r.on("inspect", ok(&inspect_line("running", "null")));
+        r.on("inspect", ok(&inspect_line("exited", "null")));
+        r.on("inspect", ok(&inspect_line("running", "null")));
+        r.on("inspect", ok(&inspect_line("exited", "null")));
+        r.on("stop", fail("Error: unmounting /var/lib/containers/storage/overlay/x/merged: device or resource busy"));
+        r.on("stop", ok(""));
+        let targets = vec![
+            ("weaviate", "vco_weaviate".to_string()),
+            ("ollama", "vco_ollama".to_string()),
+            ("code_embed", "vco_code_embed".to_string()),
+        ];
+        let failures = stop_all_verified(&r, &targets).await;
+        use vct_launcher_core::services::watchdog_pause::is_service_paused;
+        assert!(["weaviate", "ollama", "code_embed"].iter().all(|s| is_service_paused(s)), "every marker written");
+        assert_eq!(failures.len(), 1, "{failures:?}");
+        assert!(failures[0].starts_with("vco_weaviate"), "{failures:?}");
+        let stops: Vec<Vec<String>> = r.calls.borrow().iter().filter(|c| c[0] == "stop").cloned().collect();
+        assert_eq!(stops.len(), 3, "every container got its stop: {stops:?}");
+        assert!(stops.iter().all(|c| c[1] == "--time"), "bounded stop: {stops:?}");
+        assert!(!r.verbs().iter().any(|v| v == "rm"), "quit-and-stop never removes");
+    }
+
+    /// A stop that "succeeds" but leaves the container running is reported;
+    /// an unreadable state is an error, never a silent success.
+    #[tokio::test]
+    async fn a_stop_is_verified_and_unreadable_is_not_success() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("running", "null")));
+        r.on("stop", ok(""));
+        assert!(stop_verified(&r, "vco_ollama").await.unwrap_err().contains("still"));
+        let r = FakeRunner::new("docker");
+        r.on("inspect", fail("Cannot connect to the Docker daemon"));
+        assert!(stop_verified(&r, "vco_ollama").await.unwrap_err().contains("unreadable"));
+        assert!(!r.verbs().iter().any(|v| v == "stop"));
+        let r = FakeRunner::new("docker");
+        r.on("inspect", fail("Error: No such container: vco_ollama"));
+        assert!(stop_verified(&r, "vco_ollama").await.is_ok(), "nothing to stop");
+        let r = FakeRunner::new("docker");
+        r.on("inspect", fail("boom"));
+        assert_eq!(container_presence(&r, "x").await, Presence::Unknown("inspect x failed: boom".into()));
+    }
+
+    #[test]
+    fn the_stop_incomplete_command_is_non_destructive() {
+        let (detected, command) =
+            stop_incomplete_entry("podman", &["vco_weaviate".into()], &["vco_weaviate: still Running".into()]);
+        assert!(detected.contains("vco_weaviate"));
+        assert!(command.contains("podman stop --time 30 vco_weaviate"));
+        assert!(command.contains("ps -a --external"));
+        assert!(!command.contains(" rm"), "{command}");
     }
 
     /// The single-service router: VCO's own → compose; an adopted container

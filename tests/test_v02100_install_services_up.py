@@ -94,7 +94,9 @@ class World:
         h = dict(
             log_event=lambda *a, **k: self.events.append((a, k)),
             reachable=lambda rt: self.reachable_v,
-            try_start_podman=lambda: (self.started.append("podman"), (False, "restart failed"))[1],
+            heal_podman=lambda: (self.started.append("podman"),
+                                 cp.HealResult(False, ["systemctl --user restart podman.socket"],
+                                               "restart failed", cr.CID_SOCKET_HEAL_FAILED))[1],
             try_start_docker=lambda: (False, "n/a"),
             emit_podman_start_failed=lambda report, detail: report.add_entry(
                 type("E", (), {"condition_id": "podman_daemon_start_failed"})()),
@@ -176,7 +178,8 @@ def test_network_label_on_a_foreign_network_is_ledgered_and_left(tmp_path):
     outcome, _ = w.go()
     assert outcome == isu.FAIL and len(w.compose_calls) == 1
     assert not any(c[1:3] == ["network", "rm"] for c in w.probe_calls)
-    assert w.ledger.cids == [cr.CID_NETWORK_LABEL_ATTACHED]
+    # + the hard-stop row the exit-path flush writes (v0.2.100 AD-9)
+    assert w.ledger.cids == [cr.CID_NETWORK_LABEL_ATTACHED, "services_compose_up_failed"]
 
 
 def test_socket_error_with_a_healthy_socket_is_one_attempt_and_no_heal_event(tmp_path):
@@ -226,7 +229,7 @@ def test_preflight_heals_a_vanished_socket_file(tmp_path):
     status = cp.SocketStatus(cp.SOCKET_UNIT_ACTIVE_FILE_MISSING,
                              "/run/user/1000/podman/podman.sock", "podman.socket")
     outcome, out = w.go(socket_status=lambda rt: status,
-                        try_start_podman=lambda: (w.started.append("p"), (True, "ok"))[1])
+                        heal_podman=lambda: (w.started.append("p"), cp.HealResult(True, [], "ok"))[1])
     assert w.started == ["p"] and outcome == isu.OK
     assert "/run/user/1000/podman/podman.sock" in out
     assert "not running" not in out.lower()
@@ -259,3 +262,52 @@ def test_compose_timeout_env():
     assert isu.compose_timeout_s({"VCT_INSTALL_DOCKER_TIMEOUT": "30"}) == 60
     assert isu.compose_timeout_s({"VCT_INSTALL_DOCKER_TIMEOUT": "1800"}) == 1800
     assert isu.compose_timeout_s({"VCT_INSTALL_DOCKER_TIMEOUT": "x"}) == 900
+
+
+# ── W1R-03 / W1R-09 / W1R-10 (v0.2.100 WP-12) ──────────────────────────────
+
+
+def test_w1r03_socket_row_names_only_what_actually_ran(tmp_path):
+    """The REAL HealResult reaches the ledger: a heal that refused on
+    uncertainty ran nothing, so the row must not claim a restart."""
+    w = World(tmp_path, reachable=False)
+    status = cp.SocketStatus(cp.SOCKET_UNIT_ACTIVE_FILE_MISSING, "/s", "podman.socket")
+    w.go(socket_status=lambda rt: status,
+         heal_podman=lambda: cp.HealResult(False, [], "socket state unknown — no action",
+                                           cr.CID_SOCKET_HEAL_FAILED))
+    row = next(e for e in w.ledger.entries if e.condition_id == cr.CID_SOCKET_HEAL_FAILED)
+    assert "no repair" in row.detected and "restart" not in row.detected
+
+
+def test_w1r03_rerun_command_is_update_only_for_an_update(tmp_path):
+    for update, want in ((False, "python install.py\n"), (True, "python install.py --update")):
+        (tmp_path / str(update)).mkdir()
+        w = World(tmp_path / str(update), reachable=False)
+        w.plan.args = argparse.Namespace(update=update)
+        w.go(socket_status=lambda rt: cp.SocketStatus(cp.SOCKET_UNIT_ACTIVE_FILE_MISSING, "/s",
+                                                      "podman.socket"))
+        row = next(e for e in w.ledger.entries if e.condition_id == cr.CID_SOCKET_HEAL_FAILED)
+        assert want in row.command_to_apply + "\n", (update, row.command_to_apply)
+
+
+def test_w1r09_unreachable_podman_shows_the_real_reason_not_ok(tmp_path):
+    w = World(tmp_path, reachable=False)
+    real = w.run
+
+    def run(argv, **k):
+        if argv[1:] == ["info"]:
+            return _cp(argv, 125, "", "Error: database storage mismatch")
+        return real(argv, **k)
+
+    _, out = w.go(run=run, socket_status=lambda rt: cp.SocketStatus(cp.SOCKET_OK),
+                  heal_podman=lambda: cp.HealResult(False, [], "nothing to heal"))
+    assert "(ok)" not in out and "database storage mismatch" in out
+
+
+def test_w1r10_manual_command_is_the_last_argv_after_a_build_drop(tmp_path):
+    w = World(tmp_path, compose_results=((1, CORPUS["cobra_unknown_build_flag"]),
+                                         (1, "Error: something else entirely\n")))
+    outcome, out = w.go()
+    assert outcome == isu.FAIL and "--build" not in w.compose_calls[-1]
+    manual = out.split("Try starting manually:")[1].splitlines()[2].strip()
+    assert "--build" not in manual and "compose" in manual

@@ -80,29 +80,84 @@ use vct_launcher_core::process::CommandExt as _;
 /// bounded (an unbounded git hangs the daily check forever).
 pub(crate) const GIT_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The program a `git` spawn hands `Command::new`, resolved NOW.
+///
+/// `git` is resolved through `vct_launcher_core::paths::spawn_program`: on the
+/// process `PATH` in production, as before; over a test's per-thread injected
+/// lookup `PATH` otherwise, so a test puts a fake `git` first without setting
+/// the shared process `PATH` (v0.2.97 review R6). Exposed separately from
+/// [`git_command`] so a caller that builds its command LATER (inside a future
+/// polled on another tick — the fetch ladder) can resolve at call time.
+pub(crate) fn git_program() -> std::ffi::OsString {
+    vct_launcher_core::paths::spawn_program("git")
+}
+
 /// A silent `git` command — the one place the launcher's git runners name
-/// the program. `git` is resolved through
-/// `vct_launcher_core::paths::spawn_program`: on the process `PATH` in
-/// production, as before; over a test's per-thread injected lookup `PATH`
-/// otherwise, so a test puts a fake `git` first without setting the shared
-/// process `PATH` (v0.2.97 review R6).
+/// the program (see [`git_program`]).
+///
+/// NOT `kill_on_drop`: most git verbs mutate the work tree or the index, and
+/// killing one part-way (a cancelled task, app shutdown) can leave a
+/// half-applied checkout behind. The two places where a dropped future
+/// genuinely means "abandon this child" opt in explicitly —
+/// [`git_network_command`] and [`run_git`].
 pub(crate) fn git_command() -> TokioCommand {
-    TokioCommand::new(vct_launcher_core::paths::spawn_program("git")).silent()
+    TokioCommand::new(git_program()).silent()
+}
+
+/// The git verbs that talk to a remote. A dropped future for one of these is
+/// a timed-out or abandoned network wait, and the child must die with it
+/// (v0.2.100 WP-05, L2-F03): before, a `git fetch` whose
+/// `tokio::time::timeout` fired kept running as an orphan, held its ref and
+/// `shallow` locks, and made the NEXT attempt of the same ladder fail on a
+/// lock the previous attempt still owned.
+pub(crate) const NETWORK_VERBS: &[&str] = &["fetch", "ls-remote", "pull", "push", "clone"];
+
+/// `true` when `verb` (a git subcommand) talks to a remote — [`NETWORK_VERBS`].
+pub(crate) fn is_network_verb(verb: &str) -> bool {
+    NETWORK_VERBS.contains(&verb)
+}
+
+/// A silent `git` command for a NETWORK verb, with `kill_on_drop(true)`: when
+/// the future awaiting it is dropped (a per-attempt timeout, a cancelled
+/// caller) the child is killed rather than orphaned.
+///
+/// `program` comes from [`git_program`], resolved by the caller at call time.
+///
+/// Windows: `kill_on_drop` maps to `TerminateProcess` on the child. The wiring
+/// is unit-tested on every OS (`network_commands_are_kill_on_drop`); the
+/// end-to-end orphan test drives a POSIX `sh` fake git and is `#[cfg(unix)]`
+/// — on Windows the kill itself is tokio's, not ours, and is not exercised by
+/// a fake-git integration test here.
+pub(crate) fn git_network_command(program: &OsStr) -> TokioCommand {
+    let mut cmd = TokioCommand::new(program).silent();
+    cmd.kill_on_drop(true);
+    cmd
+}
+
+/// The command [`run_git`] spawns. Factored out so the `kill_on_drop` wiring
+/// is unit-testable without spawning anything.
+fn run_git_command(repo: &Path, args: &[&str]) -> TokioCommand {
+    let mut cmd = git_command();
+    // `run_git` ALWAYS runs under `GIT_TIMEOUT`. A timed-out child must not
+    // outlive the Err it produced: the caller has already been told "failed"
+    // and moves on; an orphan finishing the operation later (or holding its
+    // lock files) contradicts that answer.
+    cmd.kill_on_drop(true).args(args).current_dir(repo);
+    cmd
 }
 
 /// Run `git <args>` in `repo`, returning trimmed stdout.
 ///
-/// `Err` on: spawn failure, timeout, OR a non-zero exit (with trimmed stderr
-/// in the message). A caller that wants to inspect a non-zero exit rather
-/// than treat it as an error should not use this helper.
+/// `Err` on: spawn failure, timeout (the child is killed), OR a non-zero exit
+/// (with trimmed stderr AND the exit status in the message — an empty stderr
+/// must never leave the error without evidence, v0.2.100 WP-05 / I-06).
+/// A caller that wants to inspect a non-zero exit rather than treat it as an
+/// error should not use this helper.
 ///
 /// Output is captured, never inherited — `.silent()` also suppresses the
 /// console window Windows would otherwise flash for every invocation.
 pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String> {
-    let fut = git_command()
-        .args(args)
-        .current_dir(repo)
-        .output();
+    let fut = run_git_command(repo, args).output();
     let output = tokio::time::timeout(GIT_TIMEOUT, fut)
         .await
         .map_err(|_| format!("git {} timed out", args.join(" ")))?
@@ -110,7 +165,12 @@ pub(crate) async fn run_git(repo: &Path, args: &[&str]) -> Result<String, String
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(format!("git {}: {}", args.join(" "), stderr.trim()));
+        return Err(format!(
+            "git {}: {} ({})",
+            args.join(" "),
+            stderr.trim(),
+            output.status
+        ));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
@@ -140,6 +200,24 @@ pub(crate) async fn run_git_raw<S: AsRef<OsStr>>(
     run_git_raw_env(repo, args, &[]).await
 }
 
+/// The command [`run_git_raw_env`] spawns: `kill_on_drop` for a NETWORK verb
+/// only ([`is_network_verb`]) — a raw `git pull`/`push` abandoned by its
+/// caller is killed, a raw `git commit`/`rebase --continue` is left to finish.
+fn raw_git_command<S: AsRef<OsStr>>(
+    repo: &Path,
+    args: &[S],
+    envs: &[(&str, &str)],
+) -> TokioCommand {
+    let mut cmd = git_command();
+    cmd.kill_on_drop(is_network_verb(&first_arg(args)))
+        .args(args)
+        .current_dir(repo);
+    for (key, value) in envs {
+        cmd.env(key, value);
+    }
+    cmd
+}
+
 /// [`run_git_raw`] plus explicit environment overrides.
 ///
 /// Exists for the two `GIT_EDITOR=true` sites (`git commit --no-edit` /
@@ -152,12 +230,8 @@ pub(crate) async fn run_git_raw_env<S: AsRef<OsStr>>(
     args: &[S],
     envs: &[(&str, &str)],
 ) -> Result<std::process::Output, String> {
-    let mut cmd = git_command();
-    cmd.args(args).current_dir(repo);
-    for (key, value) in envs {
-        cmd.env(key, value);
-    }
-    cmd.output()
+    raw_git_command(repo, args, envs)
+        .output()
         .await
         .map_err(|e| format!("git {} spawn failed: {}", first_arg(args), e))
 }
@@ -943,5 +1017,51 @@ mod tests {
             .await
             .expect_err("bad ref must be Err");
         assert!(err.starts_with("git rev-parse"), "got: {err}");
+    }
+
+    // ── v0.2.100 WP-05: kill_on_drop wiring + exit-status evidence ──────
+
+    /// The wiring half of "a timed-out git child is killed", on EVERY OS
+    /// (Windows included — the end-to-end orphan test in `self_update` is
+    /// POSIX-only). Network verbs and `run_git` are `kill_on_drop`; a raw
+    /// mutating verb is NOT (killing a half-done `commit`/`rebase` is worse
+    /// than letting it finish).
+    #[test]
+    fn network_commands_are_kill_on_drop() {
+        let git = git_program();
+        assert!(git_network_command(&git).get_kill_on_drop());
+        assert!(run_git_command(Path::new("."), &["rev-parse", "HEAD"]).get_kill_on_drop());
+        for verb in NETWORK_VERBS {
+            assert!(
+                raw_git_command(Path::new("."), &[*verb, "x"], &[]).get_kill_on_drop(),
+                "raw `git {verb}` must be kill_on_drop"
+            );
+        }
+        for verb in ["commit", "rebase", "merge", "checkout", "add"] {
+            assert!(
+                !raw_git_command(Path::new("."), &[verb], &[]).get_kill_on_drop(),
+                "raw `git {verb}` mutates the tree and must NOT be killed on drop"
+            );
+            assert!(!is_network_verb(verb));
+        }
+        assert!(!git_command().get_kill_on_drop(), "the plain builder stays opt-in");
+    }
+
+    /// I-06 class, `run_git` half: a non-zero exit with EMPTY stderr still
+    /// carries evidence — the exit status. Pre-fix the message was
+    /// `"git <args>: "` and nothing else.
+    #[tokio::test]
+    async fn run_git_error_carries_the_exit_status() {
+        skip_if_no_git!();
+        let tmp = tempfile::tempdir().unwrap();
+        git(tmp.path(), &["init", "-q"]);
+        // `git rev-parse --verify --quiet <bad>` exits 1 and prints NOTHING.
+        let err = run_git(tmp.path(), &["rev-parse", "--verify", "--quiet", "nope"])
+            .await
+            .expect_err("bad ref must be Err");
+        // `ExitStatus`'s Display: `exit status: 1` on Unix, `exit code: 1` on
+        // Windows.
+        let want = if cfg!(windows) { "exit code: 1" } else { "exit status: 1" };
+        assert!(err.contains(want), "no exit status in: {err}");
     }
 }

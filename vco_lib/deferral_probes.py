@@ -179,16 +179,45 @@ def is_rendered_file_sidecar(rel_path: str) -> bool:
     return is_rendered_sidecar_path(rel_path)
 
 
+#: v0.2.100 U17 — the machine-readable sidecar list the Rust emitter writes
+#: into ``detected``: ``<!-- vco-sidecars: [...] -->``. MUST MATCH
+#: ``git_user_editable_merge.rs::SIDECAR_LIST_MARKER``; both sides run
+#: ``tests/fixtures/sidecar_list_line.json``.
+SIDECAR_LIST_MARKER = "vco-sidecars:"
+_SIDECAR_LIST_RE = re.compile(r"<!--\s*" + re.escape(SIDECAR_LIST_MARKER) + r"\s*(\[.*?\])\s*-->")
+
+
+def machine_sidecar_list(entry: Any) -> Optional[tuple[str, ...]]:
+    """The entry's COMPLETE machine-readable sidecar list (POSIX, repo-relative),
+    or ``None`` when it carries none (an entry written before v0.2.100) or the
+    line does not parse — the caller then falls back to the prose."""
+    if entry is None:
+        return None
+    for attr in ("detected", "command_to_apply"):
+        m = _SIDECAR_LIST_RE.search(getattr(entry, attr, "") or "")
+        if m is None:
+            continue
+        try:
+            raw = json.loads(m.group(1))
+        except ValueError:
+            return None
+        if not isinstance(raw, list) or not all(isinstance(x, str) for x in raw):
+            return None
+        return tuple(x.replace("\\", "/") for x in raw)
+    return None
+
+
 def adoptable_upstream_sidecar_paths(entry: Any) -> tuple[str, ...]:
-    """:func:`upstream_sidecar_paths` minus sidecars of RENDERED files.
+    """The entry's sidecars (its machine list when present, else the prose)
+    minus sidecars of RENDERED files.
 
     The set whose disappearance is the condition's lifecycle: see
     :func:`is_rendered_file_sidecar` for why a rendered file's sidecar is not
     in it.
     """
-    return tuple(
-        p for p in upstream_sidecar_paths(entry) if not is_rendered_file_sidecar(p)
-    )
+    listed = machine_sidecar_list(entry)
+    named = listed if listed is not None else upstream_sidecar_paths(entry)
+    return tuple(p for p in named if not is_rendered_file_sidecar(p))
 
 
 def dismiss_fields_for_sidecars(entry: Any) -> dict:
@@ -327,24 +356,22 @@ def _on_disk_launcher_version(install_root: Path, dist_rel_dir: str, binary_name
     return raw.strip() if isinstance(raw, str) and raw.strip() else None
 
 
-def _version_ge(a: str, b: str) -> bool:
-    """``a >= b`` for strict ``X.Y.Z`` versions; RAISES ``VersionParseError`` otherwise
-    (see :mod:`vco_lib.version_compare`).
-
-    The caller (``launcher_binary_stale_still_applies``) does NOT yet map that
-    error to "not probed": a non-``X.Y.Z`` dist sidecar or source version
-    propagates the exception out of the probe. Mapping it (``except
-    VersionParseError`` → ``None`` + a log line) is v0.2.100 WP-12's scheduled
-    work (plan register F-W1-01, review W1R-08); until WP-12 lands, only strict
-    ``X.Y.Z`` producers reach this call.
-
-    Was a hand-written copy of install.py's ``_ge`` — its own docstring said
-    "mirrors install.py's ``_ge``", which is a request for extraction rather
-    than a design. Both now delegate to :mod:`vco_lib.version_compare`.
+def version_reached(have: str, want: str, *, what: str = "version") -> Optional[bool]:
+    """``have >= want`` for strict ``X.Y.Z`` versions; ``None`` — NOT probed —
+    when either side is not ``X.Y.Z`` (v0.2.100 F-W1-01), with one stderr line
+    naming the unreadable value. The comparison itself is
+    :func:`vco_lib.version_compare.version_ge` (the ONE parser); this is the
+    ONE mapping of its ``VersionParseError`` for the deferral re-probes (this
+    module and install.py's ``launcher_binary_stale`` re-probe), so a malformed
+    sidecar can never read as "reached" nor escape as a traceback.
     """
-    from vco_lib.version_compare import version_ge
+    from vco_lib.version_compare import VersionParseError, version_ge
 
-    return version_ge(a, b)
+    try:
+        return version_ge(have, want)
+    except VersionParseError as exc:
+        print(f"  [deferral re-probe] {what}: not probed — {exc}", file=sys.stderr)
+        return None
 
 
 def _staged_new_siblings(install_root: Path, dist_rel_dir: str) -> list[str]:
@@ -377,11 +404,12 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     Returns:
         True  — at least one named sidecar is still on disk, OR the entry named
                 none and the bounded whole-root sweep found one anyway.
-        False — the entry named sidecars, the list is COMPLETE, and every one
-                of them is gone; OR the entry named none and the bounded sweep
-                COMPLETED finding no sidecar anywhere under the root.
-        None  — the list was truncated at the emitter's cap (see below), the
-                folder is unreadable, or the fallback sweep could not complete.
+        False — the entry named sidecars and every one of them is gone (a
+                machine list is complete by construction; a PROSE list only
+                when it was not truncated); OR the entry named none and the
+                bounded sweep COMPLETED finding no sidecar anywhere under the root.
+        None  — a prose list truncated at the emitter's cap (see below), an
+                unreadable folder, or a fallback sweep that could not complete.
 
     v0.2.91 dogfood fix — the LEGACY arm: an entry naming no sidecars used to
     return ``None`` unconditionally, i.e. NotProbed-forever with nothing in the
@@ -407,32 +435,42 @@ def orchestrator_sidecars_still_present(ctx: ProbeContext) -> Optional[bool]:
     ``CLAUDE.md.from-upstream-f1f5488`` (not named by any live entry). Clearing
     once the named ones are gone would retire the only record of the other and
     leave it parked and invisible — "cleared on a subset of real outstanding
-    work", which is exactly what the truncation arm above exists to refuse. So
-    the complete-list arm ends in the SAME bounded sweep the list-less arm
-    uses: every sidecar this condition can create is accounted for, not the
-    subset one entry happened to name.
+    work", which is exactly what the truncation arm above exists to refuse.
+    v0.2.95 answered with a sweep after the complete-list arm — SUPERSEDED in
+    v0.2.100 by U17 below (a sweep an entry never named made a named entry
+    immortal; the emitter's list is now machine-readable and complete).
 
     v0.2.97 — RENDERED files. Both arms look only at ADOPTABLE sidecars
     (:func:`adoptable_upstream_sidecar_paths`, and the same exclusion inside
     the sweep). A ``CLAUDE.md.from-upstream-<sha>`` is upstream's placeholder
     for a file install.py renders; it was never work the user owed, so an
-    entry naming only such sidecars clears (the field case above: both
-    ``CLAUDE.md`` sidecars were of this kind), while any genuine sidecar still
-    keeps the entry exactly as before.
+    entry naming only such sidecars clears.
+
+    v0.2.100 U17 — the entry and its probe name THE SAME FILES. The field case:
+    an entry naming only ``CLAUDE.md.from-upstream-89a5530`` (gone) stayed
+    "still applies" forever because the whole-root sweep found three UNRELATED
+    older ``knowledge/…md.from-upstream-*`` sidecars the entry never mentioned.
+    So the sweep now runs ONLY for an entry that named no sidecar at all (the
+    legacy list-less shape). An entry that named files — its complete
+    machine-readable list (the Rust emitter's ``vco-sidecars`` line), or, for
+    an older entry, its prose — clears exactly when those files are gone. This
+    retires v0.2.95 F4's "sweep after a complete list" by owner-plan decision
+    (PLAN-V0300-FIX WP-12): a sidecar no entry names is not this entry's.
     """
-    paths = adoptable_upstream_sidecar_paths(ctx.entry)
-    if not paths:
+    listed = machine_sidecar_list(ctx.entry)
+    named = listed if listed is not None else upstream_sidecar_paths(ctx.entry)
+    if not named:
         return any_upstream_sidecar_on_disk(ctx.folder)
     try:
-        for rel in paths:
+        for rel in adoptable_upstream_sidecar_paths(ctx.entry):
             candidate = ctx.folder / rel
             if candidate.exists() or candidate.is_symlink():
                 return True
     except OSError:
         return None
-    if sidecar_list_is_truncated(ctx.entry):
-        return None
-    return any_upstream_sidecar_on_disk(ctx.folder)
+    if listed is None and sidecar_list_is_truncated(ctx.entry):
+        return None  # the prose list was cut at the display cap: the tail is unnamed
+    return False
 
 
 def launcher_dist_still_dirty(ctx: ProbeContext) -> Optional[bool]:
@@ -503,7 +541,10 @@ def launcher_binary_stale_still_applies(ctx: ProbeContext) -> Optional[bool]:
     on_disk = _on_disk_launcher_version(ctx.folder, dist_rel_dir, binary_name)
     if not on_disk:
         return None
-    if not _version_ge(on_disk, str(source_version)):
+    reached = version_reached(on_disk, str(source_version), what="launcher binary sidecar")
+    if reached is None:
+        return None
+    if not reached:
         return True
 
     running = _launcher_process_running(binary_name)

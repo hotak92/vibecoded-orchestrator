@@ -18,6 +18,19 @@ which keeps thin shims) and made honest:
   caller turns it into the ``ollama_model_pull_failed`` deferral and a clean
   non-zero exit — no traceback.
 
+Ollama not answering at step 6 (owner answers, 2026-09-29 — :func:`install_step`):
+
+1. restart Ollama's container ONLY when VCO owns it — the service row is
+   ``vco_managed`` AND the container's real compose labels name VCO's own
+   project (:func:`restart_owned_ollama`: ``restart`` by name, never a
+   recreate); an adopted or foreign Ollama is reported, never touched;
+2. a bounded re-wait;
+3. still down → the update CONTINUES: model pulls and the KG seed are skipped
+   and recorded as the ``auto_retryable`` ``ollama_not_ready_at_update`` row,
+   whose retry (:func:`retry_owed_model_work`, the ``ollama_models`` handler of
+   :mod:`vco_lib.deferral_retry`) completes both once Ollama answers. The run
+   exits 0 unless something else failed.
+
 The base URL is always the caller's — the ``service_endpoints`` row (an
 adopted Ollama on another port included), never an environment default.
 HTTP goes through a tiny injectable layer so tests never reach a real Ollama.
@@ -65,12 +78,16 @@ class OllamaNotReadyError(OllamaStepError):
             title="Ollama did not answer; model setup not done",
             detected=str(self),
             why_deferred=(
-                "The models VCO uses could not be checked or pulled because Ollama was "
-                "not answering. Nothing was assumed present."
+                "The models VCO uses could not be checked or pulled, and the knowledge-graph "
+                "seed was not run, because Ollama was not answering. Nothing was assumed "
+                "present. The rest of the update completed; VCO retries the model pulls and "
+                "the seed by itself once Ollama answers."
             ),
             command_to_apply=(
-                f"Check the Ollama container (`podman logs vco_ollama`) and that {self.url} "
-                "answers, then re-run `python install.py --update`."
+                f"Nothing to do if Ollama comes back. Otherwise check the Ollama container "
+                f"(`podman logs vco_ollama` / `docker logs vco_ollama`) and that {self.url} "
+                "answers; to run the owed retry now (from the install root):\n"
+                "python -m vco_lib.deferral_retry --folder ."
             ),
             severity="warning",
         )
@@ -248,10 +265,12 @@ def ensure(
     load_bearing: Iterable[str] = (),
     http: Optional[OllamaHttp] = None,
     out: Callable[[str], None] = print,
+    skip_present: bool = True,
 ) -> EnsureResult:
     """Make ``models`` present: skip what ``/api/tags`` lists, pull the rest,
     verify afterwards. Raises :class:`OllamaPullError` (after trying every
-    model) when a ``load_bearing`` one failed; other failures are returned."""
+    model) when a ``load_bearing`` one failed; other failures are returned.
+    ``skip_present=False`` (``install.py --no-resume``) pulls every model."""
     base = base_url.rstrip("/")
     res = EnsureResult()
     try:
@@ -259,6 +278,8 @@ def ensure(
     except _PROBE_ERRORS as exc:
         present, missing = [], list(models)
         out(f"  (could not list present models: {exc}; pulling all)")
+    if not skip_present:
+        present, missing = [], list(models)
     for m in present:
         out(f"  {m} ... present")
     res.present = present
@@ -290,25 +311,50 @@ def ensure(
 # ── install.py steps 6 / 7 ──────────────────────────────────────────────────
 
 
-def wait_ready_step(base_url: str, *, timeout_s: float, log_event: LogEvent) -> None:
-    """install.py step 6 (shim target of ``_wait_for_ollama``)."""
+def wait_ready_step(base_url: str, *, timeout_s: float, log_event: LogEvent,
+                    recover: Optional[Callable[[], "tuple[str, str]"]] = None,
+                    rewait_s: float = 60.0,
+                    http: Optional[OllamaHttp] = None) -> Optional[OllamaNotReadyError]:
+    """install.py step 6: ``None`` once Ollama answers, else the typed error.
+
+    Never raises for "not ready": the caller decides (install.py continues).
+    ``recover`` is tried once on the first timeout — it returns
+    ``(outcome, detail)`` from :func:`restart_owned_ollama`; only a
+    ``restarted`` outcome earns the bounded re-wait."""
     print("[6/10] Waiting for Ollama ... ", end="", flush=True)
     log_event("6/10", "start", "waiting for Ollama")
     try:
-        wait_ready(base_url, timeout_s=timeout_s)
+        wait_ready(base_url, timeout_s=timeout_s, http=http)
     except OllamaNotReadyError as exc:
+        err: Optional[OllamaNotReadyError] = exc
         print("NOT READY")
-        log_event("6/10", "error", str(exc), data={"url": exc.url, "timeout_s": timeout_s})
-        raise
+        outcome, detail = recover() if recover is not None else ("none", "no recovery available")
+        print(f"  Ollama recovery: {detail}")
+        log_event("6/10", "recover", detail, data={"outcome": outcome})
+        if outcome == RESTARTED:
+            print("  Waiting for Ollama again ... ", end="", flush=True)
+            try:
+                wait_ready(base_url, timeout_s=rewait_s, http=http)
+                err = None
+            except OllamaNotReadyError as again:
+                err = again
+                print("NOT READY")
+        if err is not None:
+            log_event("6/10", "error", str(err), data={"url": err.url, "timeout_s": timeout_s,
+                                                        "recovery": outcome})
+            return err
     print("OK")
     log_event("6/10", "ok", "Ollama is ready", data={"url": base_url})
+    return None
 
 
 def ensure_plan_step(plan: PullPlan, urls: Mapping[str, Any], report: Any,
-                     *, log_event: LogEvent) -> EnsureResult:
-    """install.py step 7 (shim target of ``_pull_ollama_models``): ensure the
-    plan's models, report non-fatal failures + a down code backend into the
-    run's deferral report; raise :class:`OllamaPullError` for embeddings."""
+                     *, log_event: LogEvent, resume: bool = True,
+                     http: Optional[OllamaHttp] = None) -> EnsureResult:
+    """install.py step 7: ensure the plan's models, report non-fatal failures +
+    a down code backend into the run's deferral report; raise
+    :class:`OllamaPullError` for embeddings. With ``resume`` (the default) a
+    plan whose every model ``/api/tags`` lists prints "verified, skipped"."""
     print("[7/10] Ollama models (exactly the ones in use) ... ", flush=True)
     for why in plan.rationale:
         print(f"    - {why}")
@@ -316,7 +362,8 @@ def ensure_plan_step(plan: PullPlan, urls: Mapping[str, Any], report: Any,
               data={"models": list(plan.models)})
     base = str(urls["ollama_url"]).rstrip("/")
     try:
-        res = ensure(base, plan.models, load_bearing=plan.embedding)
+        res = ensure(base, plan.models, load_bearing=plan.embedding, skip_present=resume,
+                     http=http)
     except OllamaPullError as exc:
         log_event("7/10", "error", str(exc), data={"failed": exc.failed})
         raise
@@ -325,45 +372,172 @@ def ensure_plan_step(plan: PullPlan, urls: Mapping[str, Any], report: Any,
     if plan.code_backend_unavailable and report is not None:
         report.add_entry(code_embed_unavailable_entry(
             f"code_embed at {urls.get('code_embed_url')} did not answer /health"))
+    if resume and plan.models and len(res.present) == len(plan.models):
+        print(f"[7/10] Ollama models: verified, skipped ({len(res.present)} models present)")
     log_event("7/10", "warn" if res.failed else "ok",
               f"present={len(res.present)} pulled={len(res.pulled)} failed={len(res.failed)}",
               data={"failed": res.failed})
     return res
 
 
-def fail_step(exc: OllamaStepError, report: Any, folder: Path) -> int:
-    """Clean exit for a typed step-6/7 failure: the deferral lands on disk
-    NOW (the locked writer — this run returns before its final write) and in
-    the run report; one stderr line, exit 1, no traceback."""
-    import sys
+@dataclass
+class StepOutcome:
+    """install.py steps 6+7: ``rc`` non-None = exit with it; ``owed`` = Ollama
+    was down, pulls + the KG seed are owed to the retry driver."""
 
-    from vco_lib.deferral_emit import emit
-
-    entry = exc.deferral_entry()
-    if report is not None:
-        report.add_entry(entry)
-    emit(Path(folder), entry)
-    print(f"\n  ERROR: {exc}\n  Recorded in UPDATE_DEFERRED.md ({entry.condition_id}).",
-          file=sys.stderr)
-    return 1
+    rc: Optional[int] = None
+    owed: bool = False
 
 
-def code_embed_reachable(url: Optional[str], *, timeout_s: float = 60.0,
-                         http: Optional[OllamaHttp] = None) -> Optional[bool]:
-    """Bounded ``/health`` wait for the code_embed service (None: no URL)."""
+def install_step(urls: Mapping[str, Any], report: Any, *, plan: Callable[[], PullPlan],
+                 log_event: LogEvent, timeout_s: float, resume: bool = True,
+                 recover: Optional[Callable[[], "tuple[str, str]"]] = None,
+                 http: Optional[OllamaHttp] = None) -> StepOutcome:
+    """install.py steps 6+7 (see the module docstring for the Ollama-down flow).
+
+    Every failure lands in the run ``report`` — the run's exit-path flush
+    (``install_deferral_flow.flush_on_exit``) writes it, whatever the exit."""
+    down = wait_ready_step(str(urls["ollama_url"]).rstrip("/"), timeout_s=timeout_s,
+                           log_event=log_event, recover=recover, http=http)
+    if down is not None:
+        if report is not None:
+            report.add_entry(down.deferral_entry())
+        print(f"  Continuing the update WITHOUT model pulls and the knowledge-graph seed; "
+              f"recorded as {NOT_READY_CID} — VCO retries both once Ollama answers.")
+        return StepOutcome(owed=True)
+    try:
+        ensure_plan_step(plan(), urls, report, log_event=log_event, resume=resume, http=http)
+    except OllamaPullError as exc:
+        if report is not None:
+            report.add_entry(exc.deferral_entry())
+        import sys
+
+        print(f"\n  ERROR: {exc}\n  Recorded in UPDATE_DEFERRED.md ({PULL_FAILED_CID}).",
+              file=sys.stderr)
+        return StepOutcome(rc=1)
+    return StepOutcome()
+
+
+# ── recovery: restart an OWNED Ollama container (never adopted / foreign) ──
+
+RESTARTED = "restarted"
+NOT_OWNED = "not_owned"
+NO_CONTAINER = "no_container"
+RESTART_FAILED = "restart_failed"
+
+
+def restart_owned_ollama(install_root: Path, runtime: str, row: Any, *,
+                         run: Optional[Callable[..., Any]] = None,
+                         find: Optional[Callable[..., Optional[str]]] = None,
+                         identity: Optional[Callable[..., Any]] = None) -> "tuple[str, str]":
+    """``(outcome, detail)``. Restarts ONLY a container VCO owns: the
+    ``service_endpoints`` row is ``vco_managed`` AND the container's compose
+    project label is VCO's own project (the same predicate the recreate guard
+    uses, :func:`vco_lib.containers.foreign_compose_identity`). ``restart`` by
+    name — never ``rm``, never a compose recreate. Anything else is reported."""
+    import subprocess
+
+    from vco_lib import containers as _c
+
+    mode = getattr(row, "mode", None) if row is not None else "vco_managed"
+    if mode != "vco_managed":
+        who = getattr(row, "container_name", "") or getattr(row, "url", "") or "it"
+        return NOT_OWNED, (f"Ollama is {mode} ({who}) — not VCO's container, so VCO does "
+                           "not restart it; start it yourself")
+    if not runtime:
+        return NO_CONTAINER, "no container runtime detected — nothing VCO could restart"
+    name = (find or _c.find_existing_container)("ollama", runtime=runtime)
+    if not name:
+        return NO_CONTAINER, "no Ollama container exists — nothing VCO could restart"
+    why = _c.foreign_compose_identity(
+        (identity or _c.compose_identity_of)(name, runtime),
+        _c.own_compose_project(Path(install_root)))
+    if why:
+        return NOT_OWNED, f"container {name} {why} — not VCO's, left alone"
+    try:
+        res = (run or subprocess.run)([runtime, "restart", name], capture_output=True,
+                                      text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return RESTART_FAILED, f"`{runtime} restart {name}` could not run ({exc})"
+    if getattr(res, "returncode", 1) != 0:
+        tail = (getattr(res, "stderr", "") or "").strip().splitlines()[-1:]
+        return RESTART_FAILED, (f"`{runtime} restart {name}` failed"
+                                f"{': ' + tail[0] if tail else ''}")
+    return RESTARTED, f"restarted VCO's own container {name}"
+
+
+CODE_EMBED_READY = "ready"
+CODE_EMBED_WARMING = "warming"
+CODE_EMBED_DOWN = "down"
+
+
+def _timed_out(exc: BaseException) -> bool:
+    """A read that timed out: the port ACCEPTED the connection (the service is
+    up and busy — CodeSage's first ``/health`` loads, or downloads, the model)."""
+    seen: object = exc
+    for _ in range(8):  # URLError.reason / __cause__ chain, bounded
+        if isinstance(seen, TimeoutError):
+            return True
+        if not isinstance(seen, BaseException):
+            return False  # e.g. a URLError whose reason is a plain string
+        seen = getattr(seen, "reason", None) or seen.__cause__
+    return False
+
+
+def code_embed_container_running(runtime: str, *, run: Optional[Callable[..., Any]] = None,
+                                 find: Optional[Callable[..., Optional[str]]] = None
+                                 ) -> Optional[bool]:
+    """Tri-state: is the code_embed container RUNNING? ``None`` = could not tell
+    (no runtime, no such container, probe failed). Read-only."""
+    import subprocess
+
+    from vco_lib import containers as _c
+
+    if not runtime:
+        return None
+    name = (find or _c.find_existing_container)("code_embed", runtime=runtime)
+    if not name:
+        return False
+    try:
+        res = (run or subprocess.run)([runtime, "inspect", "--type", "container", "--format",
+                                       "{{.State.Running}}", name],
+                                      capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if getattr(res, "returncode", 1) != 0:
+        return None
+    return (res.stdout or "").strip().lower() == "true"
+
+
+def code_embed_state(url: Optional[str], *, timeout_s: float = 60.0,
+                     http: Optional[OllamaHttp] = None,
+                     container_running: Optional[Callable[[], Optional[bool]]] = None
+                     ) -> Optional[str]:
+    """``READY`` / ``WARMING`` / ``DOWN`` for the code_embed service (``None``:
+    no URL). v0.2.100 W3R-04: a service that accepts connections but has not
+    answered ``/health`` within the bound is loading its model — a fresh GPU
+    install downloads ~2.6 GB on the first request — and so is a container the
+    runtime reports RUNNING; neither is an outage. ``DOWN`` only when the port
+    never accepted AND the container is not provably running."""
     if not url:
         return None
     h = _http(http)
     deadline = time.monotonic() + timeout_s
+    accepted = False
     while True:
         try:
             h.get_json(f"{url.rstrip('/')}/health", 3.0)
-            return True
-        except _PROBE_ERRORS:
-            pass
+            return CODE_EMBED_READY
+        except _PROBE_ERRORS + (TimeoutError,) as exc:
+            accepted = accepted or _timed_out(exc)
         if time.monotonic() >= deadline:
-            return False
+            break
         time.sleep(2.0)
+    if accepted:
+        return CODE_EMBED_WARMING
+    if container_running is not None and container_running() is True:
+        return CODE_EMBED_WARMING
+    return CODE_EMBED_DOWN
 
 
 # ── launcher dual-flag toggle (python -m vco_lib.embedding_pull_plan ensure) ─
@@ -397,3 +571,54 @@ def ensure_for_machine(plan: PullPlan, root: Path, *, launcher_db: Optional[Path
     resolve_conditions(Path(root), (PULL_FAILED_CID, NOT_READY_CID))
     out["ok"] = True
     return out
+
+
+# ── the retry of the owed work (deferral_retry handler ``ollama_models``) ────
+
+DONE = "done"
+BLOCKED = "blocked"
+RETRY_FAILED = "failed"
+
+def retry_owed_model_work(folder: Path, *, seed: Callable[[], bool],
+                          launcher_db: Optional[Path] = None, wait_s: float = 15.0,
+                          http: Optional[OllamaHttp] = None,
+                          out: Callable[[str], None] = print) -> "tuple[str, str]":
+    """Complete what a run that found Ollama down skipped: the machine's model
+    pulls, then the KG seed. ``(DONE | BLOCKED | RETRY_FAILED, detail)``.
+
+    Clears ``ollama_not_ready_at_update`` / ``ollama_model_pull_failed`` ONLY on
+    proven success — every planned model listed by ``/api/tags`` AND ``seed()``
+    True, which the caller answers with PROOF, not an exit code (the retry
+    handler: the KG sync ran AND left no ``kg_sync_no_embedding_backend`` row).
+    Ollama still down → ``BLOCKED``, rows untouched for the next retry."""
+    from vco_lib import service_endpoints
+    from vco_lib.deferral_emit import emit, resolve_conditions
+    from vco_lib.embedding_pull_plan import PlanUnavailable, plan_from_machine
+
+    folder = Path(folder)
+    base = str(service_endpoints.machine_service_urls(launcher_db)["ollama_url"]).rstrip("/")
+    try:
+        wait_ready(base, timeout_s=wait_s, http=http)
+    except OllamaNotReadyError as exc:
+        return BLOCKED, f"{exc} — the entry stays for the next retry"
+    try:
+        pp = plan_from_machine(folder, launcher_db)
+        res = ensure(base, pp.models, load_bearing=pp.embedding, http=http, out=out)
+        missing = [] if res.failed else verify_present(base, pp.models, http=http)[1]
+    except PlanUnavailable as exc:
+        return RETRY_FAILED, str(exc)
+    except OllamaPullError as exc:
+        resolve_conditions(folder, (NOT_READY_CID,))
+        emit(folder, exc.deferral_entry())
+        return RETRY_FAILED, str(exc)
+    except _PROBE_ERRORS as exc:
+        return RETRY_FAILED, f"/api/tags could not be read after the pulls ({exc})"
+    if res.failed or missing:
+        failed = dict(res.failed) or {m: "not listed by /api/tags" for m in missing}
+        resolve_conditions(folder, (NOT_READY_CID,))
+        emit(folder, pull_failed_entry(failed, base))
+        return RETRY_FAILED, "model(s) still missing: " + ", ".join(failed)
+    if not seed():
+        return RETRY_FAILED, "the knowledge-graph seed did not complete (not proven)"
+    resolve_conditions(folder, (NOT_READY_CID, PULL_FAILED_CID))
+    return DONE, f"{len(pp.models)} model(s) present, knowledge-graph seed completed"

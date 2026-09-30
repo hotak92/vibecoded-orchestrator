@@ -358,6 +358,7 @@ owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-6): Ollama did not answer within the step-6 wait during an update; the owed model work resolves once it answers. Registered ahead of its emitter (install.py step 6)."
+retry_action = "retry:py:ollama_models"
 
 [conditions.ollama_model_pull_failed]
 class = "auto_retryable"
@@ -365,6 +366,7 @@ owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-6, L1-F09): a model the configuration uses could not be pulled; the run records it instead of a traceback. Registered ahead of its emitter (install.py step 7)."
+retry_action = "retry:py:ollama_models"
 
 [conditions.code_embed_backend_unavailable]
 class = "action_required"
@@ -390,16 +392,16 @@ notes = "v0.2.100 (AD-7, L5-F02; F-W1-12): the gateway agent gate could not be e
 [conditions.watchdog_foreign_container]
 class = "environmental"
 owner = "vct-hub (infra_watchdog.rs)"
-clear_probe = "owned-drop-when-absent"
+clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-5): the hub watchdog found a service container VCO does not own (by label) and left it alone. A true description of the machine. Registered ahead of its emitter (WP-06); emitted outside install.py, so install ownership gives the one-shot expiry on the next update."
+notes = "v0.2.100 (AD-5, WP-06): the hub watchdog found a stopped service container whose own compose labels name another project and left it alone (no up, no rm, no start). A true description of the machine, kept true by its emitter: `infra_watchdog::record_foreign` rewrites the row when the set of foreign services changes and resolves it (`deferral_bridge::resolve_deferral_conditions`) on the first tick that finds none — including the hub's first tick after a restart. NOT install.py-owned (W1R-15): owned-drop-when-absent would expire the row on the next update while the condition still holds."
 
 [conditions.services_stop_incomplete]
 class = "action_required"
 owner = "vct-launcher (commands/lifecycle.rs)"
-clear_probe = "owned-drop-when-absent"
+clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-5, L2-F09): quit-and-stop could not verify every VCO container stopped. Registered ahead of its emitter (WP-06); emitted by the launcher, outside install.py — one-shot expiry on the next update."
+notes = "v0.2.100 (AD-5, L2-F09, WP-06): quit-and-stop could not verify every VCO container stopped; the row names them and a non-destructive command (stop + list, never rm). Resolved by `lifecycle::record_stop_outcome` when a later quit-and-stop verifies every stop, or when `services_start_all` starts the services again. NOT install.py-owned (W1R-15): an update must not drop an unverified stop the user has not dealt with."
 
 [conditions.bundle_leftover_removed]
 class = "informational_record"
@@ -417,10 +419,10 @@ notes = "v0.2.100 (AD-12, owner Q3): project-bundle copies of infrastructure com
 
 [conditions.module_container_unlabelled]
 class = "informational_record"
-owner = "vct-launcher-core (container_ownership.rs)"
-clear_probe = "owned-drop-when-absent"
+owner = "vct-launcher-core (container_runtime.rs reaper)"
+clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-12, L2-F17): a pre-existing module container carries no ownership label, so the reaper leaves it alone. Registered ahead of its emitter (WP-06)."
+notes = "v0.2.100 (AD-12, L2-F17, WP-06): a module container the database calls a leftover carries no launcher ownership label (created before v0.2.100, or not by this launcher), so the reaper left it alone. Kept true by `container_runtime::record_unlabelled_modules`, called after every reaper pass by BOTH surfaces (launcher `module_service`, hub `module_supervisor`): rewritten while unlabelled containers remain, resolved by the first pass that finds none. NOT install.py-owned (W1R-15)."
 
 [conditions.update_install_phase_failed]
 class = "action_required"
@@ -2073,3 +2075,11 @@ mechanism: the remedy is a full code-graph analysis, which is the user's \
 decision because it costs compute, and a probe that cleared the entry when \
 the count happened to reach zero could not distinguish "analyzed" from \
 "someone deleted the rows"."""
+
+[conditions."migrate_collections_partial_failure_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.100 (WP-12): one row per collection whose smart schema migration (`project_init.migrate_collections`) raised during `install.py --update`, emitted inside the run by `vco_lib.install_weaviate.migrate_errors_to_entries`. Emitted since HIGH-1 but never registered; install-owned so a later completed run that no longer fails drops it."""

@@ -1528,7 +1528,6 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     // loaded machine without making a genuinely-down hub hang the caller.
     const ATTEMPTS: u32 = 10;
     const DELAY_MS: u64 = 300;
-    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(2))?;
     // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
     // is restarting (update flow / crash-restart) it may bind a different port
     // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
@@ -1546,11 +1545,9 @@ async fn wait_for_hub_ready() -> Result<(), String> {
             Err(_) => continue, // port file not written yet — retry
         };
         last_port = port;
-        let url = format!("http://127.0.0.1:{}/api/v1/health", port);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        // v0.2.100 (F-W3-12): the ONE liveness probe.
+        if vct_launcher_core::services::hub_health::probe_async(port).await {
+            return Ok(());
         }
     }
     Err(format!(
@@ -2758,9 +2755,7 @@ async fn reap_pathological_containers_for_resume<F>(db: &Db, resolve_manifest: &
 where
     F: Fn(&str) -> Option<ModuleManifest>,
 {
-    use std::collections::HashSet;
-
-    // Build claimed_names: every container_name referenced by any
+    // Every container_name referenced by any
     // module_installs row (whether status='installed' or other).
     // Includes both per-project + global rows.
     let claimed = match db.list_module_installs_with_containers() {
@@ -2774,9 +2769,6 @@ where
             return;
         }
     };
-    let claimed_names: HashSet<String> =
-        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
-
     // Build the (container_name → expected image:tag) lookup. For
     // each claimed row, resolve the manifest's
     // `install.container.image:tag` (variant-aware via the same
@@ -2806,25 +2798,10 @@ where
         }
     }
 
-    // Build name_filter: a container name is interesting if it
-    // matches a known module-id prefix. We derive the set of
-    // module-id prefixes from the claimed rows + any module known
-    // to the resolver (the resolve_manifest closure can be queried
-    // for arbitrary ids — but the claimed set already covers every
-    // module the launcher has installed; broken/orphan containers
-    // for those modules ARE the targets). The reaper deliberately
-    // does NOT touch containers whose names don't match any known
-    // module-id prefix — never reap Weaviate / Ollama / user
-    // containers.
-    let prefixes: HashSet<String> = claimed
-        .iter()
-        .map(|(_pid, mid, _cn)| mid.clone())
-        .collect();
-    let name_filter = move |name: &str| -> bool {
-        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
-    };
-
-    // Detect runtime + invoke the core reaper.
+    // Detect runtime + invoke the ONE core reaper pass (v0.2.100 WP-06,
+    // L2-F17): module-name filter AND the DB verdict AND this install's
+    // launcher label — never Weaviate / Ollama / the user's containers, and
+    // never a container this launcher cannot prove it created.
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
@@ -2836,21 +2813,19 @@ where
         }
     };
 
-    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
-    let (reaped, errors) =
-        vct_launcher_core::services::container_runtime::reap_pathological_containers(
-            &runtime,
-            &claimed_names,
-            expected_lookup,
-            name_filter,
-        )
-        .await;
-    if reaped > 0 || errors > 0 {
+    let report = vct_launcher_core::services::container_runtime::reap_module_containers(
+        &runtime,
+        &claimed,
+        expected_map,
+    )
+    .await;
+    if report.reaped > 0 || report.errors > 0 {
         tracing::info!(
             "[module_service] V52-D.2 reaper: pass complete, reaped={} errors={}",
-            reaped, errors
+            report.reaped, report.errors
         );
     }
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules(&report.unlabelled);
 }
 
 /// Test-friendly variant: same logic as `resume_containers_on_startup`

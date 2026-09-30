@@ -15,11 +15,10 @@ a directory is an orchestrator clone iff it carries the structural markers
 ``vct-module.json`` parses to an object whose ``id`` is exactly the string
 ``"orchestrator"``.
 
-The Python statement of the rule composes only primitives that are already
-the Python homes for the facts it reads: the manifest's module id is the key
-``vco_lib`` itself uses for the orchestrator manifest (``vct-module.json``
-``id``), and ``vco_lib.project_identity.normalise_for_match`` is asserted NOT
-to be the comparison (the id match is exact, unlike class-name matching).
+The Python side of the rule is ``vco_lib.orchestrator_identity``
+(``is_orchestrator_clone``) — the shipped home this file now drives, so the
+parity is real (rule C: two implementations, one table). The id match is
+exact, unlike ``vco_lib.project_identity.normalise_for_match``.
 """
 
 from __future__ import annotations
@@ -35,32 +34,13 @@ RUST_SOURCE = (
     REPO / "launcher" / "src-tauri" / "vct-launcher-core" / "src" / "services" / "install_root.rs"
 )
 
-ORCHESTRATOR_MODULE_ID = "orchestrator"  # must match install_root.rs ORCHESTRATOR_MODULE_ID
+from vco_lib.orchestrator_identity import (  # noqa: E402 — the Python home (F-W1-05)
+    ORCHESTRATOR_MODULE_ID,
+    has_root_markers as _looks_like_orchestrator_root,
+    is_orchestrator_clone,
+)
+
 MAX_WALK_LEVELS = 8  # must match install_root.rs MAX_WALK_LEVELS
-
-
-def _looks_like_orchestrator_root(d: Path) -> bool:
-    # must match install_root.rs::looks_like_orchestrator_root
-    return (d / "vct-module.json").is_file() or (
-        (d / "install.py").is_file() and (d / "CLAUDE.md").is_file()
-    )
-
-
-def _manifest_id(d: Path) -> str | None:
-    # must match install_root.rs::manifest_id
-    try:
-        data = json.loads((d / "vct-module.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    mid = data.get("id")
-    return mid if isinstance(mid, str) else None
-
-
-def is_orchestrator_clone(d: Path) -> bool:
-    # must match install_root.rs::is_orchestrator_clone
-    return _looks_like_orchestrator_root(d) and _manifest_id(d) == ORCHESTRATOR_MODULE_ID
 
 
 def _walk_from_exe(exe: Path) -> Path | None:

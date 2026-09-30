@@ -146,7 +146,9 @@ def _holds_shared_deferral_lock(text: str) -> bool:
 
 _V0290_OWNED_PREFIXES = (
     "bundle_pin_drift_", "deprecated_mcp_", "kg_named_vector_slot_error_",
-    "lowercase_codegraph_residual_", "schema_migration_failed_",
+    "lowercase_codegraph_residual_",
+    # v0.2.100 (WP-12): emitted since HIGH-1, registered now.
+    "migrate_collections_partial_failure_", "schema_migration_failed_",
     "schema_migration_required_", "stale_unit_retired_",
 )
 
@@ -296,10 +298,12 @@ _V0298_OWNED_ADDITIONS = frozenset({
 #     gated delivery): family A proper — emitted INSIDE the install.py run
 #     into that run's report, so the run that no longer detects the state
 #     drops the row;
-#   * launcher / hub emitters (`watchdog_foreign_container`,
-#     `services_stop_incomplete`, `module_container_unlabelled`): never
-#     emitted from inside an install.py run, so install ownership is the
-#     one-shot auto-expiry the `stale_unit_retired_` precedent established.
+#   * (the launcher / hub emitters `watchdog_foreign_container`,
+#     `services_stop_incomplete`, `module_container_unlabelled` LEFT this set
+#     in WP-06 — wave-1 review W1R-15: install ownership expired a row whose
+#     class says it persists while true. They are paired-resolution rows kept
+#     true by their emitters: infra_watchdog::record_foreign,
+#     lifecycle::record_stop_outcome, container_runtime::record_unlabelled_modules.)
 _V02100_OWNED_ADDITIONS = frozenset({
     "compose_socket_heal_failed",
     "compose_provider_mismatch",
@@ -313,10 +317,16 @@ _V02100_OWNED_ADDITIONS = frozenset({
     # (F-W1-12): their emitter runs INSIDE an install.py run (the root bundle),
     # so install ownership would drop the row in that run's own finalize; they
     # are paired-resolution rows owned by vco_lib.module_gated_delivery.
-    "watchdog_foreign_container",
-    "services_stop_incomplete",
     "bundle_leftover_removed",
     "bundle_compose_copies_removed",
+})
+
+
+# v0.2.100 WP-06 (W1R-15): the launcher / hub rows are NOT install-owned —
+# pinned the other way round so a later edit cannot quietly hand them back.
+_V02100_EMITTER_KEPT = frozenset({
+    "watchdog_foreign_container",
+    "services_stop_incomplete",
     "module_container_unlabelled",
 })
 
@@ -730,6 +740,14 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             "one-shot records, catastrophic for anything whose emitter runs "
             "INSIDE an install.py run. Justify the change and update this pin.",
         )
+
+    def test_launcher_and_hub_rows_are_kept_true_by_their_emitters(self):
+        from vco_lib import deferral_registry as dr  # noqa: PLC0415
+
+        leaked = _V02100_EMITTER_KEPT & self.owned
+        self.assertFalse(leaked, f"install.py would expire these on the next update: {sorted(leaked)}")
+        for cid in _V02100_EMITTER_KEPT:
+            self.assertEqual(dr.clear_probe_for(cid), "paired-resolution", cid)
 
     def test_prefix_families_unchanged(self):
         self.assertEqual(self.prefixes, _V0290_OWNED_PREFIXES)

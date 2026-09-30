@@ -132,7 +132,9 @@ def test_not_ready_is_typed_and_bounded(monkeypatch):
     assert len(fake.gets) <= 7
 
 
-# ── install.py steps 6/7: typed failure → deferral on disk + exit 1 ────────
+# ── install.py steps 6/7: typed failures land in the RUN report ─────────────
+# (the run's exit-path flush — install_deferral_flow.flush_on_exit — writes it;
+# the Ollama-down CONTINUE flow is tests/test_v02100_ollama_down_continue.py)
 
 
 def _install_env(monkeypatch, tmp_path, fake: FakeOllama, plan: PullPlan):
@@ -144,6 +146,7 @@ def _install_env(monkeypatch, tmp_path, fake: FakeOllama, plan: PullPlan):
     monkeypatch.setattr(install, "_log_install_event", lambda *a, **k: None)
     monkeypatch.setattr(install, "_inference_models_for_capability", lambda _s: [])
     monkeypatch.setattr(install._embedding_pull_plan, "plan_for_install", lambda *a, **k: plan)
+    monkeypatch.setitem(install._SERVICE_ENDPOINTS, "rows", {})
 
 
 def _ledger_ids(folder: Path) -> list[str]:
@@ -152,28 +155,17 @@ def _ledger_ids(folder: Path) -> list[str]:
     return [e.condition_id for e in DeferralReport.read(folder).entries]
 
 
-def test_install_step_not_ready_exits_1_with_deferral(monkeypatch, tmp_path, capsys):
-    from vco_lib.deferral_report import DeferralReport
-
-    _install_env(monkeypatch, tmp_path, FakeOllama(ready=False),
-                 PullPlan(embedding=(QWEN,), inference=()))
-    report = DeferralReport()
-    rc = install._ollama_models_step({}, object(), report, tmp_path)
-    assert rc == 1
-    assert _ledger_ids(tmp_path) == ["ollama_not_ready_at_update"]
-    assert report.has_condition("ollama_not_ready_at_update")
-    err = capsys.readouterr().err
-    assert "Traceback" not in err and "ollama_not_ready_at_update" in err
-
-
-def test_install_step_embedding_pull_failure_exits_1_with_deferral(monkeypatch, tmp_path):
+def test_install_step_embedding_pull_failure_exits_1_with_deferral(monkeypatch, tmp_path, capsys):
     from vco_lib.deferral_report import DeferralReport
 
     _install_env(monkeypatch, tmp_path, FakeOllama(streams={QWEN: [{"error": "no space left"}]}),
                  PullPlan(embedding=(QWEN,), inference=()))
-    rc = install._ollama_models_step({}, object(), DeferralReport(), tmp_path)
+    report = DeferralReport()
+    rc = install._ollama_models_step({}, object(), report)
     assert rc == 1
-    assert _ledger_ids(tmp_path) == ["ollama_model_pull_failed"]
+    assert report.has_condition("ollama_model_pull_failed")
+    err = capsys.readouterr().err
+    assert "Traceback" not in err and "ollama_model_pull_failed" in err
 
 
 def test_install_step_success_and_nonfatal_reports(monkeypatch, tmp_path):
@@ -183,7 +175,7 @@ def test_install_step_success_and_nonfatal_reports(monkeypatch, tmp_path):
     _install_env(monkeypatch, tmp_path, fake,
                  PullPlan(embedding=(QWEN,), inference=(GEMMA,), code_backend_unavailable=True))
     report = DeferralReport()
-    assert install._ollama_models_step({}, object(), report, tmp_path) is None
+    assert install._ollama_models_step({}, object(), report) is None
     assert fake.pulled == [GEMMA]
     assert report.has_condition("ollama_model_pull_failed")
     assert report.has_condition("code_embed_backend_unavailable")
@@ -210,3 +202,75 @@ def test_ensure_for_machine_uses_the_row_url_and_records_failure(monkeypatch, tm
                                  quiet=True, http=fake2)
     assert out2["ok"] and out2["present"] == [QWEN, ARCTIC] and fake2.pulled == []
     assert _ledger_ids(tmp_path) == []  # resolved on success
+
+
+# ── W3R-04: a code_embed still LOADING its model is warming, not down ───────
+
+
+class _CodeEmbed:
+    """/health that times out (the port accepted; the first request is loading
+    the model) for ``slow`` probes, then answers — or refuses when ``down``."""
+
+    def __init__(self, slow: int = 0, down: bool = False) -> None:
+        self.slow, self.down, self.calls = slow, down, 0
+
+    def get_json(self, url: str, timeout: float):
+        self.calls += 1
+        if self.down:
+            raise OSError("connection refused")
+        if self.calls <= self.slow:
+            raise TimeoutError("timed out")
+        return {"status": "ok", "model_loaded": True}
+
+
+def _ticks(monkeypatch):
+    t = iter(range(0, 100_000, 7))
+    monkeypatch.setattr(op.time, "monotonic", lambda: float(next(t)))
+    monkeypatch.setattr(op.time, "sleep", lambda _s: None)
+
+
+def test_code_embed_loading_its_model_is_warming_not_unavailable(monkeypatch):
+    """ACT (fresh GPU install): every probe inside the bound times out while
+    CodeSage downloads/loads → WARMING, so no action_required row."""
+    _ticks(monkeypatch)
+    state = op.code_embed_state("http://c:11440", timeout_s=60, http=_CodeEmbed(slow=10_000),
+                                container_running=lambda: None)
+    assert state == op.CODE_EMBED_WARMING
+    assert op.code_embed_state("http://c:11440", timeout_s=60, http=_CodeEmbed(slow=2)) == \
+        op.CODE_EMBED_READY
+
+
+def test_a_running_container_that_refuses_is_warming_and_a_stopped_one_is_down(monkeypatch):
+    _ticks(monkeypatch)
+    down = _CodeEmbed(down=True)
+    assert op.code_embed_state("http://c", timeout_s=30, http=down,
+                               container_running=lambda: True) == op.CODE_EMBED_WARMING
+    # LEAVE-ALONE: genuinely stopped / absent → the row is still owed
+    assert op.code_embed_state("http://c", timeout_s=30, http=down,
+                               container_running=lambda: False) == op.CODE_EMBED_DOWN
+
+
+def test_plan_records_the_row_only_for_a_down_code_embed(monkeypatch, tmp_path):
+    from vco_lib import embedding_pull_plan as epp
+
+    for state, unavailable in ((op.CODE_EMBED_WARMING, False), (op.CODE_EMBED_DOWN, True)):
+        monkeypatch.setattr(op, "code_embed_state", lambda *a, _s=state, **k: _s)
+        pp = epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["gpu"],
+                                  capability_tier=["qwen3.5:0.8b"], code_embed_url="http://c",
+                                  launcher_db=tmp_path / "absent.db", runtime="podman")
+        assert pp.code_backend_unavailable is unavailable, state
+
+
+def test_container_running_reads_the_real_state_read_only():
+    calls = []
+
+    def run(argv, **_k):
+        calls.append(argv)
+        return type("R", (), {"returncode": 0, "stdout": "true\n"})()
+
+    assert op.code_embed_container_running("podman", run=run,
+                                           find=lambda s, runtime: "vco_code_embed") is True
+    assert calls == [["podman", "inspect", "--type", "container", "--format",
+                      "{{.State.Running}}", "vco_code_embed"]]
+    assert op.code_embed_container_running("podman", run=run, find=lambda s, runtime: None) is False
+    assert op.code_embed_container_running("", run=run) is None

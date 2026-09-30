@@ -1157,11 +1157,33 @@ def _strip_think_blocks(text: str) -> str:
 
 
 def ollama_available() -> bool:
+    """The Ollama tier is usable only when Ollama answers AND already HOLDS
+    the summary model (``OLLAMA_DEFAULT_MODEL``).
+
+    v0.2.100 (owner 2026-09-29): install pulls ONLY the one text-generation
+    model the machine's tier uses. A model that is not present here — a lower
+    rung, or a tier this machine never pulled — degrades to the next backend
+    (OpenAI / Anthropic API / skip); nothing is ever pulled at runtime (an
+    ``/api/generate`` for an absent model is a 404, and a pull is multi-GB).
+    """
+    want = OLLAMA_DEFAULT_MODEL if ":" in OLLAMA_DEFAULT_MODEL else f"{OLLAMA_DEFAULT_MODEL}:latest"
     try:
         with urllib.request.urlopen(f"{OLLAMA_URL}/api/tags", timeout=3) as resp:
-            return resp.status == 200
-    except (urllib.error.URLError, urllib.error.HTTPError, OSError):
+            if resp.status != 200:
+                return False
+            body = json.loads(resp.read().decode("utf-8") or "{}")
+    except (urllib.error.URLError, urllib.error.HTTPError, OSError, ValueError):
         return False
+    models = body.get("models") if isinstance(body, dict) else None
+    names = {
+        str(m.get(key)) for m in (models if isinstance(models, list) else [])
+        if isinstance(m, dict) for key in ("name", "model") if m.get(key)
+    }
+    if want in names:
+        return True
+    _log(f"  Ollama answers but does not hold `{want}` — not pulling it at runtime; "
+         "trying the next summary backend")
+    return False
 
 
 def call_ollama(prompt: str, model: str = OLLAMA_DEFAULT_MODEL) -> str:

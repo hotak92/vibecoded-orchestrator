@@ -2346,9 +2346,9 @@ fn spawn_root_identity_sweep(
             Ok(out) => {
                 let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(
-                    "[vct] warning: root identity sweep for {} exited {}: {}",
+                    "[vct] warning: root identity sweep for {} failed ({}): {}",
                     project_id,
-                    out.status.code().unwrap_or(-1),
+                    out.status,
                     stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
                 );
             }

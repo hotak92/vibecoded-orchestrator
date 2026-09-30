@@ -119,7 +119,7 @@ class _FakeConn:
         pass
 
 
-def _dogfood_version_with(running: str, mine: str) -> "tuple[bool, str]":
+def _dogfood_version_with(running: str, mine: str) -> "tuple[bool | None, str]":
     conn = type("Conn", (_FakeConn,), {"body": json.dumps({"version": running}).encode()})
     with mock.patch("http.client.HTTPConnection", conn), mock.patch.object(
         vscode_settings, "_this_package_version", return_value=mine
@@ -132,17 +132,16 @@ class GatewayFreshnessMappingTests(unittest.TestCase):
 
     def test_unparseable_running_version_is_unknown_not_stale_or_fresh(self):
         ok, detail = _dogfood_version_with("0.2.100-rc1", "0.2.100")
-        # The function's existing "unknown" shape (same as an absent version):
-        # it does not refuse, and it says the comparison is unavailable,
-        # naming the offending string. It never claims "vX" (fresh).
-        self.assertTrue(ok)
+        # UNKNOWN (same as an absent version): None — never a pass (W1R-12),
+        # never a refusal; it names the offending string, never "vX" (fresh).
+        self.assertIsNone(ok)
         self.assertIn("unavailable", detail)
         self.assertIn("'0.2.100-rc1'", detail)
         self.assertIn("running daemon", detail)
 
     def test_unparseable_installed_version_is_unknown(self):
         ok, detail = _dogfood_version_with("0.2.100", "0.2.100.dev0")
-        self.assertTrue(ok)
+        self.assertIsNone(ok)
         self.assertIn("unavailable", detail)
         self.assertIn("'0.2.100.dev0'", detail)
         self.assertIn("this install", detail)
@@ -156,9 +155,51 @@ class GatewayFreshnessMappingTests(unittest.TestCase):
 
     def test_leave_alone_a_current_daemon_passes(self):
         ok, detail = _dogfood_version_with("0.2.100", "0.2.99")
-        self.assertTrue(ok)
+        self.assertIs(ok, True)
         self.assertEqual(detail, "v0.2.100")
 
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ── v0.2.100 F-W1-01: the two Python re-probe callers map VersionParseError ─
+
+
+def test_deferral_probe_maps_an_unreadable_sidecar_to_not_probed(tmp_path, capsys):
+    from vco_lib import deferral_probes as dp
+
+    dist = tmp_path / "launcher" / "dist" / "linux-x64"
+    dist.mkdir(parents=True)
+    (dist / "vct-launcher.metadata.json").write_text(json.dumps({"launcher_version": "0.2.100-rc1"}))
+    ctx = dp.ProbeContext(folder=tmp_path, entry=None, extras={
+        "dist_rel_dir": "launcher/dist/linux-x64", "launcher_binary_name": "vct-launcher",
+        "source_version": "0.2.100"})
+    with mock.patch.object(dp, "_dist_dirty", return_value=False):
+        assert dp.launcher_binary_stale_still_applies(ctx) is None  # not probed, no traceback
+    assert "not probed" in capsys.readouterr().err
+
+
+def test_install_reprobe_keeps_the_entry_on_an_unreadable_sidecar(tmp_path, capsys):
+    """install.py's ``launcher_update_diverged`` re-probe: a non-X.Y.Z sidecar
+    is "not reached" + a logged line — the entry stays, no exception path."""
+    import install
+    from vco_lib.deferral_report import DeferralEntry, DeferralReport
+
+    cid = "launcher_update_diverged"
+    prior = DeferralReport()
+    prior.add_entry(DeferralEntry(condition_id=cid, title="t", detected="d", why_deferred="w",
+                                  command_to_apply="c"))
+    prior.write(tmp_path)
+    run = DeferralReport()
+    run.merge_from_disk(tmp_path)
+    subdir, fname = install._launcher_binary_relative_path()
+    dist = tmp_path / "launcher" / "dist" / subdir
+    dist.mkdir(parents=True)
+    (dist / f"{fname}.metadata.json").write_text(json.dumps({"launcher_version": "0.2.100.dev0"}))
+    with mock.patch.object(install, "_read_launcher_version", return_value="0.2.100"):
+        install._apply_deferred_entries(run, tmp_path, args=None)
+    out = capsys.readouterr()
+    assert run.has_condition(cid)
+    assert "[skip]" in out.out and "[fail]" not in out.out
+    assert "not probed" in out.err
