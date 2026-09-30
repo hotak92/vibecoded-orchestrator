@@ -2121,3 +2121,25 @@ exist on this machine. The file is written with the correct path for this \
 install; the row says what will fail until the path exists. Same paired site: \
 `vco_lib.materialize.settle_deferrals` resolves it on the next render that \
 finds every path present."""
+
+[conditions.claude_md_user_section_review]
+class = "action_required"
+owner = "vco_lib.project_templates"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["template_sha256", "reason"]
+notes = """v0.2.100 (review R18-01, owner decision): a project CLAUDE.md is split \
+into VCO's managed region (between the VCO_MANAGED markers, re-rendered on \
+every update) and the USER SECTION outside them (introduction, overview, tech \
+stack, key paths — written only when the file is created, never rewritten). \
+One row, emitted by `vco_lib.project_templates.reconcile_claude_md` (bundle \
+update AND the launcher's module toggle) when the user-section TEMPLATE differs \
+from the one recorded in `.claude/context/templates/CLAUDE.md.user-section.json` \
+(reason `template_changed`; the new text is written to \
+`CLAUDE.md.user-section.reference.md` beside it), or once after a pre-split file \
+whose edited text was moved above the markers (reason `migrated`). No row when \
+that template did not change. ACKNOWLEDGEMENT = dismissing the row \
+(`dismiss-deferral`): the dismissal is keyed on the template hash, so the next \
+run records that hash as acknowledged and the row stays away until a release \
+changes the template again. PAIRED SITE: the same function resolves the row on \
+the run that finds recorded == shipped."""

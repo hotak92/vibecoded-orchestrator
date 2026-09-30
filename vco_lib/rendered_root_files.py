@@ -340,7 +340,7 @@ class RenderOutcome:
 
 
 def _render_template_text(install_root: Path, entry: RenderedRootFile, text: str,
-                          context=None):
+                          context=None, *, db_path: Path | None = None):
     """The registry pass for one entry (``vco_lib.materialize``). The table's
     ``substitutions`` is the entry's ALLOWED set; a name it lists that the
     registry does not know, or one the body uses that the table does not list,
@@ -350,11 +350,13 @@ def _render_template_text(install_root: Path, entry: RenderedRootFile, text: str
     from vco_lib import materialize as _mz
 
     ctx = _mz.LazyContext(context if context is not None
-                          else _mz.MaterializeContext(install_root, install_root))
+                          else _mz.MaterializeContext(install_root, install_root,
+                                                      db_path=db_path))
     return _mz.render(text, ctx, allowed=frozenset(entry.substitutions), escape="none")
 
 
-def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
+def render_entry(install_root: Path, entry: RenderedRootFile, *,
+                 db_path: Path | None = None) -> RenderOutcome:
     """Render one entry into ``install_root``. Never raises.
 
     The template's placeholders are substituted, then the body is written
@@ -378,7 +380,8 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
 
     try:
         result = _render_template_text(
-            install_root, entry, template_path.read_text(encoding="utf-8"))
+            install_root, entry, template_path.read_text(encoding="utf-8"),
+            db_path=db_path)
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
     rendered = result.text
@@ -426,16 +429,41 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
             outcome = RenderOutcome(entry.path, "created", "OK (created)" + suffix, **findings)
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
-    _mz.settle_deferrals(install_root, {entry.path: result})
+    _mz.settle_deferrals(install_root, {entry.path: result}, surface=ROOT_FILE_SURFACE)
     return outcome
+
+
+def _carries_markers(target: Path, entry: RenderedRootFile) -> bool:
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    begin = text.find(entry.begin_marker)
+    return begin >= 0 and text.find(entry.end_marker) > begin
 
 
 #: Statuses after which the file on disk IS the fresh render.
 _RENDERED_OK = ("created", "auto_block_updated", "full_rewrite")
 
 
-def render_all(install_root: Path) -> tuple[RenderOutcome, ...]:
+#: The deferral-row surface of this renderer (``materialize.settle_deferrals``).
+ROOT_FILE_SURFACE = "root-file"
+
+
+def render_all(install_root: Path, *, db_path: Path | None = None,
+               only_marked: bool = False) -> tuple[RenderOutcome, ...]:
     """Render every table entry into ``install_root``, in table order.
+
+    ``db_path`` selects the launcher.db whose ``service_endpoints`` rows the
+    endpoint placeholders read (``None`` = this machine's default).
+
+    ``only_marked`` (v0.2.100 review R18-12): re-render an entry ONLY when its
+    target already exists and carries both AUTO markers — i.e. an install has
+    rendered it before. The ``service_endpoints`` follow-up chain uses this to
+    keep the baked endpoint values current after a ``move`` without ever
+    CREATING or wholly REWRITING a file (a source checkout's tracked
+    ``CLAUDE.md`` has no markers and is left alone). Skipped entries report
+    ``not_rendered_here``.
 
     After an entry renders successfully its stale ``.from-upstream-`` sidecars
     are reaped (see :func:`reap_stale_sidecars`) — the re-render is the merge
@@ -443,7 +471,12 @@ def render_all(install_root: Path) -> tuple[RenderOutcome, ...]:
     """
     outcomes: list[RenderOutcome] = []
     for entry in entries():
-        outcome = render_entry(install_root, entry)
+        if only_marked and not _carries_markers(install_root / Path(entry.path), entry):
+            outcomes.append(RenderOutcome(
+                entry.path, "not_rendered_here",
+                "SKIP (no rendered AUTO block to refresh)"))
+            continue
+        outcome = render_entry(install_root, entry, db_path=db_path)
         if outcome.status in _RENDERED_OK:
             reaped = reap_stale_sidecars(install_root, entry)
             if reaped:

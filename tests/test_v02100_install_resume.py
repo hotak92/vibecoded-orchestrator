@@ -200,6 +200,9 @@ def test_step_4_probes_run_isolated_from_a_cwd_outside_the_checkout(tmp_path):
 
 @pytest.mark.parametrize("report, expect", [
     ("site", "site-packages copy"),
+    ("site_in_root", "site-packages copy"),
+    ("dist_in_root", "site-packages copy"),
+    ("copy_in_root", "not the checkout's own"),
     ("elsewhere", "outside the checkout"),
     ("missing", "not installed"),
     ("error", "does not import"),
@@ -209,9 +212,19 @@ def test_step_4_reruns_when_vco_lib_is_not_served_by_the_checkout(tmp_path, repo
     """ACT: the probe reports a shadow copy / no editable install → run step 4."""
     root = _root(tmp_path)
     shadow = tmp_path / "venv" / "lib" / "python3.12" / "site-packages" / "vco_lib"
+    # R18-02: the DEFAULT layout — install.py's venv lives inside the checkout.
+    in_root = root / ".venv" / "lib" / "python3.12" / "site-packages" / "vco_lib"
+    dist = root / ".venv" / "lib" / "python3" / "dist-packages" / "vco_lib"
+    build = root / "build" / "lib" / "vco_lib"
+
+    def _pkg(d):
+        return _report(origin=str(d / "__init__.py"), locations=[str(d)],
+                       file=str(d / "__init__.py"))
     rep = {
-        "site": _report(origin=str(shadow / "__init__.py"), locations=[str(shadow)],
-                        file=str(shadow / "__init__.py")),
+        "site": _pkg(shadow),
+        "site_in_root": _pkg(in_root),
+        "dist_in_root": _pkg(dist),
+        "copy_in_root": _pkg(build),
         "elsewhere": _report(origin=str(tmp_path / "other" / "vco_lib" / "__init__.py"),
                              locations=[str(tmp_path / "other" / "vco_lib")]),
         "missing": _report(),
@@ -232,11 +245,12 @@ def test_step_4_skips_when_vco_lib_resolves_in_the_checkout(tmp_path):
     assert skipped and "editable imports OK" in out
 
 
-def _real_venv(tmp_path: Path) -> "tuple[Path, Path]":
-    """A real (pip-less) venv; returns (interpreter, purelib)."""
+def _real_venv(tmp_path: Path, env: "Path | None" = None) -> "tuple[Path, Path]":
+    """A real (pip-less) venv at ``env`` (default: a sibling of the checkout);
+    returns (interpreter, purelib)."""
     import os
     import venv
-    env = tmp_path / "venv"
+    env = env if env is not None else tmp_path / "venv"
     venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(env)
     py = env / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
     purelib = subprocess.run(
@@ -279,6 +293,31 @@ def test_step_4_real_interpreter_accepts_an_editable_install(tmp_path):
     pointing at the checkout verifies."""
     root = _checkout_with_vco_lib(tmp_path)
     py, purelib = _real_venv(tmp_path)
+    (purelib / "__editable__.vco_test.pth").write_text(f"{root}\n", encoding="utf-8")
+    ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert ok, why
+
+
+def test_step_4_real_interpreter_detects_a_shadow_copy_in_an_in_root_venv(tmp_path):
+    """ACT (R18-02), against a real interpreter, DEFAULT layout: the venv is
+    ``<root>/.venv`` — inside the checkout — and holds a frozen ``vco_lib``.
+    The copy is "under root", which the pre-fix verdict accepted."""
+    root = _checkout_with_vco_lib(tmp_path)
+    py, purelib = _real_venv(tmp_path, root / ".venv")
+    assert root.resolve() in purelib.resolve().parents
+    (purelib / "vco_lib").mkdir()
+    (purelib / "vco_lib" / "__init__.py").write_text("WHERE = 'shadow'\n", encoding="utf-8")
+    ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
+        root, dev=False)["deps_fingerprint"]})
+    assert not ok and "site-packages copy" in why, why
+
+
+def test_step_4_real_interpreter_accepts_an_editable_install_in_an_in_root_venv(tmp_path):
+    """LEAVE-ALONE (R18-02), DEFAULT layout: ``<root>/.venv`` with a ``.pth``
+    editable install pointing at the checkout verifies."""
+    root = _checkout_with_vco_lib(tmp_path)
+    py, purelib = _real_venv(tmp_path, root / ".venv")
     (purelib / "__editable__.vco_test.pth").write_text(f"{root}\n", encoding="utf-8")
     ok, why = _real_deps(root, py)({"deps_fingerprint": ir.deps_fingerprint(
         root, dev=False)["deps_fingerprint"]})

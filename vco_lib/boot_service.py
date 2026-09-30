@@ -188,25 +188,52 @@ def read_template(templates_root: Path, relpath: str) -> Optional[str]:
         return None
 
 
+#: The deferral-row surface of unit renders (``materialize.settle_deferrals``).
+BOOT_UNIT_SURFACE = "boot-unit"
+
+
 def render_template(
     template_text: str,
     substitutions: Mapping[str, object],
     *,
     escape: str = "none",
+    label: Optional[str] = None,
+    deferral_folder: Optional[Path] = None,
 ) -> str:
-    """``{{KEY}}`` substitution through the ONE materializer
-    (``vco_lib.materialize.render``, v0.2.100 WP-18).
+    """THE boot-unit renderer: ``{{KEY}}`` substitution through the ONE
+    materializer (``vco_lib.materialize.render``, v0.2.100 WP-18). Every
+    ``register_*`` function reaches it through :func:`_render_unit`.
 
-    Only the supplied keys are allowed; any other ``{{NAME}}`` stays in place
-    (and :func:`_render_unit` reports it). ``escape`` is applied to every value
-    except the registry's verbatim keys (``EXEC_ARGV_PLIST``, a pre-escaped
-    fragment). Stdlib-only, like the rest of install.py's early steps.
+    The allowed set is the registry's boot-unit vocabulary
+    (``materialize.BOOT_UNIT_KEYS``); ``substitutions`` supplies the values. A
+    name outside that vocabulary, or one the spec gives no value, stays in
+    place — never a failed registration. With a ``label``, findings are
+    warned about on stderr, and with a ``deferral_folder`` they are also
+    settled as the owner-rule deferral rows there (a clean render clears
+    them). ``escape`` applies to every value except the registry's verbatim
+    keys (``EXEC_ARGV_PLIST``, a pre-escaped fragment).
     """
     from vco_lib import materialize as _mz
 
     values = {k: (None if v is None else str(v)) for k, v in substitutions.items()}
-    return _mz.render(template_text, values, allowed=frozenset(values),
-                      escape=escape).text
+    result = _mz.render(template_text, values, allowed=_mz.BOOT_UNIT_KEYS, escape=escape)
+    if label is not None:
+        if not result.clean:
+            _mz.warn(label, result)
+        if deferral_folder is not None:
+            _mz.settle_deferrals(deferral_folder, {label: result},
+                                 surface=BOOT_UNIT_SURFACE)
+    return result.text
+
+
+def unit_label(spec: "BootServiceSpec", os_name: str) -> str:
+    """The deferral label of ``spec``'s unit on ``os_name`` — ONE home for
+    the render (which records it) and :func:`unregister` (which resolves it)."""
+    if os_name == "Darwin":
+        return f"launchd:{spec.plist_label}"
+    if os_name == "Windows":
+        return f"windows-task:{spec.task_name}"
+    return f"systemd:{spec.unit_name}"
 
 
 def _render_unit(
@@ -215,25 +242,14 @@ def _render_unit(
     values: Mapping[str, object],
     *,
     escape: str,
-    label: str,
+    os_name: str,
 ) -> str:
-    """Render one unit file; warn + settle the owner-rule deferral rows.
-
-    The allowed set is the registry's boot-unit vocabulary
-    (``materialize.BOOT_UNIT_KEYS``) — a unit template naming anything else
-    renders with the token left in place and is reported, never a failed
-    registration. Rows land in ``spec.deferral_folder`` (the install root);
-    a spec without one (tests, ad-hoc callers) only warns.
-    """
-    from vco_lib import materialize as _mz
-
-    ctx = {k: (None if v is None else str(v)) for k, v in values.items()}
-    result = _mz.render(template_text, ctx, allowed=_mz.BOOT_UNIT_KEYS, escape=escape)
-    if not result.clean:
-        _mz.warn(label, result)
-    if spec.deferral_folder is not None:
-        _mz.settle_deferrals(spec.deferral_folder, {label: result})
-    return result.text
+    """One unit file through :func:`render_template`, labelled for ``os_name``
+    and settling its rows in ``spec.deferral_folder`` (the install root); a
+    spec without one (tests, ad-hoc callers) only warns."""
+    return render_template(template_text, values, escape=escape,
+                           label=unit_label(spec, os_name),
+                           deferral_folder=spec.deferral_folder)
 
 
 def backup_and_write_idempotent(
@@ -458,7 +474,7 @@ def register_linux(
         "LOG_FILE": str(log_file),
         "BOOT_LOG_FILE": str(boot_log_file(log_file)),
         **spec.substitutions,
-    }, escape="none", label=f"systemd:{spec.unit_name}")
+    }, escape="none", os_name="Linux")
     try:
         changed, backup = backup_and_write_idempotent(unit_path, rendered)
     except OSError as exc:
@@ -561,7 +577,7 @@ def register_macos(
         "LOG_FILE": str(log_file),
         "BOOT_LOG_FILE": str(boot_log_file(log_file)),
         **spec.substitutions,
-    }, escape="xml", label=f"launchd:{spec.plist_label}")
+    }, escape="xml", os_name="Darwin")
     try:
         changed, backup = backup_and_write_idempotent(plist_path, rendered)
     except OSError as exc:
@@ -651,7 +667,7 @@ def register_windows(
         "LOG_FILE": _windows_forward(log_file),
         "BOOT_LOG_FILE": _windows_forward(boot_log_file(log_file)),
         **spec.substitutions,
-    }, escape="xml", label=f"windows-task:{spec.task_name}")
+    }, escape="xml", os_name="Windows")
     try:
         changed, backup = backup_and_write_idempotent(task_xml_path, rendered)
     except OSError as exc:
@@ -877,6 +893,12 @@ def unregister(
         audit.append(
             f"WARN: {spec.service_id} boot-service removal raised {type(e).__name__}: {e}"
         )
+    # Review R18-09: an unregistered unit is no longer rendered, so nothing
+    # would ever clear a row its last render left. Resolve them here.
+    if spec.deferral_folder is not None:
+        from vco_lib import materialize as _mz
+
+        _mz.resolve_labels(spec.deferral_folder, [unit_label(spec, os_name)])
     return audit
 
 
@@ -2238,6 +2260,7 @@ __all__ = [
     "register_windows",
     "remove_gateway_state",
     "render_template",
+    "unit_label",
     "rerender_if_registered",
     "resolve_gateway_exec",
     "resolve_gateway_exec_verified",

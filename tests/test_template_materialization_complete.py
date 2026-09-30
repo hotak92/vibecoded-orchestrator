@@ -50,6 +50,7 @@ from vco_lib import boot_service, materialize, project_init  # noqa: E402
 from vco_lib import rendered_root_files as rrf  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 from vco_lib.project_templates import render_project_template  # noqa: E402
+from tests._materialize_fixtures import mirror_repo_tree  # noqa: E402
 
 #: Path-vocabulary keys that NO shipped template uses today. They are part of
 #: the documented contract (templates/README.md) and of the moved-clone heal's
@@ -87,6 +88,9 @@ def _make(tmp: Path, os_name: str) -> Synthetic:
     state = tmp / "state & dir"
     for d in (root, project, home, state, root / "infrastructure", root / "scripts"):
         d.mkdir(parents=True, exist_ok=True)
+    # Review R18-03: composite paths (`{{ORCHESTRATOR_ROOT}}/tools/…`) are
+    # checked, so the synthetic root is a real copy of the tree's layout.
+    mirror_repo_tree(root)
     py = materialize.venv_python_path(root, os_name=os_name)
     py.parent.mkdir(parents=True, exist_ok=True)
     py.write_text("", encoding="utf-8")

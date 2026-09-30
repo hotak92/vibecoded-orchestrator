@@ -283,11 +283,40 @@ def test_query_code_graph_env_outranks_config_per_knob(monkeypatch, tmp_path: Pa
     ("http://[::1]:8090", ("::1", 8090)),
     ("localhost:18081", ("localhost", 18081)),
     ("http://host:notaport", ("host", 8081)),
+    ("HTTPS://weaviate.example.com", ("weaviate.example.com", 443)),  # R18-11 scheme case
+    ("HTTP://[::1]", ("::1", 80)),
 ])
 def test_split_http_url(url: str, want) -> None:
     from vco_lib.weaviate_helpers import split_http_url
 
     assert split_http_url(url) == want
+
+
+@pytest.mark.parametrize("url,host,port,secure", [
+    ("http://localhost:8081", "localhost", 8081, False),
+    ("https://weaviate.example.com", "weaviate.example.com", 443, True),
+    ("HTTPS://weaviate.example.com", "weaviate.example.com", 443, True),   # R18-11
+    ("Https://h:9443", "h", 9443, True),
+    ("http://[::1]:8090", "[::1]", 8090, False),                           # R18-11 re-bracketed
+    ("https://[2001:db8::5]", "[2001:db8::5]", 443, True),
+    ("gpu.lan:18081", "gpu.lan", 18081, False),
+])
+def test_connect_v4_scheme_case_and_ipv6_host(monkeypatch, url, host, port, secure) -> None:
+    """R18-11: ``http_secure`` follows the PARSED scheme (``HTTPS://`` is TLS
+    on the 443 split chose), and an IPv6 host reaches the client bracketed —
+    weaviate-client formats ``f"{host}:{port}"`` itself."""
+    import types
+
+    from vco_lib import weaviate_helpers as wh
+
+    seen: dict = {}
+    fake = types.ModuleType("weaviate")
+    fake.connect_to_custom = lambda **kw: seen.update(kw) or "client"  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "weaviate", fake)
+    monkeypatch.delenv("GRPC_PORT", raising=False)
+    assert wh.connect_v4(url) == "client"
+    assert (seen["http_host"], seen["http_port"], seen["http_secure"]) == (host, port, secure)
+    assert seen["grpc_host"] == host
 
 
 # ─── 4. SSRF allowlist ──────────────────────────────────────────────────

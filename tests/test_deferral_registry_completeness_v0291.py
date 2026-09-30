@@ -699,6 +699,10 @@ class TestRegistryCompleteness(unittest.TestCase):
             # placeholders / paths on every emit (pinned by
             # tests/test_template_materialization_complete.py).
             "template_placeholder_unrendered_*", "template_path_missing_*",
+            # v0.2.100 review R18-01: vco_lib.project_templates._review_entry
+            # attaches template_sha256 + reason on every emit (pinned by
+            # tests/test_v02100_claude_md_user_section.py).
+            "claude_md_user_section_review",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

@@ -36,6 +36,7 @@ from vco_lib import boot_service, materialize, project_init  # noqa: E402
 from vco_lib import rendered_root_files as rrf  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 from vco_lib.hashing import sha256_file  # noqa: E402
+from tests._materialize_fixtures import mirror_repo_tree  # noqa: E402
 
 AGENT_REL = str(Path(".claude") / "agents" / "coder-fixture.md")
 
@@ -272,7 +273,8 @@ class TestProjectClaudeMdMigrates:
 class TestRootClaudeMdMigrates:
     def test_old_auto_block_is_rerendered_and_user_text_kept(self, tmp_path):
         root = tmp_path / "root"
-        (root / "templates").mkdir(parents=True)
+        mirror_repo_tree(root)  # composite paths exist, as in a real clone (R18-03)
+        (root / "templates").mkdir(parents=True, exist_ok=True)
         _fake_orch(root)
         (root / "templates" / "ORCHESTRATOR-CLAUDE.md.template").write_bytes(
             (REPO_ROOT / "templates" / "ORCHESTRATOR-CLAUDE.md.template").read_bytes())

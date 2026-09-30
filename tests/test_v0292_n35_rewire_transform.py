@@ -155,12 +155,16 @@ class TestTransformContract:
         target = project / "agent.md"
         target.write_text(old_render, encoding="utf-8")
         new_root = tmp_path / "new" / "vco"
+        # v0.2.100 review R18-06: the heal re-runs the op's OWN transform.
+        transform = materialize.Transform(
+            "agent.md", materialize.RenderSpec(allowed=materialize.PATH_KEYS),
+            materialize.MaterializeContext(new_root, project))
         assert project_init._stale_orchestrator_root_heal_match(
-            raw, target, new_root, project)
+            raw, target, new_root, project, transform)
         # And a key the heal did NOT fill would break the round-trip:
         target.write_text(old_render.replace(str(project), "/elsewhere"), encoding="utf-8")
         assert not project_init._stale_orchestrator_root_heal_match(
-            raw, target, new_root, project)
+            raw, target, new_root, project, transform)
 
 
 class TestWindowsPathEscaping:

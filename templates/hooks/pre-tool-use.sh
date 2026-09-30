@@ -210,31 +210,38 @@ if [[ "$TOOL_NAME" == "WebFetch" ]]; then
         # v0.2.100 WP-18B: the host:port pairs are DERIVED at run time from
         # the projected env (_lib/ssrf-allowlist.sh), so a moved
         # service_endpoints port is allowed and nothing asks the user to
-        # hand-edit this hook. The lib missing (partial install) allows
-        # nothing: a security guard fails closed.
-        _SSRF_ALLOWED=1
-        if [[ -f "$SCRIPT_DIR/_lib/ssrf-allowlist.sh" ]]; then
+        # hand-edit this hook. Reviews R18-04/R18-05: the allow AND block
+        # decisions are the lib's ONE parser (WHATWG-shaped: `\` is `/`,
+        # userinfo at the last `@`, percent-decoded / numeric / IPv6 hosts),
+        # so the two halves cannot read one URL two ways. The lib missing
+        # (partial install) blocks every WebFetch: a security guard that
+        # cannot run fails closed, and says why.
+        _SSRF_VERDICT=block
+        _SSRF_LIB="$SCRIPT_DIR/_lib/ssrf-allowlist.sh"
+        if [[ -f "$_SSRF_LIB" ]]; then
             # shellcheck source=_lib/ssrf-allowlist.sh disable=SC1091
-            . "$SCRIPT_DIR/_lib/ssrf-allowlist.sh"
-            vco_ssrf_url_allowed "$URL" "$PROJECT_ROOT" && _SSRF_ALLOWED=0
+            . "$_SSRF_LIB"
+            _SSRF_VERDICT="$(vco_ssrf_verdict "$URL" "$PROJECT_ROOT")"
         fi
-        if [[ "$_SSRF_ALLOWED" -eq 0 ]]; then
-            : # an allowed local service — fall through
-        elif echo "$URL" | grep -qE "(localhost|127\.|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.|192\.168\.[0-9]+\.|169\.254\.[0-9]+\.|0\.0\.0\.0|::1)" 2>/dev/null; then
+        if [[ "$_SSRF_VERDICT" == block ]]; then
             # Block messages route to stderr — see comment in bash-
             # security branch below for why (Claude Code drops plain
             # stdout from PreToolUse hooks).
             _SSRF_PAIRS=""
             if command -v vco_ssrf_allowed_pairs >/dev/null 2>&1; then
-                _SSRF_PAIRS="$(vco_ssrf_allowed_pairs "$PROJECT_ROOT" | grep -vE '^(127\.0\.0\.1|\[::1\]):' | tr '\n' ' ')"
+                _SSRF_PAIRS="$(vco_ssrf_allowed_pairs "$PROJECT_ROOT" | grep -vE '^(127\.0\.0\.1|\[0:0:0:0:0:0:0:1\]):' | tr '\n' ' ')"
             fi
             {
-                echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
-                echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none (hooks/_lib/ssrf-allowlist.sh is missing)}"
+                echo "🔒 SSRF guard: '$URL' targets a private/internal network address (or one the guard cannot read)."
+                echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none (hooks/_lib/ssrf-allowlist.sh is missing — run the bundle update to restore it)}"
                 echo "   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port — a moved service is"
                 echo "   changed with the launcher's Services page or \`python -m vco_lib.service_endpoints move\`, never by editing this hook."
             } >&2
-            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$URL\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+            # JSON-escape `\` and `"` (the backslash URLs above are exactly
+            # what this line logs), as the .ps1 sibling does.
+            _SSRF_URL_ESC="${URL//\\/\\\\}"
+            _SSRF_URL_ESC="${_SSRF_URL_ESC//\"/\\\"}"
+            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$_SSRF_URL_ESC\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
         fi
     fi

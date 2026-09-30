@@ -4229,90 +4229,34 @@ def _stale_orchestrator_root_heal_match(
     target_path: Path,
     orchestrator_root: Path,
     project_root: Path | None = None,
+    transform: "Any" = None,
 ) -> bool:
-    """PR-2 portability heal (2026-05-06).
+    """PR-2 portability heal (2026-05-06): True when the installed file is the
+    render of ``raw`` under an OLD orchestrator root (the user moved the clone),
+    not a user edit — the caller may then overwrite without a backup.
 
-    Detect the case where an agent .md was install-stamped against an
-    OLD orchestrator-clone path (e.g. user moved/renamed the clone) and
-    is now stale. If we substitute the SAME placeholders against an
-    `old_root` extracted from the installed file and reproduce the
-    installed bytes, then the user did NOT customise — they just have
-    a stale baked path. Return True in that case so the caller can
-    overwrite safely.
-
-    Conservative: returns False on any ambiguity. Only matches when
-    the installed file contains a path-shaped string of the form
-    `<old_root>/claude_mcp_servers/...` and round-tripping with that
-    `old_root` reproduces the file byte-for-byte. False on Windows
-    paths (case-insensitive FS makes the round-trip unreliable).
-
-    SCOPE (v0.2.92 WP-16, stated so the next reader does not over-trust it):
-    the `/claude_mcp_servers/` anchor means this helper heals AGENT/SKILL
-    bodies, which name that path in prose. It does NOT generally fire for the
-    `VCO-REWIRE`-marked scripts, whose baked value is a bare root with no such
-    suffix — and they do not need it, because the manifest records their
-    POST-transform hash so a moved clone is already an `installed_hash ==
-    prior_hash` `overwrite`. The subs map below is kept EQUAL to
-    `vco_lib.rewire.rewire_subs` (pinned by a test) so that when the anchor
-    does happen to be present, the two round-trips cannot disagree.
+    v0.2.100 (review R18-06): a thin caller of
+    :func:`vco_lib.materialize.renders_under_moved_root`, which re-runs the
+    op's OWN ``Transform`` (same escaping, regions and non-path keys) under
+    the old root; the raw ``str.replace`` round-trip is retired. Here only:
+    ``{{PROJECT_ROOT}}`` is the project being updated — a moved CLONE does not
+    move the project — except on a self-install, where the project IS the
+    (old) clone.
     """
+    from vco_lib import materialize as _mz
+
     try:
         installed = target_path.read_bytes()
-        installed_text = installed.decode("utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return False
-
-    # Look for a baked path of the form `<root>/claude_mcp_servers/`. Use
-    # a byte-anchor + back-walk so we don't try to grep arbitrary regex
-    # over the whole file. The first match wins; we tolerate at most one
-    # candidate orchestrator-root prefix per file.
-    needle = "/claude_mcp_servers/"
-    idx = installed_text.find(needle)
-    if idx <= 0:
-        return False
-    # Walk back to the start of the path. Acceptable path chars: anything
-    # that's not whitespace, quote, colon (YAML separator), or comma.
-    end = idx
-    start = end
-    while start > 0:
-        c = installed_text[start - 1]
-        if c.isspace() or c in ('"', "'", ":", ",", "(", ")", "<", ">"):
-            break
-        start -= 1
-    if start == end:
-        return False
-    candidate = installed_text[start:end]
-    if not candidate.startswith("/"):
-        # POSIX absolute paths only. Skip Windows / relative.
-        return False
-    old_root = Path(candidate).resolve()
-    if old_root == orchestrator_root.resolve():
-        # Same path → not a stale-root case (the hash compare would have
-        # caught it as noop).
-        return False
-
-    # Round-trip: build subs map for the OLD root, transform the source,
-    # compare to the installed bytes. If they match, the user didn't
-    # touch it; the stale path is the only difference.
-    # v0.2.100 WP-18: the SAME vocabulary the renderers use
-    # (`vco_lib.materialize.path_subs`), so the round-trip can never lack a
-    # key the forward render has. `{{PROJECT_ROOT}}` is the project being
-    # updated — a moved CLONE does not move the project — except on a
-    # self-install, where the project IS the (old) clone.
-    from vco_lib.materialize import path_subs
-    _heal_project = (
+    heal_project = (
         None if project_root is None or _canonical_path_eq(project_root, orchestrator_root)
         else project_root
     )
-    subs = path_subs(old_root, _heal_project)
-    try:
-        text = raw.decode("utf-8", errors="replace")
-        for k, v in subs.items():
-            text = text.replace(k, v)
-        round_trip = text.encode("utf-8")
-    except Exception:
-        return False
-    return round_trip == installed
+    return _mz.renders_under_moved_root(
+        transform, raw, installed, orchestrator_root, heal_project,
+        same_path=_canonical_path_eq,
+    )
 
 
 def _agent_or_skill_already_present(
@@ -4562,7 +4506,7 @@ def _file_action(
         op.transform is not None
         and orchestrator_root is not None
         and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root,
-                                               project_root)
+                                               project_root, op.transform)
     ):
         return ("overwrite", source_bytes)
 
@@ -9758,11 +9702,18 @@ def install_project_bundle(
     from vco_lib import materialize as _mz
     _materialize_sink = _mz.FindingsSink(
         rerender_command=_mz.bundle_rerender_command(folder, orchestrator_root),
+        surface="bundle",
     )
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
                                   gate_outcomes=_gate_outcomes,
                                   sink=_materialize_sink,
                                   project_name=project_name)
+    # Review R18-09: every label this release still SHIPS (before the
+    # skip-kinds filter — a kind skipped this run is still shipped, and its
+    # rows stay true). The settle below resolves a bundle row whose file is
+    # no longer in this set (a template removed in a later release).
+    _shipped_labels = {op.dest_rel for op in ops} | {
+        str(live_rel) for _t, live_rel, _r in _PROJECT_LEVEL_TEMPLATES}
     # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
     # any skipped file-kind BEFORE the classify/write loop, so a skipped kind's
     # files are never touched on disk. `settings` is NOT a file-kind (it is the
@@ -9956,7 +9907,10 @@ def install_project_bundle(
             # location is the source-of-truth, not a divergent edit).
             # Pure no-op other than the result["actions"]["skip-disabled"]
             # append below for caller introspection.
-            pass
+            # Review R18-09: the transform already RAN (to hash the bytes);
+            # its findings describe no file on disk, so they create no row,
+            # and a row the file had while enabled is resolved.
+            _materialize_sink.retire(op.dest_rel)
 
         elif action == "keep-regenerated":
             # v0.2.57: regenerated per-project data file (e.g.
@@ -10618,7 +10572,7 @@ def install_project_bundle(
     # one row per file still carrying a placeholder or a missing path, and a
     # clean render of a file clears the row it had. Soft-fail.
     if not dry_run:
-        _mz_summary = _materialize_sink.settle(folder)
+        _mz_summary = _materialize_sink.settle(folder, shipped=_shipped_labels)
         if any(_mz_summary.values()):
             result["materialize_deferrals"] = _mz_summary
             _log("4.bundle.materialize", "warn" if _mz_summary["emitted"] or

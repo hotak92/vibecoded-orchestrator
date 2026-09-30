@@ -81,12 +81,16 @@ __all__ = [
     "escape_value",
     "escape_for_filename",
     "path_subs",
+    "renders_under_moved_root",
     "project_display_name",
     "venv_python_path",
     "unrendered_condition_id",
     "path_missing_condition_id",
     "UNRENDERED_PREFIX",
     "PATH_MISSING_PREFIX",
+    "COMPOSITE_CREATED_LATER",
+    "composite_tail",
+    "resolve_labels",
     "warn",
     "settle_deferrals",
     "bundle_rerender_command",
@@ -324,8 +328,9 @@ _KEYS: Tuple[Key, ...] = (
         _service_url("ollama_url")),
     Key("CODE_EMBED_URL", "Code-embedding service URL from this machine's endpoint row",
         _service_url("code_embed_url")),
-    Key("HUB_PORT", "The vct-hub port a client uses (`$VCT_HUB_PORT` → "
-        "`hub.port` → 7700)", _hub_port),
+    Key("HUB_PORT", "The vct-hub port at render time (`$VCT_HUB_PORT` → "
+        "`hub.port` → 7700); a snapshot — clients re-resolve that ladder at run "
+        "time", _hub_port),
     # ── boot units: declared here, valued by the spec ────────────────────
     Key("INSTALLED_AT_PATH", _BOOT_DOC),
     Key("WORKING_DIR", _BOOT_DOC, must_exist=True),
@@ -474,15 +479,88 @@ def _yaml_plain_safe(s: str) -> bool:
     return True
 
 
+#: A YAML frontmatter body line: blank, a comment, a ``key:`` mapping entry,
+#: a ``- `` sequence item, or an indented continuation. Anything else (a prose
+#: sentence) means the leading ``---`` was a Markdown horizontal rule.
+_YAML_FM_LINE = re.compile(r"^(?:\s*|\s*#.*|[A-Za-z0-9_][A-Za-z0-9_.\-]*\s*:(?:\s.*)?|\s*-(?:\s.*)?|\s+\S.*)$")
+
+
+def _plain_value_is_prose(line: str) -> bool:
+    """A top-level ``key: value`` line whose PLAIN value contains ``": "`` is
+    not YAML (a plain scalar cannot hold a mapping indicator) — it is a
+    sentence such as ``Note: see x, it is: odd``."""
+    m = re.match(r"^[A-Za-z0-9_][A-Za-z0-9_.\-]*\s*:\s+(.*)$", line)
+    if m is None:
+        return False
+    value = m.group(1)
+    return bool(value) and value[0] not in "\"'|>[{&*!" and ": " in value
+
+
 def _frontmatter_line_span(lines: Sequence[str]) -> Tuple[int, int]:
     """``(first, last)`` 0-based indexes of the YAML frontmatter BODY lines,
-    or ``(0, -1)`` when the document has none."""
+    or ``(0, -1)`` when the document has none.
+
+    v0.2.100 (review R18-15): a Markdown file may OPEN with a ``---``
+    horizontal rule. The block counts as frontmatter only when every line
+    between the fences is YAML-shaped (:data:`_YAML_FM_LINE`, stdlib-only) —
+    otherwise a prose line such as ``Note: see {{ORCHESTRATOR_ROOT}}/x`` would
+    be quoted as a YAML scalar and the prose corrupted."""
     if not lines or lines[0].rstrip("\r\n") != "---":
         return (0, -1)
     for idx in range(1, len(lines)):
         if lines[idx].rstrip("\r\n") == "---":
+            body = [b.rstrip("\r\n") for b in lines[1:idx]]
+            if not all(_YAML_FM_LINE.match(b) and not _plain_value_is_prose(b)
+                       for b in body):
+                return (0, -1)
             return (1, idx - 1)
     return (0, -1)
+
+
+# ---------------------------------------------------------------------------
+# Composite paths (review R18-03)
+# ---------------------------------------------------------------------------
+
+#: The run of path characters that FOLLOWS a path-valued token in the template
+#: text: up to whitespace, a quote, a backtick, ``)`` or ``,``.
+_PATH_TAIL_RE = re.compile(r"[^\s'\"`),]*")
+#: A tail containing any of these is a pattern or a prose example
+#: (``{provider}``, ``<name>``, ``*.md``, ``$VAR``), not a literal path.
+_PATTERN_CHARS = frozenset("{}<>*$|[]?…&;")
+
+#: Composite paths under a root that are LEGITIMATELY created later (by the
+#: agent or tool that the rendered text instructs), so their absence at render
+#: time is not a defect. POSIX-separated, matched as a prefix of the tail
+#: after the root. The completeness gate reads this same tuple — one home.
+COMPOSITE_CREATED_LATER: Tuple[str, ...] = (
+    ".claude/backups/",
+    "integrations/",
+)
+
+
+def composite_tail(line: str, token_end: int) -> Optional[str]:
+    """The literal path suffix that follows a path-valued token at
+    ``token_end`` in the TEMPLATE line, or ``None`` when there is none to
+    check (no separator follows, the tail is a pattern / prose example, or it
+    is on :data:`COMPOSITE_CREATED_LATER`).
+
+    ``{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python`` →
+    ``/claude_mcp_servers/.venv/bin/python``. A following placeholder ends the
+    tail; trailing sentence punctuation (``.:;``) is stripped.
+    """
+    m = _PATH_TAIL_RE.match(line, token_end)
+    tail = m.group(0) if m else ""
+    if "{{" in tail:
+        tail = tail[:tail.index("{{")]
+    tail = tail.rstrip(".:;")
+    if not tail or tail[0] not in "/\\" or len(tail.strip("/\\")) == 0:
+        return None
+    if any(ch in _PATTERN_CHARS for ch in tail):
+        return None
+    rel = tail.replace("\\", "/").lstrip("/")
+    if any(rel.startswith(prefix) for prefix in COMPOSITE_CREATED_LATER):
+        return None
+    return tail
 
 
 def render(
@@ -522,7 +600,15 @@ def render(
     lines = text.splitlines(keepends=True)
     fm_first, fm_last = _frontmatter_line_span(lines) if escape == "yaml" else (0, -1)
 
-    def _value(name: str, lineno: int) -> Optional[str]:
+    def _exists(path: str) -> bool:
+        if path not in exists_cache:
+            try:
+                exists_cache[path] = Path(path).exists()
+            except (OSError, ValueError):
+                exists_cache[path] = False
+        return exists_cache[path]
+
+    def _value(name: str, lineno: int, tail: Optional[str] = None) -> Optional[str]:
         if name not in allowed_set or name not in REGISTRY:
             unresolved.append(Unresolved(name, lineno, "unknown"))
             return None
@@ -535,19 +621,24 @@ def render(
             return None
         used.add(name)
         if REGISTRY[name].must_exist:
-            if value not in exists_cache:
-                try:
-                    exists_cache[value] = Path(value).exists()
-                except OSError:
-                    exists_cache[value] = False
-            if not exists_cache[value]:
+            # Owner rule 2 checks the path the file will USE: the value plus
+            # the literal path that follows it in the template (review
+            # R18-03 — `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python`
+            # must be caught, not only `{{ORCHESTRATOR_ROOT}}`). The bare
+            # value is the fallback, and is checked first: a missing root is
+            # reported as the root, not as every path under it.
+            if not _exists(value):
                 missing.append(MissingPath(name, value, lineno))
+            elif tail is not None and not _exists(value + tail):
+                missing.append(MissingPath(name, value + tail, lineno))
         return value
 
     def _sub_line(line: str, lineno: int, mode: str) -> str:
         def _one(m: "re.Match[str]") -> str:
             name = m.group(1)
-            value = _value(name, lineno)
+            tail = (composite_tail(m.string, m.end())
+                    if name in REGISTRY and REGISTRY[name].must_exist else None)
+            value = _value(name, lineno, tail)
             if value is None:
                 return m.group(0)
             if name in verbatim_set:
@@ -678,19 +769,36 @@ class FindingsSink:
     warning is printed only when the findings change.
     """
 
-    def __init__(self, *, rerender_command: str = "") -> None:
+    def __init__(self, *, rerender_command: str = "", surface: str = "") -> None:
         self.rerender_command = rerender_command
+        self.surface = surface
         self.results: Dict[str, RenderResult] = {}
+        self.retired: set = set()
 
     def record(self, label: str, result: RenderResult) -> None:
+        if label in self.retired:
+            return
         prior = self.results.get(label)
         self.results[label] = result
         if not result.clean and (prior is None or prior.problems() != result.problems()):
             warn(label, result)
 
-    def settle(self, folder: Path, *, log=None) -> Dict[str, List[str]]:
+    def retire(self, label: str) -> None:
+        """``label`` was rendered (e.g. to hash it) but is NOT written this run
+        — an agent the user disabled (review R18-09). Its findings describe no
+        file on disk, so they create no row, and a row it had is resolved."""
+        self.results.pop(label, None)
+        self.retired.add(label)
+
+    def settle(self, folder: Path, *, log=None,
+               shipped: Optional[Iterable[str]] = None) -> Dict[str, List[str]]:
+        """Settle this run's rows. ``shipped`` (the labels this surface still
+        ships, rendered or not this run) turns on the sweep: a row of this
+        sink's ``surface`` whose file is no longer shipped is resolved."""
         return settle_deferrals(folder, self.results,
-                                rerender_command=self.rerender_command, log=log)
+                                rerender_command=self.rerender_command, log=log,
+                                surface=self.surface, retired=self.retired,
+                                shipped=shipped)
 
 
 class Transform:
@@ -724,6 +832,81 @@ class Transform:
         return data
 
 
+def renders_under_moved_root(
+    transform: object,
+    raw: bytes,
+    installed: bytes,
+    orchestrator_root: Path,
+    project_root: Optional[Path],
+    *,
+    same_path: Optional[Callable[[Path, Path], bool]] = None,
+) -> bool:
+    """True when ``installed`` is EXACTLY what ``transform`` renders from
+    ``raw`` under some OLD orchestrator root — a moved clone, not a user edit
+    (the bundle's moved-clone heal, review R18-06).
+
+    The round-trip is the forward render itself: the op's own
+    :class:`Transform` (same allowed set, per-destination escaping, region
+    scoping and non-path keys such as ``{{VENV_PYTHON}}``) re-run under a
+    context whose root is the old one. Finding that root: one render under a
+    SENTINEL root; the fixed text before the sentinel's first occurrence and
+    the literal text after it locate the old root in the installed file, which
+    is then tried as found, unescaped (a doubled backslash, an escaped double
+    quote, a doubled single quote) and stripped of a YAML quote. Only a
+    byte-exact round-trip returns True — the locator is a search strategy, the
+    round-trip is the safety property. False on any ambiguity, for a transform
+    that is not a :class:`Transform`, or for an old root equal to the current.
+    """
+    if not isinstance(transform, Transform):
+        return False
+    try:
+        installed_text = installed.decode("utf-8", errors="strict")
+    except UnicodeDecodeError:
+        return False
+    base = transform.context
+
+    def _render_under(root: str) -> Optional[bytes]:
+        ctx = MaterializeContext(Path(root), project_root, project_name=base.project_name,
+                                 os_name=base.os_name, home=base.home, db_path=base.db_path)
+        try:
+            return transform.render(raw, LazyContext(ctx))[0]
+        except Exception:  # noqa: BLE001 — a failed re-render never heals
+            return None
+
+    sentinel = "/VCO-HEAL-OLD-ROOT-SENTINEL"
+    probe = _render_under(sentinel)
+    if probe is None:
+        return False
+    probe_text = probe.decode("utf-8", errors="replace")
+    at = probe_text.find(sentinel)
+    if at < 0 or not installed_text.startswith(probe_text[:at]):
+        return False  # no baked root to heal, or the text before it differs
+    after = probe_text[at + len(sentinel):]
+    nxt = after.find(sentinel)
+    literal = (after[:nxt] if nxt >= 0 else after).split("\n", 1)[0] or "\n"
+    end = installed_text.find(literal, at)
+    if end <= at:
+        return False
+    found = installed_text[at:end]
+    candidates: List[str] = []
+    for c in (found, found[1:] if found[:1] in ("'", '"') else ""):
+        if c:
+            candidates.append(c)
+            candidates.append(c.replace("\\\\", "\\").replace('\\"', '"').replace("''", "'"))
+    for candidate in dict.fromkeys(candidates):
+        if candidate in (str(orchestrator_root), sentinel):
+            continue
+        if same_path is not None:
+            try:
+                if same_path(Path(candidate), Path(orchestrator_root)):
+                    continue
+            except (OSError, ValueError):
+                pass
+        if _render_under(candidate) == installed:
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Deferral rows (owner rules 1 + 2)
 # ---------------------------------------------------------------------------
@@ -754,7 +937,15 @@ def _default_rerender_command(folder: Path) -> str:
             "python install.py --update")
 
 
-def _unrendered_entry(label: str, result: RenderResult, command: str):
+def _fields(surface: str, fields: Dict[str, str]) -> Dict[str, str]:
+    """``dismiss_fields`` plus the emitting SURFACE (``bundle``, ``root-file``,
+    ``boot-unit``). Not a dismiss key (the registry declares ``file`` +
+    ``placeholders`` / ``paths``); it scopes the no-longer-shipped sweep so the
+    bundle never resolves a root-file or boot-unit row that shares a ledger."""
+    return {**fields, "surface": surface} if surface else fields
+
+
+def _unrendered_entry(label: str, result: RenderResult, command: str, surface: str = ""):
     from vco_lib.deferral_report import DeferralEntry
 
     items = "; ".join(
@@ -780,14 +971,14 @@ def _unrendered_entry(label: str, result: RenderResult, command: str):
         ),
         command_to_apply=command,
         severity="warning",
-        dismiss_fields={
+        dismiss_fields=_fields(surface, {
             "file": label,
             "placeholders": ",".join(sorted({u.name for u in result.unresolved})),
-        },
+        }),
     )
 
 
-def _missing_entry(label: str, result: RenderResult, command: str):
+def _missing_entry(label: str, result: RenderResult, command: str, surface: str = ""):
     from vco_lib.deferral_report import DeferralEntry
 
     items = "; ".join(f"{{{{{m.name}}}}} = `{m.value}` (line {m.line})"
@@ -808,10 +999,10 @@ def _missing_entry(label: str, result: RenderResult, command: str):
         ),
         command_to_apply=command,
         severity="warning",
-        dismiss_fields={
+        dismiss_fields=_fields(surface, {
             "file": label,
             "paths": ",".join(sorted(f"{m.name}={m.value}" for m in result.missing_paths)),
-        },
+        }),
     )
 
 
@@ -821,6 +1012,9 @@ def settle_deferrals(
     *,
     rerender_command: str = "",
     log=None,
+    surface: str = "",
+    retired: Iterable[str] = (),
+    shipped: Optional[Iterable[str]] = None,
 ) -> Dict[str, List[str]]:
     """Write/clear the two row families for every file rendered this run.
 
@@ -829,10 +1023,20 @@ def settle_deferrals(
     (paired resolution). No ledger and nothing to add ⇒ nothing is touched —
     a clean install never creates the lock file or the ledger.
 
+    Review R18-09 — rows nothing would otherwise ever clear:
+
+    * ``retired`` labels (a file that is no longer written: a disabled agent,
+      an unregistered boot unit) have their rows resolved.
+    * ``shipped`` (optional) turns on the SWEEP: every row of this
+      ``surface`` whose file is neither rendered this run nor in ``shipped``
+      is resolved — a template removed in a later release.
+
     Soft-fail: returns ``{"emitted": [...], "resolved": [...], "error": [...]}``.
     """
     summary: Dict[str, List[str]] = {"emitted": [], "resolved": [], "error": []}
-    if not results:
+    retired = frozenset(retired)
+    shipped_set = None if shipped is None else frozenset(shipped)
+    if not results and not retired and shipped_set is None:
         return summary
     folder = Path(folder)
     command = rerender_command or _default_rerender_command(folder)
@@ -840,13 +1044,15 @@ def settle_deferrals(
     to_clear: List[str] = []
     for label, result in sorted(results.items()):
         if result.unresolved:
-            to_add.append(_unrendered_entry(label, result, command))
+            to_add.append(_unrendered_entry(label, result, command, surface))
         else:
             to_clear.append(unrendered_condition_id(label))
         if result.missing_paths:
-            to_add.append(_missing_entry(label, result, command))
+            to_add.append(_missing_entry(label, result, command, surface))
         else:
             to_clear.append(path_missing_condition_id(label))
+    for label in sorted(retired - set(results)):
+        to_clear += [unrendered_condition_id(label), path_missing_condition_id(label)]
 
     from vco_lib.deferral_report import _DEFERRED_JSON_REL, _DEFERRED_REL
 
@@ -859,6 +1065,15 @@ def settle_deferrals(
         gate = WriteGate()
         changed = False
         with locked_report(folder, gate=gate) as report:
+            if shipped_set is not None and surface:
+                keep = shipped_set | set(results)
+                for entry in list(report.entries):
+                    cid = entry.condition_id
+                    fields = entry.dismiss_fields or {}
+                    if (cid.startswith((UNRENDERED_PREFIX, PATH_MISSING_PREFIX))
+                            and fields.get("surface") == surface
+                            and fields.get("file") not in keep):
+                        to_clear.append(cid)
             for cid in to_clear:
                 if report.has_condition(cid):
                     report.mark_resolved(cid)
@@ -882,6 +1097,12 @@ def settle_deferrals(
             except Exception:  # noqa: BLE001
                 pass
     return summary
+
+
+def resolve_labels(folder: Path, labels: Iterable[str], *, log=None) -> Dict[str, List[str]]:
+    """Resolve both row families for files that are no longer rendered (an
+    unregistered boot unit). Soft-fail, like :func:`settle_deferrals`."""
+    return settle_deferrals(folder, {}, retired=labels, log=log)
 
 
 def _quote_arg(value: str) -> str:

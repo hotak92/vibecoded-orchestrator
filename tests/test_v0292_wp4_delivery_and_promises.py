@@ -464,11 +464,15 @@ class DeliveryAuditTests(unittest.TestCase):
         the whole project-level-template half (``_install_project_level_templates``,
         ``render_claude_md``, the shared render pipeline) moved to
         ``vco_lib/project_templates.py``, leaving same-name thin aliases.
+
+        v0.2.100 (WP-18 review fixes) — LOWERED 15_262 -> 15_216: the moved-clone
+        heal's round-trip moved to ``vco_lib.materialize.renders_under_moved_root``
+        (review R18-06), leaving a thin caller.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_262,
+            n, 15_216,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

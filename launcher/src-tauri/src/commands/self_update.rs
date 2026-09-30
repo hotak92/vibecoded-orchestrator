@@ -873,8 +873,12 @@ const TRANSIENT_FETCH_MARKERS: &[&str] = &[
     "returned error: 502",
     "returned error: 503",
     "returned error: 504",
+    // Ref-update contention — only the shapes another RUNNING git causes.
+    // `cannot lock ref` alone is NOT a marker (R18-10): it also prefixes the
+    // deterministic directory/file ref conflict ([`ref_dir_file_conflict`]).
     ".lock': file exists",
-    "cannot lock ref",
+    "': reference already exists",
+    " but expected ",
 ];
 
 /// Should a failed fetch be retried?
@@ -1005,6 +1009,58 @@ fn reclassify_stale_ref_lock(repo: &Path, stderr: &str, err: FetchAttemptError) 
     }
 }
 
+/// v0.2.100 (R18-10): the remote a ref-update failure names — `refs/remotes/<remote>/…`
+/// in a `cannot lock ref` line — when git's message is a DIRECTORY/FILE ref
+/// conflict: upstream renamed a branch so that one ref name is now a prefix
+/// of another (`a` ↔ `a/b`), and the stale local remote-tracking ref blocks
+/// the new one. Git's shapes: `'<ref>' exists; cannot create '<ref>'`
+/// (2.x, both directions), `there is a non-empty directory '…' blocking
+/// reference '…'`, and the older `unable to resolve reference '…': Not a
+/// directory`. Deterministic — every retry fails identically until the stale
+/// ref is pruned. `Some("")` when the conflict names no remote-tracking ref.
+fn ref_dir_file_conflict(stderr: &str) -> Option<String> {
+    const MARKER: &str = "cannot lock ref '";
+    stderr.lines().find_map(|line| {
+        // ASCII lower-casing keeps byte offsets, so `at` indexes `line` too.
+        let low = line.to_ascii_lowercase();
+        let conflict = low.contains("' exists; cannot create '")
+            || low.contains("blocking reference '")
+            || low.contains(": not a directory");
+        if !conflict {
+            return None;
+        }
+        let at = low.find(MARKER)? + MARKER.len();
+        let refname = line[at..].split('\'').next()?;
+        Some(
+            refname
+                .strip_prefix("refs/remotes/")
+                .and_then(|r| r.split('/').next())
+                .unwrap_or("")
+                .to_string(),
+        )
+    })
+}
+
+/// v0.2.100 (R18-10): a directory/file ref conflict is deterministic, and its
+/// error says the one thing that fixes it: `git remote prune <remote>` in
+/// this repository (it deletes the stale remote-tracking ref that blocks the
+/// renamed branch; local branches are untouched). Any other failure passes
+/// through unchanged.
+fn classify_ref_dir_file_conflict(repo: &Path, stderr: &str, err: FetchAttemptError) -> FetchAttemptError {
+    let Some(remote) = ref_dir_file_conflict(stderr) else {
+        return err;
+    };
+    let remote = if remote.is_empty() { "<remote>".to_string() } else { remote };
+    FetchAttemptError::deterministic(format!(
+        "{} — an upstream branch was renamed so that its new name collides with a stale \
+         remote-tracking ref in this clone; retrying cannot fix it. Run `git remote prune {}` in \
+         {} (it removes only stale remote-tracking refs), then update again",
+        err.message,
+        remote,
+        repo.display()
+    ))
+}
+
 /// One `git fetch` attempt. `kill_on_drop`: when the per-attempt timeout in
 /// [`fetch_with_retry`] drops this future, the child dies with it.
 async fn run_fetch_attempt(
@@ -1022,7 +1078,9 @@ async fn run_fetch_attempt(
         return Ok(());
     }
     let stderr = String::from_utf8_lossy(&out.stderr);
-    Err(reclassify_stale_ref_lock(repo, &stderr, describe_failed_fetch(&out.status, &stderr)))
+    let err = describe_failed_fetch(&out.status, &stderr);
+    let err = classify_ref_dir_file_conflict(repo, &stderr, err);
+    Err(reclassify_stale_ref_lock(repo, &stderr, err))
 }
 
 /// The ONE production upstream fetch (D5). Coalesces with a covering fetch
@@ -2927,30 +2985,49 @@ mod tests {
         assert_eq!(fake_git_calls(&git).len(), 2, "Quick retries a transient failure once");
     }
 
-    /// W4R-03: a real temp repo holding a planted ref lock, and git's exact
-    /// "File exists" text for it (the fake git prints it and exits 1).
-    #[cfg(unix)]
+    /// W4R-03: a temp repo (a `.git` directory — no git is spawned, so this
+    /// runs on every OS) holding a planted ref lock whose mtime is `age` ago,
+    /// and git's exact "File exists" text for it. The path in the text is
+    /// written the way git prints it on this OS: on Windows git prints
+    /// forward slashes (`C:/Users/…/main.lock`), which is what R18-14 covers.
     fn repo_with_ref_lock(age: Duration) -> (tempfile::TempDir, std::path::PathBuf, String) {
         let repo = tempfile::tempdir().unwrap();
-        let st = StdCommand::new("git").args(["init", "-q"]).current_dir(repo.path()).status().unwrap();
-        assert!(st.success(), "git init");
-        let dir = repo.path().join(".git/refs/remotes/vco_upstream");
+        let dir = repo.path().join(".git").join("refs").join("remotes").join("vco_upstream");
         std::fs::create_dir_all(&dir).unwrap();
         let lock = dir.join("main.lock");
-        let f = std::fs::File::create(&lock).unwrap();
-        f.set_modified(std::time::SystemTime::now() - age).unwrap();
-        drop(f);
+        plant_lock(&lock, age);
+        let printed = git_printed_path(&lock);
         let msg = format!(
-            "error: cannot lock ref 'refs/remotes/vco_upstream/main': Unable to create '{}': File exists.\n\n\
+            "error: cannot lock ref 'refs/remotes/vco_upstream/main': Unable to create '{printed}': File exists.\n\n\
              Another git process seems to be running in this repository, e.g.\n\
              an editor opened by 'git commit'. Please make sure all processes\n\
              are terminated then try again. If it still fails, a git process\n\
              may have crashed in this repository earlier:\n\
              remove the file manually to continue.\n \
-             ! [new branch]      main       -> vco_upstream/main  (unable to update local ref)",
-            lock.display()
+             ! [new branch]      main       -> vco_upstream/main  (unable to update local ref)"
         );
         (repo, lock, msg)
+    }
+
+    /// Create `lock` with an mtime `age` in the past (std `File::set_modified`:
+    /// every OS; the handle is opened for writing, which Windows requires).
+    fn plant_lock(lock: &Path, age: Duration) {
+        let f = std::fs::OpenOptions::new().create(true).truncate(true).write(true).open(lock).unwrap();
+        f.set_modified(std::time::SystemTime::now() - age).unwrap();
+        drop(f);
+        let got = std::fs::metadata(lock).unwrap().modified().unwrap().elapsed().unwrap_or_default();
+        assert!(got + Duration::from_secs(5) >= age, "mtime was not set back: {got:?} < {age:?}");
+    }
+
+    /// `path` as git prints it in an error on this OS (forward slashes on
+    /// Windows; unchanged elsewhere).
+    fn git_printed_path(path: &Path) -> String {
+        let s = path.display().to_string();
+        if cfg!(windows) {
+            s.replace('\\', "/")
+        } else {
+            s
+        }
     }
 
     /// W4R-03 (act): a STALE ref lock — older than one attempt — is
@@ -2973,6 +3050,28 @@ mod tests {
         assert!(err.contains("stale lock") && err.contains("deleted"), "{err}");
     }
 
+    /// R18-10 through the REAL fetch path: git's directory/file ref-conflict
+    /// text makes ONE spawn even on the Persistent ladder, and the error the
+    /// caller gets tells it to prune the remote.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_path_ref_dir_file_conflict_is_not_retried_and_says_prune() {
+        let msg = "error: cannot lock ref 'refs/remotes/vco_upstream/a/b': 'refs/remotes/vco_upstream/a' exists; \
+                   cannot create 'refs/remotes/vco_upstream/a/b'\n \
+                   ! [new branch]      a/b        -> vco_upstream/a/b  (unable to update local ref)";
+        let git = fake_git(&format!("printf '%s\\n' \"{}\" >&2; exit 1", msg.replace('"', "\\\"")));
+        let repo = tempfile::tempdir().unwrap();
+        let fut = vct_launcher_core::paths::with_lookup_path(Some(git.path().as_os_str()), || {
+            serialized_fetch_upstream(repo.path(), FetchPolicy::Persistent, None)
+        });
+        let err = tokio::time::timeout(Duration::from_secs(20), fut)
+            .await
+            .expect("a D/F ref conflict must not climb the Persistent ladder")
+            .expect_err("still failing");
+        assert_eq!(fake_git_calls(&git).len(), 1, "a D/F conflict must not be retried: {err}");
+        assert!(err.contains("git remote prune vco_upstream"), "{err}");
+    }
+
     /// W4R-03 (leave-alone): a FRESH ref lock is a moment's contention —
     /// still retried (Quick = two spawns).
     #[cfg(unix)]
@@ -2991,7 +3090,6 @@ mod tests {
     /// W4R-03: both message shapes resolve to the lock file on disk — the
     /// bare `cannot lock ref '<ref>'` form via the git dir — and a lock that
     /// cannot be stat'ed stays transient.
-    #[cfg(unix)]
     #[test]
     fn ref_lock_path_is_resolved_from_either_message_shape() {
         let (repo, lock, msg) = repo_with_ref_lock(Duration::from_secs(3600));
@@ -3006,6 +3104,114 @@ mod tests {
         let gone = "error: cannot lock ref 'refs/remotes/vco_upstream/nope': x";
         assert!(reclassify_stale_ref_lock(repo.path(), gone, FetchAttemptError::transient("x")).transient);
         assert_eq!(ref_lock_path_from_stderr(repo.path(), "fatal: early EOF"), None);
+    }
+
+    /// W4R-03 / R18-14 (every OS): the decision the Persistent ladder acts on,
+    /// from a failed attempt's stderr — `describe_failed_fetch` then the two
+    /// reclassifiers, exactly as `run_fetch_attempt` chains them. A stale
+    /// lock (git's absolute path, as printed on THIS OS) is deterministic and
+    /// named; a fresh one stays transient.
+    #[test]
+    fn stale_and_fresh_ref_locks_are_classified_on_every_os() {
+        let classify = |repo: &Path, msg: &str| {
+            let err = describe_failed_fetch(&exit_status(1), msg);
+            let err = classify_ref_dir_file_conflict(repo, msg, err);
+            reclassify_stale_ref_lock(repo, msg, err)
+        };
+        let (repo, lock, msg) = repo_with_ref_lock(Duration::from_secs(3600));
+        let stale = classify(repo.path(), &msg);
+        assert!(!stale.transient, "a stale lock is deterministic: {}", stale.message);
+        assert!(stale.message.contains(&lock.display().to_string()), "{}", stale.message);
+        assert!(stale.message.contains("stale lock"), "{}", stale.message);
+
+        let (repo, _lock, msg) = repo_with_ref_lock(Duration::ZERO);
+        let fresh = classify(repo.path(), &msg);
+        assert!(fresh.transient, "a fresh lock is a moment's contention: {}", fresh.message);
+    }
+
+    /// R18-14 (every OS): the lock path as git prints it resolves to the file
+    /// — absolute with forward slashes (Windows' form), relative to the repo,
+    /// and through a worktree's `gitdir:` file.
+    #[test]
+    fn ref_lock_path_resolves_absolute_relative_and_worktree_forms() {
+        let (repo, lock, _msg) = repo_with_ref_lock(Duration::from_secs(3600));
+        let fwd = format!("error: Unable to create '{}': File exists.", lock.display().to_string().replace('\\', "/"));
+        assert_eq!(ref_lock_path_from_stderr(repo.path(), &fwd), Some(lock.clone()), "forward-slash absolute");
+
+        let rel = "error: Unable to create '.git/refs/remotes/vco_upstream/main.lock': File exists.";
+        let got = ref_lock_path_from_stderr(repo.path(), rel).expect("relative form");
+        assert!(got.exists() && got.ends_with("main.lock"), "{got:?}");
+
+        // A worktree: `<wt>/.git` is a FILE `gitdir: <abs git dir>`.
+        let wt = tempfile::tempdir().unwrap();
+        let gitdir = wt.path().join("real-gitdir");
+        let dir = gitdir.join("refs").join("remotes").join("vco_upstream");
+        std::fs::create_dir_all(&dir).unwrap();
+        let wt_lock = dir.join("main.lock");
+        plant_lock(&wt_lock, Duration::from_secs(3600));
+        let checkout = wt.path().join("checkout");
+        std::fs::create_dir_all(&checkout).unwrap();
+        std::fs::write(checkout.join(".git"), format!("gitdir: {}\n", git_printed_path(&gitdir))).unwrap();
+        let bare = "error: cannot lock ref 'refs/remotes/vco_upstream/main': reference already exists";
+        assert_eq!(ref_lock_path_from_stderr(&checkout, bare), Some(gitdir.join("refs/remotes/vco_upstream/main.lock")));
+        let stale = reclassify_stale_ref_lock(&checkout, bare, FetchAttemptError::transient("x"));
+        assert!(!stale.transient, "the worktree's stale lock is found: {}", stale.message);
+    }
+
+    /// R18-10: git's exact directory/file ref-conflict text (git 2.43,
+    /// captured from a real `git fetch` against a local repo whose branch
+    /// `a` was renamed `a/b`, and the reverse) is DETERMINISTIC — even
+    /// though it starts with `cannot lock ref` — and the error says to run
+    /// `git remote prune <remote>`. ACT side.
+    #[test]
+    fn ref_dir_file_conflict_is_deterministic_and_names_the_prune() {
+        let repo = tempfile::tempdir().unwrap();
+        let shapes = [
+            "error: cannot lock ref 'refs/remotes/vco_upstream/a/b': 'refs/remotes/vco_upstream/a' exists; \
+             cannot create 'refs/remotes/vco_upstream/a/b'\nFrom https://example.invalid/r\n \
+             ! [new branch]      a/b        -> vco_upstream/a/b  (unable to update local ref)\n",
+            "error: cannot lock ref 'refs/remotes/vco_upstream/a': 'refs/remotes/vco_upstream/a/b' exists; \
+             cannot create 'refs/remotes/vco_upstream/a'\nFrom https://example.invalid/r\n \
+             ! [new branch]      a          -> vco_upstream/a  (unable to update local ref)\n",
+            "error: cannot lock ref 'refs/remotes/vco_upstream/a': there is a non-empty directory \
+             '.git/refs/remotes/vco_upstream/a' blocking reference 'refs/remotes/vco_upstream/a'\n",
+            "error: cannot lock ref 'refs/remotes/vco_upstream/a/b': unable to resolve reference \
+             'refs/remotes/vco_upstream/a/b': Not a directory\n",
+        ];
+        for msg in shapes {
+            assert_eq!(ref_dir_file_conflict(msg).as_deref(), Some("vco_upstream"), "{msg}");
+            let err = describe_failed_fetch(&exit_status(1), msg);
+            let err = classify_ref_dir_file_conflict(repo.path(), msg, err);
+            let err = reclassify_stale_ref_lock(repo.path(), msg, err);
+            assert!(!err.transient, "a D/F ref conflict must not climb the ladder: {}", err.message);
+            assert!(err.message.contains("git remote prune vco_upstream"), "{}", err.message);
+            assert!(err.message.contains(&repo.path().display().to_string()), "{}", err.message);
+        }
+    }
+
+    /// R18-10 LEAVE-ALONE: the lock-held shapes another running git causes
+    /// stay transient and get no prune advice; an unrelated failure passes
+    /// through `classify_ref_dir_file_conflict` untouched.
+    #[test]
+    fn ref_contention_stays_transient_and_other_failures_pass_through() {
+        for msg in [
+            "error: cannot lock ref 'refs/remotes/vco_upstream/main': Unable to create '/nonexistent/main.lock': File exists.",
+            "error: cannot lock ref 'refs/remotes/vco_upstream/main': reference already exists",
+            "error: cannot lock ref 'refs/remotes/vco_upstream/main': is at 1111111 but expected 2222222",
+        ] {
+            assert_eq!(ref_dir_file_conflict(msg), None, "{msg}");
+            assert!(fetch_failure_is_transient(false, msg), "contention is retried: {msg}");
+        }
+        let repo = tempfile::tempdir().unwrap();
+        let other = FetchAttemptError::transient("fatal: early EOF (git exit status: 128)");
+        let out = classify_ref_dir_file_conflict(repo.path(), "fatal: early EOF", other.clone());
+        assert_eq!(out, other);
+        // A `cannot lock ref` git does not explain (a broken ref) is no
+        // longer retried on the word "lock" alone.
+        assert!(!fetch_failure_is_transient(
+            false,
+            "error: cannot lock ref 'refs/remotes/vco_upstream/x': unable to resolve reference 'refs/remotes/vco_upstream/x': reference broken"
+        ));
     }
 
     /// Coalescing through the REAL fetch path: two callers arriving together

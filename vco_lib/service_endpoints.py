@@ -719,6 +719,9 @@ InfraEnvWriter = Callable[[Path, Mapping[str, EndpointRow]], None]
 Reprojector = Callable[[Optional[Path]], Any]
 #: ``(orchestrator_root) -> bool`` — refreshes the MCP registration.
 Registrar = Callable[[Path], bool]
+#: ``(orchestrator_root, db_path) -> Any`` — re-renders the orchestrator-root
+#: files that bake endpoint values (``rendered_root_files``).
+RootRerenderer = Callable[[Path, Optional[Path]], Any]
 
 
 @dataclass
@@ -747,6 +750,24 @@ def _default_reprojector(db_path: Optional[Path]) -> Any:
     from vco_lib.config_projection import reproject_all_registered_projects  # noqa: PLC0415
 
     return reproject_all_registered_projects(db_path=db_path)
+
+
+def _default_root_rerenderer(orchestrator_root: Path, db_path: Optional[Path]) -> Any:
+    """Review R18-12: the orchestrator ``CLAUDE.md`` AUTO block bakes
+    ``{{WEAVIATE_URL}}`` / ``{{OLLAMA_URL}}`` / ``{{CODE_EMBED_URL}}`` /
+    ``{{WEAVIATE_GRPC_PORT}}`` from these rows, so a row change re-renders it
+    HERE — the one place every row change already passes — instead of leaving
+    a stale endpoint in the file until the next ``install.py --update``.
+    ``only_marked``: a file no install has rendered (no AUTO markers — a source
+    checkout) is never created or rewritten by this step."""
+    from vco_lib import rendered_root_files  # noqa: PLC0415
+
+    outcomes = rendered_root_files.render_all(orchestrator_root, db_path=db_path,
+                                              only_marked=True)
+    failed = [o.detail for o in outcomes if o.status == "failed"]
+    if failed:
+        raise OSError("; ".join(failed))
+    return outcomes
 
 
 def _default_registrar(orchestrator_root: Path) -> bool:
@@ -862,13 +883,16 @@ def apply_change(
     reproject: Optional[Reprojector] = None,
     register_mcps: Optional[Registrar] = None,
     out: Callable[[str], None] = print,
+    rerender_root: Optional[RootRerenderer] = None,
 ) -> ApplyChangeReport:
     """The follow-up chain every row change triggers (plan §4a.5, I5):
 
     1. the managed ``infrastructure/.env`` keys (``write_infra_env``);
     2. every registered project's env re-projected (``reproject``);
     3. the MCP registration refreshed (``register_mcps``);
-    4. one printed line per changed service.
+    4. the orchestrator-root rendered files that bake endpoint values
+       re-rendered (``rerender_root``, v0.2.100 review R18-12);
+    5. one printed line per changed service.
 
     Each step is a seam (tests inject fakes; the defaults are production).
     A failing step is recorded in ``errors`` and logged, and the chain
@@ -884,6 +908,7 @@ def apply_change(
         ("infra_env", lambda: (write_infra_env or _default_infra_env_writer)(root / "infrastructure", rows)),
         ("reproject", lambda: (reproject or _default_reprojector)(db_path)),
         ("register_mcps", lambda: (register_mcps or _default_registrar)(root)),
+        ("root_files", lambda: (rerender_root or _default_root_rerenderer)(root, db_path)),
     ]
     for name, step in steps:
         try:
@@ -918,6 +943,7 @@ def commit_rows(
     reproject: Optional[Reprojector] = None,
     register_mcps: Optional[Registrar] = None,
     out: Callable[[str], None] = print,
+    rerender_root: Optional[RootRerenderer] = None,
     now_ms: Optional[int] = None,
     propagate: bool = True,
     clear_mount: "bool | Iterable[str]" = False,
@@ -942,7 +968,7 @@ def commit_rows(
     report = apply_change(
         changed, orchestrator_root=orchestrator_root, db_path=db_path,
         write_infra_env=write_infra_env, reproject=reproject,
-        register_mcps=register_mcps, out=out,
+        register_mcps=register_mcps, out=out, rerender_root=rerender_root,
     )
     return result, report
 

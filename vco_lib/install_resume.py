@@ -263,10 +263,28 @@ def _under(path: Path, root: Path) -> bool:
     return path == root or root in path.parents
 
 
+def _in_site_dir(path: Path, root: Path) -> bool:
+    """True when ``path`` sits in a site-packages / dist-packages directory.
+    Under ``root`` only the components BELOW root count, so a checkout that
+    itself lives in a folder named ``site-packages`` is not misread; the
+    default layout's in-root venv (``<root>/.venv/lib/.../site-packages``)
+    still is (review R18-02)."""
+    parts = path.relative_to(root).parts if _under(path, root) else path.parts
+    return bool(_SITE_DIRS.intersection(parts))
+
+
 def vco_lib_resolution_verdict(probe_stdout: str, root: Path) -> "tuple[bool, str]":
     """Decide from the probe's report whether ``vco_lib`` is served by the
-    checkout: its origin, its loaded ``__file__`` and EVERY package location
-    must lie under ``root``, and none may be a site-packages directory."""
+    checkout's OWN package directory: its origin and loaded ``__file__`` must
+    be ``<root>/vco_lib/__init__.py`` and its package locations exactly
+    ``[<root>/vco_lib]``.
+
+    "Somewhere under root" is not enough: install.py puts the venv INSIDE the
+    checkout (``<root>/.venv``), so a frozen shadow copy at
+    ``<root>/.venv/lib/python3.X/site-packages/vco_lib`` is under root too —
+    and is exactly the v0.2.92 breakage this probe exists to catch (review
+    R18-02). A site-packages / dist-packages location is refused by name
+    wherever it lies."""
     lines = (probe_stdout or "").strip().splitlines()
     try:
         rep = json.loads(lines[-1]) if lines else None
@@ -276,17 +294,24 @@ def vco_lib_resolution_verdict(probe_stdout: str, root: Path) -> "tuple[bool, st
         return False, "the vco_lib editable-import probe printed no report"
     if rep.get("error"):
         return False, f"vco_lib does not import ({rep['error']})"
-    places = [p for p in [rep.get("origin"), rep.get("file"), *(rep.get("locations") or [])]
-              if p]
     if not rep.get("origin") and not rep.get("locations"):
         return False, "vco_lib is not installed in the venv (no editable install)"
     root = Path(root).resolve()
-    for raw in places:
-        path = Path(str(raw)).resolve()
-        if _SITE_DIRS.intersection(path.parts) and not _under(path, root):
+    pkg = root / "vco_lib"
+    init = pkg / "__init__.py"
+    files = [Path(str(p)).resolve() for p in (rep.get("origin"), rep.get("file")) if p]
+    dirs = [Path(str(p)).resolve() for p in (rep.get("locations") or []) if p]
+    for path in [*files, *dirs]:
+        if _in_site_dir(path, root):
             return False, f"vco_lib resolves from a site-packages copy ({path}), not the checkout"
         if not _under(path, root):
             return False, f"vco_lib resolves outside the checkout ({path})"
+    for path in files:
+        if path != init:
+            return False, f"vco_lib resolves from {path}, not the checkout's own {init}"
+    if dirs != [pkg]:
+        shown = ", ".join(str(d) for d in dirs) or "none"
+        return False, f"vco_lib's package locations are [{shown}], not the checkout's own {pkg}"
     return True, ""
 
 

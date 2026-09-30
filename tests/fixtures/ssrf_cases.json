@@ -1,0 +1,580 @@
+{
+ "_doc": "Shared SSRF case table: every case runs against BOTH templates/hooks/_lib/ssrf-allowlist.sh and .ps1 (tests/test_v02100_ssrf_url_parity.py). expect = allow (a VCO service on this machine) | block (private / internal / unreadable) | pass (public). The env marker __NO_PYTHON__ runs that group with a PATH that holds no Python interpreter.",
+ "envs": {
+  "moved": {
+   "WEAVIATE_URL": "http://127.0.0.1:18081",
+   "OLLAMA_URL": "http://localhost:21435",
+   "CODE_EMBED_SERVICE_URL": "http://GPU.LAN:11440"
+  },
+  "default": {},
+  "nopython": {
+   "__NO_PYTHON__": "1"
+  }
+ },
+ "cases": [
+  {
+   "env": "moved",
+   "url": "http://localhost:18081/v1/meta",
+   "expect": "allow",
+   "why": "moved Weaviate (row -> env)"
+  },
+  {
+   "env": "moved",
+   "url": "http://127.0.0.1:18081/",
+   "expect": "allow",
+   "why": "loopback spelling of a moved pair"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::1]:18081/",
+   "expect": "allow",
+   "why": "IPv6 loopback spelling"
+  },
+  {
+   "env": "moved",
+   "url": "http://[0:0:0:0:0:0:0:1]:18081/",
+   "expect": "allow",
+   "why": "long-form IPv6 loopback is the same pair"
+  },
+  {
+   "env": "moved",
+   "url": "http://LOCALHOST:18081/",
+   "expect": "allow",
+   "why": "host case-folded"
+  },
+  {
+   "env": "moved",
+   "url": "HTTP://localhost:21435/api/tags",
+   "expect": "allow",
+   "why": "scheme case-insensitive (moved Ollama)"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost.:21435/",
+   "expect": "allow",
+   "why": "trailing dot"
+  },
+  {
+   "env": "moved",
+   "url": "http://gpu.lan:11440/health",
+   "expect": "allow",
+   "why": "adopted non-loopback service (env spelled GPU.LAN)"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:8082/",
+   "expect": "allow",
+   "why": "literal :8082"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:7860/",
+   "expect": "allow",
+   "why": "Gradio literal"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:7700/api/v1/health",
+   "expect": "allow",
+   "why": "hub default port (no resolver)"
+  },
+  {
+   "env": "moved",
+   "url": " http://localhost:18081 ",
+   "expect": "allow",
+   "why": "surrounding spaces trimmed"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:8081/v1/meta",
+   "expect": "block",
+   "why": "Weaviate's OLD port once it moved"
+  },
+  {
+   "env": "moved",
+   "url": "http://127.0.0.1:9999/",
+   "expect": "block",
+   "why": "a random local port"
+  },
+  {
+   "env": "moved",
+   "url": "http://10.0.0.1:22\\@localhost:18081/",
+   "expect": "block",
+   "why": "R18-04 backslash: WHATWG host is 10.0.0.1:22"
+  },
+  {
+   "env": "moved",
+   "url": "http://10.0.0.1:22\\@127.0.0.1:18081/",
+   "expect": "block",
+   "why": "R18-04 backslash, 127.0.0.1 decoy"
+  },
+  {
+   "env": "moved",
+   "url": "http://10.0.0.1:22\\@[::1]:18081/",
+   "expect": "block",
+   "why": "R18-04 backslash, [::1] decoy"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:18081\\@evil.example/",
+   "expect": "block",
+   "why": "backslash in the authority is never allowed"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost:18081@10.0.0.5:22/",
+   "expect": "block",
+   "why": "userinfo trick: host is 10.0.0.5"
+  },
+  {
+   "env": "moved",
+   "url": "http://evil@localhost:18081/",
+   "expect": "block",
+   "why": "userinfo on an allowed pair is not a clean authority"
+  },
+  {
+   "env": "moved",
+   "url": "http:\\\\10.0.0.1\\x",
+   "expect": "block",
+   "why": "backslashes after the scheme reach host 10.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "http:///10.0.0.1/",
+   "expect": "block",
+   "why": "extra slashes skipped"
+  },
+  {
+   "env": "moved",
+   "url": "http:10.0.0.1/",
+   "expect": "block",
+   "why": "no slashes: still host 10.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "HTTP://10.0.0.1/",
+   "expect": "block",
+   "why": "scheme case"
+  },
+  {
+   "env": "moved",
+   "url": "http://LOCALHOST:6379/",
+   "expect": "block",
+   "why": "R18-05 uppercase host (was a .sh-only bypass)"
+  },
+  {
+   "env": "moved",
+   "url": "http://LocalHost:6379/",
+   "expect": "block",
+   "why": "R18-05 mixed case"
+  },
+  {
+   "env": "moved",
+   "url": "http://local%68ost:6379/",
+   "expect": "block",
+   "why": "R18-05 percent-encoded name"
+  },
+  {
+   "env": "moved",
+   "url": "http://%31%32%37.0.0.1:6379/",
+   "expect": "block",
+   "why": "R18-05 percent-encoded IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://loc\talhost:6379/",
+   "expect": "block",
+   "why": "tab removed by the URL parser"
+  },
+  {
+   "env": "moved",
+   "url": "http://2130706433/",
+   "expect": "block",
+   "why": "R18-05 decimal IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://0x7f000001/",
+   "expect": "block",
+   "why": "R18-05 hex IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://0x7f.1/",
+   "expect": "block",
+   "why": "hex short form"
+  },
+  {
+   "env": "moved",
+   "url": "http://0177.0.0.1/",
+   "expect": "block",
+   "why": "R18-05 octal IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://017700000001/",
+   "expect": "block",
+   "why": "octal 32-bit"
+  },
+  {
+   "env": "moved",
+   "url": "http://127.1/",
+   "expect": "block",
+   "why": "short IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://10.1/",
+   "expect": "block",
+   "why": "short IPv4 private"
+  },
+  {
+   "env": "moved",
+   "url": "http://0xa9.0xfe.0xa9.0xfe/",
+   "expect": "block",
+   "why": "hex cloud-metadata address"
+  },
+  {
+   "env": "moved",
+   "url": "http://2852039166/",
+   "expect": "block",
+   "why": "decimal cloud-metadata address"
+  },
+  {
+   "env": "moved",
+   "url": "http://169.254.169.254/latest/meta-data/",
+   "expect": "block",
+   "why": "cloud metadata"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::]/",
+   "expect": "block",
+   "why": "R18-05 IPv6 unspecified"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::1]/",
+   "expect": "block",
+   "why": "IPv6 loopback, not an allowed port"
+  },
+  {
+   "env": "moved",
+   "url": "http://[0:0:0:0:0:0:0:1]:6379/",
+   "expect": "block",
+   "why": "R18-05 long-form IPv6 loopback"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::ffff:7f00:1]/",
+   "expect": "block",
+   "why": "R18-05 IPv4-mapped hex"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::ffff:127.0.0.1]/",
+   "expect": "block",
+   "why": "IPv4-mapped dotted"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::ffff:a9fe:a9fe]/",
+   "expect": "block",
+   "why": "IPv4-mapped metadata"
+  },
+  {
+   "env": "moved",
+   "url": "http://[64:ff9b::7f00:1]/",
+   "expect": "block",
+   "why": "NAT64 of 127.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "http://[2002:7f00:1::]/",
+   "expect": "block",
+   "why": "6to4 of 127.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "http://[fe80::1]/",
+   "expect": "block",
+   "why": "IPv6 link-local"
+  },
+  {
+   "env": "moved",
+   "url": "http://[fd00::1]/",
+   "expect": "block",
+   "why": "IPv6 ULA"
+  },
+  {
+   "env": "moved",
+   "url": "http://[FD00::1]/",
+   "expect": "block",
+   "why": "IPv6 ULA upper-case"
+  },
+  {
+   "env": "moved",
+   "url": "http://0.0.0.0:8081/",
+   "expect": "block",
+   "why": "R18-05 0.0.0.0"
+  },
+  {
+   "env": "moved",
+   "url": "http://0/",
+   "expect": "block",
+   "why": "0 is 0.0.0.0"
+  },
+  {
+   "env": "moved",
+   "url": "http://192.168.1.1/",
+   "expect": "block",
+   "why": "RFC1918"
+  },
+  {
+   "env": "moved",
+   "url": "http://172.16.0.1/",
+   "expect": "block",
+   "why": "RFC1918"
+  },
+  {
+   "env": "moved",
+   "url": "http://172.31.255.255/",
+   "expect": "block",
+   "why": "RFC1918 top"
+  },
+  {
+   "env": "moved",
+   "url": "http://100.64.0.1/",
+   "expect": "block",
+   "why": "CGNAT"
+  },
+  {
+   "env": "moved",
+   "url": "http://foo.localhost/",
+   "expect": "block",
+   "why": "*.localhost"
+  },
+  {
+   "env": "moved",
+   "url": "http://localhost./",
+   "expect": "block",
+   "why": "localhost with trailing dot, port 80"
+  },
+  {
+   "env": "moved",
+   "url": "http://127.0.0.1.nip.io/",
+   "expect": "block",
+   "why": "legacy substring: DNS name embedding a private address"
+  },
+  {
+   "env": "moved",
+   "url": "http://bücher.example/",
+   "expect": "pass",
+   "why": "non-ASCII public host: judged as its IDNA form xn--bcher-kva.example"
+  },
+  {
+   "env": "moved",
+   "url": "http://ｌｏｃａｌｈｏｓｔ/",
+   "expect": "block",
+   "why": "fullwidth localhost: NFKC + IDNA -> localhost"
+  },
+  {
+   "env": "moved",
+   "url": "http://ex%C3%A4mple.com/",
+   "expect": "pass",
+   "why": "percent-encoded non-ASCII public host: IDNA xn--exmple-cua.com"
+  },
+  {
+   "env": "moved",
+   "url": "http://[fe80::1%25eth0]/",
+   "expect": "block",
+   "why": "zone id: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::1/",
+   "expect": "block",
+   "why": "unterminated IPv6"
+  },
+  {
+   "env": "moved",
+   "url": "http://1.2.3.4.5/",
+   "expect": "block",
+   "why": "five-part numeric: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "http://08.1.1.1/",
+   "expect": "block",
+   "why": "bad octal: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "http://4294967296/",
+   "expect": "block",
+   "why": "beyond 32 bits: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "http://example.com:99999/",
+   "expect": "block",
+   "why": "port out of range: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "http://exa mple.com/",
+   "expect": "block",
+   "why": "space in host: unreadable"
+  },
+  {
+   "env": "moved",
+   "url": "https://example.com/",
+   "expect": "pass",
+   "why": "public"
+  },
+  {
+   "env": "moved",
+   "url": "HTTPS://Example.COM./x",
+   "expect": "pass",
+   "why": "public, case + trailing dot"
+  },
+  {
+   "env": "moved",
+   "url": "http://8.8.8.8/",
+   "expect": "pass",
+   "why": "public IPv4"
+  },
+  {
+   "env": "moved",
+   "url": "http://134744072/",
+   "expect": "pass",
+   "why": "public IPv4 in decimal"
+  },
+  {
+   "env": "moved",
+   "url": "http://[2606:4700:4700::64]/",
+   "expect": "pass",
+   "why": "public IPv6"
+  },
+  {
+   "env": "moved",
+   "url": "http://[::ffff:8.8.8.8]/",
+   "expect": "pass",
+   "why": "IPv4-mapped public"
+  },
+  {
+   "env": "moved",
+   "url": "https://xn--bcher-kva.example/",
+   "expect": "pass",
+   "why": "punycode spelling of an IDN"
+  },
+  {
+   "env": "moved",
+   "url": "http://user@example.com/",
+   "expect": "pass",
+   "why": "userinfo on a public host"
+  },
+  {
+   "env": "moved",
+   "url": "http://example.com:8081/",
+   "expect": "pass",
+   "why": "public host on a VCO port number"
+  },
+  {
+   "env": "moved",
+   "url": "http://11.0.0.1/",
+   "expect": "pass",
+   "why": "just outside 10/8"
+  },
+  {
+   "env": "moved",
+   "url": "http://172.32.0.1/",
+   "expect": "pass",
+   "why": "just outside 172.16/12"
+  },
+  {
+   "env": "default",
+   "url": "http://localhost:8081/v1/meta",
+   "expect": "allow",
+   "why": "Weaviate default"
+  },
+  {
+   "env": "default",
+   "url": "http://127.0.0.1:11435/api/tags",
+   "expect": "allow",
+   "why": "Ollama default"
+  },
+  {
+   "env": "default",
+   "url": "http://[::1]:11440/health",
+   "expect": "allow",
+   "why": "code-embed default"
+  },
+  {
+   "env": "default",
+   "url": "http://localhost:18081/",
+   "expect": "block",
+   "why": "a port nothing claims"
+  },
+  {
+   "env": "default",
+   "url": "http://10.0.0.1:22\\@localhost:8081/",
+   "expect": "block",
+   "why": "R18-04 against the default pairs"
+  },
+  {
+   "env": "moved",
+   "url": "http://bücher.de/",
+   "expect": "pass",
+   "why": "owner ruling: a non-ASCII public host is converted, not blocked"
+  },
+  {
+   "env": "moved",
+   "url": "http://１０．０．０．１/",
+   "expect": "block",
+   "why": "fullwidth private IPv4 -> 10.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "http://１２７。０。０。１:6379/",
+   "expect": "block",
+   "why": "fullwidth digits + ideographic full stops -> 127.0.0.1"
+  },
+  {
+   "env": "moved",
+   "url": "http://ｌｏｃａｌｈｏｓｔ:18081/",
+   "expect": "block",
+   "why": "fullwidth localhost on an allowed port: converted, but a non-ASCII authority is never allowed"
+  },
+  {
+   "env": "moved",
+   "url": "http://%ff.example/",
+   "expect": "block",
+   "why": "invalid UTF-8 host: conversion fails"
+  },
+  {
+   "env": "nopython",
+   "url": "http://bücher.de/",
+   "expect": "block",
+   "why": "no Python: a non-ASCII host cannot be converted, so it is blocked"
+  },
+  {
+   "env": "nopython",
+   "url": "http://ｌｏｃａｌｈｏｓｔ/",
+   "expect": "block",
+   "why": "no Python: fullwidth localhost blocked"
+  },
+  {
+   "env": "nopython",
+   "url": "https://example.com/",
+   "expect": "pass",
+   "why": "no Python: an ASCII public host is unaffected"
+  },
+  {
+   "env": "nopython",
+   "url": "http://localhost:8081/",
+   "expect": "allow",
+   "why": "no Python: an ASCII allowed pair is unaffected"
+  }
+ ]
+}

@@ -189,15 +189,17 @@ if ($ToolName -eq "WebFetch") {
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
         # v0.2.100 WP-18B: the host:port pairs are DERIVED at run time from
         # the projected env (_lib/ssrf-allowlist.ps1). MUST MATCH the .sh
-        # sibling. The lib missing (partial install) allows nothing: a
-        # security guard fails closed.
+        # sibling. Reviews R18-04/R18-05: the allow AND block decisions are
+        # the lib's ONE parser (WHATWG-shaped), so the two halves cannot read
+        # one URL two ways. The lib missing (partial install) blocks every
+        # WebFetch: a security guard that cannot run fails closed.
         $ssrfLib = Join-Path $LibDir "ssrf-allowlist.ps1"
-        $whitelisted = $false
+        $ssrfVerdict = "block"
         if (Test-Path -LiteralPath $ssrfLib) {
             . $ssrfLib
-            $whitelisted = Test-VcoSsrfUrlAllowed -Url $url -ProjectRoot $ProjectRoot
+            $ssrfVerdict = Get-VcoSsrfVerdict -Url $url -ProjectRoot $ProjectRoot
         }
-        if (-not $whitelisted -and $url -match '(localhost|127\.|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.\d+\.|192\.168\.\d+\.|169\.254\.\d+\.|0\.0\.0\.0|::1)') {
+        if ($ssrfVerdict -eq "block") {
             # Route the block message to STDERR (matches pre-tool-use.sh).
             # Claude Code's PreToolUse runner discards plain stdout — an
             # exit-2 hook with only-stdout renders as "hook error: No
@@ -206,10 +208,10 @@ if ($ToolName -eq "WebFetch") {
             $ssrfPairs = ""
             if (Get-Command Get-VcoSsrfAllowedPairs -ErrorAction SilentlyContinue) {
                 $ssrfPairs = ((Get-VcoSsrfAllowedPairs -ProjectRoot $ProjectRoot) |
-                    Where-Object { $_ -notmatch '^(127\.0\.0\.1|\[::1\]):' }) -join ' '
+                    Where-Object { $_ -notmatch '^(127\.0\.0\.1|\[0:0:0:0:0:0:0:1\]):' }) -join ' '
             }
-            if (-not $ssrfPairs) { $ssrfPairs = "none (hooks/_lib/ssrf-allowlist.ps1 is missing)" }
-            [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address.")
+            if (-not $ssrfPairs) { $ssrfPairs = "none (hooks/_lib/ssrf-allowlist.ps1 is missing - run the bundle update to restore it)" }
+            [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address (or one the guard cannot read).")
             [Console]::Error.WriteLine("   Allowed local services on this machine: $ssrfPairs")
             [Console]::Error.WriteLine("   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port - a moved service is")
             [Console]::Error.WriteLine("   changed with the launcher's Services page or ``python -m vco_lib.service_endpoints move``, never by editing this hook.")

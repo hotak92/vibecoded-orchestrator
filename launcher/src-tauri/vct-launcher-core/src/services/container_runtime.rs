@@ -1595,7 +1595,10 @@ where
 /// that already has the name it is about to `run` under. The reaper's label
 /// gate ([`reap_decision`]) and this are the only two places a module
 /// container is removed, and both read the container's own
-/// [`super::container_ownership::LAUNCHER_LABEL`] before an `rm -f`.
+/// [`super::container_ownership::LAUNCHER_LABEL`] before an `rm -f`. A
+/// container with NO label (created before v0.2.100, by any install) is
+/// removed here only on the DB claim PLUS [`PreLabelEvidence`] read from the
+/// container itself (R18-08) — never on the DB claim alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PreStartRemoval {
     /// No container has the name: nothing to remove, go ahead.
@@ -1609,16 +1612,161 @@ pub enum PreStartRemoval {
     Refuse(String),
 }
 
+/// v0.2.100 (R18-08): what an UNLABELLED container itself says about which
+/// install created it — read only when the DB claims the name and the
+/// container carries no launcher label (the ≤0.2.99 upgrade path).
+///
+/// The DB claim comes from `<state root>/launcher.db`
+/// ([`crate::paths::vct_root_dir`]). A container that mounts data from, or
+/// is pointed by an env path at, that SAME state root was created from the
+/// state the claim describes; one that mounts data from anywhere else keeps
+/// data this install cannot show is its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreLabelEvidence {
+    /// Not read (the decision did not need it).
+    NotRead,
+    /// The container could not be inspected for mounts / env.
+    Unreadable(String),
+    /// A bind-mount source, or an absolute-path env value, lies under this
+    /// launcher's state root: `what` names it.
+    ThisInstall(String),
+    /// It mounts data (a bind outside this state root, or a named volume)
+    /// and nothing on it points at this state root.
+    Foreign { source: String, state_root: String },
+    /// No mounts and no path into any state root: it holds no data, and
+    /// nothing on it identifies ANY install (the shipped RL module's shape).
+    Stateless,
+}
+
+/// `inspect` template for [`PreLabelEvidence`]: the mounts and the env.
+const PRE_LABEL_INSPECT_FORMAT: &str = "{{json .Mounts}}\t{{json .Config.Env}}";
+
+/// Is `candidate` (a path as the runtime printed it) `root` or inside it?
+/// Separator-agnostic (`\` and `/`), trailing-separator tolerant, and
+/// case-insensitive on Windows. A relative root proves nothing → `false`.
+pub fn path_is_under_root(candidate: &str, root: &Path) -> bool {
+    fn norm(s: &str) -> String {
+        let s = s.replace('\\', "/");
+        let s = s.trim_end_matches('/').to_string();
+        if cfg!(windows) {
+            s.to_lowercase()
+        } else {
+            s
+        }
+    }
+    if !root.is_absolute() {
+        return false;
+    }
+    let root = norm(&root.to_string_lossy());
+    let cand = norm(candidate);
+    if root.is_empty() || cand.is_empty() {
+        return false;
+    }
+    cand == root || cand.starts_with(&format!("{root}/"))
+}
+
+/// Pure: classify `inspect --format PRE_LABEL_INSPECT_FORMAT` output against
+/// this launcher's state root(s) (the path as configured and canonicalised).
+pub fn classify_pre_label_evidence(stdout: &str, state_roots: &[PathBuf]) -> PreLabelEvidence {
+    let line = stdout.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+    let (mounts_json, env_json) = line.split_once('\t').unwrap_or((line, "null"));
+    let mounts = match serde_json::from_str::<serde_json::Value>(mounts_json.trim()) {
+        Ok(serde_json::Value::Array(a)) => a,
+        Ok(serde_json::Value::Null) => Vec::new(),
+        _ => return PreLabelEvidence::Unreadable(format!("unreadable mounts in inspect output {:?}", line)),
+    };
+    let env: Vec<String> = match serde_json::from_str::<serde_json::Value>(env_json.trim()) {
+        Ok(serde_json::Value::Array(a)) => a.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
+        _ => Vec::new(),
+    };
+    let under_ours = |p: &str| state_roots.iter().any(|r| path_is_under_root(p, r));
+    let mut data_mounts: Vec<String> = Vec::new();
+    for m in &mounts {
+        let kind = m.get("Type").and_then(|v| v.as_str()).unwrap_or("").to_ascii_lowercase();
+        let source = m.get("Source").and_then(|v| v.as_str()).unwrap_or("");
+        match kind.as_str() {
+            "bind" => {
+                if under_ours(source) {
+                    return PreLabelEvidence::ThisInstall(format!("bind mount {}", source));
+                }
+                data_mounts.push(format!("bind mount {}", source));
+            }
+            "volume" => {
+                let vol = m.get("Name").and_then(|v| v.as_str()).unwrap_or(source);
+                data_mounts.push(format!("named volume {}", vol));
+            }
+            _ => {}
+        }
+    }
+    for kv in &env {
+        if let Some((k, v)) = kv.split_once('=') {
+            if under_ours(v) {
+                return PreLabelEvidence::ThisInstall(format!("env {}={}", k, v));
+            }
+        }
+    }
+    match data_mounts.into_iter().next() {
+        Some(source) => PreLabelEvidence::Foreign {
+            source,
+            state_root: state_roots.first().map(|r| r.display().to_string()).unwrap_or_default(),
+        },
+        None => PreLabelEvidence::Stateless,
+    }
+}
+
+/// This launcher's state root, as configured and canonicalised (deduped).
+fn launcher_state_roots() -> Vec<PathBuf> {
+    let root = crate::paths::vct_root_dir();
+    let mut roots = vec![root.clone()];
+    if let Ok(c) = dunce::canonicalize(&root) {
+        if c != root {
+            roots.push(c);
+        }
+    }
+    roots
+}
+
+/// Read [`PreLabelEvidence`] for `name` (one extra `inspect`).
+pub async fn read_pre_label_evidence<R: super::container_ownership::ContainerRunner>(
+    runner: &R,
+    name: &str,
+    state_roots: &[PathBuf],
+) -> PreLabelEvidence {
+    match runner
+        .run(
+            &["inspect", "--type", "container", "--format", PRE_LABEL_INSPECT_FORMAT, name],
+            std::time::Duration::from_secs(10),
+        )
+        .await
+    {
+        Ok(o) if o.success => classify_pre_label_evidence(&o.stdout, state_roots),
+        Ok(o) => PreLabelEvidence::Unreadable(format!("inspect {} failed: {}", name, o.stderr.trim())),
+        Err(e) => PreLabelEvidence::Unreadable(e),
+    }
+}
+
 /// Pure: the pre-start removal decision for `name`, from its read
 /// [`super::container_ownership::Identity`], THIS install's `owner_id`
-/// ([`super::container_ownership::launcher_owner_id`]) and whether the
+/// ([`super::container_ownership::launcher_owner_id`]), whether the
 /// caller's launcher DB records the module install that derives this name
-/// (`claimed`).
+/// (`claimed`), and — for an unlabelled container only — what the container
+/// itself says about its install (`pre_label`). `runtime` names the binary
+/// in the hand-removal hint.
 ///
 /// * absent → [`PreStartRemoval::Proceed`];
 /// * labelled by this install → `Remove`;
-/// * unlabelled AND claimed → `Remove { unlabelled: true }` (every container
-///   created before v0.2.100 must stay replaceable by its own module);
+/// * unlabelled AND claimed → decided by `pre_label` (R18-08):
+///   - `ThisInstall` (a mount / env path under this launcher's state root)
+///     → `Remove { unlabelled: true }`;
+///   - `Stateless` (no mounts, no state path — nothing identifies ANY
+///     install and no data is at stake) → `Remove { unlabelled: true }`, so
+///     the ≤0.2.99 upgrade of a data-less module keeps working. Residual,
+///     stated: another ≤0.2.99 install's data-less container of the same
+///     name is indistinguishable from ours and is replaced (its service is
+///     interrupted; nothing is lost);
+///   - `Foreign` (it keeps data outside this state root) → `Refuse`, naming
+///     the container, the data it mounts, and how to remove it by hand;
+///   - `Unreadable` / `NotRead` → `Refuse` (never guess);
 /// * labelled by ANOTHER install → `Refuse`, naming the install id;
 /// * unlabelled and unclaimed, or unreadable → `Refuse` (never guess);
 /// * podman storage-only leftover → `Remove` when claimed (nothing runs
@@ -1628,6 +1776,8 @@ pub fn pre_start_removal_decision(
     identity: &super::container_ownership::Identity,
     owner_id: Option<&str>,
     claimed: bool,
+    pre_label: &PreLabelEvidence,
+    runtime: &str,
 ) -> PreStartRemoval {
     use super::container_ownership::{launcher_label_verdict, ContainerState, LabelVerdict};
     match &identity.state {
@@ -1654,7 +1804,33 @@ pub fn pre_start_removal_decision(
     }
     match launcher_label_verdict(&identity.labels, owner_id) {
         LabelVerdict::Ours => PreStartRemoval::Remove { unlabelled: false },
-        LabelVerdict::Unlabelled if claimed => PreStartRemoval::Remove { unlabelled: true },
+        LabelVerdict::Unlabelled if claimed => {
+            let by_hand = format!(
+                "If it is this install's, remove it by hand (`{} rm -f {}`) and start the module again",
+                runtime, name
+            );
+            match pre_label {
+                PreLabelEvidence::ThisInstall(_) | PreLabelEvidence::Stateless => {
+                    PreStartRemoval::Remove { unlabelled: true }
+                }
+                PreLabelEvidence::Foreign { source, state_root } => PreStartRemoval::Refuse(format!(
+                    "not starting: container '{}' carries no launcher label and keeps data in {}, \
+                     outside this launcher's state directory {} — it may belong to another VCO \
+                     install on this machine, so it is not removed. {}",
+                    name, source, state_root, by_hand
+                )),
+                PreLabelEvidence::Unreadable(why) => PreStartRemoval::Refuse(format!(
+                    "not starting: container '{}' carries no launcher label and its mounts could not \
+                     be read to check which install created it ({}), so it is not removed. {}",
+                    name, why, by_hand
+                )),
+                PreLabelEvidence::NotRead => PreStartRemoval::Refuse(format!(
+                    "not starting: container '{}' carries no launcher label and nothing was read to \
+                     show which install created it, so it is not removed. {}",
+                    name, by_hand
+                )),
+            }
+        }
         LabelVerdict::Unlabelled => PreStartRemoval::Refuse(format!(
             "not starting: container '{}' exists, carries no launcher label and no module \
              install in this launcher claims it, so it is not removed",
@@ -1675,15 +1851,41 @@ pub fn pre_start_removal_decision(
     }
 }
 
-/// Read `name`'s labels and apply [`pre_start_removal_decision`] — no action.
+/// Read `name`'s labels — and, for an unlabelled container the DB claims,
+/// its mounts / env ([`PreLabelEvidence`]) — and apply
+/// [`pre_start_removal_decision`]. No action.
 pub async fn read_pre_start_decision<R: super::container_ownership::ContainerRunner>(
     runner: &R,
     name: &str,
     owner_id: Option<&str>,
     claimed: bool,
 ) -> PreStartRemoval {
+    read_pre_start_decision_in(runner, name, owner_id, claimed, &launcher_state_roots()).await
+}
+
+/// [`read_pre_start_decision`] against explicit state roots (tests).
+pub async fn read_pre_start_decision_in<R: super::container_ownership::ContainerRunner>(
+    runner: &R,
+    name: &str,
+    owner_id: Option<&str>,
+    claimed: bool,
+    state_roots: &[PathBuf],
+) -> PreStartRemoval {
+    use super::container_ownership::{launcher_label_verdict, ContainerState, LabelVerdict};
     let identity = super::container_ownership::read_identity(runner, name).await;
-    pre_start_removal_decision(name, &identity, owner_id, claimed)
+    let existing = !matches!(
+        identity.state,
+        ContainerState::Missing | ContainerState::StorageOnly | ContainerState::Unknown(_)
+    );
+    let needs_evidence = claimed
+        && existing
+        && matches!(launcher_label_verdict(&identity.labels, owner_id), LabelVerdict::Unlabelled);
+    let pre_label = if needs_evidence {
+        read_pre_label_evidence(runner, name, state_roots).await
+    } else {
+        PreLabelEvidence::NotRead
+    };
+    pre_start_removal_decision(name, &identity, owner_id, claimed, &pre_label, runner.runtime_name())
 }
 
 /// Read `name`, apply [`pre_start_removal_decision`], and act: `rm -f` when
@@ -1697,7 +1899,18 @@ pub async fn clear_name_for_start<R: super::container_ownership::ContainerRunner
     owner_id: Option<&str>,
     claimed: bool,
 ) -> Result<(), String> {
-    match read_pre_start_decision(runner, name, owner_id, claimed).await {
+    clear_name_for_start_in(runner, name, owner_id, claimed, &launcher_state_roots()).await
+}
+
+/// [`clear_name_for_start`] against explicit state roots (tests).
+pub async fn clear_name_for_start_in<R: super::container_ownership::ContainerRunner>(
+    runner: &R,
+    name: &str,
+    owner_id: Option<&str>,
+    claimed: bool,
+    state_roots: &[PathBuf],
+) -> Result<(), String> {
+    match read_pre_start_decision_in(runner, name, owner_id, claimed, state_roots).await {
         PreStartRemoval::Proceed => Ok(()),
         PreStartRemoval::Refuse(msg) => {
             tracing::warn!(container = %name, "[container_runtime] module start: {}", msg);
@@ -1709,7 +1922,7 @@ pub async fn clear_name_for_start<R: super::container_ownership::ContainerRunner
                     container = %name,
                     "[container_runtime] module start: replacing a container with no launcher \
                      label (created before v0.2.100) — this launcher's module install claims \
-                     its name"
+                     its name, and its mounts show this launcher's state directory or no data"
                 );
             }
             match runner.run(&["rm", "-f", name], std::time::Duration::from_secs(60)).await {
@@ -5661,12 +5874,119 @@ mod tests {
     }
 
     /// ACT: an unlabelled (≤0.2.99) container is replaced when this
-    /// launcher's DB claims the name — the upgrade path keeps working.
+    /// launcher's DB claims the name AND it mounts data from this launcher's
+    /// state root — the upgrade path keeps working.
     #[tokio::test]
     async fn w4r01_start_replaces_an_unlabelled_container_the_db_claims() {
-        let r = w4r01_runner(None);
-        clear_name_for_start(&r, W4R01_NAME, Some(W4R01_OWNER), true).await.unwrap();
+        let root = r18_08_root();
+        let r = r18_08_runner(&r18_08_mounts(&[("bind", &format!("{}/modules/vct-rl/data", root.display()))], &[]));
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap();
         assert_eq!(w4r01_rms(&r), vec![vec!["rm".to_string(), "-f".into(), W4R01_NAME.into()]]);
+    }
+
+    // ─── v0.2.100 R18-08: an unlabelled claimed container needs evidence ───
+
+    /// An absolute state root for this OS.
+    fn r18_08_root() -> PathBuf {
+        if cfg!(windows) {
+            PathBuf::from(r"C:\Users\u\.vct")
+        } else {
+            PathBuf::from("/home/u/.vct")
+        }
+    }
+
+    /// `{{json .Mounts}}\t{{json .Config.Env}}` for `(type, source)` mounts
+    /// and `KEY=VALUE` env entries.
+    fn r18_08_mounts(mounts: &[(&str, &str)], env: &[&str]) -> String {
+        let m: Vec<serde_json::Value> = mounts
+            .iter()
+            .map(|(t, src)| serde_json::json!({"Type": t, "Source": src, "Name": if *t == "volume" { "vol1" } else { "" }, "Destination": "/data"}))
+            .collect();
+        format!("{}\t{}\n", serde_json::Value::Array(m), serde_json::json!(env))
+    }
+
+    /// Unlabelled running container: the first `inspect` answers the label
+    /// read, the second (the evidence read) answers `evidence`.
+    fn r18_08_runner(evidence: &str) -> crate::services::container_ownership::fake::FakeRunner {
+        use crate::services::container_ownership::fake::{inspect_line, ok, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("running", "{}")));
+        r.on("inspect", ok(evidence));
+        r.on("rm", ok(""));
+        r
+    }
+
+    /// LEAVE-ALONE (the R18-08 scenario): unlabelled, claimed by this DB,
+    /// but its data lives under ANOTHER install's state root → refused,
+    /// naming the container, the mount and the hand-removal command; no rm.
+    #[tokio::test]
+    async fn r18_08_unlabelled_claimed_container_mounting_another_root_is_refused() {
+        let root = r18_08_root();
+        let other = if cfg!(windows) { r"D:\other\.vct\modules\vct-rl\data" } else { "/srv/other/.vct/modules/vct-rl/data" };
+        let r = r18_08_runner(&r18_08_mounts(&[("bind", other)], &["HOME=/root"]));
+        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap_err();
+        assert!(err.contains(W4R01_NAME) && err.contains(other), "{err}");
+        assert!(err.contains(&format!("podman rm -f {W4R01_NAME}")), "names the hand removal: {err}");
+        assert!(w4r01_rms(&r).is_empty(), "no rm may be issued: {:?}", r.calls.borrow());
+    }
+
+    /// LEAVE-ALONE: a named volume is data this install cannot show is its
+    /// own; an unreadable evidence read refuses too.
+    #[tokio::test]
+    async fn r18_08_named_volume_or_unreadable_evidence_is_refused() {
+        let r = r18_08_runner(&r18_08_mounts(&[("volume", "/var/lib/containers/storage/volumes/vol1/_data")], &[]));
+        let err = clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.unwrap_err();
+        assert!(err.contains("named volume vol1"), "{err}");
+        assert!(w4r01_rms(&r).is_empty());
+
+        use crate::services::container_ownership::fake::{fail, inspect_line, ok, FakeRunner};
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("running", "{}")));
+        r.on("inspect", fail("Error: cannot connect to Podman socket"));
+        assert!(clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.is_err());
+        assert!(w4r01_rms(&r).is_empty());
+    }
+
+    /// ACT: an env path under this state root is evidence too; a container
+    /// with no data at all (the shipped RL module's shape) keeps the ≤0.2.99
+    /// upgrade path — replaced on the DB claim.
+    #[tokio::test]
+    async fn r18_08_env_evidence_and_stateless_container_are_replaced() {
+        let root = r18_08_root();
+        let env = format!("VCT_DATA={}", root.join("data").display());
+        let r = r18_08_runner(&r18_08_mounts(&[("bind", "/srv/elsewhere")], &[&env]));
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root.clone()]).await.unwrap();
+        assert_eq!(w4r01_rms(&r).len(), 1);
+
+        let r = r18_08_runner(&r18_08_mounts(&[("tmpfs", "")], &["PATH=/usr/bin"]));
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[root]).await.unwrap();
+        assert_eq!(w4r01_rms(&r).len(), 1);
+    }
+
+    /// The evidence is read ONLY for an unlabelled container the DB claims:
+    /// a labelled one is decided by its label alone (one inspect).
+    #[tokio::test]
+    async fn r18_08_evidence_is_not_read_for_a_labelled_container() {
+        let r = w4r01_runner(Some(W4R01_OWNER));
+        clear_name_for_start_in(&r, W4R01_NAME, Some(W4R01_OWNER), true, &[r18_08_root()]).await.unwrap();
+        assert_eq!(r.verbs().iter().filter(|v| *v == "inspect").count(), 1, "{:?}", r.calls.borrow());
+    }
+
+    /// The path comparison: separator-agnostic, trailing-separator tolerant,
+    /// no prefix false-positive (`/home/u/.vct2`), relative root proves nothing.
+    #[test]
+    fn r18_08_path_is_under_root_rules() {
+        let root = r18_08_root();
+        let r = root.display().to_string();
+        assert!(path_is_under_root(&r, &root));
+        assert!(path_is_under_root(&format!("{r}/data/x"), &root));
+        assert!(path_is_under_root(&format!("{r}\\data"), &root));
+        assert!(!path_is_under_root(&format!("{r}2/data"), &root), "sibling prefix is not inside");
+        assert!(!path_is_under_root("/elsewhere", &root));
+        assert!(!path_is_under_root(".vct/data", Path::new(".vct")), "relative root proves nothing");
+        if cfg!(windows) {
+            assert!(path_is_under_root("c:/users/U/.VCT/data", &root), "case-insensitive on Windows");
+        }
     }
 
     /// LEAVE-ALONE: another install's container refuses the start, names
@@ -5713,7 +6033,7 @@ mod tests {
         labels.insert(LAUNCHER_LABEL.into(), W4R01_OWNER.into());
         let id = Identity::with_labels(ContainerState::Running, labels);
         assert!(matches!(
-            pre_start_removal_decision(W4R01_NAME, &id, None, true),
+            pre_start_removal_decision(W4R01_NAME, &id, None, true, &PreLabelEvidence::NotRead, "podman"),
             PreStartRemoval::Refuse(_)
         ));
     }

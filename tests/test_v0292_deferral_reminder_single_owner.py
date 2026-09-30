@@ -517,7 +517,13 @@ class TestRenderAndSpliceInterplay(unittest.TestCase):
 
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="vct-v0292-render-"))
-        (self.tmp / "templates").mkdir(parents=True)
+        # v0.2.100 review R18-03: the renderer checks the COMPOSITE paths the
+        # template bakes in (`{{ORCHESTRATOR_ROOT}}/tools/vct-secrets/vct`), so
+        # the synthetic root carries the tree's layout like a real clone.
+        from tests._materialize_fixtures import mirror_repo_tree  # noqa: PLC0415
+
+        mirror_repo_tree(self.tmp)
+        (self.tmp / "templates").mkdir(parents=True, exist_ok=True)
         self.template = self.tmp / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
         shutil.copy2(ORCH_TEMPLATE, self.template)
         # v0.2.100 WP-18: the root template now renders `{{VENV_PYTHON}}`, and a

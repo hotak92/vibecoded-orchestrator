@@ -527,8 +527,30 @@ def fetch_schema(
 # a plain list, minus the silent lie.
 
 
+def _split_http_url_parts(url: str) -> "tuple[str, str, int]":
+    """``(scheme, host, port)`` — the one parse behind :func:`split_http_url`
+    and :func:`connect_v4`. The scheme comes from ``urlsplit`` and is
+    therefore lower-cased (``HTTPS://h`` is https); the host is the bare
+    hostname (IPv6 without brackets)."""
+    from urllib.parse import urlsplit
+
+    text = url.strip()
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    scheme = parts.scheme or "http"
+    host = parts.hostname or "localhost"
+    try:
+        port = parts.port
+    except ValueError:
+        return scheme, host, DEFAULT_WEAVIATE_PORT
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    return scheme, host, port
+
+
 def split_http_url(url: str) -> "tuple[str, int]":
-    """``(host, port)`` of a Weaviate HTTP URL, for ``connect_to_custom``.
+    """``(host, port)`` of a Weaviate HTTP URL.
 
     v0.2.100 WP-18B: the service-endpoint render
     (:func:`vco_lib.service_endpoints.render_url`) ELIDES a scheme's default
@@ -536,24 +558,23 @@ def split_http_url(url: str) -> "tuple[str, int]":
     an IPv6 host (``http://[::1]:8090``). The old inline parse took the text
     after the last ``:`` as the port, so both shapes fell back to 8081 — and
     ``[::1]`` split into host ``[``. A URL without a port now means its
-    scheme's default (443 / 80), as it does everywhere else; a scheme-less
-    ``host:port`` is read as ``http``; an unparsable port still falls back to
-    :data:`DEFAULT_WEAVIATE_PORT`.
+    scheme's default (443 / 80, scheme case-insensitive), as it does
+    everywhere else; a scheme-less ``host:port`` is read as ``http``; an
+    unparsable port still falls back to :data:`DEFAULT_WEAVIATE_PORT`. The
+    host is returned BARE (``::1``); :func:`connect_v4` re-brackets it for
+    the client, which formats ``f"{host}:{port}"`` itself.
     """
-    from urllib.parse import urlsplit
-
-    text = url.strip()
-    if "://" not in text:
-        text = "http://" + text
-    parts = urlsplit(text)
-    host = parts.hostname or "localhost"
-    try:
-        port = parts.port
-    except ValueError:
-        return host, DEFAULT_WEAVIATE_PORT
-    if port is None:
-        port = 443 if parts.scheme == "https" else 80
+    _scheme, host, port = _split_http_url_parts(url)
     return host, port
+
+
+def _client_host(host: str) -> str:
+    """``host`` as weaviate-client needs it: an IPv6 literal bracketed, since
+    the client builds ``f"{scheme}://{host}:{port}"`` / ``f"{host}:{port}"``
+    unbracketed (review R18-11)."""
+    if ":" in host and not host.startswith("["):
+        return f"[{host}]"
+    return host
 
 
 def connect_v4(
@@ -580,7 +601,8 @@ def connect_v4(
             historical default MUST pass it explicitly.
         grpc_secure: TLS for the gRPC channel. Default False.
         http_secure: TLS for the HTTP channel. When None (default), derived
-            from whether ``weaviate_url`` starts with ``https://``.
+            from whether ``weaviate_url``'s scheme is ``https``
+            (case-insensitive).
         skip_init_checks: pass-through to weaviate-client. Default True
             (matches the migrate/bootstrap contract — avoids a startup probe
             round-trip on every connect).
@@ -588,11 +610,14 @@ def connect_v4(
     import weaviate  # noqa: WPS433  (intentional lazy import)
 
     url = weaviate_url or weaviate_url_default()
-    host, port = split_http_url(url)
+    scheme, host, port = _split_http_url_parts(url)
+    host = _client_host(host)
     if grpc_port is None:
         grpc_port = int(os.environ.get("GRPC_PORT", str(DEFAULT_GRPC_PORT)))
     if http_secure is None:
-        http_secure = url.startswith("https://")
+        # From the PARSED scheme, so ``HTTPS://h`` is secure on the port
+        # (443) that split chose for it (review R18-11).
+        http_secure = scheme == "https"
     return weaviate.connect_to_custom(
         http_host=host,
         http_port=port,

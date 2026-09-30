@@ -1,6 +1,11 @@
 # {{PROJECT_NAME}} — Project Instructions
 
-These instructions are loaded by Claude Code whenever you open this project. Adapt the placeholder sections below to reflect what {{PROJECT_NAME}} actually is.
+These instructions are loaded by Claude Code whenever you open this project. The file has two parts:
+
+- **Yours** — everything OUTSIDE the `VCO_MANAGED` marker comments: this introduction, Project Overview, Tech Stack, Key Paths, and anything you add below the closing marker. VCO writes it once, when it creates this file, and never changes it afterwards. Replace the italic placeholder text with what {{PROJECT_NAME}} actually is.
+- **VCO's** — everything BETWEEN the markers. It is re-rendered from the orchestrator's template on every bundle update, so do not edit it: an edit there is backed up under `.claude/backups/bundle-adoptions/` and replaced.
+
+When a VCO update changes the template text of YOUR part, your text is left alone: the new version is written to `.claude/context/templates/CLAUDE.md.user-section.reference.md` and a row in `.claude/context/UPDATE_DEFERRED.md` asks you to compare the two.
 
 ---
 
@@ -15,12 +20,18 @@ _(List the primary languages, frameworks, and infrastructure. Examples: "Python 
 ## Key Paths
 
 - Project root: `{{PROJECT_ROOT}}`
+
+_(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
+
+<!-- >>>VCO_MANAGED>>> -->
+---
+
+## VCO Paths
+
 - Orchestrator (VibeCoded Orchestrator): `{{ORCHESTRATOR_ROOT}}` — source-of-truth for hooks, scripts, agents, skills shipped under `.claude/`.
 - KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's bundled *curated* nodes (shipped from its `templates/knowledge/`) are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
 - Active context: `.claude/CONTEXT_STATE.md` (current task, recent progress, blockers).
 - Active plans: `.claude/context/plans/` (referenced, not auto-loaded).
-
-_(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 
 ---
 
@@ -254,6 +265,8 @@ anything.
    Identity tab, the hub's `/config` response, and the collections that
    actually hold your objects. If the "legacy" class is the one your
    project is reading, the detector is wrong, not your data.
+
+<!-- <<<VCO_MANAGED<<< -->
 
 ---
 
