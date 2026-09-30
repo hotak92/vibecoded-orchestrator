@@ -350,20 +350,45 @@ class TestRendererIsTableDriven(_RendererCase):
         self.assertIn("Keep this line", body, "user text ABOVE the markers must survive")
         self.assertIn("Also only here", body, "user text BELOW the markers must survive")
 
-    def test_a_template_the_renderer_cannot_substitute_writes_nothing(self) -> None:
-        # A table entry naming an unknown placeholder must fail that entry
-        # loudly rather than write a file with a literal {{NAME}} in it.
+    def test_a_placeholder_the_renderer_cannot_fill_is_loud_but_never_fatal(self) -> None:
+        # Retargeted by the v0.2.100 owner rule (2026-09-30): an unknown or
+        # unresolvable placeholder must NOT fail the materialization. The claim
+        # this test always made — a gap is LOUD, never silent — now holds as:
+        # the file is written with the token left in place, the outcome is a
+        # warn-level result naming the name, a stderr warning is printed, and
+        # a registered deferral row names file + placeholder + line.
+        from vco_lib import materialize
+
+        self.template.write_text(
+            TEMPLATE_V1.replace("AUTO body v1", "AUTO body v1 {{NO_SUCH_PLACEHOLDER}}"),
+            encoding="utf-8",
+        )
         bogus = rrf.RenderedRootFile(
             path="CLAUDE.md",
             template="templates/ORCHESTRATOR-CLAUDE.md.template",
             begin_marker="<!-- BEGIN: AUTO",
             end_marker="<!-- END: AUTO -->",
-            substitutions=("NO_SUCH_PLACEHOLDER",),
+            substitutions=("ORCHESTRATOR_ROOT", "NO_SUCH_PLACEHOLDER"),
         )
-        outcome = rrf.render_entry(self.root, bogus)
-        self.assertEqual(outcome.status, "unknown_substitution")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            outcome = rrf.render_entry(self.root, bogus)
+        self.assertTrue(outcome.is_failure, "a left token is a warn-level outcome")
         self.assertIn("NO_SUCH_PLACEHOLDER", outcome.detail)
-        self.assertFalse((self.root / "CLAUDE.md").exists(), "nothing may be written")
+        self.assertIn("NO_SUCH_PLACEHOLDER", err.getvalue(), "stderr warning")
+        body = (self.root / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("{{NO_SUCH_PLACEHOLDER}}", body, "written WITH the token")
+        self.assertIn(str(self.root), body, "the fillable names still rendered")
+        cid = materialize.unrendered_condition_id("CLAUDE.md")
+        report = DeferralReport.read(self.root)
+        self.assertTrue(report.has_condition(cid), report.entries)
+        self.assertIn("NO_SUCH_PLACEHOLDER", report.entry_for(cid).detected)
+        # A later CLEAN render clears it (paired resolution).
+        self.template.write_text(TEMPLATE_V1, encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            clean = rrf.render_entry(self.root, bogus)
+        self.assertFalse(clean.is_failure)
+        self.assertFalse(DeferralReport.read(self.root).has_condition(cid))
 
 
 class TestDeferralEmission(_RendererCase):

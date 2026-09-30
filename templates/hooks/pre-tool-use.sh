@@ -202,21 +202,37 @@ except Exception:
 if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     URL=$(_get_field "url")
     if [[ -n "$URL" ]]; then
-        # Whitelisted local services (Weaviate, Ollama, code-embed, Gradio).
-        # SearXNG (:8888) and the mcp__search__fetch_page tool both
+        # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
+        # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
         # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
         # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
-        if echo "$URL" | grep -qE "(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))" 2>/dev/null; then
-            : # whitelisted — fall through
+        # v0.2.100 WP-18B: the host:port pairs are DERIVED at run time from
+        # the projected env (_lib/ssrf-allowlist.sh), so a moved
+        # service_endpoints port is allowed and nothing asks the user to
+        # hand-edit this hook. The lib missing (partial install) allows
+        # nothing: a security guard fails closed.
+        _SSRF_ALLOWED=1
+        if [[ -f "$SCRIPT_DIR/_lib/ssrf-allowlist.sh" ]]; then
+            # shellcheck source=_lib/ssrf-allowlist.sh disable=SC1091
+            . "$SCRIPT_DIR/_lib/ssrf-allowlist.sh"
+            vco_ssrf_url_allowed "$URL" "$PROJECT_ROOT" && _SSRF_ALLOWED=0
+        fi
+        if [[ "$_SSRF_ALLOWED" -eq 0 ]]; then
+            : # an allowed local service — fall through
         elif echo "$URL" | grep -qE "(localhost|127\.|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.|192\.168\.[0-9]+\.|169\.254\.[0-9]+\.|0\.0\.0\.0|::1)" 2>/dev/null; then
             # Block messages route to stderr — see comment in bash-
             # security branch below for why (Claude Code drops plain
             # stdout from PreToolUse hooks).
+            _SSRF_PAIRS=""
+            if command -v vco_ssrf_allowed_pairs >/dev/null 2>&1; then
+                _SSRF_PAIRS="$(vco_ssrf_allowed_pairs "$PROJECT_ROOT" | grep -vE '^(127\.0\.0\.1|\[::1\]):' | tr '\n' ' ')"
+            fi
             {
                 echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
-                echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
-                echo "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.sh"
+                echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none (hooks/_lib/ssrf-allowlist.sh is missing)}"
+                echo "   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port — a moved service is"
+                echo "   changed with the launcher's Services page or \`python -m vco_lib.service_endpoints move\`, never by editing this hook."
             } >&2
             echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$URL\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2

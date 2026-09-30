@@ -695,6 +695,10 @@ class TestRegistryCompleteness(unittest.TestCase):
             # wrapper's record-boot-refusal included (pinned by
             # tests/test_v0297_runtime_reconcile.py).
             "container_runtime_unusable", "container_runtime_data_under_both",
+            # v0.2.100 WP-18: vco_lib.materialize's entry builders attach file +
+            # placeholders / paths on every emit (pinned by
+            # tests/test_template_materialization_complete.py).
+            "template_placeholder_unrendered_*", "template_path_missing_*",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:

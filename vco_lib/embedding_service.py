@@ -85,6 +85,7 @@ from typing import Any, Callable, Optional
 
 import requests
 
+from vco_lib.containers import runtime_command_hint
 from vco_lib.embedding_providers import (
     CodeEmbedAdapter,
     OllamaAdapter,
@@ -2205,13 +2206,13 @@ class EmbeddingService:
             errors["ollama"] = (
                 f"Ollama at {self.ollama_url} did not respond to GET /api/tags. "
                 f"Is the container running? "
-                f"`podman start vco_ollama` or `docker start vco_ollama`."
+                f"`{runtime_command_hint('start vco_ollama')}`."
             )
         if not self.codeembed.is_reachable():
             errors["codeembed"] = (
                 f"CodeEmbed service at {self.code_embed_url} did not respond "
                 f"to GET /health. Is the container running? "
-                f"`podman start vco_code_embed` or `docker start vco_code_embed`."
+                f"`{runtime_command_hint('start vco_code_embed')}`."
             )
         if self.openai_api_key:
             res = self.openai.validate()

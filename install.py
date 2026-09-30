@@ -19333,10 +19333,7 @@ def _register_mcps(
         )
         return
 
-    entries = _build_python_mcp_entries(
-        install_root, venv_python,
-        weaviate_port, ollama_port, grpc_port, code_embed_port,
-    )
+    entries = _build_python_mcp_entries(install_root, venv_python, _urls)
     success, errors = _python_fallback_write_mcp_entries(claude_json, entries)
     if success > 0:
         print(

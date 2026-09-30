@@ -6830,11 +6830,9 @@ def main():
             f"model={embedding_service.code_model_id}) is not reachable.",
             file=sys.stderr,
         )
-        print(
-            "   Start CodeEmbed (`podman start vco_code_embed`) or Ollama "
-            "with a code-capable model before re-running.",
-            file=sys.stderr,
-        )
+        from vco_lib.containers import runtime_command_hint as _rt_hint  # v0.2.100: detected runtime
+        print(f"   Start CodeEmbed (`{_rt_hint('start vco_code_embed')}`) or Ollama "
+              "with a code-capable model before re-running.", file=sys.stderr)
         try:
             embedding_service.close()
         except Exception:

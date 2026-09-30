@@ -1,0 +1,27 @@
+{
+  "_comment": [
+    "v0.2.100 WP-18B: the ONE key table of the vct-hub unit renderer (R7, launcher/src-tauri/vct-hub/src/boot.rs).",
+    "R7 is the one sanctioned Rust template renderer: the hub binary registers its own boot unit without Python, and",
+    "its values (its own binary path, its state dir, the Windows user SID, the .cmd shim path) exist only at",
+    "registration time inside the hub, so they are NOT vco_lib.materialize REGISTRY keys and use their own",
+    "__SCREAMING_SNAKE__ syntax. Pinned by: boot.rs `hub_unit_placeholder_table_matches_templates` (every template's",
+    "token set == its row, and each render_* leaves none behind) and tests/test_v02100_wp18b_materialization_gaps.py",
+    "(the same token sets from the Python side, and the manual mirror below byte-identical to its canonical body).",
+    "The template-completeness gate reads `token_regex` + the union of `templates` to recognise a hub token.",
+    "A new placeholder goes HERE first; both sides fail until the renderer and this table agree."
+  ],
+  "token_regex": "__[A-Z][A-Z0-9_]*__",
+  "template_dir": "launcher/src-tauri/vct-hub/templates",
+  "templates": {
+    "vct-hub.service.template": ["__VCT_HUB_BIN__", "__VCT_STATE_DIR__"],
+    "com.vibecodedtools.vct-hub.plist.template": ["__VCT_HUB_BIN__", "__VCT_STATE_DIR__"],
+    "vct-hub-task.xml.template": ["__VCT_HUB_DIR__", "__VCT_HUB_SHIM__", "__WIN_USER_SID__"],
+    "vct-hub-boot.cmd.template": ["__VCT_STATE_DIR__"]
+  },
+  "manual_mirrors": {
+    "templates/scripts/launchctl-plist.template": {
+      "canonical": "com.vibecodedtools.vct-hub.plist.template",
+      "rule": "the manual file == the canonical body with ONE extra leading <!-- ... --> block (the manual-install notes) inserted after the XML declaration"
+    }
+  }
+}

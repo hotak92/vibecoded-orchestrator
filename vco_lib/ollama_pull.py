@@ -48,6 +48,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Iterator, Mapping, Optional, Protocol, Sequence
 
 from vco_lib.embedding_pull_plan import PullPlan, code_embed_unavailable_entry
+from vco_lib.containers import runtime_command_hint
 
 NOT_READY_CID = "ollama_not_ready_at_update"
 PULL_FAILED_CID = "ollama_model_pull_failed"
@@ -85,7 +86,7 @@ class OllamaNotReadyError(OllamaStepError):
             ),
             command_to_apply=(
                 f"Nothing to do if Ollama comes back. Otherwise check the Ollama container "
-                f"(`podman logs vco_ollama` / `docker logs vco_ollama`) and that {self.url} "
+                f"(`{runtime_command_hint('logs vco_ollama')}`) and that {self.url} "
                 "answers; to run the owed retry now (from the install root):\n"
                 "python -m vco_lib.deferral_retry --folder ."
             ),

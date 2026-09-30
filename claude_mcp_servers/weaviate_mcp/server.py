@@ -4166,21 +4166,28 @@ def _build_unreachable_hint(exc: Exception) -> str:
     # may have `weaviate` (v0.1.x unprefixed) or `weaviate_claude`
     # (pre-VCO maintainer-machine name). The authoritative registry is
     # in vco_lib/containers.py — see CANONICAL_CONTAINERS["weaviate"] and
-    # HISTORICAL_ALIASES["weaviate"]. We don't import vco_lib here to
-    # keep the MCP server free of repo-root sys.path coupling; this
-    # string is intentionally a copy of the canonical value.
+    # HISTORICAL_ALIASES["weaviate"]; this server already imports vco_lib at
+    # module scope, so the name comes from there.
+    # v0.2.100 WP-18B: the printed commands name the DETECTED runtime and the
+    # resolved WEAVIATE_URL — they used to say `podman …` and
+    # `http://localhost:8081` to every docker user / moved-port install.
+    from vco_lib.containers import canonical_name, runtime_command_hint
+    _name = canonical_name("weaviate")
+    _rt = runtime_command_hint("").strip()
     return (
         f"Weaviate unreachable at {WEAVIATE_URL} (gRPC :{GRPC_PORT}). "
         "This is the loud-fail behaviour added 2026-05-08 — earlier the MCP "
         "would silently return success:true count:0 on connection refused, "
         "which let multi-hour sessions run thinking the KG was empty. "
         "Common causes + fixes:\n"
-        "  1. Container down: `podman ps | grep weaviate` and check status.\n"
+        f"  1. Container down: `{_rt} ps -a --filter name=weaviate` and check status.\n"
         "  2. Host port unbound while container reports 'running' (Podman state-DB "
-        "desync): `curl -sf http://localhost:8081/v1/meta` from host. If it fails, "
-        "force-recreate: `podman rm -f vco_weaviate && podman-compose up -d weaviate` "
+        f"desync): `curl -sf {WEAVIATE_URL.rstrip('/')}/v1/meta` from host. If it fails, "
+        f"force-recreate: `{_rt} rm -f {_name}`, then start it from the launcher's "
+        "Services page (or open a new session — the SessionStart ensure-containers "
+        "hook brings it back up from the orchestrator's compose) "
         "(legacy installs may use `weaviate` or `weaviate_claude` in place of "
-        "`vco_weaviate` — check `podman ps -a --format '{{.Names}}'`).\n"
+        f"`{_name}` — check `{_rt} ps -a --format '{{{{.Names}}}}'`).\n"
         "  3. Stuck healthcheck restart-loop (pre-2026-05-08 compose used the "
         "strict `/v1/.well-known/ready` endpoint that 503s during legitimate "
         "operations): verify compose.yaml's healthcheck uses `/v1/meta` + "

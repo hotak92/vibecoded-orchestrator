@@ -14,13 +14,6 @@ tools:
 model: sonnet
 effort: medium
 isolation: worktree
-mcpServers:
-  orchestrator-tools:
-    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python
-    args:
-      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py
-    env:
-      PYTHONPATH: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers
 ---
 
 # Coding Agent
@@ -387,7 +380,7 @@ Implementing JWT token generation and validation
 **Python**:
 - Version: Python 3.12
 - Virtual environment: project's own `.venv/` (typically at project root). Activate with: `source .venv/bin/activate`
-- Note: For KG/MCP scripts, use `.claude/scripts/kg-*` wrappers — they auto-activate the orchestrator's MCP venv internally. Don't reference `claude_mcp_servers/.venv` from non-orchestrator projects.
+- Note: For KG/MCP scripts, use `.claude/scripts/kg-*` wrappers — they auto-activate the orchestrator's venv internally. Don't hard-code the orchestrator's venv path in a project.
 
 **Running Tests**:
 ```bash

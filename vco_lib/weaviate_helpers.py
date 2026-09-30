@@ -527,6 +527,35 @@ def fetch_schema(
 # a plain list, minus the silent lie.
 
 
+def split_http_url(url: str) -> "tuple[str, int]":
+    """``(host, port)`` of a Weaviate HTTP URL, for ``connect_to_custom``.
+
+    v0.2.100 WP-18B: the service-endpoint render
+    (:func:`vco_lib.service_endpoints.render_url`) ELIDES a scheme's default
+    port (``https://weaviate.example.com``, ``http://gpu.lan``), and brackets
+    an IPv6 host (``http://[::1]:8090``). The old inline parse took the text
+    after the last ``:`` as the port, so both shapes fell back to 8081 — and
+    ``[::1]`` split into host ``[``. A URL without a port now means its
+    scheme's default (443 / 80), as it does everywhere else; a scheme-less
+    ``host:port`` is read as ``http``; an unparsable port still falls back to
+    :data:`DEFAULT_WEAVIATE_PORT`.
+    """
+    from urllib.parse import urlsplit
+
+    text = url.strip()
+    if "://" not in text:
+        text = "http://" + text
+    parts = urlsplit(text)
+    host = parts.hostname or "localhost"
+    try:
+        port = parts.port
+    except ValueError:
+        return host, DEFAULT_WEAVIATE_PORT
+    if port is None:
+        port = 443 if parts.scheme == "https" else 80
+    return host, port
+
+
 def connect_v4(
     weaviate_url: Optional[str] = None,
     *,
@@ -559,13 +588,7 @@ def connect_v4(
     import weaviate  # noqa: WPS433  (intentional lazy import)
 
     url = weaviate_url or weaviate_url_default()
-    host = url.replace("http://", "").replace("https://", "").split(":")[0]
-    # Defensive port parse (works for "http://localhost:8081" or
-    # "https://host:9999/").
-    try:
-        port = int(url.rsplit(":", 1)[-1].split("/")[0])
-    except ValueError:
-        port = DEFAULT_WEAVIATE_PORT
+    host, port = split_http_url(url)
     if grpc_port is None:
         grpc_port = int(os.environ.get("GRPC_PORT", str(DEFAULT_GRPC_PORT)))
     if http_secure is None:

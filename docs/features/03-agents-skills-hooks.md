@@ -20,7 +20,7 @@ Writes code from a spec, following patterns from the KG. Runs in git worktree is
 <details>
 <summary>Details</summary>
 
-Tools: Read, Write, Edit, Grep, Glob, Bash. MCP: `orchestrator-tools` (injected at `{{ORCHESTRATOR_ROOT}}`). Worktree isolation puts changes on a throwaway branch until reviewed — a half-finished implementation can't dirty the working directory. The `{{ORCHESTRATOR_ROOT}}` template variable is rewritten to an absolute path at install time by `install.py`.
+Tools: Read, Write, Edit, Grep, Glob, Bash, plus the `weaviate-kg` MCP tools registered in `~/.claude.json`. Worktree isolation puts changes on a throwaway branch until reviewed — a half-finished implementation can't dirty the working directory.
 
 </details>
 
@@ -28,7 +28,7 @@ Tools: Read, Write, Edit, Grep, Glob, Bash. MCP: `orchestrator-tools` (injected 
 Requirements analysis, architectural design, and task breakdown. Injects `task-breakdown` and `architect` skills.
 
 ### `tester` (Sonnet)
-Test creation, verification, and bug investigation. Injects `code-review-expert` skill. MCP: `orchestrator-tools`.
+Test creation, verification, and bug investigation. Injects `code-review-expert` skill.
 
 ### `code-explorer` (Haiku)
 Read-heavy research agent that can also write findings reports.
@@ -126,15 +126,6 @@ Multi-level web research: spawns recursive sub-agents to chase down branches wit
 ## Worktree Isolation
 
 Agents with `isolation: worktree` run in a temporary git worktree (isolated branch). No changes → worktree is auto-cleaned. Changes → worktree path + branch name returned for review/merge. Prevents partial implementations from corrupting the working directory. See `templates/agents/WORKTREE_ISOLATION_GUIDE.md`.
-
----
-
-## `orchestrator-tools` MCP (referenced in templates)
-
-Agent frontmatter `mcpServers: orchestrator-tools` references `{{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py`. The implementation is not present in the OSS bundle (paid module). Free-tier agents use `weaviate-kg` and `search` MCPs directly.
-
-### Graceful degradation behaviour
-Seven free agents reference `orchestrator-tools` in their frontmatter: `coder`, `tester`, `planner`, `expert-coder`, `project-architect`, `consulting-cto-portfolio-coordinator`, `ai-agentic-architect`. The OSS bundle does not ship this MCP server. Claude Code silently ignores MCP entries it cannot find on disk, so the agents install and start cleanly — calls to `orchestrator-tools` tools fail at runtime, not at install time.
 
 ---
 

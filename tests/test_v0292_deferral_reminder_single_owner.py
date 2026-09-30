@@ -520,6 +520,16 @@ class TestRenderAndSpliceInterplay(unittest.TestCase):
         (self.tmp / "templates").mkdir(parents=True)
         self.template = self.tmp / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
         shutil.copy2(ORCH_TEMPLATE, self.template)
+        # v0.2.100 WP-18: the root template now renders `{{VENV_PYTHON}}`, and a
+        # rendered path that does not exist is (correctly) a deferral row —
+        # which would splice a pending-action block into CLAUDE.md. A real
+        # install always has its venv before step 4c, so the synthetic root
+        # gets one too; "never deferred anything" stays the state under test.
+        from vco_lib.materialize import venv_python_path
+
+        _py = venv_python_path(self.tmp)
+        _py.parent.mkdir(parents=True, exist_ok=True)
+        _py.write_text("", encoding="utf-8")
         import install  # noqa: E402,PLC0415 — heavy module, imported lazily
 
         self.install = install

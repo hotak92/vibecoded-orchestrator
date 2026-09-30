@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import sys
 import unittest
+from unittest import mock
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -52,13 +53,27 @@ class TenancyTests(unittest.TestCase):
             self.assertEqual(_cids(folder), [NO_BACKEND])
 
     def test_code_backend_down_names_the_service_to_restart(self) -> None:
+        # v0.2.100 WP-18B: the restart command names the DETECTED runtime —
+        # pinned to docker here (only docker installed, nothing pinned), so a
+        # literal `podman start` would fail this.
+        from vco_lib import containers
+
+        which = mock.patch.object(
+            containers._tsd, "which",
+            lambda name, *a, **k: "/usr/bin/docker" if name == "docker" else None)
+        no_record = mock.patch.object(containers, "read_runtime_txt", lambda _root: None)
+        no_pin = mock.patch.dict("os.environ", {"VCT_CONTAINER_RUNTIME": ""})
+        with which, no_record, no_pin:
+            self._code_backend_down_cases()
+
+    def _code_backend_down_cases(self) -> None:
         cases = {
-            "codesage_embed": ("CodeEmbed", "podman start vco_code_embed"),
+            "codesage_embed": ("CodeEmbed", "docker start vco_code_embed"),
             # v0.2.98: the remedy names VCO's OWN slot. It used to name
             # `$OPENAI_API_KEY`, which no VCO consumer reads any more — the
             # printed command has to send the user somewhere that works.
             "openai_embed": ("OpenAI", "openai_api_key"),
-            "qwen3_embed": ("Ollama", "podman start vco_ollama"),
+            "qwen3_embed": ("Ollama", "docker start vco_ollama"),
         }
         for slot, (hint, cmd) in cases.items():
             with self.subTest(slot=slot):

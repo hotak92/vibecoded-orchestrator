@@ -2083,3 +2083,41 @@ owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = """v0.2.100 (WP-12): one row per collection whose smart schema migration (`project_init.migrate_collections`) raised during `install.py --update`, emitted inside the run by `vco_lib.install_weaviate.migrate_errors_to_entries`. Emitted since HIGH-1 but never registered; install-owned so a later completed run that no longer fails drops it."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Template materializer (v0.2.100 WP-18) — owner rules 2026-09-30
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions."template_placeholder_unrendered_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.materialize"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["file", "placeholders"]
+notes = """One row per materialized FILE (suffix = slug of its destination path) \
+that was written with a `{{NAME}}` token left in place: a name the file class \
+may not use / the registry does not know, or one with no value on this \
+machine. Owner rule: a placeholder never fails an install or update — the \
+file is written, a stderr warning names file, placeholder and line, and this \
+row records it. PAIRED SITE: `vco_lib.materialize.settle_deferrals`, called \
+at the end of every bundle install/update (`project_init.install_project_bundle`), \
+by `rendered_root_files.render_entry` (install.py step 4c) and by every \
+boot-unit render (`boot_service._render_unit`): a CLEAN render of the same \
+file resolves the row. Not install-owned, so a mid-run clear is honoured by \
+the flow's vanished-seed reconcile and a mid-run emit by its late merge."""
+
+[conditions."template_path_missing_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.materialize"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["file", "paths"]
+notes = """Sibling of `template_placeholder_unrendered_*`: a path-valued \
+placeholder (the registry's `must_exist` keys — roots, the venv interpreter, \
+a boot unit's working dir / wrapper script) rendered to a value that does not \
+exist on this machine. The file is written with the correct path for this \
+install; the row says what will fail until the path exists. Same paired site: \
+`vco_lib.materialize.settle_deferrals` resolves it on the next render that \
+finds every path present."""

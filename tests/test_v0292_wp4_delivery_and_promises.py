@@ -458,11 +458,17 @@ class DeliveryAuditTests(unittest.TestCase):
         v0.2.100 (WP-12) — LOWERED 15_526 -> 15_494: the override-pair
         classifiers moved to ``vco_lib/compose_override_pair.py`` together
         with the new U16 reconcile of VCO's own generated pair.
+
+        v0.2.100 (WP-18) — LOWERED 15_494 -> 15_262: the managed-region
+        re-render on bundle update tripped this gate (the gate working), and
+        the whole project-level-template half (``_install_project_level_templates``,
+        ``render_claude_md``, the shared render pipeline) moved to
+        ``vco_lib/project_templates.py``, leaving same-name thin aliases.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_494,
+            n, 15_262,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

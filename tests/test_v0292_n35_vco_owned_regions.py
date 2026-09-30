@@ -166,18 +166,27 @@ class TestTheProjectAxis:
             encoding="utf-8")
         assert _rerun(folder) == []
 
-    def test_a_user_edit_outside_the_region_still_diverges(self, tmp_path):
-        """LEAVE-ALONE: green both ways. The nudge is a feature."""
+    def test_a_user_edit_outside_the_region_is_kept_verbatim(self, tmp_path):
+        """LEAVE-ALONE: a user's edit is never lost. Retargeted by v0.2.100
+        WP-18 (owner: the managed region is re-rendered on every bundle
+        update): before, VCO could not update CLAUDE.md, so ANY difference
+        raised the review nudge; now the managed body is always the current
+        render and text OUTSIDE the markers is, by the markers' contract, the
+        user's own — kept byte-for-byte, with nothing left to review."""
         folder = _fresh_project(tmp_path)
         cm = folder / "CLAUDE.md"
         cm.write_text(cm.read_text(encoding="utf-8")
                       + "\n## My section\nhand written\n", encoding="utf-8")
-        assert _rerun(folder) == ["CLAUDE.md"]
+        assert _rerun(folder) == []
+        assert cm.read_text(encoding="utf-8").endswith("\n## My section\nhand written\n")
 
-    def test_a_user_edit_inside_the_managed_region_still_diverges(self, tmp_path):
+    def test_a_user_edit_inside_the_managed_region_is_still_seen(self, tmp_path):
         """LEAVE-ALONE, and the WP-15/WP-16 split in miniature: only the
         MARKER LINES are stripped, never the body, so an edit between them is
-        still seen."""
+        still SEEN. Retargeted by v0.2.100 WP-18: the managed body is now
+        re-rendered on update, so "seen" means the adoption rule — the edited
+        file is backed up under `.claude/backups/bundle-adoptions/` before the
+        fresh render replaces the body; never silently dropped."""
         folder = _fresh_project(tmp_path)
         cm = folder / "CLAUDE.md"
         cm.write_text(
@@ -185,7 +194,14 @@ class TestTheProjectAxis:
                 MANAGED_REGION_CLOSE, "my line\n" + MANAGED_REGION_CLOSE),
             encoding="utf-8",
         )
-        assert _rerun(folder) == ["CLAUDE.md"]
+        out = pi._install_project_level_templates(
+            folder, orchestrator_root=REPO_ROOT, project_name="Fixture",
+            dry_run=False,
+        )
+        assert out["managed_rerendered"] == ["CLAUDE.md"]
+        (backup_rel,) = out["managed_backups"]
+        assert "my line" in (folder / backup_rel).read_text(encoding="utf-8")
+        assert "my line" not in cm.read_text(encoding="utf-8")
 
     def test_a_user_edit_to_context_state_still_diverges(self, tmp_path):
         """LEAVE-ALONE: the other two entries are untouched by this change."""

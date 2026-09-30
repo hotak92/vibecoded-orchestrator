@@ -182,10 +182,10 @@ class StaleOrchRootHealTests(unittest.TestCase):
             "---\n"
             "name: coder\n"
             "mcpServers:\n"
-            "  orchestrator-tools:\n"
-            "    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python\n"
+            "  example-mcp:\n"
+            "    command: {{ORCHESTRATOR_ROOT}}/.venv/bin/python\n"
             "    args:\n"
-            "      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/server.py\n"
+            "      - {{ORCHESTRATOR_ROOT}}/example_mcp/server.py\n"
             "---\n"
             "# Coder\n",
             encoding="utf-8",

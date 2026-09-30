@@ -1450,9 +1450,9 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
             if v.get("deferred").and_then(|x| x.as_bool()).unwrap_or(false) {
                 warnings.push(format!(
                     "Weaviate collection bootstrap deferred — Weaviate was \
-                     unreachable during project creation. The launcher attempted \
-                     `podman start weaviate_claude` but it did not become \
-                     healthy in time. The deferral is recorded at \
+                     unreachable during project creation. VCO tried to start \
+                     the Weaviate container but it did not become healthy in \
+                     time. The deferral is recorded at \
                      {}/.claude/context/UPDATE_DEFERRED.md; collections will \
                      be created when Weaviate is up and you re-run \
                      `python -m vco_lib.project_init bootstrap-collections \

@@ -42,24 +42,32 @@ edit invisible and then silently overwrite it.
 
 WHAT GETS BAKED
 ---------------
-Only the four placeholders below, and only INSIDE a region. The set is
-deliberately identical to the round-trip map in
-``project_init._stale_orchestrator_root_heal_match`` — that helper re-derives
-"what would this file have looked like under the OLD root?" with its own inline
-map, and a placeholder present here but absent there would silently defeat the
-moved-clone heal. ``{{PROJECT_ROOT}}`` is therefore EXCLUDED even though
-``_project_template_subs`` defines it.
+The shared path vocabulary (``vco_lib.materialize.PATH_KEYS``), and only
+INSIDE a region. v0.2.100 WP-18: the rendering itself — token grammar,
+per-language escaping, the unknown-placeholder rule — lives in
+``vco_lib.materialize``; this module keeps only what is region-specific (the
+sentinel grammar and the span walk). The vocabulary is the SAME set the
+agent renderer and the moved-clone heal use (one ``path_subs``), which is
+what retired the old "``{{PROJECT_ROOT}}`` is excluded here" drift. A name
+outside it is left in place, warned about and recorded as a deferral row —
+never a failed install.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Callable, Dict, List, Tuple
+from typing import TYPE_CHECKING, Callable, Dict, List, Mapping, Optional, Tuple
+
+from vco_lib import materialize as _mz
+
+if TYPE_CHECKING:  # pragma: no cover
+    from vco_lib.materialize import RenderResult
 
 __all__ = [
     "REWIRE_BEGIN",
     "REWIRE_END",
     "has_rewire_region",
+    "render_regions",
     "rewire_bytes",
     "rewire_transform",
     "rewire_subs",
@@ -69,53 +77,25 @@ REWIRE_BEGIN = "VCO-REWIRE-BEGIN: orchestrator-root-resolution"
 REWIRE_END = "VCO-REWIRE-END: orchestrator-root-resolution"
 
 
-def rewire_subs(orchestrator_root: Path) -> Dict[str, str]:
+def rewire_subs(orchestrator_root: Path,
+                project_root: Optional[Path] = None) -> Dict[str, str]:
     """The placeholder → value map applied inside a region.
 
-    Must stay equal (same keys, same values) to the map in
-    ``project_init._stale_orchestrator_root_heal_match``; pinned by
+    A thin view of :func:`vco_lib.materialize.path_subs` — the ONE path
+    vocabulary the agent renderer and the moved-clone heal
+    (``project_init._stale_orchestrator_root_heal_match``) share, pinned by
     ``tests/test_v0292_n35_rewire_transform.py::
     test_vocabulary_matches_the_stale_root_heal_map``.
     """
-    return {
-        "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
-        "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
-        "{{HOME}}": str(Path.home()),
-        # Survives as a literal so the consumer expands it at use time.
-        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
-    }
+    return _mz.path_subs(orchestrator_root, project_root)
 
 
 def _escape_for(filename: str, value: str) -> str:
-    """Escape ``value`` for the literal context the placeholder sits in.
-
-    The placeholder always appears inside a STRING LITERAL in the region, and
-    the literal's quoting rules differ per language. A Windows root
-    (``C:\\Users\\alice\\vco``) baked verbatim into a Python double-quoted
-    literal is a SyntaxError (``\\U`` starts a unicode escape) that would brick
-    every shipped Python script on Windows — tri-OS, R12/R14.
-
-      * ``.py``  → double-quoted literal: escape ``\\`` then ``"``.
-      * ``.ps1`` → single-quoted literal: ``'`` doubles; ``\\`` is literal in
-        PowerShell single-quotes and must NOT be escaped.
-      * everything else (``.sh`` and extension-less shell wrappers) →
-        double-quoted POSIX word: escape ``\\``, ``"``, ``$`` and a backtick so
-        a path can never introduce an expansion or a command substitution.
-
-    ``value`` for ``{{VCT_ORCHESTRATOR_ROOT}}`` is the literal
-    ``${VCT_ORCHESTRATOR_ROOT}`` and is returned verbatim by the caller — see
-    :func:`rewire_bytes` — precisely because escaping its ``$`` would destroy
-    the deliberate runtime-expansion form.
-    """
-    suffix = Path(filename).suffix.lower()
-    if suffix == ".py":
-        return value.replace("\\", "\\\\").replace('"', '\\"')
-    if suffix == ".ps1":
-        return value.replace("'", "''")
-    out = value.replace("\\", "\\\\")
-    for ch in ('"', "$", "`"):
-        out = out.replace(ch, "\\" + ch)
-    return out
+    """Escape ``value`` for the region's literal context — delegated to the one
+    escaping home, :func:`vco_lib.materialize.escape_value` (``.py`` →
+    double-quoted Python literal, ``.ps1`` → single-quoted PowerShell literal,
+    anything else → a double-quoted POSIX word)."""
+    return _mz.escape_value(value, _mz.escape_for_filename(filename))
 
 
 def _region_line_spans(lines: List[str], filename: str) -> List[Tuple[int, int]]:
@@ -173,8 +153,14 @@ def has_rewire_region(data: bytes) -> bool:
     return REWIRE_BEGIN.encode("utf-8") in data or REWIRE_END.encode("utf-8") in data
 
 
-def rewire_bytes(data: bytes, orchestrator_root: Path, *, filename: str) -> bytes:
-    """Substitute the placeholder vocabulary INSIDE every region of ``data``.
+def render_regions(
+    data: bytes,
+    ctx: Mapping[str, Optional[str]],
+    *,
+    allowed=_mz.PATH_KEYS,
+    filename: str,
+) -> "Tuple[bytes, RenderResult]":
+    """Render every region of ``data`` through :func:`vco_lib.materialize.render`.
 
     Contract:
       * bytes OUTSIDE a region are untouched — including ``{{`` sequences from
@@ -185,10 +171,15 @@ def rewire_bytes(data: bytes, orchestrator_root: Path, *, filename: str) -> byte
       * line endings are preserved verbatim (``splitlines(keepends=True)``), so
         a CRLF working copy stays CRLF — a normalising rewrite would make every
         Windows checkout look user-modified to the manifest compare;
-      * unbalanced sentinels raise ``ValueError`` naming the file.
+      * unbalanced sentinels raise ``ValueError`` naming the file (a MALFORMED
+        TEMPLATE, not a placeholder the machine cannot fill — the bundle loop
+        records it as an error on the run);
+      * a placeholder the vocabulary does not hold is LEFT IN PLACE and
+        reported in the result (owner rule, ``vco_lib.materialize``).
     """
+    empty = _mz.RenderResult(text="")
     if not has_rewire_region(data):
-        return data
+        return data, empty
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -200,39 +191,49 @@ def rewire_bytes(data: bytes, orchestrator_root: Path, *, filename: str) -> byte
     lines = text.splitlines(keepends=True)
     spans = _region_line_spans(lines, filename)
     if not spans:
-        return data
+        return data, empty
 
-    subs = rewire_subs(orchestrator_root)
+    escape = _mz.escape_for_filename(filename)
+    total = empty
     for begin_idx, end_idx in spans:
-        for idx in range(begin_idx, end_idx + 1):
-            line = lines[idx]
-            for key, value in subs.items():
-                if key not in line:
-                    continue
-                # The runtime-expansion form is a literal, not a path: escaping
-                # its `$` would turn `${VCT_ORCHESTRATOR_ROOT}` into inert text.
-                repl = (
-                    value
-                    if key == "{{VCT_ORCHESTRATOR_ROOT}}"
-                    else _escape_for(filename, value)
-                )
-                line = line.replace(key, repl)
-            lines[idx] = line
-    return "".join(lines).encode("utf-8")
+        region = "".join(lines[begin_idx:end_idx + 1])
+        result = _mz.render(region, ctx, allowed=allowed, escape=escape,
+                            first_line=begin_idx + 1)
+        new_lines = result.text.splitlines(keepends=True)
+        lines[begin_idx:end_idx + 1] = new_lines
+        total = total.merged(result, text="")
+    return "".join(lines).encode("utf-8"), total
+
+
+def rewire_bytes(data: bytes, orchestrator_root: Path, *, filename: str,
+                 project_root: Optional[Path] = None) -> bytes:
+    """Substitute the path vocabulary INSIDE every region of ``data``.
+
+    Same contract as :func:`render_regions`, bound to one install's root.
+    """
+    ctx = _mz.LazyContext(_mz.MaterializeContext(Path(orchestrator_root), project_root))
+    out, _result = render_regions(data, ctx, filename=filename)
+    return out
 
 
 def rewire_transform(
-    orchestrator_root: Path, *, filename: str
+    orchestrator_root: Path, *, filename: str,
+    project_root: Optional[Path] = None,
+    label: str = "",
+    sink: "Optional[_mz.FindingsSink]" = None,
 ) -> Callable[[bytes], bytes]:
     """Bundle-engine ``transform=`` factory bound to one install's root.
 
     The root is the INSTALL's own (computed at install time from
     ``orchestrator_root``), never a build-machine path — the same clone
     installed from ``/opt/vco`` and from ``C:\\tools\\vco`` bakes each of those
-    respectively (R17.4).
+    respectively (R17.4). Returns a :class:`vco_lib.materialize.Transform`
+    (a plain ``bytes -> bytes`` callable to the engine).
     """
-
-    def _transform(data: bytes) -> bytes:
-        return rewire_bytes(data, orchestrator_root, filename=filename)
-
-    return _transform
+    return _mz.Transform(
+        label or filename,
+        _mz.RenderSpec(allowed=_mz.PATH_KEYS, regions=True),
+        _mz.MaterializeContext(Path(orchestrator_root), project_root),
+        filename=filename,
+        sink=sink,
+    )

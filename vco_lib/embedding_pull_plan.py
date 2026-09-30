@@ -41,6 +41,8 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
+from vco_lib.containers import runtime_command_hint
+
 TEXT_QWEN3 = "qwen3-embedding:0.6b"
 TEXT_ARCTIC = "snowflake-arctic-embed2:latest"
 CODE_JINA = "unclemusclez/jina-embeddings-v2-base-code:latest"
@@ -402,8 +404,8 @@ def code_embed_unavailable_entry(detail: str) -> Any:
             "code graph keeps exactly one embedder. The knowledge graph is unaffected."
         ),
         command_to_apply=(
-            "Start the service: `podman start vco_code_embed` (or `docker start "
-            "vco_code_embed`), or re-run `python install.py --update`. Developers who "
+            f"Start the service: `{runtime_command_hint('start vco_code_embed')}`, "
+            "or re-run `python install.py --update`. Developers who "
             "accept a mixed-embedder code graph may set VCO_CODE_EMBED_ALLOW_FALLBACK=1."
         ),
         severity="warning",

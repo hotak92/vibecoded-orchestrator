@@ -37,6 +37,7 @@ from pathlib import Path
 from typing import Optional
 
 from vco_lib import weaviate_helpers as _wh
+from vco_lib.containers import runtime_command_hint
 
 __all__ = [
     "SNAPSHOT_FILENAME",
@@ -205,7 +206,7 @@ def render_cleanup_command(
             "#     stop the weaviate container (launcher Services tab, or"
         )
         lines.append(
-            "#     `podman stop weaviate_claude` / `docker compose stop weaviate`),"
+            f"#     `{runtime_command_hint('stop vco_weaviate')}`),"
         )
         lines.append(
             "#     run it, then restart Weaviate. GUARD (with Weaviate DOWN it"

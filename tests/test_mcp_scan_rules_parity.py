@@ -153,8 +153,10 @@ class McpScanRulesParityTests(unittest.TestCase):
             (root / "claude_mcp_servers" / "weaviate_mcp").mkdir(parents=True)
             (root / "claude_mcp_servers" / "search_mcp").mkdir(parents=True)
             py = root / ".venv" / "bin" / "python"
+            # v0.2.100 WP-18B: the builder takes the rows' URL map.
+            from vco_lib.service_endpoints import urls_from_rows
             entries = install_mcp._build_python_mcp_entries(
-                root, py, 8081, 11435, 50052, 11440
+                root, py, urls_from_rows({})
             )
             emitted = [name for name, _, _ in entries]
         self.assertEqual(emitted, table)

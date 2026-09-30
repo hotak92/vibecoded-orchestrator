@@ -9,13 +9,6 @@ effort: medium
 skills:
   - consulting-portfolio-status
   - task-breakdown
-mcpServers:
-  orchestrator-tools:
-    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python
-    args:
-      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py
-    env:
-      PYTHONPATH: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers
 ---
 
 # Consulting CTO Portfolio Coordinator

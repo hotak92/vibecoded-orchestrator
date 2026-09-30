@@ -115,6 +115,8 @@ __all__ = [
     "PIN_VIA_ENV",
     "PIN_VIA_RUNTIME_TXT",
     "installed_runtime",
+    "hint_runtime",
+    "runtime_command_hint",
     "binary_works",
     "daemon_responsive",
     "compose_command",
@@ -873,6 +875,35 @@ def installed_runtime(
         if _which(cmd):
             return cmd
     return ""
+
+
+def hint_runtime(
+    *, env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
+    install_root: object = _DEFAULT_ROOT,
+) -> str:
+    """The runtime a PRINTED container command names (v0.2.100 WP-18B).
+
+    Messages, deferral remedies and CLI hints used to spell ``podman start …``
+    literally, which is wrong for every docker user. This is the ONE answer
+    for them: the pinned runtime when installed, else the first installed
+    candidate (:func:`installed_runtime` — no daemon probe, cheap enough for
+    an error path), else the canonical first candidate so a machine with no
+    runtime still gets a command shaped like the default install.
+    """
+    return (installed_runtime(env=env, which=which, install_root=install_root)
+            or RUNTIME_CANDIDATES[0])
+
+
+def runtime_command_hint(
+    args: str, *, runtime: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
+    install_root: object = _DEFAULT_ROOT,
+) -> str:
+    """``"<runtime> <args>"`` — e.g. ``runtime_command_hint("start vco_ollama")``
+    → ``"docker start vco_ollama"`` on a docker machine. *runtime* overrides
+    the detection (a caller that already resolved it)."""
+    rt = runtime or hint_runtime(env=env, which=which, install_root=install_root)
+    return f"{rt} {args}"
 
 
 def _probe(

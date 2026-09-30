@@ -77,8 +77,10 @@ def _built_entries() -> dict[str, dict]:
     same interpreter pytest runs under, so the test needs no venv discovery
     and cannot silently probe a different Python than it asserts about.
     """
+    # v0.2.100 WP-18B: the builder takes the rows' URL map (default rows here).
+    from vco_lib.service_endpoints import urls_from_rows
     entries = install_mcp._build_python_mcp_entries(
-        REPO_ROOT, Path(sys.executable), 8081, 11435, 50052, 11440,
+        REPO_ROOT, Path(sys.executable), urls_from_rows({}),
     )
     return {name: entry for name, entry, _ in entries}
 

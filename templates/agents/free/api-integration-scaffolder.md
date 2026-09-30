@@ -279,7 +279,7 @@ async def test_5xx_triggers_retry_path(status, client_with_mocked_transport):
 ## Output structure
 
 ```
-{{ORCHESTRATOR_ROOT}}/integrations/{provider}/
+{{PROJECT_ROOT}}/integrations/{provider}/
 ├── README.md                 # 1-page: how to instantiate, common methods, gotchas
 ├── pyproject.toml            # standalone package OR section in main pyproject
 ├── src/

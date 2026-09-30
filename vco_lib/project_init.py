@@ -3169,9 +3169,10 @@ def _write_bootstrap_deferral(
         _find_existing_container("weaviate")
         or _all_known_names("weaviate")[0]  # canonical (vco_weaviate)
     )
-    _cmd_hint = (
-        f"podman start {_restart_target}  # or: docker start {_restart_target}"
-    )
+    # v0.2.100 WP-18: the printed command names THIS machine's runtime
+    # (`vco_lib.containers.runtime_command_hint`), not podman-then-docker.
+    from vco_lib.containers import runtime_command_hint as _runtime_hint
+    _cmd_hint = _runtime_hint(f"start {_restart_target}")
     if _find_existing_container("weaviate") is None:
         # No container yet on host. Show the full candidate list so the
         # user can pick whichever one matches their install era.
@@ -3503,19 +3504,22 @@ def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
         return False
 
 
-# Placeholder substitutions applied to agent .md files (mirrors
-# install.py:5564). Skill .md files use the same map.
+# Placeholder substitutions applied to agent .md files. Skill .md files use
+# the same map.
 #
 # PR-2 portability (2026-05-06):
 #
 # `{{ORCHESTRATOR_ROOT}}` resolves to an ABSOLUTE PATH at install time.
 # This is necessary because Claude Code's agent .md frontmatter parses
 # YAML mcpServers `command:` fields straight to `execvp()` — shell-style
-# `${VAR}` expansion does NOT happen there. Baking the absolute path is
-# the only mechanism that lets Claude Code spawn the orchestrator-tools
-# MCP. Trade-off: moving the orchestrator clone breaks every project's
-# MCP wiring until `install-bundle --update` is rerun (which the launcher
-# triggers on rename and adoption). The manifest-driven hash compare in
+# `${VAR}` expansion does NOT happen there, so an agent-scoped MCP server
+# can only be spawned through a baked absolute path (`{{VENV_PYTHON}}` for
+# the interpreter, v0.2.100). No shipped agent declares one today — the
+# `orchestrator-tools` block that did named a server that never existed and
+# was removed with the owner's approval (v0.2.100 WP-18). Trade-off of any
+# baked path: moving the orchestrator clone leaves it stale until
+# `install-bundle --update` is rerun (which the launcher triggers on rename
+# and adoption). The manifest-driven hash compare in
 # `_file_action` already heals stale baked paths when the prior-shipped
 # hash matches the installed file (i.e. user hasn't customised it).
 #
@@ -3533,22 +3537,19 @@ def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
 # orchestrator self-install (where there's no separate project folder);
 # in that case `{{PROJECT_ROOT}}` resolves to the orchestrator root
 # itself, since the orchestrator IS its own project at install time.
+#
+# v0.2.100 WP-18: the map is no longer written here. It is a view of
+# `vco_lib.materialize.path_subs` — the ONE path vocabulary the rewire
+# renderer and the moved-clone heal share — and agents/skills now render
+# through `vco_lib.materialize` (registry-wide names, YAML-aware escaping,
+# unknown placeholders warned about + recorded instead of passed silently).
 def _agent_subs(
     orchestrator_root: Path,
     project_root: Path | None = None,
 ) -> dict[str, str]:
-    return {
-        "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
-        "{{PROJECT_ROOT}}": str(project_root if project_root else orchestrator_root),
-        "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
-        "{{HOME}}": str(Path.home()),
-        # Runtime-resolvable form for shell / Python contexts. The literal
-        # ${VCT_ORCHESTRATOR_ROOT} string survives substitution as-is so the
-        # consumer expands it at use time. Templates SHOULD prefer this
-        # placeholder unless the consumer is a YAML execvp boundary (see
-        # the {{ORCHESTRATOR_ROOT}} note above).
-        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
-    }
+    from vco_lib.materialize import path_subs
+
+    return path_subs(orchestrator_root, project_root)
 
 
 def _hook_globs_for_os() -> tuple[str, ...]:
@@ -3699,6 +3700,9 @@ def _enumerate_bundle_files(
     orchestrator_root: Path,
     project_root: Path | None = None,
     gate_outcomes: list | None = None,
+    *,
+    sink: "Any" = None,
+    project_name: Optional[str] = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3792,36 +3796,44 @@ def _enumerate_bundle_files(
                     _needs_rewire = has_rewire_region(script_file.read_bytes())
                 except OSError:
                     _needs_rewire = True
+                _script_dest = str(Path(".claude") / "scripts" / script_file.name)
                 ops.append(_BundleFileOp(
-                    dest_rel=str(Path(".claude") / "scripts" / script_file.name),
+                    dest_rel=_script_dest,
                     source_abs=script_file,
                     source_rel=str(script_file.relative_to(orchestrator_root)),
                     transform=(
                         rewire_transform(
                             orchestrator_root, filename=script_file.name,
+                            project_root=project_root, label=_script_dest,
+                            sink=sink,
                         )
                         if _needs_rewire else None
                     ),
                     always_overwrite=False,
                 ))
 
-    # Agents (with placeholder substitution).
+    # Agents (with placeholder substitution). v0.2.100 WP-18: every rendered
+    # Markdown file goes through the ONE materializer — registry vocabulary,
+    # YAML-aware escaping of the frontmatter, and the owner rule for a name it
+    # cannot fill (token left, stderr warning, deferral row via `sink`).
+    from vco_lib import materialize as _mz
     agents_src = templates / "agents" / "free"
-    subs = _agent_subs(orchestrator_root, project_root)
+    _md_context = _mz.MaterializeContext(
+        orchestrator_root, project_root, project_name=project_name,
+    )
+    _md_spec = _mz.RenderSpec(allowed=_mz.GLOBAL_KEYS, escape="yaml")
 
-    def _apply_subs(buf: bytes) -> bytes:
-        text = buf.decode("utf-8", errors="replace")
-        for k, v in subs.items():
-            text = text.replace(k, v)
-        return text.encode("utf-8")
+    def _apply_subs(dest_rel: str) -> "_mz.Transform":
+        return _mz.Transform(dest_rel, _md_spec, _md_context, sink=sink)
 
     if agents_src.exists():
         for agent_file in sorted(agents_src.glob("*.md")):
+            _agent_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                dest_rel=_agent_dest,
                 source_abs=agent_file,
                 source_rel=str(agent_file.relative_to(orchestrator_root)),
-                transform=_apply_subs,
+                transform=_apply_subs(_agent_dest),
                 always_overwrite=False,
             ))
 
@@ -3840,11 +3852,12 @@ def _enumerate_bundle_files(
             gate_outcomes.append((_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict))
         for agent_file in (sorted(gateway_agents_src.glob("*.md"))
                            if verdict.delivers else ()):
+            _gw_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                dest_rel=_gw_dest,
                 source_abs=agent_file,
                 source_rel=str(agent_file.relative_to(orchestrator_root)),
-                transform=_apply_subs,
+                transform=_apply_subs(_gw_dest),
                 always_overwrite=False,
             ))
 
@@ -3861,7 +3874,7 @@ def _enumerate_bundle_files(
                     dest_rel=dest_rel,
                     source_abs=f,
                     source_rel=str(f.relative_to(orchestrator_root)),
-                    transform=_apply_subs if f.suffix == ".md" else None,
+                    transform=_apply_subs(dest_rel) if f.suffix == ".md" else None,
                     always_overwrite=False,
                 ))
 
@@ -4215,6 +4228,7 @@ def _stale_orchestrator_root_heal_match(
     raw: bytes,
     target_path: Path,
     orchestrator_root: Path,
+    project_root: Path | None = None,
 ) -> bool:
     """PR-2 portability heal (2026-05-06).
 
@@ -4280,12 +4294,17 @@ def _stale_orchestrator_root_heal_match(
     # Round-trip: build subs map for the OLD root, transform the source,
     # compare to the installed bytes. If they match, the user didn't
     # touch it; the stale path is the only difference.
-    subs = {
-        "{{ORCHESTRATOR_ROOT}}": str(old_root),
-        "{{PROJECTS_ROOT}}": str(old_root.parent),
-        "{{HOME}}": str(Path.home()),
-        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
-    }
+    # v0.2.100 WP-18: the SAME vocabulary the renderers use
+    # (`vco_lib.materialize.path_subs`), so the round-trip can never lack a
+    # key the forward render has. `{{PROJECT_ROOT}}` is the project being
+    # updated — a moved CLONE does not move the project — except on a
+    # self-install, where the project IS the (old) clone.
+    from vco_lib.materialize import path_subs
+    _heal_project = (
+        None if project_root is None or _canonical_path_eq(project_root, orchestrator_root)
+        else project_root
+    )
+    subs = path_subs(old_root, _heal_project)
     try:
         text = raw.decode("utf-8", errors="replace")
         for k, v in subs.items():
@@ -4542,7 +4561,8 @@ def _file_action(
     if (
         op.transform is not None
         and orchestrator_root is not None
-        and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root)
+        and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root,
+                                               project_root)
     ):
         return ("overwrite", source_bytes)
 
@@ -4930,31 +4950,12 @@ _PROJECT_LEVEL_TEMPLATES = (
 )
 
 
-def _project_template_subs(
-    orchestrator_root: Path,
-    project_root: Path,
-    project_name: str,
-) -> dict[str, str]:
-    """Placeholder map for project-level templates. Superset of
-    ``_agent_subs`` plus ``{{PROJECT_NAME}}``.
+def _render_project_template(template_text: str, **kwargs: Any) -> str:
+    """Thin alias — the pipeline lives in ``vco_lib.project_templates``
+    (v0.2.100 WP-18 extraction; the project_init ratchet)."""
+    from vco_lib.project_templates import render_project_template
 
-    Plain-text substitution via ``str.replace`` (per coordinator: no fancy
-    templating engine). Keep keys delimited so partial matches don't
-    accidentally substitute. The orchestrator root is included so the
-    auto-generated `--orchestrator-root` lines in CLAUDE.md point at the
-    user's actual clone.
-    """
-    base = _agent_subs(orchestrator_root, project_root)
-    base["{{PROJECT_NAME}}"] = project_name
-    return base
-
-
-def _apply_template_subs(buf: bytes, subs: dict[str, str]) -> bytes:
-    """Apply placeholder substitutions; UTF-8 in / UTF-8 out (emoji-safe)."""
-    text = buf.decode("utf-8", errors="replace")
-    for k, v in subs.items():
-        text = text.replace(k, v)
-    return text.encode("utf-8")
+    return render_project_template(template_text, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -5295,7 +5296,7 @@ def merge_managed_region(
 # `project_modules` row is INACTIVE. Its one home moved to
 # `vco_lib.module_gated_delivery` in v0.2.100 with the tri-state reader.
 from vco_lib.module_gated_delivery import (  # noqa: E402
-    DEFAULT_ACTIVE_MODULES as _DEFAULT_ACTIVE_MODULES,
+    DEFAULT_ACTIVE_MODULES as _DEFAULT_ACTIVE_MODULES,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (vco_lib.project_templates reads it off this module)
 )
 
 
@@ -5350,14 +5351,12 @@ def resolve_active_modules(
 
 
 # v0.2.92 WP-15: the "meaningfully differs" rule moved to
-# `vco_lib.template_divergence` (ONE home, with its own tests). Thin aliases
-# under the historical names so existing importers are unaffected.
+# `vco_lib.template_divergence` (ONE home, with its own tests). Its consumer,
+# the project-level-template install, moved to `vco_lib.project_templates` in
+# v0.2.100 and imports it from there directly; the historical alias below is
+# kept for callers that read it off this module.
 from vco_lib.template_divergence import (  # noqa: E402
-    meaningfully_differs as _meaningfully_differs,
-    # Re-exported under its historical name for callers that import it from
-    # here; `meaningfully_differs` is what this module itself now uses.
     normalise_for_diff as _normalise_for_diff,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (test reads it via module attr)
-    remove_stale_root_claude_md_sidecar as _remove_stale_root_sidecar,
 )
 
 
@@ -5553,281 +5552,22 @@ def _emit_template_review_pending_deferral(
     _de.emit(folder, entry)
 
 
-def _install_project_level_templates(
-    folder: Path,
-    *,
-    orchestrator_root: Path,
-    project_name: str,
-    dry_run: bool,
-) -> dict:
-    """Install (or refresh) the three project-level template stubs.
+def _install_project_level_templates(folder: Path, **kwargs: Any) -> dict:
+    """Thin alias — see ``vco_lib.project_templates.install_project_level_templates``
+    (v0.2.100 WP-18 extraction: the managed-region re-render grew this past the
+    project_init ratchet, so the whole project-level-template half moved)."""
+    from vco_lib.project_templates import install_project_level_templates
 
-    Returns a result dict for the install_project_bundle response::
-
-        {
-          "live_created":  [<rel>...],  # template stub installed as the
-                                        # actual project file (was missing).
-          "reference_written": [<rel>...],  # .reference.md sidecar refreshed.
-          "diverged":      [<rel>...],  # existing file ≠ reference template.
-        }
-
-    Idempotent. On every run the reference sidecars are rewritten with
-    the current shipping shape (atomic write, no-op when bytes match).
-
-    v0.2.70 (Bug B / B-1): the `.claude/CONTEXT_STATE.md` live file and the
-    `.claude/context/templates/*.reference.md` sidecars are written via
-    `_write_file_atomic`, so when `.claude` itself is a symlink VCO refused to
-    write through, those writes redirect to `.vco-new`. We surface every such
-    redirect via the `symlink_redirects` key so `install_project_bundle` folds
-    them into the SAME consolidated symlink deferral as the main file loop.
-    (CLAUDE.md / MEMORY.md live at the project ROOT — never under `.claude/` —
-    so their live writes don't redirect; only their `.reference.md` sidecars,
-    which live under `.claude/`, can.)
-    """
-    out: dict = {
-        "live_created": [],
-        "reference_written": [],
-        "diverged": [],
-        "symlink_redirects": [],  # list[tuple[Path, Path]] of (orig, vco_new)
-    }
-
-    templates_dir = orchestrator_root / "templates"
-    subs = _project_template_subs(orchestrator_root, folder, project_name)
-    # Reuses the EXISTING root-identity home (`_canonical_path_eq`, symlink-
-    # and case-safe) rather than adding a second `folder == orchestrator_root`
-    # comparison — §9.3 sweep 7 wants exactly one such idiom in this module.
-    is_root_target = _is_root_bundle_target(orchestrator_root, folder)
-
-    for template_name, live_rel, ref_rel in _PROJECT_LEVEL_TEMPLATES:
-        # v0.2.92 WP-15 half 2 — ROOT EXCLUSION. On the orchestrator root,
-        # `CLAUDE.md` is rendered by install.py from
-        # `templates/ORCHESTRATOR-CLAUDE.md.template` (an 889-line document
-        # with its own AUTO-region owner). This loop walks the PROJECT
-        # template, so comparing them compared two DIFFERENT DOCUMENTS and
-        # every orchestrator root was reported diverged by construction —
-        # forever, with no user action able to clear it. Skip the entry
-        # entirely (a skip, not a fork: the other two entries still run,
-        # because `.claude/CONTEXT_STATE.md` and `MEMORY.md` ARE the
-        # project-shaped files on the root and their reference IS this
-        # template's render). The stale sidecar is removed below.
-        if is_root_target and live_rel == Path("CLAUDE.md"):
-            if not dry_run:
-                _remove_stale_root_sidecar(folder, ref_rel, log=_log_auto)
-            continue
-
-        src = templates_dir / template_name
-        if not src.exists():
-            # Templates not shipped on this orchestrator clone — skip
-            # silently. The bundle pre-install gate (`orchestrator_root`
-            # validation) covers the catastrophic case.
-            continue
-
-        try:
-            raw = src.read_bytes()
-        except OSError:
-            continue
-        # Phase 1.5.B: run the conditional-blocks pre-pass BEFORE the
-        # dict-substitution pass. CLAUDE.md.template is the primary
-        # consumer (per-module sections); the pre-pass is a no-op on
-        # templates that don't contain any conditional tags, so applying
-        # it uniformly is safe. Use the project folder as the resolver's
-        # project_id — Phase 1.1's launcher DB uses the project folder
-        # path (sanitised) as the slug key.
-        try:
-            active = resolve_active_modules(str(folder))
-        except Exception:
-            # Defensive: any unexpected resolver failure falls back to
-            # defaults so install never breaks.
-            active = set(_DEFAULT_ACTIVE_MODULES)
-        try:
-            raw_text = raw.decode("utf-8", errors="replace")
-            rendered_text = render_conditional_blocks(raw_text, active_modules=active)
-            raw = rendered_text.encode("utf-8")
-        except TemplateError:
-            # If the template itself is malformed, skip the conditional
-            # pass and let the original bytes flow through. The reference
-            # sidecar will surface the issue on diff.
-            pass
-        substituted = _apply_template_subs(raw, subs)
-
-        live_target = folder / live_rel
-        if not live_target.exists():
-            # Missing project-level file → install the stub.
-            # For CLAUDE.md specifically, wrap the substituted body in
-            # the VCO-managed-region markers so future re-renders can
-            # safely replace only the managed body (preserving any
-            # user-added content below the closing marker).
-            if live_rel == Path("CLAUDE.md"):
-                wrapped = merge_managed_region(
-                    existing_claude_md="",
-                    new_managed_body=substituted.decode("utf-8", errors="replace"),
-                )
-                substituted = wrapped.encode("utf-8")
-            if not dry_run:
-                try:
-                    _redirect = _write_file_atomic(live_target, substituted)
-                    if _redirect is not None:
-                        out["symlink_redirects"].append((live_target, _redirect))
-                except OSError:
-                    # Best-effort: skip this template if the write fails;
-                    # don't fail the whole install.
-                    continue
-            out["live_created"].append(str(live_rel))
-            # Don't write the reference sidecar in this case — the live
-            # file IS the reference at this moment, so a sidecar is
-            # redundant. A future install run (after the user edits the
-            # live file) will create the sidecar then.
-            continue
-
-        # Live file already exists → refresh the reference sidecar.
-        ref_target = folder / ref_rel
-        if not dry_run:
-            try:
-                _redirect = _write_file_atomic(ref_target, substituted)
-                if _redirect is not None:
-                    out["symlink_redirects"].append((ref_target, _redirect))
-            except OSError:
-                continue
-        out["reference_written"].append(str(ref_rel))
-
-        # Compare existing vs reference. "Meaningfully differs" =
-        # anything beyond whitespace + trailing-newline normalisation
-        # (per coordinator: keep the check simple).
-        try:
-            existing_text = live_target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            # Can't read — don't flag for review; the user has a bigger
-            # problem than a template diff.
-            continue
-        reference_text = substituted.decode("utf-8", errors="replace")
-        # v0.2.92 WP-15 half 1 — COMPARE LIKE AGAINST LIKE. The rule (strip
-        # VCO's OWN injected regions from BOTH sides, THEN normalise
-        # whitespace) lives in `vco_lib.template_divergence`.
-        if _meaningfully_differs(existing_text, reference_text):
-            out["diverged"].append(str(live_rel))
-
-    return out
+    return install_project_level_templates(folder, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# CLAUDE.md re-render entrypoint (Phase 1.5.B)
-#
-# Wired into the DiagramsTab toggle (Phase 1.3 — sibling): when the user
-# flips a module toggle, the launcher's Tauri command
-# ``set_project_module_enabled`` calls this CLI via subprocess (Option A
-# pattern from Phase 0.B's config_projection — Rust shells out to Python
-# for byte-layout authority over template rendering).
-#
-# Pipeline:
-#   1. Read ``templates/CLAUDE.md.template`` from the orchestrator clone.
-#   2. ``render_conditional_blocks`` strips per-module sections.
-#   3. ``_apply_template_subs`` resolves ``{{PROJECT_NAME}}`` etc.
-#   4. ``merge_managed_region`` replaces the body inside the markers
-#      while preserving any user-added content outside.
-#   5. Atomic write via ``_write_file_atomic``.
-# ---------------------------------------------------------------------------
+def render_claude_md(folder: Path, **kwargs: Any) -> dict:
+    """Thin alias — see ``vco_lib.project_templates.render_claude_md`` (the
+    launcher's ``re-render-claude-md`` entry point; same pipeline as the
+    bundle update)."""
+    from vco_lib.project_templates import render_claude_md as _render
 
-
-def render_claude_md(
-    folder: Path,
-    *,
-    orchestrator_root: Path,
-    project_name: str,
-    project_id: str | None = None,
-    db_path: Path | None = None,
-) -> dict:
-    """Re-render ``<folder>/CLAUDE.md`` from the orchestrator template,
-    preserving any user content outside the VCO-managed-region markers.
-
-    Used by the launcher's ``set_project_module_enabled`` Tauri command
-    (via the ``re-render-claude-md`` CLI subcommand) when the user
-    toggles a module on/off in DiagramsTab or any future per-module
-    settings UI.
-
-    Idempotent on the managed body: feeding the same active-modules set
-    in twice produces byte-identical output.
-
-    Args:
-        folder: Target project folder containing (or about to contain)
-            ``CLAUDE.md``.
-        orchestrator_root: Orchestrator clone root (source of the
-            ``templates/CLAUDE.md.template`` file).
-        project_name: Display name used to resolve ``{{PROJECT_NAME}}``.
-        project_id: Project id/slug used to look up
-            ``project_modules`` rows. Defaults to ``str(folder)`` so the
-            stub resolver (no DB) returns default-on modules — matches
-            the install-time behaviour.
-        db_path: Override the default ``~/.vct/launcher.db`` resolution
-            (used by tests).
-
-    Returns:
-        A result dict::
-
-            {
-              "wrote_path": "<abs path>",
-              "active_modules": [<sorted module names>],
-              "managed_region_present_before": bool,
-              "rendered_bytes": <int>,
-            }
-
-    Raises:
-        FileNotFoundError: ``templates/CLAUDE.md.template`` missing on
-            the orchestrator clone.
-        TemplateError: malformed conditional tag or out-of-order markers
-            in the existing CLAUDE.md.
-        OSError: write failure (atomic-write: no partial file on disk).
-    """
-    template_path = orchestrator_root / "templates" / "CLAUDE.md.template"
-    if not template_path.is_file():
-        raise FileNotFoundError(
-            f"CLAUDE.md template not found at {template_path}. The "
-            f"orchestrator clone may be incomplete; re-run install.py "
-            f"--update."
-        )
-
-    raw_bytes = template_path.read_bytes()
-    raw_text = raw_bytes.decode("utf-8", errors="replace")
-
-    # Resolve active modules. Default project_id to the folder path so
-    # the stub resolver (no DB) returns the default-on set — matches
-    # install-time behaviour.
-    effective_project_id = project_id if project_id is not None else str(folder)
-    active = resolve_active_modules(effective_project_id, db_path=db_path)
-
-    # Pipeline: conditional → substitution.
-    rendered = render_conditional_blocks(raw_text, active_modules=active)
-    subs = _project_template_subs(orchestrator_root, folder, project_name)
-    rendered_bytes = _apply_template_subs(rendered.encode("utf-8"), subs)
-    rendered_body = rendered_bytes.decode("utf-8", errors="replace")
-
-    # Read existing CLAUDE.md (may not exist).
-    target = folder / "CLAUDE.md"
-    if target.is_file():
-        try:
-            existing = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            existing = ""
-    else:
-        existing = ""
-
-    had_markers = (
-        MANAGED_REGION_OPEN in existing and MANAGED_REGION_CLOSE in existing
-    )
-
-    merged = merge_managed_region(
-        existing_claude_md=existing,
-        new_managed_body=rendered_body,
-    )
-
-    merged_bytes = merged.encode("utf-8")
-    _write_file_atomic(target, merged_bytes)
-
-    return {
-        "wrote_path": str(target),
-        "active_modules": sorted(active),
-        "managed_region_present_before": had_markers,
-        "rendered_bytes": len(merged_bytes),
-    }
+    return _render(folder, **kwargs)
 
 
 def _run_rl_client_setup(folder: Path) -> dict:
@@ -10012,8 +9752,17 @@ def install_project_bundle(
     backup_failures: list[tuple[str, str]] = []
 
     _gate_outcomes: list = []  # v0.2.100 AD-7: (source_prefix, GateVerdict)
+    # v0.2.100 WP-18: every render this run reports into ONE sink; the sink
+    # warns (stderr) once per finding and settles the placeholder/path
+    # deferral rows after the project-level templates below.
+    from vco_lib import materialize as _mz
+    _materialize_sink = _mz.FindingsSink(
+        rerender_command=_mz.bundle_rerender_command(folder, orchestrator_root),
+    )
     ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
-                                  gate_outcomes=_gate_outcomes)
+                                  gate_outcomes=_gate_outcomes,
+                                  sink=_materialize_sink,
+                                  project_name=project_name)
     # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
     # any skipped file-kind BEFORE the classify/write loop, so a skipped kind's
     # files are never touched on disk. `settings` is NOT a file-kind (it is the
@@ -10829,13 +10578,19 @@ def install_project_bundle(
     # from its `projects.name`, the basename resolves to a DIFFERENT collection
     # family than the one the project reads, and the detectors emit migrate/DROP
     # commands against the project's own live data.
+    #
+    # v0.2.100 WP-18: `{{PROJECT_NAME}}` now has ONE source for both CLAUDE.md
+    # render paths — `vco_lib.materialize.project_display_name` (registered
+    # name → `project_name` → this basename). The variable below is only the
+    # last rung, passed as the fallback.
     derived_project_name = folder.name or "Project"
     try:
         templates_result = _install_project_level_templates(
             folder,
             orchestrator_root=orchestrator_root,
-            project_name=derived_project_name,
+            project_name=project_name or derived_project_name,
             dry_run=dry_run,
+            sink=_materialize_sink,
         )
         # v0.2.70 (Bug B / B-1): fold any `.claude/`-redirected template writes
         # (CONTEXT_STATE.md, *.reference.md sidecars) into the SAME consolidated
@@ -10858,6 +10613,19 @@ def install_project_bundle(
              f"project-level templates failed: {err}",
              data={"error": err})
         result["warnings"].append(f"project-level templates failed: {err}")
+
+    # v0.2.100 WP-18 (owner rules 1+2): settle the materializer's findings —
+    # one row per file still carrying a placeholder or a missing path, and a
+    # clean render of a file clears the row it had. Soft-fail.
+    if not dry_run:
+        _mz_summary = _materialize_sink.settle(folder)
+        if any(_mz_summary.values()):
+            result["materialize_deferrals"] = _mz_summary
+            _log("4.bundle.materialize", "warn" if _mz_summary["emitted"] or
+                 _mz_summary["error"] else "ok",
+                 f"materialize deferrals: emitted={len(_mz_summary['emitted'])}, "
+                 f"resolved={len(_mz_summary['resolved'])}",
+                 data=_mz_summary)
 
     # RL client per-project setup (Stream 1, v0.2.20). Creates the local
     # data directories used by the rl_client logger so the free-tier

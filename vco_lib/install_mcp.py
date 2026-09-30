@@ -35,7 +35,7 @@ import re
 import shutil
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Mapping, Optional
 
 from vco_lib import mcp_scan_rules
 from vco_lib.deferral_report import DeferralEntry, DeferralReport
@@ -226,10 +226,7 @@ def _filter_env_for_global_json(candidate: dict) -> tuple[dict, list[str]]:
 def _build_python_mcp_entries(
     install_root: Path,
     venv_python: Path,
-    weaviate_port: int,
-    ollama_port: int,
-    grpc_port: int,
-    code_embed_port: int,
+    urls: Mapping[str, Any],
 ) -> list[tuple[str, dict, list[str]]]:
     """Pure-Python mirror of mcp_registration.rs::build_default_mcp_entries.
 
@@ -237,10 +234,20 @@ def _build_python_mcp_entries(
     field has already been filtered through the allowlist + secret-shape
     denylist. The Rust path is the authoritative writer; this exists for
     Tier 4 (pure-Python fallback).
+
+    *urls* is the dict :func:`vco_lib.service_endpoints.urls_from_rows`
+    returns (install.py passes ``_service_endpoint_urls()``): the RENDERED
+    URLs, the row's scheme + host + port. v0.2.100 WP-18B: this used to
+    rebuild ``http://localhost:<port>`` from the ports alone, so an adopted
+    or remote endpoint (``http://gpu.lan:11434``) was registered as a local
+    port exactly when the Rust registrar was unusable. The Rust side
+    (``ServicePorts`` from ``render_url``) is pinned to this by the shared
+    case table ``tests/fixtures/mcp_registration_url_parity.json``.
     """
-    weaviate_url = f"http://localhost:{weaviate_port}"
-    ollama_url = f"http://localhost:{ollama_port}"
-    code_embed_url = f"http://localhost:{code_embed_port}"
+    weaviate_url = str(urls["weaviate_url"])
+    ollama_url = str(urls["ollama_url"])
+    code_embed_url = str(urls["code_embed_url"])
+    grpc_port = int(urls["weaviate_grpc_port"])
     mcp_root = install_root / "claude_mcp_servers"
     pythonpath = str(mcp_root)
     # v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
