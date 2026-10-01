@@ -214,7 +214,7 @@ Resolved in commit `03eb485`. Earlier launcher builds registered projects withou
 
 Click the **Refresh** button on the affected tab if you're on a build before `03eb485` and don't want to re-clone. New registrations on current builds populate immediately.
 
-(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.2.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the MCP tab.)
+(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.2.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the project's Hooks/Agents tabs for the parts they cover. There is no per-project MCP tab yet; one is scheduled for v0.2.102 by the owner.)
 
 ### Bundled launcher binary is stale (built from a different launcher source)
 

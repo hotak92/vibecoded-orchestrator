@@ -19,7 +19,7 @@ exhaustive as of this writing — derived by greping for `db.audit(` across
 | `commands/secrets_cmd.rs` | `secret_set`, `secret_clear` |
 | `commands/licensing.rs` | `license_activate`, `license_deactivate` |
 | `commands/kg.rs` | `kg_set_collection_access`, `kg_set_collection_access_mode`, `kg_set_node_access`, `kg_set_node_access_bulk`, `kg_promote_to_shared`, `kg_ensure_node_access_schema` |
-| `commands/codegraph.rs` | `codegraph_grant_access`, `codegraph_set_entity_access_bulk` |
+| `commands/codegraph.rs` | `codegraph_grant_access` |
 | `commands/coordination.rs` | `coordination_set_config`, `coordination_apply_schema` |
 | `commands/mcp_reg.rs` | `mcp_register_module`, `mcp_deregister_module` |
 | `commands/telemetry_cmd.rs` | `telemetry_set_consent`, `telemetry_clear_queue` |

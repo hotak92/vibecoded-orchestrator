@@ -69,7 +69,7 @@ JSON record, which you should skip rather than abort on).
 - `start → warn` — step partially succeeded (e.g. seed step where the KG
   sync ran but docs upload failed). Non-fatal but worth surfacing.
 - `start` with no terminal phase — the writer crashed mid-step.
-  `read_install_log` reports these in `failed_steps` with detail
+  `read_install_log` reports these (the launcher panel that shows them is deferred by the owner to v0.2.102; until then read `state/logs/install.jsonl` directly) in `failed_steps` with detail
   `"interrupted: ..."` so the wizard offers to re-run them.
 
 **Step IDs you'll see:**
@@ -441,7 +441,7 @@ above.
 
 When the install path already contains orchestrator files (`.claude/`,
 `knowledge/`, etc.), the launcher's OnboardingWizard surfaces a 4-option
-modal instead of the legacy "call preview_install + confirm_overwrite=true"
+modal instead of the legacy "preview, then confirm_overwrite=true"
 error. CLI users who run `python install.py` directly get the same options
 via `--conflict-strategy=...`.
 
@@ -592,8 +592,9 @@ Both the launcher (Rust) and `install.py` (Python) emit a
 }
 ```
 
-`read_install_log` (Tauri command) surfaces this event so the launcher
-can show which strategy ran and what it touched.
+`read_install_log` (Tauri command) returns this event; the launcher panel
+that would show which strategy ran and what it touched is deferred by the
+owner to v0.2.102 (read `state/logs/install.jsonl` until then).
 
 ---
 

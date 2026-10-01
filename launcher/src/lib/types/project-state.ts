@@ -183,21 +183,6 @@ export interface CodegraphAccessMatrix {
   readable_by: ProjectRef[];
 }
 
-export interface CodegraphSummary {
-  project_id: string;
-  project_name: string;
-  module_count: number;
-  class_count: number;
-  function_count: number;
-  api_count: number;
-  interaction_count: number;
-}
-
-export interface CodegraphCheckResult {
-  allowed: boolean;
-  access_level: string;
-}
-
 // ─── Coordination ────────────────────────────────────────────────────────
 
 export interface CoordinationConfig {

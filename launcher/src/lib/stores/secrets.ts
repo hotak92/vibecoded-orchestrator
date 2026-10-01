@@ -188,7 +188,7 @@ export type BadgeInput = Pick<
  *    exact meaning (keychain value × the per-(secret × requester) active
  *    flag); the badge merely READS it. The dependency must never run the
  *    other way: folding a display fact into `is_set` would silently widen
- *    what `is_secret_set`, the hub and module code all ask.
+ *    what `get_secret_status_v2`, the hub and module code all ask.
  *
  * The keychain leg is gated on `is_set` rather than on `is_active`
  * deliberately. `is_active` is this launcher's OWN row; `is_set` is the

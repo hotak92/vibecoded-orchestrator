@@ -10,7 +10,7 @@
    *  - Apply button (calls set_storage_config), with a "containers must
    *    restart" hint
    *
-   * STRICT allowlist note: the Rust side filters `detect_legacy_volumes`
+   * STRICT allowlist note: the Rust side filters the `legacy_volumes` that `get_storage_config` returns
    * through a hand-curated allowlist + the `vco_*` prefix. We never get
    * to see some other app's sibling-project volumes (e.g. `someapp-*`,
    * `otherproj_*`) here — the FE just renders whatever the backend hands back.

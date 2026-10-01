@@ -13,6 +13,7 @@
   import { license } from '$lib/stores/license';
   import { hasProTier } from '$lib/license-gate';
   import { invoke, tauriAvailable } from '$lib/tauri';
+  import { moduleUpdateCount } from '$lib/stores/modules';
 
   type NavItem = {
     href: string;
@@ -26,6 +27,9 @@
      *  surfaces the affordance early so users discover the upgrade path
      *  before the section's full UI lands. */
     proOnly?: boolean;
+    /** v0.2.100: count badge fed by a store. Only 'moduleUpdates' exists: the
+     *  number of installed modules the 24h poll found behind the catalog. */
+    badge?: 'moduleUpdates';
   };
 
   type NavGroup = {
@@ -118,6 +122,7 @@
           label: 'Modules',
           sub: 'Install and manage Orchestrator modules',
           match: (p) => p.startsWith('/modules'),
+          badge: 'moduleUpdates',
         },
         {
           // Bug 5: Store needs to be a discoverable route. Sits between
@@ -381,6 +386,14 @@
                   {#if locked}
                     <span class="nav-pro-badge">Pro</span>
                   {/if}
+                  {#if item.badge === 'moduleUpdates' && $moduleUpdateCount > 0}
+                    <span
+                      class="nav-count-badge"
+                      data-testid="nav-module-updates-badge"
+                      title={`${$moduleUpdateCount} module update${$moduleUpdateCount === 1 ? '' : 's'} available`}
+                      aria-label={`${$moduleUpdateCount} module update${$moduleUpdateCount === 1 ? '' : 's'} available`}
+                    >{$moduleUpdateCount}</span>
+                  {/if}
                 </span>
                 <span class="nav-sub">{item.sub}</span>
               </a>
@@ -541,6 +554,21 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+
+  /* v0.2.100: update-count pill (brand teal, same scale as the Pro pill). */
+  .nav-count-badge {
+    display: inline-block;
+    min-width: 16px;
+    text-align: center;
+    font-size: 10px;
+    font-weight: 700;
+    padding: 1px 5px;
+    border-radius: 8px;
+    background: rgba(0, 191, 166, 0.18);
+    color: var(--color-teal, #00bfa6);
+    border: 1px solid rgba(0, 191, 166, 0.30);
+    line-height: 1.2;
   }
 
   .nav-pro-badge {

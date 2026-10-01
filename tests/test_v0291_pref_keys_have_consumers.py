@@ -155,12 +155,15 @@ class WindowPrefsHaveBackendConsumers(unittest.TestCase):
         nothing on this page may write settings generically again."""
         src = PREFS_PAGE.read_text(encoding="utf-8")
         code = src.split("</script>")[0]
-        self.assertNotIn(
-            "'set_setting_v2'",
-            code,
-            "the Preferences page must not persist settings through the generic "
-            "per-project setting writer",
-        )
+        # `set_setting_v2` was the generic per-project writer until v0.2.100
+        # retired it; `set_module_setting` is the one that remains.
+        for writer in ("'set_setting_v2'", "'set_module_setting'"):
+            self.assertNotIn(
+                writer,
+                code,
+                "the Preferences page must not persist settings through the generic "
+                "per-project setting writer",
+            )
 
 
 class LoggingLevelPrefHasBackendConsumers(unittest.TestCase):

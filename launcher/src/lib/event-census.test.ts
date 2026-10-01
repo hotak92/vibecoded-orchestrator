@@ -238,10 +238,7 @@ const DYNAMIC_LISTENERS: DynamicDecl[] = [
 
 /** Emitted with no frontend listener. Every entry is either a deliberate
  *  non-GUI consumer or an OPEN FINDING named as such (never silently OK). */
-const UNHEARD_OK: Record<string, string> = {
-  'vct-module-updates-available':
-    'OPEN FINDING (WP-11, 2026-09-30): module_updates.rs emits it after the 24h poll "so any open window can refresh badges", but no badge listens — api/module_updates.ts declares EVENT_UPDATES_AVAILABLE and nothing imports it; owner to rule',
-};
+const UNHEARD_OK: Record<string, string> = {};
 
 /** Listened for but never emitted by the launcher backend. */
 const UNEMITTED_OK: Record<string, string> = {};

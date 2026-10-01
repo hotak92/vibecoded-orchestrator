@@ -28,8 +28,9 @@ How it works:
    `state/`, `config/`, `docs/`, `templates/`, `tools/`,
    `infrastructure/`, `requirements.txt`, `requirements-dev.txt`,
    `install.sh`, `install.ps1`, `install.py`, `BOOTSTRAP.md`.
-2. Before any write, the launcher calls the Rust `preview_install`
-   command and shows a diff:
+2. Before any write, `install_orchestrator` computes the diff itself
+   (`diff_install`) and, when orchestrator files already exist, returns a
+   conflict the wizard shows as a 4-option modal:
    - **Will overwrite (N orchestrator files):** files that already
      exist and would be replaced
    - **Will add (M new files):** files the bundle would create
@@ -59,9 +60,10 @@ Anything else is treated as **user code** and left alone.
 
 ## CLI equivalent (advanced)
 
-The Tauri commands `preview_install` and `install_orchestrator` are
-mirrored on the hub CLI; see `launcher/src-tauri/src/hub/cli_api.rs` for
-the JSON-RPC surface.
+The Tauri command `install_orchestrator` (which runs the diff itself; the
+standalone `preview_install` command was retired in v0.2.100) is the
+launcher's install entry point; the hub CLI surface is in
+`launcher/src-tauri/vct-hub/src/cli_api.rs`.
 
 ## Troubleshooting
 

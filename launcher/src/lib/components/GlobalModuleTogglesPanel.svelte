@@ -56,6 +56,7 @@
     GLOBAL_TRI_CHOICE_LABELS,
     dormantNotice,
     globalDefaultLine,
+    moduleSystemDefault,
     globalTriChoiceFor,
     globalTriChoiceToValue,
     type GlobalTriChoice,
@@ -83,7 +84,8 @@
   ];
 
   type ModuleState = {
-    /** null = no global row written (system default true applies). */
+    /** null = no global row written (the module's system default applies:
+     *  on, except the RL reranker, which is off). */
     globalEnabled: boolean | null;
     /** Current rl_events row count (only meaningful for vct-rl-reranker). */
     rlEventsCount: number | null;
@@ -197,10 +199,10 @@
    * and read-failure are separate branches above it. Wording comes from
    * `$lib/module-enable` so this panel and the per-project tile agree.
    */
-  function describeGlobal(s: ModuleState): string {
+  function describeGlobal(moduleId: string, s: ModuleState): string {
     if (s.pending) return 'loading…';
     if (s.error) return 'status unavailable';
-    return globalDefaultLine(s.globalEnabled);
+    return globalDefaultLine(s.globalEnabled, moduleSystemDefault(moduleId));
   }
 
   /**
@@ -278,7 +280,7 @@
               <div class="row-label">{m.label}</div>
               <div class="row-desc">{m.description}</div>
               <div class="row-status">
-                Current global default: <strong>{describeGlobal(s)}</strong>
+                Current global default: <strong>{describeGlobal(m.id, s)}</strong>
               </div>
               {#if autoEnableProgress(m.id, s)}
                 <div class="row-progress">
@@ -324,7 +326,8 @@
       the hub for module state, the resolver checks the project's own row
       first; if none exists, it falls back to the host-wide default
       above; if that's also unset, modules are treated as enabled
-      (fail-open).
+      (fail-open), except the RL reranker, which is treated as disabled
+      until its model is trained.
     </p>
     <p>
       <strong>What these gate:</strong> whether a module is consulted for

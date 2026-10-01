@@ -1490,7 +1490,7 @@
                wizard via DialogRoot (see `pendingConflict`). The script
                still exposes `pendingDiff` / `confirmAdopt` / `cancelAdopt`
                so unrelated callers keep compiling, but nothing sets
-               `pendingDiff` anymore — `runInstall` skips preview_install
+               `pendingDiff` anymore — `runInstall` skips the (retired) preview_install
                entirely and lets the Rust install_orchestrator surface a
                structured `InstallConflictError` instead. -->
         {:else if step === 4}

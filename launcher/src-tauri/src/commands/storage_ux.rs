@@ -30,7 +30,8 @@
 //!
 //! ## Strict allowlist
 //!
-//! `detect_legacy_volumes()` MUST NOT return anything outside
+//! `detect_legacy_volumes_inner()` (surfaced as `get_storage_config`'s
+//! `legacy_volumes`) MUST NOT return anything outside
 //! [`LEGACY_VOLUME_ALLOWLIST`] / the `vco_*` prefix. The list is hand-curated
 //! and audited by `tests::detect_legacy_volumes_rejects_unrelated_namespaces`.
 //! Adding a name here means we'll offer it to users as a recyclable volume —
@@ -693,7 +694,7 @@ async fn inspect_volume(runtime: &str, name: &str) -> (String, String) {
     }
 }
 
-/// Inner detection routine — separate from the Tauri command so tests
+/// Detection routine behind `get_storage_config`'s `legacy_volumes` — separate so tests
 /// can call it directly. Returns an empty list if no runtime is present
 /// (soft-fail: no error to the caller).
 async fn detect_legacy_volumes_inner() -> Vec<DetectedLegacyVolume> {
@@ -870,13 +871,6 @@ pub async fn set_storage_config(config: StorageConfig) -> Result<StorageConfigVi
         legacy_volumes,
         synthesized_from_defaults: false,
     })
-}
-
-/// List pre-existing volumes from the container runtime, filtered through
-/// the strict allowlist. Soft-fail: no runtime → empty list + log line.
-#[command]
-pub async fn detect_legacy_volumes() -> Result<Vec<DetectedLegacyVolume>, String> {
-    Ok(detect_legacy_volumes_inner().await)
 }
 
 /// v0.2.34 (Agent I) — Read-only resolver for the launcher's state-root

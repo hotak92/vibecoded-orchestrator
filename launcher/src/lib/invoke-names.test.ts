@@ -57,7 +57,10 @@ export function invokeAliases(files: SourceFile[]): Set<string> {
 
 export function invokeSites(files: SourceFile[]): InvokeSite[] {
   const aliases = [...invokeAliases(files)].join('|');
-  const re = new RegExp(`(?<![\\w$.])(${aliases})\\s*(?:<(?:[^<>()]|<(?:[^<>()]|<[^<>()]*>)*>)*>)?\\s*\\(\\s*`, 'g');
+  // Member calls count too (`deps.invoke('x')` — the injected form used for testability): the
+  // lookbehind excludes only identifier chars, so `foo.invoke(` matches; any literal it yields must
+  // still be a registered command, so this cannot whitelist a non-command.
+  const re = new RegExp(`(?<![\\w$])(${aliases})\\s*(?:<(?:[^<>()]|<(?:[^<>()]|<[^<>()]*>)*>)*>)?\\s*\\(\\s*`, 'g');
   const out: InvokeSite[] = [];
   for (const f of files) {
     for (const m of f.code.matchAll(re)) {
@@ -110,7 +113,7 @@ const DYNAMIC_INVOKES: DynamicInvoke[] = [
   },
 ];
 
-type NotInvokedClass = 'rust-only' | 'tray' | 'uncalled-finding';
+type NotInvokedClass = 'rust-only' | 'tray' | 'owner-deferred' | 'uncalled-finding';
 
 /** Registered, never invoked by literal name, not manifest-dispatchable.
  *  `uncalled-finding` = no caller in the GUI, the tray or other Rust code
@@ -120,6 +123,13 @@ type NotInvokedClass = 'rust-only' | 'tray' | 'uncalled-finding';
  *  approve removal). The census only guarantees the list cannot grow
  *  silently. */
 const UNCALLED = 'OPEN FINDING: no GUI, tray or Rust caller (2026-09-30 survey)';
+// `owner-deferred`: the owner has scheduled the work; the command stays registered
+// until then. NOT an open finding — but it is not silent either: each carries
+// the owner's words and the release, and the census still fails the moment it
+// gains a caller (the entry must then be removed).
+const OWNER_RL = 'owner: kept for when RL work resumes (v0.2.102+)';
+const OWNER_0102 = 'owner-deferred to v0.2.102';
+const OWNER_030 = 'owner-deferred to v0.3.0';
 const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string }> = {
   check_for_launcher_update: {
     class: 'rust-only',
@@ -137,51 +147,19 @@ const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string }>
     class: 'tray',
     reason: 'tray.rs reads the cached status to label the tray update item',
   },
-  apply_deprecation_state: { class: 'uncalled-finding', reason: UNCALLED },
-  apply_module_db_migrations: { class: 'uncalled-finding', reason: UNCALLED },
-  check_for_weights_update_now: { class: 'uncalled-finding', reason: UNCALLED },
-  codegraph_check_access: { class: 'uncalled-finding', reason: UNCALLED },
-  codegraph_load_graph: { class: 'uncalled-finding', reason: UNCALLED },
-  codegraph_set_entity_access_bulk: { class: 'uncalled-finding', reason: UNCALLED },
-  codegraph_summary: { class: 'uncalled-finding', reason: UNCALLED },
-  delete_diagram_snapshot: { class: 'uncalled-finding', reason: UNCALLED },
-  delete_project_codegraph_binding: { class: 'uncalled-finding', reason: UNCALLED },
-  delete_project_kg_binding: { class: 'uncalled-finding', reason: UNCALLED },
-  detect_legacy_volumes: { class: 'uncalled-finding', reason: UNCALLED },
-  diagram_grant_access: { class: 'uncalled-finding', reason: UNCALLED },
-  get_diagrams_token: { class: 'uncalled-finding', reason: UNCALLED },
-  get_machine_id_hash: { class: 'uncalled-finding', reason: UNCALLED },
-  get_module_license_key_status: { class: 'uncalled-finding', reason: UNCALLED },
-  get_project_setup_status: { class: 'uncalled-finding', reason: UNCALLED },
-  get_rl_dashboard_state: { class: 'uncalled-finding', reason: UNCALLED },
-  get_setting_v2: { class: 'uncalled-finding', reason: UNCALLED },
-  is_secret_set: { class: 'uncalled-finding', reason: UNCALLED },
-  issue_module_access_token: { class: 'uncalled-finding', reason: UNCALLED },
-  license_is_admin: { class: 'uncalled-finding', reason: UNCALLED },
-  list_diagram_access: { class: 'uncalled-finding', reason: UNCALLED },
-  list_live_project_moves_v2: { class: 'uncalled-finding', reason: UNCALLED },
-  list_module_settings_v2: { class: 'uncalled-finding', reason: UNCALLED },
-  list_project_hooks: { class: 'uncalled-finding', reason: UNCALLED },
-  list_project_modules: { class: 'uncalled-finding', reason: UNCALLED },
-  list_user_added_project_mcp_servers: { class: 'uncalled-finding', reason: UNCALLED },
-  migrate_to_bind_path: { class: 'uncalled-finding', reason: UNCALLED },
-  migrate_to_named_volume: { class: 'uncalled-finding', reason: UNCALLED },
-  orchestrator_health_check: { class: 'uncalled-finding', reason: UNCALLED },
-  orchestrator_open_logs: { class: 'uncalled-finding', reason: UNCALLED },
-  perform_hard_cut: { class: 'uncalled-finding', reason: UNCALLED },
-  preflight_install_safety_check: { class: 'uncalled-finding', reason: UNCALLED },
-  preview_install: { class: 'uncalled-finding', reason: UNCALLED },
-  read_env_var: { class: 'uncalled-finding', reason: UNCALLED },
-  read_install_log: { class: 'uncalled-finding', reason: UNCALLED },
-  refresh_all_projects_env: { class: 'uncalled-finding', reason: UNCALLED },
-  restart_rl_container: { class: 'uncalled-finding', reason: UNCALLED },
-  rl_is_container_running: { class: 'uncalled-finding', reason: UNCALLED },
-  save_orchestrator_config: { class: 'uncalled-finding', reason: UNCALLED },
-  services_get_endpoints: { class: 'uncalled-finding', reason: UNCALLED },
-  set_project_mcp_server_enabled: { class: 'uncalled-finding', reason: UNCALLED },
-  set_setting_v2: { class: 'uncalled-finding', reason: UNCALLED },
-  set_shared_kg_opt_out: { class: 'uncalled-finding', reason: UNCALLED },
-  unregister_project_mcp_server: { class: 'uncalled-finding', reason: UNCALLED },
+  apply_module_db_migrations: { class: 'owner-deferred', reason: OWNER_RL },
+  check_for_weights_update_now: { class: 'owner-deferred', reason: OWNER_RL },
+  delete_project_codegraph_binding: { class: 'owner-deferred', reason: OWNER_0102 },
+  diagram_grant_access: { class: 'owner-deferred', reason: OWNER_0102 },
+  list_diagram_access: { class: 'owner-deferred', reason: OWNER_0102 },
+  migrate_to_bind_path: { class: 'owner-deferred', reason: OWNER_0102 },
+  migrate_to_named_volume: { class: 'owner-deferred', reason: OWNER_0102 },
+  perform_hard_cut: { class: 'owner-deferred', reason: OWNER_030 },
+  preflight_install_safety_check: { class: 'owner-deferred', reason: OWNER_0102 },
+  read_install_log: { class: 'owner-deferred', reason: OWNER_0102 },
+  restart_rl_container: { class: 'owner-deferred', reason: OWNER_RL },
+  set_project_mcp_server_enabled: { class: 'owner-deferred', reason: OWNER_0102 },
+  unregister_project_mcp_server: { class: 'owner-deferred', reason: OWNER_0102 },
 };
 
 // ─── the tree ──────────────────────────────────────────────────────────────
@@ -271,6 +249,13 @@ describe('invoke-name census', () => {
       (n) => !invoked.has(n) && !manifestReachable(n) && !(n in NOT_INVOKED_OK),
     ).sort();
     expect(unclassified).toEqual([]);
+  });
+
+  it('every owner-deferred entry names the owner and a release', () => {
+    const bad = Object.entries(NOT_INVOKED_OK)
+      .filter(([, v]) => v.class === 'owner-deferred' && !/owner.*v0\.\d+\.\d+/.test(v.reason))
+      .map(([n]) => n);
+    expect(bad).toEqual([]);
   });
 
   it('NOT_INVOKED_OK holds only registered, still-uninvoked names', () => {

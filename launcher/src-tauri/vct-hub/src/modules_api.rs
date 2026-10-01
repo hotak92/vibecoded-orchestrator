@@ -985,7 +985,7 @@ async fn project_env(
         // as empty strings). Consumers that test for presence — e.g.
         // `if env_var_set("OPENAI_API_KEY"): use_real_api()` — see
         // "not set" rather than "set to empty", which is the contract
-        // we promise in `is_secret_set` / `get_secret_preview`.
+        // we promise in `get_secret_status_v2` / `get_secret_preview`.
         //
         // See secrets-and-access-matrix-audit-2026-05-06.md §6 (canary
         // test asymmetric-leak diagnosis) and the matching unit-test
@@ -1356,7 +1356,7 @@ async fn project_env(
 /// secret is active AND the keychain has it; `None` otherwise (never
 /// served to subprocesses). Inactive entries omit the env var entirely
 /// — consumers see "not set" rather than "set to empty", matching the
-/// `is_secret_set` / `get_secret_preview` contract.
+/// `get_secret_status_v2` / `get_secret_preview` contract.
 ///
 /// Returning `Option<String>` rather than emitting a `serde_json::Value`
 /// keeps this independent of the response shape so the unit test can

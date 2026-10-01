@@ -849,7 +849,10 @@ async fn project_config(
     //      enabled_for_project)` — host-wide default landed by V52-AD.
     //      install.py seeds this row to `false` on fresh installs so
     //      RL reranking is off until enough training data accumulates.
-    //   3. System default `true` (fail-open).
+    //   3. System default: `false` for the RL reranker (v0.2.100, owner
+    //      2026-10-01: RL scoring stays inactive until the model is trained;
+    //      `Db::module_enable_system_default`), `true` (fail-open) for any
+    //      other module.
     //
     // The MCP's `_rl_cache_and_rerank` gate consumes this field via
     // `ProjectConfig.rl_reranker_enabled_for_project` to decide whether
@@ -3758,12 +3761,14 @@ kg_tier_full = 0.8
     /// v0.2.49 Stream B — RL Reranker per-project enable toggle.
     ///
     /// A project with no row in ``module_settings`` for
-    /// ``vct-rl-reranker / enabled_for_project`` reads back as `true`.
-    /// This is the fail-open default — a freshly registered project
-    /// must NOT silently disable a global module it hasn't opted out
-    /// of. Mirrors the DB-layer reader's contract.
+    /// ``vct-rl-reranker / enabled_for_project`` (and no host-wide row)
+    /// reads back as `false`: v0.2.100 (owner 2026-10-01) — RL scoring
+    /// stays inactive until the model is trained, so "nothing set
+    /// anywhere" is OFF for this module. (Every OTHER module keeps the
+    /// fail-open `true`: `module_enable_system_default`.) The license gate
+    /// still sits in front of this on the MCP side.
     #[tokio::test]
-    async fn config_emits_rl_reranker_enabled_default_true() {
+    async fn config_emits_rl_reranker_enabled_default_false() {
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-rl-enable-default", "myproject");
 
@@ -3778,8 +3783,8 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(true),
-            "default missing-row must read true; body={}",
+            Some(false),
+            "default missing-row must read false (RL off until trained); body={}",
             body,
         );
     }
@@ -3849,7 +3854,8 @@ kg_tier_full = 0.8
         let (base, h) = spawn_config_api_hub().await;
         seed_full_project(&h, "p-rl-global", "myproject");
 
-        // Step 1: no per-project row, no global row → fail-open true.
+        // Step 1: no per-project row, no global row → the RL reranker's
+        // system default, OFF (v0.2.100; other modules stay fail-open).
         let resp = reqwest::get(format!("{}/projects/p-rl-global/config", base))
             .await
             .expect("hub reachable");
@@ -3857,8 +3863,8 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(true),
-            "no rows → default true; body={}",
+            Some(false),
+            "no rows → RL reranker defaults OFF; body={}",
             body,
         );
 

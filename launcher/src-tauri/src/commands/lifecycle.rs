@@ -494,16 +494,6 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
     })
 }
 
-/// The ONE `service_endpoints` read the Services page's diagnostics use:
-/// every core service with its row (`null` = none yet).
-#[command]
-pub async fn services_get_endpoints() -> Result<Vec<(String, Option<ServiceEndpointRow>)>, String> {
-    Ok(machine_rows_from_disk()
-        .into_iter()
-        .map(|(svc, row)| (svc.name().to_string(), row))
-        .collect())
-}
-
 /// PR-15 G2 (v0.2.11) + v0.2.97: recover a stuck (zombie) service.
 ///
 /// Row-gated (plan §4b, [`zombie_route`]):

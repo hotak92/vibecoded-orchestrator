@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — false doc/UI claims about launcher commands (v0.2.100, uncalled-commands pass)
+
+- **Per-project "Re-render this project's env" button** on the project Settings tab (Maintenance section), with a confirmation and a result toast; it calls the existing per-project `refresh_project_env`, now run on the blocking pool. There is deliberately no all-projects button (owner ruling: too risky for users).
+- **"Open this project's logs folder"** now opens `<project>/.claude/logs` (where the project's hooks, including the RL citation-drain log, write) instead of `~/.claude/logs`; `orchestrator_open_logs` takes the project id. The button is on the project Settings tab.
+- **KG per-node access**: the access modal now says per-node access is saved but not enforced yet; enforcement is owner-deferred to v0.2.102. The "select a project to enable access enforcement" header text no longer implies enforcement.
+- **Docs corrected**: TROUBLESHOOTING no longer tells users to click Refresh on a non-existent per-project MCP tab (the tab is owner-scheduled for v0.2.102); `preflight_install_safety_check` no longer documented as running before installs (the real gate is `install_orchestrator`'s `diff_install` conflict refusal; the preflight panel is owner-deferred to v0.2.102); the `read_install_log` docs (INSTALL_RECOVERY, 01-launcher, install.py) record that its diagnostics panel is owner-deferred to v0.2.102.
+- Stale "once the poller wires…" deprecation-badge comment replaced with the real mechanism (`ModuleCatalogEntry::from_l0`).
+
+### Added / Fixed — features the launcher had built but never wired (v0.2.100, uncalled-commands pass)
+
+- **Module updates are now visible.** The 24 h update poll's `vct-module-updates-available` event had no listener: the launcher now keeps its list, re-reads the module catalog, and shows a count badge on the Sidebar "Modules" entry (one count per module; it drops when you update that module).
+- **Preferences: "Check for module updates automatically"** switch (opt-out of the 24 h poll; default on, persisted). One lazy entry in the Preferences loader registry, so the page's mount cost is unchanged.
+- **Diagrams timeline: per-snapshot delete**, with a confirmation; a declined confirm changes nothing. The diagram file itself is never touched.
+- **Project KG/Codegraph tab: a `shared` or `archive` KG binding added by mistake can now be removed** (confirmed; the Weaviate collection and its nodes stay). The `primary` binding is deliberately not removable here (owner decision pending for v0.2.102).
+- **Interrupted project-move banner.** A move the launcher left half-done is now announced at start-up with two different sentences: interrupted before the flip ("it was not moved", still works at the old folder) and after it ("needs finishing", with the exact `vco project move --verify` command and a Copy button).
+- **Project setup progress survives a reload.** The banner restores the selected project's persisted setup status (still running, failed with Retry, or a recent terminal state) instead of going blank; a live event always wins and a dismissed banner stays dismissed.
+- **Activation dialog shows this machine's id hash** (truncated, hover for the full value, Copy) beside "Rebind to this machine".
+- **RL: the "recent events" figure reads the real store.** It counted lines of a JSONL file nothing has written since v0.2.47, so it always read 0. `get_rl_dashboard_state` now counts the `rl_events` table in launcher.db (last 24 h and total, per project, also when the RL module is not installed) and the RL status panel shows "N events collected (M in the last 24 h)" so it is visible that training data is being collected.
+- **RL: the "RL-Scored Retrieval" switch is now the global default of the per-project RL toggle.** It used to write a key of `~/.vct/orchestrator.json` that nothing read. It now reads and writes the host-wide `enabled_for_project` row of the RL module, the same row the hub resolver serves to the MCP; projects with no setting of their own inherit it and an explicit per-project choice still wins. The licence gate is unchanged. **Default is OFF**: with no row anywhere the RL reranker now resolves to off (before, `install.py` only seeded an off row below 500 events, so the installs with the most data resolved to ON). Owner ruling: RL scoring stays inactive until the network is trained, so the switch is rendered disabled with a note saying so. Event logging is independent of the switch in every state (tested).
+
 ## [0.2.99] - 2026-09-29
 
 ### Fixed — the launcher could not see or notify about updates (v0.2.99)

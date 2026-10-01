@@ -30,6 +30,26 @@ use super::Db;
 /// design rationale.
 pub const MODULE_ENABLED_FOR_PROJECT_KEY: &str = "enabled_for_project";
 
+/// Module id of the RL reranker (the only module whose system default is OFF).
+pub const RL_RERANKER_MODULE_ID: &str = "vct-rl-reranker";
+
+/// What a module resolves to when NEITHER a per-project row NOR a host-wide
+/// row exists (the bottom tier of the enable cascade).
+///
+/// `true` (fail-open) for every module: a corrupted or never-seeded setting
+/// must not silently disable a module the user expects to work.
+///
+/// `false` for the RL reranker. v0.2.100, owner 2026-10-01: RL scoring stays
+/// inactive until the network is trained, so "nothing set anywhere" must mean
+/// OFF. Relying on `install.py` to seed a host-wide `false` row is not enough:
+/// it deliberately skips the seed once `rl_events` holds >= 500 rows (so the
+/// GUI can prompt), which left exactly the installs with the most data
+/// resolving to ON. This gates RERANKING only: event collection never
+/// consults the enable cascade (see the "WHAT THIS GATES" note below).
+pub fn module_enable_system_default(module_id: &str) -> bool {
+    module_id != RL_RERANKER_MODULE_ID
+}
+
 impl Db {
     /// Read the per-project enable flag for a module. Returns `true`
     /// when the row is absent, present with `true`, or present but
@@ -266,7 +286,8 @@ impl Db {
     ///    on malformed values).
     /// 2. Else if a GLOBAL row exists (`project_id IS NULL`), return
     ///    its boolean value (same fail-open contract).
-    /// 3. Else return `true` (system default — fail-open).
+    /// 3. Else return the system default: `true` (fail-open), except the RL
+    ///    reranker, which is `false` ([`module_enable_system_default`]).
     ///
     /// This is the function the hub resolver should call when deciding
     /// `rl_reranker_enabled_for_project`. The legacy
@@ -292,8 +313,8 @@ impl Db {
         if let Some(b) = self.module_global_enabled(module_id)? {
             return Ok(b);
         }
-        // Step 3: system default.
-        Ok(true)
+        // Step 3: system default (fail-open, except the RL reranker: OFF).
+        Ok(module_enable_system_default(module_id))
     }
 }
 
@@ -333,7 +354,8 @@ pub enum ModuleEnableSource {
     Project,
     /// No per-project row; the host-wide default row supplied it.
     GlobalDefault,
-    /// Neither tier had a row; fail-open `true` by system default.
+    /// Neither tier had a row; the system default answered (fail-open `true`,
+    /// except the RL reranker, which is OFF — see [`module_enable_system_default`]).
     SystemDefault,
 }
 
@@ -377,7 +399,10 @@ impl Db {
         let (effective, source) = match (explicit, global_default) {
             (Some(b), _) => (b, ModuleEnableSource::Project),
             (None, Some(b)) => (b, ModuleEnableSource::GlobalDefault),
-            (None, None) => (true, ModuleEnableSource::SystemDefault),
+            (None, None) => (
+                module_enable_system_default(module_id),
+                ModuleEnableSource::SystemDefault,
+            ),
         };
         Ok(ModuleEnableState {
             explicit,
@@ -1203,7 +1228,8 @@ mod enable_toggle_tests {
     }
 
     /// `module_effective_enabled` cascade:
-    ///   no per-project row, no global row → true (fail-open default)
+    ///   no per-project row, no global row → true (fail-open default), EXCEPT
+    ///     the RL reranker, whose system default is OFF (v0.2.100)
     ///   no per-project row, global=false → false (global wins)
     ///   no per-project row, global=true  → true
     ///   per-project=true, global=false   → true (per-project overrides)
@@ -1212,10 +1238,15 @@ mod enable_toggle_tests {
     fn module_effective_enabled_cascade() {
         let (db, pid) = db_with_project("eff");
 
-        // (a) Both absent → default true.
+        // (a) Both absent → fail-open true for an ordinary module, OFF for
+        // the RL reranker (owner 2026-10-01: inactive until trained).
         assert!(
-            db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            db.module_effective_enabled(&pid, "vct-coordination").unwrap(),
             "no rows → fail-open default true"
+        );
+        assert!(
+            !db.module_effective_enabled(&pid, "vct-rl-reranker").unwrap(),
+            "no rows → the RL reranker defaults OFF"
         );
 
         // (b) Global=false, no per-project → false (global default applies).
@@ -1396,6 +1427,39 @@ mod enable_toggle_tests {
         let st = db.resolve_module_enable(&pid, "vct-rl-reranker").unwrap();
         assert_eq!(st.explicit, None);
         assert_eq!(st.source, ModuleEnableSource::SystemDefault);
+        assert!(!st.effective, "RL reranker: system default is OFF");
+    }
+
+    /// v0.2.100: the RL-scoring default, end to end through the cascade.
+    /// Off when nothing is set (even with the install-time seed skipped),
+    /// a project with no row INHERITS the host-wide default in both
+    /// directions, and an explicit per-project row still wins.
+    #[test]
+    fn rl_scoring_default_is_off_and_projects_inherit_the_global_default() {
+        let (db, pid) = db_with_project("rl-default");
+        let m = RL_RERANKER_MODULE_ID;
+
+        let st = db.resolve_module_enable(&pid, m).unwrap();
+        assert!(!st.effective, "nothing set anywhere → OFF");
+        assert_eq!(st.source, ModuleEnableSource::SystemDefault);
+
+        db.module_set_global_enabled(m, true).unwrap();
+        let st = db.resolve_module_enable(&pid, m).unwrap();
+        assert!(st.effective, "project with no row inherits the global ON");
+        assert_eq!(st.source, ModuleEnableSource::GlobalDefault);
+
+        db.module_set_global_enabled(m, false).unwrap();
+        assert!(!db.module_effective_enabled(&pid, m).unwrap());
+
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        assert!(
+            db.module_effective_enabled(&pid, m).unwrap(),
+            "an explicit per-project row beats the global default"
+        );
+
+        // Every other module keeps the fail-open default.
+        assert!(module_enable_system_default("vct-coordination"));
+        assert!(!module_enable_system_default(m));
     }
 
     /// F-4 at the GLOBAL layer: `module_set_global_enabled` is DELETE+INSERT
@@ -1532,6 +1596,26 @@ mod enable_toggle_tests {
             2,
             "both events landed — the enable flag gates reranking, never collection",
         );
+
+        // v0.2.100: and with the RL-scoring switch ON, at either tier, the
+        // count keeps moving — the switch is not on the collection path in
+        // ANY state (absent, off, on).
+        db.module_set_global_enabled(m, true).unwrap();
+        db.insert_rl_event(
+            "retrieval", 1, 3_000, Some(&pid), None, "task-global-on",
+            None, None, None, None, "{}",
+        )
+        .expect("collection must work with the switch ON (global)");
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        db.insert_rl_event(
+            "retrieval", 1, 4_000, Some(&pid), None, "task-project-on",
+            None, None, None, None, "{}",
+        )
+        .expect("collection must work with the switch ON (per project)");
+        assert_eq!(db.count_rl_events(Some(&pid), None, None, None).unwrap(), 4);
+        // Put the tiers back where the rest of this test expects them.
+        db.module_write_enabled_for_project(&pid, m, Some(false)).unwrap();
+        db.module_set_global_enabled(m, false).unwrap();
 
         // The collection flag lives under the SAME module_id but a different
         // setting_key; no enable write may disturb it.

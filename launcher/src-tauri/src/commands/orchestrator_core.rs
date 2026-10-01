@@ -43,7 +43,6 @@
 // a user-readable message.
 
 use std::path::PathBuf;
-use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tauri::{command, AppHandle, State};
@@ -126,30 +125,6 @@ pub struct CodeGraphResult {
     pub ok: bool,
     pub duration_ms: u64,
     pub log_tail: String,
-}
-
-/// Per-service status returned by `orchestrator_health_check`. One
-/// `ServiceCheck` per probed endpoint. `ok=false` means either the
-/// endpoint didn't respond within the timeout OR returned a non-2xx
-/// status code; `detail` carries the explanation.
-#[derive(Debug, Clone, Serialize)]
-pub struct ServiceCheck {
-    pub name: String,
-    pub endpoint: String,
-    pub ok: bool,
-    /// Round-trip time in ms for successful checks. `None` on failure.
-    pub latency_ms: Option<u64>,
-    /// Human-readable status. "200 OK" on success; error message on
-    /// failure ("connection refused", "timeout after 3s", etc.).
-    pub detail: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct HealthReport {
-    pub services: Vec<ServiceCheck>,
-    /// `true` iff every service in `services` reports `ok=true`. The
-    /// GUI uses this for the overall traffic-light indicator.
-    pub all_ok: bool,
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────
@@ -545,105 +520,36 @@ pub async fn code_graph_prune_stale(
     })
 }
 
-/// The health-check probe URLs: every one the machine row's
-/// (`service_endpoints`, v0.2.97). No endpoint env var is read — not
-/// `WEAVIATE_URL`, `OLLAMA_URL` or `CODE_EMBED_SERVICE_URL`: the launcher is
-/// machine-scoped, and a project's hook may have started it with that
-/// project's projection (plan §4f). A dev container points VCO elsewhere
-/// with `python -m vco_lib.service_endpoints adopt --url …`.
-fn health_check_urls(db: &Db) -> Vec<(String, String)> {
-    use vct_launcher_core::services::service_endpoints as se;
-    let weaviate_url = se::machine_weaviate_url(db);
-    let ollama_url = se::machine_ollama_url(db);
-    let code_embed_url = se::machine_code_embed_url(db);
-    vec![
-        (
-            "Weaviate".to_string(),
-            format!("{}/v1/.well-known/ready", weaviate_url),
-        ),
-        (
-            "Ollama".to_string(),
-            format!("{}/api/tags", ollama_url),
-        ),
-        (
-            "Code Embedding Service".to_string(),
-            format!("{}/health", code_embed_url),
-        ),
-    ]
-}
-
-/// Probe the three local infrastructure endpoints + emit a per-service
-/// status report. Total budget ~3s (each probe times out at 1s).
-#[command]
-pub async fn orchestrator_health_check(
-    db: State<'_, Db>,
-) -> Result<HealthReport, String> {
-    let checks = health_check_urls(&db);
-
-    let mut services = Vec::with_capacity(checks.len());
-    for (name, endpoint) in checks {
-        let client = vct_launcher_core::services::loopback_http::client_for(&endpoint, Duration::from_secs(1))?;
-        let started = std::time::Instant::now();
-        let result = client.get(&endpoint).send().await;
-        let latency_ms = started.elapsed().as_millis() as u64;
-        let check = match result {
-            Ok(resp) => {
-                let status = resp.status();
-                if status.is_success() {
-                    ServiceCheck {
-                        name,
-                        endpoint,
-                        ok: true,
-                        latency_ms: Some(latency_ms),
-                        detail: format!("{}", status),
-                    }
-                } else {
-                    ServiceCheck {
-                        name,
-                        endpoint,
-                        ok: false,
-                        latency_ms: None,
-                        detail: format!("HTTP {}", status.as_u16()),
-                    }
-                }
-            }
-            Err(e) => ServiceCheck {
-                name,
-                endpoint,
-                ok: false,
-                latency_ms: None,
-                // reqwest's display includes whether it was a timeout
-                // or a connect error — informative enough to render.
-                detail: format!("{}", e),
-            },
-        };
-        services.push(check);
-    }
-
-    let all_ok = services.iter().all(|s| s.ok);
-    Ok(HealthReport { services, all_ok })
-}
-
-/// Reveal `~/.claude/logs/` in the user's file manager (Finder /
-/// Nautilus / Explorer). Soft-fails when the directory doesn't exist —
-/// we return Err so the GUI can show a toast explaining that the user
-/// hasn't run any Claude Code sessions yet (which is when the hook
-/// system populates the logs directory).
-#[command]
-pub async fn orchestrator_open_logs() -> Result<(), String> {
-    let home = directories::UserDirs::new()
-        .ok_or_else(|| "could not resolve home directory".to_string())?
-        .home_dir()
-        .to_path_buf();
-    let logs = home.join(".claude").join("logs");
-    if !logs.exists() {
+/// The project's own hook-log folder: `<project>/.claude/logs`. Pure path
+/// decision (no I/O beyond `exists()`), split out so the act / leave-alone
+/// cases are unit-testable without a Tauri runtime.
+///
+/// This folder is where the project's hooks write (tool-usage logs, and
+/// `rl_drain_citations.log`). It is NOT `~/.claude/logs` — that was the
+/// pre-v0.2.100 target and is not where a project's hooks log.
+pub(crate) fn project_logs_dir(folder: &std::path::Path) -> Result<PathBuf, String> {
+    let logs = folder.join(".claude").join("logs");
+    if !logs.is_dir() {
         return Err(format!(
-            "{} does not exist yet — start a Claude Code session in any \
+            "{} does not exist yet — start a Claude Code session in this \
              project to populate it (the .claude/hooks/* scripts write \
-             tool-usage logs here on every Bash/Edit/Write call).",
+             their logs here).",
             logs.display()
         ));
     }
+    Ok(logs)
+}
+
+/// Reveal the project's own `.claude/logs/` folder in the user's file
+/// manager. Soft-fails (Err, rendered as a toast) when the folder does not
+/// exist yet or the project is unknown.
+#[command]
+pub async fn orchestrator_open_logs(
+    project_id: String,
+    db: State<'_, Db>,
+) -> Result<(), String> {
+    let folder = resolve_project_folder(&db, &project_id)?;
+    let logs = project_logs_dir(&folder)?;
     tauri_plugin_opener::open_path(logs.display().to_string(), None::<&str>)
         .map_err(|e| format!("open_path failed: {}", e))?;
     Ok(())
@@ -829,33 +735,21 @@ pub async fn validate_clone_manifest(
 mod tests {
     use super::*;
 
-    /// v0.2.97: every health-report URL is the machine row's — the
-    /// projected `WEAVIATE_URL` / `OLLAMA_URL` / `CODE_EMBED_SERVICE_URL` in
-    /// the launcher's own environment are not read.
+    /// #9: the open-logs target is the PROJECT's `.claude/logs`, and a
+    /// missing folder is refused (leave-alone) rather than opened.
     #[test]
-    fn health_check_urls_follow_the_machine_chain() {
-        let _g = vct_launcher_core::test_env::state_dir_guard_with(&[
-            ("WEAVIATE_URL", Some("http://transport.invalid:1")),
-            ("OLLAMA_URL", Some("http://transport.invalid:2")),
-            ("CODE_EMBED_SERVICE_URL", Some("http://transport.invalid:3")),
-            (vct_launcher_core::services::service_endpoints::STATEMENT_ENV, None),
-        ]);
-        let db = crate::db::Db::open_in_memory().unwrap();
-        let checks = health_check_urls(&db);
-        // No row on this harness DB: the unroutable sentinel.
-        assert_eq!(checks[0].1, "http://127.0.0.1:9/v1/.well-known/ready");
-        assert_eq!(checks[1].1, "http://127.0.0.1:9/api/tags");
-        assert_eq!(checks[2].1, "http://127.0.0.1:9/health");
-        let mut row = vct_launcher_core::db::service_endpoints::ServiceEndpointRow::new(
-            "weaviate",
-            vct_launcher_core::db::service_endpoints::EndpointMode::VcoManaged,
-            "localhost",
-            18081,
-        );
-        row.grpc_port = Some(50052);
-        db.service_endpoint_seed_for_tests(&row).unwrap();
-        let checks = health_check_urls(&db);
-        assert_eq!(checks[0].1, "http://localhost:18081/v1/.well-known/ready");
+    fn project_logs_dir_is_the_projects_own_claude_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path();
+        let err = project_logs_dir(folder).unwrap_err();
+        assert!(err.contains(".claude"), "{err}");
+        std::fs::create_dir_all(folder.join(".claude").join("logs")).unwrap();
+        let got = project_logs_dir(folder).unwrap();
+        assert_eq!(got, folder.join(".claude").join("logs"));
+        // Never the machine-global ~/.claude/logs.
+        let home_logs = directories::UserDirs::new()
+            .map(|u| u.home_dir().join(".claude").join("logs"));
+        assert_ne!(Some(got), home_logs);
     }
 
     /// `tail_1kb` truncates oversize input, leaves small input alone,
@@ -1121,34 +1015,5 @@ mod tests {
         .expect("insert project");
         let err = resolve_project_folder(&db, &project_id).expect_err("dir missing");
         assert!(err.contains("not a directory"));
-    }
-
-    /// `orchestrator_health_check` runs against arbitrary endpoints —
-    /// when probed endpoints are unreachable (the test env has no
-    /// Weaviate / Ollama / code-embed running) we expect three
-    /// `ok=false` entries and an `all_ok=false` summary. The command
-    /// must NOT panic on connect errors; the timeout is short enough
-    /// that this test completes in <5s even when all three probes
-    /// have to time out.
-    #[tokio::test]
-    async fn health_check_reports_failures_without_panicking() {
-        // Probe URLs on an unused port guarantee connect-refused.
-
-        // We can't easily construct a State<'_, Db> outside Tauri; the
-        // command body doesn't use the db arg today, so we invoke the
-        // underlying logic directly via a fresh client. This test
-        // therefore proves the SHAPE of the report (three services,
-        // all ok=false) rather than the Tauri-bound command itself —
-        // the latter is exercised end-to-end in the launcher integ
-        // tests under tests/.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(1))
-            .build()
-            .unwrap();
-        let endpoints = ["http://127.0.0.1:1/a", "http://127.0.0.1:1/b", "http://127.0.0.1:1/c"];
-        for ep in endpoints {
-            let res = client.get(ep).send().await;
-            assert!(res.is_err(), "connect refused on unused port");
-        }
     }
 }

@@ -99,9 +99,11 @@
 //      writes from foreign pages. Defence in depth: each layer covers
 //      the other's residual risk.
 //
-//      The Svelte frontend can obtain the token via the
-//      `get_diagrams_token` Tauri command (reads the token file);
-//      it is NOT baked into any bundle.
+//      The editor receives the token in the URL fragment (`#token=`)
+//      that `open_diagrams_editor` builds — a fragment never reaches the
+//      server or a referrer. The webview is never handed it (the retired
+//      `get_diagrams_token` command did, for no consumer); it is NOT
+//      baked into any bundle.
 //
 // State model
 // -----------
@@ -136,8 +138,9 @@ use crate::db::Db;
 
 /// Filename inside `vct_root_dir()` where the per-boot save token
 /// persists for the lifetime of the launcher process. Mirrors the
-/// `hub.token` pattern (vct-hub/src/auth.rs::TOKEN_FILE). Read back by
-/// the `get_diagrams_token` Tauri command for the Svelte frontend.
+/// `hub.token` pattern (vct-hub/src/auth.rs::TOKEN_FILE). Read by
+/// out-of-process tooling that needs the running server's token (the
+/// editor itself gets it from the `open_diagrams_editor` URL fragment).
 pub const TOKEN_FILE: &str = "diagrams.token";
 
 /// Lazily-initialised server-state singleton. Holds the bound port so
@@ -267,12 +270,12 @@ async fn spawn_server(
     // we hand to `open_url`, so it doesn't matter which we land on.
     let (listener, port) = try_bind_in_range(22000, 20).await?;
 
-    // Mint the per-boot save token and persist it for the Svelte
-    // frontend (`get_diagrams_token` command). Same generate + 0o600
-    // persistence primitives as vct-hub's hub.token. A persist failure
-    // is fatal for the server start: a token that exists in memory but
-    // not on disk would leave the frontend permanently unable to
-    // authenticate, which is worse than a clear startup error.
+    // Mint the per-boot save token and persist it (0o600) for out-of-process
+    // readers. Same generate + persistence primitives as vct-hub's
+    // hub.token. A persist failure is fatal for the server start: a token
+    // that exists in memory but not on disk would leave those readers
+    // permanently unable to authenticate, which is worse than a clear
+    // startup error.
     let token = boot_token::generate_token()?;
     let token_path = vct_launcher_core::paths::vct_root_dir().join(TOKEN_FILE);
     boot_token::write_token_file(&token_path, &token)?;

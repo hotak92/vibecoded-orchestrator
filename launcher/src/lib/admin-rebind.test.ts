@@ -273,3 +273,32 @@ describe('hasActiveLicense (modal gating predicate)', () => {
     expect(hasActiveLicense('admin', 'machine_mismatch')).toBe(true);
   });
 });
+
+// v0.2.100: the machine-id hash shown beside the Rebind button.
+import { vi } from 'vitest';
+const { invokeMock } = vi.hoisted(() => ({ invokeMock: vi.fn() }));
+vi.mock('$lib/tauri', () => ({ invoke: invokeMock }));
+import { fetchMachineIdHash, shortMachineHash } from './admin-rebind';
+
+describe('machine-id hash display', () => {
+  const HASH = 'a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90';
+
+  it('reads it through get_machine_id_hash', async () => {
+    invokeMock.mockResolvedValueOnce(HASH);
+    expect(await fetchMachineIdHash()).toBe(HASH);
+    expect(invokeMock).toHaveBeenCalledWith('get_machine_id_hash');
+  });
+
+  it('returns null for a failed call or a value that is not a sha256 (hides the line)', async () => {
+    invokeMock.mockRejectedValueOnce(new Error('boom'));
+    expect(await fetchMachineIdHash()).toBeNull();
+    invokeMock.mockResolvedValueOnce('not-a-hash');
+    expect(await fetchMachineIdHash()).toBeNull();
+  });
+
+  it('truncates to head…tail for display and leaves short values alone', () => {
+    expect(shortMachineHash(HASH)).toBe('a1b2c3d4…c6d7e8f90'.replace('c6d7e8f90', HASH.slice(-6)));
+    expect(shortMachineHash(HASH).length).toBeLessThan(HASH.length);
+    expect(shortMachineHash('abc')).toBe('abc');
+  });
+});

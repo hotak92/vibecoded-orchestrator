@@ -188,16 +188,45 @@ pub fn get_feature_flags(db: State<'_, Db>) -> FeatureFlags {
 // Orchestrator config
 // ---------------------------------------------------------------------------
 
-/// Load the full orchestrator config.
-#[command]
-pub fn get_orchestrator_config() -> OrchestratorConfig {
-    load_config()
+/// The RL-scoring global default: the host-wide `enabled_for_project` row of
+/// `vct-rl-reranker`, i.e. exactly what a project with no explicit row
+/// inherits and what the hub resolver serves to the MCP. No row reads as OFF
+/// (`module_enable_system_default`). The licence gate is applied separately
+/// and is unchanged. NOT a gate on event collection.
+pub(crate) fn rl_scoring_global_default(db: &Db) -> bool {
+    use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
+    db.module_global_enabled(RL_RERANKER_MODULE_ID)
+        .ok()
+        .flatten()
+        .unwrap_or(false)
 }
 
-/// Save the full orchestrator config.
+/// Overlay the DB-backed RL-scoring default onto a loaded config. The
+/// `rl_retrieval_enabled` key of `orchestrator.json` had no reader; the
+/// authoritative value is the `module_settings` row, so that is what the
+/// dashboard shows.
+fn with_rl_scoring_default(db: &Db, mut config: OrchestratorConfig) -> OrchestratorConfig {
+    config.rl_retrieval_enabled = rl_scoring_global_default(db);
+    config
+}
+
+/// Write the RL-scoring global default (the host-wide row) and audit it,
+/// like `module_set_global_enabled`. Tier-gated by the caller.
+fn set_rl_scoring_global_default(db: &Db, enabled: bool) -> Result<(), String> {
+    use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
+    db.module_set_global_enabled(RL_RERANKER_MODULE_ID, enabled)?;
+    db.audit(
+        "module_global_enabled_changed",
+        None,
+        Some(RL_RERANKER_MODULE_ID),
+        &serde_json::json!({ "enabled": enabled, "scope": "global", "via": "rl_scored_retrieval_switch" }),
+    )
+}
+
+/// Load the full orchestrator config.
 #[command]
-pub async fn save_orchestrator_config(config: OrchestratorConfig) -> Result<(), String> {
-    save_config(&config).await
+pub fn get_orchestrator_config(db: State<'_, Db>) -> OrchestratorConfig {
+    with_rl_scoring_default(&db, load_config())
 }
 
 /// Update a single top-level config field.
@@ -207,7 +236,7 @@ pub async fn save_orchestrator_config(config: OrchestratorConfig) -> Result<(), 
 #[command]
 pub async fn update_orchestrator_setting(key: String, value: String, db: State<'_, Db>) -> Result<OrchestratorConfig, String> {
     let tier = current_tier_slug(&db);
-    update_orchestrator_setting_inner(key, value, &tier).await
+    update_orchestrator_setting_inner(key, value, &tier, &db).await
 }
 
 /// Testable core of `update_orchestrator_setting` — takes the resolved
@@ -216,6 +245,7 @@ async fn update_orchestrator_setting_inner(
     key: String,
     value: String,
     tier: &str,
+    db: &Db,
 ) -> Result<OrchestratorConfig, String> {
     let flags = feature_flags_for_tier(tier);
     let mut config = load_config();
@@ -235,6 +265,10 @@ async fn update_orchestrator_setting_inner(
             if val && !flags.has_rl_retrieval {
                 return Err(tier_required_message("pro", "RL-scored retrieval"));
             }
+            // v0.2.100: the GLOBAL DEFAULT of the per-project RL toggle (the
+            // host-wide module_settings row the hub resolver reads), not a
+            // key of orchestrator.json that nothing read.
+            set_rl_scoring_global_default(db, val)?;
             config.rl_retrieval_enabled = val;
         }
         "telemetry_enabled" => {
@@ -250,7 +284,7 @@ async fn update_orchestrator_setting_inner(
     }
 
     save_config(&config).await?;
-    Ok(config)
+    Ok(with_rl_scoring_default(db, config))
 }
 
 // ---------------------------------------------------------------------------
@@ -780,7 +814,7 @@ mod tests {
     /// Set up a temp dir as the launcher's state root + the user's HOME.
     /// Returns a guard that restores prior env on drop and the temp path.
     /// Run the closure under the SERIALIZE mutex.
-    struct EnvGuard {
+    pub(super) struct EnvGuard {
         // v0.2.92: `VCT_STATE_DIR` + `HOME` are restored by the shared
         // `test_env::EnvGuard` (which also holds `GLOBAL_ENV_MUTEX`), so
         // this struct only carries the keychain lock now. The old fields
@@ -792,6 +826,12 @@ mod tests {
         // `cargo test --lib` invocations from different terminals
         // serialise on the OS-shared keychain slot.
         _lock: crate::secrets::test_serialize::KeychainGuard,
+    }
+
+    /// Sibling test modules (`rl_scoring_default_tests`) reuse the same
+    /// keychain-serialised, env-isolated temp dir.
+    pub(super) fn setup_temp_env_for_sibling() -> (std::path::PathBuf, EnvGuard) {
+        setup_temp_env()
     }
 
     fn setup_temp_env() -> (std::path::PathBuf, EnvGuard) {
@@ -1829,5 +1869,75 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+/// v0.2.100: the "RL-Scored Retrieval" switch is the GLOBAL DEFAULT of the
+/// per-project RL toggle (the host-wide `module_settings` row), read by the
+/// same resolver the hub serves. Default OFF; licence gate unchanged.
+#[cfg(test)]
+mod rl_scoring_default_tests {
+    use super::*;
+    use crate::db::models::ProjectHost;
+    use vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID;
+
+    fn db_with_project() -> (Db, String) {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.insert_project("proj-rl", "P", "/tmp/rl", ProjectHost::Base, "rl")
+            .expect("insert project");
+        (db, "proj-rl".to_string())
+    }
+
+    #[test]
+    fn default_is_off_with_no_row() {
+        let (db, pid) = db_with_project();
+        assert!(!rl_scoring_global_default(&db));
+        let cfg = with_rl_scoring_default(&db, OrchestratorConfig::default());
+        assert!(!cfg.rl_retrieval_enabled);
+        assert!(!db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
+    }
+
+    /// Writing the switch changes what the per-project resolver answers for a
+    /// project with no explicit row (inherits), and an explicit row still wins.
+    #[test]
+    fn switch_is_the_global_default_the_project_toggle_inherits() {
+        let (db, pid) = db_with_project();
+        set_rl_scoring_global_default(&db, true).unwrap();
+        assert!(rl_scoring_global_default(&db));
+        assert!(db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
+        assert!(with_rl_scoring_default(&db, OrchestratorConfig::default()).rl_retrieval_enabled);
+
+        db.module_write_enabled_for_project(&pid, RL_RERANKER_MODULE_ID, Some(false))
+            .unwrap();
+        assert!(
+            !db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap(),
+            "an explicit per-project row beats the global default"
+        );
+
+        set_rl_scoring_global_default(&db, false).unwrap();
+        assert!(!rl_scoring_global_default(&db));
+    }
+
+    #[test]
+    fn the_setting_arm_writes_the_row_for_pro_and_refuses_free() {
+        let (_tmp, _g) = super::tests::setup_temp_env_for_sibling();
+        let (db, pid) = db_with_project();
+        let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+        let err = rt
+            .block_on(update_orchestrator_setting_inner(
+                "rl_retrieval_enabled".into(), "true".into(), "free", &db,
+            ))
+            .unwrap_err();
+        assert!(err.to_lowercase().contains("pro"), "free tier refused: {err}");
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None);
+
+        let cfg = rt
+            .block_on(update_orchestrator_setting_inner(
+                "rl_retrieval_enabled".into(), "true".into(), "pro", &db,
+            ))
+            .unwrap();
+        assert!(cfg.rl_retrieval_enabled);
+        assert!(db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
     }
 }

@@ -75,6 +75,8 @@
   // the MenuBar — see the markup note there. It used to sit above MenuBar,
   // which put it at the window's top edge, glued to the titlebar.
   import ProjectSetupBanner from '$lib/components/ProjectSetupBanner.svelte';
+  // v0.2.100: interrupted-project-move banner (`list_live_project_moves_v2`).
+  import ProjectMoveBanner from '$lib/components/ProjectMoveBanner.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
   // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
   // class with objects AND (b) at least one user project has a different
@@ -415,6 +417,7 @@
          Project modal. -->
     <div class="shell-banners">
       <ProjectSetupBanner />
+      <ProjectMoveBanner />
     </div>
     <div class="app-body">
       <Sidebar />

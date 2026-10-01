@@ -62,7 +62,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tauri::{command, AppHandle, State};
 
-use crate::commands::module_db::DEFAULT_TOKEN_TTL_MS;
+use crate::commands::module_db::get_or_issue_module_token;
 use crate::db::Db;
 
 /// Default Supabase edge endpoint. Operators override via
@@ -88,10 +88,6 @@ const EDGE_TIMEOUT_SECS: u64 = 15;
 /// Bounded hub-upsert timeout. Mirrors `module_db_client::HUB_READ_TIMEOUT_SECS`
 /// (5 s) but writes go through the same code path.
 const HUB_WRITE_TIMEOUT_SECS: u64 = 5;
-
-/// Margin (ms) below token expiry at which we proactively refresh.
-/// Same value module_db_client uses.
-const TOKEN_REFRESH_MARGIN_MS: i64 = 60_000;
 
 // ─── Wire types ─────────────────────────────────────────────────────────
 
@@ -834,61 +830,6 @@ pub async fn download_to_module_dir(
 /// a duplicated copy "to keep this module self-contained").
 fn hub_port() -> Result<u16, String> {
     vct_launcher_core::services::hub_port::read_hub_port_file()
-}
-
-/// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
-/// v0.2.54 Track J amend: delegates to
-/// `vct_launcher_core::services::boot_token::generate_token`.
-fn generate_token_hex() -> Result<String, String> {
-    vct_launcher_core::services::boot_token::generate_token()
-}
-
-/// Get-or-issue a per-(module, project) bearer token from the
-/// launcher's `module_access_tokens` table. Same upsert pattern
-/// `module_db_client::get_or_issue_token` uses.
-fn get_or_issue_module_token(
-    db: &Db,
-    module_id: &str,
-    project_id: &str,
-) -> Result<String, String> {
-    let now = chrono::Utc::now().timestamp_millis();
-
-    let cached: Option<(String, i64)> = {
-        let guard = db.lock();
-        guard
-            .query_row(
-                "SELECT token_secret, expires_at FROM module_access_tokens \
-                 WHERE module_id = ?1 AND project_id = ?2",
-                rusqlite::params![module_id, project_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .ok()
-    };
-
-    if let Some((secret, expires_at)) = cached {
-        if expires_at > now + TOKEN_REFRESH_MARGIN_MS {
-            return Ok(secret);
-        }
-    }
-
-    let secret = generate_token_hex()?;
-    let expires_at = now + DEFAULT_TOKEN_TTL_MS;
-    {
-        let guard = db.lock();
-        guard
-            .execute(
-                "INSERT INTO module_access_tokens \
-                    (module_id, project_id, token_secret, issued_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(module_id, project_id) DO UPDATE SET \
-                    token_secret = excluded.token_secret, \
-                    issued_at = excluded.issued_at, \
-                    expires_at = excluded.expires_at",
-                rusqlite::params![module_id, project_id, &secret, now, expires_at],
-            )
-            .map_err(|e| format!("upsert module_access_tokens: {}", e))?;
-    }
-    Ok(secret)
 }
 
 /// Best-effort upsert of an `rl_global_weights_available` row via the

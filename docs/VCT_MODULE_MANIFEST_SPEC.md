@@ -508,7 +508,8 @@ KV store. How a value reaches the module depends on who starts the module:
   every bundled setting, and a test fails when a new one has neither.
 - **Validation.** Every write goes through one gate,
   `module_settings_schema::write_module_setting` — reached by the launcher's
-  `set_module_setting` command and by `set_setting_v2` alike — which checks
+  `set_module_setting` command (the `set_setting_v2` twin was retired in
+  v0.2.100, so there is one caller) — which checks
   the value against its declaration — `type` (an `integer` is a JSON integer:
   never a numeric string, never `7700.0` or `7.7e3`), `min`/`max`, `options`,
   `validation` (a regex search), `required` (refuses a blank string / empty

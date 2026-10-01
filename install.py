@@ -484,8 +484,8 @@ class SystemInfo(NamedTuple):
 # Durable install log (state/logs/install.jsonl)
 #
 # Append-only JSONL written by both install.py and post-install-launcher.sh.
-# Both the launcher (Tauri command read_install_log) and Claude Code read
-# this file on failure to figure out where the install got to. See
+# Claude Code (and the launcher's read_install_log command, whose panel is
+# owner-deferred to v0.2.102) read this file on failure to figure out where the install got to. See
 # docs/INSTALL_RECOVERY.md for the schema.
 #
 # Design constraints:

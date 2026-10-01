@@ -936,7 +936,10 @@ mod tests {
         );
         let st = db.resolve_module_enable("p1", "vct-rl-reranker").unwrap();
         assert_eq!(st.source, ModuleEnableSource::SystemDefault);
-        assert!(st.effective, "fail-open when nothing is set anywhere");
+        assert!(
+            !st.effective,
+            "the RL reranker resolves OFF when nothing is set anywhere (v0.2.100)"
+        );
     }
 
     /// The audit trail can tell a CLEAR apart from an explicit off. Without

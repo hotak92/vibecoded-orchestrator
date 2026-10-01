@@ -330,19 +330,6 @@ function createProjectsStore() {
     },
 
     /**
-     * Deprecated alias of `setSharedKgWriteDisabled`. Kept for ~3 releases
-     * (target removal: 2026-08) so any UI code still calling the old name
-     * keeps working through the rename. Emits a console warning per call.
-     */
-    async setSharedKgOptOut(id: string, optOut: boolean): Promise<ProjectView> {
-      console.warn(
-        '[vct] setSharedKgOptOut is deprecated — use setSharedKgWriteDisabled. ' +
-        'The toggle now gates WRITES only; reads of the shared KG are always on.',
-      );
-      return this.setSharedKgWriteDisabled(id, optOut);
-    },
-
-    /**
      * v0.2.46 Decision B — toggle the project's SHARED_KG_READ_DISABLED
      * setting. Symmetric mirror of `setSharedKgWriteDisabled`: when
      * `true`, the MCP's `_kg_collections_to_search` drops the shared

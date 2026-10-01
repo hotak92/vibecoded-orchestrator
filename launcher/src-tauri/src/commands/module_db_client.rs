@@ -12,8 +12,8 @@
 //! is the thin client that:
 //!
 //!   1. Reads/refreshes the per-(module, project) shared secret from
-//!      `module_access_tokens` (issues a fresh one via
-//!      `module_db::issue_module_access_token` if missing or expired).
+//!      `module_access_tokens` (issues a fresh one if missing or expired)
+//!      through the ONE helper, `module_db::get_or_issue_module_token`.
 //!   2. Issues the HTTP GET against the hub.
 //!   3. Returns the raw JSON for the frontend to render.
 //!
@@ -35,7 +35,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tauri::{command, State};
 
-use crate::commands::module_db::DEFAULT_TOKEN_TTL_MS;
+use crate::commands::module_db::get_or_issue_module_token;
 use crate::db::Db;
 
 /// Bounded HTTP-call timeout for hub reads. 5 s matches the existing
@@ -44,85 +44,10 @@ use crate::db::Db;
 /// the hub's DB layer takes the rusqlite lock).
 const HUB_READ_TIMEOUT_SECS: u64 = 5;
 
-/// Margin (ms) below the token's `expires_at` at which we proactively
-/// refresh. Avoids racing the hub's expiry check on the very last
-/// millisecond. 60 s is generous; tokens have a 1-hour TTL on issue.
-const TOKEN_REFRESH_MARGIN_MS: i64 = 60_000;
-
 /// The running hub's port, strictly from `hub.port` (the one reader:
 /// `vct_launcher_core::services::hub_port::read_hub_port_file`).
 fn hub_port() -> Result<u16, String> {
     vct_launcher_core::services::hub_port::read_hub_port_file()
-}
-
-/// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
-///
-/// Mirrors the helper in `commands::module_db::generate_token_hex` —
-/// duplicated here (3 lines) to keep `module_db_client` self-contained
-/// without re-exporting private helpers. v0.2.32 should move both into
-/// a shared crate.
-// v0.2.54 Track J amend: delegate to vct-launcher-core::services::boot_token
-// (same OsRng + hex shape; v0.2.32-era "move to shared crate" comment closed).
-fn generate_token_hex() -> Result<String, String> {
-    vct_launcher_core::services::boot_token::generate_token()
-}
-
-/// Get a usable per-(module, project) bearer token. Reads
-/// `module_access_tokens` first; if the row is missing or expired (or
-/// within the refresh margin) we re-issue inline.
-///
-/// We don't delegate to `module_db::issue_module_access_token` because
-/// that's a `#[tauri::command]` taking `State<'_, Db>` — calling it
-/// from another command requires cloning the State guard, which Tauri
-/// doesn't support. Inlining the upsert keeps the dependency graph
-/// clean and the SQL identical.
-fn get_or_issue_token(
-    db: &Db,
-    module_id: &str,
-    project_id: &str,
-) -> Result<String, String> {
-    let now = chrono::Utc::now().timestamp_millis();
-
-    // Try the cached row first.
-    let cached: Option<(String, i64)> = {
-        let guard = db.lock();
-        guard
-            .query_row(
-                "SELECT token_secret, expires_at FROM module_access_tokens \
-                 WHERE module_id = ?1 AND project_id = ?2",
-                rusqlite::params![module_id, project_id],
-                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
-            )
-            .ok()
-    };
-
-    if let Some((secret, expires_at)) = cached {
-        if expires_at > now + TOKEN_REFRESH_MARGIN_MS {
-            return Ok(secret);
-        }
-        // Falls through to re-issue.
-    }
-
-    // No row, or near-expiry. Re-issue inline (same SQL as
-    // `module_db::issue_module_access_token`).
-    let secret = generate_token_hex()?;
-    let expires_at = now + DEFAULT_TOKEN_TTL_MS;
-    {
-        let guard = db.lock();
-        guard
-            .execute(
-                "INSERT INTO module_access_tokens \
-                    (module_id, project_id, token_secret, issued_at, expires_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5) \
-                 ON CONFLICT(module_id, project_id) DO UPDATE SET \
-                    token_secret = excluded.token_secret, \
-                    issued_at = excluded.issued_at, \
-                    expires_at = excluded.expires_at",
-                rusqlite::params![module_id, project_id, &secret, now, expires_at],
-            )
-            .map_err(|e| format!("upsert module_access_tokens: {}", e))?;
-    }
-    Ok(secret)
 }
 
 /// Tauri command: read a single keyed row from the hub's module-DB
@@ -187,7 +112,7 @@ async fn module_db_read_row_with_fields_inner(
     db: &Db,
 ) -> Result<Option<Value>, String> {
     let port = hub_port()?;
-    let token = get_or_issue_token(db, &module_id, &project_id)?;
+    let token = get_or_issue_module_token(db, &module_id, &project_id)?;
 
     let mut url = format!(
         "http://127.0.0.1:{}/api/v1/modules/{}/db/projects/{}/rows/{}/{}",
@@ -241,8 +166,11 @@ mod tests {
         // Sanity: margin should fit comfortably inside the 1-hour TTL
         // set by `module_db::DEFAULT_TOKEN_TTL_MS`, otherwise the
         // refresh-eagerly path triggers on every call.
-        assert!(TOKEN_REFRESH_MARGIN_MS > 0);
-        assert!(TOKEN_REFRESH_MARGIN_MS < crate::commands::module_db::DEFAULT_TOKEN_TTL_MS);
+        assert!(crate::commands::module_db::TOKEN_REFRESH_MARGIN_MS > 0);
+        assert!(
+            crate::commands::module_db::TOKEN_REFRESH_MARGIN_MS
+                < crate::commands::module_db::DEFAULT_TOKEN_TTL_MS
+        );
     }
 
     #[test]

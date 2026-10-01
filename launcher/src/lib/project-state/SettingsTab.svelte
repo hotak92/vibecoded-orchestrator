@@ -18,6 +18,7 @@
   import { goto } from '$app/navigation';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { openProjectLogsAction, refreshProjectEnvAction } from './project-maintenance';
   import { projects } from '$lib/stores/projects';
   import { DEFAULT_UNREGISTER_OPTIONS, runUnregister } from '$lib/unregister-escape';
   import UnregisterStoppedDialog from '$lib/components/UnregisterStoppedDialog.svelte';
@@ -131,6 +132,25 @@
   let project = $state<ProjectView | null>(null);
   let newName = $state('');
   let saving = $state(false);
+  let maintenanceBusy = $state(false);
+
+  async function rerenderEnv() {
+    if (!project) return;
+    maintenanceBusy = true;
+    try {
+      await refreshProjectEnvAction(
+        { confirm: (m) => window.confirm(m), invoke, toast },
+        projectId,
+        project.name,
+      );
+    } finally {
+      maintenanceBusy = false;
+    }
+  }
+
+  async function openLogs() {
+    await openProjectLogsAction({ invoke, toast }, projectId);
+  }
   // PR 5 (2026-05-01): "Update bundle" button — re-runs the per-project
   // bundle install in update mode. Subprocess can take 5-15s (Python
   // startup + file copies + Weaviate probe), so we lock the button while
@@ -902,6 +922,30 @@
           </tr>
         </tbody>
       </table>
+    </section>
+
+    <section class="ps-section">
+      <h2>Maintenance</h2>
+      <p class="ps-hint">
+        Re-render this project's environment files from the launcher's current
+        settings. Only this project is touched. Open the folder where this
+        project's hooks write their logs (including the RL citation-drain log).
+      </p>
+      <button
+        class="ps-btn"
+        onclick={rerenderEnv}
+        disabled={maintenanceBusy || !project}
+        title="Rewrite this project's .claude/env and the env block of .claude/settings.json"
+      >
+        {maintenanceBusy ? 'Re-rendering…' : "Re-render this project's env"}
+      </button>
+      <button
+        class="ps-btn"
+        onclick={openLogs}
+        title="Open this project's .claude/logs folder"
+      >
+        Open this project's logs folder
+      </button>
     </section>
 
     <section class="ps-section ps-danger">

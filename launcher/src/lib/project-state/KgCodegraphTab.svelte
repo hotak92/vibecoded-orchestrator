@@ -12,6 +12,7 @@
     ModelChoice,
   } from '$lib/types/embedding-catalog';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import { canRemoveKgBinding, removeKgBinding } from './kg-bindings';
   import EnrichmentProgressModal from '$lib/components/EnrichmentProgressModal.svelte';
   // v0.2.18 (Plan C): Re-analyze code-graph modal. Forks the enrichment
   // modal's streaming pattern against analyze_code_graph.py --json-progress.
@@ -281,6 +282,25 @@ Continue?`;
     return found ? found.slot : null;
   }
 
+  // v0.2.100: remove a shared/archive binding (confirm first; primary is not
+  // removable here). The collection itself is untouched. Reload the snapshot
+  // so the list and the form reflect the new state.
+  async function removeBinding(b: ProjectKgBinding) {
+    try {
+      const outcome = await removeKgBinding(projectId, b, {
+        confirm: (m) => confirm(m),
+        remove: (pid, role) => invoke('delete_project_kg_binding', { projectId: pid, role }),
+      });
+      if (outcome === 'removed') {
+        toast.success(`${b.role} binding removed`);
+        if (kgRole === b.role) kgRole = 'primary';
+        await load();
+      }
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
   async function saveKg() {
     if (!kgCollection.trim()) {
       toast.error('Collection name required');
@@ -436,6 +456,28 @@ Continue?`;
         </label>
       </div>
       <button class="ps-btn-primary" onclick={saveKg}>Save KG binding</button>
+
+      {#if snapshot && snapshot.kg_bindings.length > 0}
+        <h5 class="ps-bindings-title">Current bindings</h5>
+        <ul class="ps-bindings" aria-label="Current KG bindings">
+          {#each snapshot.kg_bindings as b (b.role)}
+            <li>
+              <span class="ps-tag">{b.role}</span>
+              <code>{b.collection_name}</code>
+              {#if canRemoveKgBinding(b.role)}
+                <button
+                  class="ps-link-btn"
+                  data-testid="kg-binding-remove"
+                  onclick={() => removeBinding(b)}
+                  aria-label="Remove the {b.role} KG binding to {b.collection_name}"
+                >Remove</button>
+              {:else}
+                <span class="ps-hint">primary cannot be removed here</span>
+              {/if}
+            </li>
+          {/each}
+        </ul>
+      {/if}
     </div>
 
     <div class="ps-section">
@@ -621,6 +663,11 @@ Continue?`;
     background: rgba(255,200,80,0.08); border: 1px solid rgba(255,200,80,0.2);
     border-radius: 4px; color: rgb(255,200,120); font-size: 11px;
   }
+  .ps-tag { font-size: 10px; padding: 1px 6px; border-radius: 8px; background: rgba(255,255,255,0.08); color: #ccc; }
+  .ps-hint { font-size: 11px; color: #888; }
+  .ps-bindings-title { font-size: 12px; margin: 14px 0 6px; color: #aaa; font-weight: 600; }
+  .ps-bindings { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+  .ps-bindings li { display: flex; align-items: center; gap: 8px; font-size: 12px; }
   .ps-link-btn {
     background: none; border: none; color: rgb(0,191,166); cursor: pointer;
     padding: 0; margin-left: 8px; text-decoration: underline; font-size: 11px;

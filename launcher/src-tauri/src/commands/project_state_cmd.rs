@@ -23,7 +23,7 @@ use tauri::{command, State};
 
 use crate::db::project_mcp_servers::ProjectMcpServer;
 use crate::db::project_state::{
-    ProjectAgent, ProjectCodegraphBinding, ProjectHook, ProjectKgBinding, ProjectPermission,
+    ProjectAgent, ProjectCodegraphBinding, ProjectKgBinding, ProjectPermission,
     ProjectSecretRef, ProjectSkill, ProjectStateSnapshot,
 };
 use crate::db::Db;
@@ -158,23 +158,6 @@ pub async fn list_project_skills(
     db.list_project_skills(&project_id)
 }
 
-/// The hooks the launcher has MIRRORED for this project.
-///
-/// **Not the truth about what runs.** Claude Code reads
-/// `<project>/.claude/settings.json`; this table is populated from that file
-/// at scan time and can be stale the moment the file is edited by anything
-/// else. Rendering enable/disable state from these rows is exactly the
-/// v0.2.91 P2-B2 placebo. Use
-/// `commands::project_hooks_settings::list_project_hooks_effective`, which
-/// reads settings.json and joins these rows only for metadata.
-#[command]
-pub async fn list_project_hooks(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ProjectHook>, String> {
-    db.list_project_hooks(&project_id)
-}
-
 #[command]
 pub async fn list_project_permissions(
     project_id: String,
@@ -284,12 +267,10 @@ pub async fn rescan_project_from_filesystem(
 //
 // Resolves the KNOWN_ISSUES.md "Custom MCP tab is not populated by initial
 // project registration" entry. The Custom MCP tab calls
-// `list_user_added_project_mcp_servers` to surface only entries where
-// `is_user_added=true` (anything beyond the bundled allowlist in
-// `crate::db::project_mcp_servers::BUNDLED_MCP_NAMES`).
-//
-// The full unfiltered list is also exposed so a future "all MCPs" tab
-// can render bundled + user-added together.
+// `list_project_mcp_servers` returns every row (bundled + user-added);
+// `is_user_added=true` marks anything beyond the bundled allowlist in
+// `crate::db::project_mcp_servers::BUNDLED_MCP_NAMES`, so the user-added
+// view is a client-side filter (McpMaintenanceSection does exactly that).
 
 #[command]
 pub async fn list_project_mcp_servers(
@@ -297,14 +278,6 @@ pub async fn list_project_mcp_servers(
     db: State<'_, Db>,
 ) -> Result<Vec<ProjectMcpServer>, String> {
     db.list_project_mcp_servers(&project_id)
-}
-
-#[command]
-pub async fn list_user_added_project_mcp_servers(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ProjectMcpServer>, String> {
-    db.list_user_added_mcp_servers(&project_id)
 }
 
 #[command]
@@ -504,8 +477,11 @@ pub async fn unregister_project_skill(
 // touches only the DB is the bug, and there should be no local symbol offering
 // one.
 //
-// `list_project_hooks` below stays — it is a legitimate read of what the
-// launcher has MIRRORED — but see its doc comment before rendering from it.
+// The mirrored rows are read through `Db::list_project_hooks` (the hub and the
+// enforcement path use it); the GUI reads the EFFECTIVE view,
+// `project_hooks_settings::list_project_hooks_effective`. Rendering enable /
+// disable state from the mirror is the v0.2.91 P2-B2 placebo, which is why no
+// Tauri command exposes the raw mirror any more.
 
 #[derive(Debug, Deserialize)]
 pub struct AddPermissionReq {

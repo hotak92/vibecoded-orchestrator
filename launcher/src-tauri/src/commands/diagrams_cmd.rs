@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use tauri::{command, State};
 
-use crate::db::diagrams::{AccessRow, DiagramRow, ModuleRow, SnapshotRow, ToolGrant};
+use crate::db::diagrams::{AccessRow, DiagramRow, SnapshotRow, ToolGrant};
 use crate::db::mcp_tool_defaults::McpToolDefault;
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
@@ -63,14 +63,6 @@ pub async fn list_project_mcp_tools(
     db: State<'_, Db>,
 ) -> Result<Vec<ToolGrant>, String> {
     db.list_project_mcp_tools(&project_id, &mcp_name)
-}
-
-#[command]
-pub async fn list_project_modules(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ModuleRow>, String> {
-    db.list_project_modules(&project_id)
 }
 
 // ─── Diagram registry mutations ─────────────────────────────────────────
@@ -1349,31 +1341,6 @@ async fn open_editor_for_rel_path(
         .map_err(|e| format!("open_editor_for_rel_path: open_url({}): {}", url, e))?;
 
     Ok(url)
-}
-
-/// Read the diagrams local server's per-boot save token from
-/// `<vct_root_dir>/diagrams.token` (written by
-/// `diagrams_local_server::spawn_server` with mode 0o600).
-///
-/// This is the sanctioned channel for the Svelte frontend to obtain
-/// the token if it ever needs to POST /save directly — the token is
-/// deliberately NOT baked into the frontend bundle (a bundle ships to
-/// every install; the token is per-boot and per-machine). Errors if
-/// the editor server hasn't been started yet this session (no token
-/// file, or a stale one from a previous boot would fail auth anyway —
-/// callers should invoke `open_diagrams_editor` first, which starts
-/// the server and mints the token).
-#[command]
-pub async fn get_diagrams_token() -> Result<String, String> {
-    let path = vct_launcher_core::paths::vct_root_dir()
-        .join(crate::commands::diagrams_local_server::TOKEN_FILE);
-    vct_launcher_core::services::boot_token::read_token_file(&path).map_err(|e| {
-        format!(
-            "get_diagrams_token: {} (the diagrams editor server may not \
-             have started yet this session — open an editor first)",
-            e,
-        )
-    })
 }
 
 /// Minimal URL-encoder for query-string values. Encodes the printable

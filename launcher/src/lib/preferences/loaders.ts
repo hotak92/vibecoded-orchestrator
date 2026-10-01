@@ -28,6 +28,7 @@
 
 import { invoke, safeInvoke, listen } from '$lib/tauri';
 import { getVersion } from '@tauri-apps/api/app';
+import { getModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
 
 /** The most IPC calls the page may make at mount through eager loaders. */
 export const PREF_EAGER_IPC_BUDGET = 8;
@@ -270,6 +271,12 @@ export const PREF_LOADERS = {
     eager: false,
     section: 'Volume location',
     load: <T>() => invoke<T>('get_volumes_config'),
+  },
+  moduleUpdateAutoCheck: {
+    eager: false,
+    section: 'Module updates (24 h automatic check)',
+    /** One read; the API wrapper is the ONE home of the command name. */
+    load: () => getModuleUpdateAutoCheckEnabled(),
   },
   appVersion: {
     eager: false,

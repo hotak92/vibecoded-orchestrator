@@ -18,8 +18,10 @@
   import type { TierCacheView } from '$lib/types/launcher';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import {
+    fetchMachineIdHash,
     friendlyRebindMessage,
     hasActiveLicense,
+    shortMachineHash,
     shouldShowRebindButton,
   } from '$lib/admin-rebind';
 
@@ -62,6 +64,30 @@
   onMount(() => {
     license.load();
   });
+
+  // v0.2.100: this machine's id hash, shown next to the Rebind button so an
+  // admin can see what "this machine" is before binding to it. Read once,
+  // only when the button is visible.
+  let machineHash = $state<string | null>(null);
+  let machineHashCopied = $state(false);
+  let machineHashRequested = false;
+  $effect(() => {
+    if (open && showRebindButton && !machineHashRequested) {
+      machineHashRequested = true;
+      void fetchMachineIdHash().then((h) => (machineHash = h));
+    }
+  });
+
+  async function copyMachineHash() {
+    if (!machineHash) return;
+    try {
+      await navigator.clipboard.writeText(machineHash);
+      machineHashCopied = true;
+      setTimeout(() => (machineHashCopied = false), 1500);
+    } catch {
+      machineHashCopied = false;
+    }
+  }
 
   async function handleActivate() {
     if (!code.trim()) return;
@@ -216,6 +242,17 @@
               >
                 {viewState.rebinding ? 'Rebinding…' : 'Rebind to this machine'}
               </button>
+              {#if machineHash}
+                <span class="machine-hash" data-testid="machine-id-hash">
+                  <span class="tier-label">This machine</span>
+                  <code class="mono" title={machineHash}>{shortMachineHash(machineHash)}</code>
+                  <button
+                    class="btn-3d btn-3d-ghost btn-3d-sm"
+                    data-testid="machine-id-hash-copy"
+                    onclick={copyMachineHash}
+                  >{machineHashCopied ? 'Copied' : 'Copy'}</button>
+                </span>
+              {/if}
             {/if}
             {#if !confirmingDeactivate}
               <button
@@ -374,6 +411,12 @@
     color: var(--color-text);
     font-weight: 600;
     text-transform: capitalize;
+  }
+
+  .machine-hash {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
   }
 
   .mono {

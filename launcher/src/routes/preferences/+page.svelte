@@ -49,6 +49,12 @@
     resolveSessionAutostart,
     sessionAutostartHint,
   } from '$lib/session-autostart';
+  import {
+    resolveModuleUpdateAutoCheck,
+    moduleUpdateAutoCheckHint,
+    DEFAULT_MODULE_UPDATE_AUTO_CHECK,
+  } from '$lib/module-update-autocheck';
+  import { setModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -1573,6 +1579,40 @@
     }
   }
 
+  // ── Module updates: the 24 h automatic check (v0.2.100) ───────────────
+  // Opt-out for `spawn_module_update_check_loop`. The shipped default is ON;
+  // the switch renders that default while the read is in flight or fails.
+  let moduleUpdateAutoCheck = $state(DEFAULT_MODULE_UPDATE_AUTO_CHECK);
+  let moduleUpdateAutoCheckBusy = $state(false);
+  let moduleUpdateAutoCheckError = $state<string | null>(null);
+
+  async function loadModuleUpdateAutoCheck() {
+    try {
+      moduleUpdateAutoCheck = resolveModuleUpdateAutoCheck(
+        await PREF_LOADERS.moduleUpdateAutoCheck.load(),
+      );
+    } catch (e) {
+      moduleUpdateAutoCheck = resolveModuleUpdateAutoCheck(null);
+      console.warn('get_module_update_auto_check_enabled failed', e);
+    }
+  }
+
+  async function toggleModuleUpdateAutoCheck(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    moduleUpdateAutoCheckBusy = true;
+    moduleUpdateAutoCheckError = null;
+    try {
+      await setModuleUpdateAutoCheckEnabled(enable);
+      moduleUpdateAutoCheck = enable;
+    } catch (e) {
+      moduleUpdateAutoCheckError = e instanceof Error ? e.message : String(e);
+      target.checked = moduleUpdateAutoCheck;
+    } finally {
+      moduleUpdateAutoCheckBusy = false;
+    }
+  }
+
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
   // Read-only probe of the per-machine Weaviate / Ollama / code_embed
   // instances every orchestrator install reuses (per-install isolation
@@ -1670,7 +1710,7 @@
   //
   //   consumer: `vct_launcher_core::logging::resolve_log_level`
   //     · written here through the dedicated `set_logging_level` command
-  //       (NOT `set_setting_v2` — a test pins that too, and not the generic
+  //       (NOT `set_module_setting` — a test pins that too, and not the generic
   //       `app_state_set` either, because the command also validates the
   //       value, applies it to the running process and re-projects env);
   //     · read at launcher startup (`crate::logging::init_early` →
@@ -1981,6 +2021,7 @@
     hardwareSnapshot: loadInitialHardwareSnapshot,
     bootAutostart: loadBootAutostart,
     sessionAutostart: loadSessionAutostart,
+    moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
     services: refreshServices,
     activeEmbedding: loadActiveEmbedding,
     volumes: refreshVolumes,
@@ -3393,6 +3434,29 @@
           checked={sessionAutostart}
           disabled={sessionAutostartBusy}
           onchange={toggleSessionAutostart}
+        />
+      </div>
+    </section>
+
+    <!-- v0.2.100: module-update automatic check (opt-out). -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['moduleUpdateAutoCheck'] }} aria-labelledby="pr-module-updates-title">
+      <h2 class="pr-section-title" id="pr-module-updates-title">Module updates</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Check for module updates automatically</strong>
+          <span class="pr-onboarding-hint">
+            {moduleUpdateAutoCheckHint(moduleUpdateAutoCheck)}
+          </span>
+          {#if moduleUpdateAutoCheckError}
+            <span class="pr-onboarding-hint pr-startup-error">{moduleUpdateAutoCheckError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="module-update-auto-check"
+          checked={moduleUpdateAutoCheck}
+          disabled={moduleUpdateAutoCheckBusy}
+          onchange={toggleModuleUpdateAutoCheck}
         />
       </div>
     </section>

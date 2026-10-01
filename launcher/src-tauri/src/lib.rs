@@ -2707,7 +2707,6 @@ pub fn run() {
             // Python verbs that change them (candidates / adopt /
             // use-vco-copy / hand-to-vco). The services.toml adoption
             // commands and the container picker are retired.
-            commands::lifecycle::services_get_endpoints,
             commands::lifecycle::services_endpoint_candidates,
             commands::lifecycle::services_endpoint_action,
             // Container-runtime install (no-runtime modal). Linux uses
@@ -2758,7 +2757,6 @@ pub fn run() {
             commands::projects_v2::get_shared_kg_read_disabled_cmd,
             // Deprecated alias — delegates to set_shared_kg_write_disabled,
             // logs a deprecation warning. Slated for removal ~2026-08.
-            commands::projects_v2::set_shared_kg_opt_out,
             // P1-D (2026-05-08): re-run env writers for a project so the
             // current state of the launcher's access matrix lands in the
             // 3 surfaces. Auto-invoked by access-matrix setters; FE may
@@ -2768,7 +2766,6 @@ pub fn run() {
             // boundary — re-renders `.claude/env` + `.claude/settings.json`
             // for every project so the canonical orchestrator-root
             // resolver's newly-warm DB cache propagates everywhere.
-            commands::projects_v2::refresh_all_projects_env,
             commands::projects_v2::switch_project_host_v2,
             // v0.2.92 WP-17 (W3) — change a registered project's folder.
             // `preview_` is read-only and MUST be called first: the modal
@@ -2848,7 +2845,6 @@ pub fn run() {
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
             // (Phase 4B scaffolding). Wired commands:
-            commands::module_service::rl_is_container_running,
             commands::module_service::restart_rl_container,
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
@@ -2908,7 +2904,6 @@ pub fn run() {
             commands::orchestrator_core::kg_check_duplicates,
             commands::orchestrator_core::code_graph_reanalyze_current,
             commands::orchestrator_core::code_graph_prune_stale,
-            commands::orchestrator_core::orchestrator_health_check,
             commands::orchestrator_core::orchestrator_open_logs,
             // v0.2.24.1 (A0bis): "Clone integrity" tab — root-clone-only
             // affordances. Re-detect orchestrator root + Validate clone
@@ -2996,7 +2991,6 @@ pub fn run() {
             // for `runtime.update_endpoint` itself is deferred to v0.2.32 —
             // only the manual apply / seen / mark-seen Tauri entries are
             // wired here. See `commands/module_deprecation.rs`.
-            commands::module_deprecation::apply_deprecation_state,
             commands::module_deprecation::has_module_deprecation_been_seen,
             commands::module_deprecation::mark_module_deprecation_seen,
             // v0.2.31: module-shipped DB migrations. Manual-repair
@@ -3006,7 +3000,6 @@ pub fn run() {
             // installer_engine's run_install / run_upgrade — these
             // commands are for the GUI / dashboard manual paths.
             commands::module_db::apply_module_db_migrations,
-            commands::module_db::issue_module_access_token,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by
@@ -3019,7 +3012,6 @@ pub fn run() {
             // Per-project orchestrator state (agents/skills/hooks/permissions/secrets/KG/codegraph)
             commands::project_state_cmd::list_project_agents,
             commands::project_state_cmd::list_project_skills,
-            commands::project_state_cmd::list_project_hooks,
             commands::project_state_cmd::list_project_permissions,
             commands::project_state_cmd::list_project_secret_refs,
             commands::project_state_cmd::get_project_state_snapshot,
@@ -3082,7 +3074,6 @@ pub fn run() {
             commands::project_state_cmd::delete_project_codegraph_binding,
             // Per-project MCP servers (migration 010 — Custom MCP tab feed).
             commands::project_state_cmd::list_project_mcp_servers,
-            commands::project_state_cmd::list_user_added_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
             // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
@@ -3111,7 +3102,6 @@ pub fn run() {
             // just diagrams — gets the same surface.
             commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
-            commands::diagrams_cmd::list_project_modules,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no
@@ -3162,7 +3152,6 @@ pub fn run() {
             // alongside the existing text-only one.
             commands::diagrams_cmd::open_diagrams_editor,
             commands::diagrams_cmd::open_diagram_editor_for_path,
-            commands::diagrams_cmd::get_diagrams_token,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
@@ -3170,18 +3159,13 @@ pub fn run() {
             // C8 wire-up (2026-05-25): read-only process env lookup, with
             // a credential-name blocklist. DiagramsTab calls this for the
             // Wayland-fallback decision (XDG_SESSION_TYPE).
-            commands::env_cmd::read_env_var,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
             commands::secrets_cmd::reactivate_secret_v2,
             commands::secrets_cmd::remove_secret_v2,
-            commands::secrets_cmd::is_secret_set,
             commands::secrets_cmd::get_secret_status_v2,
             commands::secrets_cmd::get_secret_preview,
-            commands::secrets_cmd::get_setting_v2,
-            commands::secrets_cmd::set_setting_v2,
-            commands::secrets_cmd::list_module_settings_v2,
             // 0.2.1 grants & per-requester pause API
             commands::secrets_cmd::grant_secret,
             commands::secrets_cmd::revoke_secret_grant_cmd,
@@ -3210,7 +3194,6 @@ pub fn run() {
             commands::projects_v2::update_all_projects,
             // Licensing
             commands::licensing::license_get_tier,
-            commands::licensing::license_is_admin,
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
@@ -3234,7 +3217,6 @@ pub fn run() {
             // UX flows through the License Manager modal go through
             // these commands.
             commands::licensing::list_license_keys,
-            commands::licensing::get_module_license_key_status,
             commands::licensing::set_module_license_key,
             commands::licensing::clear_module_license_key,
             commands::licensing::validate_module_license,
@@ -3258,8 +3240,6 @@ pub fn run() {
             // single-row UX. KEEP: deliberately post-v1 surface.
             commands::codegraph::codegraph_list_access,
             commands::codegraph::codegraph_grant_access,
-            commands::codegraph::codegraph_check_access,
-            commands::codegraph::codegraph_summary,
             // v0.2.72 (P1/P5): codegraph retrieval floors (machine-global) +
             // per-project .claude-index toggle. Registered by the integrator.
             commands::codegraph_settings::get_codegraph_floors,
@@ -3297,7 +3277,6 @@ pub fn run() {
             commands::installer::get_installed_version,
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
-            commands::installer::preview_install,
             commands::installer::detect_existing_install_root,
             // Bug A (v0.2.5): path-agnostic install discovery. FE's
             // `checkStatus()` calls this BEFORE falling back to
@@ -3326,8 +3305,9 @@ pub fn run() {
             // Diagnostics panel. Pull-only: the FE invokes on demand.
             commands::installer::read_install_log,
             // TODO(safety): wire preflight_install_safety_check to the
-            //   OnboardingWizard's confirm-step. Currently `preview_install`
-            //   covers the diff-mode path; preflight returns the richer
+            //   OnboardingWizard's confirm-step (owner-deferred to v0.2.102).
+            //   `install_orchestrator` runs `diff_install` itself and refuses
+            //   with `InstallConflictError`; preflight returns the richer
             //   SafetyReport (volumes, collections, services classification)
             //   and should run before clicking Install on a fresh path.
             commands::installer::preflight_install_safety_check,
@@ -3340,7 +3320,6 @@ pub fn run() {
             // allowlist enforced in storage_ux::is_recognized_legacy_volume.
             commands::storage_ux::get_storage_config,
             commands::storage_ux::set_storage_config,
-            commands::storage_ux::detect_legacy_volumes,
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
             // v0.2.34 (Agent I): read-only resolver for the launcher's
@@ -3438,8 +3417,6 @@ pub fn run() {
             commands::kg::kg_set_node_access_bulk,
             commands::kg::kg_ensure_node_access_schema,
             // Codegraph — graph viz (v1.1)
-            commands::codegraph::codegraph_load_graph,
-            commands::codegraph::codegraph_set_entity_access_bulk,
             // Codegraph — Gap 2: initial build status + manual rebuild
             commands::codegraph::get_code_graph_build_status,
             commands::codegraph::rebuild_code_graph,
@@ -3567,10 +3544,6 @@ pub fn run() {
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
-            // TODO(v1.x): wire save_orchestrator_config to a Settings UI
-            //   "Save" button. update_orchestrator_setting handles the
-            //   per-key path; this command is the bulk-write counterpart.
-            commands::dashboard::save_orchestrator_config,
             commands::dashboard::update_orchestrator_setting,
             commands::dashboard::get_mcp_servers,
             commands::dashboard::toggle_mcp_server,

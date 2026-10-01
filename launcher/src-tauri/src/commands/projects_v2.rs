@@ -4253,29 +4253,6 @@ pub async fn set_shared_kg_read_disabled(
     })
 }
 
-/// Deprecated alias of `set_shared_kg_write_disabled`. Logs a deprecation
-/// notice to stderr and delegates. Slated for removal once the legacy env
-/// var + DB key are fully retired (target: 2026-08, ~3 releases).
-///
-/// The Svelte client ships a matching `setSharedKgOptOut` deprecated
-/// alias — both go away together.
-#[command]
-pub async fn set_shared_kg_opt_out(
-    project_id: String,
-    opt_out: bool,
-    db: State<'_, Db>,
-) -> Result<RenameProjectResult, String> {
-    tracing::warn!(
-        "[vct] DEPRECATED: Tauri command `set_shared_kg_opt_out` was called \
-         (project_id={}, opt_out={}). The toggle now gates WRITES only — \
-         reads of the shared KG are always on. Use \
-         `set_shared_kg_write_disabled` instead. The legacy command will be \
-         removed in ~3 releases (target: 2026-08).",
-        project_id, opt_out,
-    );
-    set_shared_kg_write_disabled(project_id, opt_out, db).await
-}
-
 /// P1-D (2026-05-08): re-run the env projection for a registered
 /// project so the launcher's current view of the access matrix lands in
 /// `.claude/env` and `.claude/settings.json env`. (PR-27 / v0.2.12 /
@@ -4291,12 +4268,26 @@ pub async fn set_shared_kg_opt_out(
 /// list of warnings produced by the projection, plus the
 /// access lists this run resolved (so the FE can show "now exporting
 /// VCT_KG_ACCESS_LIST=Foo,Bar" feedback).
+///
+/// The per-project "Re-render this project's env" button on the project's
+/// Settings tab calls this. There is deliberately NO all-projects button
+/// (owner ruling, v0.2.100: re-rendering every project at once is too risky
+/// to hand to users); `refresh_all_projects_env_with_db` stays as the
+/// internal core for the boot hook and the gate paths.
+///
+/// The projection runs a Python subprocess (30 s cap), so it goes through
+/// the blocking pool, not a tokio worker (F3).
 #[command]
 pub async fn refresh_project_env(
     project_id: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<RefreshProjectEnvResult, String> {
-    refresh_project_env_with_db(&db, &project_id)
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_project_env",
+        move |db| refresh_project_env_with_db(db, &project_id),
+    )
+    .await?
 }
 
 /// Free-function variant of `refresh_project_env` that takes `&Db` so
@@ -4398,9 +4389,13 @@ pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult 
 ///   * The launcher's first-boot setup hook (post seed consumption)
 ///     — re-renders env for every project so the user-project-style
 ///     "missing exports" state is healed automatically.
-///   * The launcher GUI's "Refresh all projects" admin action, if a
-///     user wants to force a manual refresh after a manual edit to
-///     the launcher DB.
+///   * The `app_state` write trigger (`app_state_cmd.rs`), which carries the
+///     RL logging / online-training global switches into every project.
+///
+/// Deliberately NOT a Tauri command: a manual "re-render every project"
+/// button was retired in v0.2.100 (owner: doing it for all projects is a
+/// risky operation users should not be offered). The per-project repair is
+/// `refresh_project_env`.
 ///
 /// Soft-fail per project: one project's hiccup MUST NOT prevent the
 /// others from refreshing. Returns a per-project status map (the
@@ -4457,27 +4452,6 @@ pub struct RefreshAllProjectsEnvResult {
     /// Errors outside the per-project loop (e.g. `list_projects`
     /// itself failed).
     pub global_warnings: Vec<String>,
-}
-
-/// v0.2.37 (Agent V37-E): Tauri command surface for the bulk refresh.
-/// Lets the launcher GUI's admin / dev-tools tab trigger a manual
-/// "re-render env for every project" without the user having to walk
-/// project-by-project. The boot hook in lib.rs calls
-/// `refresh_all_projects_env_with_db` directly (no Tauri layer).
-///
-/// F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
-/// each) — route it through spawn_blocking so it doesn't park a tokio
-/// worker for the duration.
-#[command]
-pub async fn refresh_all_projects_env(
-    app: tauri::AppHandle,
-) -> Result<RefreshAllProjectsEnvResult, String> {
-    crate::commands::blocking::run_with_db_on_blocking_pool(
-        app,
-        "refresh_all_projects_env",
-        refresh_all_projects_env_with_db,
-    )
-    .await
 }
 
 #[command]
@@ -6910,14 +6884,14 @@ mod tests {
         assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
     }
 
-    /// Tauri command level: legacy `set_shared_kg_opt_out` delegates to
-    /// `set_shared_kg_write_disabled`. Both write under the canonical DB
-    /// key and refresh env surfaces. We exercise the underlying logic
+    /// `set_shared_kg_write_disabled` writes under the canonical DB key and
+    /// refreshes env surfaces (the legacy `set_shared_kg_opt_out` command
+    /// was retired in v0.2.100; the legacy key constants remain for the
+    /// migration that relocates old rows). We exercise the underlying logic
     /// (skipping the actual #[command] async wrapping, which needs the
-    /// Tauri runtime) by setting the row and confirming env files reflect
-    /// it — same code path the deprecated command takes.
+    /// Tauri runtime) by setting the row and confirming env files reflect it.
     #[test]
-    fn deprecated_set_shared_kg_opt_out_writes_canonical_key() {
+    fn set_shared_kg_write_disabled_writes_canonical_key() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         let tmp = std::env::temp_dir().join(format!(
@@ -6927,7 +6901,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         db.insert_project(&pid, "Acme", tmp.to_str().unwrap(), ProjectHost::Base, "acme").unwrap();
 
-        // Simulate the legacy command: same DB write the new command does.
+        // Same DB write the command does.
         db.set_setting(
             &pid,
             KG_GATE_MODULE_ID,

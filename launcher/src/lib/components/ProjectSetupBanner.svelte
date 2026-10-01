@@ -22,6 +22,7 @@
 
   import { onDestroy } from 'svelte';
   import { projectSetup } from '$lib/stores/project-setup';
+  import { selectedProject } from '$lib/stores/projects';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import OperationProgressBanner from '$lib/components/OperationProgressBanner.svelte';
@@ -42,6 +43,14 @@
       clearInterval(tick);
       tick = null;
     }
+  });
+
+  // v0.2.100: after a reload the store is empty, so restore the selected
+  // project's persisted setup status (in-flight, failed-with-Retry, or a
+  // recent terminal state). A live event already in the store wins.
+  $effect(() => {
+    const p = $selectedProject;
+    if (p) void projectSetup.rehydrate(p.id, p.name);
   });
 
   onDestroy(() => {

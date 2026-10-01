@@ -9,7 +9,7 @@
 //!      module exposes the `was_first_seen` field on the result so the GUI
 //!      decides whether to fire the notification).
 //!   2. Env-var injection into `.claude/settings.json env` (Claude-visible)
-//!      via [`apply_deprecation_state`]. Four keys land in the JSON env
+//!      via [`apply_deprecation_state_impl`]. Four keys land in the JSON env
 //!      block under the same `env` key as the canonical install pairs:
 //!
 //!        * `VCT_RL_MODULE_DEPRECATED=1`
@@ -104,7 +104,7 @@ pub(crate) const DEPRECATION_ENV_KEYS: &[&str] = &[
     "VCT_RL_MODULE_DEPRECATION_URL",
 ];
 
-/// Result of [`apply_deprecation_state`]. Soft-fail per layer: a layer
+/// Result of [`apply_deprecation_state_impl`]. Soft-fail per layer: a layer
 /// failure populates `warnings` rather than failing the whole call.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApplyDeprecationResult {
@@ -302,32 +302,6 @@ fn write_or_strip_deprecation_env(
         DEPRECATION_ENV_KEYS,
     )
     .map(|_| ())
-}
-
-/// Tauri command surface for [`apply_deprecation_state_impl`]. Callers
-/// (e.g. the polling task once it lands in v0.2.32) invoke this on every
-/// poll cycle. Re-asserting the same state is cheap — only a transition
-/// touches the audit + env layers.
-#[command]
-pub async fn apply_deprecation_state(
-    project_id: String,
-    module_id: String,
-    deprecated: bool,
-    message: Option<String>,
-    eol_date: Option<String>,
-    migration_url: Option<String>,
-    db: State<'_, Db>,
-) -> Result<ApplyDeprecationResult, String> {
-    let res = apply_deprecation_state_impl(
-        &db,
-        &project_id,
-        &module_id,
-        deprecated,
-        message.as_deref(),
-        eol_date.as_deref(),
-        migration_url.as_deref(),
-    );
-    Ok(res)
 }
 
 /// Has the launcher already fired the one-shot desktop notification for

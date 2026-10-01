@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from '$lib/tauri';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { rlScoringSwitchView } from '$lib/rl-scoring-default';
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -100,6 +101,13 @@
       error = e instanceof Error ? e.message : String(e);
     }
   }
+
+  // v0.2.100: the RL-Scored Retrieval switch is the global default of the
+  // per-project RL toggle. Wired end to end, but rendered DISABLED and OFF
+  // until a model is trained (see $lib/rl-scoring-default).
+  const rlSwitch = $derived(
+    config && features ? rlScoringSwitchView(config.rl_retrieval_enabled, features.has_rl_retrieval) : null,
+  );
 
   function tierLabel(tier: string): string {
     if (tier === 'free') return 'Free';
@@ -249,11 +257,15 @@
             <div class="feature-row">
               <div class="feature-info">
                 <h3>RL-Scored Retrieval</h3>
-                <p>Reinforcement learning reranking — learns from your usage patterns</p>
+                <p>Default for every project's RL reranker toggle — projects with no setting of their own follow it</p>
+                {#if rlSwitch?.notice}
+                  <p class="rl-locked-notice" data-testid="rl-scoring-locked-notice">{rlSwitch.notice}</p>
+                {/if}
               </div>
               <label class="toggle-switch">
-                <input type="checkbox" checked={config.rl_retrieval_enabled}
-                  disabled={!features.has_rl_retrieval}
+                <input type="checkbox" checked={rlSwitch?.checked ?? false}
+                  disabled={rlSwitch?.disabled ?? true}
+                  data-testid="rl-scoring-switch"
                   onchange={(e) => updateSetting('rl_retrieval_enabled', String((e.target as HTMLInputElement).checked))} />
                 <span class="toggle-slider"></span>
               </label>
@@ -455,6 +467,7 @@
   .feature-info { flex: 1; }
   .feature-info h3 { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
   .feature-info p { font-size: 12px; color: var(--color-muted); }
+  .rl-locked-notice { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--color-purple, #7b5fff); }
   .upgrade-hint {
     font-size: 11px;
     color: var(--color-purple);

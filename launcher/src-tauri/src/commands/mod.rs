@@ -76,11 +76,6 @@ pub mod env_secrets_migrate;
 // option (smart default = most-populated slot). Thin shell-out to
 // `vco_lib.embedding_enrichment slot-counts`; no duplicate count logic.
 pub mod embedding_slot_counts;
-// C8 wire-up (2026-05-25): Tauri command `read_env_var` consumed by the
-// DiagramsTab Wayland fallback (read XDG_SESSION_TYPE). Secret-shaped
-// names are redacted to "" before reaching std::env::var; the FE never
-// sees credential-looking values.
-pub mod env_cmd;
 // v0.2.92 WP-13: the ONE git runner + the ONE branch resolver. `installer.rs`
 // normalised a detached `"HEAD"` → `main` at five inline sites while
 // `self_update.rs` did it at zero, so the two update surfaces gave OPPOSITE

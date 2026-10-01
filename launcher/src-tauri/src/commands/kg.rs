@@ -992,6 +992,11 @@ pub async fn kg_set_collection_access_mode(
 // REST PATCH will fail; we catch and report so callers can run a schema
 // migration. This is best-effort — the launcher's collection-level access
 // gate is still authoritative for reads.
+//
+// NOT ENFORCED YET: nothing reads `cross_project_access` when serving a
+// search (the MCP fan-out and the hub ignore it). Enforcement is deferred by
+// the owner to v0.2.102; the KG screen says so next to the control
+// (`lib/kg/node-access-notice.ts`).
 
 #[derive(Debug, Deserialize)]
 pub struct NodeAccessReq {

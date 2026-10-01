@@ -103,7 +103,7 @@ Secrets entered through the Launcher GUI are stored in the OS keychain, not in p
 Maintained blocklist of every token that has ever leaked from this repo's history. Wire as a git pre-commit hook. Refusals include the exact file and a pointer to the secrets rotation runbook (see maintainer docs).
 
 ### Hard path whitelist (install safety)
-The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. A `preflight_install_safety_check` Tauri command runs before any installation step.
+The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. What actually gates an install today: `install_orchestrator` runs `diff_install` and refuses with a conflict when it would overwrite files it does not own. A `preflight_install_safety_check` Tauri command exists (it reports what would be overwritten, preserved and added) but no launcher screen calls it yet; the preflight panel is deferred by the owner to v0.2.102.
 
 ### Read-merge-write for all settings files
 All writes to `.claude/settings.json` perform a read-merge-write: only the managed key(s) are overwritten; any other content the user has added is preserved. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes the env block into `.vscode/settings.json` at all — that file is touched only by the Python-side Pylance/watcher exclude backfill, which similarly uses key-level read-merge-write to preserve user customizations.

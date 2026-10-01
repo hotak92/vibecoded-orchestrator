@@ -18,6 +18,7 @@ import {
   dormantNotice,
   enableMechanismFor,
   globalDefaultLine,
+  moduleSystemDefault,
   globalTriChoiceFor,
   globalTriChoiceToValue,
   installedTileUsesCascade,
@@ -166,6 +167,12 @@ describe('moduleEffectiveLine — a value is never stated without its cause', ()
     expect(line).toMatch(/nothing set/i);
   });
 
+  it('an RL-reranker system default reads Off, not On (v0.2.100)', () => {
+    const line = moduleEffectiveLine(state({ effective: false, source: 'system_default' }));
+    expect(line).toMatch(/^Off/);
+    expect(line).toMatch(/defaults to off/i);
+  });
+
   it('every source × value combination produces a line naming its cause', () => {
     const cases: ModuleEnableState[] = [
       state({ explicit: true, effective: true, source: 'project' }),
@@ -173,6 +180,7 @@ describe('moduleEffectiveLine — a value is never stated without its cause', ()
       state({ global_default: true, effective: true, source: 'global_default' }),
       state({ global_default: false, effective: false, source: 'global_default' }),
       state({ effective: true, source: 'system_default' }),
+      state({ effective: false, source: 'system_default' }),
     ];
     for (const s of cases) {
       const line = moduleEffectiveLine(s);
@@ -243,5 +251,17 @@ describe('dormant modules — the USER rider', () => {
   it('returns null for any module not in the dormant set', () => {
     expect(dormantNotice('vct-coordination')).toBeNull();
     expect(dormantBadgeLabel('vct-coordination')).toBeNull();
+  });
+});
+
+describe('moduleSystemDefault / globalDefaultLine (v0.2.100)', () => {
+  it('only the RL reranker defaults off; every other module stays fail-open', () => {
+    expect(moduleSystemDefault('vct-rl-reranker')).toBe(false);
+    expect(moduleSystemDefault('vct-coordination')).toBe(true);
+  });
+
+  it('the host-wide "nothing set" line follows the module system default', () => {
+    expect(globalDefaultLine(null, true)).toMatch(/are on unless/);
+    expect(globalDefaultLine(null, false)).toMatch(/is off unless/);
   });
 });

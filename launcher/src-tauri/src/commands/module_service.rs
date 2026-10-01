@@ -168,8 +168,20 @@ pub struct RlDashboardState {
     /// First 8 chars of the active weights file's sha256, "" when no
     /// state row yet.
     pub weights_sha256_prefix: String,
+    /// v0.2.100: events recorded for this project in the last 24 hours,
+    /// counted from the `rl_events` table in launcher.db (the real corpus
+    /// since v0.2.47). Before this it was the length of the last <=10 lines
+    /// of a JSONL file nothing has written since v0.2.47, so it was always 0.
     pub recent_events_count: u32,
+    /// Legacy placeholder, always `0.0`. The JSONL it was averaged from is
+    /// gone and `rl_events` rows carry no latency; kept so the wire shape
+    /// (and saved snapshots) stay readable.
     pub recent_events_avg_latency_ms: f32,
+    /// v0.2.100: every event ever collected for this project (the whole
+    /// `rl_events` corpus for it, pruned rows excluded). This is the number
+    /// that answers "is training data being collected?".
+    #[serde(default)]
+    pub total_events_count: u32,
     /// v0.2.29: from `GET /state_summary` — count of registry entries
     /// with `idx >= N_ENTITY_TYPES` (i.e. user-trained types beyond the
     /// builtin set). `None` when the probe failed.
@@ -198,6 +210,7 @@ impl RlDashboardState {
             weights_sha256_prefix: String::new(),
             recent_events_count: 0,
             recent_events_avg_latency_ms: 0.0,
+            total_events_count: 0,
             dynamic_types_count: None,
             d1_marker_present: None,
         }
@@ -1362,8 +1375,8 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 
 // ─── Tauri commands (Phase 1E / 3C / 4A / 4B) ───────────────────────────
 //
-// Step 24 commit b: the lifecycle commands (`rl_is_container_running`,
-// `restart_rl_container`) now proxy to the hub's
+// Step 24 commit b: the lifecycle surface (`restart_rl_container`; "is it
+// running" is the hub's `module_health_snapshot`) proxies to the hub's
 // `/api/v1/projects/{project_id}/modules/{module_id}/...` endpoints
 // (filled in by `vct-hub::lifecycle_api`). The supervisor logic lives
 // in `vct-hub::module_supervisor`.
@@ -1374,26 +1387,6 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 // working in the "hub crashed but launcher GUI still up" failure mode
 // and during the v0.2.21 → v0.2.22 cutover where some users may run a
 // stale hub binary.
-
-/// `is_container_running` by project_id. First tries the hub proxy;
-/// falls back to in-process probe if the hub is unreachable.
-#[command]
-pub async fn rl_is_container_running(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<bool, String> {
-    // Hub-first path.
-    if let Ok(running) = hub_proxy_module_status(&project_id, RL_RERANKER_MODULE_ID).await {
-        return Ok(running);
-    }
-    // Fallback: in-process probe (used when hub unreachable).
-    let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
-    let name = match install.and_then(|i| i.container_name) {
-        Some(n) if !n.is_empty() => n,
-        _ => return Ok(false),
-    };
-    is_container_running(&name).await
-}
 
 /// Restart the per-project RL container. Hub proxy not yet wired for
 /// restart (the hub-side endpoint is 501 until a catalog resolver
@@ -1493,35 +1486,6 @@ fn hub_token_for_proxy() -> Result<String, String> {
     vct_launcher_core::services::boot_token::read_nonempty_token_file(
         &crate::paths::vct_root_dir().join("hub.token"),
     )
-}
-
-/// Proxy for `GET /projects/{project_id}/modules/{module_id}/status`.
-/// Returns the `running` boolean from the JSON envelope.
-async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bool, String> {
-    let port = hub_port_for_proxy()?;
-    let token = hub_token_for_proxy()?;
-    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(5))?;
-    let url = format!(
-        "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/status",
-        port, project_id, module_id
-    );
-    let resp = client
-        .get(&url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| format!("hub GET status: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("hub status returned {}", resp.status()));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse hub status: {}", e))?;
-    Ok(body
-        .get("running")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false))
 }
 
 /// Proxy for `POST /projects/{project_id}/modules/{module_id}/stop`.
@@ -2494,18 +2458,33 @@ async fn run_finetune_then_rotate_async(
 
 // ─── Phase 4B: dashboard widget commands ────────────────────────────────
 
-/// Reads `module_install` + `is_container_running` + recent rl_events.jsonl
-/// tail. Returns the struct expected by the dashboard widget. Soft-fail
-/// throughout — never errors out on a partial state.
+/// Reads `module_install` + `is_container_running` + the `rl_events` counts
+/// (launcher.db, via `rl_event_counts`). Returns the struct expected by the
+/// dashboard widget. Soft-fail throughout — never errors out on a partial
+/// state. The event counts are reported even when the RL module is not
+/// installed: collection does not depend on the module.
 #[command]
 pub async fn get_rl_dashboard_state(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<RlDashboardState, String> {
+    // v0.2.100: the collection counters come from `rl_events` and are
+    // independent of the module install: event collection runs whether or
+    // not the RL module is installed, so the "not installed" state must
+    // still report the real corpus size.
+    let (recent_events_count, total_events_count) =
+        rl_event_counts(&db, &project_id, now_unix_ms());
+
     let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
     let install = match install {
         Some(i) => i,
-        None => return Ok(RlDashboardState::empty()),
+        None => {
+            return Ok(RlDashboardState {
+                recent_events_count,
+                total_events_count,
+                ..RlDashboardState::empty()
+            })
+        }
     };
 
     let project = db
@@ -2559,9 +2538,6 @@ pub async fn get_rl_dashboard_state(
         })
         .unwrap_or_default();
 
-    let (recent_events_count, recent_events_avg_latency_ms) =
-        load_recent_event_stats(&project.slug).await;
-
     // v0.2.29: probe `GET /state_summary` (vct-rl-reranker v0.2.3+).
     // Soft-fail to `(None, None)` if the container isn't running, the
     // endpoint 404s (pre-v0.2.3 module), or the body fails to parse.
@@ -2588,7 +2564,8 @@ pub async fn get_rl_dashboard_state(
         last_finetuned_at: 0,
         weights_sha256_prefix: String::new(),
         recent_events_count,
-        recent_events_avg_latency_ms,
+        recent_events_avg_latency_ms: 0.0,
+        total_events_count,
         dynamic_types_count,
         d1_marker_present,
     })
@@ -2622,74 +2599,43 @@ async fn probe_state_summary(port: u16) -> (Option<u32>, Option<bool>) {
     (dyn_count, marker)
 }
 
-/// Read the last <=10 events from `rl_events_<slug>.jsonl` and return
-/// `(count, avg_latency_ms)`. Hard caps the file-tail read at 16 KB so
-/// the dashboard call is bounded even when the events file is huge.
-async fn load_recent_event_stats(project_slug: &str) -> (u32, f32) {
-    let safe_slug = sanitize_path_component(project_slug);
-    let path = match directories::UserDirs::new() {
-        Some(d) => d
-            .home_dir()
-            .join(".claude")
-            .join("retrieval_rl_data")
-            .join(format!("rl_events_{}.jsonl", safe_slug)),
-        None => return (0, 0.0),
-    };
-    parse_recent_event_stats_from_path(&path).await
+/// Window for [`RlDashboardState::recent_events_count`].
+const RL_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Path-driven variant so we can unit-test the parsing logic without
-/// depending on `directories::UserDirs`.
-async fn parse_recent_event_stats_from_path(path: &Path) -> (u32, f32) {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return (0, 0.0),
-    };
-    let len = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(_) => return (0, 0.0),
-    };
-    const TAIL_BYTES: u64 = 16 * 1024;
-    let read_from = len.saturating_sub(TAIL_BYTES);
-    if file.seek(SeekFrom::Start(read_from)).await.is_err() {
-        return (0, 0.0);
-    }
-    let mut buf = Vec::with_capacity(TAIL_BYTES as usize);
-    if file.read_to_end(&mut buf).await.is_err() {
-        return (0, 0.0);
-    }
-    let s = String::from_utf8_lossy(&buf);
-
-    let lines: Vec<&str> = if read_from > 0 {
-        s.lines().skip(1).collect()
-    } else {
-        s.lines().collect()
-    };
-
-    let mut latencies: Vec<f32> = Vec::new();
-    for line in lines.iter().rev().take(10).rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// `(events in the last 24h, all events)` for one project, counted from the
+/// `rl_events` table in launcher.db via `Db::count_rl_events` (the same
+/// accessor the hub's `GET /api/v1/rl/events/count` uses). The corpus moved
+/// from `~/.claude/retrieval_rl_data/rl_events_<slug>.jsonl` to that table in
+/// v0.2.47; this used to tail the JSONL, which nothing has written since, so
+/// the dashboard figure read 0 while events were being collected.
+///
+/// Soft-fails to `(0, 0)` on a DB error: a dashboard counter must never
+/// error the load. Saturates into `u32`.
+pub(crate) fn rl_event_counts(db: &Db, project_id: &str, now_ms: i64) -> (u32, u32) {
+    let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
+    let total = match db.count_rl_events(Some(project_id), None, None, None) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("[rl-dashboard] count rl_events failed: {}", e);
+            return (0, 0);
         }
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(trimmed);
-        if let Ok(v) = parsed {
-            if let Some(lat) = v.get("latency_ms").and_then(|x| x.as_f64()) {
-                latencies.push(lat as f32);
-            } else if let Some(lat) = v.get("latency_ms").and_then(|x| x.as_i64()) {
-                latencies.push(lat as f32);
-            }
-        }
-    }
-    let count = latencies.len() as u32;
-    let avg = if count > 0 {
-        latencies.iter().sum::<f32>() / count as f32
-    } else {
-        0.0
     };
-    (count, avg)
+    let recent = db
+        .count_rl_events(
+            Some(project_id),
+            None,
+            Some(now_ms.saturating_sub(RL_RECENT_WINDOW_MS)),
+            None,
+        )
+        .unwrap_or(0);
+    (clamp(recent), clamp(total))
 }
 
 // ─── Startup hook + daily poller (scaffolding) ──────────────────────────
@@ -4462,36 +4408,60 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── recent events parsing ─────────────────────────────────────────
+    // ─── rl_event_counts reads the real store ──────────────────────────
 
-    #[tokio::test]
-    async fn recent_events_avg_latency_handles_missing_file() {
-        let nonexistent = PathBuf::from("/tmp/__rl_test_def_not_there.jsonl");
-        let (count, avg) = parse_recent_event_stats_from_path(&nonexistent).await;
-        assert_eq!(count, 0);
-        assert!((avg - 0.0).abs() < f32::EPSILON);
+    fn fixture_project_db() -> (Db, String) {
+        let db = Db::open_in_memory().expect("DB");
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES ('proj-rl', 'P', '/tmp/p', 'base', 'p-slug', 1, 1)",
+                    [],
+                )
+                .expect("insert project");
+        }
+        (db, "proj-rl".to_string())
     }
 
-    #[tokio::test]
-    async fn recent_events_avg_latency_averages_last_10_lines() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("rl_test_avg_{}.jsonl", std::process::id()));
-
-        let mut content = String::new();
-        for i in 1..=12u32 {
-            content.push_str(&format!(
-                "{{\"event\":\"rerank\",\"latency_ms\":{}}}\n",
-                i * 10
-            ));
+    /// A project with events in `rl_events` reports them. The old reader
+    /// tailed a JSONL file that nothing writes, so it always said 0.
+    #[test]
+    fn rl_event_counts_reads_the_rl_events_table() {
+        let (db, pid) = fixture_project_db();
+        let now = 10 * RL_RECENT_WINDOW_MS;
+        // 2 recent, 1 older than 24h.
+        for (i, ts) in [now - 1_000, now - 5_000, now - RL_RECENT_WINDOW_MS - 1].iter().enumerate() {
+            db.insert_rl_event(
+                "retrieval", 3, *ts, Some(&pid), None, &format!("t{i}"),
+                None, None, None, None, "{}",
+            )
+            .unwrap();
         }
-        tokio::fs::write(&path, content).await.expect("write");
+        assert_eq!(rl_event_counts(&db, &pid, now), (2, 3));
+    }
 
-        let (count, avg) = parse_recent_event_stats_from_path(&path).await;
-        assert_eq!(count, 10);
-        // Lines 3..=12 → latencies 30, 40, ..., 120. Sum 750, avg 75.0.
-        assert!((avg - 75.0).abs() < 0.01, "got {}", avg);
+    /// Another project's events, and events with no project, never count.
+    #[test]
+    fn rl_event_counts_is_scoped_to_the_project() {
+        let (db, pid) = fixture_project_db();
+        db.insert_rl_event("retrieval", 3, 5, None, None, "free", None, None, None, None, "{}")
+            .unwrap();
+        assert_eq!(rl_event_counts(&db, &pid, 10), (0, 0));
+    }
 
-        let _ = tokio::fs::remove_file(&path).await;
+    #[test]
+    fn rl_dashboard_state_reports_total_events_on_the_wire() {
+        let v = serde_json::to_value(RlDashboardState::empty()).unwrap();
+        assert_eq!(v["total_events_count"], 0);
+        // A snapshot saved before the field existed still deserializes.
+        let legacy = r#"{"container_name":"","container_running":false,"port":0,
+            "image_tag":"","current_weights_version":"","last_checked_at":0,
+            "last_finetuned_at":0,"weights_sha256_prefix":"",
+            "recent_events_count":0,"recent_events_avg_latency_ms":0.0}"#;
+        let d: RlDashboardState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(d.total_events_count, 0);
     }
 
     // ─── DB-backed: ensure_project_rl_port ─────────────────────────────

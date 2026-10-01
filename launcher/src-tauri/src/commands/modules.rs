@@ -93,11 +93,11 @@ pub struct ModuleCatalogEntry {
     /// `DEPRECATED` badge in the launcher's Modules card head; does NOT
     /// block install/run (deprecated modules keep working until EOL).
     ///
-    /// Populated at catalog-build time once the v0.2.32 poller wires the
-    /// Supabase response into `apply_deprecation_state`. v0.2.31 ships
-    /// the field with a `false` default so the UI is forward-compatible;
-    /// manual flips via the `apply_deprecation_state` Tauri command set
-    /// the env vars + audit row independently of this catalog field.
+    /// Populated at catalog-build time by `ModuleCatalogEntry::from_l0`,
+    /// which copies the L0 catalog's `deprecated` / message / EOL fields
+    /// (the deprecation poller writes the same state through
+    /// `apply_deprecation_state_impl`). Entries built without an L0 row
+    /// (this default constructor) are `false`.
     #[serde(default)]
     pub deprecated: bool,
     /// Optional human-readable deprecation message (rendered in the badge
@@ -173,8 +173,8 @@ impl ModuleCatalogEntry {
             cta_route: String::new(),
             coming_soon_tier: String::new(),
             coming_soon_target: String::new(),
-            // v0.2.31: defaults — catalog-build time doesn't yet read
-            // `runtime.update_endpoint`. See struct doc comment.
+            // Defaults for entries with no L0 row; `from_l0` fills the
+            // deprecation fields from the L0 catalog. See struct doc comment.
             deprecated: false,
             deprecation_message: String::new(),
             deprecation_eol_date: String::new(),

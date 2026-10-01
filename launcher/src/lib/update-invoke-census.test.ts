@@ -23,50 +23,32 @@
 // the name must NOT be counted.
 
 import { describe, expect, it } from 'vitest';
-import { readFileSync, readdirSync, statSync } from 'node:fs';
-import { join, relative, sep } from 'node:path';
-import { fileURLToPath } from 'node:url';
+import { loadFrontend, sourceFile, type SourceFile } from './test-support/source-census';
 
-const SRC = fileURLToPath(new URL('..', import.meta.url));
-
-function walk(dir: string, out: string[] = []): string[] {
-  for (const name of readdirSync(dir)) {
-    const p = join(dir, name);
-    if (statSync(p).isDirectory()) {
-      if (name === 'test-stubs' || name === 'node_modules') continue;
-      walk(p, out);
-    } else if (/\.(svelte|ts)$/.test(name) && !/\.test\.ts$/.test(name)) {
-      out.push(p);
-    }
-  }
-  return out;
-}
-
-/** Remove `//` and block comments (and Svelte `<!-- -->`) so a comment
- *  naming a command never counts as a call site. */
-function stripComments(src: string): string {
-  return src
-    .replace(/<!--[\s\S]*?-->/g, '')
-    .replace(/\/\*[\s\S]*?\*\//g, '')
-    .replace(/(^|[^:'"`])\/\/[^\n]*/g, '$1');
-}
+// The comment-stripper, file walk and literal masking are the shared
+// `source-census` lexer (WP-11): this file used to carry its own regex
+// stripper, which eats real code the moment a string holds `//` or `/*`
+// (the bug WP-11 fixed in the other two censuses).
 
 // `tauriInvoke` is the orchestrator store's import alias of `invoke`.
-const CALL_RE = /\b(?:safeInvoke|tauriInvoke|invoke)\s*(?:<[^()]*?>)?\s*\(\s*['"`]([a-z0-9_]+)['"`]/g;
+const CALL_RE = /(?<![\w$.])(?:safeInvoke|tauriInvoke|invoke)\s*(?:<[^()]*?>)?\s*\(\s*/g;
 
-/** Literal command names invoked in `src`, with call counts. */
-function invokedNames(src: string): Map<string, number> {
+/** Literal command names invoked in `f`, with call counts. A call is located
+ *  in the literal-masked text (so `invoke('x')` inside a log string or a
+ *  comment is never a call) and its argument read from the comment-stripped
+ *  text at the same offset. */
+function invokedNames(f: SourceFile): Map<string, number> {
   const out = new Map<string, number>();
-  for (const m of stripComments(src).matchAll(CALL_RE)) {
-    out.set(m[1], (out.get(m[1]) ?? 0) + 1);
+  for (const m of f.code.matchAll(CALL_RE)) {
+    const lit = /^(['"`])([a-z0-9_]+)\1/.exec(f.text.slice(m.index! + m[0].length, m.index! + m[0].length + 80));
+    if (lit) out.set(lit[2], (out.get(lit[2]) ?? 0) + 1);
   }
   return out;
 }
 
-const FILES = walk(SRC).map((abs) => ({
-  rel: relative(SRC, abs).split(sep).join('/'),
-  names: invokedNames(readFileSync(abs, 'utf-8')),
-}));
+const fixture = (src: string) => invokedNames(sourceFile('fixture.ts', src, 'ts'));
+
+const FILES = loadFrontend().map((f) => ({ rel: f.rel, text: f.text, names: invokedNames(f) }));
 
 function sitesOf(cmd: string): string[] {
   return FILES.filter((f) => f.names.has(cmd)).map((f) => f.rel);
@@ -74,7 +56,7 @@ function sitesOf(cmd: string): string[] {
 
 describe('scanner fixtures (red-proof)', () => {
   it('sees a direct invoke, typed or not, single or double quotes', () => {
-    const n = invokedNames(`
+    const n = fixture(`
       await invoke('update_orchestrator', { path });
       await invoke<void>("restart_launcher", {});
       const x = await safeInvoke<Record<string, unknown>>('apply_pending_install');
@@ -89,13 +71,23 @@ describe('scanner fixtures (red-proof)', () => {
   });
 
   it('does not count a comment or a bare string', () => {
-    const n = invokedNames(`
+    const n = fixture(`
       // await invoke('update_orchestrator', { path });
       /* invoke('restart_launcher') */
       <!-- invoke('apply_launcher_update') -->
       const label = 'update_orchestrator_at';
     `);
     expect(n.size).toBe(0);
+  });
+
+  it('a string holding // or /* does not hide the calls after it (the regex-stripper bug)', () => {
+    const n = fixture(`
+      const glob = 'commands/*';
+      const url = "https://x.invalid/a//b";
+      await invoke('still_seen', {});
+      const log = "invoke('only_in_a_string')";
+    `);
+    expect([...n.keys()]).toEqual(['still_seen']);
   });
 
   it('actually scanned the launcher sources', () => {
@@ -131,7 +123,7 @@ describe('update commands are invoked only through the store', () => {
 });
 
 describe('root layout wiring', () => {
-  const layout = stripComments(readFileSync(join(SRC, 'routes/+layout.svelte'), 'utf-8'));
+  const layout = FILES.find((f) => f.rel === 'routes/+layout.svelte')!.text;
 
   it('startStatusPolling() is the FIRST statement of onMount (L3-F13)', () => {
     const at = layout.indexOf('onMount(() => {');
@@ -147,9 +139,7 @@ describe('root layout wiring', () => {
       (f) =>
         f.rel !== 'routes/+layout.svelte' &&
         f.rel !== 'lib/stores/ui.ts' &&
-        /registerShellListeners\(|['"`]vct-tray-action['"`]/.test(
-          stripComments(readFileSync(join(SRC, f.rel), 'utf-8')),
-        ),
+        /registerShellListeners\(|['"`]vct-tray-action['"`]/.test(f.text),
     ).map((f) => f.rel);
     expect(elsewhere).toEqual([]);
   });

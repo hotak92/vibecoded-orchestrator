@@ -5,7 +5,7 @@
 //! Migration 018 (v0.2.31) ships two tables:
 //!
 //!   * `deprecation_events` — every transition observed by
-//!     `apply_deprecation_state` (false → true OR true → false). Useful for
+//!     `apply_deprecation_state_impl` (false → true OR true → false). Useful for
 //!     "deprecated for N days" badge text and support-ticket triage.
 //!     Append-only; rows are never UPDATEd in place.
 //!   * `module_deprecation_seen` — single sentinel row per
@@ -14,7 +14,7 @@
 //!
 //! WRITER MODEL: this module exposes plain INSERT helpers and a single read
 //! helper (`has_module_deprecation_been_seen`). Callers — the launcher's
-//! `apply_deprecation_state` Tauri command — are responsible for sequencing:
+//! `apply_deprecation_state_impl` (driven by the poller) — are responsible for sequencing:
 //!
 //!   1. Look up prior state (most-recent `deprecated` from `deprecation_events`).
 //!   2. If the new state differs, append a row.
@@ -22,7 +22,7 @@
 //!      `module_deprecation_seen` row IF NOT EXISTS.
 //!
 //! Soft-fail discipline: every DB error is returned to the caller as a
-//! `Result<_, String>`. The caller (`apply_deprecation_state`) logs +
+//! `Result<_, String>`. The caller (`apply_deprecation_state_impl`) logs +
 //! continues so that a write hiccup in Layer 3 (audit) does NOT block
 //! Layer 1 (GUI) or Layer 2 (env-var injection). See the spec at
 //! `.claude/context/plans/rl-deprecation-warning-surface-spec-2026-05-23.md`

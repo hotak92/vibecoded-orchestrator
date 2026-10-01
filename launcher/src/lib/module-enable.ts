@@ -167,7 +167,22 @@ export function moduleEffectiveLine(state: ModuleEnableState): string {
       ? 'On — following the host-wide default.'
       : 'Off — following the host-wide default.';
   }
-  return 'On — nothing set for this project and no host-wide default (modules default to on).';
+  return state.effective
+    ? 'On — nothing set for this project and no host-wide default (modules default to on).'
+    : 'Off — nothing set for this project and no host-wide default (this module defaults to off).';
+}
+
+/**
+ * What a module resolves to when no project row and no host-wide row exist.
+ * `true` (fail-open) for every module except the RL reranker, which is OFF
+ * (v0.2.100: RL scoring stays inactive until the model is trained).
+ *
+ * MUST MATCH `vct_launcher_core::db::settings::module_enable_system_default`
+ * (Rust, the resolver the hub serves); a display-only mirror, because this is
+ * a pure render helper and a per-call IPC for one boolean is not worth it.
+ */
+export function moduleSystemDefault(moduleId: string): boolean {
+  return moduleId !== 'vct-rl-reranker';
 }
 
 /**
@@ -176,9 +191,14 @@ export function moduleEffectiveLine(state: ModuleEnableState): string {
  * loading value — so it gets a named third position rather than "neither
  * button highlighted".
  */
-export function globalDefaultLine(globalEnabled: boolean | null): string {
+export function globalDefaultLine(
+  globalEnabled: boolean | null,
+  systemDefault: boolean = true,
+): string {
   if (globalEnabled === null) {
-    return 'No host-wide choice set — modules are on unless a project says otherwise.';
+    return systemDefault
+      ? 'No host-wide choice set — modules are on unless a project says otherwise.'
+      : 'No host-wide choice set — this module is off unless a project says otherwise.';
   }
   return globalEnabled
     ? 'On for every project that has not made its own choice.'

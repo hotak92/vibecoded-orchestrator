@@ -168,7 +168,7 @@ def _deprecation_warning() -> Optional[str]:
 
     Reads the four ``VCT_RL_MODULE_*`` env vars the launcher writes into
     ``.claude/settings.json env`` via
-    ``commands::module_deprecation::apply_deprecation_state``. The four
+    ``commands::module_deprecation::apply_deprecation_state_impl`` (driven by the deprecation poller). The four
     keys (set together; stripped together) are:
 
       * ``VCT_RL_MODULE_DEPRECATED=1`` (or absent)

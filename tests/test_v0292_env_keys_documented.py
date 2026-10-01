@@ -269,7 +269,6 @@ ALLOWED_UNDOCUMENTED: dict[str, str] = {
     "VCO_VENV_PYTHON": "set by resolve-vco-venv, read by sibling bundled hooks",
     "VCT_ANALYZER_SCRIPT": "code-graph hooks hand the analyzer path to their child",
     "VCT_AUTO_RESTART_LAUNCHER": "post-install launcher relaunch loop guard",
-    "VCT_CODE_GRAPH_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
     "VCT_COMPOSE_CMD": "container-hook plumbing (compose command handoff)",
     "VCT_DIAGRAMS_ACCESS_LIST": "per-project access snapshot the launcher writes into .claude/env; the launcher GUI is the user surface",
     "VCT_FIELD": "hook-script -> embedded-python value channel (vct_project_config.sh)",

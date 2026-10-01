@@ -148,7 +148,10 @@ describe('the registry holds every loader exactly once', () => {
     expect(PREF_LOADER_KEYS).toContain('artifactTool');
     expect(PREF_LOADER_KEYS).toContain('dualFlags');
     expect(new Set(PREF_LOADER_KEYS).size).toBe(PREF_LOADER_KEYS.length);
-    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 2);
+    // + `moduleUpdateAutoCheck` (v0.2.100): one lazy entry; its write goes
+    // through the api wrapper (see module-update-autocheck.test.ts).
+    expect(PREF_LOADER_KEYS).toContain('moduleUpdateAutoCheck');
+    expect(PREF_LOADER_KEYS.length).toBe(Object.keys(BEFORE).length + 3);
   });
 
   it('every lazy key is attached to a section of the page', () => {

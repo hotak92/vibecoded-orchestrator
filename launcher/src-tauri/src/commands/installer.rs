@@ -446,8 +446,9 @@ pub static ORCHESTRATOR_MANAGED_PATHS: LazyLock<Vec<&'static str>> =
 //
 // When the install target already contains orchestrator files (`mode ==
 // Adopt`), the wizard prompts the user with four explicit strategies
-// instead of the cryptic "call preview_install + confirm_overwrite=true"
-// error path. See docs/INSTALL_RECOVERY.md → "Conflict Resolution" for
+// instead of the cryptic "preview, then confirm_overwrite=true"
+// error path (`install_orchestrator` runs `diff_install` itself and returns
+// `InstallConflictError`, which the modal renders). See docs/INSTALL_RECOVERY.md → "Conflict Resolution" for
 // the user-facing description and the Claude self-merge contract.
 //
 // Strategy semantics:
@@ -1465,14 +1466,6 @@ pub fn diff_install(install_path: &Path) -> InstallDiff {
     }
 }
 
-/// Preview what install_orchestrator would do at `config.install_path`.
-/// Frontend calls this before showing the adopt-confirm modal.
-#[command]
-pub async fn preview_install(config: InstallConfig) -> Result<InstallDiff, String> {
-    let install_path = PathBuf::from(&config.install_path);
-    Ok(diff_install(&install_path))
-}
-
 /// Return the local repo root path (used by frontend to show "Copying
 /// from {path}" in the install UI).
 #[command]
@@ -2444,8 +2437,11 @@ fn list_user_paths_under(path: &Path, cap: usize) -> Vec<String> {
     out
 }
 
-/// Pre-flight safety check. Renders the "you're about to install" panel
-/// in the frontend. Fully read-only — never mutates Weaviate, container
+/// Pre-flight safety check: the report for a "you're about to install"
+/// panel. NOTE: no launcher screen calls this yet; the panel is deferred by
+/// the owner to v0.2.102, and this command does NOT gate installs. The
+/// actual refusal lives in `install_orchestrator` (`diff_install` conflict
+/// check). Fully read-only — never mutates Weaviate, container
 /// state, or files at `install_path`.
 #[command]
 pub async fn preflight_install_safety_check(
