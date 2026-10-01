@@ -440,19 +440,20 @@ struct ProjectConfigResponse {
     /// The RL Reranker is a global-scope module (one install on the
     /// host, visible across every project); this flag is the per-project
     /// gate that decides whether the MCP client should issue rerank
-    /// requests. Source: `module_settings(project_id, "vct-rl-reranker",
-    /// "enabled_for_project")`. Default `true` when no row exists
-    /// (fail-open: a corrupted setting never silently disables the
-    /// reranker).
+    /// requests. Source: the shipped RL scoring lock first
+    /// (`vco_lib/rl_scoring_lock.toml`: `false` while locked, v0.2.100), then
+    /// `module_settings(project_id, "vct-rl-reranker", "enabled_for_project")`
+    /// → host-wide row → the RL reranker's system default (`false`), via
+    /// `Db::rl_scoring_enabled_for_project`.
     ///
-    /// Consumer: `claude_mcp_servers/weaviate_mcp/server.py::
-    /// _rl_cache_and_rerank` reads this through
-    /// `ProjectConfig.rl_reranker_enabled_for_project` and short-circuits
-    /// the rerank path when `false` — the search returns base cosine
-    /// order instead. The server-side telemetry path
-    /// (`/data/logs/rl_events_<slug>.jsonl`) is untouched: that file
-    /// is written by the RL container itself, not by the MCP, so
-    /// disabling the client gate cannot drop training events.
+    /// Consumer: `claude_mcp_servers/rl_client/search_pipeline.py::
+    /// _resolve_rl_enabled` reads this through
+    /// `ProjectConfig.rl_reranker_enabled_for_project` (after checking the
+    /// same lock table itself, so a hub-down MCP is locked too) and skips
+    /// the rerank when `false` — the search returns base cosine order.
+    /// Event collection (the MCP's `POST /api/v1/rl/events` into
+    /// `rl_events`) never reads this field, so it cannot drop training
+    /// events.
     ///
     /// Additive field — pre-v0.2.49 Python clients see an unknown field
     /// and ignore it; the parser back-fills with `true` (the safe
@@ -854,16 +855,20 @@ async fn project_config(
     //      `Db::module_enable_system_default`), `true` (fail-open) for any
     //      other module.
     //
-    // The MCP's `_rl_cache_and_rerank` gate consumes this field via
-    // `ProjectConfig.rl_reranker_enabled_for_project` to decide whether
-    // to call the rerank endpoint. When `false`, the MCP falls back to
-    // base cosine ordering — no error, no missing-event log entry on
-    // the server side (training logs are SERVER-driven by the RL
-    // container's own JSONL writer; the client gate only suppresses
-    // outbound requests).
+    // The MCP's scoring gate (`search_pipeline._resolve_rl_enabled`)
+    // consumes this field via `ProjectConfig.rl_reranker_enabled_for_project`
+    // to decide whether to call the rerank endpoint. When `false`, the MCP
+    // falls back to base cosine ordering — no error, and event collection
+    // (`POST /api/v1/rl/events`) is unaffected: it never reads this field.
+    //
+    // v0.2.100 W5R-02: the shipped RL SCORING LOCK (`vco_lib/rl_scoring_lock.toml`)
+    // sits on top of that cascade. While it is set this field is `false`
+    // whatever the rows say (`Db::rl_scoring_enabled_for_project`); the rows
+    // are untouched and apply again once unlocked. Event collection
+    // (`POST /api/v1/rl/events`) reads neither.
     let rl_reranker_enabled_for_project = h
         .0
-        .module_effective_enabled(&project.id, "vct-rl-reranker")
+        .rl_scoring_enabled_for_project(&project.id)
         .unwrap_or(true);
 
     // V52-AA (v0.2.52) — RL Reranker container port.
@@ -3823,13 +3828,17 @@ kg_tier_full = 0.8
             body,
         );
 
-        // Re-enable.
+        // Re-enable. v0.2.100 W5R-02: the shipped RL scoring lock keeps the
+        // SERVED field false even with an explicit per-project `true` row and
+        // a host-wide `true` row; the rows themselves are untouched and are
+        // what the field follows once unlocked.
         h.0.module_set_enabled_for_project(
             "p-rl-enable-set",
             "vct-rl-reranker",
             true,
         )
         .unwrap();
+        h.0.module_set_global_enabled("vct-rl-reranker", true).unwrap();
         let resp = reqwest::get(format!(
             "{}/projects/p-rl-enable-set/config",
             base
@@ -3837,10 +3846,21 @@ kg_tier_full = 0.8
         .await
         .expect("hub reachable");
         let body: serde_json::Value = resp.json().await.expect("json body");
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(true),
+            Some(false),
+            "locked: an explicit true row must NOT turn scoring on; body={}",
+            body,
+        );
+        assert!(
+            h.0.module_effective_enabled("p-rl-enable-set", "vct-rl-reranker").unwrap(),
+            "the stored row is kept, not rewritten by the lock",
+        );
+        assert!(
+            h.0.rl_scoring_enabled_with_lock("p-rl-enable-set", None).unwrap(),
+            "once unlocked, the row applies again",
         );
     }
 
@@ -3883,7 +3903,9 @@ kg_tier_full = 0.8
             body,
         );
 
-        // Step 3: per-project=true overrides global=false.
+        // Step 3: per-project=true overrides global=false IN THE CASCADE,
+        // which the served field follows once the RL scoring lock lifts.
+        // While locked (v0.2.100 W5R-02) the served field stays false.
         h.0.module_set_enabled_for_project(
             "p-rl-global",
             "vct-rl-reranker",
@@ -3897,9 +3919,13 @@ kg_tier_full = 0.8
         assert_eq!(
             body.get("rl_reranker_enabled_for_project")
                 .and_then(|v| v.as_bool()),
-            Some(true),
-            "per-project=true must override global=false; body={}",
+            Some(false),
+            "locked: served false despite per-project=true; body={}",
             body,
+        );
+        assert!(
+            h.0.rl_scoring_enabled_with_lock("p-rl-global", None).unwrap(),
+            "per-project=true must override global=false once unlocked",
         );
     }
 

@@ -31,6 +31,42 @@ export interface ExtraPath {
   enabled: boolean;
   /** Server-side derived label = label ?? basename(path). */
   display_label: string;
+  /**
+   * v0.2.100 W5R-04: the path's CURRENT repo HEAD at list time, or null
+   * (non-git path / git unavailable). Optional: absent on rows built by
+   * `add_*` before a list refresh.
+   */
+  head_commit?: string | null;
+  /**
+   * v0.2.100 W5R-04: HEAD is known and differs from `last_indexed_commit`
+   * (the one Rust rule `extra_path_is_stale`). The Stop hook re-indexes such
+   * a path automatically; the panel badges it until then.
+   */
+  stale?: boolean;
+}
+
+/** Badge shown on a stale extra path, or null when none applies. */
+export interface ExtraPathStaleBadge {
+  text: string;
+  title: string;
+}
+
+/**
+ * The panel's "stale" badge for a row (W5R-04). Decided by the server-side
+ * `stale` flag — this only words it. Disabled rows get no badge (nothing
+ * re-indexes them, and the "disabled" badge already says why).
+ */
+export function extraPathStaleBadge(row: ExtraPath): ExtraPathStaleBadge | null {
+  if (!row.enabled || !row.stale) return null;
+  const head = (row.head_commit ?? '').slice(0, 8);
+  const last = row.last_indexed_commit ? row.last_indexed_commit.slice(0, 8) : 'never';
+  return {
+    text: 'stale',
+    title:
+      `The checkout is at ${head || 'a newer commit'} but the code graph was indexed at ${last}. ` +
+      'It is re-indexed automatically at the end of a session turn (at most hourly), ' +
+      'or now with Sync.',
+  };
 }
 
 /**

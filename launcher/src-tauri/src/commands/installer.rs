@@ -9422,6 +9422,11 @@ mod tests {
             // would raise before doing any work. Listed here so the copy path
             // ships the pair and future EDITS of the table propagate.
             "vco_lib/deferral_conditions.toml",
+            // v0.2.100 W5R-02: the RL scoring lock — the one home Rust
+            // (compile time), Python (`vco_lib/rl_scoring_lock.py`, read by
+            // the MCP's scoring gate at runtime) and the GUI all read. A copy
+            // install must carry it, and future EDITS (the unlock) propagate.
+            "vco_lib/rl_scoring_lock.toml",
         ];
         let actual: Vec<&str> = ORCHESTRATOR_MANAGED_PATHS.iter().copied().collect();
         assert_eq!(

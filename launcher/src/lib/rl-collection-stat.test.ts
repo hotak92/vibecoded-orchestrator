@@ -19,6 +19,30 @@ describe('summarizeCollection (the RL "is data being collected" figure)', () => 
     expect(r?.headline).toBe('1,204 events collected (37 in the last 24 h)');
   });
 
+  it('W5R-13: breaks the figure down by embedding source (is arctic being saved?)', () => {
+    const r = summarizeCollection({
+      recent_events_count: 3,
+      total_events_count: 1806,
+      events_by_embedding_source: [
+        { embedding_source: 'arctic', retrieval: 451, citation: 151, total: 602 },
+        { embedding_source: 'qwen3', retrieval: 904, citation: 300, total: 1204 },
+      ],
+    });
+    expect(r?.bySource).toEqual([
+      'arctic: 602 (retrieval 451, citation 151)',
+      'qwen3: 1,204 (retrieval 904, citation 300)',
+    ]);
+    // Other event types are named, not hidden in the total.
+    expect(
+      summarizeCollection({
+        total_events_count: 5,
+        events_by_embedding_source: [{ embedding_source: 'codesage', retrieval: 2, citation: 1, total: 5 }],
+      })?.bySource,
+    ).toEqual(['codesage: 5 (retrieval 2, citation 1, other 2)']);
+    // Pre-v0.2.100 payloads carry no breakdown.
+    expect(summarizeCollection({ recent_events_count: 1, total_events_count: 1 })?.bySource).toEqual([]);
+  });
+
   it('singular, and old snapshots without the total field do not crash', () => {
     expect(summarizeCollection({ recent_events_count: 1, total_events_count: 1 })?.headline).toBe(
       '1 event collected (1 in the last 24 h)',

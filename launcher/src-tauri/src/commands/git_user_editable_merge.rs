@@ -4385,7 +4385,75 @@ pub(crate) fn merge_deferral_section(
         return fresh_doc.to_string();
     }
     let kept = crate::commands::restart::strip_section(existing, condition_id);
-    format!("{}\n\n{}", kept.trim_end(), &fresh_doc[idx..])
+    // W5R-11 (v0.2.100): the kept text carries the EXISTING frontmatter, whose
+    // `condition_ids` / `severity_max` predate this merge — re-derive both from
+    // the sections the merged document actually holds.
+    sync_deferral_frontmatter(&format!("{}\n\n{}", kept.trim_end(), &fresh_doc[idx..]))
+}
+
+/// Ledger severities, highest first. MUST MATCH `SEVERITY_ORDER` in
+/// `vco_lib/deferral_report.py` (the Python writer's `severity_max` rule).
+const DEFERRAL_SEVERITY_ORDER: [&str; 3] = ["critical", "warning", "info"];
+
+/// Parse one ledger section header — `## <condition_id> (<severity>)` — into
+/// `(condition_id, severity)`. Any other `## ` line (prose headings) → `None`.
+fn parse_deferral_section_header(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("## ")?;
+    let (cid, tail) = rest.split_once(" (")?;
+    let sev = tail.trim_end().strip_suffix(')')?;
+    let cid_ok = !cid.is_empty()
+        && cid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if cid_ok && DEFERRAL_SEVERITY_ORDER.contains(&sev) {
+        Some((cid, sev))
+    } else {
+        None
+    }
+}
+
+/// Rewrite a ledger's frontmatter `condition_ids: [...]` and `severity_max:`
+/// lines from the entry sections its body holds (W5R-11). The Python reader
+/// keys behaviour off the sections, but `deferral_report.read()` still reports
+/// the frontmatter list as metadata, so a stale list is a false statement in
+/// the file. Pure; a text without a `---` frontmatter block is returned as is,
+/// and only those two lines are touched (everything else byte-for-byte).
+pub(crate) fn sync_deferral_frontmatter(doc: &str) -> String {
+    let Some(after_open) = doc.strip_prefix("---\n") else {
+        return doc.to_string();
+    };
+    let Some(close_rel) = after_open.find("\n---\n") else {
+        return doc.to_string();
+    };
+    let fm = &after_open[..close_rel];
+    let body = &after_open[close_rel..];
+
+    let mut ids: Vec<&str> = Vec::new();
+    let mut sev_rank = DEFERRAL_SEVERITY_ORDER.len() - 1; // "info" when no entries
+    for line in body.lines() {
+        if let Some((cid, sev)) = parse_deferral_section_header(line) {
+            if !ids.contains(&cid) {
+                ids.push(cid);
+            }
+            if let Some(r) = DEFERRAL_SEVERITY_ORDER.iter().position(|s| *s == sev) {
+                sev_rank = sev_rank.min(r);
+            }
+        }
+    }
+
+    let new_fm: Vec<String> = fm
+        .lines()
+        .map(|l| {
+            if l.starts_with("condition_ids:") {
+                format!("condition_ids: [{}]", ids.join(", "))
+            } else if l.starts_with("severity_max:") {
+                format!("severity_max: {}", DEFERRAL_SEVERITY_ORDER[sev_rank])
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    format!("---\n{}{}", new_fm.join("\n"), body)
 }
 
 /// Write a `launcher_update_post_pull_unverified` entry: the post-pull
@@ -7215,6 +7283,48 @@ pub(crate) mod tests {
         let stub = "---\nstub: true\n---\n\n# No deferrals\n";
         assert_eq!(merge_deferral_section(Some(stub), "x_cid", fresh), fresh);
         assert_eq!(merge_deferral_section(None, "x_cid", fresh), fresh);
+    }
+
+    /// W5R-11: merging a new entry into a ledger that already holds another
+    /// must list BOTH in the frontmatter (and raise `severity_max`), and
+    /// re-merging an existing cid must not duplicate it.
+    #[test]
+    fn merge_deferral_section_keeps_frontmatter_condition_ids_in_sync() {
+        let existing = "---\ntitle: VCO Update Deferred\ngenerated_at: t0\n\
+condition_ids: [old_cid]\nseverity_max: info\n---\n\n# VCO Update Deferred\n\n\
+## old_cid (info)\n\nold body\n";
+        let fresh = "---\ntitle: VCO Update Deferred\ngenerated_at: t1\n\
+condition_ids: [new_cid]\nseverity_max: warning\n---\n\n# VCO Update Deferred\n\n\
+## new_cid (warning)\n\nnew body\n";
+        let merged = merge_deferral_section(Some(existing), "new_cid", fresh);
+        assert!(
+            merged.contains("condition_ids: [old_cid, new_cid]\n"),
+            "{merged}"
+        );
+        assert!(merged.contains("severity_max: warning\n"), "{merged}");
+        assert!(merged.contains("## old_cid (info)\n\nold body"), "{merged}");
+        assert!(merged.contains("## new_cid (warning)\n\nnew body"), "{merged}");
+        // Untouched frontmatter lines survive byte-for-byte.
+        assert!(merged.contains("generated_at: t0\n"), "{merged}");
+
+        // Re-merge the same cid: replaced, not duplicated.
+        let again = merge_deferral_section(Some(&merged), "new_cid", fresh);
+        assert!(
+            again.contains("condition_ids: [old_cid, new_cid]\n"),
+            "{again}"
+        );
+        assert_eq!(again.matches("## new_cid (").count(), 1, "{again}");
+    }
+
+    #[test]
+    fn sync_deferral_frontmatter_ignores_prose_headings_and_no_frontmatter() {
+        let doc = "---\ncondition_ids: []\nseverity_max: info\n---\n\n\
+## Notes on this file\n\n## a_cid (critical)\n\nx\n";
+        let out = sync_deferral_frontmatter(doc);
+        assert!(out.contains("condition_ids: [a_cid]\n"), "{out}");
+        assert!(out.contains("severity_max: critical\n"), "{out}");
+        let plain = "# no frontmatter\n\n## a_cid (info)\n";
+        assert_eq!(sync_deferral_frontmatter(plain), plain);
     }
 
     /// WP-B6 (v0.2.83): `write_launcher_update_diverged_deferral` must hold the

@@ -15,9 +15,11 @@ Soft-fail discipline (locked decision 2026-06-04):
     - v0.2.100 (F4): a lost event is VISIBLE. Every failure branch records
       one line in the RL telemetry loss ledger
       (``vco_lib.rl_telemetry_loss``, read by ``vco doctor``) and logs one
-      WARNING per failure reason per process. A refused/reset connection
-      (the hub restarting) gets ONE immediate bounded retry; a timeout does
-      not (retrying it would double the caller's worst-case latency).
+      WARNING per failure reason per process. A REFUSED connection (the hub
+      restarting; the request never reached it) gets ONE bounded retry. A
+      reset does not (W5R-06: the hub may already have inserted the event,
+      and a retry would store it twice); nor does a timeout (retrying it
+      would double the caller's worst-case latency).
 
 Discovery:
     - Hub port: ``$VCT_HUB_PORT`` -> ``<vct_root>/hub.port`` -> 7700.
@@ -244,11 +246,15 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
             _record_post_loss(event, f"http_{e.code}")
             return False
         except urllib.error.URLError as e:
-            # Connect-refused / reset is the hub restarting (token on disk,
-            # listener not up yet, or a respawn in flight): ONE bounded retry
-            # after a short pause. Anything else (DNS, TLS, a timeout wrapped
-            # in URLError) is not retried.
-            if attempt == 1 and isinstance(e.reason, (ConnectionRefusedError, ConnectionResetError)):
+            # Connect-REFUSED is the hub restarting (token on disk, listener
+            # not up yet, or a respawn in flight): ONE bounded retry after a
+            # short pause. Refused is the only case where the request provably
+            # never reached the hub. A RESET may arrive after the hub already
+            # committed the INSERT (rl_events has no uniqueness), so retrying it
+            # could store the event twice and bias training (v0.2.100 W5R-06):
+            # it is recorded as lost instead. Anything else (DNS, TLS, a timeout
+            # wrapped in URLError) is not retried either.
+            if attempt == 1 and isinstance(e.reason, ConnectionRefusedError):
                 time.sleep(_RETRY_PAUSE_S)
                 continue
             _record_post_loss(event, _url_error_reason(e))
@@ -261,7 +267,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
     return False  # pragma: no cover — the loop always returns
 
 
-#: Pause before the single retry of a refused/reset connection. Small: the
+#: Pause before the single retry of a refused connection. Small: the
 #: retry exists for a hub mid-restart, and the caller may be a latency-bounded
 #: hook.
 _RETRY_PAUSE_S = 0.2

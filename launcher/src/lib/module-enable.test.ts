@@ -14,10 +14,11 @@ import { describe, expect, it } from 'vitest';
 import {
   GLOBAL_TRI_CHOICE_LABELS,
   MODULE_TRI_CHOICE_LABELS,
-  dormantBadgeLabel,
-  dormantNotice,
   enableMechanismFor,
   globalDefaultLine,
+  globalLockedLine,
+  moduleActiveChoice,
+  moduleLockReason,
   moduleSystemDefault,
   globalTriChoiceFor,
   globalTriChoiceToValue,
@@ -236,21 +237,37 @@ describe('host-wide tri-state control — F-4, the dead end', () => {
   });
 });
 
-describe('dormant modules — the USER rider', () => {
-  it('states that the RL reranker is not reranking yet', () => {
-    const notice = dormantNotice('vct-rl-reranker');
-    expect(notice).toBeTruthy();
-    expect(notice).toMatch(/not live yet|no trained model/i);
-    expect(dormantBadgeLabel('vct-rl-reranker')).toBe('not reranking yet');
+describe('the RL scoring lock (v0.2.100 W5R-02) — served, rendered, never a live "On"', () => {
+  const REASON = 'RL scoring stays inactive until the model is trained. Data collection continues regardless.';
+
+  it('a locked state with an explicit ON row highlights NO position and says Off + the reason', () => {
+    const st = state({ explicit: true, effective: true, source: 'project', lock_reason: REASON });
+    expect(moduleLockReason(st)).toBe(REASON);
+    expect(moduleActiveChoice(st)).toBeNull();
+    const line = moduleEffectiveLine(st);
+    expect(line.startsWith('Off — ')).toBe(true);
+    expect(line).toContain(REASON);
+    expect(line).toMatch(/own choice \(On\) is kept and applies once unlocked/);
   });
 
-  it('says collection is unaffected — the #25 constraint, in user-facing words', () => {
-    expect(dormantNotice('vct-rl-reranker')).toMatch(/collection.*continues/i);
+  it('a locked inheriting state names the inheritance, not a value', () => {
+    const st = state({ explicit: null, global_default: true, effective: true, source: 'global_default', lock_reason: REASON });
+    expect(moduleEffectiveLine(st)).toMatch(/follows the host-wide default once unlocked/);
   });
 
-  it('returns null for any module not in the dormant set', () => {
-    expect(dormantNotice('vct-coordination')).toBeNull();
-    expect(dormantBadgeLabel('vct-coordination')).toBeNull();
+  it('unlocked (or a pre-v0.2.100 payload with no field) behaves as before', () => {
+    const st = state({ explicit: true, effective: true, source: 'project' });
+    expect(moduleLockReason(st)).toBeNull();
+    expect(moduleActiveChoice(st)).toBe('on');
+    expect(moduleEffectiveLine(st)).toBe('On — set for this project.');
+    expect(moduleActiveChoice({ ...st, lock_reason: null })).toBe('on');
+  });
+
+  it('the host-wide locked line leads with Off + reason and keeps the stored choice', () => {
+    expect(globalLockedLine(true, REASON)).toMatch(/^Off for every project — /);
+    expect(globalLockedLine(true, REASON)).toContain(REASON);
+    expect(globalLockedLine(true, REASON)).toMatch(/stored host-wide choice \(On\) is kept/);
+    expect(globalLockedLine(null, REASON)).toMatch(/No host-wide choice is stored/);
   });
 });
 

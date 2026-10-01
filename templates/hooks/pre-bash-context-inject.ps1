@@ -118,7 +118,7 @@ $WriteModule = ""
 if ((Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue) -and
     (Test-VcoWriteSuspicious $Command)) {
     Initialize-VcoBashWriteTargets -HooksDir $ScriptDir -FallbackPython $PY
-    $parts = Get-VcoBashWritePreBash -Command $Command
+    $parts = Get-VcoBashWritePreBash -Command $Command -ProjectRoot $ProjectRoot
     if ($parts.Count -ge 1) { $WriteTarget = [string]$parts[0] }
     if ($parts.Count -ge 2) { $WriteSnippet = [string]$parts[1] }
 }
@@ -163,8 +163,8 @@ if ($cgRaw) {
     $cgInj = ""
     $cgRd = ""
     if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
-        $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
+        $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
     }
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
         $cgRaw = Invoke-VcoFilterSeenBlocks -InputText $cgRaw -InjectFile $cgInj -ReadsFile $cgRd
@@ -322,6 +322,9 @@ if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scr
 # harness already set it): the script lives in the orchestrator root, so its
 # own location must never be what names the project.
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+$env:VCO_RL_TASK_TYPE = "pre_bash_kg_search"
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
         # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
@@ -349,8 +352,8 @@ if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
     $pbInject = ""
     $pbReads = ""
     if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $pbInject = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
-        $pbReads  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
+        $pbInject = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $pbReads  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
     }
     $KgResult = Invoke-VcoFilterSeenBlocks -InputText $KgResult -InjectFile $pbInject -ReadsFile $pbReads
 }

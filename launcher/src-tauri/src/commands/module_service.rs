@@ -182,6 +182,12 @@ pub struct RlDashboardState {
     /// that answers "is training data being collected?".
     #[serde(default)]
     pub total_events_count: u32,
+    /// v0.2.100 W5R-13: the same corpus split by `embedding_source` (and
+    /// retrieval vs citation), so the dashboard answers "is arctic data being
+    /// saved?" — the dual-log twin lands under the other slot's source. One
+    /// entry per source present; a NULL source is reported as `"unknown"`.
+    #[serde(default)]
+    pub events_by_embedding_source: Vec<RlSourceEventCount>,
     /// v0.2.29: from `GET /state_summary` — count of registry entries
     /// with `idx >= N_ENTITY_TYPES` (i.e. user-trained types beyond the
     /// builtin set). `None` when the probe failed.
@@ -193,6 +199,16 @@ pub struct RlDashboardState {
     /// failed.
     #[serde(default)]
     pub d1_marker_present: Option<bool>,
+}
+
+/// One `embedding_source`'s share of a project's `rl_events` (W5R-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RlSourceEventCount {
+    pub embedding_source: String,
+    pub retrieval: u32,
+    pub citation: u32,
+    /// Every event type for this source (retrieval + citation + any other).
+    pub total: u32,
 }
 
 impl RlDashboardState {
@@ -211,6 +227,7 @@ impl RlDashboardState {
             recent_events_count: 0,
             recent_events_avg_latency_ms: 0.0,
             total_events_count: 0,
+            events_by_embedding_source: Vec::new(),
             dynamic_types_count: None,
             d1_marker_present: None,
         }
@@ -2474,6 +2491,7 @@ pub async fn get_rl_dashboard_state(
     // still report the real corpus size.
     let (recent_events_count, total_events_count) =
         rl_event_counts(&db, &project_id, now_unix_ms());
+    let events_by_embedding_source = rl_event_counts_by_source(&db, &project_id);
 
     let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
     let install = match install {
@@ -2482,6 +2500,7 @@ pub async fn get_rl_dashboard_state(
             return Ok(RlDashboardState {
                 recent_events_count,
                 total_events_count,
+                events_by_embedding_source,
                 ..RlDashboardState::empty()
             })
         }
@@ -2566,6 +2585,7 @@ pub async fn get_rl_dashboard_state(
         recent_events_count,
         recent_events_avg_latency_ms: 0.0,
         total_events_count,
+        events_by_embedding_source,
         dynamic_types_count,
         d1_marker_present,
     })
@@ -2636,6 +2656,38 @@ pub(crate) fn rl_event_counts(db: &Db, project_id: &str, now_ms: i64) -> (u32, u
         )
         .unwrap_or(0);
     (clamp(recent), clamp(total))
+}
+
+/// W5R-13: one project's `rl_events` per `embedding_source`, folded from
+/// `Db::count_rl_events_by_source`. Soft-fails to an empty list (a dashboard
+/// counter never errors the load). Sorted by source name.
+pub(crate) fn rl_event_counts_by_source(db: &Db, project_id: &str) -> Vec<RlSourceEventCount> {
+    let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
+    let rows = match db.count_rl_events_by_source(project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[rl-dashboard] count rl_events by source failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut by: std::collections::BTreeMap<String, RlSourceEventCount> = Default::default();
+    for (src, event_type, n) in rows {
+        let key = src.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "unknown".to_string());
+        let e = by.entry(key.clone()).or_insert_with(|| RlSourceEventCount {
+            embedding_source: key,
+            retrieval: 0,
+            citation: 0,
+            total: 0,
+        });
+        let n = clamp(n);
+        match event_type.as_str() {
+            "retrieval" => e.retrieval = e.retrieval.saturating_add(n),
+            "citation" => e.citation = e.citation.saturating_add(n),
+            _ => {}
+        }
+        e.total = e.total.saturating_add(n);
+    }
+    by.into_values().collect()
 }
 
 // ─── Startup hook + daily poller (scaffolding) ──────────────────────────
@@ -4449,6 +4501,33 @@ mod tests {
         db.insert_rl_event("retrieval", 3, 5, None, None, "free", None, None, None, None, "{}")
             .unwrap();
         assert_eq!(rl_event_counts(&db, &pid, 10), (0, 0));
+    }
+
+    /// W5R-13: the corpus split by embedding source (qwen3 primary + arctic
+    /// twin), retrieval vs citation, scoped to the project.
+    #[test]
+    fn rl_event_counts_by_source_splits_qwen3_arctic_and_types() {
+        let (db, pid) = fixture_project_db();
+        let ins = |et: &str, src: Option<&str>, task: &str| {
+            db.insert_rl_event(et, 3, 1, Some(&pid), None, task, None, src, None, None, "{}")
+                .unwrap();
+        };
+        ins("retrieval", Some("qwen3"), "a");
+        ins("retrieval", Some("arctic"), "a:arctic");
+        ins("citation", Some("qwen3"), "a-c");
+        ins("citation", Some("arctic"), "a-c:arctic");
+        ins("retrieval", Some("arctic"), "b:arctic");
+        ins("retrieval", None, "legacy");
+        db.insert_rl_event("retrieval", 3, 1, None, None, "other", None, Some("qwen3"), None, None, "{}")
+            .unwrap();
+        let got = rl_event_counts_by_source(&db, &pid);
+        let row = |src: &str| got.iter().find(|r| r.embedding_source == src).cloned().unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(row("arctic"), RlSourceEventCount { embedding_source: "arctic".into(), retrieval: 2, citation: 1, total: 3 });
+        assert_eq!(row("qwen3"), RlSourceEventCount { embedding_source: "qwen3".into(), retrieval: 1, citation: 1, total: 2 });
+        assert_eq!(row("unknown").total, 1);
+        let v = serde_json::to_value(RlDashboardState::empty()).unwrap();
+        assert_eq!(v["events_by_embedding_source"], serde_json::json!([]));
     }
 
     #[test]

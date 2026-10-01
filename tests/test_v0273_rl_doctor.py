@@ -59,10 +59,17 @@ def test_fallback_counter_corrupt(tmp_path):
 # ── aggregate health logic ──────────────────────────────────────────────
 
 
-def _run_with_probes(*, lic, toggle, container, telemetry, retention, fallback=None, tmp_path=None):
+_UNLOCKED = {"status": "unlocked", "locked": False, "detail": ""}
+
+
+def _run_with_probes(*, lic, toggle, container, telemetry, retention, fallback=None, tmp_path=None, lock=None):
+    # The scoring lock is pinned UNLOCKED here so these cases keep exercising
+    # the licence/toggle/container logic beneath it; the locked case is below.
     fallback = fallback or {"status": "none", "count": 0, "detail": ""}
     root = str(tmp_path) if tmp_path else "/tmp/x"
-    with patch.object(rl_doctor, "_probe_license", return_value=lic), patch.object(
+    with patch.object(rl_doctor, "_probe_scoring_lock", return_value=lock or _UNLOCKED), patch.object(
+        rl_doctor, "_probe_license", return_value=lic
+    ), patch.object(
         rl_doctor, "_probe_per_project_toggle", return_value=toggle
     ), patch.object(rl_doctor, "_probe_container", return_value=container), patch.object(
         rl_doctor, "_probe_telemetry_hub", return_value=telemetry
@@ -132,6 +139,28 @@ def test_per_project_disabled_treated_as_not_enabled():
     # Toggle off → not enabled → healthy (legitimately cosine).
     assert report["rl_enabled"] is False
     assert report["healthy"] is True
+
+
+def test_scoring_lock_overrides_licence_and_toggle():
+    """v0.2.100 W5R-02: while the shipped lock is set, RL is not enabled even
+    with a licence and an explicit per-project ON, and a down container is
+    therefore nothing to fix."""
+    report = _run_with_probes(
+        lic={"status": "enabled", "enabled": True, "detail": ""},
+        toggle={"status": "enabled", "enabled": True, "detail": ""},
+        container={"status": "disabled", "compatible": False, "reachable": False, "detail": ""},
+        telemetry={"status": "hub_down", "reachable": False, "detail": ""},
+        retention={"status": "noop", "detail": ""},
+        lock={"status": "locked", "locked": True, "detail": "locked"},
+    )
+    assert report["rl_enabled"] is False
+    assert report["healthy"] is True
+
+
+def test_the_real_lock_probe_reports_the_shipped_lock():
+    res = rl_doctor._probe_scoring_lock()
+    assert res["status"] == "locked" and res["locked"] is True
+    assert "until the model is trained" in res["detail"]
 
 
 # ── CLI surface ─────────────────────────────────────────────────────────

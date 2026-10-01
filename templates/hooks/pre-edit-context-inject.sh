@@ -453,13 +453,16 @@ if [[ "$CACHE_HIT" == "1" ]]; then
 fi
 _cache_log miss
 
-# === Auto-detect project for multi-codebase support ===
-source "$SCRIPT_DIR/../scripts/detect-project.sh"
-DETECTED_PROJECT=$(detect_project_for_file "$FILE_PATH" "$PROJECT_ROOT")
+# === Code-graph identity: ALWAYS the calling project (v0.2.100 W5R-03) ===
+# No --project override, ever. The CLI resolves the CALLING project
+# (CLAUDE_PROJECT_DIR -> hub binding prefix, which also holds its extra paths)
+# and fans out over that project's own VCT_CODE_GRAPH_ACCESS_LIST grants. The
+# old detect-project.sh sibling-by-folder-name heuristic searched a neighbour
+# folder's code graph with no grant (cross-tenant leak) and skipped the
+# project's own prefix for files under its extra paths. A file in a GRANTED
+# peer is still covered: the grant puts that peer in the fan-out.
+# MUST MATCH pre-edit-context-inject.ps1.
 CODE_GRAPH_PROJECT_ARG=""
-if [[ -n "$DETECTED_PROJECT" ]]; then
-    CODE_GRAPH_PROJECT_ARG="--project $DETECTED_PROJECT"
-fi
 
 # === Build search query ===
 # BASENAME already computed above (needed by the cache-replay branch).
@@ -499,6 +502,9 @@ RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/r
 # harness already set it): the script lives in the orchestrator root, so its
 # own location must never be what names the project.
 export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
+export VCO_RL_TASK_TYPE="pre_edit_kg_search"
 
 # KG search with RL reranking — same pipeline as weaviate MCP (Weaviate → RL server → top-k)
 # Falls back to raw Weaviate order if RL server is unreachable.

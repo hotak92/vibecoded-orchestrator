@@ -195,7 +195,10 @@ def test_every_case_through_the_real_hook(impl: str, env_name: str, tmp_path: Pa
     cases = _cases(env_name)
     env = _env(tmp_path, TABLE["envs"][env_name])
     proj = _proj(tmp_path)
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    # pwsh is run serially: concurrent pwsh launches crashed with SIGSEGV (exit -11)
+    # twice in v0.2.100 full-suite runs — an interpreter crash, not a verdict.
+    workers = 1 if impl == "ps1" else 8
+    with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(lambda c: _run_hook(impl, HOOKS, proj, c["url"], env), cases))
     wrong = []
     for c, res in zip(cases, results):

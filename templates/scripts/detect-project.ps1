@@ -13,6 +13,15 @@
 # If not, looks for a sibling project folder under the common parent
 # (e.g. ~/dev/) and returns that project's name.
 #
+# SCOPE (v0.2.100 W5R-03): the ONLY remaining consumer is the UNREGISTERED
+# code-graph-incremental hook (kept for users who wire it themselves; its
+# registered successor is stop-codegraph-drain, which does not use this).
+# It must NEVER pick a code graph to SEARCH: a folder name is not a grant.
+# Every search path (pre-edit included) runs as the CALLING project -- its own
+# binding prefix (which holds its extra paths) plus its own
+# VCT_CODE_GRAPH_ACCESS_LIST grants -- because the sibling-by-folder-name
+# answer read a neighbour project's code graph with no grant.
+#
 # Usage:
 #   . "$PSScriptRoot/detect-project.ps1"
 #   $project = Get-ProjectForFile -FilePath "C:\path\to\file.py" -CurrentRoot "C:\current\project\root"

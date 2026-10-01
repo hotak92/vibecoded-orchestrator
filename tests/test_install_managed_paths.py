@@ -70,6 +70,11 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     # install that received the module without its table raises on import.
     # The copy-install path only copies what is listed here, hence this row.
     "vco_lib/deferral_conditions.toml",
+    # v0.2.100 W5R-02: the RL scoring lock — the one home Rust (compile time),
+    # Python (``vco_lib/rl_scoring_lock.py``, read by the MCP scoring gate at
+    # runtime) and the GUI all read. Listed so a copy install carries it and
+    # future EDITS (the unlock) propagate.
+    "vco_lib/rl_scoring_lock.toml",
 )
 
 

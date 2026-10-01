@@ -1183,8 +1183,12 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
     Standing rule: RL is optional, but its training logs are ALWAYS collected.
     Losses are recorded by their writers in the RL telemetry loss ledger
     (:mod:`vco_lib.rl_telemetry_loss`): a vct-hub POST that did not land
-    (``hub_post_failed``) or a dual-log twin that was wanted but not produced
-    (``dual_skip``). This probe is that ledger's surface.
+    (``hub_post_failed``), a dual-log twin that was wanted but not produced
+    (``dual_skip``), or a twin written with fewer nodes than its primary
+    (``dual_partial``, reported apart: no event was lost). This probe is that
+    ledger's surface. Blind spot, stated in the summary: a hook search killed
+    by its harness timeout before sending records nothing (since W5R-07 the
+    sends happen after the output, in a detached child, so this is rare).
 
     Informational (``ok``) with the counts in the summary: no single loss is a
     machine defect to fix — a hub that was down for an hour, a cold secondary
@@ -1207,6 +1211,8 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
         ]
     total = int(summary.get("total") or 0)
     by_kind = summary.get("by_kind") or {}
+    partial = int(summary.get("partial_twins") or 0)
+    missing_nodes = int(summary.get("partial_missing_nodes") or 0)
     if total == 0:
         text = f"no RL training events lost in the last {RL_LOSS_WINDOW_DAYS} days"
     else:
@@ -1219,6 +1225,19 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
             f"{total} RL training event(s) lost in the last "
             f"{RL_LOSS_WINDOW_DAYS} days ({'; '.join(parts)})"
         )
+    if partial:
+        # W5R-08: a twin written with fewer nodes than its primary.
+        text += (
+            f"; {partial} dual-log twin(s) partial ({missing_nodes} node(s) "
+            "had no vector for the other slot)"
+        )
+    # The one loss no writer can record: a hook search killed by its own
+    # timeout before it sent anything. Say so, so a quiet ledger is not read
+    # as proof of zero loss.
+    text += (
+        "; not counted: a hook search killed by its timeout before sending "
+        "(it records nothing)"
+    )
     return [
         Finding(
             probe="rl_telemetry_loss",
@@ -1229,6 +1248,9 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
                 "total": total,
                 "by_kind": by_kind,
                 "last_ts_ms": summary.get("last_ts_ms"),
+                "partial_twins": partial,
+                "partial_missing_nodes": missing_nodes,
+                "not_counted": "hook search killed by its timeout before sending",
             },
         )
     ]

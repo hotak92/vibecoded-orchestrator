@@ -91,7 +91,7 @@ if (-not $Prompt) {
     # rationale. Empty prompts still produce subagents that can modify
     # files; the reconciler needs the baseline.
     if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
-        try { Take-Snapshot -AgentId $AgentId | Out-Null } catch {}
+        try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
     }
     exit 0
 }
@@ -100,7 +100,7 @@ if (-not $Prompt) {
 # runs. SubagentStop reconciler diffs against this snapshot to find
 # files modified by the subagent. Soft-fail.
 if ($AgentId -and (Get-Command Take-Snapshot -ErrorAction SilentlyContinue)) {
-    try { Take-Snapshot -AgentId $AgentId | Out-Null } catch {}
+    try { Take-Snapshot -AgentId $AgentId -ProjectRoot $ProjectRoot | Out-Null } catch {}
 }
 
 # Export session / agent context so rl_kg_search.py's emit path
@@ -146,6 +146,9 @@ if (Get-Command Resolve-VcoOrchestratorScript -ErrorAction SilentlyContinue) {
     # harness already set it): the script lives in the orchestrator root, so its
     # own location must never be what names the project.
     $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+    # v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+    # (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+    $env:VCO_RL_TASK_TYPE = "subagent_kg_search"
 }
 
 # Bail silently if the venv didn't resolve or the script is missing.

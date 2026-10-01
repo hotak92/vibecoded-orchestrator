@@ -296,8 +296,8 @@ Security scan backend for `pre-tool-use.sh`: SSRF guards, shell injection patter
 ### `precompact_prune.py`
 Pre-compaction pruning of `CONTEXT_STATE.md` to stay within line limits. Invoked by the `PreCompact` hook.
 
-### `detect-project.sh`
-Walks up from `$PWD` looking for a `.vct-project` marker file and prints the project name. Used by `vct-secrets` and the git credential helper to auto-scope secrets to the right project without explicit `--project` flags.
+### `detect-project.sh` / `detect-project.ps1`
+Given a file path and the current project root, prints the name of the sibling folder (under the root's parent) that holds the file, or nothing. Its only consumer is the unregistered `code-graph-incremental` hook. It is never used to choose a code graph to search: since v0.2.100 every hook search (pre-edit included) runs as the calling project, with its own prefix (which also holds its extra code-graph paths) and its own code-graph grants, because a folder name is not a grant. (Secrets scoping by a `.vct-project` marker is `vct detect-project`, a different tool.)
 
 ### `get_node_info.py`
 Backend for `kg-info`. Loads a single KG node, parses its frontmatter, and prints metadata + connections.

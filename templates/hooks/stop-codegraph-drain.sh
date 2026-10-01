@@ -89,6 +89,112 @@ QUEUE="$STATE_DIR/codegraph_drain_${SESSION_ID}.txt"
 # in this session-AGNOSTIC file so the NEXT eligible Stop drain (any session)
 # processes them. MUST MATCH stop-codegraph-drain.ps1 + subagent-stop-reconcile.*.
 SHARED_QUEUE="$STATE_DIR/codegraph_drain_shared.txt"
+# ── RUNTIME: analyzer script + interpreter (one home for this hook) ─────────
+# Used by BOTH the extra-path refresh below and the queue drain. Sets ANALYZER,
+# ANALYZER_PY and _CG_RUNTIME_RC (cached — resolved at most once per run):
+#   0 usable · 1 no analyzer script · 2 bare-PATH interpreter cannot import
+#   the analyzer's dependencies.
+_CG_RUNTIME_RC=""
+_drain_resolve_runtime() {
+    [ -n "$_CG_RUNTIME_RC" ] && return "$_CG_RUNTIME_RC"
+    local _default_repo_root
+    _default_repo_root="$(cd "$SCRIPT_DIR/../.." && pwd)"
+    ANALYZER="${VCT_ANALYZER_SCRIPT:-$_default_repo_root/.claude/scripts/analyze_code_graph.py}"
+    if [ ! -f "$ANALYZER" ]; then
+        _CG_RUNTIME_RC=1
+        return 1
+    fi
+    # shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
+    [ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
+    # Interpreter for the analyzer. Precedence — MUST MATCH
+    # stop-codegraph-drain.ps1 (`$env:VCT_PYTHON` → resolver → PATH loop):
+    #   1. $VCT_PYTHON      explicit operator override (a user statement)
+    #   2. shared venv resolver (VCT_INSTALL_ROOT/.venv, clone-relative, …)
+    #   3. $PY              bare PATH — python3 / python / py
+    # v0.2.96: this file read NEITHER $VCT_PYTHON (its .ps1 sibling and
+    # code-graph-incremental.sh both do — a silent cross-OS divergence) nor any
+    # record of WHICH tier answered, which is what the probe below needs.
+    ANALYZER_PY="${VCT_PYTHON:-}"
+    local _from_bare_path=0
+    if [ -z "$ANALYZER_PY" ] && command -v resolve_vco_venv_python >/dev/null 2>&1; then
+        resolve_vco_venv_python "$SCRIPT_DIR"
+        ANALYZER_PY="${VCO_VENV_PYTHON:-}"
+    fi
+    if [ -z "$ANALYZER_PY" ]; then
+        ANALYZER_PY="$PY"
+        _from_bare_path=1
+    fi
+    # v0.2.96 (WP-5 S2): when every venv tier missed, ANALYZER_PY is whatever
+    # `python3`/`python`/`py` happens to be on PATH — an interpreter that in a
+    # user project routinely has neither `weaviate` nor `vco_lib`. The
+    # analyzer would then die inside a detached run whose output goes to
+    # /dev/null, after the queue was already consumed: the batch of edited
+    # paths lost with no trace. Probe the SAME import string the shipped
+    # wrappers gate on (`kg-duplicates`, `vct_venv_ladder.sh`), and only when
+    # we actually fell back — a healthy install resolves a venv and pays
+    # nothing.
+    if [ "$_from_bare_path" = "1" ] \
+        && ! "$ANALYZER_PY" -c 'import weaviate, vco_lib' >/dev/null 2>&1; then
+        _CG_RUNTIME_RC=2
+        return 2
+    fi
+    _CG_RUNTIME_RC=0
+    return 0
+}
+
+# Run a `sh -c` snippet fully detached (new session when possible) — the ONE
+# spawn shape of this hook, so a Stop hook never waits on an analyzer.
+_drain_spawn_detached() {
+    if command -v setsid >/dev/null 2>&1; then
+        setsid sh -c "$1" >/dev/null 2>&1 < /dev/null &
+    elif command -v nohup >/dev/null 2>&1; then
+        nohup sh -c "$1" >/dev/null 2>&1 < /dev/null &
+        disown 2>/dev/null || true
+    else
+        ( sh -c "$1" ) >/dev/null 2>&1 < /dev/null &
+    fi
+}
+
+# ── EXTRA CODE-GRAPH PATHS: automatic re-index (v0.2.100 W5R-04) ────────────
+# An extra path (launcher → project → Codegraph → "Extra codegraph paths")
+# feeds another checkout into THIS project's code-graph collections. Its repo
+# moves on independently of this session's edits, so this check runs whether
+# or not the turn queued any file. At most once per
+# VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS (default 600) per project, it
+# spawns `python -m vco_lib.codegraph_extras_refresh` DETACHED: that module
+# compares each enabled extra path's HEAD with its last indexed commit, runs
+# the SAME single-path analyzer argv the panel's Sync button uses (one home:
+# `extra_path_sync_args` / `build_extra_sync_argv`), throttled per path
+# (VCO_CODEGRAPH_EXTRAS_MIN_INTERVAL_SECONDS, default 3600) and bounded
+# (30 min), then records the new commit through the hub route — never by
+# opening launcher.db. Every decision is logged to
+# .claude/logs/codegraph_extras_refresh.log. MUST MATCH the .ps1 sibling.
+_CG_EXTRAS_INTERVAL="${VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS:-600}"
+case "$_CG_EXTRAS_INTERVAL" in
+    ''|*[!0-9]*) _CG_EXTRAS_INTERVAL=600 ;;
+esac
+if [ -d "$STATE_DIR" ]; then
+    _CG_EXTRAS_TS_FILE="$STATE_DIR/codegraph_extras_check.ts"
+    _CG_EXTRAS_NOW="$(date +%s 2>/dev/null || echo 0)"
+    _CG_EXTRAS_LAST=0
+    if [ -f "$_CG_EXTRAS_TS_FILE" ]; then
+        _CG_EXTRAS_LAST=$(cat "$_CG_EXTRAS_TS_FILE" 2>/dev/null || echo 0)
+        case "$_CG_EXTRAS_LAST" in ''|*[!0-9]*) _CG_EXTRAS_LAST=0 ;; esac
+    fi
+    if [ "$_CG_EXTRAS_LAST" -eq 0 ] \
+        || [ $(( _CG_EXTRAS_NOW - _CG_EXTRAS_LAST )) -ge "$_CG_EXTRAS_INTERVAL" ]; then
+        printf '%s' "$_CG_EXTRAS_NOW" > "$_CG_EXTRAS_TS_FILE" 2>/dev/null || true
+        if _drain_resolve_runtime; then
+            _CG_EXTRAS_LOG_DIR="$PROJECT_ROOT/.claude/logs"
+            mkdir -p "$_CG_EXTRAS_LOG_DIR" 2>/dev/null || true
+            _CG_EXTRAS_LOG="$_CG_EXTRAS_LOG_DIR/codegraph_extras_refresh.log"
+            # The child's own stderr (an import failure, a crash) lands in the
+            # same log the module writes, so a broken refresh is never silent.
+            _drain_spawn_detached "\"$ANALYZER_PY\" -m vco_lib.codegraph_extras_refresh --project-root \"$PROJECT_ROOT\" --analyzer \"$ANALYZER\" --state-dir \"$STATE_DIR\" >>\"$_CG_EXTRAS_LOG\" 2>&1"
+        fi
+    fi
+fi
+
 # Drain when EITHER the per-session queue OR the shared queue has entries.
 [ -f "$QUEUE" ] || [ -f "$SHARED_QUEUE" ] || exit 0
 
@@ -136,59 +242,21 @@ if [ -f "$SHARED_QUEUE" ]; then
     fi
 fi
 
-# Resolve analyzer + python (mirror code-graph-incremental.sh's resolution).
-DEFAULT_REPO_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
-ANALYZER="${VCT_ANALYZER_SCRIPT:-$DEFAULT_REPO_ROOT/.claude/scripts/analyze_code_graph.py}"
-if [ ! -f "$ANALYZER" ]; then
-    # No analyzer → put the queue back (append, so nothing is lost) + no-op.
-    cat "$CONSUMED" >> "$QUEUE" 2>/dev/null || true
-    rm -f "$CONSUMED" 2>/dev/null || true
-    exit 0
-fi
-# shellcheck source=_lib/resolve-vco-venv.sh disable=SC1091
-[ -f "$SCRIPT_DIR/_lib/resolve-vco-venv.sh" ] && . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
-# Interpreter for the analyzer. Precedence — MUST MATCH
-# stop-codegraph-drain.ps1 (`$env:VCT_PYTHON` → resolver → PATH loop):
-#   1. $VCT_PYTHON      explicit operator override (a user statement)
-#   2. shared venv resolver (VCT_INSTALL_ROOT/.venv, clone-relative, …)
-#   3. $PY              bare PATH — python3 / python / py
-# v0.2.96: this file read NEITHER $VCT_PYTHON (its .ps1 sibling and
-# code-graph-incremental.sh both do — a silent cross-OS divergence) nor any
-# record of WHICH tier answered, which is what the probe below needs.
-ANALYZER_PY="${VCT_PYTHON:-}"
-_CG_PY_FROM_BARE_PATH=0
-if [ -z "$ANALYZER_PY" ] && command -v resolve_vco_venv_python >/dev/null 2>&1; then
-    resolve_vco_venv_python "$SCRIPT_DIR"
-    ANALYZER_PY="${VCO_VENV_PYTHON:-}"
-fi
-if [ -z "$ANALYZER_PY" ]; then
-    ANALYZER_PY="$PY"
-    _CG_PY_FROM_BARE_PATH=1
-fi
-
-# v0.2.96 (WP-5 S2): when every venv tier missed, ANALYZER_PY is whatever
-# `python3`/`python`/`py` happens to be on PATH — an interpreter that in a
-# user project routinely has neither `weaviate` nor `vco_lib`. The analyzer
-# then prints "Error: weaviate-client not installed" into the detached run's
-# `>/dev/null 2>&1`, while the code below has ALREADY consumed $QUEUE and
-# deletes $CONSUMED at the end: the batch of edited paths is lost with no
-# trace, and those files' code-graph rows stay stale forever.
-#
-# This is not a new policy — it is the policy this hook already applies two
-# blocks up ("No analyzer → put the queue back (append, so nothing is lost)").
-# An interpreter that cannot import the analyzer's dependencies is the same
-# condition: the analyzer cannot run. Probe the SAME import string the
-# shipped wrappers gate on (`kg-duplicates`, `vct_venv_ladder.sh`), and only
-# when we actually fell back — a healthy install resolves a venv and pays
-# nothing. One line to stderr, exit 0: a Stop hook still never blocks.
-if [ "$_CG_PY_FROM_BARE_PATH" = "1" ]; then
-    if ! "$ANALYZER_PY" -c 'import weaviate, vco_lib' >/dev/null 2>&1; then
+# Resolve analyzer + interpreter through the ONE home above. Unusable →
+# put the queue back (append, so nothing is lost) + no-op; the bare-PATH
+# interpreter case also says one line on stderr (see _drain_resolve_runtime).
+_drain_resolve_runtime
+case "$_CG_RUNTIME_RC" in
+    0) ;;
+    *)
         cat "$CONSUMED" >> "$QUEUE" 2>/dev/null || true
         rm -f "$CONSUMED" 2>/dev/null || true
-        echo "ℹ️  code-graph drain: no interpreter with weaviate+vco_lib (tried '$ANALYZER_PY'); queue kept for a later turn." >&2
+        if [ "$_CG_RUNTIME_RC" = "2" ]; then
+            echo "ℹ️  code-graph drain: no interpreter with weaviate+vco_lib (tried '$ANALYZER_PY'); queue kept for a later turn." >&2
+        fi
         exit 0
-    fi
-fi
+        ;;
+esac
 
 # Resolve the code-graph collection prefix for a canonical root (hub resolver
 # `code_graph_collection_prefix`, else basename). Mirrors
@@ -356,14 +424,7 @@ for _pf in "$BATCH_DIR"/*.paths; do
     # its lock past 30 min instead of being broken into a 2nd concurrent run
     # (Stage-1 SEV-2 #3).
     _snip="printf '%s' \"\$\$\" > \"$_lock/pid\" 2>/dev/null; \"$ANALYZER_PY\" \"$ANALYZER\" \"$_canon\" --project \"$_project\" --only-files-from \"$_list\" --canonical-source \"$_canon\" $_dot_flag >/dev/null 2>&1; rm -f \"$_list\" 2>/dev/null; rm -rf \"$_lock\" 2>/dev/null"
-    if command -v setsid >/dev/null 2>&1; then
-        setsid sh -c "$_snip" >/dev/null 2>&1 < /dev/null &
-    elif command -v nohup >/dev/null 2>&1; then
-        nohup sh -c "$_snip" >/dev/null 2>&1 < /dev/null &
-        disown 2>/dev/null || true
-    else
-        ( sh -c "$_snip" ) >/dev/null 2>&1 < /dev/null &
-    fi
+    _drain_spawn_detached "$_snip"
 done
 
 # Record the drain timestamp (rate-limit clock) + clean up.

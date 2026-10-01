@@ -96,12 +96,17 @@ class FakeEmbeddingService:
     def __init__(self, delay_s: float = 0.0) -> None:
         self.delay_s = delay_s
         self.calls = 0
+        self.include_active: list = []
 
-    def embed_text_all_configured(self, text: str) -> dict:
+    def embed_text_all_configured(self, text: str, *, include_active: bool = True) -> dict:
         self.calls += 1
+        self.include_active.append(include_active)
         if self.delay_s:
             time.sleep(self.delay_s)
-        return {ACTIVE_SLOT: list(ACTIVE_VEC), OTHER_SLOT: list(ARCTIC_VEC)}
+        out = {OTHER_SLOT: list(ARCTIC_VEC)}
+        if include_active:
+            out[ACTIVE_SLOT] = list(ACTIVE_VEC)
+        return out
 
 
 def _fake_enrich(state: dict):
@@ -166,7 +171,11 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
 
     patch(es, "configured_text_models", lambda: ["qwen3-embedding:0.6b", "snowflake-arctic-embed2:latest"])
 
+    emit_delay_s = float(cfg.get("emit_delay_s") or 0.0)
+
     def _capture(ev, *, writer_factory=None):
+        if emit_delay_s:
+            time.sleep(emit_delay_s)  # a slow / wedged hub: the POST's timeout
         emitted.append(
             {
                 "task_id": ev.task_id,
@@ -197,6 +206,27 @@ def install_fakes(srv, sp, *, cfg: dict, state: dict, patch) -> None:
         for alias in ("weaviate_mcp.server", "claude_mcp_servers.weaviate_mcp.server"):
             patch(importlib.import_module(alias), "_try_resolve_project_config", lambda: None)
     patch(sp, "emit_rl_event", _capture)
+    # W5R-07: the hook path hands its events to a DETACHED child. This harness
+    # captures emits in THIS process, so send inline unless the caller asks for
+    # the real hand-off (``cfg["real_detach"]``): the REAL child is started and
+    # the number of events handed to it is recorded as ``handed_off``.
+    from claude_mcp_servers.rl_client import deferred_emit as de
+
+    if not cfg.get("real_detach"):
+        patch(de, "_can_detach", lambda: False)
+    else:
+        patch(de, "_can_detach", lambda: True)
+        real_spawn = de._spawn_child
+
+        def _counting_spawn(payload):
+            state["handed_off"] = state.get("handed_off", 0) + len(json.loads(payload)["items"])
+            # The REAL detached start (Popen + temp file + child), but with an
+            # empty batch: the fakes live in THIS process, and a child doing a
+            # real send would only add CPU contention to the timing runs. What
+            # the child does with a real batch is tested on its own.
+            return real_spawn(json.dumps({"items": []}))
+
+        patch(de, "_spawn_child", _counting_spawn)
     patch(sp, "_resolve_rl_enabled", lambda: False)
     patch(sp, "_retrieval_emit_has_consumer", lambda: True)
     patch(sp, "_should_capture_citations", lambda rl_enabled: True)
@@ -211,9 +241,12 @@ def import_rl_kg_search():
     return importlib.import_module("rl_kg_search")
 
 
-def run_main(mod, query: str = "dual log query", limit: int = 1) -> None:
+def run_main(mod, query: str = "dual log query", limit: int = 1,
+             task_type: str = "pre_edit_kg_search") -> None:
     saved = sys.argv
     sys.argv = ["rl_kg_search.py", query, "--limit", str(limit), "--hook-format"]
+    if task_type:
+        sys.argv += ["--task-type", task_type]
     try:
         asyncio.run(mod.main())
     finally:
@@ -272,7 +305,8 @@ def _subprocess_main(config_path: str) -> int:
     state: dict = {}
     install_fakes(srv, sp, cfg=cfg, state=state, patch=setattr)
     t0 = time.monotonic()
-    run_main(mod, query=cfg.get("query", "dual log query"))
+    run_main(mod, query=cfg.get("query", "dual log query"),
+             task_type=cfg.get("task_type", "pre_edit_kg_search"))
     state["main_elapsed_s"] = time.monotonic() - t0
     out = {
         "queried": state.get("queried", []),
@@ -282,6 +316,7 @@ def _subprocess_main(config_path: str) -> int:
         "main_elapsed_s": state["main_elapsed_s"],
         "kg_collection": srv.KG_COLLECTION,
         "asked_paths": asked,
+        "handed_off": state.get("handed_off", 0),
     }
     Path(cfg["result_path"]).write_text(json.dumps(out))
     return 0

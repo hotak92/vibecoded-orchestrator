@@ -3130,6 +3130,8 @@ pub fn run() {
             commands::module_enabled::module_is_global_enabled,
             commands::module_enabled::module_effective_enabled,
             commands::module_enabled::rl_events_count,
+            // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
+            commands::module_enabled::rl_scoring_lock,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.

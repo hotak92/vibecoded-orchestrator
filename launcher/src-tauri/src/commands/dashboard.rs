@@ -262,6 +262,12 @@ async fn update_orchestrator_setting_inner(
         }
         "rl_retrieval_enabled" => {
             let val: bool = value.parse().map_err(|_| "Invalid bool")?;
+            // v0.2.100 W5R-02: the shipped RL scoring lock refuses "on" first —
+            // a Pro licence cannot lift it.
+            vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(
+                vct_launcher_core::db::settings::RL_RERANKER_MODULE_ID,
+                val,
+            )?;
             if val && !flags.has_rl_retrieval {
                 return Err(tier_required_message("pro", "RL-scored retrieval"));
             }
@@ -1918,26 +1924,33 @@ mod rl_scoring_default_tests {
         assert!(!rl_scoring_global_default(&db));
     }
 
+    /// v0.2.100 W5R-02: while the RL scoring lock is set the setting arm
+    /// refuses "on" for EVERY tier (Pro included) and writes nothing; "off"
+    /// is accepted and written.
     #[test]
-    fn the_setting_arm_writes_the_row_for_pro_and_refuses_free() {
+    fn the_setting_arm_refuses_on_while_locked_for_every_tier() {
         let (_tmp, _g) = super::tests::setup_temp_env_for_sibling();
         let (db, pid) = db_with_project();
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
 
-        let err = rt
-            .block_on(update_orchestrator_setting_inner(
-                "rl_retrieval_enabled".into(), "true".into(), "free", &db,
-            ))
-            .unwrap_err();
-        assert!(err.to_lowercase().contains("pro"), "free tier refused: {err}");
-        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None);
+        for tier in ["free", "pro", "mao"] {
+            let err = rt
+                .block_on(update_orchestrator_setting_inner(
+                    "rl_retrieval_enabled".into(), "true".into(), tier, &db,
+                ))
+                .unwrap_err();
+            assert!(err.contains("locked"), "{tier}: {err}");
+            assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), None, "{tier}");
+        }
 
         let cfg = rt
             .block_on(update_orchestrator_setting_inner(
-                "rl_retrieval_enabled".into(), "true".into(), "pro", &db,
+                "rl_retrieval_enabled".into(), "false".into(), "pro", &db,
             ))
             .unwrap();
-        assert!(cfg.rl_retrieval_enabled);
-        assert!(db.module_effective_enabled(&pid, RL_RERANKER_MODULE_ID).unwrap());
+        assert!(!cfg.rl_retrieval_enabled);
+        assert_eq!(db.module_global_enabled(RL_RERANKER_MODULE_ID).unwrap(), Some(false));
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap());
     }
 }

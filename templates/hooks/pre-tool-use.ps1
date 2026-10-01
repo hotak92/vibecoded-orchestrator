@@ -298,13 +298,13 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anc
     # counter error runs UNCAPPED. MUST MATCH pre-tool-use.sh _cg_inject.
     $cnt = ""
     if (Get-Command Get-VcoCgInjectCountPath -ErrorAction SilentlyContinue) {
-        $cnt = Get-VcoCgInjectCountPath -SessionId $SessionIdRaw
+        $cnt = Get-VcoCgInjectCountPath -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
     }
     if ($cnt -and (Get-Command Test-VcoCgInjectCapped -ErrorAction SilentlyContinue) `
         -and (Test-VcoCgInjectCapped -CountFile $cnt)) {
         if ((Get-Command Test-VcoCgInjectNoteOnce -ErrorAction SilentlyContinue) `
             -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) `
-            -and (Test-VcoCgInjectNoteOnce -SessionId $SessionIdRaw)) {
+            -and (Test-VcoCgInjectNoteOnce -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot)) {
             Emit-AdditionalContext "[codegraph injection cap reached for this session]" 'PreToolUse'
         }
         return
@@ -315,8 +315,8 @@ function Invoke-CgInject([string]$q, [string]$excl, [string]$label, [string]$anc
     $inj = ""
     $rd = ""
     if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $inj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
-        $rd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
+        $inj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $rd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
     }
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
         $raw = Invoke-VcoFilterSeenBlocks -InputText $raw -InjectFile $inj -ReadsFile $rd
@@ -347,10 +347,10 @@ if ($ToolName -eq "Read") {
         # session id is untrustworthy.
         $relFp = $filePath
         if (Get-Command ConvertTo-VcoRepoRelative -ErrorAction SilentlyContinue) {
-            $relFp = ConvertTo-VcoRepoRelative -Path $filePath
+            $relFp = ConvertTo-VcoRepoRelative -Path $filePath -ProjectRoot $ProjectRoot
         }
         if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw
+            $unifiedReads = Get-VcoSeenStorePath -Kind "reads" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
             if ($unifiedReads) {
                 try { Add-Content -Path $unifiedReads -Value $relFp -ErrorAction Stop } catch { }
             }
@@ -505,6 +505,9 @@ if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scr
 # harness already set it): the script lives in the orchestrator root, so its
 # own location must never be what names the project.
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+$env:VCO_RL_TASK_TYPE = "pre_tool_use_kg_search"
 $matchOutput = ""
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {

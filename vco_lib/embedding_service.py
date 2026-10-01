@@ -2828,8 +2828,15 @@ class EmbeddingService:
 
     # ---- multi-slot writes --------------------------------------------
 
-    def embed_text_all_configured(self, text: str) -> dict[str, list[float]]:
+    def embed_text_all_configured(
+        self, text: str, *, include_active: bool = True
+    ) -> dict[str, list[float]]:
         """Embed ``text`` into the configured text slot(s).
+
+        ``include_active=False`` (v0.2.100 W5R-07) skips the ACTIVE slot and
+        returns the secondaries only — for a caller that already holds the
+        active vector (the dual-RL-log query embed on a latency-bounded hook,
+        which used to re-embed the active slot inside its 1 s budget).
 
         Returns ``{slot_name: vector}``. ALWAYS includes the active slot
         (``self._text_slot``). The SECONDARY enrichment slots (qwen3,
@@ -2874,10 +2881,11 @@ class EmbeddingService:
         # (denser than the token counter assumed), in which case
         # ``_embed_text_via_active`` shrinks, warns, and sets
         # ``last_active_truncated`` — a leading-window vector, never no vector.
-        try:
-            result[self._text_slot] = self._embed_text_via_active(text)
-        except Exception as exc:
-            logger.warning("Active text backend failed: %s", exc)
+        if include_active:
+            try:
+                result[self._text_slot] = self._embed_text_via_active(text)
+            except Exception as exc:
+                logger.warning("Active text backend failed: %s", exc)
 
         # v0.2.71 Piece 5c: secondary enrichment slots are opt-in (default
         # OFF). When disabled, return only the active slot above.

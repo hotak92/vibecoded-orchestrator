@@ -76,6 +76,9 @@ pub mod process;
 pub mod project_naming;
 pub mod python_resolve;
 pub mod registry;
+// v0.2.100 W5R-02: the RL scoring lock — Rust reader of the one home,
+// `vco_lib/rl_scoring_lock.toml` (Python parses the same file).
+pub mod rl_scoring_lock;
 // v0.2.80 A4: the single-line secret-value shape predicate lives in core so
 // the `secrets::set` write chokepoint (this crate) can call it; the app crate
 // re-exports it from here. See `secret_value_shape.rs` header.

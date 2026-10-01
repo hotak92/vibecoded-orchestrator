@@ -327,6 +327,25 @@ class RLTelemetryWriter:
 
     # ---- public API ---------------------------------------------------
 
+    def construction_params(self) -> Dict[str, Any]:
+        """The identity this writer tags events with, as constructor kwargs.
+
+        v0.2.100 W5R-07: a hook hands its events to a detached child
+        (``deferred_emit``). The child rebuilds THIS writer from these params
+        instead of re-resolving the project (a ~1-2 s ``weaviate_mcp.server``
+        import per search) — and so tags the events exactly as the hook would
+        have. Upload event-type overrides are carried too; the hub POST
+        callable is not (the child uses the default poster)."""
+        return {
+            "project": self._project,
+            "project_id": self._project_id,
+            "embedding_source": self._embedding_source,
+            "embedding_dim": self._embedding_dim,
+            "embedding_model": self._embedding_model,
+            "upload_event_type_retrieval": self._etype_retrieval,
+            "upload_event_type_citations": self._etype_citations,
+        }
+
     def log_retrieval(
         self,
         task_id: str,

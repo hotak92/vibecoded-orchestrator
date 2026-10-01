@@ -170,6 +170,9 @@ RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/r
 # harness already set it): the script lives in the orchestrator root, so its
 # own location must never be what names the project.
 export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
+export VCO_RL_TASK_TYPE="subagent_kg_search"
 
 # Bail silently if the venv didn't resolve or the script is missing —
 # this hook is best-effort context injection, never blocking.

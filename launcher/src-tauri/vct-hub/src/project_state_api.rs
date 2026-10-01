@@ -47,6 +47,15 @@ pub fn router() -> Router<LauncherDbHandle> {
         .route("/projects/{project_id}/secrets/{secret_key}", delete(delete_secret))
         .route("/projects/{project_id}/kg-binding", post(set_kg_binding))
         .route("/projects/{project_id}/codegraph-binding", post(set_codegraph_binding))
+        // v0.2.100 W5R-04: record that an EXTRA code-graph path was re-indexed
+        // at a given commit. The automatic Stop-drain refresh
+        // (`vco_lib/codegraph_extras_refresh.py`) runs the analyzer and then
+        // POSTs here, so launcher.db keeps a single writer (the hook never
+        // opens the DB). Same writer fn as the panel's Sync button.
+        .route(
+            "/projects/{project_id}/codegraph/extras/indexed",
+            post(record_codegraph_extra_indexed),
+        )
         // v0.2.49 access-matrix Phase 8 (Stream W4) — WRITE-path gate.
         // Hooks + MCP server consult this endpoint before allowing a
         // write into a Weaviate collection. Returns the project's
@@ -585,6 +594,84 @@ async fn set_codegraph_binding(
     }
 }
 
+// ─── Extra code-graph path: record an automatic re-index (W5R-04) ─────────
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RecordExtraIndexedBody {
+    /// The extra path EXACTLY as stored (the hub serves it in `/config`'s
+    /// `code_graph_extra_paths`; the caller echoes it back).
+    path: String,
+    /// The repo HEAD the run indexed.
+    commit: String,
+    #[serde(default)]
+    files_analyzed: u64,
+    #[serde(default)]
+    entities_indexed: u64,
+    #[serde(default)]
+    duration_ms: u64,
+}
+
+/// A git object id: 7..=64 hex chars (short SHA-1 up to SHA-256).
+fn is_commit_id(s: &str) -> bool {
+    (7..=64).contains(&s.len()) && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+/// `POST /api/v1/projects/{project_id}/codegraph/extras/indexed`
+///
+/// 200 `{ "recorded": true, "path", "last_indexed_commit" }` on success;
+/// 400 malformed commit; 404 no such (project, path) row; 409 the path is
+/// disabled (it was switched off while the run was in flight — the result is
+/// not recorded, so the next enabled check re-indexes from the old commit).
+async fn record_codegraph_extra_indexed(
+    State(h): State<LauncherDbHandle>,
+    Path(project_id): Path<String>,
+    Json(body): Json<RecordExtraIndexedBody>,
+) -> impl IntoResponse {
+    let commit = body.commit.trim();
+    if !is_commit_id(commit) {
+        return err400(format!("'commit' is not a git object id: {:?}", body.commit));
+    }
+    let row = match h.0.get_codegraph_extra(&project_id, &body.path) {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "error": format!("no extra-path row at '{}' for project {}", body.path, project_id)
+                })),
+            )
+                .into_response()
+        }
+        Err(e) => return err500(e),
+    };
+    if !row.enabled {
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": format!("extra path '{}' is disabled; result not recorded", body.path)
+            })),
+        )
+            .into_response();
+    }
+    let run = vct_launcher_core::db::codegraph_extras::ExtraPathIndexedRun {
+        commit: Some(commit),
+        files_analyzed: body.files_analyzed,
+        entities_indexed: body.entities_indexed,
+        duration_ms: body.duration_ms,
+        trigger: "stop_drain",
+    };
+    match h.0.record_codegraph_extra_indexed(&project_id, &row.path, &run) {
+        Ok(()) => Json(serde_json::json!({
+            "recorded": true,
+            "path": row.path,
+            "last_indexed_commit": commit,
+        }))
+        .into_response(),
+        Err(e) => err500(e),
+    }
+}
+
 // ─── Access matrix (v0.2.49 Phase 8, Stream W4) ───────────────────────────
 
 /// v0.2.49 access-matrix Phase 8 / Stream W4 — WRITE-path gate
@@ -842,6 +929,56 @@ mod tests {
                 rusqlite::params![id, name, folder, now],
             )
             .unwrap();
+    }
+
+    // ── v0.2.100 W5R-04: record an extra path's indexed commit ─────────
+
+    fn seed_extra(db: &Db, pid: &str, path: &str, enabled: bool) {
+        db.add_codegraph_extra(pid, path, None).unwrap();
+        if !enabled {
+            db.set_codegraph_extra_enabled(pid, path, false).unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn record_extra_indexed_writes_commit_for_enabled_row() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "p1", "Acme", "/tmp/acme");
+        seed_extra(&h.0, "p1", "/srv/clone", true);
+        let resp = reqwest::Client::new()
+            .post(format!("{}/projects/p1/codegraph/extras/indexed", base))
+            .json(&serde_json::json!({
+                "path": "/srv/clone", "commit": "0123456789abcdef",
+                "files_analyzed": 4, "entities_indexed": 12, "duration_ms": 30
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let row = h.0.get_codegraph_extra("p1", "/srv/clone").unwrap().unwrap();
+        assert_eq!(row.last_indexed_commit.as_deref(), Some("0123456789abcdef"));
+    }
+
+    #[tokio::test]
+    async fn record_extra_indexed_refuses_disabled_missing_and_bad_commit() {
+        let (base, h) = spawn_project_state_hub().await;
+        seed_project(&h.0, "p1", "Acme", "/tmp/acme");
+        seed_extra(&h.0, "p1", "/srv/off", false);
+        let c = reqwest::Client::new();
+        let post = |path: &str, commit: &str| {
+            c.post(format!("{}/projects/p1/codegraph/extras/indexed", base))
+                .json(&serde_json::json!({"path": path, "commit": commit}))
+                .send()
+        };
+        assert_eq!(post("/srv/off", "abcdef1").await.unwrap().status(), 409);
+        assert_eq!(post("/srv/none", "abcdef1").await.unwrap().status(), 404);
+        seed_extra(&h.0, "p1", "/srv/on", true);
+        assert_eq!(post("/srv/on", "not-a-sha; rm").await.unwrap().status(), 400);
+        // Nothing recorded on any refused path.
+        for p in ["/srv/off", "/srv/on"] {
+            let row = h.0.get_codegraph_extra("p1", p).unwrap().unwrap();
+            assert!(row.last_indexed_commit.is_none(), "{p}");
+        }
     }
 
     /// serde contract: an omitted `is_set` deserializes to `None`

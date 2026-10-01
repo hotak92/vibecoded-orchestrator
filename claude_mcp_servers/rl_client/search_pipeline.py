@@ -54,6 +54,9 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
+from . import deferred_emit as _deferred_emit
+from .deferred_emit import DeferredEmit
+from .deferred_emit import emit_now as emit_deferred_now
 from .telemetry_emit import (
     EmitValidationError,
     RetrievalEvent,
@@ -106,6 +109,12 @@ class RerankRequest:
     other_embedding_source: str = ""
     other_embedding_dim: int = 0
     other_embedding_model: str = ""
+    # ---- v0.2.100 W5R-07: hook path — build the events, do not send them ----
+    # When True the retrieval events (primary + dual-log twin) are BUILT but not
+    # POSTed; they come back on ``RerankResult.deferred`` so a short-lived hook
+    # producer can print its results first and then hand the sends to a
+    # detached child (``deferred_emit.hand_off``). The MCP tools leave it False.
+    defer_emit: bool = False
 
 
 def dual_log_request_fields(dual_inputs: Optional[dict]) -> dict[str, Any]:
@@ -136,6 +145,10 @@ class RerankResult:
     task_id: str                       # echo of req.task_id (or generated one)
     rl_used: bool                      # diagnostic — did the rerank RPC actually run?
     emit_success: bool                 # diagnostic — did emit_rl_event return True?
+    # v0.2.100 W5R-07: the built-but-unsent events when ``req.defer_emit``
+    # (primary first, then the twin); empty otherwise. Send with
+    # ``deferred_emit.hand_off`` AFTER the caller's output.
+    deferred: tuple = ()
 
 
 async def rerank_and_emit(req: RerankRequest) -> RerankResult:
@@ -246,6 +259,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # would drop it at its boundary anyway; skipping here saves the log-node
     # build, the RetrievalEvent construction, and the worker-thread serialize).
     emit_success = False
+    deferred: list = []
     if not _retrieval_emit_has_consumer():
         logger.debug(
             "rerank_and_emit: no retrieval-event consumer (local logging off + "
@@ -262,6 +276,10 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             await asyncio.to_thread(_drive_retention_housekeeping)
         except Exception as exc:  # noqa: BLE001 — housekeeping never breaks search
             logger.debug("rerank_and_emit: opted-out retention drive raised (%s)", exc)
+    elif req.defer_emit:
+        primary = _build_retrieval_event(req, ranked, task_id, rl_used)
+        if primary is not None:
+            deferred.append(DeferredEmit(primary))
     else:
         emit_success = await _emit_retrieval_event(req, ranked, task_id, rl_used)
 
@@ -274,19 +292,29 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     # Concern-A: the second retrieval event has the SAME two consumers as the
     # primary, so it is also skipped when neither exists.
     if req.dual_log and _retrieval_emit_has_consumer():
-        try:
-            # Same blocking-POST concern as the primary emit above — the
-            # other-slot event is a second ~0.5 MB urllib POST. Offload so the
-            # dual-log fan-out never blocks the retrieval coroutine.
-            await asyncio.to_thread(_emit_other_slot_event, task_id, req, ranked, rl_used)
-        except Exception as exc:
-            logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
+        if req.defer_emit:
+            try:
+                twin = _build_other_slot_event(task_id, req, ranked, rl_used)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("rerank_and_emit: dual-log twin build raised (%s)", exc)
+                twin = None
+            if twin is not None:
+                deferred.append(twin)
+        else:
+            try:
+                # Same blocking-POST concern as the primary emit above — the
+                # other-slot event is a second ~0.5 MB urllib POST. Offload so the
+                # dual-log fan-out never blocks the retrieval coroutine.
+                await asyncio.to_thread(_emit_other_slot_event, task_id, req, ranked, rl_used)
+            except Exception as exc:
+                logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
 
     return RerankResult(
         ranked=ranked,
         task_id=task_id,
         rl_used=rl_used,
         emit_success=emit_success,
+        deferred=tuple(deferred),
     )
 
 
@@ -303,11 +331,42 @@ async def _emit_retrieval_event(
     without an early-return maze in the main flow. Byte-identical event shape to
     the pre-extraction inline path — pure move.
     """
-    log_nodes = _build_log_nodes(req.candidates, req.limit)
-    _stamp_shown_ranks(log_nodes, ranked)
     emit_success = False
     try:
-        ev = RetrievalEvent(
+        ev = _build_retrieval_event(req, ranked, task_id, rl_used, raise_errors=True)
+        assert ev is not None  # raise_errors=True: a build error raised above
+        # v0.2.73 retrieval-I/O: emit_rl_event → log_retrieval → post_rl_event
+        # is a BLOCKING urllib POST (hub_writer.py) carrying ~0.5 MB of per-node
+        # embeddings. Called bare on the retrieval coroutine it stalls the MCP
+        # event loop for the POST (up to the 2 s hub timeout on a slow hub).
+        # Offload to a worker thread so the retrieval returns without waiting on
+        # the telemetry write. Soft-fail preserved (the except arms still catch).
+        emit_success = await asyncio.to_thread(emit_rl_event, ev)
+    except EmitValidationError as exc:
+        # Surface as DEBUG, not WARN — caller-side missing fields are
+        # noisy in degraded-mode emit paths (failure_mode set, query_emb
+        # absent). Production paths should never hit this; if they do
+        # the validation message names the field for fast triage.
+        logger.debug("rerank_and_emit: emit validation failed (%s)", exc)
+    except Exception as exc:
+        logger.debug("rerank_and_emit: emit raised (%s)", exc)
+    return emit_success
+
+
+def _build_retrieval_event(
+    req: RerankRequest,
+    ranked: list[dict[str, Any]],
+    task_id: str,
+    rl_used: bool,
+    *,
+    raise_errors: bool = False,
+) -> Optional[RetrievalEvent]:
+    """Build the primary retrieval event (the ONE builder for the sent-now and
+    the deferred path). ``None`` on a build error unless ``raise_errors``."""
+    try:
+        log_nodes = _build_log_nodes(req.candidates, req.limit)
+        _stamp_shown_ranks(log_nodes, ranked)
+        return RetrievalEvent(
             query=req.query,
             # Pass None through verbatim (do NOT coerce to []) — the
             # writer + offline trainer distinguish "no embedding
@@ -327,22 +386,11 @@ async def _emit_retrieval_event(
             # see _do_rerank / RLClient.last_call_ok).
             rl_used=rl_used,
         )
-        # v0.2.73 retrieval-I/O: emit_rl_event → log_retrieval → post_rl_event
-        # is a BLOCKING urllib POST (hub_writer.py) carrying ~0.5 MB of per-node
-        # embeddings. Called bare on the retrieval coroutine it stalls the MCP
-        # event loop for the POST (up to the 2 s hub timeout on a slow hub).
-        # Offload to a worker thread so the retrieval returns without waiting on
-        # the telemetry write. Soft-fail preserved (the except arms still catch).
-        emit_success = await asyncio.to_thread(emit_rl_event, ev)
-    except EmitValidationError as exc:
-        # Surface as DEBUG, not WARN — caller-side missing fields are
-        # noisy in degraded-mode emit paths (failure_mode set, query_emb
-        # absent). Production paths should never hit this; if they do
-        # the validation message names the field for fast triage.
-        logger.debug("rerank_and_emit: emit validation failed (%s)", exc)
-    except Exception as exc:
-        logger.debug("rerank_and_emit: emit raised (%s)", exc)
-    return emit_success
+    except Exception as exc:  # noqa: BLE001
+        if raise_errors:
+            raise
+        logger.debug("rerank_and_emit: retrieval event build raised (%s)", exc)
+        return None
 
 
 # ---- internal helpers ----------------------------------------------
@@ -473,11 +521,40 @@ def _should_capture_citations(rl_enabled: bool) -> bool:
         return True
 
 
-def _resolve_rl_enabled() -> bool:
-    """License-tier + per-project toggle gate. Returns True iff the
-    caller should hit the RL container for rerank.
+def _rl_scoring_lock_reason() -> Optional[str]:
+    """The shipped RL scoring lock (``vco_lib/rl_scoring_lock.toml``, the one
+    home Rust and the GUI also read). ``None`` = not locked.
 
-    Two independent gates, both falling open on resolver errors:
+    An unreadable table is a broken install; it is logged loudly and treated
+    as LOCKED: when "scoring is allowed" cannot be positively confirmed, the
+    conservative answer is not to rerank (search itself is unaffected).
+    """
+    try:
+        from vco_lib.rl_scoring_lock import rl_scoring_lock_reason
+
+        return rl_scoring_lock_reason()
+    except Exception as exc:  # noqa: BLE001 — broken install: scoring off, loudly
+        logger.warning(
+            "RL scoring lock table unreadable (%s); treating RL scoring as locked off. "
+            "This is a broken install: re-run the orchestrator update.",
+            exc,
+        )
+        return "RL scoring lock table unreadable (broken install)"
+
+
+def _resolve_rl_enabled() -> bool:
+    """Scoring lock + license-tier + per-project toggle gate. Returns True
+    iff the caller should hit the RL container for rerank.
+
+    The RL SCORING LOCK (v0.2.100, W5R-02, owner 2026-10-01: keep RL
+    inactive until the network is trained) is checked FIRST and wins over
+    everything below: explicit per-project ``true`` rows, a host-wide
+    ``true`` row, a Pro licence, and the hub-down fall-open. It gates
+    reranking only; event logging (``_retrieval_emit_has_consumer`` and the
+    citation capture) never consults it.
+
+    Below the lock, two independent gates, both falling open on resolver
+    errors:
 
       1. License tier — ``feature_enabled("rl_retrieval", module_id=
          "vct-rl-reranker")``. Free → False. Pro / MAO → True. The
@@ -489,8 +566,10 @@ def _resolve_rl_enabled() -> bool:
          out via the launcher GUI's per-project Modules panel without
          revoking the license. Hub-down branch falls open (True): never
          silently disable a paying user's reranker because the hub
-         crashed mid-session.
+         crashed mid-session (not reached while the scoring lock is set).
     """
+    if _rl_scoring_lock_reason() is not None:
+        return False
     try:
         from VCThelpers.license import feature_enabled
         if not feature_enabled("rl_retrieval", module_id="vct-rl-reranker"):
@@ -1064,40 +1143,75 @@ def _build_other_slot_log_nodes(
     return out
 
 
-def _emit_other_slot_event(
+def hand_off_deferred(items: "tuple | list") -> str:
+    """Send ``RerankResult.deferred`` without holding the caller (W5R-07).
+
+    Call AFTER the caller's output is printed and flushed. See
+    ``deferred_emit.hand_off``; this wrapper threads this module's
+    ``emit_rl_event`` binding through so the inline fallback uses the same
+    emitter as every other send here."""
+    return _deferred_emit.hand_off(items, emit=emit_rl_event)
+
+
+def _record_twin_shortfall(req: "RerankRequest", task_id: str, produced: int) -> None:
+    """W5R-08: a twin that was WANTED (``req.dual_log``) but comes out empty or
+    partial is a loss of training signal — record it in the ledger instead of
+    a DEBUG line. ``produced`` = twin nodes built; the reference is the set of
+    nodes the primary event logs (dict candidates, as ``_build_log_nodes``)."""
+    try:
+        wanted = sum(1 for n in req.candidates if isinstance(n, dict))
+        if not wanted or produced >= wanted:
+            return
+        from vco_lib.rl_telemetry_loss import (
+            KIND_DUAL_PARTIAL,
+            KIND_DUAL_SKIP,
+            record_loss,
+        )
+
+        if produced == 0:
+            record_loss(
+                KIND_DUAL_SKIP, "no_other_slot_vectors",
+                task_type=req.task_type, task_id=task_id,
+                embedding_source=req.other_embedding_source, nodes=wanted,
+            )
+        else:
+            record_loss(
+                KIND_DUAL_PARTIAL, "missing_other_slot_vectors",
+                task_type=req.task_type, task_id=task_id,
+                embedding_source=req.other_embedding_source,
+                missing=wanted - produced, nodes=wanted,
+            )
+    except Exception as exc:  # noqa: BLE001 — a ledger write never breaks a search
+        logger.debug("dual-log: shortfall could not be recorded (%s)", exc)
+
+
+def _build_other_slot_event(
     task_id: str,
     req: "RerankRequest",
     ranked: Optional[list[Any]] = None,
     rl_used: bool = False,
-) -> None:
-    """Emit the second (other-slot) retrieval event. Soft-fail, no-op when empty.
+) -> "Optional[DeferredEmit]":
+    """Build the second (other-slot) retrieval event, or ``None`` when no
+    candidate carries the other slot.
 
     Builds the other-slot log-nodes (skipping candidates with no other-slot
     vector). When NO candidate has the other slot, the second event is SUPPRESSED
     (we do not write a node-less happy-path event — that would mis-signal). The
     writer is the OTHER-slot writer, resolved via ``_get_rl_telemetry_writer_for``
     keyed on ``other_embedding_source`` (the per-(project, emb_source) cache
-    already isolates the two writers — no new caching code).
+    already isolates the two writers — no new caching code). An empty or partial
+    twin is recorded in the loss ledger (W5R-08).
     """
     other_nodes = _build_other_slot_log_nodes(req.candidates, req.limit, ranked)
+    _record_twin_shortfall(req, task_id, len(other_nodes))
     if not other_nodes:
         logger.debug(
             "dual-log: no candidate carries the other slot; suppressing second event"
         )
-        return
+        return None
 
     other_src = req.other_embedding_source
     other_task_id = slot_suffixed_task_id(task_id, other_src or "other")
-
-    def _other_writer_factory():
-        from claude_mcp_servers.weaviate_mcp.server import _get_rl_telemetry_writer_for
-
-        return _get_rl_telemetry_writer_for(
-            other_src,
-            embedding_dim=req.other_embedding_dim,
-            embedding_model=req.other_embedding_model,
-        )
-
     other_ev = RetrievalEvent(
         query=req.query,
         query_emb=req.other_query_emb,
@@ -1113,9 +1227,22 @@ def _emit_other_slot_event(
         # F2: the twin describes the SAME presented list as the active event.
         rl_used=rl_used,
     )
+    return DeferredEmit(
+        other_ev, (other_src, req.other_embedding_dim, req.other_embedding_model)
+    )
+
+
+def _emit_other_slot_event(
+    task_id: str,
+    req: "RerankRequest",
+    ranked: Optional[list[Any]] = None,
+    rl_used: bool = False,
+) -> None:
+    """Build and send the second (other-slot) retrieval event now. Soft-fail,
+    no-op when empty (see :func:`_build_other_slot_event`)."""
     try:
-        emit_rl_event(other_ev, writer_factory=_other_writer_factory)
-    except EmitValidationError as exc:
-        logger.debug("dual-log: second emit validation failed (%s)", exc)
+        twin = _build_other_slot_event(task_id, req, ranked, rl_used)
+        if twin is not None:
+            emit_deferred_now([twin], emit=emit_rl_event)
     except Exception as exc:
         logger.debug("dual-log: second emit raised (%s)", exc)

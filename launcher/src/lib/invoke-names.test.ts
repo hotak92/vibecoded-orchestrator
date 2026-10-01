@@ -122,7 +122,6 @@ type NotInvokedClass = 'rust-only' | 'tray' | 'owner-deferred' | 'uncalled-findi
  *  authority; each one is the owner's call (wire it, name its successor, or
  *  approve removal). The census only guarantees the list cannot grow
  *  silently. */
-const UNCALLED = 'OPEN FINDING: no GUI, tray or Rust caller (2026-09-30 survey)';
 // `owner-deferred`: the owner has scheduled the work; the command stays registered
 // until then. NOT an open finding — but it is not silent either: each carries
 // the owner's words and the release, and the census still fails the moment it
@@ -130,22 +129,30 @@ const UNCALLED = 'OPEN FINDING: no GUI, tray or Rust caller (2026-09-30 survey)'
 const OWNER_RL = 'owner: kept for when RL work resumes (v0.2.102+)';
 const OWNER_0102 = 'owner-deferred to v0.2.102';
 const OWNER_030 = 'owner-deferred to v0.3.0';
-const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string }> = {
+// `rust-only` / `tray` entries name the Rust file that calls the command fn
+// (`caller`, relative to launcher/src-tauri). W5R-12: the census VERIFIES that
+// file contains a real call — outside comments, strings and test modules — so
+// removing the caller turns the census red instead of leaving a stale reason.
+const NOT_INVOKED_OK: Record<string, { class: NotInvokedClass; reason: string; caller?: string }> = {
   check_for_launcher_update: {
     class: 'rust-only',
     reason: 'self_update.rs daily background check calls the command fn directly',
+    caller: 'src/commands/self_update.rs',
   },
   prepare_windows_update_handoff: {
     class: 'rust-only',
     reason: 'services/binary_freshness.rs calls it on the Windows binary swap',
+    caller: 'src/services/binary_freshness.rs',
   },
   validate_model_against_catalog: {
     class: 'rust-only',
     reason: 'reused by project_state_cmd.rs commands; no direct GUI call',
+    caller: 'src/commands/project_state_cmd.rs',
   },
   get_cached_update_status: {
     class: 'tray',
     reason: 'tray.rs reads the cached status to label the tray update item',
+    caller: 'src/tray.rs',
   },
   apply_module_db_migrations: { class: 'owner-deferred', reason: OWNER_RL },
   check_for_weights_update_now: { class: 'owner-deferred', reason: OWNER_RL },
@@ -184,6 +191,18 @@ function manifestReachable(name: string): boolean {
   return name.startsWith('module_') || MANIFEST.includes(name);
 }
 
+/** True when `f` CALLS `name(...)` in live code: comments, string literals
+ *  and `#[cfg(test)]` modules are already blanked in `f.code`, and the
+ *  function's own definition (`fn name(`) does not count as a call. */
+export function rustCalls(f: SourceFile, name: string): boolean {
+  const re = new RegExp(`(?<![\\w$])${name}\\s*\\(`, 'g');
+  for (const m of f.code.matchAll(re)) {
+    if (/\bfn\s+$/.test(f.code.slice(Math.max(0, m.index! - 8), m.index!))) continue;
+    return true;
+  }
+  return false;
+}
+
 // ─── fixtures ──────────────────────────────────────────────────────────────
 
 describe('scanner fixtures', () => {
@@ -205,6 +224,17 @@ describe('scanner fixtures', () => {
       ),
     ];
     expect(invokeSites(files).map((s) => s.name ?? `DYN:${s.expr}`)).toEqual(['typed', 'soft', 'aliased', 'DYN:cmd']);
+  });
+
+  it('rustCalls sees a call, not a definition, comment, string or test module', () => {
+    const f = sourceFile(
+      'x.rs',
+      `pub fn target() {}\n// target()\nfn other() { let s = "target()"; }\n#[cfg(test)]\nmod tests { fn t() { super::target(); } }`,
+      'rust',
+    );
+    expect(rustCalls(f, 'target')).toBe(false);
+    const g = sourceFile('y.rs', `fn other() { let _ = crate::m::target(1); }`, 'rust');
+    expect(rustCalls(g, 'target')).toBe(true);
   });
 
   it('actually scanned the tree', () => {
@@ -255,6 +285,20 @@ describe('invoke-name census', () => {
     const bad = Object.entries(NOT_INVOKED_OK)
       .filter(([, v]) => v.class === 'owner-deferred' && !/owner.*v0\.\d+\.\d+/.test(v.reason))
       .map(([n]) => n);
+    expect(bad).toEqual([]);
+  });
+
+  it('every rust-only / tray entry names a Rust caller that really calls it (W5R-12)', () => {
+    const bad: string[] = [];
+    for (const [name, v] of Object.entries(NOT_INVOKED_OK)) {
+      if (v.class !== 'rust-only' && v.class !== 'tray') continue;
+      const f = v.caller ? RUST.find((x) => x.rel === v.caller) : undefined;
+      if (!f) {
+        bad.push(`${name}: caller file ${v.caller ?? '(none named)'} not found`);
+        continue;
+      }
+      if (!rustCalls(f, name)) bad.push(`${name}: no call in ${v.caller}`);
+    }
     expect(bad).toEqual([]);
   });
 

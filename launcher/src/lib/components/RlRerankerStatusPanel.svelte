@@ -145,6 +145,14 @@
             {collectionSummary.headline}
           </dd>
         </div>
+        {#each collectionSummary.bySource as line (line)}
+          <!-- v0.2.100 W5R-13: per embedding source (qwen3 / arctic /
+               codesage), so the owner can see each space being saved. -->
+          <div class="row">
+            <dt></dt>
+            <dd class="value" data-testid="rl-collection-by-source">{line}</dd>
+          </div>
+        {/each}
       </dl>
     {/if}
     {#if loading && !flagsReady}

@@ -51,9 +51,28 @@ export interface ModuleEnableState {
   explicit: boolean | null;
   /** Host-wide default row, or `null` when none is set. */
   global_default: boolean | null;
-  /** What the hub resolver serves. */
+  /** The stored cascade (rows). While `lock_reason` is set this is NOT the
+   *  live state — it is what applies again once the lock lifts. */
   effective: boolean;
   source: ModuleEnableSource;
+  /** v0.2.100 W5R-02: `string` while the module's effect is forced OFF by a
+   *  shipped lock (today the RL scoring lock, served from its one home
+   *  `vco_lib/rl_scoring_lock.toml`). Absent from pre-v0.2.100 payloads. */
+  lock_reason?: string | null;
+}
+
+/** The lock reason for a resolved state, or `null` when not locked. */
+export function moduleLockReason(state: ModuleEnableState): string | null {
+  return state.lock_reason ?? null;
+}
+
+/**
+ * Which segment to highlight. `null` while locked: the stored row is not the
+ * live state, so no position may read as "this is in force" — the line below
+ * the control names the stored choice instead.
+ */
+export function moduleActiveChoice(state: ModuleEnableState): ModuleTriChoice | null {
+  return moduleLockReason(state) !== null ? null : moduleTriChoiceFor(state);
 }
 
 /** The three positions of the per-project segmented control. */
@@ -157,6 +176,22 @@ export function moduleBadgeFor(state: ModuleEnableState): ModuleEnableBadge {
  * makes an inherited default read as a local choice.
  */
 export function moduleEffectiveLine(state: ModuleEnableState): string {
+  const lock = moduleLockReason(state);
+  if (lock !== null) {
+    return `Off — ${lock} ${storedChoiceSentence(state)}`;
+  }
+  return cascadeLine(state);
+}
+
+/** While locked: what the stored rows say, kept for when the lock lifts. */
+function storedChoiceSentence(state: ModuleEnableState): string {
+  if (state.explicit !== null) {
+    return `This project's own choice (${state.explicit ? 'On' : 'Off'}) is kept and applies once unlocked.`;
+  }
+  return 'This project follows the host-wide default once unlocked.';
+}
+
+function cascadeLine(state: ModuleEnableState): string {
   if (state.source === 'project') {
     return state.effective
       ? 'On — set for this project.'
@@ -205,6 +240,18 @@ export function globalDefaultLine(
     : 'Off for every project that has not made its own choice.';
 }
 
+/**
+ * The host-wide panel's state line while the module's effect is locked: the
+ * lock first, then the stored host-wide row (kept, applies once unlocked).
+ */
+export function globalLockedLine(globalEnabled: boolean | null, lockReason: string): string {
+  const stored =
+    globalEnabled === null
+      ? 'No host-wide choice is stored.'
+      : `The stored host-wide choice (${globalEnabled ? 'On' : 'Off'}) is kept and applies once unlocked.`;
+  return `Off for every project — ${lockReason} ${stored}`;
+}
+
 /** The three positions of the host-wide control. */
 export type GlobalTriChoice = 'default' | 'on' | 'off';
 
@@ -225,37 +272,10 @@ export function globalTriChoiceToValue(choice: GlobalTriChoice): boolean | null 
   return choice === 'on';
 }
 
-// ─── Dormant modules — say what is TRUE today (USER rider, decision #23) ──
+// ─── Dormant-module notices: SUPERSEDED (v0.2.100, W5R-02) ──────────────
 //
-// A toggle whose "On" position promises behaviour the product does not
-// perform yet is the same dishonesty as a toggle that writes the wrong
-// table: the user reads "On" as "this is happening". The RL reranker's
-// switch is real and its plumbing works end-to-end, but nothing reranks
-// today because no trained model has been produced — so every surface that
-// renders the switch also states that.
-//
-// This is a PRODUCT-STATE fact, not a computed one: there is no "has a
-// trained model" probe to read, and inventing one that guesses would be
-// worse than saying plainly what is true. Delete the entry the moment a
-// trained model ships — a stale dormancy notice is its own lie.
-export const DORMANT_MODULE_NOTICES: Readonly<Record<string, string>> = {
-  'vct-rl-reranker':
-    'Reranking is not live yet: no trained model has been produced, so search ' +
-    'results are unaffected whichever way this is set. The switch controls ' +
-    'whether the reranker WOULD be consulted once a model exists. Training-event ' +
-    'collection is separate and continues either way.',
-};
-
-/**
- * The dormancy notice for a module, or `null` when the module is not in the
- * dormant set. Rendered next to the control, never instead of it — the
- * setting is real and persists; it is the EFFECT that is pending.
- */
-export function dormantNotice(moduleId: string): string | null {
-  return DORMANT_MODULE_NOTICES[moduleId] ?? null;
-}
-
-/** Short badge form for a tile, where a paragraph does not fit. */
-export function dormantBadgeLabel(moduleId: string): string | null {
-  return dormantNotice(moduleId) === null ? null : 'not reranking yet';
-}
+// v0.2.91 kept a TS-only `DORMANT_MODULE_NOTICES` table saying "reranking is
+// not live yet: no trained model". That fact now has ONE home shared by Rust,
+// Python and the GUI — the RL scoring lock (`vco_lib/rl_scoring_lock.toml`) —
+// and it is ENFORCED, not just stated. Every surface renders the served
+// `lock_reason` instead (see `moduleEffectiveLine` / `globalLockedLine`).

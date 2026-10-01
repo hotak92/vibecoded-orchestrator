@@ -180,8 +180,8 @@ if (-not (Test-Path $SeenDir)) {
 $SeenInjectFile = ""
 $SeenReadsFile = ""
 if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
-    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
+    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
 }
 $SeenNodesFile = if ($SeenInjectFile) { $SeenInjectFile } else { Join-Path $SeenDir "seen_inject_$SessionId.txt" }
 
@@ -247,17 +247,20 @@ function Emit-ContextJson([string]$ctx) {
 # two live searches. Pre-v0.2.77 they were defined after the searches, so the
 # replay branch sat after the searches had already run (audit: warm ≈ cold).
 # MUST MATCH pre-edit-context-inject.sh ordering.
-function Filter-Seen([string]$input) {
-    if (-not $input) { return "" }
+# NOT `$input`: that is PowerShell's automatic pipeline enumerator, which
+# shadows a declared [string]$input parameter -- every call returned "" and
+# this hook never injected on Windows (W5R-01 behavioural test, v0.2.100).
+function Filter-Seen([string]$Text) {
+    if (-not $Text) { return "" }
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
-        return Invoke-VcoFilterSeenBlocks -InputText $input -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
+        return Invoke-VcoFilterSeenBlocks -InputText $Text -InjectFile $SeenInjectFile -ReadsFile $SeenReadsFile
     }
-    return Filter-Seen-Legacy $input
+    return Filter-Seen-Legacy $Text
 }
 
 # Legacy fallback (pre-v0.2.70): title-coarse dedup, no reads-ledger consult.
-function Filter-Seen-Legacy([string]$input) {
-    if (-not $input) { return "" }
+function Filter-Seen-Legacy([string]$Text) {
+    if (-not $Text) { return "" }
     $filtered = New-Object System.Text.StringBuilder
     if (-not (Test-Path $SeenNodesFile)) { New-Item -ItemType File -Path $SeenNodesFile -Force | Out-Null }
     $seen = @{}
@@ -276,7 +279,7 @@ function Filter-Seen-Legacy([string]$input) {
         }
     }
 
-    foreach ($line in $input -split "`n") {
+    foreach ($line in $Text -split "`n") {
         # Header line starts a new block. Format: "KG: <title> | ..." or
         # "CODE: <full_name> | ..." — the first field after the prefix and
         # before the next " | " is the dedup key.
@@ -374,15 +377,14 @@ if ($CacheHit) {
 }
 Write-CacheLog "miss"
 
-# Auto-detect project for multi-codebase support — best-effort, optional.
-$DetectScriptPs1 = Join-Path $ProjectRoot ".claude/scripts/detect-project.ps1"
-$DetectedProject = ""
-if (Test-Path $DetectScriptPs1) {
-    try {
-        $DetectedProject = (& $PsExe -NoProfile -File $DetectScriptPs1 $FilePath $ProjectRoot 2>$null).Trim()
-    } catch { }
-}
-$CodeGraphProjectArg = if ($DetectedProject) { @('--project', $DetectedProject) } else { @() }
+# Code-graph identity: ALWAYS the calling project (v0.2.100 W5R-03).
+# No --project override, ever: the CLI resolves the CALLING project
+# (CLAUDE_PROJECT_DIR -> hub binding prefix, which also holds its extra paths)
+# and fans out over that project's own VCT_CODE_GRAPH_ACCESS_LIST grants. The
+# old detect-project.ps1 sibling-by-folder-name heuristic searched a neighbour
+# folder's code graph with no grant and skipped the own prefix for extra
+# paths. MUST MATCH pre-edit-context-inject.sh.
+$CodeGraphProjectArg = @()
 
 $ModuleName = [System.IO.Path]::GetFileNameWithoutExtension($Basename)
 $NewSnippet = if ($NewString.Length -gt 200) { $NewString.Substring(0,200) } else { $NewString }
@@ -415,6 +417,9 @@ if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scr
 # harness already set it): the script lives in the orchestrator root, so its
 # own location must never be what names the project.
 $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+$env:VCO_RL_TASK_TYPE = "pre_edit_kg_search"
 
 # v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
 # _lib/code-extensions.ps1. v0.2.70 Stream C kept it as a C-tier mirror here,

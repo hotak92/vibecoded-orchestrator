@@ -53,6 +53,7 @@ module-level binding is both sufficient and cheaper than 29 in-function imports.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from pathlib import Path
 from typing import Optional
@@ -3102,13 +3103,17 @@ async def _resolve_dual_rl_log_inputs(
         if svc is None:
             _record_dual_skip("no_embedding_service", task_type)
             return None
-        # embed_text_all_configured returns {active_slot: vec} PLUS the secondary
-        # slots (only when dual-write is on — already guaranteed by the gate).
+        # embed_text_all_configured returns the secondary slots (only when
+        # dual-write is on — already guaranteed by the gate). W5R-07: the
+        # caller already holds the ACTIVE vector, so the active slot is NOT
+        # re-embedded (include_active=False) — on the 1 s hook budget that
+        # second active embed was pure waste.
+        _embed = functools.partial(svc.embed_text_all_configured, include_active=False)
         if embed_budget_s is None:
-            slots = await asyncio.to_thread(svc.embed_text_all_configured, query)
+            slots = await asyncio.to_thread(_embed, query)
         else:
             slots = await _call_in_daemon_thread(
-                svc.embed_text_all_configured, query, timeout_s=embed_budget_s
+                _embed, query, timeout_s=embed_budget_s
             )
     except asyncio.TimeoutError:
         _record_dual_skip("secondary_embed_timeout", task_type, budget_s=embed_budget_s)

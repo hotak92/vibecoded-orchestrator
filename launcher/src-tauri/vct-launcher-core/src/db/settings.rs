@@ -318,6 +318,38 @@ impl Db {
     }
 }
 
+// ─── v0.2.100 W5R-02 — RL SCORING, with the shipped lock on top ──────────
+//
+// `module_effective_enabled` answers "is the RL module on for this project?"
+// from the stored rows. That answer still decides which projects receive the
+// module's settings and is what the rows will mean again once the lock lifts.
+// RL SCORING additionally obeys the shipped lock (`vco_lib/rl_scoring_lock.toml`,
+// read by `crate::rl_scoring_lock`): while it is set, scoring is OFF whatever
+// the rows say. Rows are never rewritten by the lock (they are user data).
+// Event collection reads neither.
+
+impl Db {
+    /// Whether RL SCORING (reranking) is on for `project_id`: the shipped
+    /// lock first, then the enable cascade. This is what the hub's `/config`
+    /// serves as `rl_reranker_enabled_for_project`.
+    pub fn rl_scoring_enabled_for_project(&self, project_id: &str) -> Result<bool, String> {
+        self.rl_scoring_enabled_with_lock(project_id, crate::rl_scoring_lock::rl_scoring_lock())
+    }
+
+    /// [`Db::rl_scoring_enabled_for_project`] with an explicit lock, so both
+    /// the locked and the post-unlock behaviour stay testable.
+    pub fn rl_scoring_enabled_with_lock(
+        &self,
+        project_id: &str,
+        lock: Option<&str>,
+    ) -> Result<bool, String> {
+        if lock.is_some() {
+            return Ok(false);
+        }
+        self.module_effective_enabled(project_id, RL_RERANKER_MODULE_ID)
+    }
+}
+
 // ─── v0.2.91 decision #23 — the module-enable cascade, WITH PROVENANCE ───
 //
 // `module_effective_enabled` above answers "on or off?". That is all the hub
@@ -367,11 +399,19 @@ pub struct ModuleEnableState {
     /// The host-wide default row, if one exists. `None` = none set (which
     /// resolves to the fail-open system default, NOT to `false`).
     pub global_default: Option<bool>,
-    /// What the hub resolver serves — identical to
-    /// [`Db::module_effective_enabled`] by construction (see the test).
+    /// The stored enable cascade — identical to
+    /// [`Db::module_effective_enabled`] by construction (see the test). For
+    /// the RL reranker the hub serves this AND-ed with the scoring lock
+    /// ([`Db::rl_scoring_enabled_for_project`]); see `lock_reason`.
     pub effective: bool,
     /// Which tier supplied `effective`.
     pub source: ModuleEnableSource,
+    /// v0.2.100 W5R-02: `Some(reason)` while this module's effect is forced
+    /// OFF by a shipped lock (today only the RL scoring lock, for
+    /// `vct-rl-reranker`). `effective` still reports the stored cascade — the
+    /// value that applies again once unlocked — so a control must render the
+    /// lock FIRST and never show `effective` as the live state while it is set.
+    pub lock_reason: Option<&'static str>,
 }
 
 impl Db {
@@ -409,6 +449,7 @@ impl Db {
             global_default,
             effective,
             source,
+            lock_reason: crate::rl_scoring_lock::module_effect_lock(module_id),
         })
     }
 }
@@ -1627,6 +1668,38 @@ mod enable_toggle_tests {
             db.resolve_dual_flags(&pid).rl_log.effective,
             "writing and clearing the enable flag must not touch dual_rl_log_enabled",
         );
+    }
+
+    /// v0.2.100 W5R-02: the shipped RL scoring lock forces scoring OFF over
+    /// an explicit per-project `true` AND a host-wide `true`, leaves both rows
+    /// exactly as stored, and is what the GUI state reports.
+    #[test]
+    fn rl_scoring_lock_overrides_rows_without_touching_them() {
+        let (db, pid) = db_with_project("lock");
+        let m = RL_RERANKER_MODULE_ID;
+        db.module_write_enabled_for_project(&pid, m, Some(true)).unwrap();
+        db.module_set_global_enabled(m, true).unwrap();
+
+        let lock = crate::rl_scoring_lock::rl_scoring_lock();
+        assert!(lock.is_some(), "v0.2.100 ships locked");
+        assert!(!db.rl_scoring_enabled_for_project(&pid).unwrap(), "locked => scoring off");
+        assert!(db.rl_scoring_enabled_with_lock(&pid, None).unwrap(), "unlocked => the row applies");
+        assert!(!db.rl_scoring_enabled_with_lock(&pid, Some("r")).unwrap());
+
+        // Rows are user data: unchanged by the lock.
+        assert_eq!(
+            db.get_setting(&pid, m, MODULE_ENABLED_FOR_PROJECT_KEY).unwrap(),
+            Some(Value::Bool(true))
+        );
+        assert_eq!(db.module_global_enabled(m).unwrap(), Some(true));
+
+        let st = db.resolve_module_enable(&pid, m).unwrap();
+        assert_eq!(st.lock_reason, lock, "the GUI state carries the lock");
+        assert!(st.effective, "`effective` keeps reporting the stored cascade");
+        assert_eq!(st.explicit, Some(true));
+
+        // Other modules are never locked.
+        assert_eq!(db.resolve_module_enable(&pid, "vct-coordination").unwrap().lock_reason, None);
     }
 }
 

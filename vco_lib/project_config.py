@@ -1652,6 +1652,42 @@ def claude_session_dir_for(workspace_path: Path) -> Path:
     return Path.home() / ".claude" / "projects" / slug
 
 
+def hub_post_json(route: str, body: dict[str, Any]) -> requests.Response:
+    """POST ``body`` as JSON to ``/api/v1/<route>`` on the local hub.
+
+    The write-side sibling of the resolver's GETs, so hub discovery + bearer
+    handling keep ONE home in this module (v0.2.100 W5R-04 — first caller:
+    :mod:`vco_lib.codegraph_extras_refresh`). Uses the global ``hub.token``
+    (non-``/env``/``/config`` routes accept it); a 401 — the stale-cache shape
+    after a hub restart — invalidates discovery and retries ONCE.
+
+    :raises HubUnreachable: the hub is down / not discoverable / the
+        transport failed. Any HTTP status is returned to the caller as-is.
+    """
+    if os.environ.get("VCT_DISABLE_HUB_RESOLVER", "").strip().lower() in (
+        "1", "true", "yes",
+    ):
+        raise HubUnreachable("VCT_DISABLE_HUB_RESOLVER set; hub POST short-circuited")
+    route = route.lstrip("/")
+    resp: requests.Response | None = None
+    for attempt in range(2):
+        port, token = _discover_hub()
+        try:
+            resp = _http_session().post(
+                f"http://127.0.0.1:{port}/api/v1/{route}",
+                json=body,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=(_CONNECT_TIMEOUT_SECONDS, _READ_TIMEOUT_SECONDS),
+            )
+        except requests.RequestException as exc:
+            raise HubUnreachable(f"hub POST failed: {exc}") from exc
+        if resp.status_code != 401 or attempt == 1:
+            return resp
+        _invalidate_discovery_cache()
+    assert resp is not None  # loop always assigns
+    return resp
+
+
 __all__ = [
     "DEFAULT_HUB_PORT",
     "EmbeddingModels",
@@ -1668,6 +1704,7 @@ __all__ = [
     "ServiceMisconfigured",
     "Unauthorized",
     "claude_session_dir_for",
+    "hub_post_json",
     "resolve",
     "resolve_field",
 ]

@@ -590,6 +590,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `DELETE /api/v1/projects/{project_id}/secrets/{secret_key}` — clear a secret ref.
 - `POST /api/v1/projects/{project_id}/kg-binding` — set the project's primary KG binding.
 - `POST /api/v1/projects/{project_id}/codegraph-binding` — set the code graph binding.
+- `POST /api/v1/projects/{project_id}/codegraph/extras/indexed` — record that an extra code-graph path was re-indexed at a commit (`{path, commit, files_analyzed?, entities_indexed?, duration_ms?}`; 404 unknown path, 409 disabled path). Written by the Stop hook's automatic extra-path refresh so the hook never opens launcher.db.
 
 ### CLI-facing endpoints (`hub/cli_api.rs`)
 Mirror of Tauri commands so the headless `vct-cli` can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.

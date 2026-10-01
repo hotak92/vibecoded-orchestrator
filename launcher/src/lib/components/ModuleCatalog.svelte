@@ -73,10 +73,10 @@
   // in `$lib/module-enable` (pure ⇒ unit-tested; this file is markup).
   import {
     MODULE_TRI_CHOICE_LABELS,
-    dormantNotice,
+    moduleActiveChoice,
     moduleBadgeFor,
     moduleEffectiveLine,
-    moduleTriChoiceFor,
+    moduleLockReason,
     moduleTriChoiceToValue,
     installedTileUsesCascade,
     showsProjectSettingControl,
@@ -764,19 +764,29 @@
 -->
 {#snippet enableCascadeControl(m: ModuleCatalogEntry, tileLicenseGated: boolean)}
   {@const enableState = enableStates[m.id]}
+  <!-- v0.2.100 W5R-02: while the module's effect is LOCKED (the RL scoring
+       lock, served by the backend as `lock_reason`) no position is
+       highlighted — the stored row is not the live state — every button is
+       disabled, and the line below leads with "Off" and the reason. -->
+  {@const lockReason = enableState === undefined ? null : moduleLockReason(enableState)}
   <div class="mc-enable" data-testid="mc-enable-cascade">
     <div class="mc-enable-seg" role="group" aria-label="{m.name} for this project">
       {#each ['inherit', 'on', 'off'] as const as choice (choice)}
         <button
           class="mc-enable-btn"
           class:mc-enable-active={enableState !== undefined &&
-            moduleTriChoiceFor(enableState) === choice}
+            moduleActiveChoice(enableState) === choice}
           aria-pressed={enableState !== undefined &&
-            moduleTriChoiceFor(enableState) === choice}
-          disabled={tileLicenseGated || enableState === undefined || enableBusy !== null}
-          title={tileLicenseGated
-            ? 'License required to change enable state. Re-activate the license to manage this module.'
-            : undefined}
+            moduleActiveChoice(enableState) === choice}
+          disabled={tileLicenseGated ||
+            enableState === undefined ||
+            lockReason !== null ||
+            enableBusy !== null}
+          title={lockReason !== null
+            ? lockReason
+            : tileLicenseGated
+              ? 'License required to change enable state. Re-activate the license to manage this module.'
+              : undefined}
           onclick={() => chooseEnable(m.id, choice)}
         >
           {MODULE_TRI_CHOICE_LABELS[choice]}
@@ -796,11 +806,6 @@
         >
       {/if}
     </p>
-    {#if dormantNotice(m.id)}
-      <!-- USER rider (#23): say what is TRUE today, so "On" never reads as
-           "actively reranking". -->
-      <p class="mc-enable-dormant">{dormantNotice(m.id)}</p>
-    {/if}
   </div>
 {/snippet}
 
@@ -1852,14 +1857,6 @@
   .mc-enable-badge-auto {
     background: rgba(123, 95, 255, 0.15);
     color: var(--color-purple);
-  }
-  .mc-enable-dormant {
-    margin: 0;
-    font-size: 11px;
-    line-height: 1.45;
-    color: var(--color-mid);
-    border-left: 2px solid var(--color-purple);
-    padding-left: 8px;
   }
 
   .mono {

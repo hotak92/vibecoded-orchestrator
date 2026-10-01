@@ -42,10 +42,11 @@
     type ExtrasProgressPayload,
     type ExtrasSyncProgress,
   } from '$lib/components/extras-sync-progress';
-  import type {
-    ExtraPath,
-    ProjectMeta,
-    SyncOutcome,
+  import {
+    extraPathStaleBadge,
+    type ExtraPath,
+    type ProjectMeta,
+    type SyncOutcome,
   } from '$lib/types/codegraph-extras';
   import {
     addExtraPath,
@@ -465,6 +466,7 @@
     <ul class="extras-list" aria-label="Extra codegraph paths">
       {#each rows as row (row.path)}
         {@const busy = !!rowBusy[row.path]}
+        {@const staleBadge = extraPathStaleBadge(row)}
         <li class="extras-row" class:extras-row-disabled={!row.enabled}>
           <div class="extras-row-meta">
             <div class="extras-row-label">
@@ -475,6 +477,15 @@
                   aria-label="This path is currently disabled"
                 >
                   disabled
+                </span>
+              {/if}
+              {#if staleBadge}
+                <span
+                  class="extras-row-badge extras-row-badge-stale"
+                  title={staleBadge.title}
+                  aria-label={staleBadge.title}
+                >
+                  {staleBadge.text}
                 </span>
               {/if}
             </div>
@@ -653,6 +664,10 @@
     background: rgba(255, 255, 255, 0.06);
     border-radius: 8px;
     color: #888;
+  }
+  .extras-row-badge-stale {
+    background: rgba(255, 79, 160, 0.14);
+    color: #ff4fa0;
   }
   .extras-row-path {
     font-family: ui-monospace, monospace;
