@@ -13,8 +13,10 @@
 #               infrastructure/docker-compose.override.yml, vct-secrets/,
 #               compiled __pycache__/, etc.).
 #
-# Why this matters: `update_orchestrator_at` (launcher) copies repo
-# contents from one clone into another, so any gitignored file that
+# Why this matters: the launcher's copy install (`install_orchestrator`'s
+# copy_orchestrator_to_sync, the onboarding wizard's Install) copies repo
+# contents from one clone into another (the clone-to-clone
+# `update_orchestrator_at` copy was retired in v0.2.100), so any gitignored file that
 # IS still on disk in the source clone will silently propagate
 # machine-to-machine if the copy walker is gitignore-blind. PR-4
 # made the walker gitignore-aware; this file declares the policy.
