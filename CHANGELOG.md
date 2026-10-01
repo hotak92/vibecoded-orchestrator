@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed — code graph: incremental syncs remove deleted files and never touch rows they cannot prove are theirs (v0.2.100)
+
+- An incremental sync (the extra-path Sync button and the automatic extra-path re-index) now removes the entities of files deleted or renamed away since the last indexed commit, scoped to that path's own rows. The counts are in the run summary and in `codegraph_extras_refresh.log`. If that removal fails, the analyzer exits 5 and the indexed commit is not advanced.
+- An extra-path sync now passes `--as-extra-path`, and the analyzer then never deletes a row it cannot prove belongs to that path. Legacy rows with no `project_source` — usually the primary project's — were previously at risk from the deleted-file sweep, the orphan clear and the entity reconcile.
+
+### Changed — the gateway no longer provides glm-5.2; glm-5.3 is 1M on every route (v0.2.100)
+
+- **`glm-5.2` is retired on both routes (owner decision).** The vendor registry has a new `retired_ids` field, set on the z.ai and the QwenCloud rows: a retired id is not published, not declared (removed from the qwen row's fallback list, the static snapshot and the context-table seed), dropped from a live model list that still carries it, and refused by name with an `unknown_model` 400 that suggests `glm-5.3`. `glm-5.3` is 1M with the `[1m]` suffix on both routes, with no per-route override. The shipped CLAUDE.md template's GLM routing note is rewritten around glm-5.3. Existing launcher tables keep an inert glm-5.2 row (the seed converge never prunes), which the gateway never serves.
+
 ### Fixed — RL training logs: the second embedding net now gets a corpus from every KG search, in every project (v0.2.100, dual-RL-log)
 
 - **Dual-RL-log now covers the hook and CLI KG searches.** With dual logging on, every KG retrieval is meant to be logged twice: once for the active embedding model and once, as a `<task_id>:arctic` twin, for the secondary model, so both networks accumulate training data. Only the two MCP search tools did this, and they carry about 1% of retrievals. The hook searches (pre-edit, pre-bash, pre-tool-use, subagent-start) and `search_knowledge.py` never read the flag. All of them now call one shared helper (`rl_enrichment.resolve_and_enrich_dual`, which replaces two inline copies in `server.py`) and pass its result into the request through `search_pipeline.dual_log_request_fields`. On the hook and CLI paths, the secondary query embed is capped at 1 s, and the lazy node backfill does not run there. The primary event is still posted before the twin, so a timeout can only lose the twin.

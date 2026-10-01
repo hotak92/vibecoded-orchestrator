@@ -618,9 +618,12 @@ pub async fn set_project_codegraph_extra_path_enabled(
 
 /// Run the analyzer against a SINGLE extra path (the path's own
 /// `last_indexed_commit` may steer `--incremental --since-commit`).
-/// Does NOT pass `--prune-stale` — single-path syncs only add /
-/// refresh entities for the path itself; pruning is a project-wide
-/// concern handled by `reindex_*`.
+/// Does NOT pass `--prune-stale` — a single-path sync adds / refreshes
+/// entities for the path itself and, when incremental, removes the
+/// entities of files deleted or renamed away since `last_indexed_commit`
+/// (scoped to this path's `project_source`; `vco_lib/codegraph_deleted_files.py`).
+/// If that removal fails the analyzer exits 5 and the commit is NOT
+/// recorded. The project-wide visited-UUID prune stays with `reindex_*`.
 ///
 /// Audit log: `codegraph_extra_path_synced` with the outcome.
 #[command]

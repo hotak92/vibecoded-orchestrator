@@ -31,15 +31,15 @@ from pathlib import Path
 
 from model_router import context_table as ct
 
-#: The ten subscription-vendor rows the shipped seed must carry.
+#: The nine subscription-vendor rows the shipped seed must carry.
 EXPECTED_VENDOR_SEED_IDS = {
-    "glm-5.3", "glm-5.3-flash", "glm-5.2", "glm-5.1", "glm-5",
+    "glm-5.3", "glm-5.3-flash", "glm-5.1", "glm-5",
     "glm-5-turbo", "glm-4.7", "glm-4.6", "glm-4.5", "glm-4.5-air",
 }
 
 #: The eight Token-Plan rows (owner order 2026-09-21, expanded 2026-09-22
-#: with the live compatible-mode probe's deepseek-v4.1-flash). ``glm-5.2``
-#: and ``glm-5.3`` are NOT duplicated here although that endpoint serves
+#: with the live compatible-mode probe's deepseek-v4.1-flash). ``glm-5.3``
+#: is NOT duplicated here although that endpoint serves
 #: them too: lookup keys are bare ids and vendor-agnostic, and the rows
 #: above already carry the verified windows — a second row under another
 #: vendor could only disagree with them.
@@ -77,7 +77,7 @@ QWEN_PER_MODEL_SOURCE = (
 
 #: Exactly the models whose official page states a 1M window.
 EXPECTED_1M_IDS = (
-    {"glm-5.3", "glm-5.3-flash", "glm-5.2"}
+    {"glm-5.3", "glm-5.3-flash"}
     | EXPECTED_CLAUDE_SEED_IDS
     | EXPECTED_QWEN_SEED_IDS
 )
@@ -140,32 +140,36 @@ class SeedTests(unittest.TestCase):
 
     def test_adjacent_versions_differ_which_is_why_keys_are_exact(self) -> None:
         """The concrete case the exact-key rule exists for."""
-        self.assertEqual(self.seed.rows["glm-5.2"].context_window, 1_000_000)
+        self.assertEqual(self.seed.rows["glm-5.3"].context_window, 1_000_000)
         self.assertEqual(self.seed.rows["glm-5.1"].context_window, 200_000)
 
     def test_the_shared_ids_answer_from_the_one_row_that_exists(self) -> None:
-        """``glm-5.2`` AND ``glm-5.3`` are served by BOTH shipped vendor
-        endpoints, but the table keys on the bare id — so each has exactly
-        ONE row (the one whose window is vendor-verified) and every consumer
-        of the shared id reads it, whatever endpoint serves it. A second,
-        vendor-duplicated row here could only disagree with the first and
-        make the lookup order-dependent."""
-        for model_id in ("glm-5.2", "glm-5.3"):
-            with self.subTest(model=model_id):
-                row = self.seed.rows[model_id]
-                self.assertEqual(row.vendor, "zai", "the ONE cited row")
-                self.assertEqual(row.context_window, 1_000_000)
-                self.assertTrue(row.window_1m)
-                self.assertIsNotNone(self.seed.lookup(model_id))
-        # v0.2.100 (F-W1-19) refines the ruling where the other endpoint
-        # DOCUMENTS a smaller window: the row stays the model's (above), and
-        # the endpoint's own cited figure rides in `vendor_overrides`, read
-        # only when the caller names that vendor.
-        qwen_glm52 = self.seed.lookup("glm-5.2", "qwen")
-        assert qwen_glm52 is not None
-        self.assertLessEqual(qwen_glm52.context_window, 198_000)
-        self.assertFalse(qwen_glm52.window_1m)
-        self.assertTrue(qwen_glm52.source)
+        """``glm-5.3`` is served by BOTH shipped vendor endpoints, but the
+        table keys on the bare id — so it has exactly ONE row (the one whose
+        window is vendor-verified) and every consumer reads it, whatever
+        endpoint serves it. Owner 2026-10-01: glm-5.3 is 1M on BOTH routes
+        (the qwen route confirmed 1M), so there is no per-route override."""
+        row = self.seed.rows["glm-5.3"]
+        self.assertEqual(row.vendor, "zai", "the ONE cited row")
+        self.assertEqual(row.context_window, 1_000_000)
+        self.assertTrue(row.window_1m)
+        for vendor_id in ("zai", "qwen", None):
+            with self.subTest(vendor=vendor_id):
+                got = self.seed.lookup("glm-5.3", vendor_id)
+                assert got is not None
+                self.assertEqual(got.context_window, 1_000_000)
+                self.assertTrue(got.window_1m)
+                self.assertTrue(got.source)
+        self.assertFalse(
+            row.vendor_overrides, "no route serves glm-5.3 at a smaller window",
+        )
+
+    def test_glm_5_2_is_not_in_the_table(self) -> None:
+        """Retired by the owner (2026-10-01): no row, so nothing can
+        advertise it as 1M."""
+        self.assertNotIn("glm-5.2", self.seed.rows)
+        self.assertIsNone(self.seed.lookup("glm-5.2"))
+        self.assertFalse(self.seed.advertise_1m("glm-5.2"))
 
     def test_token_plan_rows_carry_the_vendors_per_model_windows(self) -> None:
         """Each row is pinned to the figure the vendor's OWN per-model table

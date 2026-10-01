@@ -1,5 +1,5 @@
 {
-  "_comment": "v0.2.100 W5R-04: the ONE argv shape for syncing a single extra code-graph path. Asserted by vct-launcher-core db::codegraph_extras::extra_path_sync_args (Rust, panel Sync button) AND vco_lib.codegraph_extras_refresh.build_extra_sync_argv (Python, automatic Stop-drain refresh). Edit both sides together. The stale_cases table pins the shared 'needs a re-index' rule (Rust extra_path_is_stale / Python extra_path_is_stale): stale iff the repo HEAD is known and differs from last_indexed_commit.",
+  "_comment": "v0.2.100 W5R-04: the ONE argv shape for syncing a single extra code-graph path. Asserted by vct-launcher-core db::codegraph_extras::extra_path_sync_args (Rust, panel Sync button) AND vco_lib.codegraph_extras_refresh.build_extra_sync_argv (Python, automatic Stop-drain refresh). Edit both sides together. The stale_cases table pins the shared 'needs a re-index' rule (Rust extra_path_is_stale / Python extra_path_is_stale): stale iff the repo HEAD is known and differs from last_indexed_commit. v0.2.100: every case carries --as-extra-path (the analyzer then never deletes a row not provably stamped with this path, e.g. a legacy primary row with an empty project_source).",
   "cases": [
     {
       "name": "full pass (incremental off)",
@@ -11,7 +11,8 @@
         "/srv/clone",
         "--project",
         "Acme",
-        "--json-progress"
+        "--json-progress",
+        "--as-extra-path"
       ]
     },
     {
@@ -25,6 +26,7 @@
         "--project",
         "Acme",
         "--json-progress",
+        "--as-extra-path",
         "--incremental",
         "--since-commit",
         "abc1234"
@@ -41,6 +43,7 @@
         "--project",
         "Acme",
         "--json-progress",
+        "--as-extra-path",
         "--incremental"
       ]
     },
@@ -55,6 +58,7 @@
         "--project",
         "My_Proj",
         "--json-progress",
+        "--as-extra-path",
         "--incremental"
       ]
     }

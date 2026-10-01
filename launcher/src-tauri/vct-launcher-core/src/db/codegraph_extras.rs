@@ -301,6 +301,10 @@ pub fn extra_path_sync_args(
         "--project".to_string(),
         prefix.to_string(),
         "--json-progress".to_string(),
+        // v0.2.100: `path` is analyzed AS the repo root here, so the
+        // analyzer must never delete a row it cannot prove is this path's
+        // (a legacy row with an empty `project_source` is the primary's).
+        "--as-extra-path".to_string(),
     ];
     if incremental {
         args.push("--incremental".to_string());

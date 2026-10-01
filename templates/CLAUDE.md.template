@@ -87,7 +87,7 @@ This section is here because a **model gateway is configured for this machine** 
 
 **The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers ten definitions across two lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none). The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
 
-**When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.2 is 1M on z.ai but 198K on the qwen route, glm-5.1 is 200K), so "the GLM one" is not a specification.
+**When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.3 is 1M on both the z.ai and the qwen route, glm-5.1 is 200K); `glm-5.2` is not provided at all — the gateway refuses it and suggests glm-5.3, so "the GLM one" is not a specification.
 
 ⚠️ **Everything below is conditional on YOU having supplied the vendor's API
 key.** VCO ships no third-party key and never writes one. Without a key and a
@@ -129,10 +129,10 @@ Two guardrails on flash, both from the same measurement: retries rescue it, more
 *Capacity* is settled data, version-keyed and cited — never guess it and never
 infer it from a family name. The shipped table
 (`claude_mcp_servers/model_router/chat_model_context.seed.json`, one row per FULL
-model id, each with its vendor citation) is the source of truth: `glm-5.3`,
-`glm-5.3-flash` and `glm-5.2` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
+model id, each with its vendor citation) is the source of truth: `glm-5.3`
+and `glm-5.3-flash` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
 `glm-4.7` and `glm-4.6` are 200K/128K; `glm-4.5` and `glm-4.5-air` are 128K/96K.
-So `glm-5.2` has **five times** the window of `glm-5.1` — which is exactly why a
+So `glm-5.3` has **five times** the window of `glm-5.1` — which is exactly why a
 `glm-5*` wildcard is forbidden. Claude models are deliberately absent from that
 table: the client already knows their windows natively, and overriding them
 would only introduce drift.

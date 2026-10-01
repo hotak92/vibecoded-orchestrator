@@ -41,6 +41,7 @@ from aiohttp.test_utils import TestClient, TestServer
 
 from tests.common.qwen_catalog import (  # noqa: E402
     QWEN_EXCLUDED_SIX,
+    QWEN_RETIRED,
     QWEN_LIVE_MODELS,
 )
 from model_router.auth import OAuthReader, host_token_stamp
@@ -1358,6 +1359,7 @@ class QwenVendorTests(GatewayTestBase):
     #: They were a verbatim second copy here until 2026-09-22.
     LIVE_MODELS = QWEN_LIVE_MODELS
     EXCLUDED = QWEN_EXCLUDED_SIX
+    RETIRED = QWEN_RETIRED
 
     async def asyncSetUp(self) -> None:
         await super().asyncSetUp()
@@ -1399,7 +1401,7 @@ class QwenVendorTests(GatewayTestBase):
             row["id"] for row in body["data"]
             if row["id"].startswith("claude-gw/qwen/")
         }
-        # The owner's advertised four qwen rows (nine declared minus three
+        # The owner's advertised four qwen rows (eight declared minus two
         # latest-hidden minus two curated-hidden). The shared glm id carries
         # [1m] — the context table keys the bare id and that id's verified
         # window is 1M, whatever endpoint serves it.
@@ -1409,12 +1411,11 @@ class QwenVendorTests(GatewayTestBase):
             qwen_catalog_id("deepseek-v4.1-flash"),
         })
         hidden = body["_vct_catalog_hidden"]
-        # The three older same-family siblings plus the two curated-hidden
+        # The two older same-family siblings plus the two curated-hidden
         # ids are withheld, namespaced and REPORTED — the filter narrows the
         # picker, never the router.
         for withheld in (
             qwen_catalog_id("qwen3.7-max"), qwen_catalog_id("qwen3.6-flash"),
-            qwen_catalog_id("glm-5.2"),
             qwen_catalog_id("qwen3.7-plus"), qwen_catalog_id("deepseek-v4-pro"),
         ):
             self.assertIn(withheld, hidden)
@@ -1422,7 +1423,7 @@ class QwenVendorTests(GatewayTestBase):
         # withholding. `hidden` answers "which model am I missing", and a
         # voice/image/router alias is not a model anybody is missing.
         listed = [row["id"] for row in body["data"]] + hidden
-        for excluded in self.EXCLUDED:
+        for excluded in (*self.EXCLUDED, *self.RETIRED):
             for spelling in (
                 excluded,
                 f"claude-gw/qwen/{excluded}",

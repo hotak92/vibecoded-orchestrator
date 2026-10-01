@@ -231,8 +231,8 @@ class ContextTable:
         """:meth:`lookup` for a possibly NAMESPACED id (``[1m]`` tolerated).
 
         The vendor is the id's own namespace when it carries one, else
-        ``vendor_id`` — so ``<qwen namespace>glm-5.2`` reads the QwenCloud
-        figures and ``<zai namespace>glm-5.2`` the z.ai ones.
+        ``vendor_id`` — so ``<qwen namespace>glm-5.3`` reads the QwenCloud
+        figures and ``<zai namespace>glm-5.3`` the z.ai ones.
         """
         parts = parse_model_id(model_id)
         vendor, _rest = split_namespace(strip_1m((model_id or "").strip()), VENDORS)
@@ -318,7 +318,7 @@ class ContextTable:
         table would pool both vendors' rows and take the larger window.
 
         **The shipped table DOES have such a pair, deliberately** (owner
-        ruling, 2026-09-22): ``glm-5.3`` and ``glm-5.2`` are listed by both
+        ruling, 2026-09-22): ``glm-5.3`` is listed by both
         the z.ai row and the QwenCloud row, and the cited z.ai window
         answers for both. The ruling is that a context window is a property
         of the MODEL, not of the endpoint serving it — glm-5.3 is glm-5.3

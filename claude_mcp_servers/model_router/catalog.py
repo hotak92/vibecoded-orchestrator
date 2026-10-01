@@ -1242,6 +1242,13 @@ class CatalogService:
             entries = _exclude_by_prefix(
                 entries, vendor.catalog_exclude_prefixes,
             )
+        if entries and vendor.retired_ids:
+            retired = {i.lower() for i in vendor.retired_ids}
+            entries = tuple(
+                e for e in entries
+                if parse_model_id(e.id, self._vendors).bare_id.lower()
+                not in retired
+            )
         result = (
             _FamilyCache(entries, SOURCE_LIVE, self._clock())
             if entries

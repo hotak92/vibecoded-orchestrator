@@ -15,11 +15,10 @@
       ]
     },
     "zai": {
-      "_comment": "GLM ids observed in a live /v1/models response under a Coding Plan key. The same ten ids the shipped chat-model context seed cites.",
+      "_comment": "GLM ids observed in a live /v1/models response under a Coding Plan key. The same nine ids the shipped chat-model context seed cites.",
       "models": [
         { "id": "glm-5.3" },
         { "id": "glm-5.3-flash" },
-        { "id": "glm-5.2" },
         { "id": "glm-5.1" },
         { "id": "glm-5" },
         { "id": "glm-5-turbo" },

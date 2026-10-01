@@ -137,7 +137,7 @@ exactly one operation, and the boundary is hard:
 * PERMITTED — appending the client's context-window hint ``[1m]`` to the
   SAME model id, when the version-keyed table
   (``model_router.context_table``, exact full-id match, never a wildcard:
-  ``glm-5.2`` is 1M while ``glm-5.1`` is 200K) marks it 1M-windowed. The
+  ``glm-5.3`` is 1M while ``glm-5.1`` is 200K) marks it 1M-windowed. The
   gateway strips the suffix before routing, so the model that answers is
   unchanged. Every healed value is reported by name in the done message.
 * FORBIDDEN — everything else, above all changing which model an id names

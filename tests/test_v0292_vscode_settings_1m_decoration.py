@@ -20,7 +20,7 @@ R41's boundary is asserted here, not just documented:
 * PERMITTED — appending the context-window variant of the SAME model id,
   from a version-specific table, reported in the done message.
 * FORBIDDEN — changing which model an id names, which includes any
-  prefix/wildcard table match (``glm-5.2`` is 1M while ``glm-5.1`` is 200K;
+  prefix/wildcard table match (``glm-5.3`` is 1M while ``glm-5.1`` is 200K;
   a wrong ``window_1m`` inverts the bug into silent truncation).
 
 The integration tests run against the REAL table plumbing (the shipped
@@ -119,7 +119,9 @@ def test_non_1m_and_claude_ids_are_untouched_against_the_shipped_seed():
     # Unknown vendors keep the conservative default (honest absence).
     assert vs.decorate_1m("kimi-k2-6", seed) == "kimi-k2-6"
     # The true arm, against the same real table.
-    assert vs.decorate_1m("claude-gw/glm-5.2", seed) == "claude-gw/glm-5.2[1m]"
+    assert vs.decorate_1m("claude-gw/glm-5.3", seed) == "claude-gw/glm-5.3[1m]"
+    # glm-5.2 was retired (owner 2026-10-01): no row, so it is never decorated.
+    assert vs.decorate_1m("claude-gw/glm-5.2", seed) == "claude-gw/glm-5.2"
 
 
 def test_already_suffixed_ids_are_idempotent_and_never_stripped():

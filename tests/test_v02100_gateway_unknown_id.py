@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.100 WP-10 — the gateway refuses an UNKNOWN model id (F-W1-11a), and
-the Token-Plan copy of ``glm-5.2`` is not over-budgeted (F-W1-19).
+the per-route window override mechanism stays honest (F-W1-19), and the
+retired ``glm-5.2`` is refused on every route (owner ruling 2026-10-01).
 
 F-W1-11a, owner-observed: two hand-written definitions named
 ``claude-gw/qwen3.8-max`` and ``claude-gw/deepseek-4.1-flash`` (the nested
@@ -56,8 +57,8 @@ class UnknownIdRefusalTests(unittest.TestCase):
     def test_every_valid_spelling_still_routes(self) -> None:
         for model_id, family in (
             ("claude-gw/glm-5.3", "zai"), ("claude-gw/glm-5.3[1m]", "zai"),
-            ("claude-gw/glm-5.2", "zai"),          # zai's own family
-            ("claude-gw/qwen/glm-5.2", "qwen"),    # declared on the qwen row
+            ("claude-gw/qwen/glm-5.3", "qwen"),    # declared on the qwen row
+            ("claude-gw/qwen/glm-5.3[1m]", "qwen"),
             ("claude-gw/qwen/qwen3.8-max[1m]", "qwen"),
             ("claude-gw/qwen/deepseek-v4.1-flash[1m]", "qwen"),
             ("qwen3.8-max", "qwen"), ("glm-4.6", "zai"),
@@ -131,35 +132,104 @@ class UnknownIdEndToEndTests(GatewayTestBase):
         self.assertEqual(len(self.vendor_up.message_requests), 1)
 
 
-class Glm52TokenPlanWindowTests(unittest.TestCase):
-    """F-W1-19: QwenCloud documents glm-5.2 at 198k on its endpoint."""
+class Glm52RetiredTests(unittest.TestCase):
+    """Owner 2026-10-01: glm-5.2 is not provided at all, only glm-5.3."""
 
-    def test_the_token_plan_copy_is_at_most_198k_and_not_1m(self) -> None:
+    def test_every_spelling_is_refused_and_suggests_glm_5_3(self) -> None:
+        for model_id in (
+            "claude-gw/glm-5.2", "claude-gw/glm-5.2[1m]", "glm-5.2",
+            "claude-gw/qwen/glm-5.2", "claude-gw/qwen/glm-5.2[1m]",
+            "claude-gw/GLM-5.2",
+        ):
+            with self.subTest(model=model_id):
+                decision = routing.route(model_id)
+                assert isinstance(decision, RouteError), decision
+                self.assertEqual(decision.status, 400)
+                self.assertEqual(decision.reason, "unknown_model")
+                self.assertTrue(
+                    any("glm-5.3" in s for s in decision.suggestions),
+                    decision.suggestions,
+                )
+                self.assertFalse(
+                    any("glm-5.2" in s for s in decision.suggestions),
+                    "a retired id is never offered back",
+                )
+
+    def test_a_vendor_list_that_still_carries_it_does_not_make_it_routable(self) -> None:
+        """The live lists of both vendors still name glm-5.2; the router is
+        handed that as ``known_ids`` and must still refuse."""
+        known = {"zai": {"glm-5.2", "glm-5.3"}, "qwen": {"glm-5.2", "glm-5.3"}}
+        for model_id in ("claude-gw/glm-5.2", "claude-gw/qwen/glm-5.2", "glm-5.2"):
+            with self.subTest(model=model_id):
+                decision = routing.route(model_id, known_ids=known)
+                self.assertIsInstance(decision, RouteError)
+
+    def test_both_rows_retire_it_and_neither_declares_it(self) -> None:
+        for vendor in VENDORS.values():
+            with self.subTest(vendor=vendor.vendor_id):
+                self.assertIn("glm-5.2", vendor.retired_ids)
+                for declared in (
+                    *vendor.static_ids, *vendor.verified_ids,
+                    *vendor.catalog_hide_ids,
+                ):
+                    self.assertNotEqual(declared, "glm-5.2")
+
+    def test_glm_5_3_is_one_m_on_both_routes_with_the_suffix(self) -> None:
         seed = load_seed()
-        row = seed.lookup_id("claude-gw/qwen/glm-5.2[1m]")
-        assert row is not None
-        self.assertLessEqual(row.context_window, 198_000)
-        self.assertFalse(row.window_1m)
-        self.assertTrue(row.source.startswith("https://"))
-        self.assertFalse(seed.advertise_1m("claude-gw/qwen/glm-5.2"))
-        # The z.ai copy keeps the model's own documented window.
-        zai = seed.lookup_id("claude-gw/glm-5.2")
-        assert zai is not None
-        self.assertEqual(zai.context_window, 1_000_000)
+        for spelling in ("claude-gw/glm-5.3", "claude-gw/qwen/glm-5.3"):
+            with self.subTest(model=spelling):
+                row = seed.lookup_id(spelling)
+                assert row is not None
+                self.assertEqual(row.context_window, 1_000_000)
+                self.assertTrue(row.window_1m)
+                self.assertTrue(seed.advertise_1m(spelling))
+        self.assertIsNone(seed.lookup_id("claude-gw/glm-5.2"))
+
+    def test_the_retired_id_is_not_in_the_static_snapshot(self) -> None:
+        import json
+        from pathlib import Path
+        import model_router
+        snap = json.loads(
+            (Path(model_router.__file__).parent / "static_catalog.json").read_text(),
+        )
+        ids = {m["id"] for fam in snap["families"].values() for m in fam["models"]}
+        self.assertNotIn("glm-5.2", ids)
+        self.assertIn("glm-5.3", ids)
+
+
+class PerRouteWindowOverrideTests(unittest.TestCase):
+    """F-W1-19 mechanism, kept alive on a synthetic row: no shipped model
+    needs a per-route override today (glm-5.3 is 1M on both routes), but a
+    vendor that documents a smaller window for a shared model must still be
+    able to say so, and a launcher export must not hide it."""
+
+    def _rows(self):
+        cap = ModelContext(
+            model_id="shared-1", vendor="qwen", context_window=198_000,
+            max_output=0, window_1m=False, source="https://docs.example/cap")
+        seed_row = ModelContext(
+            model_id="shared-1", vendor="zai", context_window=1_000_000,
+            max_output=128_000, window_1m=True, source="https://docs.example/z",
+            vendor_overrides={"qwen": cap})
+        return seed_row, cap
+
+    def test_the_named_vendor_gets_its_own_figure(self) -> None:
+        seed_row, cap = self._rows()
+        table = ContextTable(
+            rows={"shared-1": seed_row}, source=SOURCE_EXPORT, path=None)
+        self.assertEqual(table.lookup("shared-1", "qwen"), cap)
+        self.assertEqual(table.lookup("shared-1", "zai"), seed_row)
 
     def test_a_launcher_export_row_cannot_hide_the_endpoint_figure(self) -> None:
-        """The export has no column for overrides; the seed's still applies."""
-        seed = load_seed()
+        seed_row, cap = self._rows()
         exported = ModelContext(
-            model_id="glm-5.2", vendor="zai", context_window=1_000_000,
-            max_output=128_000, window_1m=True, source="https://docs.z.ai/x")
+            model_id="shared-1", vendor="zai", context_window=1_000_000,
+            max_output=128_000, window_1m=True, source="https://docs.example/z")
         table = ContextTable(
-            rows={"glm-5.2": exported}, source=SOURCE_EXPORT, path=None,
-            fallback_rows=dict(seed.rows))
-        row = table.lookup_id("claude-gw/qwen/glm-5.2")
-        assert row is not None
-        self.assertLessEqual(row.context_window, 198_000)
-        self.assertEqual(table.lookup_id("claude-gw/glm-5.2"), exported)
+            rows={"shared-1": exported}, source=SOURCE_EXPORT, path=None,
+            fallback_rows={"shared-1": seed_row})
+        self.assertEqual(table.lookup("shared-1", "qwen"), cap)
+        self.assertEqual(table.lookup("shared-1", "zai"), exported)
 
 
 if __name__ == "__main__":

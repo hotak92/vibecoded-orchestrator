@@ -166,6 +166,7 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
     is_deleted_primary_row,
     path_is_ignored,
     path_reachable_on_disk,
+    source_is_owned,
 )
 
 # v0.2.91 (Decision #21): the CLI entry points below (--prune-ignored,
@@ -826,6 +827,7 @@ def reconcile_walked_file_rows(
     audit_root: "Optional[Path]" = None,
     narrow_max_paths: int = _RECONCILE_NARROW_MAX_PATHS,
     log_prefix: str = "entity-reconcile",
+    strict_source: bool = False,
 ) -> "tuple":
     """v0.2.91 (WP-C): per-file entity reconciliation — delete rows anchored to
     a file this walk ACTUALLY walked whose UUIDs this walk did NOT upsert.
@@ -910,6 +912,9 @@ def reconcile_walked_file_rows(
         audit_root: repo root for the auto-resolutions audit row (optional).
         narrow_max_paths: walked-path count at/below which per-path narrowed
             reads are used instead of a full collection scan.
+        strict_source: v0.2.100 (``--as-extra-path``): a row with an EMPTY
+            ``project_source`` is never judged (see
+            ``codegraph_row_classify.source_is_owned``).
 
     Returns ``(deleted, failures)``; every per-collection failure soft-fails.
     """
@@ -958,8 +963,9 @@ def reconcile_walked_file_rows(
                     return False  # file not walked by THIS pass → never touch
                 row_src = str(props.get("project_source") or "").strip()
                 if _prim:
-                    if row_src and row_src not in primary_sources:
-                        return False  # extra-path tenant (B1)
+                    if not source_is_owned(row_src, primary_sources,
+                                           strict=strict_source):
+                        return False  # extra-path tenant (B1) / unprovable (strict)
                 elif row_src != _src:
                     return False  # another tenant's row
                 return str(uid) not in (keep_map.get(_cn) or ())

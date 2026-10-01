@@ -187,7 +187,11 @@ def _known_ids(
     ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
     if extra is not None:
         ids.update(extra.get(vendor.vendor_id, ()))
-    return frozenset(i.strip().lower() for i in ids if i and i.strip())
+    retired = {i.strip().lower() for i in vendor.retired_ids}
+    return frozenset(
+        i.strip().lower() for i in ids
+        if i and i.strip() and i.strip().lower() not in retired
+    )
 
 
 def _owns_family(vendor: Vendor, remainder: str) -> bool:
@@ -281,6 +285,14 @@ def _vendor_route(
             f"{vendor.namespace!r}) to reach Anthropic, or name one of "
             f"{vendor.vendor_id!r}'s real models.",
             "claude_id_to_vendor",
+        )
+    if remainder.lower() in {i.lower() for i in vendor.retired_ids}:
+        # Retired by the owner: refused like an unknown id, even though the
+        # vendor's own list may still carry it and its family owns the prefix.
+        return _unknown_for_vendor(
+            vendor, raw_id or raw_remainder, remainder,
+            vendors if vendors is not None else {vendor.vendor_id: vendor},
+            known_ids, raw_remainder.endswith(ONE_M_SUFFIX),
         )
     known = _known_ids(vendor, known_ids)
     judgeable = bool(known or vendor.bare_id_prefixes)

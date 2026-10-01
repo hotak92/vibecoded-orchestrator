@@ -131,7 +131,7 @@ def test_behind_reindexes_with_sync_argv_and_records_commit(tmp_path: Path) -> N
 def test_never_indexed_path_runs_a_full_pass(tmp_path: Path) -> None:
     rec = _Recorder({"/srv/new": "c" * 40})
     _drive(tmp_path, [_Extra("/srv/new", True, None)], rec)
-    assert rec.runs == [["/srv/new", "--project", "Acme", "--json-progress"]]
+    assert rec.runs == [["/srv/new", "--project", "Acme", "--json-progress", "--as-extra-path"]]
 
 
 def test_up_to_date_does_nothing(tmp_path: Path) -> None:
@@ -262,7 +262,8 @@ def test_end_to_end_real_git_and_runner(tmp_path: Path) -> None:
     )
     assert out == {str(clone): "recorded"}, lines
     assert json.loads(log.read_text().splitlines()[0]) == [
-        str(clone), "--project", "Acme", "--json-progress", "--incremental", "--since-commit", first,
+        str(clone), "--project", "Acme", "--json-progress", "--as-extra-path",
+        "--incremental", "--since-commit", first,
     ]
     (pid, p, c, res) = recorded[0]
     assert (pid, p, c) == ("pid-1", str(clone), head)

@@ -183,6 +183,13 @@ class Vendor:
     #: excluded: reported in ``_vct_catalog_hidden`` and routable by name,
     #: deferred to a later curation discussion rather than dropped.
     catalog_hide_ids: tuple[str, ...] = ()
+    #: Ids the gateway does NOT provide at all (owner ruling 2026-10-01): not
+    #: published, not in any declared list, and REFUSED by name like any
+    #: unknown id (the refusal suggests the nearest served id). Unlike
+    #: ``catalog_hide_ids`` (hidden but routable) a retired id stays refused
+    #: even when the vendor's live list still carries it. Exact ids,
+    #: compared case-insensitively.
+    retired_ids: tuple[str, ...] = ()
     auth_header: str = "Authorization"
     auth_scheme: str = "Bearer "
     docs_url: str = ""
@@ -246,6 +253,8 @@ VENDORS: Mapping[str, Vendor] = {
         # (see `verified_ids` on Vendor) — a picker row that answers as a
         # different model is the alias trap wearing a list.
         verified_ids=("glm-5.3", "glm-5.3-flash"),
+        # The owner retired glm-5.2 in v0.2.100: only glm-5.3 is provided.
+        retired_ids=("glm-5.2",),
         # Probed live 2026-09-23: 5h (unit 3, number 5) and weekly (unit 6,
         # number 1) windows, both type CREDIT_LIMIT. The endpoint is
         # undocumented and its schema changed during 2026 (older answers
@@ -289,6 +298,9 @@ VENDORS: Mapping[str, Vendor] = {
         catalog_exclude_prefixes=("qwen-audio", "qwen-asr", "wan", "auto",
                                 "deepseek-v4-flash-"),
         catalog_hide_ids=("qwen3.7-plus", "deepseek-v4-pro"),
+        # The owner retired glm-5.2 in v0.2.100 (every route): the live list
+        # still carries it, the gateway neither publishes nor routes it.
+        retired_ids=("glm-5.2",),
         docs_url="https://docs.qwencloud.com/developer-guides/clients-and-developer-tools/claude-code",
         # No claude-* alias table is documented for this endpoint (UNVERIFIED
         # either way); routing's honest-naming guard applies regardless, and
@@ -298,12 +310,12 @@ VENDORS: Mapping[str, Vendor] = {
         # The keyless / fetch-failed fallback, live-verified against the
         # compatible-mode list (probe 2026-09-22): the fifteen live ids minus
         # the six excluded (five non-chat modalities plus the dated deepseek
-        # flash snapshot, owner-curated out). Publishing trims two more via
+        # flash snapshot, owner-curated out) and glm-5.2 (retired, below). Publishing trims two more via
         # catalog_hide_ids below. validate_registry requires static_ids on
         # a catalog_url row.
         static_ids=(
             "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
-            "qwen3.6-flash", "glm-5.3", "glm-5.2", "deepseek-v4.1-flash",
+            "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash",
             "deepseek-v4-pro",
         ),
         # No quota_url: the Token Plan is monthly credits with no endpoint
@@ -371,7 +383,7 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     "Claude marker, which would hijack first-party Claude ids",
                 )
             # Bare prefixes resolve LONGEST-FIRST, so two vendors can share a
-            # prefix when one's is strictly longer (e.g. "glm" vs "glm-5.2").
+            # prefix when one's is strictly longer (e.g. "glm" vs "glm-5.3").
             # An EXACT collision between two different vendors, though, makes
             # routing order-dependent: whichever row the mapping iterates last
             # (or first, on a rebuilt dict) silently wins the other's ids.
@@ -452,6 +464,25 @@ def validate_registry(vendors: Mapping[str, Vendor] | None = None) -> None:
                     f"vendor {key!r}: catalog_hide_ids entry {hide_id!r} is "
                     "not among this row's static_ids — a hide that matches "
                     "no declared id hides nothing",
+                )
+        for retired in vendor.retired_ids:
+            if not retired.strip() or retired != retired.strip():
+                raise RegistryError(
+                    f"vendor {key!r}: retired_ids entry {retired!r} is blank "
+                    "or has surrounding whitespace — matching is exact, so "
+                    "it would retire nothing, silently",
+                )
+            offered = {
+                i.lower() for i in (
+                    *vendor.static_ids, *vendor.verified_ids,
+                    *vendor.catalog_hide_ids,
+                )
+            }
+            if retired.lower() in offered:
+                raise RegistryError(
+                    f"vendor {key!r}: retired_ids entry {retired!r} is also "
+                    "declared as served (static/verified/hidden) — an id "
+                    "cannot be both offered and retired",
                 )
         for static_id in vendor.static_ids:
             if not static_id.strip():

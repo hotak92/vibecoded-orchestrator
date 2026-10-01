@@ -23,8 +23,11 @@ the turn. For each ENABLED extra path of the calling project it:
 3. on success records the new commit through the hub route
    ``POST /api/v1/projects/{id}/codegraph/extras/indexed`` — launcher.db keeps
    its single writer; this module never opens it. On failure (non-zero exit,
-   timeout, insert errors) it logs and records NOTHING, so the path stays
-   stale and is retried after the throttle window.
+   timeout, insert errors, a failed deleted-file prune) it logs and records
+   NOTHING, so the path stays stale and is retried after the throttle window.
+   The incremental run also removes the entities of files deleted or renamed
+   away since ``last_indexed_commit`` (``vco_lib.codegraph_deleted_files``);
+   the counts are in the ``done`` log line.
 
 Every decision is one line in ``<project>/.claude/logs/codegraph_extras_refresh.log``
 (size-capped). Exit status is always 0.
@@ -70,7 +73,9 @@ def build_extra_sync_argv(
 
     must match vct_launcher_core::db::codegraph_extras::extra_path_sync_args
     """
-    argv = [path, "--project", prefix, "--json-progress"]
+    # --as-extra-path: the analyzer's repo_path IS an extra path here, so its
+    # deletes must never judge a row it cannot prove is this path's (v0.2.100).
+    argv = [path, "--project", prefix, "--json-progress", "--as-extra-path"]
     if incremental:
         argv.append("--incremental")
         sha = (since_commit or "").strip()
@@ -142,6 +147,10 @@ class AnalyzerResult:
     files_analyzed: int = 0
     entities_indexed: int = 0
     duration_ms: int = 0
+    #: v0.2.100: files deleted/renamed away since the last indexed commit, and
+    #: the entities removed for them (the analyzer's deleted-file prune).
+    deleted_files: int = 0
+    deleted_entities: int = 0
 
 
 def run_analyzer(
@@ -149,8 +158,9 @@ def run_analyzer(
 ) -> AnalyzerResult:
     """Run the analyzer bounded by ``timeout``; parse its ``{"final": true}``
     report line. Failure = non-zero exit, timeout, spawn error, or a final
-    report with ``insert_errors`` (a partial index must not be recorded as
-    current — it would never be retried)."""
+    report with ``insert_errors`` or ``deleted_file_prune_failures`` (a partial
+    index must not be recorded as current — it would never be retried; the
+    analyzer also exits 5 for the latter under ``--since-commit``)."""
     started = time.monotonic()
     try:
         proc = subprocess.run(
@@ -181,8 +191,19 @@ def run_analyzer(
     if int(final.get("insert_errors", 0) or 0) > 0:
         return AnalyzerResult(False, f"{final['insert_errors']} insert error(s); partial index not recorded",
                               duration_ms=duration_ms)
+    if int(final.get("deleted_file_prune_failures", 0) or 0) > 0:
+        return AnalyzerResult(
+            False,
+            f"{final['deleted_file_prune_failures']} deleted-file prune failure(s); "
+            "entities of deleted files remain, commit not recorded",
+            duration_ms=duration_ms,
+        )
     entities = sum(int(final.get(k, 0) or 0) for k in ("modules", "classes", "functions", "apis"))
-    return AnalyzerResult(True, "ok", int(final.get("files_analyzed", 0) or 0), entities, duration_ms)
+    return AnalyzerResult(
+        True, "ok", int(final.get("files_analyzed", 0) or 0), entities, duration_ms,
+        deleted_files=int(final.get("deleted_files", 0) or 0),
+        deleted_entities=int(final.get("deleted_file_entities", 0) or 0),
+    )
 
 
 def record_indexed(project_id: str, path: str, commit: str, res: AnalyzerResult) -> tuple[bool, str]:
@@ -299,6 +320,7 @@ def refresh_extras(
             log(
                 f"{'done' if ok else 'NOT RECORDED'} path={path} commit={head[:12]} "
                 f"files={res.files_analyzed} entities={res.entities_indexed} "
+                f"deleted_files={res.deleted_files} removed_entities={res.deleted_entities} "
                 f"ms={res.duration_ms}: {why}"
             )
         finally:

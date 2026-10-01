@@ -979,9 +979,14 @@ mod tests {
 
         assert_eq!(
             rows.len(),
-            22,
-            "the ten cited GLM rows of handoff §7, the four Claude 5 rows, \
-             and the eight v0.2.96 qwen Token-Plan rows"
+            21,
+            "the cited GLM rows of handoff §7 minus glm-5.2 (owner-retired in \
+             v0.2.100), the four Claude 5 rows, and the eight v0.2.96 qwen \
+             Token-Plan rows"
+        );
+        assert!(
+            rows.iter().all(|r| r.model_id != "glm-5.2"),
+            "glm-5.2 is retired (owner, v0.2.100): the seed must not list it"
         );
         assert!(
             rows.iter().all(|r| !r.source.trim().is_empty()),
@@ -1048,7 +1053,7 @@ mod tests {
         assert_eq!(by_id("deepseek-v4-pro").max_output, 393_216);
         // The version-key evidence: same family, 5x apart. If a future edit
         // ever collapses these into a `glm-5*` rule, this reds.
-        assert!(by_id("glm-5.2").window_1m && by_id("glm-5.2").context_window == 1_000_000);
+        assert!(by_id("glm-5.3").window_1m && by_id("glm-5.3").context_window == 1_000_000);
         assert!(!by_id("glm-5.1").window_1m && by_id("glm-5.1").context_window == 200_000);
         // The honest citation caveat survives into the rows we will store.
         let air = by_id("glm-4.5-air");

@@ -828,10 +828,8 @@ class ShippedDataInvariantTests(unittest.TestCase):
                 "claude-gw/glm-4.5", "claude-gw/glm-4.5-air",
                 "claude-gw/glm-4.6", "claude-gw/glm-4.7",
                 "claude-gw/glm-5", "claude-gw/glm-5-turbo",
-                "claude-gw/glm-5.1", "claude-gw/glm-5.2",
+                "claude-gw/glm-5.1",
                 f"claude-gw/qwen/deepseek-v4-pro{ONE_M_SUFFIX}",
-                # v0.2.100 (F-W1-19): plain — the Token Plan documents 198k.
-                "claude-gw/qwen/glm-5.2",
                 f"claude-gw/qwen/qwen3.6-flash{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-max{ONE_M_SUFFIX}",
                 f"claude-gw/qwen/qwen3.7-plus{ONE_M_SUFFIX}",

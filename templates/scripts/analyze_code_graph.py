@@ -482,6 +482,11 @@ try:
     # so the analyzer monolith stays flat (P2f ratchet). `_prune_collection`
     # is a thin shim over it.
     from vco_lib.codegraph_prune import prune_collection as _prune_collection_impl
+    from vco_lib.codegraph_deleted_files import (  # v0.2.100: deleted-file prune
+        FILE_ANCHORED_COLLECTIONS as _FILE_ANCHORED_COLLECTIONS, PruneReport as _PruneReport,
+        prune_file_rows as _prune_file_rows, prune_git_deleted_files as _prune_git_deleted_files,
+        filter_changed_files as _filter_changed_files_impl,
+    )
     # v0.2.91 dogfood fix: the orchestrator-root heuristic behind the
     # `--index-dot-claude` default has TWO callers now (here and the deferral
     # retry driver), so it lives in vco_lib rather than as a mirrored copy.
@@ -3547,7 +3552,8 @@ class CodeGraphAnalyzer:
                           since_commit: Optional[str] = None,
                           only_file: Optional[Path] = None,
                           only_files_from: Optional[Path] = None,
-                          canonical_source: Optional[str] = None) -> Dict[str, Any]:
+                          canonical_source: Optional[str] = None,
+                          as_extra_path: bool = False) -> Dict[str, Any]:
         """Analyze repository and extract code entities.
 
         Args:
@@ -3676,6 +3682,10 @@ class CodeGraphAnalyzer:
         # so a stale value from a prior analyze_repository call in the same
         # process must never leak into this run's stats.
         self._prune_failures = 0
+        # v0.2.100 (--as-extra-path): repo_path IS an extra path → only rows PROVABLY
+        # stamped with it are ever judged/deleted (source_is_owned strict).
+        self._strict_source = bool(as_extra_path)
+        self._git_deleted_report = _PruneReport()  # v0.2.100: --incremental deleted-file prune
 
         # v0.2.91 (WP-C): per-run reset of the entity-reconcile state — the
         # committed {(source, path): {collection: {uuid}}} map and the open
@@ -3851,6 +3861,8 @@ class CodeGraphAnalyzer:
                     self.index_dot_claude = (
                         False if is_extra_root else _primary_index_dot_claude
                     )
+                    if incremental:  # rows of files deleted/renamed since the lower bound
+                        self._prune_git_deleted(source_root, since_commit)
                     for lang_name, find_fn, analyze_fn in lang_dispatch:
                         if lang and lang != lang_name:
                             continue
@@ -4074,7 +4086,7 @@ class CodeGraphAnalyzer:
                 getattr(self, "_reconcile_walked", None) or {},
                 project_name=self.project_name or "",
                 primary_sources=_primary_sources_for(repo_path),
-                deleter=_delete_file_rows_exact,
+                deleter=_delete_file_rows_exact, strict_source=self._strict_source,
                 walked_sources=(_primary_sources_for(repo_path) or set())
                 | {p.as_posix() for p in canonical_extras},
                 audit_root=repo_path,
@@ -4120,6 +4132,9 @@ class CodeGraphAnalyzer:
         # never as a clean success. Read via getattr because the attribute
         # may be absent if a future path skips the per-run reset.
         stats['prune_failures'] = int(getattr(self, "_prune_failures", 0))
+        _gd = self._git_deleted_report
+        stats.update(deleted_files=_gd.files, deleted_file_entities=_gd.deleted,
+                     deleted_file_prune_failures=_gd.failures)
 
         return stats
 
@@ -4555,63 +4570,10 @@ class CodeGraphAnalyzer:
 
     def _filter_changed_files(self, repo_path: Path, files: List[Path],
                               since_commit: Optional[str] = None) -> List[Path]:
-        """Filter files to only those changed according to git.
-
-        v0.2.47: ``since_commit`` lets the caller specify the lower bound
-        of the diff range (``<sha>..HEAD``). Default ``None`` preserves
-        the legacy behaviour of ``HEAD~1..HEAD``. Non-git roots and
-        unknown SHAs fall back to the full file list with one stderr
-        notice — never a hard error.
-        """
-        # Quick git-repo check so non-git extras (e.g. a non-versioned
-        # vendored folder) skip the subprocess invocation entirely. This
-        # both speeds up the common case and produces a nicer log line.
-        if not (repo_path / ".git").exists():
-            print(
-                f"ℹ️  {repo_path} is not a git repository; analyzing all files",
-                file=sys.stderr,
-            )
-            return files
-
-        if since_commit:
-            # Validate the SHA exists before passing it to `git diff`; an
-            # unknown commit ID otherwise produces a confusing error
-            # message embedded in the stderr stream.
-            rev_check = subprocess.run(
-                ['git', 'rev-parse', '--verify', f'{since_commit}^{{commit}}'],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-            )
-            if rev_check.returncode != 0:
-                print(
-                    f"⚠️  --since-commit {since_commit} not found in {repo_path}; "
-                    f"falling back to full scan",
-                    file=sys.stderr,
-                )
-                return files
-            diff_range_lhs = since_commit
-        else:
-            diff_range_lhs = "HEAD~1"
-
-        try:
-            # Get changed files from git
-            result = subprocess.run(
-                ['git', 'diff', '--name-only', diff_range_lhs, 'HEAD'],
-                cwd=repo_path,
-                capture_output=True,
-                text=True,
-                check=True
-            )
-
-            changed_paths = {repo_path / line.strip() for line in result.stdout.split('\n') if line.strip()}
-
-            # Filter to only changed files
-            return [f for f in files if f in changed_paths]
-
-        except subprocess.CalledProcessError:
-            print("⚠️  Git not available or not a git repo, analyzing all files")
-            return files
+        """Shim over ``vco_lib.codegraph_deleted_files.filter_changed_files``
+        (one home with the deleted-file diff; ``<since_commit or HEAD~1>..HEAD``,
+        non-git / unknown-SHA → full list)."""
+        return _filter_changed_files_impl(repo_path, files, since_commit, run=subprocess.run)
 
     def _union_stale_into_changed(
         self,
@@ -4890,6 +4852,7 @@ class CodeGraphAnalyzer:
                 index_dot_claude=_classifier_index_dot_claude,
                 primary_sources=_primary_sources or None,
                 reachable_fn=reachable_fn,
+                strict_source=bool(getattr(self, "_strict_source", False)),
             )
 
         for coll, path_prop in probes:
@@ -5059,6 +5022,7 @@ class CodeGraphAnalyzer:
             return is_deleted_primary_row(
                 _props, repo_root, path_prop=path_prop,
                 primary_sources=primary_sources or None,
+                strict_source=bool(getattr(self, "_strict_source", False)),
             )
 
         try:
@@ -5161,87 +5125,38 @@ class CodeGraphAnalyzer:
     def _prune_deleted_file_objects(
         self, rel_path: str, canonical_source: str = "",
     ) -> int:
-        """Delete ALL code-graph objects for a file that vanished from disk.
+        """Delete ALL code-graph objects of a file that vanished from disk (the
+        batched drain's edited-then-deleted path; v0.2.73 FIX-B). Thin shim over
+        ``vco_lib.codegraph_deleted_files.prune_file_rows`` — the ONE
+        deleted-file prune, shared with the ``--incremental`` git-deleted pass:
+        exact-``==`` match on the raw stored path via ``_delete_file_rows_exact``
+        (never a tokenized DELETE), scoped to this project (+ the canonical
+        source when known), all five file-anchored collections. Returns the row
+        count; failures feed ``self._prune_failures`` (success→partial)."""
+        targets = [(getattr(self, a, None), p) for a, p in _FILE_ANCHORED_COLLECTIONS]
+        deleted, failures = _prune_file_rows(
+            targets, [rel_path], project=self.project_name or "",
+            project_source=canonical_source or "", deleter=_delete_file_rows_exact,
+            log_prefix="deleted-file prune",
+        )
+        if failures:
+            self._prune_failures = getattr(self, "_prune_failures", 0) + failures
+        if deleted:
+            print(f"   🗑️  pruned {deleted} object(s) for deleted file {rel_path}")
+        return deleted
 
-        v0.2.73 (FIX-B): the end-of-turn batch drain can carry a path that was
-        edited THEN DELETED within the same turn. Single-file mode used to just
-        no-op on a missing file — leaving that file's Module / Function / Class
-        objects behind as orphans (a self-inflicted source for the FIX-C
-        cleanup). Treat a vanished path as a PRUNE instead: delete every object
-        keyed on this file, scoped to this project (+ project_source when the
-        canonical source is known so a same-relative-path file in a different
-        source root can't be swept).
-
-        Scoping mirrors how objects are stamped: CodeModule keys the file on
-        ``path``; CodeFunction / CodeClass key it on ``file_path`` (v0.2.52
-        V52-O.4). CodeAPI / CodeInteraction are not 1:1 file-anchored the same
-        way; they are left alone (the module/function prune removes the bulk,
-        and a later full ``--prune-stale`` reanalyze reconciles the rest —
-        never over-delete on a best-effort per-file prune).
-
-        v0.2.74 (over-delete fix): pre-fix this used
-        ``Filter.by_property(path_prop).equal(rel_path)`` +
-        ``delete_many`` — but ``file_path`` / ``path`` are word-tokenized TEXT,
-        so an ``.equal`` (and a ``project`` / ``project_source`` ``.equal``)
-        matches on TOKEN SETS, not the exact string: a sibling file whose path
-        shares the same word tokens could be swept. Now routes through the ONE
-        safe primitive :func:`_delete_file_rows_exact` — read every row's raw
-        ``path_prop`` (+ project / project_source) back and compare in Python
-        (exact ``==``), ``delete_by_id`` only the confirmed matches. No
-        tokenized Like/Equal DELETE.
-
-        Returns the number of rows deleted (v0.2.74: was "delete passes that
-        ran"; now the true row count). Soft-fail by contract: any delete error
-        logs and continues — a cleanup failure must never wedge the drain (the
-        orphan rows are the pre-fix status quo, not a regression). Per-row
-        delete failures accumulate into ``self._prune_failures`` (same signal
-        the ``--prune-stale`` pass uses to flip success→partial).
-        """
-        if not rel_path:
-            return 0
-        deleted_total = 0
-        # (collection attr, anchor prop). Module uses `path`; the rest use
-        # `file_path`. v0.2.82 (rider a): API + Interaction joined the set (they
-        # now carry `file_path`) → a deleted file's rows are reaped too.
-        # `_delete_file_rows_exact` schema-probes the anchor → legacy
-        # anchor-less collections degrade cleanly (no delete).
-        targets = [
-            (getattr(self, "modules_collection", None), "path"),
-            (getattr(self, "functions_collection", None), "file_path"),
-            (getattr(self, "classes_collection", None), "file_path"),
-            (getattr(self, "apis_collection", None), "file_path"),
-            (getattr(self, "interactions_collection", None), "file_path"),
-        ]
-        # Exact-string predicate on the RAW stored path — never a token filter.
-        def _is_this_file(raw_path, _props):
-            return raw_path == rel_path
-
-        for coll, path_prop in targets:
-            if coll is None:
-                continue
-            try:
-                deleted, failures = _delete_file_rows_exact(
-                    coll,
-                    path_prop,
-                    _is_this_file,
-                    project=self.project_name or "",
-                    project_source=canonical_source or "",
-                    log_prefix="deleted-file prune",
-                )
-                deleted_total += deleted
-                if failures:
-                    # Propagate the count so the drain can surface a partial
-                    # (mirrors the --prune-stale failure accounting).
-                    self._prune_failures = getattr(self, "_prune_failures", 0) + failures
-            except Exception as exc:  # noqa: BLE001 — prune must never wedge drain
-                print(
-                    f"⚠️  deleted-file prune failed for {rel_path} in "
-                    f"{getattr(coll, 'name', '?')}: {exc}",
-                    file=sys.stderr,
-                )
-        if deleted_total:
-            print(f"   🗑️  pruned {deleted_total} object(s) for deleted file {rel_path}")
-        return deleted_total
+    def _prune_git_deleted(self, source_root: Path, since_commit: Optional[str]) -> None:
+        """``--incremental``: remove the rows of files deleted / renamed away in
+        ``<since_commit>..HEAD`` under ``source_root`` (vco_lib.codegraph_deleted_files)."""
+        rep = _prune_git_deleted_files(
+            [(getattr(self, a, None), p) for a, p in _FILE_ANCHORED_COLLECTIONS],
+            source_root, since_commit, project=self.project_name or "",
+            deleter=_delete_file_rows_exact,
+        )
+        acc = self._git_deleted_report
+        acc.files, acc.deleted, acc.failures = (
+            acc.files + rep.files, acc.deleted + rep.deleted, acc.failures + rep.failures)
+        self._prune_failures = getattr(self, "_prune_failures", 0) + rep.failures
 
     def _get_existing_module(self, path: str, file_hash: str) -> Optional[str]:
         """Check if module already exists with same hash AT THE CURRENT
@@ -6449,6 +6364,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     # source root that is a git repo uses its OWN diff range relative to
     # this SHA; non-git roots fall back to a full scan with a one-line
     # stderr notice.
+    # v0.2.100: the extra-path sync (Sync button + automatic refresh) analyzes
+    # an EXTRA path as repo_path; set by codegraph_extras.rs::extra_path_sync_args.
+    parser.add_argument('--as-extra-path', action='store_true',
+                        help='repo_path is one of the project\'s extra code-graph '
+                             'paths: never delete a row not provably stamped with it '
+                             '(legacy rows with no project_source are left alone).')
     parser.add_argument('--since-commit', type=str, default=None,
                        help='With --incremental, restrict the diff to '
                             '<sha>..HEAD instead of HEAD~1..HEAD. Per source '
@@ -6960,6 +6881,7 @@ def main():
             # v0.2.66 (Bug 3, part b): canonical source root for worktree
             # dedup (honoured alongside only_file OR only_files_from).
             canonical_source=args.canonical_source,
+            as_extra_path=args.as_extra_path,
         )
 
         # Post-processing: create cross-references.
@@ -7015,6 +6937,10 @@ def main():
                 # stale rows => the launcher must render this build as
                 # `partial`, not `success`, so the operator sees stale data.
                 "prune_failures": stats.get("prune_failures", 0),
+                # v0.2.100: --incremental deleted-file prune (files gone since the
+                # lower-bound commit, their rows removed, delete failures).
+                **{k: stats.get(k, 0) for k in (
+                    "deleted_files", "deleted_file_entities", "deleted_file_prune_failures")},
                 # v0.2.92: non-zero => N entities embedded UN-CHUNKED because
                 # their chunk plan could not be computed => retrieval degraded.
                 "chunk_plan_failures": stats.get("chunk_plan_failures", 0),
@@ -7050,6 +6976,10 @@ def main():
         # launcher's wizard polling can read the same numbers via
         # the database row's `files_analyzed` / new error_count cols).
         print(f"   Insert errors: {stats.get('insert_errors', 0)}")
+        if args.incremental:
+            print(f"   Deleted files pruned: {stats.get('deleted_files', 0)} "
+                  f"({stats.get('deleted_file_entities', 0)} entities, "
+                  f"{stats.get('deleted_file_prune_failures', 0)} failures)")
         if args.prune_stale:
             print(f"   Stale entries pruned: {stats.get('stale_pruned', 0)}")
             print(f"   Prune failures: {prune_failures}")
@@ -7145,6 +7075,13 @@ def main():
                 file=sys.stderr,
             )
             return 4
+        if args.since_commit and stats.get('deleted_file_prune_failures', 0) > 0:
+            # v0.2.100: only the extra-path sync passes --since-commit, and it
+            # advances its baseline on exit 0 — a failed deleted-file prune must
+            # not (those deletions would never be in a later diff).
+            print("❌ deleted-file prune failed — do NOT advance the indexed commit.",
+                  file=sys.stderr)
+            return 5
 
         # v0.2.82 (G6, WP-3 contract): one NORMATIVE provenance line at
         # successful run end (WP-3's launcher parser reads the last occurrence).

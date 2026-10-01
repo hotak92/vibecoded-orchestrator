@@ -213,6 +213,26 @@ def path_reachable_on_disk(rel_or_abs_path: str, repo_root: "Path") -> bool:
         return True
 
 
+def source_is_owned(
+    src: Any, primary_sources: "Optional[set]", *, strict: bool = False,
+) -> bool:
+    """Does a row's stored ``project_source`` belong to the walked root?
+
+    The ONE ownership rule for every delete that judges rows by source
+    (``classify_row``, ``is_deleted_primary_row``, and the entity reconcile in
+    ``vco_lib.codegraph_resync``). A non-empty source is owned iff it is in
+    ``primary_sources``. An EMPTY source (legacy rows, pre-v0.2.47) is owned
+    by a normal walk of the project's primary root — but NOT under ``strict``,
+    which the extra-path sync sets (``--as-extra-path``): there the walked
+    root is an extra path, and an unstamped row is most likely the PRIMARY
+    project's, so it must never be judged (deleted) from this walk.
+    """
+    s = str(src or "").strip()
+    if not s:
+        return not strict
+    return primary_sources is not None and s in primary_sources
+
+
 def classify_row(
     props: "Optional[Mapping[str, Any]]",
     repo_root: "Optional[Path]",
@@ -222,8 +242,16 @@ def classify_row(
     index_dot_claude: bool = True,
     primary_sources: "Optional[set]" = None,
     reachable_fn=None,
+    strict_source: bool = False,
 ) -> str:
     """Classify one code-graph row for convergence purposes.
+
+    ``strict_source`` (v0.2.100, the extra-path sync's ``--as-extra-path``):
+    the walked root is an EXTRA path analyzed on its own, so a row with an
+    EMPTY ``project_source`` (legacy) cannot be proven to be this root's — it
+    is most likely the real primary project's. Such rows, and every row whose
+    source is not in ``primary_sources``, classify ``"not_owed"`` FIRST: never
+    deleted, never counted, from this walk.
 
     Returns exactly one of:
 
@@ -253,6 +281,11 @@ def classify_row(
     """
     p = props or {}
     raw_path = str(p.get(path_prop) or "")
+    # 0. Strict (extra-path sync): only PROVABLY-owned rows are judged at all.
+    if strict_source and not source_is_owned(
+        p.get("project_source"), primary_sources, strict=True,
+    ):
+        return "not_owed"
     # 1. Transient scratch — the marker itself is the proof; regardless of
     #    revision or source (matches the 6_to_7 purge + F2/F4 semantics).
     if TRANSIENT_STATE_MARKER in raw_path:
@@ -302,8 +335,13 @@ def is_deleted_primary_row(
     path_prop: str = "file_path",
     primary_sources: "Optional[set]" = None,
     reachable_fn=None,
+    strict_source: bool = False,
 ) -> bool:
     """True when a row is a PRIMARY-source, path-bearing, deleted-from-disk row.
+
+    ``strict_source`` (v0.2.100, ``--as-extra-path``): an empty/legacy
+    ``project_source`` does NOT count as the walked root's — see
+    :func:`source_is_owned`.
 
     This is the REVISION-INDEPENDENT deleted-file predicate that the CG-4
     whole-repo sweep deletes (analyzer's ``_clear_deleted_primary_rows``) and
@@ -341,9 +379,9 @@ def is_deleted_primary_row(
     if not raw_path:
         return False  # pathless → classifier's orphan-clear owns it
     # Primary-source scoping (mirror of classify_row step 2 / B1).
-    if primary_sources is not None:
-        src = str(p.get("project_source") or "").strip()
-        if src and src not in primary_sources:
+    if primary_sources is not None or strict_source:
+        if not source_is_owned(p.get("project_source"), primary_sources,
+                               strict=strict_source):
             return False
     # Deleted-file test — revision-independent (the CG-4 gap).
     if reachable_fn is not None:

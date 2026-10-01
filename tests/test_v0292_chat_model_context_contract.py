@@ -266,10 +266,10 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
             )
             self.assertEqual(table.path, path)
             self.assertEqual(table.uncited, ())
-            # Ten cited zai rows + the four first-party Claude 5 rows + the
+            # Nine cited zai rows + the four first-party Claude 5 rows + the
             # eight QwenCloud Token-Plan rows (v0.2.96) — the id sets are
             # pinned in tests/test_model_router_context_table.py.
-            self.assertEqual(len(table.rows), 22)
+            self.assertEqual(len(table.rows), 21)
 
     def test_the_one_m_decisions_survive_the_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -278,12 +278,12 @@ class RoundTripThroughTheRealReaderTests(unittest.TestCase):
             table = ct.ContextTableLoader(path).current()
 
             # The version-key evidence, end to end through the writer's shape.
-            self.assertTrue(table.advertise_1m("glm-5.2"))
+            self.assertTrue(table.advertise_1m("glm-5.3"))
             self.assertFalse(table.advertise_1m("glm-5.1"))
             # And still EXACT: no family stem or longer-id match. (`glm-5`
             # is itself a real row, so the stem probed here is `glm`.)
             self.assertIsNone(table.lookup("glm"))
-            self.assertIsNone(table.lookup("glm-5.2-flash"))
+            self.assertIsNone(table.lookup("glm-5.3-x"))
 
     def test_the_citation_caveats_survive_the_round_trip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
