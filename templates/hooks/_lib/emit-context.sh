@@ -24,11 +24,71 @@
 # Behaviour:
 #   - Empty or whitespace-only content → return 0 silently.
 #   - $PY (find-python.sh) missing AND no python3 on PATH → return 0.
-#   - 10k char cap matches the documented Claude Code contract.
+#   - The context is capped by vco_cap_context (below) under Claude Code's
+#     10 000-character hook-injection limit, with a visible cut marker.
 #   - Always returns 0 (never blocks the calling hook).
 #
 # OS support: pure POSIX bash + python3. Works on Linux, macOS, Git Bash
 # on Windows (provided $PY resolution from find-python.sh has run).
+
+# ───────────────────────────────────────────────────────────────────────────
+# vco_cap_context <text> [pointer]   /   ... | vco_cap_context_stream [pointer]
+#
+# v0.2.100 WP-17 — THE cap for text a hook injects into the model's context.
+# Claude Code's hooks contract: injected hook output past 10 000 characters is
+# NOT shown — the model gets a file path and a 2 000-character preview
+# instead. Measured on this project's own transcripts before the cap:
+# compact-context-reinject.sh exceeded it on 223 of 235 runs (up to 144 891
+# characters — after a compaction the model saw a 2 000-character preview of
+# the very state the hook exists to restore) and diff-context-inject.sh on
+# 374 of 707. A hook now cuts its own output at VCO_HOOK_CONTEXT_CAP
+# characters (default 9 500, clamped to 1 000..10 000; headroom for the
+# harness's own wrapper) and ENDS with a marker that says what was cut and
+# where the rest is, so the model can Read it.
+#
+# Counted in the shell's locale (characters under UTF-8, bytes under C —
+# bytes >= characters, so the limit holds either way); a multi-byte sequence
+# split by a byte-wise cut is dropped by `iconv -c` when iconv exists.
+# MUST MATCH _lib/emit-context.ps1's Limit-VcoHookContext.
+vco_hook_context_cap() {
+    local cap="${VCO_HOOK_CONTEXT_CAP:-9500}"
+    case "$cap" in
+        ''|*[!0-9]*) cap=9500 ;;
+    esac
+    # Strip leading zeros so the arithmetic below never reads octal.
+    cap="${cap#"${cap%%[!0]*}"}"
+    [ -n "$cap" ] || cap=9500
+    if [ "${#cap}" -gt 5 ] || [ "$cap" -gt 10000 ]; then cap=10000; fi
+    [ "$cap" -lt 1000 ] && cap=1000
+    printf '%s' "$cap"
+}
+
+vco_cap_context() {
+    local text="$1" pointer="${2:-}" cap total marker keep head
+    cap="$(vco_hook_context_cap)"
+    total=${#text}
+    if [ "$total" -le "$cap" ]; then
+        printf '%s' "$text"
+        return 0
+    fi
+    marker="
+[VCO: output cut at ${cap} of ${total} characters to stay under Claude Code's 10 000-character hook-injection limit.${pointer:+ $pointer}]"
+    keep=$((cap - ${#marker}))
+    [ "$keep" -lt 0 ] && keep=0
+    head="${text:0:keep}"
+    if command -v iconv >/dev/null 2>&1; then
+        head="$(printf '%s' "$head" | iconv -c -f UTF-8 -t UTF-8 2>/dev/null || printf '%s' "$head")"
+    fi
+    printf '%s%s' "$head" "$marker"
+}
+
+vco_cap_context_stream() {
+    local text
+    text="$(cat)"
+    [ -n "$text" ] || return 0
+    vco_cap_context "$text" "${1:-}"
+    printf '\n'
+}
 
 emit_additional_context() {
     local ctx="$1"
@@ -51,7 +111,7 @@ emit_additional_context() {
     [ -z "$py" ] && return 0
 
     local truncated
-    truncated=$(printf '%s' "$ctx" | head -c 10000)
+    truncated=$(vco_cap_context "$ctx")
 
     EVENT="$event_name" "$py" -c "
 import json, os, sys

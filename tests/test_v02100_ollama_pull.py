@@ -231,46 +231,207 @@ def _ticks(monkeypatch):
 
 def test_code_embed_loading_its_model_is_warming_not_unavailable(monkeypatch):
     """ACT (fresh GPU install): every probe inside the bound times out while
-    CodeSage downloads/loads → WARMING, so no action_required row."""
+    CodeSage downloads/loads → WARMING, so no row."""
     _ticks(monkeypatch)
     state = op.code_embed_state("http://c:11440", timeout_s=60, http=_CodeEmbed(slow=10_000),
-                                container_running=lambda: None)
+                                container=lambda: None)
     assert state == op.CODE_EMBED_WARMING
     assert op.code_embed_state("http://c:11440", timeout_s=60, http=_CodeEmbed(slow=2)) == \
         op.CODE_EMBED_READY
 
 
+NOW = 1_800_000_000.0
+
+
+def _run(running=True, age_s=60.0, exists=True):
+    return lambda: op.ContainerRun(exists=exists, running=running,
+                                   started_at=(NOW - age_s) if running else None)
+
+
 def test_a_running_container_that_refuses_is_warming_and_a_stopped_one_is_down(monkeypatch):
     _ticks(monkeypatch)
     down = _CodeEmbed(down=True)
-    assert op.code_embed_state("http://c", timeout_s=30, http=down,
-                               container_running=lambda: True) == op.CODE_EMBED_WARMING
+    assert op.code_embed_state("http://c", timeout_s=30, http=down, container=_run(),
+                               now=lambda: NOW) == op.CODE_EMBED_WARMING
     # LEAVE-ALONE: genuinely stopped / absent → the row is still owed
     assert op.code_embed_state("http://c", timeout_s=30, http=down,
-                               container_running=lambda: False) == op.CODE_EMBED_DOWN
+                               container=_run(running=False)) == op.CODE_EMBED_DOWN
+    assert op.code_embed_state("http://c", timeout_s=30, http=down,
+                               container=_run(running=False, exists=False)) == op.CODE_EMBED_DOWN
+
+
+def test_warming_is_bounded_by_the_containers_start_time(monkeypatch):
+    """W4R-06: a container running longer than a model load takes whose
+    /health never answered is wedged — DOWN with the reason — whether the
+    port refuses or accepts-and-hangs."""
+    _ticks(monkeypatch)
+    old = op.CODE_EMBED_WARMING_MAX_S + 60
+    for http in (_CodeEmbed(down=True), _CodeEmbed(slow=10_000)):
+        state, why = op.code_embed_verdict("http://c", timeout_s=30, http=http,
+                                           container=_run(age_s=old), now=lambda: NOW)
+        assert state == op.CODE_EMBED_DOWN, why
+        assert "wedged" in why and "never answered" in why
+    # LEAVE-ALONE: a young container (inside the bound) is still loading.
+    state, _why = op.code_embed_verdict("http://c", timeout_s=30, http=_CodeEmbed(slow=10_000),
+                                        container=_run(age_s=120), now=lambda: NOW)
+    assert state == op.CODE_EMBED_WARMING
+
+
+@pytest.mark.parametrize("raw,expected", [
+    ("2026-09-30T10:00:00.123456789Z", 1790762400.0),
+    ("2026-09-30 12:00:00.123456789 +0200 CEST", 1790762400.0),
+    ("2026-09-30 10:00:00 +0000 UTC", 1790762400.0),
+    ("0001-01-01T00:00:00Z", None),
+    ("", None),
+    ("yesterday", None),
+])
+def test_started_at_parses_both_runtimes(raw, expected):
+    assert op.parse_started_at(raw) == expected
 
 
 def test_plan_records_the_row_only_for_a_down_code_embed(monkeypatch, tmp_path):
     from vco_lib import embedding_pull_plan as epp
 
     for state, unavailable in ((op.CODE_EMBED_WARMING, False), (op.CODE_EMBED_DOWN, True)):
-        monkeypatch.setattr(op, "code_embed_state", lambda *a, _s=state, **k: _s)
+        monkeypatch.setattr(op, "code_embed_verdict", lambda *a, _s=state, **k: (_s, "why"))
+        monkeypatch.setattr(op, "service_container",
+                            lambda *a, **k: (op.OWNED, "vco_code_embed", "VCO's"))
         pp = epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["gpu"],
                                   capability_tier=["qwen3.5:0.8b"], code_embed_url="http://c",
                                   launcher_db=tmp_path / "absent.db", runtime="podman")
         assert pp.code_backend_unavailable is unavailable, state
 
 
-def test_container_running_reads_the_real_state_read_only():
+def test_the_outage_row_class_follows_who_runs_the_container(monkeypatch, tmp_path):
+    """W4R-06: VCO's own code_embed → the auto_retryable row; an adopted or
+    foreign one → the action_required row."""
+    from vco_lib import deferral_registry
+    from vco_lib import embedding_pull_plan as epp
+
+    monkeypatch.setattr(op, "code_embed_verdict", lambda *a, **k: (op.CODE_EMBED_DOWN, "down"))
+    for owned, cid, klass in ((op.OWNED, "code_embed_backend_unavailable", "auto_retryable"),
+                              (op.NOT_OWNED, "code_embed_adopted_backend_unavailable",
+                               "action_required")):
+        monkeypatch.setattr(op, "service_container", lambda *a, _o=owned, **k: (_o, "x", "d"))
+        pp = epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["gpu"],
+                                  capability_tier=[], code_embed_url="http://c",
+                                  launcher_db=tmp_path / "absent.db", runtime="podman")
+        entry = epp.code_embed_unavailable_entry(pp.code_backend_detail,
+                                                 vco_managed=pp.code_backend_vco_managed)
+        assert entry.condition_id == cid
+        assert deferral_registry.condition(cid).condition_class == klass
+
+
+def test_container_run_reads_the_real_state_read_only():
     calls = []
 
     def run(argv, **_k):
         calls.append(argv)
-        return type("R", (), {"returncode": 0, "stdout": "true\n"})()
+        return type("R", (), {"returncode": 0, "stdout": "true\t2026-09-30T10:00:00Z\n",
+                              "stderr": ""})()
 
-    assert op.code_embed_container_running("podman", run=run,
-                                           find=lambda s, runtime: "vco_code_embed") is True
+    got = op.inspect_container_run("podman", "vco_code_embed", run=run)
+    assert got == op.ContainerRun(exists=True, running=True, started_at=1790762400.0)
     assert calls == [["podman", "inspect", "--type", "container", "--format",
-                      "{{.State.Running}}", "vco_code_embed"]]
-    assert op.code_embed_container_running("podman", run=run, find=lambda s, runtime: None) is False
-    assert op.code_embed_container_running("", run=run) is None
+                      "{{.State.Running}}\t{{.State.StartedAt}}", "vco_code_embed"]]
+    assert op.inspect_container_run("", "x", run=run) is None
+
+    def missing(argv, **_k):
+        return type("R", (), {"returncode": 125, "stdout": "",
+                              "stderr": "Error: no such container x"})()
+
+    assert op.inspect_container_run("podman", "x", run=missing) == op.ContainerRun(exists=False)
+
+    def broken(argv, **_k):
+        return type("R", (), {"returncode": 125, "stdout": "", "stderr": "daemon down"})()
+
+    assert op.inspect_container_run("podman", "x", run=broken) is None
+
+
+def test_service_container_run_uses_the_rows_name():
+    seen = []
+
+    def run(argv, **_k):
+        seen.append(argv[-1])
+        return type("R", (), {"returncode": 0, "stdout": "false\t\n", "stderr": ""})()
+
+    row = type("Row", (), {"mode": "vco_managed", "container_name": "my_embed"})()
+    op.service_container_run(Path("/x"), "podman", "code_embed", row, run=run,
+                             find=lambda s, runtime: "vco_code_embed")
+    assert seen == ["my_embed"]
+
+
+# ── W3R-09 / W3R-10: who failed, a command every shell runs, Ollama's reason ─
+
+
+def test_a_code_embedder_pull_failure_is_recorded_not_fatal(monkeypatch):
+    jina = "jina/jina-embeddings-v2-base-code"
+    plan = PullPlan(embedding=(QWEN, jina), inference=(), code_embedding=(jina,))
+    fake = FakeOllama(present={QWEN}, streams={jina: [{"error": "disk full"}]})
+    from vco_lib.deferral_report import DeferralReport
+
+    report = DeferralReport()
+    res = op.ensure_plan_step(plan, {"ollama_url": BASE}, report,
+                              log_event=lambda *a, **k: None, http=fake)
+    assert set(res.failed) == {jina}
+    entry = next(e for e in report.entries if e.condition_id == "ollama_model_pull_failed")
+    assert "code graph's embedder" in entry.detected and "Knowledge Graph" not in entry.detected
+
+
+def test_a_kg_embedder_pull_failure_still_aborts_and_says_so():
+    jina = "jina/jina-embeddings-v2-base-code"
+    plan = PullPlan(embedding=(QWEN, jina), inference=(), code_embedding=(jina,))
+    fake = FakeOllama(streams={QWEN: [{"error": "disk full"}]})
+    with pytest.raises(op.OllamaPullError) as ei:
+        op.ensure_plan_step(plan, {"ollama_url": BASE}, None,
+                            log_event=lambda *a, **k: None, http=fake)
+    assert set(ei.value.failed) == {QWEN}
+    assert "knowledge graph's embedder" in str(ei.value)
+
+
+def test_the_pull_failed_command_runs_in_every_shell(tmp_path, capsys):
+    entry = op.pull_failed_entry({QWEN: "x"}, BASE)
+    cmd = entry.command_to_apply
+    assert op.PULL_RETRY_COMMAND in cmd
+    assert "'" not in op.PULL_RETRY_COMMAND and '"' not in op.PULL_RETRY_COMMAND
+    assert "curl" not in cmd
+    # The printed command is a real verb of a real CLI (driven here on a root
+    # with no recorded profile: it answers, without reaching any Ollama).
+    from vco_lib import embedding_pull_plan as epp
+
+    module, verb = op.PULL_RETRY_COMMAND.split()[2:4]
+    assert module == "vco_lib.embedding_pull_plan"
+    rc = epp.main([verb, "--json", "--root", str(tmp_path),
+                   "--launcher-db", str(tmp_path / "absent.db")])
+    assert rc == 1 and json.loads(capsys.readouterr().out)["ok"] is False
+
+
+def test_an_http_error_keeps_ollamas_reason():
+    import io
+    import urllib.error
+
+    class Err:
+        def post_lines(self, url, payload, timeout):
+            raise urllib.error.HTTPError(
+                url, 500, "Internal Server Error", None,  # type: ignore[arg-type]
+                io.BytesIO(b'{"error":"pull model manifest: file does not exist"}'))
+            yield b""  # pragma: no cover
+
+    with pytest.raises(op.PullFailed) as ei:
+        op.pull(BASE, "nope:1b", http=Err())  # type: ignore[arg-type]
+    assert str(ei.value) == "HTTP 500: pull model manifest: file does not exist"
+
+
+def test_the_code_embed_retry_clears_only_when_it_answers(monkeypatch, tmp_path):
+    from vco_lib import service_endpoints
+    from vco_lib.deferral_emit import emit
+    from vco_lib.embedding_pull_plan import code_embed_unavailable_entry
+
+    monkeypatch.setattr(service_endpoints, "machine_service_urls",
+                        lambda _db=None: {"code_embed_url": "http://c:11440"})
+    _ticks(monkeypatch)
+    emit(tmp_path, code_embed_unavailable_entry("down"))
+    status, _why = op.clear_code_embed_outage(tmp_path, timeout_s=5, http=_CodeEmbed(down=True))
+    assert status == op.BLOCKED and _ledger_ids(tmp_path) == ["code_embed_backend_unavailable"]
+    status, _why = op.clear_code_embed_outage(tmp_path, timeout_s=5, http=_CodeEmbed())
+    assert status == op.DONE and _ledger_ids(tmp_path) == []

@@ -1207,6 +1207,111 @@ fn install_path_manifest_lookup(
     ))
 }
 
+/// Every installed module manifest (`<modules_dir>/<id>/vct-module.json`)
+/// that exists but does not parse: `(module dir name, file, why)` — the
+/// `why` is `ModuleManifest::from_json`'s own error, which names the field
+/// and the offending value. Sorted by module. Unreadable directories are
+/// skipped (nothing to name).
+pub(crate) fn invalid_installed_manifests(modules_dir: &std::path::Path) -> Vec<(String, PathBuf, String)> {
+    let Ok(rd) = std::fs::read_dir(modules_dir) else { return Vec::new() };
+    let mut out: Vec<(String, PathBuf, String)> = rd
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("vct-module.json");
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let err = ModuleManifest::from_json(&raw).err()?;
+            Some((entry.file_name().to_string_lossy().to_string(), path, err))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The `module_manifest_invalid` entry text for `invalid` (pure).
+pub(crate) fn invalid_manifest_entry_text(invalid: &[(String, PathBuf, String)]) -> (String, String) {
+    let detected = format!(
+        "Installed module manifest(s) this launcher can no longer read: {}. The module no longer \
+         resolves from its installed copy; the launcher falls back to the module catalog, and \
+         offline (or for a module the catalog no longer lists) to nothing.",
+        invalid
+            .iter()
+            .map(|(id, path, why)| format!("{id} ({}: {why})", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let ids: Vec<&str> = invalid.iter().map(|(id, _, _)| id.as_str()).collect();
+    let command = format!(
+        "Open the launcher's Modules tab and Update (or Reinstall) {}: the catalog's release is \
+         installed and its manifest replaces the unreadable one. Versions are strictly X.Y.Z \
+         since v0.2.100 (a suffix such as `-beta` is refused), so if the catalog does not list a \
+         module, ask its publisher for an X.Y.Z release. Nothing was removed.",
+        ids.join(", ")
+    );
+    (detected, command)
+}
+
+/// Emit (or resolve, for an empty set) `module_manifest_invalid` in the
+/// install root's ledger. Under `cfg(test)` the write goes to
+/// [`TEST_MANIFEST_LEDGER`] instead — a unit test must never write the
+/// checkout's own `UPDATE_DEFERRED.md`.
+fn write_invalid_manifest_record(now: &[(String, PathBuf, String)]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let entry = if now.is_empty() { "resolve".to_string() } else { invalid_manifest_entry_text(now).0 };
+        TEST_MANIFEST_LEDGER.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let root = crate::commands::installer::find_local_repo_root()?;
+        if now.is_empty() {
+            return crate::services::deferral::resolve_deferral_conditions(&root, &root, &["module_manifest_invalid"]);
+        }
+        let (detected, command) = invalid_manifest_entry_text(now);
+        crate::services::deferral::emit_deferral_entry(
+            &root,
+            &root,
+            &crate::services::deferral::DeferralEntryFields {
+                condition_id: "module_manifest_invalid",
+                title: "An installed module's manifest can no longer be read",
+                detected: &detected,
+                why_deferred: "The launcher refuses a module version it cannot order (strict X.Y.Z, \
+                               v0.2.100) instead of guessing; it never edits or removes an installed \
+                               module's files on its own.",
+                command_to_apply: &command,
+                severity: "warning",
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) static TEST_MANIFEST_LEDGER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The last invalid-manifest set this process recorded (emit on change only).
+static LAST_INVALID_MANIFESTS: std::sync::Mutex<Option<Vec<(String, PathBuf, String)>>> = std::sync::Mutex::new(None);
+
+/// Keep `module_manifest_invalid` true (paired-resolution: this is the site
+/// its registry row names) — written while an installed manifest does not
+/// parse, resolved once none is left (the module was updated / reinstalled /
+/// uninstalled). Called on every [`resolve_manifest_for_install`]; the
+/// ledger is touched only when the set changes. Best-effort.
+pub(crate) fn record_invalid_installed_manifests() {
+    let now = invalid_installed_manifests(&crate::paths::vct_root_dir().join("modules"));
+    let mut last = LAST_INVALID_MANIFESTS.lock().unwrap_or_else(|p| p.into_inner());
+    if last.as_ref() == Some(&now) {
+        return;
+    }
+    for (id, path, why) in &now {
+        tracing::warn!("[modules] installed manifest of {} is unreadable ({}): {}", id, path.display(), why);
+    }
+    let result = write_invalid_manifest_record(&now);
+    match result {
+        Ok(()) => *last = Some(now),
+        Err(e) => tracing::warn!("[modules] module_manifest_invalid record not updated: {}", e),
+    }
+}
+
 /// Which lookup branch produced the manifest in
 /// [`resolve_manifest_for_install`]. Carried alongside the manifest so
 /// callers (`install_module_for_project`, `update_module_for_project`)
@@ -1383,6 +1488,7 @@ pub(crate) fn resolve_manifest_for_install(
                         "decision": "on_disk_winner",
                     }),
                 );
+                record_invalid_installed_manifests();
                 return Ok((on_disk_m, ManifestSource::Installed(on_disk_path)));
             }
         }
@@ -1390,7 +1496,14 @@ pub(crate) fn resolve_manifest_for_install(
             // No on-disk manifest at all — true cold-start. No
             // authoritative on-disk scope to preserve; the synth's
             // L0-derived scope is the only source.
+            //
+            // v0.2.100 W4R-07: OR an installed manifest that no longer
+            // parses (a version a ≤0.2.99 launcher accepted, e.g.
+            // "1.0.0-beta", is refused since F-W1-02). The fall-through is
+            // unchanged, but the cause is now RECORDED (module, file, value)
+            // instead of the module silently ceasing to resolve.
             on_disk_scope = None;
+            record_invalid_installed_manifests();
             // fall through to phase 2/3.
         }
     }
@@ -5346,6 +5459,36 @@ mod tests {
     /// producer emits such a version (bump-version.sh pins X.Y.Z; the L0 seed
     /// and bundled manifests are X.Y.Z).
     #[test]
+    fn w4r07_an_unreadable_installed_manifest_is_named_with_its_file_and_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The good one: the full fixture manifest at a strict X.Y.Z version.
+        plant_installed_manifest(tmp.path(), "1.2.3");
+        let good = tmp.path().join("modules");
+        // The bad one: the same shape, a version a <=0.2.99 launcher accepted.
+        let raw = std::fs::read_to_string(good.join("vct-rl-reranker").join("vct-module.json")).unwrap();
+        let bad = good.join("beta-mod");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            bad.join("vct-module.json"),
+            raw.replace("\"vct-rl-reranker\"", "\"beta-mod\"").replace("\"1.2.3\"", "\"1.0.0-beta\""),
+        )
+        .unwrap();
+        std::fs::create_dir_all(good.join("no-manifest")).unwrap();
+        let tmp_root = good;
+
+        let invalid = invalid_installed_manifests(&tmp_root);
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, "beta-mod");
+        assert!(invalid[0].2.contains("1.0.0-beta"), "the offending value is named: {}", invalid[0].2);
+        let (detected, command) = invalid_manifest_entry_text(&invalid);
+        assert!(detected.contains("beta-mod") && detected.contains("vct-module.json"), "{detected}");
+        assert!(command.contains("Update (or Reinstall) beta-mod"), "{command}");
+        // Leave-alone: valid manifests and module dirs without one are not named.
+        assert!(!detected.contains("vct-rl-reranker") && !detected.contains("no-manifest"));
+        assert!(invalid_installed_manifests(&tmp.path().join("absent")).is_empty());
+    }
+
+    #[test]
     fn test_v0245_an_invalid_on_disk_version_is_not_honoured() {
         let (_lock, tmp) = isolate_state();
         let db = open_db();
@@ -5370,6 +5513,13 @@ mod tests {
             source
         );
         assert_eq!(manifest.version, "0.2.8");
+        // W4R-07: the fall-through is RECORDED, naming the module's file and
+        // the value that no longer parses.
+        let ledger = TEST_MANIFEST_LEDGER.lock().unwrap().clone();
+        assert!(
+            ledger.iter().any(|e| e.contains("vct-rl-reranker") && e.contains("abc")),
+            "the unreadable installed manifest must be recorded: {ledger:?}"
+        );
     }
 
     // ─── catalog kind for an installed module (v0.2.100 WP-01) ─────────

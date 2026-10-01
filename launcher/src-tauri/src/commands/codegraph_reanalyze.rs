@@ -328,14 +328,9 @@ async fn run_reanalysis_with_stream(
         // a signal kill is evidence too, and `code().unwrap_or(-1)` erased it
         // (v0.2.100 WP-05 / I-06).
         return Err(format!(
-            "analyzer {}{}: {}",
-            status,
-            hint,
-            if stderr_text.is_empty() {
-                "no stderr".to_string()
-            } else {
-                stderr_text
-            }
+            "analyzer {}{}",
+            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole),
+            hint
         ));
     }
 

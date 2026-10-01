@@ -151,14 +151,38 @@ working mid-run.
    ``SYSTEM_PROMPT + "\n\n" + body``, so what survived was the system
    prompt alone and the model answered "Ready. What do you need
    summarized?". The prompt now goes over STDIN, which no shell re-parses.
+
+v0.2.100 WP-13 — what one ``claude -p`` call costs.
+
+4. Isolation. A headless call used to start the CLI with everything an
+   interactive session gets: every MCP server registered for the folder
+   (each one a process boot) and every hook in the project's settings. A
+   summary needs none of it. ``cli_isolation_args()`` adds
+   ``--strict-mcp-config --mcp-config <empty config>`` (no MCP server
+   starts) and ``--settings <file with disableAllHooks>`` (no hook runs) —
+   EACH only when the installed CLI lists that flag in ``claude --help``,
+   so an older CLI that lacks one still runs, without it, and says so once.
+   The working directory is deliberately NOT moved to a neutral temp dir:
+   a headless call in a folder the CLI has never trusted fails with "this
+   workspace has not been trusted" (the v0.2.96 WP-7 field failure), and a
+   fresh temp dir is never trusted — the flags remove what the folder would
+   have loaded without making the call depend on a trust flag VCO must not
+   write.
+5. Batching. ``build_batch_prompt()`` / ``parse_batch_reply()`` are the one
+   JSON envelope for "N items, one call" — the code-summary generator sends
+   several entities per spawn and falls back to one call per entity for any
+   item the reply does not answer validly.
 """
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
+import re
 import shutil
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -403,6 +427,7 @@ def reset_backend_cache() -> None:
     """
     _BACKEND_CACHE.clear()
     _BREAKER_MEM.clear()
+    _CLI_ISOLATION.clear()
 
 
 def reset_breaker(*, persisted: bool = False) -> None:
@@ -968,6 +993,85 @@ def _diagnose(exc: BaseException) -> "tuple[str, str]":
 # ──────────────────────────────────────────────────────────────────────
 # Backend: Claude CLI
 # ──────────────────────────────────────────────────────────────────────
+#: v0.2.100 WP-13 — per-process cache of the isolation argv, keyed by the
+#: resolved CLI path (a different binary may list different flags).
+_CLI_ISOLATION: dict[str, list[str]] = {}
+#: The one temp dir holding the two isolation files (created on first use,
+#: removed at interpreter exit).
+_ISOLATION_DIR: dict[str, Path] = {}
+
+EMPTY_MCP_CONFIG = {"mcpServers": {}}
+NO_HOOKS_SETTINGS = {"disableAllHooks": True}
+CLI_HELP_TIMEOUT_S = 20
+
+
+def _cli_lists_flag(help_text: str, flag: str) -> bool:
+    """True when *flag* appears in ``--help`` as a whole option name
+    (``--mcp-config`` must not match inside ``--strict-mcp-config``)."""
+    return re.search(rf"(?<![\w-]){re.escape(flag)}(?![\w-])", help_text) is not None
+
+
+def _isolation_dir() -> Path:
+    cached = _ISOLATION_DIR.get("dir")
+    if cached is not None and cached.is_dir():
+        return cached
+    path = Path(tempfile.mkdtemp(prefix="vco-summary-cli-"))
+    (path / "empty-mcp.json").write_text(json.dumps(EMPTY_MCP_CONFIG), encoding="utf-8")
+    (path / "no-hooks-settings.json").write_text(
+        json.dumps(NO_HOOKS_SETTINGS), encoding="utf-8")
+    _ISOLATION_DIR["dir"] = path
+    atexit.register(shutil.rmtree, str(path), True)
+    return path
+
+
+def _cli_help_text(claude_path: str) -> str:
+    """``claude --help`` output, or ``""`` when it cannot be read."""
+    import subprocess as _sub
+
+    try:
+        result = _sub.run(
+            [claude_path, "--help"], capture_output=True, text=True,
+            timeout=CLI_HELP_TIMEOUT_S, stdin=_sub.DEVNULL,
+        )
+    except (_sub.TimeoutExpired, OSError):
+        return ""
+    return f"{result.stdout or ''}\n{result.stderr or ''}"
+
+
+def cli_isolation_args(claude_path: str) -> list[str]:
+    """The argv that starts a headless call with no MCP server and no hook.
+
+    Each flag is added only when the installed CLI lists it in ``--help``
+    (verified once per process per binary); a missing flag is logged once
+    and the call runs without it — never refused, never guessed.
+    """
+    if claude_path in _CLI_ISOLATION:
+        return list(_CLI_ISOLATION[claude_path])
+    help_text = _cli_help_text(claude_path)
+    args: list[str] = []
+    missing: list[str] = []
+    try:
+        if (_cli_lists_flag(help_text, "--strict-mcp-config")
+                and _cli_lists_flag(help_text, "--mcp-config")):
+            args += ["--strict-mcp-config", "--mcp-config",
+                     str(_isolation_dir() / "empty-mcp.json")]
+        else:
+            missing.append("--strict-mcp-config/--mcp-config (MCP servers will start)")
+        if _cli_lists_flag(help_text, "--settings"):
+            args += ["--settings", str(_isolation_dir() / "no-hooks-settings.json")]
+        else:
+            missing.append("--settings (hooks will run)")
+    except OSError as exc:
+        # The isolation files could not be written: run un-isolated, say why.
+        args = []
+        missing = [f"isolation files ({exc})"]
+    if missing:
+        _log("  summary: the claude CLI at " + claude_path + " does not offer "
+             + "; ".join(missing) + " — summary calls run without it")
+    _CLI_ISOLATION[claude_path] = args
+    return list(args)
+
+
 def cli_available() -> bool:
     """Return True if `claude` is on PATH AND a smoke-test query succeeds.
 
@@ -1001,7 +1105,7 @@ def cli_available() -> bool:
         # post-git-commit-kg-sync.{sh,ps1} hooks already use this flag.
         result = _sub.run(
             [claude_path, "-p", "say ok", "--model", "haiku", "--max-turns", "1",
-             "--no-session-persistence"],
+             "--no-session-persistence", *cli_isolation_args(claude_path)],
             capture_output=True,
             text=True,
             timeout=20,  # Generous — first-call cold-start can be slow.
@@ -1034,6 +1138,9 @@ def call_cli(prompt: str) -> str:
     (``--input-format text`` is the default for ``--print``), and stdin is
     a pipe no shell re-parses. It also removes the command-line length
     limit, which the 8 KB prompts here were approaching on ``cmd.exe``.
+
+    v0.2.100 WP-13: the argv also carries :func:`cli_isolation_args` (no MCP
+    server, no hook), each flag only when this CLI lists it in ``--help``.
     """
     import subprocess
 
@@ -1054,7 +1161,7 @@ def call_cli(prompt: str) -> str:
         # use this flag.
         result = subprocess.run(
             [claude_path, "-p", "--model", "haiku", "--max-turns", "1",
-             "--no-session-persistence"],
+             "--no-session-persistence", *cli_isolation_args(claude_path)],
             input=full_prompt,
             capture_output=True,
             text=True,
@@ -1637,3 +1744,50 @@ def call_llm(
                 f"({len((text or '').strip())} chars) — not cached"
             )
         return text
+
+
+# ──────────────────────────────────────────────────────────────────────
+# v0.2.100 WP-13 — the batch envelope ("N items, one call")
+# ──────────────────────────────────────────────────────────────────────
+_FENCE_RE = re.compile(r"^```[a-zA-Z0-9_-]*\s*|\s*```$")
+
+
+def build_batch_prompt(instructions: str, blocks: "list[tuple[str, str]]") -> str:
+    """One prompt for several items: *instructions*, then each block under
+    an ``### ITEM <id>`` header, then the reply contract (one JSON object
+    keyed by item id). The ids are the caller's; keep them short and plain."""
+    parts = [instructions.strip(), ""]
+    for item_id, text in blocks:
+        parts.append(f"### ITEM {item_id}")
+        parts.append(text.strip())
+        parts.append("")
+    ids = ", ".join(f'"{item_id}"' for item_id, _ in blocks)
+    parts.append(
+        "Reply with ONLY one JSON object and nothing else (no prose, no code "
+        f"fence). Its keys are exactly the item ids ({ids}); each value is "
+        "the answer for that item in the shape described above."
+    )
+    return "\n".join(parts)
+
+
+def parse_batch_reply(text: "str | None", ids) -> dict:
+    """The answers in a batch reply, keyed by item id.
+
+    Tolerates a code fence and prose around the object (the outermost
+    ``{ … }`` is parsed). Returns ``{}`` when no JSON object can be read;
+    ids the reply does not carry are simply absent — the caller falls back
+    to one call per missing item, so a partial reply loses nothing.
+    """
+    raw = (text or "").strip()
+    raw = _FENCE_RE.sub("", raw).strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    if start < 0 or end <= start:
+        return {}
+    try:
+        data = json.loads(raw[start:end + 1])
+    except (ValueError, TypeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    wanted = {str(i) for i in ids}
+    return {k: v for k, v in data.items() if k in wanted}

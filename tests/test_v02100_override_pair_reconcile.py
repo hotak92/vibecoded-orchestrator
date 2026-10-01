@@ -77,3 +77,29 @@ def test_two_different_generators_keep_the_deferral(tmp_path):
     _pair(tmp_path, NEWER, storage, legacy_newer=False)
     pi._detect_and_rename_legacy_compose_override(tmp_path)
     assert "compose_override_filename_conflict" in _ids(tmp_path)
+
+
+def test_a_checkout_that_reset_both_times_does_not_crown_the_older_half(tmp_path):
+    """W4R-11: a checkout/copy writes both halves within moments of each
+    other, so mtime says nothing — the canonical name wins, and the summary
+    names the rule. Here the legacy half (the OLDER generator output) was
+    written one second "later" by that checkout."""
+    from vco_lib import compose_override_pair as cop
+
+    lp, cp = _pair(tmp_path, OLDER, NEWER, legacy_newer=True)
+    os.utime(cp, (2_000_000, 2_000_000))
+    os.utime(lp, (2_000_001, 2_000_001))
+    half, rule = cop.newest_generated_half(lp, cp)
+    assert half == cp and "canonical name wins" in rule
+    pi._detect_and_rename_legacy_compose_override(tmp_path)
+    assert cp.read_text() == NEWER and lp.read_text() == NEWER
+
+
+def test_mtimes_far_apart_still_decide(tmp_path):
+    """LEAVE-ALONE: two generator runs hours apart — the later one wins,
+    whichever name it is."""
+    from vco_lib import compose_override_pair as cop
+
+    lp, cp = _pair(tmp_path, NEWER, OLDER, legacy_newer=True)
+    half, rule = cop.newest_generated_half(lp, cp)
+    assert half == lp and "later" in rule

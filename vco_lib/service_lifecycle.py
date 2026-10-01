@@ -373,19 +373,18 @@ def _bind_holds_data(source: str) -> bool:
         return False
 
 
-def _effective_mount(infra: Path, service: str, destination: str, need_gpu: bool,
-                     overlay: Optional[str]) -> tuple[list[Path], Any]:
-    """The ``-f`` chain and the *destination* mount the INSTALLER's
-    effective config gives *service*, merged in Python from the files on
-    disk with the substitution env compose itself sees
-    (``infrastructure/.env``)."""
+def _compose_chain(infra: Path, need_gpu: bool, overlay: Optional[str]) -> list[Path]:
+    """The ``-f`` chain the INSTALLER's compose runs for this migration (base +
+    the GPU overlay when needed + present overrides). The mount that chain
+    gives the service is NOT read here: :func:`vco_lib.data_identity.guard_recreate`
+    asks the provider's own ``compose config`` render (one home for that
+    question since v0.2.100 F-W2-13 — the Python merge this function used to
+    re-read it from was a second, divergent answer)."""
     from vco_lib import service_adoption as _sa  # noqa: PLC0415
 
     env = _sa.infrastructure_env_for_substitution(infra)
-    files, cfg = _sa._compose_entrypoints(need_gpu, overlay, infra, env)
-    service_cfg = (cfg.get("services") or {}).get(service) or {}
-    mounts = _sa.config_mounts(service_cfg, cfg.get("volumes") or {})
-    return files, mounts.get(destination)
+    files, _cfg = _sa._compose_entrypoints(need_gpu, overlay, infra, env)
+    return files
 
 
 def _describe_mount(mount: Any, destination: str = CACHE_DESTINATION) -> str:
@@ -720,7 +719,7 @@ def migrate_managed_service(
             f"the running service uses GPU devices but no GPU overlay matches the compose "
             f"'{compose_form}' — refusing rather than dropping the GPUs"
         )
-    files, _unused = _effective_mount(infra, service, destination, live.has_devices, overlay)
+    files = _compose_chain(infra, live.has_devices, overlay)
     if not files:
         return refuse(f"no usable compose file in {infra}")
     own_project = _containers.own_compose_project(root)
@@ -757,12 +756,6 @@ def migrate_managed_service(
     new_row = dataclasses.replace(row, data_mount=mount,
                                   container_name=row.container_name or canonical)
     env_state["restore"] = {**db_rows, service: dataclasses.replace(identity_base, data_mount=mount)}
-    _files, effective = _effective_mount(infra, service, destination, live.has_devices, overlay)
-    if _di.mount_key(effective) != data_key:
-        return refuse(
-            f"the installer's effective config would mount {_describe_mount(effective, destination)} "
-            f"at {destination}, not the live {_di.describe(mount)}"
-        )
     identity = _containers.compose_identity_of(ref, runtime, run=run)
     foreign = _containers.foreign_compose_identity(identity, own_project)
     if foreign is not None and service != "code_embed":

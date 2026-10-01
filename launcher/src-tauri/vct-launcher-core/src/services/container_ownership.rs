@@ -537,16 +537,35 @@ pub fn owner_id_for_root(root: &Path) -> String {
     hex::encode(h.finalize())[..16].to_string()
 }
 
+/// THIS process's install-root id, or why it has none (resolved once).
+fn launcher_owner_resolution() -> &'static Result<String, String> {
+    static ID: OnceLock<Result<String, String>> = OnceLock::new();
+    ID.get_or_init(|| {
+        super::install_root::resolve_current_exe_without_db()
+            .map(|r| owner_id_for_root(&r.path))
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// THIS process's install-root id (`None` when no install root resolves —
 /// then nothing is labelled and nothing is reaped).
 pub fn launcher_owner_id() -> Option<String> {
-    static ID: OnceLock<Option<String>> = OnceLock::new();
-    ID.get_or_init(|| {
-        super::install_root::resolve_current_exe_without_db()
-            .ok()
-            .map(|r| owner_id_for_root(&r.path))
+    launcher_owner_resolution().as_ref().ok().cloned()
+}
+
+/// Why THIS launcher creates module containers WITHOUT its ownership label
+/// (W4R-09): `Some(reason)` when its install root did not resolve from its
+/// own executable — a bootstrap binary run from outside an install, a test
+/// binary — else `None`.
+pub fn launcher_label_omitted_cause() -> Option<String> {
+    label_omitted_cause_for(launcher_owner_resolution())
+}
+
+/// [`launcher_label_omitted_cause`] for a given resolution. Pure.
+pub fn label_omitted_cause_for(resolution: &Result<String, String>) -> Option<String> {
+    resolution.as_ref().err().map(|why| {
+        format!("this launcher's install root did not resolve from its executable ({why})")
     })
-    .clone()
 }
 
 /// `--label io.vibecoded.vct.launcher=<id>` for a `run` argv, given the id.
@@ -557,8 +576,23 @@ pub fn launcher_label_args_for(owner_id: Option<&str>) -> Vec<String> {
     }
 }
 
-/// [`launcher_label_args_for`] this process's id.
+/// [`launcher_label_args_for`] this process's id — called at every module
+/// container CREATE. When the id is unknown the container is created
+/// unlabelled; that is logged ONCE per process with the cause (W4R-09), so a
+/// later `module_container_unlabelled` row has its explanation in the log of
+/// the launcher that created the container.
 pub fn launcher_label_args() -> Vec<String> {
+    if let Some(cause) = launcher_label_omitted_cause() {
+        if first_time("launcher-label-omitted") {
+            tracing::warn!(
+                "[container_ownership] module containers are created WITHOUT the {} label: {}. \
+                 A launcher whose install root resolves will report them as unlabelled and \
+                 never remove them.",
+                LAUNCHER_LABEL,
+                cause
+            );
+        }
+    }
     launcher_label_args_for(launcher_owner_id().as_deref())
 }
 
@@ -959,6 +993,10 @@ mod tests {
         assert_eq!(launcher_label_verdict(&ours, Some("def")), LabelVerdict::OtherInstall("abc".into()));
         assert_eq!(launcher_label_verdict(&ours, None), LabelVerdict::OtherInstall("abc".into()));
         assert_eq!(launcher_label_verdict(&Labels::new(), Some("abc")), LabelVerdict::Unlabelled);
+        // W4R-09: an unresolved root is a NAMED cause, a resolved one none.
+        let cause = label_omitted_cause_for(&Err("no vct-module.json above /tmp/x".into())).expect("cause");
+        assert!(cause.contains("did not resolve") && cause.contains("/tmp/x"), "{cause}");
+        assert_eq!(label_omitted_cause_for(&Ok("0123456789abcdef".into())), None);
         assert_eq!(launcher_label_args_for(Some("abc")), vec!["--label", "io.vibecoded.vct.launcher=abc"]);
         assert!(launcher_label_args_for(None).is_empty());
     }

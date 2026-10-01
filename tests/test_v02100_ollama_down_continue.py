@@ -74,9 +74,35 @@ def _restart(tmp_path, row, *, project=OWN, found="vco_ollama", rt=None):
 # ── 1. restart ONLY an owned container ──────────────────────────────────────
 
 
+def _verbs(rt):
+    return [c[1] for c in rt.calls]
+
+
 def test_owned_container_is_restarted_by_name(tmp_path):
     (outcome, detail), rt = _restart(tmp_path, _row())
-    assert outcome == op.RESTARTED and rt.calls == [["podman", "restart", "vco_ollama"]]
+    assert outcome == op.RESTARTED and rt.calls[-1] == ["podman", "restart", "vco_ollama"]
+    assert set(_verbs(rt)) <= {"inspect", "restart"}, rt.calls  # read, then restart by name
+
+
+def test_the_rows_container_is_the_target_not_a_canonical_leftover(tmp_path):
+    """W4R-11: the row names `my_ollama`; a stale canonical `vco_ollama` beside
+    it is not the service and must not be the one restarted."""
+    (outcome, _d), rt = _restart(tmp_path, _row(name="my_ollama"), found="vco_ollama")
+    assert outcome == op.RESTARTED and rt.calls[-1] == ["podman", "restart", "my_ollama"]
+    assert not any("vco_ollama" in c for c in rt.calls), rt.calls
+
+
+def test_a_row_naming_a_missing_container_restarts_nothing(tmp_path):
+    class Missing(Runtime):
+        def __call__(self, argv, **_k):
+            self.calls.append(list(argv))
+            return SimpleNamespace(returncode=125, stdout="",
+                                   stderr="Error: no such container my_ollama")
+
+    rt = Missing()
+    (outcome, detail), rt = _restart(tmp_path, _row(name="my_ollama"), found="vco_ollama", rt=rt)
+    assert outcome == op.NO_CONTAINER and "my_ollama" in detail
+    assert "restart" not in _verbs(rt)
 
 
 @pytest.mark.parametrize("case", ["adopted row", "foreign label", "no compose label"])
@@ -84,12 +110,12 @@ def test_adopted_or_foreign_ollama_is_reported_never_touched(tmp_path, case):
     row = _row(mode="adopted_container", name="their_ollama") if case == "adopted row" else _row()
     project = {"foreign label": "someone_else", "no compose label": None}.get(case, OWN)
     (outcome, detail), rt = _restart(tmp_path, row, project=project)
-    assert outcome == op.NOT_OWNED and rt.calls == []
+    assert outcome == op.NOT_OWNED and "restart" not in _verbs(rt)
     assert "not VCO's" in detail
 
 
 def test_no_container_is_reported_not_created(tmp_path):
-    (outcome, _d), rt = _restart(tmp_path, _row(), found=None)
+    (outcome, _d), rt = _restart(tmp_path, _row(name=""), found=None)
     assert outcome == op.NO_CONTAINER and rt.calls == []
 
 

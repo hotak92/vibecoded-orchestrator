@@ -180,6 +180,23 @@ diff_context_section() {
     return 0
 }
 
+# v0.2.100 WP-17: the changed sections go through the shared injection cap
+# (_lib/emit-context.sh vco_cap_context_stream). Claude Code shows the model
+# only a file path + a 2 000-character preview of hook output past 10 000
+# characters; this hook was over on 374 of 707 measured prompts. The cut ends
+# with a marker naming the file to Read. A missing helper (broken install)
+# injects uncapped rather than nothing. MUST MATCH diff-context-inject.ps1.
+# shellcheck source=_lib/emit-context.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+_diff_cap() {
+    if command -v vco_cap_context_stream >/dev/null 2>&1; then
+        vco_cap_context_stream "Read .claude/CONTEXT_STATE.md for the full changed sections."
+    else
+        cat
+    fi
+}
+
+{
 # 1. The shared CONTEXT_STATE.md rollup (the original, unchanged behaviour).
 diff_context_section "$CONTEXT_FILE" "$SNAPSHOT_FILE" "Context"
 
@@ -189,5 +206,6 @@ diff_context_section "$CONTEXT_FILE" "$SNAPSHOT_FILE" "Context"
 if [ -f "$SESSION_CONTEXT_FILE" ]; then
     diff_context_section "$SESSION_CONTEXT_FILE" "$SESSION_SNAPSHOT_FILE" "Session context"
 fi
+} | _diff_cap
 
 exit 0

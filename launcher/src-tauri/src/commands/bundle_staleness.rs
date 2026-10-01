@@ -371,15 +371,9 @@ async fn run_census(db: &Db) -> BundleStalenessCensus {
         }
     };
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let head = stderr
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("no stderr")
-            .to_string();
         return BundleStalenessCensus::undetermined(format!(
-            "bundle census failed ({}): {}",
-            out.status, head
+            "bundle census failed: {}",
+            vct_launcher_core::process::failure_evidence(&out.status, &String::from_utf8_lossy(&out.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
         ));
     }
     census_from_stdout(&String::from_utf8_lossy(&out.stdout))

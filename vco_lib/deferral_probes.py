@@ -716,6 +716,23 @@ def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def project_hooks_relative_paths_still_present(ctx: ProbeContext) -> Optional[bool]:
+    """``project_hooks_relative_paths`` — does a project-own hook still invoke a
+    ``.claude/hooks/`` script by a relative path?
+
+    A thin wrapper over :func:`vco_lib.hook_relative_paths.relative_hooks_still_present`,
+    the SAME detection the bundle update emits from, so the probe can never clear
+    an entry the next update would re-emit. ``None`` when a settings file cannot
+    be read.
+    """
+    from vco_lib.hook_relative_paths import relative_hooks_still_present
+
+    try:
+        return relative_hooks_still_present(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def user_owned_secret_values_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``user_owned_secret_value_in_tree`` — does a user-put secret-shaped key
     still carry a value? The SAME detection the emitter uses
@@ -1101,6 +1118,7 @@ PROBES: dict[str, ProbeFn] = {
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
     "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
+    "project_hooks_relative_paths_still_present": project_hooks_relative_paths_still_present,
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,
     "code_embed_image_still_stale": code_embed_image_still_stale,

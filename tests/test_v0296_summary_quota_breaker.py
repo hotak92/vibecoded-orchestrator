@@ -194,6 +194,10 @@ class TestTrustTerminal:
         spawns: list[list] = []
 
         def _fake_run(argv, **kwargs):
+            if list(argv)[1:] == ["--help"]:
+                # v0.2.100 WP-13: the once-per-process flag probe is not a
+                # summary spawn; it lists no isolation flags here.
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
             spawns.append(list(argv))
             if len(spawns) == 1:
                 return types.SimpleNamespace(

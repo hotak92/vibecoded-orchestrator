@@ -313,6 +313,8 @@ _V02100_OWNED_ADDITIONS = frozenset({
     "ollama_not_ready_at_update",
     "ollama_model_pull_failed",
     "code_embed_backend_unavailable",
+    # W4R-06: the adopted/foreign half of the same outage (action_required).
+    "code_embed_adopted_backend_unavailable",
     # gated_delivery_skipped / gated_delivery_unknown left this set in WP-10
     # (F-W1-12): their emitter runs INSIDE an install.py run (the root bundle),
     # so install ownership would drop the row in that run's own finalize; they
@@ -338,6 +340,8 @@ _V02100_EMITTER_KEPT = frozenset({
     "watchdog_foreign_container",
     "services_stop_incomplete",
     "module_container_unlabelled",
+    # W4R-07: kept true by modules::record_invalid_installed_manifests.
+    "module_manifest_invalid",
 })
 
 

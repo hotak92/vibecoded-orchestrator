@@ -1037,52 +1037,15 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
         return
 
     try:
-        from vco_lib.deferral_emit import (
-            DeferralEntry,
-            emit,
-        )
+        # v0.2.100 WP-17: the entry has ONE home, shared with the write hooks
+        # (`vco_lib.gate_skipped_deferral`), written through the locked emitter.
+        from vco_lib.gate_skipped_deferral import emit_gate_skipped
     except Exception:
         # vco_lib not on sys.path — silent skip. The metric still fired.
         return
 
     try:
-        # Upsert: the emitter's `add_entry` de-dups on condition_id, so
-        # even if a prior session left the entry behind it gets refreshed
-        # rather than duplicated.
-        entry = DeferralEntry(
-            condition_id="gate_skipped_no_project_id",
-            title=(
-                "Phase-8 access-matrix gate skipped (VCT_PROJECT_ID "
-                "missing from MCP env)"
-            ),
-            detected=(
-                "The MCP server reached store_knowledge_node with no "
-                "VCT_PROJECT_ID env. The Phase-8 WRITE gate cannot "
-                "identify this project against the hub's access matrix, "
-                "so writes are proceeding via the silent-allow path. "
-                "The write itself was permitted; this entry records the "
-                "remediation so future writes go through the gate "
-                f"properly. (target collection: {collection})"
-            ),
-            why_deferred=(
-                "Seeding VCT_PROJECT_ID requires either an orchestrator "
-                "install run (which queries launcher.db for the "
-                "project's UUID) or a Launcher GUI project "
-                "re-registration. Both are user-initiated; the MCP "
-                "server cannot self-heal."
-            ),
-            command_to_apply=(
-                "# Option A — orchestrator-root install / update:\n"
-                "python install.py --update\n"
-                "\n"
-                "# Option B — per-project (pre-v0.2.49 install): re-register the\n"
-                "# project via Launcher GUI → Projects → Identity tab. The\n"
-                "# launcher's apply_project_env pass seeds VCT_PROJECT_ID\n"
-                "# into <project>/.claude/env from launcher.db."
-            ),
-            severity="warning",
-        )
-        emit(project_root, entry)
+        emit_gate_skipped(project_root, collection, surface="mcp")
     except Exception:
         # Any I/O failure here must not break the allow contract.
         pass

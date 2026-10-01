@@ -137,6 +137,28 @@ Scope and caveats:
     (If you wait instead, the launcher's next boot self-heals once the
     deadline lapses.)
 
+### `<vct_root>/update.lock` (one update at a time, v0.2.100)
+
+- Written by the launcher while it runs an orchestrator update: two lines,
+  the launcher's pid and the Unix time of the claim. Removed when the
+  update ends inside that launcher; an update that ends by relaunching the
+  launcher can leave it behind naming the exited pid, and such a stale
+  claim (dead pid, or a pid reused by a newer process) is reaped by the
+  next launcher update and ignored by `install.py`.
+- A terminal `python install.py --update` reads it first
+  (`vco_lib/update_lock.py`). A live claim held by another process →
+  it stops with `ERROR: another update of this orchestrator is running`
+  and exit 1; wait for the launcher's update to finish. It proceeds when
+  the claim is stale, or when the holder is its own parent (the launcher
+  running this very install step). It never deletes the file.
+- When it cannot tell whether the holder is alive, it proceeds and prints
+  `[!] update.lock: could not tell …` followed by WHY — normally that the
+  interpreter has no `psutil` (and, on Windows, that the Win32 process
+  query failed too) — and the remedy: run `install.py` with the
+  orchestrator venv's Python, which has `psutil`, to enforce the lock.
+- Only delete it by hand when no launcher update is on screen and the pid
+  it names is not a running launcher.
+
 ### `<vct_root>/update.lock.json` (stage1 handoff contract, V52-AH, Windows)
 
 - Written by the launcher (or terminal `install.py --update`) when a
@@ -263,7 +285,7 @@ Scope and caveats:
 | **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
 | **Preferences → Launcher updates has said "Up to date" for weeks, `Branch: HEAD`, `Commits behind: 0`, `Running:` and `Latest source release:` show the SAME version** | **detached HEAD on a build before v0.2.92 — the check was structurally blind, see below** | **update once by hand (below), then use the GUI's Reattach button** |
-| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **take this one hop from the MenuBar update badge instead (it runs `update_orchestrator`, which has used the precise risk set since v0.2.58); the refusal is narrowed on both surfaces from v0.2.95. Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
+| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **on that build, take this one hop from the MenuBar update badge instead — on builds up to v0.2.94 the badge ran a separate update whose tree check already used the precise risk set (since v0.2.58); from v0.2.95 the two surfaces share that check, and from v0.2.100 they are one update. Or update from a terminal (`docs/INSTALL_RECOVERY.md` → "Update from the shell"). Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
 | **GUI update stuck at "Seeding Weaviate KG" (or "Applying updates…") forever, no progress for many minutes** | **pipe deadlock on launchers ≤ v0.2.94 (2026-09-20 field incident): the old launcher read install.py's stdout to EOF before draining stderr, and install.py's KG-sync child inherited those pipes — its stderr (per-node tracebacks against a stale schema) filled the ~64 KiB OS pipe buffer, blocking the child mid-write, which blocked install.py in `subprocess.run`, which kept stdout open, so the launcher never saw EOF. Fixed on both ends: v0.2.95's launcher drains both pipes concurrently, and v0.2.96 routes every install child's output to per-run log files under `~/.vct/logs/` (`vco_lib/child_process.py`) so nothing large is ever written to the inherited pipes at all. A terminal run of `python install.py --update` cannot hang this way — a terminal drains both streams** | **kill the wedged `install.py` and its sync child (`ps -ef | grep -E "install.py|sync_knowledge_graph"`; the launcher's abort-recovery then records the failed phase as designed), relaunch the launcher, and finish via the update-resume flow (Continue Update badge, or `python install.py --update` from the install root). On v0.2.96+ the child's full output is in `~/.vct/logs/<stem>-*.log`, named in the failure message** |
 
 ---

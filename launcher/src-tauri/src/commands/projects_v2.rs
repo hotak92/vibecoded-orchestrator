@@ -2350,12 +2350,10 @@ fn spawn_root_identity_sweep(
                 }
             }
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(
-                    "[vct] warning: root identity sweep for {} failed ({}): {}",
+                    "[vct] warning: root identity sweep for {} failed: {}",
                     project_id,
-                    out.status,
-                    stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
+                    vct_launcher_core::process::failure_evidence(&out.status, &String::from_utf8_lossy(&out.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
                 );
             }
             Err(e) => {
@@ -3628,64 +3626,32 @@ fn apply_project_env_via_python(
     // (v0.2.97 review F13, same fix as the env-block verbs).
     cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
-    // Spawn with stdout/stderr captured. 30 s wall-clock cap — the
-    // happy path is ~150 ms; a hang past 30 s indicates a stuck DB
-    // open or a runaway Python process and is better surfaced than
-    // letting the user click sit indefinitely.
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "config_projection apply: spawn failed (python={}): {}",
-                python.display(),
-                e
-            )
-        })?;
+    // 30 s wall-clock cap through the ONE bounded runner (v0.2.100
+    // F-W4-05) — the happy path is ~150 ms; a hang past 30 s indicates a
+    // stuck DB open or a runaway Python process and is better surfaced than
+    // letting the user click sit indefinitely. Pipes are drained while the
+    // child runs, so a chatty child cannot deadlock on a full pipe.
+    let out = vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|e| {
+        format!(
+            "config_projection apply (python={}): {}",
+            python.display(),
+            e
+        )
+    })?;
 
-    // Polled wait with 30 s deadline. std::process::Child::wait()
-    // doesn't take a timeout, so we sleep-poll. 50 ms granularity is
-    // cheap and gives the subprocess every chance to exit fast.
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(
-                        "config_projection apply: timed out after 30 s"
-                            .to_string(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "config_projection apply: wait failed: {}",
-                    e
-                ));
-            }
-        }
-    };
-
-    if !status.success() {
-        // Capture stderr for the error message — Python prints a
-        // JSON-shaped diagnostic on the CLI's error paths
+    if !out.status.success() {
+        // Python prints a JSON-shaped diagnostic on the CLI's error paths
         // (project_not_found, db_unreachable, apply_failed).
-        let mut stderr_text = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            stderr_text = String::from_utf8_lossy(&buf).into_owned();
-        }
         return Err(format!(
             "config_projection apply exited with {} (project_id={}): {}",
-            status, project_id, stderr_text.trim()
+            out.status,
+            project_id,
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
 

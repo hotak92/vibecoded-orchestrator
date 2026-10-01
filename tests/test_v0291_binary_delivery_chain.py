@@ -15,7 +15,8 @@ time. Two root causes made that reachable and then permanent:
 
 Each fix is unit-tested in Rust (``services::binary_freshness``'s reactor-free
 ``#[cfg(test)] mod tests``). What Rust unit tests CANNOT reach are the
-CALL-SITES: ``update_orchestrator`` is a Tauri command with a ``Window``
+CALL-SITES: ``run_orchestrator_update`` (v0.2.100's one update command; the
+retired ``update_orchestrator`` before it) is a Tauri command with a ``Window``
 parameter, and the boot/exit hooks live inside ``tauri::Builder``. Those are
 pinned here by source scan — the same discipline as
 ``test_v0290_no_bare_tokio_spawn_in_sync_fns.py``.

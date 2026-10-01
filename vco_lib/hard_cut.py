@@ -236,60 +236,26 @@ def hard_cut(
         return res
 
     # ---- Step 1: git bundle --all + verify (the safety net) -------------
-    backups_dir = vct_root / "backups"
-    try:
-        backups_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        res.aborted_before_reset = True
-        res.error = (
-            f"could not create backup dir {backups_dir} ({exc}); ABORTING "
-            "before any destructive step (§7.3.3)"
-        )
-        res.steps.append(f"ABORT: backup dir uncreatable ({exc})")
-        return res
+    # v0.2.100 F-W3-13: the create + verify + partial-cleanup sequence is
+    # vco_lib.git_bundle_backup's — the ONE home the launcher's ResetHard
+    # backup calls too.
+    from .git_bundle_backup import create_verified_bundle
 
+    backups_dir = vct_root / "backups"
     bundle_path = backups_dir / f"pre-hardcut-{stamp}.bundle"
     res.bundle_path = str(bundle_path)
-    try:
-        create = run(
-            ["git", "bundle", "create", str(bundle_path), "--all"],
-            cwd=str(clone_root), env=sub_env, timeout=_GIT_TIMEOUT,
-            capture_output=True, text=True,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        res.aborted_before_reset = True
-        res.error = f"git bundle create failed to run ({exc}); ABORTING (§7.3.3)"
-        res.steps.append(f"ABORT: git bundle create spawn error ({exc})")
-        return res
-    if create.returncode != 0:
+    saved = create_verified_bundle(
+        clone_root, backups_dir, bundle_path.name, ["--all"],
+        env=sub_env, run=run, timeout_s=_GIT_TIMEOUT,
+    )
+    res.steps.extend(saved.steps)
+    if not saved.ok:
         res.aborted_before_reset = True
         res.error = (
-            f"git bundle create exited rc={create.returncode}; ABORTING before "
-            "any destructive step (§7.3.3). The clone is untouched."
-        )
-        res.steps.append(f"ABORT: git bundle create rc={create.returncode}")
-        return res
-    res.steps.append(f"git bundle created at {bundle_path}")
-
-    try:
-        verify = run(
-            ["git", "bundle", "verify", str(bundle_path)],
-            cwd=str(clone_root), env=sub_env, timeout=_GIT_TIMEOUT,
-            capture_output=True, text=True,
-        )
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        res.aborted_before_reset = True
-        res.error = f"git bundle verify failed to run ({exc}); ABORTING (§7.3.3)"
-        res.steps.append(f"ABORT: git bundle verify spawn error ({exc})")
-        return res
-    if verify.returncode != 0:
-        res.aborted_before_reset = True
-        res.error = (
-            f"git bundle verify exited rc={verify.returncode}; the backup is "
-            "NOT trustworthy → ABORTING before any destructive step (§7.3.3). "
+            f"{saved.error} ABORTING before any destructive step (§7.3.3). "
             "The clone is untouched."
         )
-        res.steps.append(f"ABORT: git bundle verify rc={verify.returncode}")
+        res.steps.append(f"ABORT: backup bundle not saved ({saved.error})")
         return res
     res.bundle_verified = True
     res.steps.append("git bundle verified")

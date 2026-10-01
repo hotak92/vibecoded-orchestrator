@@ -1033,9 +1033,9 @@ pub async fn check_for_updates(path: String) -> Result<UpdateStatus, String> {
             // `.git/FETCH_HEAD.lock` (A-RC3). Was a hand-rolled `git fetch`
             // whose spawn error hard-`?`'d the whole command (a hidden A-RC4
             // trigger) — now a soft-fail into the health fields.
-            crate::commands::self_update::serialized_fetch_upstream(
+            crate::commands::upstream_fetch::serialized_fetch_upstream(
                 &p,
-                crate::commands::self_update::FetchPolicy::Quick,
+                crate::commands::upstream_fetch::FetchPolicy::Quick,
                 None,
             )
             .await
@@ -3373,7 +3373,7 @@ pub(crate) fn ensure_hub_stopped_for_update(install_path: &Path) -> Result<bool,
     let swept = crate::commands::update_gate::pre_update_hub_kill_sweep();
     if swept > 0 {
         tracing::warn!(
-            "[vct] update_orchestrator: hub-sweep backstop terminated {} stray vct-hub process(es) the lockfile path did not cover",
+            "[vct] run_orchestrator_update: hub-sweep backstop terminated {} stray vct-hub process(es) the lockfile path did not cover",
             swept
         );
     }
@@ -3389,7 +3389,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             tracing::warn!(
-                "[vct] update_orchestrator: no {} — vct-hub is not running, skipping stop",
+                "[vct] run_orchestrator_update: no {} — vct-hub is not running, skipping stop",
                 pid_file.display(),
             );
             return Ok(false);
@@ -3412,7 +3412,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             // Malformed lockfile — treat as "no hub running" and clean
             // up so install.py doesn't choke on it later.
             tracing::warn!(
-                "[vct] update_orchestrator: {} contains malformed PID {:?}; removing stale lockfile",
+                "[vct] run_orchestrator_update: {} contains malformed PID {:?}; removing stale lockfile",
                 pid_file.display(),
                 pid_raw.lines().next().unwrap_or("").trim(),
             );
@@ -3426,7 +3426,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         // post-update `--start-if-not-running` path doesn't think a
         // hub is already running.
         tracing::warn!(
-            "[vct] update_orchestrator: hub.pid claims pid {} but it's dead; removing stale lockfile",
+            "[vct] run_orchestrator_update: hub.pid claims pid {} but it's dead; removing stale lockfile",
             pid
         );
         let _ = std::fs::remove_file(&pid_file);
@@ -3434,7 +3434,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     }
 
     tracing::info!(
-        "[vct] update_orchestrator: vct-hub running (pid {}); requesting graceful stop",
+        "[vct] run_orchestrator_update: vct-hub running (pid {}); requesting graceful stop",
         pid
     );
 
@@ -3456,7 +3456,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             Ok(status) => {
                 if !status.success() {
                     tracing::warn!(
-                        "[vct] update_orchestrator: vct-hub --stop exited {:?}; will fall through to direct signal",
+                        "[vct] run_orchestrator_update: vct-hub --stop exited {:?}; will fall through to direct signal",
                         status.code()
                     );
                 }
@@ -3464,7 +3464,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             }
             Err(e) => {
                 tracing::warn!(
-                    "[vct] update_orchestrator: could not spawn vct-hub --stop ({}); falling through to direct signal",
+                    "[vct] run_orchestrator_update: could not spawn vct-hub --stop ({}); falling through to direct signal",
                     e
                 );
                 false
@@ -3472,7 +3472,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
         }
     } else {
         tracing::warn!(
-            "[vct] update_orchestrator: vct-hub binary not found on disk; \
+            "[vct] run_orchestrator_update: vct-hub binary not found on disk; \
              skipping polite --stop and going straight to direct signal"
         );
         false
@@ -3489,7 +3489,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
             // didn't, do it now).
             let _ = std::fs::remove_file(&pid_file);
             tracing::info!(
-                "[vct] update_orchestrator: vct-hub pid {} stopped gracefully",
+                "[vct] run_orchestrator_update: vct-hub pid {} stopped gracefully",
                 pid
             );
             return Ok(true);
@@ -3502,7 +3502,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     // even this fails — letting git pull continue with a live hub
     // would lock vct-hub.exe on Windows and corrupt the update.
     tracing::warn!(
-        "[vct] update_orchestrator: vct-hub pid {} did not exit within 10s (polite_attempted={}); escalating to force-kill",
+        "[vct] run_orchestrator_update: vct-hub pid {} did not exit within 10s (polite_attempted={}); escalating to force-kill",
         pid, polite_attempted
     );
 
@@ -3571,7 +3571,7 @@ fn stop_lockfile_hub_for_update(_install_path: &Path) -> Result<bool, String> {
     while std::time::Instant::now() < deadline2 {
         if !pid_is_alive(pid) {
             tracing::warn!(
-                "[vct] update_orchestrator: vct-hub pid {} force-killed; cleared stale {}",
+                "[vct] run_orchestrator_update: vct-hub pid {} force-killed; cleared stale {}",
                 pid,
                 pid_file.display()
             );
@@ -3641,7 +3641,7 @@ pub(crate) fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<Path
     match std::fs::rename(&hub_canon, &backup_path) {
         Ok(()) => {
             tracing::info!(
-                "[vct] update_orchestrator: pre-pull renamed vct-hub binary to {} (Windows). New binary will be written to {} by git pull.",
+                "[vct] run_orchestrator_update: pre-pull renamed vct-hub binary to {} (Windows). New binary will be written to {} by git pull.",
                 backup_path.display(),
                 hub_canon.display(),
             );
@@ -3649,7 +3649,7 @@ pub(crate) fn pre_pull_rename_vct_hub_binary(install_path: &Path) -> Option<Path
         }
         Err(e) => {
             tracing::warn!(
-                "[vct] update_orchestrator: pre-pull rename of vct-hub FAILED ({}). git pull may fail with ERROR_SHARING_VIOLATION if the hub binary is still locked. Continuing — the user will see any git error.",
+                "[vct] run_orchestrator_update: pre-pull rename of vct-hub FAILED ({}). git pull may fail with ERROR_SHARING_VIOLATION if the hub binary is still locked. Continuing — the user will see any git error.",
                 e,
             );
             None
@@ -3812,14 +3812,14 @@ fn start_found_hub_after_update(
 ) -> Result<(), String> {
     let Some(hub_bin) = hub_bin else {
         tracing::warn!(
-            "[vct] update_orchestrator: vct-hub binary not found on disk after install.py — \
+            "[vct] run_orchestrator_update: vct-hub binary not found on disk after install.py — \
              leaving hub stopped. Launcher restart will retry the discovery."
         );
         return Ok(());
     };
 
     tracing::info!(
-        "[vct] update_orchestrator: starting vct-hub from {}",
+        "[vct] run_orchestrator_update: starting vct-hub from {}",
         hub_bin.display()
     );
 
@@ -3837,7 +3837,7 @@ fn start_found_hub_after_update(
         Ok(status) if status.success() => {}
         Ok(status) => {
             tracing::warn!(
-                "[vct] update_orchestrator: vct-hub --start-if-not-running exited {:?}; \
+                "[vct] run_orchestrator_update: vct-hub --start-if-not-running exited {:?}; \
                  launcher will retry on next startup",
                 status.code()
             );
@@ -3845,7 +3845,7 @@ fn start_found_hub_after_update(
         }
         Err(e) => {
             tracing::warn!(
-                "[vct] update_orchestrator: could not spawn vct-hub --start-if-not-running: {}; \
+                "[vct] run_orchestrator_update: could not spawn vct-hub --start-if-not-running: {}; \
                  launcher will retry on next startup",
                 e
             );
@@ -3870,7 +3870,7 @@ fn start_found_hub_after_update(
     let root = vct_launcher_core::paths::vct_root_dir();
     if should_skip_redundant_health_poll(&root, ctx) {
         tracing::warn!(
-            "[vct] update_orchestrator: cutover sentinel absent (post-install) — install.py \
+            "[vct] run_orchestrator_update: cutover sentinel absent (post-install) — install.py \
              already validated /health; skipping redundant 30 s poll"
         );
         return Ok(());
@@ -3879,7 +3879,7 @@ fn start_found_hub_after_update(
     match ctx {
         HubRestartContext::PostInstall => {
             tracing::warn!(
-                "[vct] update_orchestrator: cutover sentinel still present at {} — \
+                "[vct] run_orchestrator_update: cutover sentinel still present at {} — \
                  install.py did not confirm /health; running full 30 s poll",
                 root.join(V0_2_21_CUTOVER_SENTINEL_NAME).display()
             );
@@ -4325,19 +4325,19 @@ impl<R: Runtime> DbUpdateClosedGuard<R> {
         if let Some(db) = app.try_state::<crate::db::Db>() {
             if let Err(e) = db.close_for_update() {
                 tracing::warn!(
-                    "[vct] update_orchestrator: close_for_update failed ({}); \
+                    "[vct] run_orchestrator_update: close_for_update failed ({}); \
                      proceeding (install.py may contend for the launcher.db lock)",
                     e
                 );
             } else {
                 tracing::info!(
-                    "[vct] update_orchestrator: launcher.db connection closed for the \
+                    "[vct] run_orchestrator_update: launcher.db connection closed for the \
                      install.py window (writer lock released)"
                 );
             }
         } else {
             tracing::info!(
-                "[vct] update_orchestrator: no managed Db state — nothing to close"
+                "[vct] run_orchestrator_update: no managed Db state — nothing to close"
             );
         }
         Self { app, armed: true }
@@ -4351,16 +4351,16 @@ impl<R: Runtime> DbUpdateClosedGuard<R> {
         }
         self.armed = false;
         let Some(db) = self.app.try_state::<crate::db::Db>() else {
-            tracing::info!("[vct] update_orchestrator: no managed Db state to reopen");
+            tracing::info!("[vct] run_orchestrator_update: no managed Db state to reopen");
             return;
         };
         match db.reopen_after_update() {
             Ok(()) => {
-                tracing::info!("[vct] update_orchestrator: launcher.db connection reopened");
+                tracing::info!("[vct] run_orchestrator_update: launcher.db connection reopened");
             }
             Err(e) => {
                 tracing::error!(
-                    "[vct] update_orchestrator: FATAL — could not reopen launcher.db \
+                    "[vct] run_orchestrator_update: FATAL — could not reopen launcher.db \
                      after update ({}); forcing restart so the launcher does not run \
                      on a dead in-memory DB",
                     e
@@ -5167,7 +5167,7 @@ pub(crate) fn write_autostash_pop_conflict_deferral(
         crate::services::deferral::emit_deferral_entry(install_path, install_path, &fields)
     {
         tracing::warn!(
-            "[vct] update_orchestrator: could not emit autostash_pop_conflict deferral \
+            "[vct] run_orchestrator_update: could not emit autostash_pop_conflict deferral \
              (non-fatal): {}",
             e,
         );
@@ -7005,9 +7005,9 @@ pub(crate) async fn claim_then_resolve_collision_files(
     // The tip may be stale if no recent fetch; a Quick fetch keeps the
     // byte-identity comparison honest. Best-effort — a fetch failure just means
     // we treat more files as divergent (back them up), which is the safe side.
-    let _ = crate::commands::self_update::serialized_fetch_upstream(
+    let _ = crate::commands::upstream_fetch::serialized_fetch_upstream(
         install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&branch),
     )
     .await;
@@ -15184,7 +15184,8 @@ MemAvailable:   23456789 kB
 
         // -------------------------------------------------------------------
         // v0.2.95 ship-gate MAJOR-3 / MINOR-4 — the orchestrator-clone claim
-        // on the abort surface, and the abort force_resync now owes.
+        // on the abort surface, and the abort the ResetHard update kind now owes
+        // (the retired `force_resync_launcher` used to).
         //
         // These are BEHAVIOURAL, against real git: the source-scan gate in
         // `tests/test_v0291_update_single_flight_wiring.py` answers "does the
@@ -15382,7 +15383,8 @@ MemAvailable:   23456789 kB
                  is no longer needed",
             );
 
-            // THE FIX: the helper force_resync now runs BEFORE the reset.
+            // THE FIX: the helper the ResetHard update kind (update_run::reset_hard_git_op)
+            // calls now runs BEFORE the reset.
             abort_merge_or_rebase_unclaimed(&local)
                 .await
                 .expect("the abort helper must conclude the rebase");

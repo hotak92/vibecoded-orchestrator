@@ -239,7 +239,7 @@ describe('recovery modals render the routed failure (modalFailure, W3-FIX)', () 
   // The autostash-pop and untracked-collision modals' commands continue the
   // update through the one pipeline, so they reject with THIS contract. Every
   // producer row must render once and unprefixed — never the raw JSON blob.
-  for (const self of ['autostashPop', 'untrackedCollision'] as const) {
+  for (const self of ['autostashPop', 'untrackedCollision', 'conflict'] as const) {
     it(`${self}: every failure row renders "<label>: <message>" once`, () => {
       for (const row of FIXTURE.surface_errors) {
         if (ROUTE_FOR_KIND[row.json.kind as string] !== 'failed') continue;

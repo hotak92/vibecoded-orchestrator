@@ -11,8 +11,9 @@ Covers the two halves of the feature:
 * **V52-B (one-click buttons)** — two new Tauri commands
   (`keep_local_and_continue_update` / `accept_upstream_and_continue_update`)
   plus matching Svelte buttons with user-locked tooltip text. The buttons
-  call into the existing v0.2.51 `resume_orchestrator_update` machinery
-  after running `git checkout --ours / --theirs` + commit/continue.
+  run `git checkout --ours / --theirs` + commit/continue, then hand over to the
+  one update pipeline's `Resume` kind (v0.2.100; the v0.2.51
+  `resume_orchestrator_update` command it replaced is retired).
 
 Why a Python smoke test for Rust + Svelte content? Cross-language drift.
 The Rust unit tests in installer.rs cover the Tauri command logic; the

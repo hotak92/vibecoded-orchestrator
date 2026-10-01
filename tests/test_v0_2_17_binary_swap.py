@@ -109,7 +109,8 @@ class TestRunningStaleDeferral:
         _write_vct_module(fake_install, "0.2.17")
         _write_manifest(fake_install, "0.2.16")
         dist_path = _write_fake_dist_binary(fake_install)
-        # Pretend we're invoked from the launcher's update_orchestrator
+        # Pretend we're invoked from the launcher's update pipeline
+        # (run_orchestrator_update)
         monkeypatch.setenv("VCT_LAUNCHER_PID", "12345")
         # Don't set VCT_AUTO_RESTART_LAUNCHER — emit IS expected
         monkeypatch.delenv("VCT_AUTO_RESTART_LAUNCHER", raising=False)
@@ -260,7 +261,8 @@ class TestWrapperRoutingStaleSrc:
         # The stale cargo artifact that used to deflect the routing.
         stale_src = self._write_stale_cargo_src(fake_install)
         assert stale_src.is_file()  # sanity
-        # Pretend we're invoked from the launcher's update_orchestrator
+        # Pretend we're invoked from the launcher's update pipeline
+        # (run_orchestrator_update)
         monkeypatch.setenv("VCT_LAUNCHER_PID", "12345")
         monkeypatch.delenv("VCT_AUTO_RESTART_LAUNCHER", raising=False)
         monkeypatch.delenv("VCT_FORCE_RESTART_DEFERRAL", raising=False)

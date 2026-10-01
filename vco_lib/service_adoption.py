@@ -98,6 +98,7 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import containers as _containers
 from vco_lib import compose_env as _compose_env
+from vco_lib import compose_mounts as _compose_mounts
 from vco_lib import compose_provider as _compose_provider
 from vco_lib import compose_recovery as _compose_recovery
 from vco_lib.atomic import atomic_write_text
@@ -621,78 +622,45 @@ class ServicePlan:
         return not self.reason
 
 
-#: A compose short-form mount is ``source:target[:opts]``, and on Windows the
-#: source carries its own colon: ``C:\\volumes\\ollama:/root/.ollama:Z``. A bare
-#: ``split(":")`` severs the drive letter and yields source ``"C"`` with the
-#: rest of the path as the TARGET — so the installer compares a mount that
-#: does not exist and reports a spurious drift on every Windows install.
-_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _split_mount_entry(entry: str) -> list[str]:
-    """Split ``source:target[:opts]`` without severing a Windows drive letter."""
-    parts = entry.split(":")
-    # Re-join a drive letter ONLY when doing so still leaves an absolute
-    # container target. That is what separates a Windows bind from a
-    # one-character VOLUME name: `C:\\vol:/data` has a target after the join
-    # (`/data`), while `v:/data` does not — it is volume `v` mounted at
-    # `/data`, and joining it would invent the target `.ollama` from the
-    # tail of the host path.
-    if (
-        len(parts) >= 3
-        and len(parts[0]) == 1
-        and parts[0].isalpha()
-        and parts[1][:1] in ("\\", "/")
-        and parts[2][:1] == "/"
-    ):
-        parts = [f"{parts[0]}:{parts[1]}", *parts[2:]]
-    return parts
-
-
-def _is_bind_source(source: str) -> bool:
-    """Is this mount source a HOST PATH rather than a named volume?
-
-    POSIX absolute (``/``), home-relative (``~``) and project-relative
-    (``.``) — plus a Windows drive path, which is what every bind on that
-    platform looks like. Without the last case a real Windows bind is
-    classified as a named VOLUME, and the adoption check then looks it up in
-    the top-level ``volumes:`` mapping, finds nothing, and treats the
-    service as unadoptable for a reason that is not true.
-    """
-    return source.startswith(("/", "~", ".")) or bool(_WINDOWS_DRIVE_RE.match(source))
+# The entry shapes (short syntax with Windows drive letters, long syntax) and
+# the top-level volume-name rule live in ONE parser, vco_lib.compose_mounts
+# (v0.2.100 F-W2-13 / F-W3-10); this module keeps only the adoption's policy.
+_split_mount_entry = _compose_mounts.split_mount_entry
+_is_bind_source = _compose_mounts.is_bind_source
 
 
 def config_mounts(service_cfg: dict, top_volumes: dict) -> dict[str, MountSpec]:
-    """The installer-side mounts for one service, by destination.  Resolves
-    named volume keys through the top-level ``volumes:`` mapping (explicit
-    ``name:`` wins — the base file pins all three)."""
+    """The installer-side mounts for one service, by destination, read
+    through :func:`vco_lib.compose_mounts.parse_mount_entry` (the one parser
+    :func:`vco_lib.data_identity.render_mount` also uses).
+
+    Lenient where the adoption gate can afford it: an entry this parser
+    cannot read, or an anonymous one, is skipped — the gate then sees that
+    destination as absent from the config and refuses any live mount there
+    (``_mount_problems``: "lost by the reconciled config"). A named volume
+    resolves through :func:`vco_lib.compose_mounts.volume_real_name` (explicit
+    ``name:``/``external`` wins — the base file pins all three); a key whose
+    real name the Python merge cannot derive (no ``name:``, project not known
+    here) stays the bare key."""
     out: dict[str, MountSpec] = {}
     entries = service_cfg.get("volumes") or []
     if isinstance(entries, str):
         entries = [entries]
-    for entry in entries:
-        kind, source, dest, opts = "volume", "", "", ""
-        if isinstance(entry, str):
-            parts = _split_mount_entry(entry)
-            if len(parts) >= 2:
-                source, dest = parts[0], parts[1]
-                opts = parts[2] if len(parts) > 2 else ""
-                kind = "bind" if _is_bind_source(source) else "volume"
-        elif isinstance(entry, dict):
-            kind = str(entry.get("type", "volume") or "volume")
-            source = str(entry.get("source", "") or "")
-            dest = str(entry.get("target", "") or "")
-            ro = entry.get("read_only")
-            opts = "ro" if ro else ""
-        else:
+    for i, raw in enumerate(entries):
+        where = f"volumes[{i}]"
+        try:
+            entry = _compose_mounts.parse_mount_entry(raw, where)
+        except _compose_mounts.MountShapeError:
             continue
-        if not source or not dest:
+        if entry is None or not entry.source or not entry.target:
             continue
+        kind, source = entry.kind or "volume", entry.source
         if kind == "volume":
-            spec = (top_volumes.get(source) or {}) if isinstance(top_volumes, dict) else {}
-            if isinstance(spec, dict):
-                source = str(spec.get("name") or source)
-        out[dest] = MountSpec(kind, source, dest, opts)
+            try:
+                source = _compose_mounts.volume_real_name(top_volumes, source, where, None)
+            except _compose_mounts.MountShapeError:
+                pass
+        out[entry.target] = MountSpec(kind, source, entry.target, entry.options)
     return out
 
 

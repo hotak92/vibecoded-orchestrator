@@ -49,13 +49,36 @@ if [ -z "${PY:-}" ]; then
     # any URL, and a security guard that cannot run fails CLOSED: the tool
     # name is read from the payload by pattern (no JSON parser needed) and
     # every WebFetch is blocked with the fix named.
-    if grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"WebFetch"'; then
+    _NOPY_STDIN="$(cat 2>/dev/null || true)"
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"WebFetch"'; then
         {
             echo "🔒 SSRF guard: no Python interpreter was found, so WebFetch cannot be checked and is blocked."
             echo "   This is a broken VCO install: put Python 3 on PATH (or re-run the orchestrator's install / update,"
             echo "   which provides the VCO venv), then retry."
         } >&2
         exit 2
+    fi
+    # v0.2.100 WP-17: the Bash security scans (the injection regexes read the
+    # parsed command; .claude/scripts/bash_security.py IS Python) cannot run
+    # either — say so instead of skipping in silence. stderr every time (for
+    # the human); once per session (sentinel under .claude/state) a static
+    # additionalContext envelope so the MODEL can tell the user (PreToolUse
+    # stderr on exit 0 never reaches it). Non-blocking: blocking every Bash
+    # call would make a Python-less machine unusable, and the notice names the
+    # fix. MUST MATCH pre-tool-use.ps1's Write-VcoNoPythonNotice.
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"Bash"'; then
+        _NOPY_MSG="[VCO broken install] The Bash security scans (shell-injection guard + .claude/scripts/bash_security.py) did NOT run: no Python interpreter was found (python3 / python / py on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (python install.py --update in the orchestrator root, or the launcher's Update), then retry."
+        echo "$_NOPY_MSG" >&2
+        _NOPY_SID="$(printf '%s' "$_NOPY_STDIN" | grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_-]+"' | head -n 1 | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/')"
+        [ -n "$_NOPY_SID" ] || _NOPY_SID="default"
+        _NOPY_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+        _NOPY_SENTINEL="$_NOPY_ROOT/.claude/state/no_python_notice_$_NOPY_SID"
+        if [ ! -e "$_NOPY_SENTINEL" ]; then
+            mkdir -p "$_NOPY_ROOT/.claude/state" 2>/dev/null && : > "$_NOPY_SENTINEL" 2>/dev/null
+            # The message is a fixed ASCII literal with no quote or backslash,
+            # so it is embedded in the JSON as-is (no encoder available here).
+            printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "additionalContext": "%s"}}\n' "$_NOPY_MSG"
+        fi
     fi
     exit 0
 fi

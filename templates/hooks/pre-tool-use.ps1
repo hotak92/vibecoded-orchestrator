@@ -163,15 +163,41 @@ try {
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
+# v0.2.100 WP-17: read a tool_input field NATIVELY from the payload the
+# ConvertFrom-Json above already decoded. The old Get-Field piped $ToolArgs
+# through a `python -c` child, so with no Python on PATH it returned "" and
+# every branch reading a field -- the Bash shell-injection scan above all --
+# was silently skipped on Windows (and under Windows PowerShell 5.1 the pipe's
+# ASCII $OutputEncoding turned non-ASCII into `?`). No interpreter is needed
+# to read a decoded object. MUST MATCH pre-tool-use.sh's `_get_field` (a
+# missing / null field is "", a value is its string form, trimmed).
 function Get-Field([string]$field) {
-    if (-not $PY) { return "" }
-    if (-not $ToolArgs) { return "" }
+    if (-not $payload -or -not $payload.tool_input) { return "" }
     try {
-        $code = "import sys, json`ntry:`n    d = json.loads(sys.stdin.read())`n    print(d.get('$field', ''))`nexcept Exception:`n    print('')"
-        $result = $ToolArgs | & $PY -c $code 2>$null
-        if ($result) { return $result.Trim() }
+        $value = $payload.tool_input.$field
+        if ($null -eq $value) { return "" }
+        return ([string]$value).Trim()
     } catch { }
     return ""
+}
+
+# v0.2.100 WP-17: the ONE place a branch that genuinely needs Python says so,
+# loudly, instead of skipping itself. Every time it goes to stderr for the
+# human; once per session (a sentinel under .claude/state) it is queued in
+# $script:VcoModelNotice, which the hook emits as its ONE additionalContext
+# envelope where the Bash branch exits (Section 5's tool gate) -- PreToolUse
+# stderr on exit 0 is not shown to the model, and a second envelope on stdout
+# would break the hook's JSON contract.
+# MUST MATCH pre-tool-use.sh's _vco_report_no_python.
+$script:VcoModelNotice = ""
+function Write-VcoNoPythonNotice([string]$what) {
+    $msg = "[VCO broken install] $what did NOT run: no Python interpreter was found (python / py / python3 on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (``python install.py --update`` in the orchestrator root, or the launcher's Update), then retry."
+    [Console]::Error.WriteLine($msg)
+    $key = if ($SessionIdRaw) { $SessionIdRaw } else { "default" }
+    $sentinel = Join-Path $SessionStateDir "no_python_notice_$key"
+    if (Test-Path -LiteralPath $sentinel) { return }
+    try { Set-Content -LiteralPath $sentinel -Value "" -ErrorAction Stop } catch { }
+    $script:VcoModelNotice = $msg
 }
 
 function Write-SecurityLine([string]$json) {
@@ -258,8 +284,13 @@ if ($ToolName -eq "Bash") {
         exit 2
     }
 
-    # Extended security scan via bash_security.py if available.
+    # Extended security scan via bash_security.py if available. It is Python,
+    # so with no interpreter it cannot run -- and says so (v0.2.100 WP-17)
+    # instead of being skipped in silence. The regex scan above already ran.
     $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+    if ((Test-Path $SecurityScript) -and -not $PY) {
+        Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
+    }
     if ((Test-Path $SecurityScript) -and $PY) {
         try {
             $secOut = $cmd | & $PY $SecurityScript 2>&1
@@ -438,7 +469,14 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 }
 
 # === 5. KG SEARCH SUGGESTION (Edit/Write only) ===
-if ($ToolName -ne "Edit" -and $ToolName -ne "Write") { exit 0 }
+if ($ToolName -ne "Edit" -and $ToolName -ne "Write") {
+    # v0.2.100 WP-17: the Bash branch's queued broken-install notice leaves
+    # in this tool call's one envelope.
+    if ($script:VcoModelNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+        Emit-AdditionalContext $script:VcoModelNotice 'PreToolUse'
+    }
+    exit 0
+}
 
 # WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
 # regex scanned out of $UserMessage (populated from the hook payload's

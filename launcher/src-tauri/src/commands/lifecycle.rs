@@ -130,24 +130,73 @@ fn find_stack_wrapper() -> Option<PathBuf> {
 /// means "nothing to do", so this file never calls the wrapper with one.
 pub const ENV_COMPOSE_SERVICES: &str = "VCO_COMPOSE_SERVICES";
 
+/// `launch-claude-mcp-stack`'s exit status for "the data-identity guard
+/// refused some service(s) — nothing removed; the cleared ones were
+/// composed". MUST MATCH `scripts/launch-claude-mcp-stack.{sh,ps1}` (exit 6 /
+/// `return 6`) and the boot unit's `SuccessExitStatus`
+/// (`templates/systemd/claude-mcp-containers.service.template`).
+pub(crate) const WRAPPER_GUARD_REFUSED_EXIT: i32 = 6;
+
+/// How one wrapper run ended (W4R-10).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum WrapperRun {
+    /// Composed everything it was asked to.
+    Composed,
+    /// The wrapper's own guard refused `refused` (named from its log line);
+    /// the rest were composed. Final: the refusal is already evaluated and
+    /// ledgered — running the guarded verb again would evaluate it twice.
+    GuardRefused { refused: Vec<String>, output: String },
+    /// Anything else (spawn failure, compose failure, the guard could not
+    /// run): the caller may fall back to the guarded verb.
+    Failed(String),
+}
+
+/// Classify a finished wrapper run. Pure.
+pub(crate) fn classify_wrapper_exit(
+    subcommand: &str,
+    code: Option<i32>,
+    status_text: &str,
+    stdout: &str,
+    stderr: &str,
+) -> WrapperRun {
+    match code {
+        Some(0) => WrapperRun::Composed,
+        Some(WRAPPER_GUARD_REFUSED_EXIT) => {
+            // Both wrappers log `the data-identity guard refused: <names> (left …`.
+            let refused = stdout
+                .lines()
+                .chain(stderr.lines())
+                .find_map(|l| l.split_once("the data-identity guard refused:"))
+                .map(|(_, rest)| {
+                    rest.split(" (").next().unwrap_or("").split_whitespace().map(str::to_string).collect()
+                })
+                .unwrap_or_default();
+            WrapperRun::GuardRefused { refused, output: stdout.trim().to_string() }
+        }
+        _ => WrapperRun::Failed(format!(
+            "launch-claude-mcp-stack {} failed (status {}): {}",
+            subcommand,
+            status_text,
+            stderr.trim()
+        )),
+    }
+}
+
 /// Run the wrapper for `services` (never empty — the caller checks).
 ///
 /// Cross-OS: `bash <script> <subcommand>` on Linux/macOS (no reliance on the
 /// exec bit); `powershell -NoProfile -ExecutionPolicy Bypass -File <script>
 /// <subcommand>` on Windows (matches the Scheduled Task template).
-async fn run_stack_wrapper(subcommand: &str, services: &[&str]) -> Result<(), String> {
-    let wrapper = find_stack_wrapper()
-        .ok_or_else(|| "launch-claude-mcp-stack wrapper not found at <install>/scripts/".to_string())?;
+async fn run_stack_wrapper(subcommand: &str, services: &[&str]) -> WrapperRun {
+    let Some(wrapper) = find_stack_wrapper() else {
+        return WrapperRun::Failed("launch-claude-mcp-stack wrapper not found at <install>/scripts/".to_string());
+    };
     let mut cmd = if cfg!(target_os = "windows") {
+        let Some(path) = wrapper.to_str() else {
+            return WrapperRun::Failed("non-UTF8 wrapper path".to_string());
+        };
         let mut c = tokio::process::Command::new("powershell").silent();
-        c.args([
-            "-NoProfile",
-            "-ExecutionPolicy",
-            "Bypass",
-            "-File",
-            wrapper.to_str().ok_or("non-UTF8 wrapper path")?,
-            subcommand,
-        ]);
+        c.args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File", path, subcommand]);
         c
     } else {
         let mut c = tokio::process::Command::new("bash").silent();
@@ -158,19 +207,25 @@ async fn run_stack_wrapper(subcommand: &str, services: &[&str]) -> Result<(), St
     if let Ok(root) = crate::commands::installer::find_local_repo_root() {
         cmd.current_dir(root);
     }
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("spawn launch-claude-mcp-stack wrapper: {}", e))?;
-    if !output.status.success() {
-        return Err(format!(
-            "launch-claude-mcp-stack {} failed (status {}): {}",
+    match cmd.output().await {
+        Err(e) => WrapperRun::Failed(format!("spawn launch-claude-mcp-stack wrapper: {}", e)),
+        Ok(output) => classify_wrapper_exit(
             subcommand,
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
+            output.status.code(),
+            &output.status.to_string(),
+            &String::from_utf8_lossy(&output.stdout),
+            &String::from_utf8_lossy(&output.stderr),
+        ),
     }
-    Ok(())
+}
+
+/// `Err` naming what the WRAPPER's own guard refused (W4R-10).
+fn wrapper_refusal_error(refused: &[String], output: &str) -> Result<(), String> {
+    let names = if refused.is_empty() { "some service(s)".to_string() } else { refused.join(", ") };
+    Err(format!(
+        "not started — the data-identity guard refused {} (nothing was removed): {}",
+        names, output
+    ))
 }
 
 /// The runtime as a [`ContainerRunner`] (the ownership module's reads,
@@ -226,8 +281,11 @@ async fn start_managed_guarded(
     let wrapper = prefer_wrapper && find_stack_wrapper().is_some();
     if wrapper && recreate.is_empty() {
         match run_stack_wrapper("start", services).await {
-            Ok(()) => return Ok(()),
-            Err(e) => tracing::warn!(
+            WrapperRun::Composed => return Ok(()),
+            // The wrapper's guard already decided (and ledgered) the refusal:
+            // no second guarded pass over the same services (W4R-10).
+            WrapperRun::GuardRefused { refused, output } => return wrapper_refusal_error(&refused, &output),
+            WrapperRun::Failed(e) => tracing::warn!(
                 "[lifecycle] launch-claude-mcp-stack start failed, retrying through the guarded verb: {}",
                 e
             ),
@@ -236,7 +294,11 @@ async fn start_managed_guarded(
         let reply = guarded_up(&python, &root, &start_request(&infra, runtime, services, recreate, build, true)).await?;
         let cleared: Vec<&str> = reply.cleared.iter().map(String::as_str).collect();
         if !cleared.is_empty() {
-            run_stack_wrapper("start", &cleared).await?;
+            match run_stack_wrapper("start", &cleared).await {
+                WrapperRun::Composed => {}
+                WrapperRun::GuardRefused { refused, output } => return wrapper_refusal_error(&refused, &output),
+                WrapperRun::Failed(e) => return Err(e),
+            }
         }
         return refusal_error(&reply);
     }
@@ -342,11 +404,66 @@ pub(crate) fn stop_incomplete_entry(runtime_bin: &str, containers: &[String], fa
     (detected, command)
 }
 
+/// W4R-04: the by-name lifecycle actions — quit-and-stop, a single service's
+/// stop / restart, a zombie's `start` when the container is not provably
+/// VCO's — act on the ROW's container name; the container's own compose
+/// labels are NOT consulted to decide (the user asked for exactly this
+/// container; none of these removes or re-creates anything). The label
+/// verdict (AD-5's predicate, the watchdog's rule) is read and LOGGED once
+/// per action so a foreign-labelled container stopped or restarted by name
+/// is visible in the log. Returns `(warn, line)`: `warn` for a container the
+/// labels do not prove VCO's. Pure.
+pub(crate) fn label_verdict_line(action: &str, container: &str, own: &Ownership) -> (bool, String) {
+    let tail = match own {
+        Ownership::Owned => "its compose labels say it is VCO's".to_string(),
+        Ownership::Foreign { why } => format!("its compose labels say it is NOT VCO's: it {why}"),
+        Ownership::Unknown { why } => format!("its ownership could not be read ({why})"),
+    };
+    (
+        !matches!(own, Ownership::Owned),
+        format!("{action} {container} by the row's name (labels not consulted to decide); {tail}"),
+    )
+}
+
+/// Read `container`'s label verdict and log it for `action` (see
+/// [`label_verdict_line`]). Returns the verdict. Best-effort: an unreadable
+/// container is logged as such, never an error.
+async fn log_label_verdict<R: ContainerRunner>(
+    runner: &R,
+    row: Option<&ServiceEndpointRow>,
+    action: &str,
+    container: &str,
+) -> Ownership {
+    let identity = read_identity(runner, container).await;
+    let installer_project = compose_dir().ok().and_then(|d| installer_compose_project(&d));
+    let own = ownership(row, &identity, installer_project.as_deref());
+    let (warn, line) = label_verdict_line(action, container, &own);
+    if warn {
+        tracing::warn!("[lifecycle] {}", line);
+    } else {
+        tracing::info!("[lifecycle] {}", line);
+    }
+    own
+}
+
 /// Keep `services_stop_incomplete` true (paired-resolution: this function is
 /// the site its registry row names) — written when a stop could not be
 /// verified, resolved when a quit-and-stop verified every stop or the
 /// services were deliberately started again. Best-effort.
-fn record_stop_outcome(runtime_bin: &str, containers: &[String], failures: &[String]) {
+///
+/// The record spawns a bounded Python payload (W4R-05 / F-W4-05: the bridge's
+/// `DEFERRAL_PAYLOAD_TIMEOUT`), on the blocking pool — the quit path awaits
+/// this and must never be parked behind a hung interpreter.
+async fn record_stop_outcome(runtime_bin: &str, containers: &[String], failures: &[String]) {
+    let (runtime_bin, containers, failures) = (runtime_bin.to_string(), containers.to_vec(), failures.to_vec());
+    if let Err(e) =
+        tokio::task::spawn_blocking(move || record_stop_outcome_blocking(&runtime_bin, &containers, &failures)).await
+    {
+        tracing::warn!("[lifecycle] services_stop_incomplete record task failed: {}", e);
+    }
+}
+
+fn record_stop_outcome_blocking(runtime_bin: &str, containers: &[String], failures: &[String]) {
     let Ok(root) = crate::commands::installer::find_local_repo_root() else { return };
     let result = if failures.is_empty() {
         crate::services::deferral::resolve_deferral_conditions(&root, &root, &["services_stop_incomplete"])
@@ -374,7 +491,8 @@ fn record_stop_outcome(runtime_bin: &str, containers: &[String], failures: &[Str
 /// Stop or restart ONE compose-managed service BY ITS CONTAINER NAME — no
 /// compose invocation for a stop. A restart of a container that does not
 /// exist yet creates it (guarded). A stop of a missing container is a no-op;
-/// an unreadable one is an error.
+/// an unreadable one is an error. By the row's name: the container's labels
+/// are not consulted to decide, only logged ([`label_verdict_line`], W4R-04).
 async fn stop_or_restart_managed(info: &RuntimeInfo, service: CoreService, action: &str) -> Result<(), String> {
     let row = machine_row_from_disk(service);
     let container = lifecycle_container(service, row.as_ref()).unwrap_or_else(|| {
@@ -383,10 +501,14 @@ async fn stop_or_restart_managed(info: &RuntimeInfo, service: CoreService, actio
     validate_container_name(&container)?;
     let runner = runner_for(info);
     if action == "stop" {
+        log_label_verdict(&runner, row.as_ref(), action, &container).await;
         return stop_verified(&runner, &container).await;
     }
     match container_presence(&runner, &container).await {
-        Presence::Exists => control_container(info, &container, action).await,
+        Presence::Exists => {
+            log_label_verdict(&runner, row.as_ref(), action, &container).await;
+            control_container(info, &container, action).await
+        }
         Presence::Missing if action == "restart" => {
             start_managed_guarded(info, &[service.name()], &[], service == CoreService::CodeEmbed, false).await
         }
@@ -501,8 +623,9 @@ pub async fn services_status() -> Result<ServicesRuntimeSnapshot, String> {
 ///     is VCO's — removed only after the data-identity guard of
 ///     `service_lifecycle up --recreate` passed, then THIS service is brought
 ///     back up (the wrapper — CDI-wait preserved — else the guarded verb).
-///     A container whose labels name another project is only started by
-///     name, never removed.
+///     A container whose labels name another project (or cannot be read)
+///     is only started BY THE ROW'S NAME, never removed — the labels gate
+///     the removal, not the start; the verdict is logged (W4R-04).
 ///   * `adopted_container`, or NO row yet (ownership unknown) — NEVER
 ///     removed: a `rm` would let compose recreate the service on VCO's
 ///     default (empty) data volume. VCO only tries `<runtime> start <name>`;
@@ -530,7 +653,16 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
             match zombie_action_given(row.as_ref(), &own) {
                 // Removed ONLY after its data guard passed, then re-created.
                 ZombieAction::Recreate => start_managed_guarded(&info, &[svc], &[svc], false, true).await,
-                _ => control_container(&info, &container, "start").await.map_err(|e| {
+                _ => {
+                    // By name (W4R-04): logged with the verdict that kept
+                    // it from a recreate.
+                    let (warn, line) = label_verdict_line("start (zombie recovery)", &container, &own);
+                    if warn {
+                        tracing::warn!("[lifecycle] {}", line);
+                    } else {
+                        tracing::info!("[lifecycle] {}", line);
+                    }
+                    control_container(&info, &container, "start").await.map_err(|e| {
                     let why = match &own {
                         Ownership::Foreign { why } | Ownership::Unknown { why } => why.clone(),
                         Ownership::Owned => String::new(),
@@ -540,7 +672,8 @@ pub async fn recover_zombie(name: String) -> Result<(), String> {
                          keeping its data mount)",
                         e, container, why
                     )
-                }),
+                    })
+                }
             }
         }
         LifecycleRoute::Container { name: container } => {
@@ -596,7 +729,7 @@ pub async fn services_start_all() -> Result<(), String> {
     if errors.is_empty() {
         // The services were deliberately started again: a pending "could
         // not verify the stop" record no longer describes the machine.
-        record_stop_outcome(info.runtime.binary(), &[], &[]);
+        record_stop_outcome(info.runtime.binary(), &[], &[]).await;
         Ok(())
     } else {
         Err(errors.join("; "))
@@ -604,8 +737,14 @@ pub async fn services_start_all() -> Result<(), String> {
 }
 
 /// Stop VCO's compose-managed services WITHOUT removing anything. Adopted
-/// containers belong to someone else and keep running. Used by
-/// Quit-confirmation's "Quit and stop services".
+/// ROWS (an adopted container or URL) belong to someone else and keep
+/// running. Used by Quit-confirmation's "Quit and stop services".
+///
+/// By the row's name (W4R-04): every `vco_managed` row's container is
+/// stopped whatever its compose labels say — a container another project
+/// created under a VCO-managed row's name is stopped too (and the watchdog,
+/// paused for it, leaves it stopped). The label verdict is logged per
+/// container, so such a stop is visible in the log; nothing is removed.
 ///
 /// v0.2.100 (WP-06, L2-F09): the watchdog pause markers are written FIRST
 /// for every service (intent before action, so the hub never restarts a
@@ -627,9 +766,16 @@ pub async fn services_stop_all() -> Result<(), String> {
             Some((service.name(), container))
         })
         .collect();
-    let failures = stop_all_verified(&runner_for(&info), &targets).await;
+    let runner = runner_for(&info);
+    for (svc, container) in &targets {
+        let row = CoreService::from_name(svc)
+            .and_then(|service| rows.iter().find(|(s, _)| *s == service))
+            .and_then(|(_, r)| r.as_ref());
+        log_label_verdict(&runner, row, "stop (quit)", container).await;
+    }
+    let failures = stop_all_verified(&runner, &targets).await;
     let containers: Vec<String> = targets.iter().map(|(_, c)| c.clone()).collect();
-    record_stop_outcome(info.runtime.binary(), &containers, &failures);
+    record_stop_outcome(info.runtime.binary(), &containers, &failures).await;
     if failures.is_empty() {
         Ok(())
     } else {
@@ -1330,6 +1476,76 @@ mod services_lifecycle_tests {
         ));
         assert!(argv.windows(2).any(|w| w == ["--recreate", "ollama"]));
         assert!(argv.iter().any(|a| a == "--guard-only"));
+    }
+
+    // ----- v0.2.100 W4R-10: wrapper exit 6 is the guard's refusal -----
+
+    #[test]
+    fn wrapper_exit_6_is_the_guards_refusal_and_names_the_services() {
+        let out = "2026-10-01T00:00:00Z [launch-claude-mcp-stack] the data-identity guard refused: ollama code_embed (left exactly as it is; see UPDATE_DEFERRED.md)\n";
+        match classify_wrapper_exit("start", Some(6), "exit status: 6", out, "") {
+            WrapperRun::GuardRefused { refused, .. } => assert_eq!(refused, vec!["ollama", "code_embed"]),
+            other => panic!("exit 6 must be the refusal, got {other:?}"),
+        }
+        let err = wrapper_refusal_error(&["ollama".into()], "x").unwrap_err();
+        assert!(err.contains("refused ollama") && err.contains("nothing was removed"), "{err}");
+    }
+
+    #[test]
+    fn other_wrapper_exits_are_not_a_refusal() {
+        assert_eq!(classify_wrapper_exit("start", Some(0), "exit status: 0", "", ""), WrapperRun::Composed);
+        for code in [Some(1), Some(5), Some(125), None] {
+            assert!(
+                matches!(classify_wrapper_exit("start", code, "x", "", "boom"), WrapperRun::Failed(ref e) if e.contains("boom")),
+                "{code:?}"
+            );
+        }
+    }
+
+    /// The constant, the wrappers and the boot unit agree on exit 6.
+    #[test]
+    fn exit_6_is_the_same_number_everywhere() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let sh = std::fs::read_to_string(root.join("scripts/launch-claude-mcp-stack.sh")).unwrap();
+        let ps1 = std::fs::read_to_string(root.join("scripts/launch-claude-mcp-stack.ps1")).unwrap();
+        let unit = std::fs::read_to_string(root.join("templates/systemd/claude-mcp-containers.service.template")).unwrap();
+        assert_eq!(WRAPPER_GUARD_REFUSED_EXIT, 6);
+        assert!(sh.contains("exit 6"));
+        assert!(ps1.contains("return 6"));
+        let success = unit.lines().find(|l| l.starts_with("SuccessExitStatus=")).expect("unit success set");
+        assert!(success.split(['=', ' ']).any(|t| t == "6"), "{success}");
+    }
+
+    // ----- v0.2.100 W4R-04: by-name actions log the label verdict -----
+
+    #[test]
+    fn the_label_verdict_line_names_the_by_name_rule_and_warns_unless_owned() {
+        let (warn, line) = label_verdict_line("stop (quit)", "vco_ollama", &Ownership::Owned);
+        assert!(!warn);
+        assert!(line.contains("by the row's name") && line.contains("labels not consulted"), "{line}");
+        let foreign = Ownership::Foreign { why: "was created by compose project 'other', not by project 'infrastructure'".into() };
+        let (warn, line) = label_verdict_line("restart", "vco_ollama", &foreign);
+        assert!(warn, "a foreign-labelled by-name action must be a warning");
+        assert!(line.contains("NOT VCO's") && line.contains("'other'"), "{line}");
+        let (warn, line) = label_verdict_line("stop", "x", &Ownership::Unknown { why: "daemon down".into() });
+        assert!(warn && line.contains("daemon down"), "{line}");
+    }
+
+    /// The verdict comes from the container's OWN labels (AD-5 predicate):
+    /// a row naming project `infrastructure` and a container carrying
+    /// `other` is foreign; the same container under `infrastructure` is owned.
+    #[tokio::test]
+    async fn log_label_verdict_reads_the_containers_own_labels() {
+        let mut r = row("ollama", EndpointMode::VcoManaged, 11435);
+        r.compose_project = Some("infrastructure".into());
+        let fake = FakeRunner::new("podman");
+        fake.on("inspect", ok(&inspect_line("running", r#"{"com.docker.compose.project":"other"}"#)));
+        let own = log_label_verdict(&fake, Some(&r), "stop", "vco_ollama").await;
+        assert!(matches!(own, Ownership::Foreign { .. }), "{own:?}");
+        let fake = FakeRunner::new("podman");
+        fake.on("inspect", ok(&inspect_line("running", r#"{"com.docker.compose.project":"infrastructure"}"#)));
+        let own = log_label_verdict(&fake, Some(&r), "stop", "vco_ollama").await;
+        assert_eq!(own, Ownership::Owned);
     }
 
     // ----- v0.2.100 WP-06 (L2-F09): quit-and-stop -----

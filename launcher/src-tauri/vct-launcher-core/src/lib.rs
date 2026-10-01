@@ -107,6 +107,8 @@ pub mod state;
 pub mod test_env;
 pub mod time;
 pub mod types;
+// v0.2.100 F-W4-09: the one byte-size rendering.
+pub mod units;
 // v0.2.100 WP-01: the ONE Rust version parser/comparator (strict X.Y.Z, owner
 // ruling Q7). Replaces seven private copies in the launcher crate; shares its
 // case table with vco_lib/version_compare.py and launcher/src/lib/version-compare.ts.

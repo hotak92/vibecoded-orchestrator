@@ -35,8 +35,9 @@ THIS test guards:
     spawning cargo).
 
 PROPAGATION (v0.2.83 WP-B5, gap now CLOSED): ``mcp_scan_rules.toml`` is listed
-in ``orchestrator-managed-paths.txt`` so ``update_orchestrator_at`` propagates
-future table EDITS into every existing install (same self-propagating shape as
+in ``orchestrator-managed-paths.txt`` so a copy install (``install_orchestrator``)
+carries future table EDITS along (git installs get them through the update
+pipeline's pull; the file-copy ``update_orchestrator_at`` was retired in v0.2.100) (same self-propagating shape as
 ``bundled_mcp_versions.toml``). WP-B4 left this deferred because it needed a
 coordinated 3-line change touching ``installer.rs`` (the managed-paths test
 constant); WP-B5 landed it. ``test_table_is_in_managed_paths`` below now
@@ -203,8 +204,8 @@ class McpScanRulesParityTests(unittest.TestCase):
     # ── WP-B5: propagation gap closed ──────────────────────────────────
     def test_table_is_in_managed_paths(self) -> None:
         """v0.2.83 WP-B5: mcp_scan_rules.toml is now listed in
-        orchestrator-managed-paths.txt so update_orchestrator_at propagates
-        future table edits to existing installs. (The .txt ↔ Python ↔ Rust
+        orchestrator-managed-paths.txt so a copy install carries future table
+        edits along (the file-copy update_orchestrator_at was retired in v0.2.100). (The .txt ↔ Python ↔ Rust
         three-way consistency is pinned by test_install_managed_paths.py /
         test_managed_paths_consistency.py; here we just assert the entry is
         present in the source-of-truth file.)"""

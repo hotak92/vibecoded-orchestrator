@@ -62,6 +62,14 @@ pub fn emit_deferral_entry(
     run_deferral_payload(&python, &script, "deferral emit")
 }
 
+/// Upper bound on one deferral payload (v0.2.100 W4R-05 / F-W4-05). The
+/// payload is a lock + a small file write: seconds at most. A Python that
+/// does not finish in this time is stuck (a venv on a stalled network
+/// filesystem, an import waiting on a lock), and every caller — the hub's
+/// watchdog tick, the reaper passes, the launcher's quit path — must not be
+/// parked behind it. Callers already log-and-swallow an `Err`.
+pub const DEFERRAL_PAYLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Run one `python -c` deferral payload, mapping failure to an `Err` that
 /// SAYS WHY.
 ///
@@ -69,7 +77,12 @@ pub fn emit_deferral_entry(
 /// the interpreter handling, the stream policy and the error shape cannot
 /// drift between "emit an entry" and "settle an entry".
 ///
-/// Captures the child's streams (`output()`, not `status()`) for two reasons:
+/// Runs through [`crate::process::output_bounded`] (the one bounded runner):
+/// a payload still running after [`DEFERRAL_PAYLOAD_TIMEOUT`] is killed and
+/// reported as `Err("… timed out after 30 s (killed)")`. Blocking — an async
+/// caller runs it through `tokio::task::spawn_blocking`.
+///
+/// Captures the child's streams for two reasons:
 ///
 /// * the caller's log line becomes diagnostic. `deferral helper exited exit
 ///   status: 1` names nothing; `… ModuleNotFoundError: No module named
@@ -83,13 +96,20 @@ pub fn emit_deferral_entry(
 /// resolve"). Success discards the captured output — a payload that succeeds
 /// has nothing to say.
 pub fn run_deferral_payload(python: &Path, script: &str, what: &str) -> Result<(), String> {
-    let out = std::process::Command::new(python)
-        .silent()
-        .arg("-c")
-        .arg(script)
-        .output();
+    run_deferral_payload_within(python, script, what, DEFERRAL_PAYLOAD_TIMEOUT)
+}
 
-    match out {
+/// [`run_deferral_payload`] with an explicit bound (tests drive the timeout
+/// arm with a short one).
+pub fn run_deferral_payload_within(
+    python: &Path,
+    script: &str,
+    what: &str,
+    limit: std::time::Duration,
+) -> Result<(), String> {
+    let mut cmd = std::process::Command::new(python).silent();
+    cmd.arg("-c").arg(script);
+    match crate::process::output_bounded(&mut cmd, None, limit) {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(format!(
             "{what} helper ({}) exited {}: {}",
@@ -97,10 +117,11 @@ pub fn run_deferral_payload(python: &Path, script: &str, what: &str) -> Result<(
             o.status,
             summarise_child_output(&o.stderr, &o.stdout)
         )),
-        Err(e) => Err(format!(
-            "{what} helper spawn failed ({}): {e}",
+        Err(e @ crate::process::BoundedError::TimedOut { .. }) => Err(format!(
+            "{what} helper ({}) {e}",
             python.display()
         )),
+        Err(e) => Err(format!("{what} helper ({}) {e}", python.display())),
     }
 }
 
@@ -291,4 +312,60 @@ pub fn py_quote(s: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn spawnable_python() -> Option<std::path::PathBuf> {
+        let python = crate::python_resolve::resolve_python_for_vco_lib()?;
+        std::process::Command::new(&python)
+            .arg("-c")
+            .arg("pass")
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|_| python)
+    }
+
+    /// W4R-05 / F-W4-05: a payload that never finishes is killed at the
+    /// bound and reported, instead of parking its caller (the hub's watchdog
+    /// tick, the reaper pass, the launcher's quit path) forever.
+    #[test]
+    fn a_hung_payload_is_killed_at_the_bound_and_reported() {
+        let Some(python) = spawnable_python() else {
+            eprintln!("skipping: no spawnable python interpreter");
+            return;
+        };
+        let started = Instant::now();
+        let err = run_deferral_payload_within(
+            &python,
+            "import time\ntime.sleep(60)\n",
+            "deferral emit",
+            Duration::from_millis(500),
+        )
+        .expect_err("a hung payload must be an Err");
+        assert!(started.elapsed() < Duration::from_secs(20), "the bound was not honoured");
+        assert!(err.contains("timed out after"), "got: {err}");
+        assert!(err.contains("deferral emit helper"), "got: {err}");
+    }
+
+    /// Leave-alone: a payload that finishes inside the bound is unaffected.
+    #[test]
+    fn a_quick_payload_is_ok() {
+        let Some(python) = spawnable_python() else {
+            eprintln!("skipping: no spawnable python interpreter");
+            return;
+        };
+        run_deferral_payload_within(&python, "pass\n", "deferral emit", Duration::from_secs(20))
+            .expect("a payload that exits 0 is Ok");
+    }
+
+    #[test]
+    fn the_production_bound_is_finite_and_generous() {
+        assert!(DEFERRAL_PAYLOAD_TIMEOUT >= Duration::from_secs(10));
+        assert!(DEFERRAL_PAYLOAD_TIMEOUT <= Duration::from_secs(120));
+    }
 }

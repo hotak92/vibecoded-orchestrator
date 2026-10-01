@@ -122,8 +122,24 @@ python install.py --gpu               # Enable NVIDIA GPU acceleration
 python install.py --cpu-only          # Force CPU-only mode
 python install.py --low-resource      # Lightest models for low-RAM machines
 python install.py --no-containers     # Skip container management (bring your own)
-python install.py --update            # Re-run on an existing install (preserves .env)
+python install.py --update            # Re-apply the checked-out tree to an existing install (preserves .env; does NOT pull)
 ```
+
+`--update` never fetches or pulls: it applies whatever release is checked out. To
+move to a newer release, use the launcher's update (the MenuBar badge, the tray's
+"Check for updates", or Preferences → Updates — all three run the same update), or
+from a terminal in the install root: `git fetch --tags --force vco_upstream`,
+`git pull --ff-only vco_upstream main`, then `python install.py --update`
+([INSTALL_RECOVERY.md → Update from the shell](INSTALL_RECOVERY.md#update-from-the-shell-no-launcher-gui)
+covers a pull that is not a fast-forward).
+
+**A second VCO install on the same machine** (another clone of this repository) is
+updated on its own, from a terminal in THAT clone's folder with the same three
+commands. The launcher updates one install — the one recorded as its install root —
+and since v0.2.100 no launcher button copies one install over another: the
+"Update N orchestrator clones" button of earlier releases file-copied the running
+install into the other clones without git and without `install.py`, which left them
+half-updated, so it was retired.
 
 For CI or non-interactive installs:
 

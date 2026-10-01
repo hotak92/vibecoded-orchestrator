@@ -606,7 +606,7 @@ async fn reap_pathological_containers_for_resume(
             "[module_supervisor] V52-D.2 reaper: pass complete"
         );
     }
-    vct_launcher_core::services::container_runtime::record_unlabelled_modules(&report.unlabelled);
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules_off_runtime(report.unlabelled.clone()).await;
 }
 
 /// Test-friendly variant of [`resume_containers_on_startup`] that takes

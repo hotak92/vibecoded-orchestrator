@@ -94,33 +94,62 @@ class OllamaNotReadyError(OllamaStepError):
         )
 
 
-class OllamaPullError(OllamaStepError):
-    """One or more EMBEDDING models could not be pulled / verified."""
+#: The role of a model whose pull failed, named in the error and the row
+#: (W3R-09: a CODE-model failure is not a Knowledge Graph failure).
+ROLE_KG = "the knowledge graph's embedder"
+ROLE_CODE = "the code graph's embedder"
+ROLE_TEXT = "text generation"
 
-    def __init__(self, failed: Mapping[str, str], base_url: str) -> None:
+
+def model_roles(plan: PullPlan) -> dict[str, str]:
+    """``model → role`` for every model of ``plan``."""
+    roles = {m: ROLE_TEXT for m in plan.inference}
+    roles.update({m: ROLE_CODE for m in plan.code_embedding})
+    roles.update({m: ROLE_KG for m in plan.kg_embedding})
+    return roles
+
+
+class OllamaPullError(OllamaStepError):
+    """One or more KNOWLEDGE-GRAPH embedding models could not be pulled /
+    verified (the only load-bearing pulls — W3R-09)."""
+
+    def __init__(self, failed: Mapping[str, str], base_url: str,
+                 roles: Optional[Mapping[str, str]] = None) -> None:
         self.failed = dict(failed)
         self.base_url = base_url
+        self.roles = dict(roles or {})
         super().__init__(
             "Load-bearing embedding model pull(s) failed: "
-            + "; ".join(f"{m} ({why})" for m, why in self.failed.items())
+            + "; ".join(f"{m} ({self.roles.get(m, ROLE_KG)}: {why})" for m, why in self.failed.items())
             + ". The Knowledge Graph cannot work without them."
         )
 
     def deferral_entry(self) -> Any:
-        return pull_failed_entry(self.failed, self.base_url)
+        return pull_failed_entry(self.failed, self.base_url, self.roles)
 
 
-def pull_failed_entry(failed: Mapping[str, str], base_url: str) -> Any:
+#: The retry command a pull-failed row prints: cross-shell (no quoting —
+#: bash, PowerShell and cmd.exe run it as written), against the row's own
+#: Ollama, pulling exactly the models this machine uses (W3R-10).
+PULL_RETRY_COMMAND = "python -m vco_lib.embedding_pull_plan ensure"
+
+
+def pull_failed_entry(failed: Mapping[str, str], base_url: str,
+                      roles: Optional[Mapping[str, str]] = None) -> Any:
     from vco_lib.deferral_report import DeferralEntry
 
+    roles = roles or {}
     return DeferralEntry(
         condition_id=PULL_FAILED_CID,
         title="Ollama model pull failed",
-        detected="; ".join(f"{m}: {why}" for m, why in failed.items()),
+        detected="; ".join(
+            f"{m}{' (' + roles[m] + ')' if m in roles else ''}: {why}" for m, why in failed.items()
+        ) + f" — Ollama at {base_url}",
         why_deferred="A model the configuration uses is not present in Ollama.",
-        command_to_apply="\n".join(
-            [f"curl -X POST {base_url}/api/pull -d '{{\"name\": \"{m}\"}}'" for m in failed]
-            + ["then re-run `python install.py --update`"]
+        command_to_apply=(
+            "From the install root (any shell), pull exactly the models this machine uses "
+            f"against its Ollama ({base_url}):\n{PULL_RETRY_COMMAND}\n"
+            "or re-run `python install.py --update`."
         ),
         severity="warning",
     )
@@ -246,10 +275,36 @@ def pull(base_url: str, model: str, *, http: Optional[OllamaHttp] = None,
                 if obj.get("error"):
                     raise PullFailed(str(obj["error"]))
                 last = str(obj.get("status") or last)
+    except urllib.error.HTTPError as exc:
+        # Keep Ollama's own reason (`{"error": "pull model manifest: file does
+        # not exist"}`), not just "HTTP Error 500" (W3R-10).
+        raise PullFailed(_http_error_reason(exc)) from exc
     except _PROBE_ERRORS as exc:
         raise PullFailed(str(exc)) from exc
     if last != "success":
         raise PullFailed(f"stream ended without success (last status: {last or 'none'})")
+
+
+def _http_error_reason(exc: "urllib.error.HTTPError") -> str:
+    """``HTTP <code>: <Ollama's error>`` — the body's ``error`` field when it
+    is JSON, else its first line (bounded), else the status alone."""
+    body = ""
+    try:
+        raw = exc.read() or b""
+        body = raw.decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001 — an unreadable body is not the error
+        body = ""
+    reason = ""
+    if body:
+        try:
+            obj = json.loads(body)
+            if isinstance(obj, dict) and obj.get("error"):
+                reason = str(obj["error"])
+        except ValueError:
+            pass
+        if not reason:
+            reason = body.splitlines()[0][:300]
+    return f"HTTP {exc.code}: {reason}" if reason else f"HTTP {exc.code}"
 
 
 @dataclass
@@ -267,6 +322,7 @@ def ensure(
     http: Optional[OllamaHttp] = None,
     out: Callable[[str], None] = print,
     skip_present: bool = True,
+    roles: Optional[Mapping[str, str]] = None,
 ) -> EnsureResult:
     """Make ``models`` present: skip what ``/api/tags`` lists, pull the rest,
     verify afterwards. Raises :class:`OllamaPullError` (after trying every
@@ -305,7 +361,7 @@ def ensure(
     lb = {_norm(m) for m in load_bearing}
     bad = {m: why for m, why in res.failed.items() if _norm(m) in lb}
     if bad:
-        raise OllamaPullError(bad, base)
+        raise OllamaPullError(bad, base, roles)
     return res
 
 
@@ -362,17 +418,23 @@ def ensure_plan_step(plan: PullPlan, urls: Mapping[str, Any], report: Any,
     log_event("7/10", "start", f"ensuring {len(plan.models)} Ollama model(s)",
               data={"models": list(plan.models)})
     base = str(urls["ollama_url"]).rstrip("/")
+    roles = model_roles(plan)
     try:
-        res = ensure(base, plan.models, load_bearing=plan.embedding, skip_present=resume,
-                     http=http)
+        # Only the KNOWLEDGE GRAPH's embedders are load-bearing (W3R-09): a
+        # code-graph embedder that fails to pull is recorded and the run goes
+        # on — the KG seed and the steps after this one do not depend on it.
+        res = ensure(base, plan.models, load_bearing=plan.kg_embedding, skip_present=resume,
+                     http=http, roles=roles)
     except OllamaPullError as exc:
         log_event("7/10", "error", str(exc), data={"failed": exc.failed})
         raise
     if res.failed and report is not None:
-        report.add_entry(pull_failed_entry(res.failed, base))
+        report.add_entry(pull_failed_entry(res.failed, base, roles))
     if plan.code_backend_unavailable and report is not None:
         report.add_entry(code_embed_unavailable_entry(
-            f"code_embed at {urls.get('code_embed_url')} did not answer /health"))
+            plan.code_backend_detail
+            or f"code_embed at {urls.get('code_embed_url')} did not answer /health",
+            vco_managed=plan.code_backend_vco_managed))
     if resume and plan.models and len(res.present) == len(plan.models):
         print(f"[7/10] Ollama models: verified, skipped ({len(res.present)} models present)")
     log_event("7/10", "warn" if res.failed else "ok",
@@ -419,42 +481,167 @@ def install_step(urls: Mapping[str, Any], report: Any, *, plan: Callable[[], Pul
     return StepOutcome()
 
 
-# ── recovery: restart an OWNED Ollama container (never adopted / foreign) ──
+# ── which container a service row names, and whether VCO owns it ─────────
 
+OWNED = "owned"
 RESTARTED = "restarted"
 NOT_OWNED = "not_owned"
 NO_CONTAINER = "no_container"
 RESTART_FAILED = "restart_failed"
 
 
-def restart_owned_ollama(install_root: Path, runtime: str, row: Any, *,
-                         run: Optional[Callable[..., Any]] = None,
-                         find: Optional[Callable[..., Optional[str]]] = None,
-                         identity: Optional[Callable[..., Any]] = None) -> "tuple[str, str]":
-    """``(outcome, detail)``. Restarts ONLY a container VCO owns: the
-    ``service_endpoints`` row is ``vco_managed`` AND the container's compose
-    project label is VCO's own project (the same predicate the recreate guard
-    uses, :func:`vco_lib.containers.foreign_compose_identity`). ``restart`` by
-    name — never ``rm``, never a compose recreate. Anything else is reported."""
+@dataclass(frozen=True)
+class ContainerRun:
+    """What ``inspect`` says about one container (read-only)."""
+
+    exists: bool
+    running: bool = False
+    #: ``State.StartedAt`` as epoch seconds (``None``: not reported / unparseable).
+    started_at: Optional[float] = None
+
+
+_STARTED_AT_RE = None
+
+
+def parse_started_at(value: str) -> Optional[float]:
+    """``State.StartedAt`` → epoch seconds. Docker prints RFC 3339
+    (``2026-09-30T10:00:00.123456789Z``), podman a Go time
+    (``2026-09-30 10:00:00.123456789 +0200 CEST``); both carry an offset.
+    ``None`` for anything else (no offset → no guess)."""
+    import datetime as _dt
+    import re as _re
+
+    global _STARTED_AT_RE
+    if _STARTED_AT_RE is None:
+        _STARTED_AT_RE = _re.compile(
+            r"^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})(?:\.\d+)?\s*(Z|[+-]\d{2}:?\d{2})")
+    m = _STARTED_AT_RE.match((value or "").strip())
+    if not m:
+        return None
+    off = m.group(3)
+    if off == "Z":
+        tz = _dt.timezone.utc
+    else:
+        sign = -1 if off[0] == "-" else 1
+        hh, mm = int(off[1:3]), int(off[-2:])
+        tz = _dt.timezone(sign * _dt.timedelta(hours=hh, minutes=mm))
+    try:
+        stamp = _dt.datetime.fromisoformat(f"{m.group(1)}T{m.group(2)}").replace(tzinfo=tz)
+    except ValueError:
+        return None
+    if stamp.year < 1971:  # docker's zero time for a never-started container
+        return None
+    return stamp.timestamp()
+
+
+def inspect_container_run(runtime: str, name: str, *,
+                          run: Optional[Callable[..., Any]] = None) -> Optional[ContainerRun]:
+    """``ContainerRun`` for ``name``; ``None`` when it could not be read (no
+    runtime, daemon down) — never folded into "absent"."""
     import subprocess
 
+    from vco_lib import containers as _c
+
+    if not runtime or not name:
+        return None
+    try:
+        res = (run or subprocess.run)(
+            [runtime, "inspect", "--type", "container", "--format",
+             "{{.State.Running}}\t{{.State.StartedAt}}", name],
+            capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    verdict = _c.classify_container_probe(res)
+    if verdict == "not_found":
+        return ContainerRun(exists=False)
+    if verdict != "exists":
+        return None
+    running, _, started = (res.stdout or "").strip().partition("\t")
+    return ContainerRun(exists=True, running=running.strip().lower() == "true",
+                        started_at=parse_started_at(started))
+
+
+def _row_container(service: str, runtime: str, row: Any,
+                   find: Optional[Callable[..., Optional[str]]]) -> str:
+    """The container a service row names: the ROW's ``container_name`` when it
+    has one (W4R-11 — a canonical-named leftover beside it is not the
+    service), else the first known name that exists."""
+    from vco_lib import containers as _c
+
+    named = str(getattr(row, "container_name", "") or "").strip() if row is not None else ""
+    if named:
+        return named
+    return (find or _c.find_existing_container)(service, runtime=runtime) or ""
+
+
+def service_container(install_root: Path, runtime: str, service: str, row: Any, *,
+                      run: Optional[Callable[..., Any]] = None,
+                      find: Optional[Callable[..., Optional[str]]] = None,
+                      identity: Optional[Callable[..., Any]] = None) -> "tuple[str, str, str]":
+    """``(OWNED | NOT_OWNED | NO_CONTAINER, container name, detail)`` — the ONE
+    "does VCO own this service's container" reading for the step-6/7 code: the
+    ``service_endpoints`` row is ``vco_managed`` (no row reads as VCO's
+    default) AND the container's compose project label is VCO's own project
+    (the recreate guard's predicate, :func:`vco_lib.containers.foreign_compose_identity`).
+    Read-only."""
     from vco_lib import containers as _c
 
     mode = getattr(row, "mode", None) if row is not None else "vco_managed"
     if mode != "vco_managed":
         who = getattr(row, "container_name", "") or getattr(row, "url", "") or "it"
-        return NOT_OWNED, (f"Ollama is {mode} ({who}) — not VCO's container, so VCO does "
-                           "not restart it; start it yourself")
+        return NOT_OWNED, "", (f"{service} is {mode} ({who}) — not VCO's container, so VCO "
+                               "does not start or restart it")
     if not runtime:
-        return NO_CONTAINER, "no container runtime detected — nothing VCO could restart"
-    name = (find or _c.find_existing_container)("ollama", runtime=runtime)
+        return NO_CONTAINER, "", "no container runtime detected"
+    name = _row_container(service, runtime, row, find)
     if not name:
-        return NO_CONTAINER, "no Ollama container exists — nothing VCO could restart"
+        return NO_CONTAINER, "", f"no {service} container exists"
+    state = inspect_container_run(runtime, name, run=run)
+    if state is not None and not state.exists:
+        return NO_CONTAINER, name, f"the row's {service} container {name} does not exist"
     why = _c.foreign_compose_identity(
         (identity or _c.compose_identity_of)(name, runtime),
         _c.own_compose_project(Path(install_root)))
     if why:
-        return NOT_OWNED, f"container {name} {why} — not VCO's, left alone"
+        return NOT_OWNED, name, f"container {name} {why} — not VCO's"
+    return OWNED, name, f"VCO's own container {name}"
+
+
+def service_container_run(install_root: Path, runtime: str, service: str, row: Any, *,
+                          run: Optional[Callable[..., Any]] = None,
+                          find: Optional[Callable[..., Optional[str]]] = None) -> Optional[ContainerRun]:
+    """``inspect`` facts of the container the service row names (``None``:
+    could not tell; ``exists=False``: there is none)."""
+    if not runtime:
+        return None
+    name = _row_container(service, runtime, row, find)
+    if not name:
+        return ContainerRun(exists=False)
+    return inspect_container_run(runtime, name, run=run)
+
+
+# ── recovery: restart an OWNED Ollama container (never adopted / foreign) ──
+
+
+def restart_owned_ollama(install_root: Path, runtime: str, row: Any, *,
+                         run: Optional[Callable[..., Any]] = None,
+                         find: Optional[Callable[..., Optional[str]]] = None,
+                         identity: Optional[Callable[..., Any]] = None) -> "tuple[str, str]":
+    """``(outcome, detail)``. Restarts ONLY a container VCO owns
+    (:func:`service_container`: the row is ``vco_managed`` AND the container's
+    compose project label is VCO's own project), and only the container the
+    ROW names when it names one (W4R-11). ``restart`` by name — never ``rm``,
+    never a compose recreate. Anything else is reported."""
+    import subprocess
+
+    outcome, name, detail = service_container(install_root, runtime, "ollama", row,
+                                              run=run, find=find, identity=identity)
+    if outcome == NOT_OWNED:
+        if not name:
+            return NOT_OWNED, f"{detail}; start it yourself"
+        return NOT_OWNED, f"{detail}, left alone"
+    if outcome == NO_CONTAINER:
+        return NO_CONTAINER, f"{detail} — nothing VCO could restart"
     try:
         res = (run or subprocess.run)([runtime, "restart", name], capture_output=True,
                                       text=True, timeout=120)
@@ -485,60 +672,62 @@ def _timed_out(exc: BaseException) -> bool:
     return False
 
 
-def code_embed_container_running(runtime: str, *, run: Optional[Callable[..., Any]] = None,
-                                 find: Optional[Callable[..., Optional[str]]] = None
-                                 ) -> Optional[bool]:
-    """Tri-state: is the code_embed container RUNNING? ``None`` = could not tell
-    (no runtime, no such container, probe failed). Read-only."""
-    import subprocess
-
-    from vco_lib import containers as _c
-
-    if not runtime:
-        return None
-    name = (find or _c.find_existing_container)("code_embed", runtime=runtime)
-    if not name:
-        return False
-    try:
-        res = (run or subprocess.run)([runtime, "inspect", "--type", "container", "--format",
-                                       "{{.State.Running}}", name],
-                                      capture_output=True, text=True, timeout=10)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    if getattr(res, "returncode", 1) != 0:
-        return None
-    return (res.stdout or "").strip().lower() == "true"
+#: The longest a code_embed container may be "loading its model" (W4R-06).
+#: A first start downloads CodeSage (~2.6 GB) and loads it: minutes, not an
+#: hour. A container older than this whose ``/health`` never answers is
+#: wedged, and reported as DOWN with that reason.
+CODE_EMBED_WARMING_MAX_S = 30 * 60
 
 
-def code_embed_state(url: Optional[str], *, timeout_s: float = 60.0,
-                     http: Optional[OllamaHttp] = None,
-                     container_running: Optional[Callable[[], Optional[bool]]] = None
-                     ) -> Optional[str]:
-    """``READY`` / ``WARMING`` / ``DOWN`` for the code_embed service (``None``:
-    no URL). v0.2.100 W3R-04: a service that accepts connections but has not
-    answered ``/health`` within the bound is loading its model — a fresh GPU
+def code_embed_verdict(url: Optional[str], *, timeout_s: float = 60.0,
+                       http: Optional[OllamaHttp] = None,
+                       container: Optional[Callable[[], Optional[ContainerRun]]] = None,
+                       warming_max_s: float = CODE_EMBED_WARMING_MAX_S,
+                       now: Optional[Callable[[], float]] = None,
+                       ) -> "tuple[Optional[str], str]":
+    """``(READY | WARMING | DOWN, why)`` for the code_embed service (``(None,
+    "")``: no URL). v0.2.100 W3R-04: a service that accepts connections but has
+    not answered ``/health`` within the bound is loading its model — a fresh GPU
     install downloads ~2.6 GB on the first request — and so is a container the
-    runtime reports RUNNING; neither is an outage. ``DOWN`` only when the port
-    never accepted AND the container is not provably running."""
+    runtime reports RUNNING; neither is an outage. W4R-06: either reading is
+    WARMING only while the container started less than ``warming_max_s`` ago
+    (when its start time is known); past that it is DOWN, with the reason."""
     if not url:
-        return None
+        return None, ""
     h = _http(http)
     deadline = time.monotonic() + timeout_s
     accepted = False
     while True:
         try:
             h.get_json(f"{url.rstrip('/')}/health", 3.0)
-            return CODE_EMBED_READY
+            return CODE_EMBED_READY, f"{url} answered /health"
         except _PROBE_ERRORS + (TimeoutError,) as exc:
             accepted = accepted or _timed_out(exc)
         if time.monotonic() >= deadline:
             break
         time.sleep(2.0)
+    run = container() if container is not None else None
+    age = None
+    if run is not None and run.running and run.started_at is not None:
+        age = max(0.0, (now or time.time)() - run.started_at)
+    if age is not None and age > warming_max_s:
+        return CODE_EMBED_DOWN, (
+            f"the code_embed container has been running for {age / 60:.0f} min but {url} "
+            f"never answered /health — longer than a model load takes "
+            f"({warming_max_s / 60:.0f} min); it is wedged, not loading")
     if accepted:
-        return CODE_EMBED_WARMING
-    if container_running is not None and container_running() is True:
-        return CODE_EMBED_WARMING
-    return CODE_EMBED_DOWN
+        return CODE_EMBED_WARMING, f"{url} accepted the connection but is still loading"
+    if run is not None and run.running:
+        started = f", started {age / 60:.0f} min ago" if age is not None else ""
+        return CODE_EMBED_WARMING, f"the code_embed container is running{started}"
+    if run is not None and run.exists:
+        return CODE_EMBED_DOWN, f"the code_embed container is stopped and {url} did not answer"
+    return CODE_EMBED_DOWN, f"code_embed at {url} did not answer /health and no running container"
+
+
+def code_embed_state(url: Optional[str], **kwargs: Any) -> Optional[str]:
+    """The state half of :func:`code_embed_verdict`."""
+    return code_embed_verdict(url, **kwargs)[0]
 
 
 # ── launcher dual-flag toggle (python -m vco_lib.embedding_pull_plan ensure) ─
@@ -557,7 +746,8 @@ def ensure_for_machine(plan: PullPlan, root: Path, *, launcher_db: Optional[Path
                            "failed": {}, "deferral": None, "error": None}
     try:
         wait_ready(base, timeout_s=wait_s, http=http)
-        res = ensure(base, plan.models, load_bearing=plan.embedding, http=http, out=say)
+        res = ensure(base, plan.models, load_bearing=plan.kg_embedding, http=http, out=say,
+                     roles=model_roles(plan))
     except OllamaStepError as exc:
         entry = exc.deferral_entry()
         emit(Path(root), entry)
@@ -566,7 +756,7 @@ def ensure_for_machine(plan: PullPlan, root: Path, *, launcher_db: Optional[Path
         return out
     out.update(present=res.present, pulled=res.pulled, failed=res.failed)
     if res.failed:
-        emit(Path(root), pull_failed_entry(res.failed, base))
+        emit(Path(root), pull_failed_entry(res.failed, base, model_roles(plan)))
         out.update(deferral=PULL_FAILED_CID, error="some models could not be pulled")
         return out
     resolve_conditions(Path(root), (PULL_FAILED_CID, NOT_READY_CID))
@@ -604,7 +794,8 @@ def retry_owed_model_work(folder: Path, *, seed: Callable[[], bool],
         return BLOCKED, f"{exc} — the entry stays for the next retry"
     try:
         pp = plan_from_machine(folder, launcher_db)
-        res = ensure(base, pp.models, load_bearing=pp.embedding, http=http, out=out)
+        res = ensure(base, pp.models, load_bearing=pp.kg_embedding, http=http, out=out,
+                     roles=model_roles(pp))
         missing = [] if res.failed else verify_present(base, pp.models, http=http)[1]
     except PlanUnavailable as exc:
         return RETRY_FAILED, str(exc)
@@ -617,9 +808,28 @@ def retry_owed_model_work(folder: Path, *, seed: Callable[[], bool],
     if res.failed or missing:
         failed = dict(res.failed) or {m: "not listed by /api/tags" for m in missing}
         resolve_conditions(folder, (NOT_READY_CID,))
-        emit(folder, pull_failed_entry(failed, base))
+        emit(folder, pull_failed_entry(failed, base, model_roles(pp)))
         return RETRY_FAILED, "model(s) still missing: " + ", ".join(failed)
     if not seed():
         return RETRY_FAILED, "the knowledge-graph seed did not complete (not proven)"
     resolve_conditions(folder, (NOT_READY_CID, PULL_FAILED_CID))
     return DONE, f"{len(pp.models)} model(s) present, knowledge-graph seed completed"
+
+
+def clear_code_embed_outage(folder: Path, *, launcher_db: Optional[Path] = None,
+                            timeout_s: float = 15.0,
+                            http: Optional[OllamaHttp] = None) -> "tuple[str, str]":
+    """The ``code_embed_backend`` retry (W4R-06): ``(DONE, why)`` after
+    clearing ``code_embed_backend_unavailable`` — ONLY when the machine's
+    code_embed (its ``service_endpoints`` row URL) answers ``/health`` —
+    else ``(BLOCKED, why)`` with the row untouched. Read-only otherwise."""
+    from vco_lib import service_endpoints
+    from vco_lib.deferral_emit import resolve_conditions
+    from vco_lib.embedding_pull_plan import CODE_EMBED_UNAVAILABLE_CID
+
+    url = str(service_endpoints.machine_service_urls(launcher_db).get("code_embed_url") or "")
+    state, why = code_embed_verdict(url or None, timeout_s=timeout_s, http=http)
+    if state != CODE_EMBED_READY:
+        return BLOCKED, why or "no code_embed URL is configured"
+    resolve_conditions(Path(folder), (CODE_EMBED_UNAVAILABLE_CID,))
+    return DONE, why

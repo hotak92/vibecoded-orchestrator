@@ -86,14 +86,40 @@ def managed_override_header(path: Path) -> Optional[str]:
     return first if _OVERRIDE_MANAGED_MARKER in first else None
 
 
+#: Two halves whose modification times are this close were written by the
+#: same event — a checkout, a copy, an extract — not by two generator runs, so
+#: their mtimes are no evidence of which is newer (W4R-11).
+MTIME_EVIDENCE_S = 2.0
+
+
+def newest_generated_half(legacy_path: Path, canonical_path: Path) -> tuple[Path, str]:
+    """``(half, rule)``: which half of a VCO-generated pair is the current
+    generator's output, and the rule that decided it.
+
+    The half written LAST — but only when the two modification times are more
+    than :data:`MTIME_EVIDENCE_S` apart. A ``git checkout`` / copy / archive
+    extract writes both halves in one go and resets their times together,
+    which would otherwise crown whichever it happened to write second; within
+    the window the CANONICAL name wins (the owner's "use the new one" ruling,
+    the same tie rule as B-F2)."""
+    legacy_m, canonical_m = legacy_path.stat().st_mtime, canonical_path.stat().st_mtime
+    if abs(legacy_m - canonical_m) <= MTIME_EVIDENCE_S:
+        return canonical_path, (f"written within {MTIME_EVIDENCE_S:.0f} s of each other "
+                                "(one checkout/copy), so the canonical name wins")
+    if legacy_m > canonical_m:
+        return legacy_path, "written later than the canonical half"
+    return canonical_path, "written later than the legacy half"
+
+
 def reconcile_vco_generated_pair(
     install_root: Path, legacy_path: Path, canonical_path: Path, ts: str,
 ) -> Optional[str]:
     """U16 (v0.2.100): a divergent pair that VCO GENERATED BOTH halves of is
     not a question for the user. Every current generator writes one body to
     BOTH names (the C-RT-5 mirror), so a divergent pair means one half is an
-    older generator run's output: the half written LAST is the current
-    generator's (a tie → the canonical name). Its bytes become the canonical
+    older generator run's output: :func:`newest_generated_half` picks the
+    current generator's (written last, when the times are evidence; else the
+    canonical name). Its bytes become the canonical
     ``compose.override.yaml`` and are re-mirrored to the legacy name (the
     sanctioned identical pair); every half whose bytes change is backed up
     first under ``.claude/backups/bundle-adoptions/<ts>/``.
@@ -109,8 +135,7 @@ def reconcile_vco_generated_pair(
     from vco_lib.project_init import _ADOPT_BACKUPS_REL, _backup_bytes_for_adoption, _log_auto
 
     try:
-        newest = (legacy_path if legacy_path.stat().st_mtime > canonical_path.stat().st_mtime
-                  else canonical_path)
+        newest, rule = newest_generated_half(legacy_path, canonical_path)
         body = newest.read_bytes()
         for half in (legacy_path, canonical_path):
             current = half.read_bytes()
@@ -124,5 +149,5 @@ def reconcile_vco_generated_pair(
                   "— kept the conflict deferral")
         return None
     return (f"reconciled VCO's own generated override pair: `{canonical_path}` = the newest "
-            f"generator output (`{newest.name}`), `{legacy_path.name}` re-mirrored; the replaced "
-            f"bytes are in {_ADOPT_BACKUPS_REL.as_posix()}/{ts}/")
+            f"generator output (`{newest.name}`, {rule}), `{legacy_path.name}` re-mirrored; the "
+            f"replaced bytes are in {_ADOPT_BACKUPS_REL.as_posix()}/{ts}/")

@@ -695,12 +695,9 @@ fn run_dismiss_cli(
         .output()
         .map_err(|e| format!("dismiss-deferral failed to spawn: {e}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr");
         return Err(format!(
-            "dismiss-deferral failed ({}): {}",
-            output.status,
-            first,
+            "dismiss-deferral failed: {}",
+            vct_launcher_core::process::failure_evidence(&output.status, &String::from_utf8_lossy(&output.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
         ));
     }
     serde_json::from_slice::<DismissPayload>(&output.stdout).map_err(|e| {

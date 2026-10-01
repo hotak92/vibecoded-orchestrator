@@ -1258,7 +1258,13 @@ async fn run_one_tick(
         }
     }
     if let Some(root) = infra_dir.parent() {
-        record_foreign(root, &foreign);
+        // The record spawns a bounded Python payload (W4R-05): off the
+        // runtime's workers, so a slow interpreter never parks the tick's
+        // thread — and never longer than the payload's bound.
+        let root = root.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || record_foreign(&root, &foreign)).await {
+            tracing::warn!("[vct-hub] infra watchdog: foreign-container record task failed: {}", e);
+        }
     }
 }
 

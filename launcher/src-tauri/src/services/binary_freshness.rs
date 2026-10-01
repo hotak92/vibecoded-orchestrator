@@ -2790,7 +2790,8 @@ mod tests {
         assert!(update_owns_the_tree_at(&gate, &handoff));
 
         // …but OUR OWN update is not a stand-down: WI-2's "Already up to date
-        // still heals" reconcile runs from inside `update_orchestrator`, i.e.
+        // still heals" reconcile runs from inside the update pipeline
+        // (`update_run::run_update`; `update_orchestrator` before v0.2.100), i.e.
         // inside the window where THIS process holds the gate. Standing down
         // there would restore the RC-2 dead end.
         write_gate(std::process::id());

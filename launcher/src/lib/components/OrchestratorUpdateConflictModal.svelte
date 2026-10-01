@@ -53,7 +53,7 @@
   // `updater.beginOp` and end through `endOp` / `failOp` (the store's error
   // router). The payload type is the shared declaration in
   // `$lib/tauri-error-payload`.
-  import { updater } from '$lib/stores/updater';
+  import { modalFailure, updater } from '$lib/stores/updater';
   import type { OrchestratorConflictPayload } from '$lib/tauri-error-payload';
 
   let {
@@ -193,6 +193,15 @@
     return 'Either choice is reasonable.';
   }
 
+  // v0.2.100 (W3-FIX follow-up): what a routed failure does to THIS modal —
+  // `failed` shows the one inline message; a route to ANOTHER recovery modal
+  // (the store has opened it) hands over by closing this one; a fresh
+  // conflict payload keeps this modal (`self`).
+  function settle(outcome: { inline: string | null; closeSelf: boolean }) {
+    error = outcome.inline;
+    if (outcome.closeSelf) onClose();
+  }
+
   async function abort() {
     if (aborting || aborted) return;
     aborting = true;
@@ -210,9 +219,9 @@
       // Give the user a beat to see the toast before dismissing.
       setTimeout(onClose, 600);
     } catch (e) {
-      // v0.2.100 (WP-08, L3-F06): routed like every update failure.
-      const routed = updater.failOp(e);
-      if (routed.to === 'failed') error = `Abort failed: ${routed.message}`;
+      // v0.2.100 (WP-08, L3-F06; W3-FIX): routed like every update failure,
+      // rendered through the ONE recovery-modal rule (modalFailure).
+      settle(modalFailure(updater.failOp(e), 'Abort failed', 'conflict'));
     } finally {
       aborting = false;
     }
@@ -293,8 +302,7 @@
       // v0.2.100 (WP-08, L3-F06): a structured payload (e.g. an untracked
       // collision in the continued update) opens its modal; any other
       // failure shows the same single message as the overlay.
-      const routed = updater.failOp(e);
-      if (routed.to === 'failed') error = `Keep local failed: ${routed.message}`;
+      settle(modalFailure(updater.failOp(e), 'Keep local failed', 'conflict'));
       resolutionMode = null;
     } finally {
       resolving = false;
@@ -321,8 +329,7 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      const routed = updater.failOp(e);
-      if (routed.to === 'failed') error = `Accept upstream failed: ${routed.message}`;
+      settle(modalFailure(updater.failOp(e), 'Accept upstream failed', 'conflict'));
       resolutionMode = null;
     } finally {
       resolving = false;
@@ -344,10 +351,10 @@
         resumed = true;
         toast.success('Update resumed — install.py is running.');
         setTimeout(onClose, 600);
-      } else if (result.routed.to === 'failed') {
+      } else {
         // Written FOR the user by the backend (still mid-merge, leftover
         // markers, no sentinel) — shown verbatim, once.
-        error = `Continue Update failed: ${result.routed.message}`;
+        settle(modalFailure(result.routed, 'Continue Update failed', 'conflict'));
       }
     } finally {
       resuming = false;

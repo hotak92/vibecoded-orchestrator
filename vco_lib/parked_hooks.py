@@ -91,6 +91,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional, Sequence
 
+from vco_lib.hook_relative_paths import emit_relative_hooks_deferral
 from vco_lib.hook_retirements import normalize_command, vco_hook_script_identity
 from vco_lib.hooks_settings import normalize_matcher
 from vco_lib.jsonc_edit import load_object
@@ -294,7 +295,14 @@ def report_parked_hooks(
     carried to the launcher). Then, on a real run, record any hook that is
     both parked AND running as a :data:`CONFLICT_CID` deferral
     (:func:`emit_conflict_deferral`).
+
+    v0.2.100 WP-17 (F-W1-16): this is the bundle's ONE post-merge report on
+    the settings hooks, so it also records the project's OWN hooks that invoke
+    a ``.claude/hooks/`` script by a relative path — OFFERED an anchored
+    rewrite, never rewritten (:mod:`vco_lib.hook_relative_paths`).
     """
+    if not dry_run:
+        emit_relative_hooks_deferral(folder, log=log)
     if not dry_run and state.readable:
         emit_conflict_deferral(folder, state, log=log)
     if kept_out:

@@ -85,3 +85,48 @@ def test_real_ancestry_of_this_process_contains_its_parent():
     if chain is None:
         pytest.skip("process ancestry not readable on this host")
     assert chain[0] == os.getpid() and os.getppid() in chain
+
+
+# ── W4R-08: Windows without psutil is enforced, and the warning says why ──
+
+
+def test_windows_without_psutil_uses_the_win32_probes(monkeypatch):
+    """No psutil on Windows used to make every probe ``None`` (advisory
+    guard). The ctypes probes now answer; this pins the delegation."""
+    monkeypatch.setattr(ul, "_psutil", lambda: None)
+    monkeypatch.setattr(ul, "_IS_WINDOWS", True)
+    monkeypatch.setattr(ul, "_win_pid_alive", lambda pid: pid == HOLDER)
+    monkeypatch.setattr(ul, "_win_start_time", lambda pid: 150.0)
+    monkeypatch.setattr(ul, "_win_parent_of", lambda pid: {HOLDER + 1: 1}.get(pid))
+    assert ul.pid_alive(HOLDER) is True and ul.pid_alive(HOLDER + 7) is False
+    assert ul.process_start_time(HOLDER) == 150.0
+    assert ul.ancestors(HOLDER + 1, parent_of=ul._parent_of) == [HOLDER + 1, 1]
+    # End to end: a live foreign holder is REFUSED on that interpreter.
+    decision = ul.decide(ul.Claim(HOLDER, 200.0),
+                         lineage=lambda: ul.ancestors(HOLDER + 1, parent_of=ul._parent_of))
+    assert decision.verdict == ul.REFUSE
+
+
+def test_the_unknowable_warning_names_the_cause_and_the_remedy(tmp_path, capsys, monkeypatch):
+    monkeypatch.setattr(ul, "_psutil", lambda: None)
+    _write(tmp_path, f"{HOLDER}\n200\n")
+    ul.refuse_if_foreign_update_running(
+        tmp_path, alive=lambda pid: None, started=lambda pid: None, lineage=lambda: None)
+    err = capsys.readouterr().err
+    assert "could not tell" in err
+    assert "psutil is not importable" in err and "venv" in err
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Win32 API probes run on Windows only")
+def test_the_win32_probes_answer_for_real_processes():
+    import subprocess
+
+    from tests.common.child_env import child_env
+
+    assert ul._win_pid_alive(os.getpid()) is True
+    assert ul._win_parent_of(os.getpid()) == os.getppid()
+    started = ul._win_start_time(os.getpid())
+    assert started is not None and started > 1_600_000_000
+    child = subprocess.Popen([sys.executable, "-c", "pass"], env=child_env())
+    child.wait(timeout=60)
+    assert ul._win_pid_alive(child.pid) in (False, None)

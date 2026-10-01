@@ -14,8 +14,9 @@ tests pin:
     behavior; intentional edits update the .txt AND this assertion
     in the same commit).
   * The self-reference invariant (``orchestrator-managed-paths.txt``
-    lists itself so ``update_orchestrator_at`` propagates new
-    editions of the list across existing installs).
+    lists itself so a copy install (``install_orchestrator``) carries new
+    editions of the list along; the file-copy ``update_orchestrator_at``
+    that propagated it into other installs was retired in v0.2.100).
   * Fatal-error behavior when the .txt file is missing — silently
     falling back to a default would re-introduce the drift bug
     PR-5 was written to fix.
@@ -50,8 +51,7 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     "orchestrator-managed-paths.txt",
     # Phase 0 of the diagrams-integration plan (2026-05-24): pinning
     # manifest for external npm packages. Listed here so
-    # `update_orchestrator_at` propagates new editions of the manifest
-    # to existing installs — same fail-safe self-reference shape used
+    # a copy install carries new editions of the manifest along — same fail-safe self-reference shape used
     # for `orchestrator-managed-paths.txt` itself.
     #
     # (v0.2.34: the .toml moved from the repo root into ``vco_lib/`` so
@@ -60,8 +60,8 @@ EXPECTED_MANAGED_PATHS: tuple[str, ...] = (
     # updated in lockstep so update propagation still finds it.)
     "vco_lib/bundled_mcp_versions.toml",
     # v0.2.83 WP-B5: the cross-language MCP scan/registration rule table
-    # (WP-B4). Listed here so ``update_orchestrator_at`` propagates future
-    # EDITS of the table to existing installs — same wheel-packaged,
+    # (WP-B4). Listed here so a copy install carries future EDITS of the
+    # table along — same wheel-packaged,
     # self-propagating shape as ``bundled_mcp_versions.toml`` above.
     "vco_lib/mcp_scan_rules.toml",
     # v0.2.91 WP-B: the deferral-condition registry table. NOT optional —
@@ -187,8 +187,8 @@ class OrchestratorManagedPathsContentsTests(unittest.TestCase):
 
     def test_self_reference_present(self) -> None:
         """PR-5 invariant: the .txt file lists itself so
-        ``update_orchestrator_at`` syncs a freshly-edited version
-        into every existing install. Dropping this entry would
+        a copy install (``install_orchestrator``) carries a
+        freshly-edited version along. Dropping this entry would
         silently freeze the whitelist for any user who installed
         before the next launcher release."""
         self.assertIn(

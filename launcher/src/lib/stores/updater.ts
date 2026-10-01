@@ -380,7 +380,7 @@ export function pickKind(status: {
   //   binary can change every other code path.
   // - remote_ahead ABOVE install_stale (v0.2.93, field incident 2026-09-08):
   //   a half-finished install previously masked the only action that PULLS
-  //   (`apply_pending_install` runs install.py from the tree as it stands),
+  //   (the then-`apply_pending_install` ran install.py from the tree as it stood),
   //   so a user whose update died mid-install could never reach a newer
   //   release through the badge — Resume re-ran the old installer forever.
   //   The update flow INCLUDES the install (its post-pull tail), so when the

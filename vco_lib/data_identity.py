@@ -43,6 +43,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
+from vco_lib import compose_mounts as _cm
 from vco_lib import containers as _containers
 from vco_lib import service_adoption as _sa
 from vco_lib import service_endpoints as _se
@@ -290,8 +291,7 @@ def effective_compose_mount(infra_dir: Path, service: str, compose_argv: Sequenc
     return Effective(mount, argv=tuple(argv))
 
 
-class _RenderShape(ValueError):
-    """A ``compose config`` render whose shape is not one this parser knows."""
+_RenderShape = _cm.MountShapeError
 
 
 def _type_name(value: Any) -> str:
@@ -300,73 +300,33 @@ def _type_name(value: Any) -> str:
 
 def _render_entry(entry: Any, where: str, dest: str) -> Optional[tuple[str, str]]:
     """``(kind, source)`` of one ``services.<svc>.volumes`` entry that targets
-    *dest*; ``None`` for an entry that targets something else. Raises
-    :class:`_RenderShape` naming the field for anything it cannot read."""
+    *dest*; ``None`` for an entry that targets something else. The shape is
+    read by :func:`vco_lib.compose_mounts.parse_mount_entry` (the ONE parser
+    the adoption's ``config_mounts`` also uses); this function adds the
+    recreate guard's STRICT policy — at the data destination only a ``bind``
+    or a ``volume`` with a source is understood. Raises :class:`_RenderShape`
+    naming the field for anything else."""
+    parsed = _cm.parse_mount_entry(entry, where)
+    if parsed is None or parsed.target != dest:
+        return None
     if isinstance(entry, str):
-        # podman-compose prints the file's short syntax as written.
-        parts = _sa._split_mount_entry(entry)
-        if len(parts) < 2:
-            if parts[0] == dest:
-                raise _RenderShape(f"{where} is an anonymous volume at {dest} ({entry!r}) — "
-                                   "compose would create a fresh, empty volume there")
-            return None
-        if parts[1] != dest:
-            return None
-        return ("bind" if _sa._is_bind_source(parts[0]) else "volume"), parts[0]
-    if isinstance(entry, dict):
-        # docker compose v2 normalises every entry to the long syntax
-        # (``type``/``source``/``target`` + ``bind:``/``volume:`` sub-keys).
-        target = entry.get("target")
-        if not isinstance(target, str) or not target:
-            raise _RenderShape(f"{where} has no string `target` (keys: "
-                               f"{', '.join(sorted(map(str, entry))) or 'none'})")
-        if target != dest:
-            return None
-        kind = entry.get("type")
-        if kind not in ("bind", "volume"):
-            raise _RenderShape(f"{where} mounts {dest} with type {kind!r} — only `bind` and "
-                               "`volume` are understood")
-        source = entry.get("source")
-        if not isinstance(source, str) or not source:
-            raise _RenderShape(f"{where} ({kind} at {dest}) has no `source` — an anonymous "
-                               "volume, i.e. a fresh, empty one")
-        return str(kind), source
-    raise _RenderShape(f"{where} is a {_type_name(entry)}, not a mount string or mapping")
+        if not parsed.source:
+            raise _RenderShape(f"{where} is an anonymous volume at {dest} ({entry!r}) — "
+                               "compose would create a fresh, empty volume there")
+        return parsed.kind, parsed.source
+    if parsed.kind not in ("bind", "volume"):
+        raise _RenderShape(f"{where} mounts {dest} with type {entry.get('type')!r} — only "
+                           "`bind` and `volume` are understood")
+    if not parsed.source:
+        raise _RenderShape(f"{where} ({parsed.kind} at {dest}) has no `source` — an anonymous "
+                           "volume, i.e. a fresh, empty one")
+    return parsed.kind, parsed.source
 
 
 def _volume_name(doc: Mapping[str, Any], key: str, where: str, project: Optional[str]) -> str:
     """The real name of the top-level volume *key* (what ``inspect`` reports
-    as the live mount's ``Name``)."""
-    top = doc.get("volumes")
-    if top is None:
-        top = {}
-    if not isinstance(top, dict):
-        raise _RenderShape(f"the top-level `volumes` is a {_type_name(top)}, not a map")
-    if key not in top:
-        raise _RenderShape(f"{where} names volume {key!r}, which the top-level `volumes` map "
-                           "does not declare")
-    spec = top[key]
-    if spec is None:
-        spec = {}  # podman-compose prints a bare `key:` declaration as null
-    if not isinstance(spec, dict):
-        raise _RenderShape(f"volumes.{key} is a {_type_name(spec)}, not a map")
-    name = spec.get("name")
-    if name is not None:
-        if not isinstance(name, str) or not name:
-            raise _RenderShape(f"volumes.{key}.name is a {_type_name(name)}, not a volume name")
-        return name
-    external = spec.get("external")
-    if isinstance(external, dict):  # the legacy `external: {name: …}` form
-        ext_name = external.get("name")
-        if ext_name is not None and (not isinstance(ext_name, str) or not ext_name):
-            raise _RenderShape(f"volumes.{key}.external.name is not a volume name")
-        return ext_name or key
-    if external:
-        return key
-    if not project:
-        raise _RenderShape(f"volumes.{key} has no explicit `name:` and the compose project is "
-                           f"not known, so its real name (<project>_{key}) cannot be derived")
-    return f"{project}_{key}"
+    as the live mount's ``Name``) — :func:`vco_lib.compose_mounts.volume_real_name`."""
+    return _cm.volume_real_name(doc.get("volumes"), key, where, project)
 
 
 def render_mount(doc: Mapping[str, Any], service: str, *, infra_dir: Optional[Path] = None,

@@ -37,7 +37,7 @@ import argparse
 import json
 import sqlite3
 import sys
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional, Sequence
 
@@ -59,22 +59,39 @@ _KG_PROFILE_MODEL: Mapping[str, Optional[str]] = {
 RECORD_REL = Path(".claude") / "state" / "ollama_pull_profile.json"
 
 CODE_EMBED_UNAVAILABLE_CID = "code_embed_backend_unavailable"
+#: The same outage for a code_embed VCO does not run (an adopted service, or a
+#: container another compose project created): VCO's session-start ensure
+#: does not touch it, so a human must (W3R-04 (c) / W4R-06).
+CODE_EMBED_ADOPTED_UNAVAILABLE_CID = "code_embed_adopted_backend_unavailable"
 
 
 @dataclass(frozen=True)
 class PullPlan:
     """The exact Ollama model set, split by consequence of a failed pull.
 
-    ``embedding`` models are load-bearing (a failed pull aborts the install);
+    ``embedding`` are every Ollama embedding model; of them only the
+    knowledge graph's (:attr:`kg_embedding`) are load-bearing — a failed pull
+    aborts the install — while a failed CODE-graph embedder
+    (``code_embedding``) is recorded and the run continues (W3R-09).
     ``inference`` models are the text-generation tier. ``code_backend_unavailable``
     is set when the configured code backend (CodeSage via code_embed) was
-    probed and is down — reported, never silently replaced.
+    probed and is down — reported, never silently replaced;
+    ``code_backend_detail`` says why and ``code_backend_vco_managed`` whether
+    VCO runs that container (it picks the row's class, W4R-06).
     """
 
     embedding: tuple[str, ...]
     inference: tuple[str, ...]
     rationale: tuple[str, ...] = ()
     code_backend_unavailable: bool = False
+    code_embedding: tuple[str, ...] = ()
+    code_backend_detail: str = ""
+    code_backend_vco_managed: bool = True
+
+    @property
+    def kg_embedding(self) -> tuple[str, ...]:
+        """The knowledge graph's embedders — the load-bearing pulls."""
+        return tuple(m for m in self.embedding if m not in self.code_embedding)
 
     @property
     def models(self) -> tuple[str, ...]:
@@ -194,11 +211,14 @@ def plan(
         ("text generation (profile cap): " if profile_override else "text generation tier: ")
         + (", ".join(inference) or "none")
     )
+    kg_models = _dedup((kg, *secondaries))
     return PullPlan(
-        embedding=_dedup((kg, *secondaries, code)),
+        embedding=_dedup((*kg_models, code)),
         inference=_dedup(inference),
         rationale=tuple(why),
         code_backend_unavailable=unavailable,
+        # A code model that is ALSO a KG embedder stays load-bearing.
+        code_embedding=_dedup((code,)) if code and code not in kg_models else (),
     )
 
 
@@ -209,7 +229,15 @@ def merge(plans: Sequence[PullPlan]) -> PullPlan:
         inference=_dedup(m for p in plans for m in p.inference),
         rationale=_dedup(r for p in plans for r in p.rationale),
         code_backend_unavailable=any(p.code_backend_unavailable for p in plans),
+        code_embedding=_merged_code_embedding(plans),
     )
+
+
+def _merged_code_embedding(plans: Sequence[PullPlan]) -> tuple[str, ...]:
+    """Code-only models of the union: a model any plan uses as a KG embedder
+    is load-bearing for the whole machine."""
+    kg = {m for p in plans for m in p.kg_embedding}
+    return _dedup(m for p in plans for m in p.code_embedding if m not in kg)
 
 
 # ── the recorded profile ────────────────────────────────────────────────────
@@ -335,12 +363,7 @@ def plan_from_machine(
         for s in selections
     ]
     merged = merge(plans)
-    return PullPlan(
-        embedding=merged.embedding,
-        inference=merged.inference,
-        rationale=_dedup((*notes, *merged.rationale)),
-        code_backend_unavailable=merged.code_backend_unavailable,
-    )
+    return replace(merged, rationale=_dedup((*notes, *merged.rationale)))
 
 
 def _db_default_code_model(launcher_db: Path) -> tuple[str, str]:
@@ -355,6 +378,21 @@ def _db_default_code_model(launcher_db: Path) -> tuple[str, str]:
     return model, backend
 
 
+#: Sentinel: :func:`plan_for_install` reads the code_embed row itself.
+_ROW_FROM_DB: Any = object()
+
+
+def _code_embed_row(launcher_db: Optional[Path]) -> Any:
+    """The machine's ``code_embed`` ``service_endpoints`` row, or ``None``
+    (no DB / no row / unreadable — read as VCO's default, a managed service)."""
+    from vco_lib import service_endpoints
+
+    try:
+        return service_endpoints.load_rows(launcher_db).get("code_embed")
+    except Exception:  # noqa: BLE001 — an unreadable registry is "no row"
+        return None
+
+
 def plan_for_install(
     root: Path,
     embed_config: Mapping[str, Any],
@@ -363,6 +401,7 @@ def plan_for_install(
     code_embed_url: Optional[str] = None,
     launcher_db: Optional[Path] = None,
     runtime: str = "",
+    code_embed_row: Any = _ROW_FROM_DB,
 ) -> PullPlan:
     """install.py step 7: record this run's profile, then derive the machine
     plan exactly as the launcher toggle does. Applied to the FINAL config —
@@ -370,43 +409,81 @@ def plan_for_install(
     CodeSage config probes the code_embed service (bounded) so an outage is
     reported instead of being papered over with another embedder — and a
     service still LOADING its model (a running container, or a port that
-    accepts but has not answered yet) is not an outage (W3R-04)."""
+    accepts but has not answered yet) is not an outage (W3R-04), for as long
+    as the container is young enough to be loading (W4R-06). Whether VCO runs
+    that container (``code_embed_row`` — default: the ``service_endpoints``
+    row read from ``launcher_db`` — plus the container's own labels) decides
+    which row an outage becomes."""
     record_profile(root, embed_config, capability_tier)
     reachable: Optional[bool] = None
+    detail = ""
+    managed = True
     if embed_config.get("code_model") == CODE_CODESAGE:
         from vco_lib import ollama_pull as _op
 
-        state = _op.code_embed_state(
-            code_embed_url, container_running=lambda: _op.code_embed_container_running(runtime))
+        if code_embed_row is _ROW_FROM_DB:
+            code_embed_row = _code_embed_row(launcher_db)
+        state, detail = _op.code_embed_verdict(
+            code_embed_url, container=lambda: _op.service_container_run(
+                root, runtime, "code_embed", code_embed_row))
         if state == _op.CODE_EMBED_WARMING:
-            print("    - code_embed is loading its model (first start downloads it) — "
-                  "warming, not down; nothing to do")
+            print(f"    - code_embed is loading its model ({detail}) — warming, not down; "
+                  "nothing to do")
         reachable = None if state is None else state != _op.CODE_EMBED_DOWN
-    return plan_from_machine(root, launcher_db, code_embed_reachable=reachable)
+        if reachable is False:
+            managed = _op.service_container(root, runtime, "code_embed", code_embed_row)[0] \
+                != _op.NOT_OWNED
+    pp = plan_from_machine(root, launcher_db, code_embed_reachable=reachable)
+    return replace(pp, code_backend_detail=detail, code_backend_vco_managed=managed)
 
 
 # ── the one code_embed-unavailable deferral ────────────────────────────────
 
 
-def code_embed_unavailable_entry(detail: str) -> Any:
-    """``code_embed_backend_unavailable`` — written by install step 7 only, for a
+def code_embed_unavailable_entry(detail: str, *, vco_managed: bool = True) -> Any:
+    """The code_embed outage row — written by install step 7 only, for a
     code_embed that is DOWN (never for one still loading its model, and never
-    from the embedding service's construction — W3R-04)."""
+    from the embedding service's construction — W3R-04).
+
+    Two rows, one per disposition (W3R-04 (c) / W4R-06):
+
+    * VCO runs the container → ``code_embed_backend_unavailable``,
+      ``auto_retryable``: the session-start ensure hook starts it, and the
+      ``code_embed_backend`` retry handler clears the row once it answers;
+    * an adopted / foreign code_embed → ``code_embed_adopted_backend_unavailable``,
+      ``action_required``: VCO does not start what it does not run.
+    """
     from vco_lib.deferral_report import DeferralEntry
 
+    why = (
+        "The code graph is configured for CodeSage in the code_embed service. VCO "
+        "does not switch the code graph to another embedder behind your back — one "
+        "code graph keeps exactly one embedder. The knowledge graph is unaffected."
+    )
+    fallback = ("Developers who accept a mixed-embedder code graph may set "
+                "VCO_CODE_EMBED_ALLOW_FALLBACK=1.")
+    if vco_managed:
+        return DeferralEntry(
+            condition_id=CODE_EMBED_UNAVAILABLE_CID,
+            title="Code-embedding backend (code_embed service) unavailable",
+            detected=detail,
+            why_deferred=why,
+            command_to_apply=(
+                "Nothing to do if it comes back: the next session start starts VCO's "
+                "code_embed container and VCO clears this entry once the service answers. "
+                f"To start it now: `{runtime_command_hint('start vco_code_embed')}`, or "
+                f"re-run `python install.py --update`. {fallback}"
+            ),
+            severity="warning",
+        )
     return DeferralEntry(
-        condition_id=CODE_EMBED_UNAVAILABLE_CID,
-        title="Code-embedding backend (code_embed service) unavailable",
+        condition_id=CODE_EMBED_ADOPTED_UNAVAILABLE_CID,
+        title="Code-embedding backend (an adopted code_embed) unavailable",
         detected=detail,
-        why_deferred=(
-            "The code graph is configured for CodeSage in the code_embed service. VCO "
-            "does not switch the code graph to another embedder behind your back — one "
-            "code graph keeps exactly one embedder. The knowledge graph is unaffected."
-        ),
+        why_deferred=why + " VCO does not run this code_embed, so it does not start it.",
         command_to_apply=(
-            f"Start the service: `{runtime_command_hint('start vco_code_embed')}`, "
-            "or re-run `python install.py --update`. Developers who "
-            "accept a mixed-embedder code graph may set VCO_CODE_EMBED_ALLOW_FALLBACK=1."
+            "Start the code_embed service you configured (its container or host), then "
+            f"re-run `python install.py --update`. {fallback}"
         ),
         severity="warning",
     )
@@ -456,6 +533,7 @@ def _emit(as_json: bool, payload: dict[str, Any], text: str, rc: int) -> int:
 
 
 __all__ = [
+    "CODE_EMBED_ADOPTED_UNAVAILABLE_CID", "CODE_EMBED_UNAVAILABLE_CID",
     "KgSelection", "PlanUnavailable", "PullPlan", "code_embed_unavailable_entry",
     "kg_model_for", "kg_secondary_models", "machine_kg_selections", "merge", "plan",
     "plan_for_install", "plan_from_machine", "read_record", "record_profile",

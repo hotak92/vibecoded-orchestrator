@@ -48,9 +48,11 @@ use tauri::{AppHandle, Runtime};
 /// user explicitly asked to quit and a flaky container runtime must not
 /// strand them in a half-quit state.
 ///
-/// Implementation: delegates to `commands::lifecycle::services_stop_all`
-/// which runs `<runtime> compose stop` (no `--volumes` flag — volumes
-/// are preserved). Idempotent: succeeds even when nothing is up.
+/// Implementation: delegates to `commands::lifecycle::services_stop_all`,
+/// which stops each compose-managed service's container BY NAME
+/// (`stop --time`, since v0.2.97) and reads its state back to verify the
+/// stop (v0.2.100) — nothing is removed, volumes are untouched. Idempotent:
+/// succeeds even when nothing is up.
 #[allow(dead_code)]
 pub async fn stop_all<R: Runtime>(_app: &AppHandle<R>) -> Result<(), String> {
     if let Err(e) = crate::commands::lifecycle::services_stop_all().await {

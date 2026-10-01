@@ -25,9 +25,10 @@ Content source is WEAVIATE (not source files): canonical rows
 (``chunk_num`` 0/NULL) of ``<Prefix>_CodeFunction`` + ``<Prefix>_CodeClass``.
 
 Triggers (D3):
-  1. Background rider on the resync module (``spawn_background_resync``
-     spawns this as a detached child after an update/rebuild — exactly when
-     rows change).
+  1. Background rider on the resync module: the resync DRIVER
+     (``run_resync_and_verify``) spawns this as a detached child once its
+     analyzer has EXITED (v0.2.100 WP-13 — before, it started beside the
+     analyzer and summarised the rows the walk was about to replace).
   2. Manual CLI: ``.claude/scripts/generate-code-summary.py --project X
      [--max-per-run N] [--force]``.
   NOT a per-edit hook (code edits are orders of magnitude more frequent than
@@ -43,6 +44,19 @@ Cost gating (D3):
   * Triviality skip: bodies < ~200 chars get ``one_liner`` only.
   * NO global timeout (locked rule) — per-call timeout only
     (``KG_SUMMARY_TIMEOUT``, via summary_backends).
+  * v0.2.100 WP-13 — batching: on the CLI tier, up to
+    ``VCO_CODE_SUMMARY_BATCH_SIZE`` (default 8) entities share ONE
+    ``claude -p`` spawn through the JSON envelope in summary_backends; an
+    entity the reply does not answer validly falls back to its own calls.
+    Every spawn starts with no MCP server and no hook (see
+    ``summary_backends.cli_isolation_args``).
+
+Exit status (v0.2.100 WP-13): 0 after a complete scan; 1 when Weaviate is
+unreachable or a collection scan fails — the failure is named in the run
+summary and that collection's sidecar entries are kept, never GC'd against
+an empty scan. Properties are fetched per collection from its own schema
+(``coll.config.get()``), so a property only CodeFunction carries
+(``n_callers``) no longer fails the CodeClass scan.
 
 Backends: the shared 4-tier ladder (``summary_backends.py`` — claude CLI →
 Ollama → OpenAI-with-consent → Anthropic API → skip). No backend → logs +
@@ -97,11 +111,24 @@ _ENV_MAX_PER_RUN = "VCO_CODE_SUMMARY_MAX_PER_RUN"
 # it all) — halves call volume on typical codebases (plan §3 D3).
 TRIVIAL_BODY_CHARS = 200
 
+# v0.2.100 WP-13: entities per CLI spawn. Each `claude -p` costs a process
+# start (plus, before WP-13, every MCP server registered for the folder), so
+# the CLI tier sends several entities in one JSON envelope; any entity the
+# reply does not answer validly falls back to one call per entity. 1 turns
+# batching off. Only the CLI tier batches: a local model's output budget
+# (Ollama num_predict) would truncate a multi-entity reply.
+DEFAULT_BATCH_SIZE = 8
+_ENV_BATCH_SIZE = "VCO_CODE_SUMMARY_BATCH_SIZE"
+# Upper bound on one batch prompt (characters) — a batch closes early rather
+# than send a prompt the per-call timeout cannot cover.
+BATCH_CHAR_BUDGET = 48_000
+
 # Collections summarised. CodeModule is excluded at v1: module rows embed a
 # generated module_summary already; Function/Class are where the summary tier
 # renders raw body snippets today.
 BASE_COLLECTIONS = ("CodeFunction", "CodeClass")
 _BODY_FIELD = {"CodeFunction": "function_body", "CodeClass": "class_body"}
+_KIND = {"CodeFunction": "function", "CodeClass": "class"}
 
 
 def log(msg: str) -> None:
@@ -151,6 +178,19 @@ def resolve_max_per_run(cli_value: "int | None", env: "dict | None" = None) -> i
             except ValueError:
                 pass
     return DEFAULT_MAX_PER_RUN
+
+
+def resolve_batch_size(env: "dict | None" = None) -> int:
+    """Env override → default; values below 1 / unparseable fall through."""
+    raw = (env if env is not None else os.environ).get(_ENV_BATCH_SIZE)
+    if raw is not None and str(raw).strip():
+        try:
+            value = int(str(raw).strip())
+            if value >= 1:
+                return value
+        except ValueError:
+            pass
+    return DEFAULT_BATCH_SIZE
 
 
 def is_trivial(body: str) -> bool:
@@ -326,6 +366,82 @@ Code:
     return call_llm(prompt)
 
 
+# v0.2.100 WP-13 — the same three asks, for several entities in one call.
+BATCH_INSTRUCTIONS = """You are given several code entities. For EACH one write a JSON object with:
+- "one_liner": a 1-sentence summary of what it does. Be maximally specific — name the concrete behaviour, not the category.
+- "summary" (only when the entity's Wanted line lists it): 2-4 sentences — its role, its key behaviour (inputs/outputs, side effects, error handling), and when it is used. Be technical and specific.
+- "chunks" (only when the Wanted line lists chunk numbers): an object mapping each listed chunk number (as a string) to a 1-sentence summary of what THAT section covers."""
+
+
+def batch_wants(row: dict, chunks: "list | None") -> "tuple[bool, list[str]]":
+    """(summary wanted?, chunk numbers wanted) — the per-entity rules
+    (triviality skip, chunk summaries for multi-chunk entities) unchanged."""
+    want_summary = not is_trivial(row.get("_body") or "")
+    chunk_nums = [str(cn) for cn, _ in (chunks or [])]
+    return want_summary, chunk_nums
+
+
+def batch_block(kind: str, row: dict, chunks: "list | None") -> str:
+    """One entity's block inside a batch prompt (same truncation limits as
+    the single-entity prompts)."""
+    want_summary, chunk_nums = batch_wants(row, chunks)
+    wanted = ["one_liner"] + (["summary"] if want_summary else [])
+    if chunk_nums:
+        wanted.append("chunks " + ", ".join(chunk_nums))
+    lines = [
+        f"Kind: {kind}",
+        f"Name: {row.get('full_name') or ''}",
+        f"Signature: {row.get('signature') or ''}",
+        f"Doc: {str(row.get('doc') or '')[:800]}",
+        f"Wanted: {'; '.join(wanted)}",
+        "",
+        "Code:",
+        str(row.get("_body") or "")[:4000],
+    ]
+    total = len(chunk_nums)
+    for cn, chunk_body in chunks or []:
+        lines += ["", f"Chunk {cn}/{total}:", str(chunk_body or "")[:2000]]
+    return "\n".join(lines)
+
+
+def calls_for_one(row: dict, chunks: "list | None") -> int:
+    """CLI calls the single-entity path makes for ``row`` (one_liner +
+    summary unless trivial + one per chunk)."""
+    want_summary, chunk_nums = batch_wants(row, chunks)
+    return 1 + int(want_summary) + len(chunk_nums)
+
+
+def _valid_text(value: object) -> bool:
+    return isinstance(value, str) and bool(value.strip()) and not _sb.is_non_answer(value)
+
+
+def batch_answer(answer: object, want_summary: bool,
+                 chunk_nums: "list[str]") -> "tuple[str, str, dict | None] | None":
+    """``(one_liner, summary, chunk_summaries)`` from one entity's batch
+    answer, or ``None`` when ANY wanted part is missing or a non-answer —
+    the entity then falls back to its own calls (nothing half-written)."""
+    if not isinstance(answer, dict):
+        return None
+    one_liner = answer.get("one_liner")
+    if not _valid_text(one_liner):
+        return None
+    summary = answer.get("summary") if want_summary else ""
+    if want_summary and not _valid_text(summary):
+        return None
+    chunk_summaries = None
+    if chunk_nums:
+        got = answer.get("chunks")
+        if not isinstance(got, dict):
+            return None
+        chunk_summaries = {}
+        for cn in chunk_nums:
+            text = got.get(cn)
+            if not _valid_text(text):
+                return None
+            chunk_summaries[cn] = str(text).strip()
+    return str(one_liner).strip(), str(summary or "").strip(), chunk_summaries
+
+
 def build_entry(row: dict, collection: str, *, one_liner: str, summary: str,
                 backend: str, chunk_summaries: "dict | None" = None) -> dict:
     """Assemble one FROZEN-v1 sidecar entry (plan §3 D1)."""
@@ -421,8 +537,37 @@ _ROW_PROPS = [
 ]
 
 
-def _iter_canonical_rows(client, prefix: str, base: str) -> list:
-    """All canonical rows (chunk_num 0/NULL) of ``<prefix>_<base>`` as dicts."""
+def schema_properties(coll) -> "set[str] | None":
+    """The property names ``coll`` actually declares (``coll.config.get()``),
+    or ``None`` when the config cannot be read."""
+    try:
+        config = coll.config.get()
+        return {str(p.name) for p in (getattr(config, "properties", None) or [])}
+    except Exception as exc:  # noqa: BLE001 — the caller reports the scan as failed
+        log(f"  code-summary: cannot read the schema of {getattr(coll, 'name', '?')}: {exc}")
+        return None
+
+
+def row_properties(base: str, declared: "set[str]") -> "list[str]":
+    """The properties to fetch for ``base``: what this generator wants,
+    intersected with what the collection declares (v0.2.100 WP-13).
+
+    Asking for a property a collection does not declare fails the whole
+    iterator: ``n_callers`` is a CodeFunction property, so the CodeClass
+    scan used to fail on it every run and no class was ever summarised. A
+    wanted property the schema lacks reads as missing (``n_callers`` → 0 in
+    :func:`priority_key`), which every consumer already handles."""
+    wanted = _ROW_PROPS + [_BODY_FIELD[base]]
+    return [p for p in wanted if p in declared]
+
+
+def _iter_canonical_rows(client, prefix: str, base: str) -> "list | None":
+    """All canonical rows (chunk_num 0/NULL) of ``<prefix>_<base>`` as dicts.
+
+    ``[]`` when the collection does not exist (nothing to summarise);
+    ``None`` when the scan FAILED — the caller reports it, exits non-zero and
+    keeps that collection's sidecar entries (an empty scan read as "no live
+    rows" would GC every one of them)."""
     name = f"{prefix}_{base}"
     try:
         if hasattr(client.collections, "exists") and not client.collections.exists(name):
@@ -430,11 +575,14 @@ def _iter_canonical_rows(client, prefix: str, base: str) -> list:
         coll = client.collections.get(name)
     except Exception as exc:  # noqa: BLE001
         log(f"  code-summary: cannot open {name}: {exc}")
-        return []
+        return None
+    declared = schema_properties(coll)
+    if declared is None:
+        return None
     body_field = _BODY_FIELD[base]
     rows = []
     try:
-        for obj in coll.iterator(return_properties=_ROW_PROPS + [body_field]):
+        for obj in coll.iterator(return_properties=row_properties(base, declared)):
             props = dict(getattr(obj, "properties", None) or {})
             chunk_num = props.get("chunk_num")
             if chunk_num not in (None, 0):
@@ -443,7 +591,7 @@ def _iter_canonical_rows(client, prefix: str, base: str) -> list:
             rows.append(props)
     except Exception as exc:  # noqa: BLE001 — partial scan is worse than none
         log(f"  code-summary: scan of {name} failed: {exc}")
-        return []
+        return None
     return rows
 
 
@@ -474,8 +622,69 @@ def _fetch_chunk_bodies(client, prefix: str, base: str, full_name: str) -> list:
 # ──────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────
+def _summarise_one(client, prefix: str, base: str, kind: str, row: dict,
+                   chunks: "list | None" = None) -> "tuple[str, str, dict | None]":
+    """One entity, one call per ask (the pre-batching path and the fallback
+    for any entity a batch reply did not answer). Raises on a backend
+    failure — the caller isolates it."""
+    full_name = str(row.get("full_name") or "")
+    body = row.get("_body") or ""
+    signature = str(row.get("signature") or "")
+    doc = str(row.get("doc") or "")
+    one_liner = generate_one_liner(kind, full_name, signature, doc, body)
+    summary = "" if is_trivial(body) else generate_summary(
+        kind, full_name, signature, doc, body)
+    chunk_summaries = None
+    total_chunks = int(row.get("total_chunks") or 1)
+    if total_chunks > 1:
+        if chunks is None:
+            chunks = _fetch_chunk_bodies(client, prefix, base, full_name)
+        chunk_summaries = {}
+        for cn, chunk_body in chunks:
+            chunk_summaries[str(cn)] = generate_chunk_summary(
+                full_name, cn, total_chunks, chunk_body)
+    return one_liner, summary, chunk_summaries
+
+
+def _batch_groups(items: list, batch_size: int, block_of) -> list:
+    """Split ``items`` into batches of at most ``batch_size`` entities whose
+    blocks fit :data:`BATCH_CHAR_BUDGET` (a lone oversize entity is its own
+    batch). ``block_of(item)`` → ``(block_text, chunks)``. Returns a list of
+    ``[(item, block_text, chunks), ...]``."""
+    groups: list = []
+    current: list = []
+    chars = 0
+    for row in items:
+        block, chunks = block_of(row)
+        if current and (len(current) >= batch_size
+                        or chars + len(block) > BATCH_CHAR_BUDGET):
+            groups.append(current)
+            current, chars = [], 0
+        current.append((row, block, chunks))
+        chars += len(block)
+    if current:
+        groups.append(current)
+    return groups
+
+
+class _RunState:
+    """Counters of one run (one place, so the batch and fallback paths
+    cannot drift on what counts as generated / failed)."""
+
+    def __init__(self) -> None:
+        self.generated = 0
+        self.failures = 0
+        self.batch_calls = 0
+        self.exhausted = False
+        self.persisted_at = 0
+
+
 def run(project: str, *, project_root: Path, max_per_run: int,
         force: bool) -> int:
+    """One generation pass. Exit status: 0 on a complete scan (whatever the
+    backend did — a skipped or cooling-down ladder is not a failure), 1 when
+    Weaviate could not be reached or a collection scan failed (named in the
+    run summary; that collection's sidecar entries are kept, not GC'd)."""
     formats_path = project_root / FORMATS_RELPATH
     prefix = _collection_prefix(project)
     if prefix is None:
@@ -486,83 +695,142 @@ def run(project: str, *, project_root: Path, max_per_run: int,
 
     client = _connect_weaviate()
     if client is None:
-        return 0
+        log("  code-summary: nothing scanned (Weaviate unreachable) — exit 1")
+        return 1
 
     try:
         formats = load_formats(formats_path)
         all_rows: dict[str, list] = {}
+        scan_failed: list[str] = []
         live_keys: set = set()
         for base in BASE_COLLECTIONS:
             rows = _iter_canonical_rows(client, prefix, base)
+            if rows is None:
+                scan_failed.append(base)
+                continue
             all_rows[base] = rows
             for r in rows:
                 fp, fn = r.get("file_path") or "", r.get("full_name") or ""
                 if fp and fn:
                     live_keys.add(entry_key(fp, fn))
 
-        generated = 0
-        failures = 0
-        exhausted = False
-        for base in BASE_COLLECTIONS:
-            if exhausted:
-                break
-            kind = "function" if base == "CodeFunction" else "class"
-            for row in plan_work(all_rows[base], formats, force=force):
-                if generated >= max_per_run:
-                    break
-                full_name = str(row.get("full_name") or "")
-                body = row.get("_body") or ""
-                signature = str(row.get("signature") or "")
-                doc = str(row.get("doc") or "")
-                try:
-                    one_liner = generate_one_liner(
-                        kind, full_name, signature, doc, body)
-                    summary = "" if is_trivial(body) else generate_summary(
-                        kind, full_name, signature, doc, body)
-                    chunk_summaries = None
-                    total_chunks = int(row.get("total_chunks") or 1)
-                    if total_chunks > 1:
-                        chunk_summaries = {}
-                        for cn, chunk_body in _fetch_chunk_bodies(
-                                client, prefix, base, full_name):
-                            chunk_summaries[str(cn)] = generate_chunk_summary(
-                                full_name, cn, total_chunks, chunk_body)
-                except Exception as exc:  # noqa: BLE001 — per-entity isolation
-                    failures += 1
-                    log(f"  code-summary: {full_name} failed: {exc}")
-                    # v0.2.92 WP-Q: when every tier has been demoted there
-                    # is nothing left to try, and continuing would walk the
-                    # remaining worklist raising once per entity. Stop and
-                    # say so; the next run picks up where this one left off
-                    # (the sidecar is written incrementally).
-                    if select_backend() == "skip":
-                        log("  code-summary: no backend left — every tier is "
-                            "cooling down; stopping this run early "
-                            "(resumes next run)")
-                        exhausted = True
-                        break
-                    continue
-                key = entry_key(str(row.get("file_path") or ""), full_name)
-                formats[key] = build_entry(
-                    row, base,
-                    one_liner=one_liner, summary=summary,
-                    backend=_sb._BACKEND_CACHE.get("choice", "?"),
-                    chunk_summaries=chunk_summaries,
-                )
-                generated += 1
-                # Incremental persistence: a killed run keeps its progress.
-                if generated % 10 == 0:
-                    atomic_write_json(formats_path, formats)
+        state = _RunState()
+        batch_size = resolve_batch_size() if select_backend() == "cli" else 1
 
-        # D4: GC entries whose key matches no live canonical row (bounded to
-        # the collections scanned this run — full scan == full GC).
-        removed = gc_dead_keys(formats, live_keys)
-        if generated or removed or force:
+        def _store(row: dict, base: str, result: tuple) -> None:
+            one_liner, summary, chunk_summaries = result
+            key = entry_key(str(row.get("file_path") or ""),
+                            str(row.get("full_name") or ""))
+            formats[key] = build_entry(
+                row, base, one_liner=one_liner, summary=summary,
+                backend=_sb._BACKEND_CACHE.get("choice", "?"),
+                chunk_summaries=chunk_summaries,
+            )
+            state.generated += 1
+            # Incremental persistence: a killed run keeps its progress.
+            if state.generated - state.persisted_at >= 10:
+                atomic_write_json(formats_path, formats)
+                state.persisted_at = state.generated
+
+        def _ladder_exhausted() -> bool:
+            # v0.2.92 WP-Q: when every tier has been demoted there is
+            # nothing left to try, and continuing would walk the remaining
+            # worklist raising once per entity. Stop and say so; the next
+            # run picks up where this one left off.
+            if select_backend() == "skip":
+                log("  code-summary: no backend left — every tier is "
+                    "cooling down; stopping this run early "
+                    "(resumes next run)")
+                state.exhausted = True
+            return state.exhausted
+
+        def _one(base: str, kind: str, row: dict, chunks) -> None:
+            try:
+                result = _summarise_one(client, prefix, base, kind, row, chunks)
+            except Exception as exc:  # noqa: BLE001 — per-entity isolation
+                state.failures += 1
+                log(f"  code-summary: {row.get('full_name')} failed: {exc}")
+                _ladder_exhausted()
+                return
+            _store(row, base, result)
+
+        def _batch(group: list) -> None:
+            ids = [f"e{i + 1}" for i in range(len(group))]
+            answers: dict = {}
+            try:
+                reply = call_llm(_sb.build_batch_prompt(
+                    BATCH_INSTRUCTIONS,
+                    [(item_id, block) for item_id, (_item, block, _c) in zip(ids, group)],
+                ))
+                state.batch_calls += 1
+                answers = _sb.parse_batch_reply(reply, ids)
+            except Exception as exc:  # noqa: BLE001 — falls back per entity
+                log(f"  code-summary: batch of {len(group)} failed: {exc}")
+                if _ladder_exhausted():
+                    return
+            for item_id, ((base, row), _block, chunks) in zip(ids, group):
+                if state.exhausted:
+                    return
+                want_summary, chunk_nums = batch_wants(row, chunks)
+                result = batch_answer(answers.get(item_id), want_summary, chunk_nums)
+                if result is None:
+                    # graceful single-entity fallback
+                    _one(base, _KIND[base], row, chunks)
+                else:
+                    _store(row, base, result)
+
+        # ONE worklist across the collections (functions first, then
+        # classes, each by priority), capped as a whole: --max-per-run
+        # bounds the entities visited, and a batch may mix kinds.
+        worklist: list = []
+        for base in BASE_COLLECTIONS:
+            if base not in all_rows:
+                continue
+            work = plan_work(all_rows[base], formats, force=force)
+            worklist += [(base, row) for row in
+                         work[:max(0, max_per_run - len(worklist))]]
+
+        if batch_size <= 1:
+            for base, row in worklist:
+                if state.exhausted:
+                    break
+                _one(base, _KIND[base], row, None)
+        else:
+            def _block_of(item: tuple):
+                base, row = item
+                chunks = None
+                if int(row.get("total_chunks") or 1) > 1:
+                    chunks = _fetch_chunk_bodies(
+                        client, prefix, base, str(row.get("full_name") or ""))
+                return batch_block(_KIND[base], row, chunks), chunks
+
+            for group in _batch_groups(worklist, batch_size, _block_of):
+                if state.exhausted:
+                    break
+                (base, row), _block, chunks = group[0]
+                if len(group) == 1 and calls_for_one(row, chunks) == 1:
+                    # A lone entity that needs one call anyway: the envelope
+                    # would save nothing and add a parse step.
+                    _one(base, _KIND[base], row, chunks)
+                else:
+                    _batch(group)
+
+        # D4: GC entries whose key matches no live canonical row — only for
+        # the collections whose scan SUCCEEDED (a failed scan has no live set).
+        scanned = tuple(b for b in BASE_COLLECTIONS if b in all_rows)
+        removed = gc_dead_keys(formats, live_keys, scanned)
+        if state.generated or removed or force:
             atomic_write_json(formats_path, formats)
-        log(f"  code-summary: {generated} generated, {removed} pruned, "
-            f"{failures} failed{' (backends exhausted)' if exhausted else ''} "
-            f"(cap {max_per_run}) → {formats_path}")
-        return 0
+        failed_note = (
+            f"; SCAN FAILED for {', '.join(prefix + '_' + b for b in scan_failed)} "
+            "(entries kept, see above)" if scan_failed else ""
+        )
+        log(f"  code-summary: {state.generated} generated, {removed} pruned, "
+            f"{state.failures} failed"
+            f"{' (backends exhausted)' if state.exhausted else ''}"
+            f", {state.batch_calls} batch call(s) of up to {batch_size}"
+            f" (cap {max_per_run}){failed_note} → {formats_path}")
+        return 1 if scan_failed else 0
     finally:
         try:
             client.close()

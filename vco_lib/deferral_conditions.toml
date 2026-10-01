@@ -369,11 +369,19 @@ notes = "v0.2.100 (AD-6, L1-F09): a model the configuration uses could not be pu
 retry_action = "retry:py:ollama_models"
 
 [conditions.code_embed_backend_unavailable]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (W3R-04 (c), W4R-06): VCO's OWN code_embed container (vco_managed row, VCO's compose labels) was DOWN at install step 7 — exited/absent and not answering, or running longer than a model load takes (ollama_pull.CODE_EMBED_WARMING_MAX_S) without answering /health. The session-start ensure hook starts it; `retry:py:code_embed_backend` resolves the row once the code backend answers (gate 4's positive evidence); the next install run that finds it up drops it. An adopted or foreign code_embed is `code_embed_adopted_backend_unavailable` instead. Emitter: embedding_pull_plan.code_embed_unavailable_entry via ollama_pull.ensure_plan_step."
+retry_action = "retry:py:code_embed_backend"
+
+[conditions.code_embed_adopted_backend_unavailable]
 class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100: the configured code-embedding backend is not available on this machine. Registered ahead of its emitter (WP-09)."
+notes = "v0.2.100 (W3R-04 (c), W4R-06): the configured code_embed is NOT VCO's to start — the row is adopted, or the container's compose labels name another project — and it was DOWN at install step 7. VCO starts nothing it does not run, so a human must; the next install run that finds it up drops the row. Emitter: embedding_pull_plan.code_embed_unavailable_entry(vco_managed=False) via ollama_pull.ensure_plan_step."
 
 [conditions.gated_delivery_skipped]
 class = "informational_record"
@@ -422,7 +430,14 @@ class = "informational_record"
 owner = "vct-launcher-core (container_runtime.rs reaper)"
 clear_probe = "paired-resolution"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-12, L2-F17, WP-06): a module container the database calls a leftover carries no launcher ownership label (created before v0.2.100, or not by this launcher), so the reaper left it alone. Kept true by `container_runtime::record_unlabelled_modules`, called after every reaper pass by BOTH surfaces (launcher `module_service`, hub `module_supervisor`): rewritten while unlabelled containers remain, resolved by the first pass that finds none. NOT install.py-owned (W1R-15)."
+notes = "v0.2.100 (AD-12, L2-F17, WP-06): a module container the database calls a leftover carries no launcher ownership label (created before v0.2.100, by another launcher, or by a launcher whose install root did not resolve from its executable — W4R-09: such a launcher logs once at create that it omits the label), so the reaper left it alone. Kept true by `container_runtime::record_unlabelled_modules`, called after every reaper pass by BOTH surfaces (launcher `module_service`, hub `module_supervisor`): rewritten while unlabelled containers remain, resolved by the first pass that finds none. NOT install.py-owned (W1R-15)."
+
+[conditions.module_manifest_invalid]
+class = "action_required"
+owner = "launcher (modules.rs resolve_manifest_for_install)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (W4R-07): an INSTALLED module manifest (`~/.vct/modules/<id>/vct-module.json`) no longer parses — typically a version a <=0.2.99 launcher accepted (`1.0.0-beta`, `min_launcher_version = \"0.2\"`) and the strict X.Y.Z rule (F-W1-02) now refuses. The resolver falls back to the catalog (offline / unlisted: nothing); the row names each module, file and offending value. Kept true by `modules::record_invalid_installed_manifests`, called on every `resolve_manifest_for_install`: rewritten while any installed manifest fails to parse, resolved once none does (updated, reinstalled or uninstalled). NOT install.py-owned (a launcher-side state, same reason as W1R-15)."
 
 [conditions.update_install_phase_failed]
 class = "action_required"
@@ -1125,6 +1140,21 @@ entry — the user picks the state (re-disable, or Enable on the Disabled row, \
 which clears the stale parked row). Emitted by the bundle update; cleared by the \
 probe once no hook is both parked and running (None — keep — when launcher.db \
 or settings.json cannot be read)."""
+
+[conditions.project_hooks_relative_paths]
+class = "action_required"
+owner = "vco_lib.hook_relative_paths"
+clear_probe = "probe:py:project_hooks_relative_paths_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.100 WP-17 (F-W1-16). A project's OWN hook command invokes a \
+`.claude/hooks/` script by a relative path, so it fails ("No such file or \
+directory", exit 127) whenever the session's cwd moves — on every call, each \
+failure written into the transcript. VCO's shipped hooks are anchored by the \
+bundle merge; the project's own are the user's configuration, so the bundle \
+update OFFERS the anchored rewrite (`python -m vco_lib.hook_relative_paths \
+anchor`) instead of applying it. Emitted by the bundle update; cleared by the \
+probe once no relative hook command remains in .claude/settings.json or \
+.claude/settings.local.json (None — keep — when either cannot be read)."""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Paired-resolution conditions (family C)

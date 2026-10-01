@@ -664,13 +664,13 @@ def _data_listing(runtime: str, *, run: Optional[RunFn], install_root: Optional[
     )
 
 
-_DRIVE_PATH_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
 def _is_bind_source(value: str) -> bool:
-    """Compose's rule for a volume SOURCE: a path (``/``, ``.``, ``~``, ``\\``
-    or a drive letter) is a bind mount; anything else names a volume."""
-    return value.startswith(("/", ".", "~", "\\")) or bool(_DRIVE_PATH_RE.match(value))
+    """Compose's rule for a volume SOURCE (a path is a bind mount; anything
+    else names a volume) — :func:`vco_lib.compose_mounts.is_bind_source`, the
+    one home (v0.2.100 F-W3-10)."""
+    from vco_lib.compose_mounts import is_bind_source  # noqa: PLC0415
+
+    return is_bind_source(value)
 
 
 def effective_data_sources(env_file_text: str, env: Mapping[str, str]) -> dict[str, str]:

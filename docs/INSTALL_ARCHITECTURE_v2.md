@@ -170,10 +170,15 @@ into `~/.claude.json` (soft-fail — the install completes even if registration
 fails; opt out with `--skip-mcp-registration`) and deploys/refreshes the
 launcher binary.
 
-**Resume**: on re-run, install.py reads the log and skips steps whose latest
-phase in the most-recent session is `ok`/`skip` — after re-verifying the
-actual side effect (venv on disk, schema in Weaviate). Sessions older than
-24 hours are stale and ignored; `--no-resume` forces every step.
+**Resume** (v0.2.100, `vco_lib/install_resume.py`): on re-run, a step is
+skipped only when the most recent session (younger than 24 hours) recorded
+it as completed AND a verifier proves its side effect — steps 1/10 (same
+interpreter), 3/10 (the venv interpreter runs), 4/10 (dependency
+fingerprint unchanged, `pip check` clean, `vco_lib` imports from the
+checkout) and 7/10 (`/api/tags` lists every planned model). Each prints
+`verified, skipped`. Steps 2, 5/5b and 6 always run (they reconcile live
+state). `--no-resume` forces every step. Detail:
+[`INSTALL_RECOVERY.md`](INSTALL_RECOVERY.md).
 `--lightweight` is the fast path for re-installs on a hot system (path
 rewrite + venv triage + container ensure, no model pulls or seeding) — see
 [`INSTALL_RECOVERY.md`](INSTALL_RECOVERY.md).

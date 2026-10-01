@@ -130,19 +130,33 @@ fn every_no_stderr_fallback_carries_the_exit_status() {
     assert!(files.len() > 50, "suspiciously few sources scanned: {}", files.len());
 
     let mut violations = Vec::new();
-    let mut sites = 0usize;
+    let mut homes = std::collections::BTreeSet::new();
     for f in &files {
         let src = std::fs::read_to_string(f).unwrap();
         let name = f.strip_prefix(env!("CARGO_MANIFEST_DIR")).unwrap_or(f).display().to_string();
-        sites += strip_line_comments(&src)
-            .iter()
-            .filter(|l| l.to_ascii_lowercase().contains(PHRASE))
-            .count();
+        let lines = strip_line_comments(&src);
+        let prod = &lines[..test_module_start(&lines)];
+        if prod.iter().any(|l| l.to_ascii_lowercase().contains(PHRASE)) {
+            homes.insert(name.replace('\\', "/").trim_start_matches('/').to_string());
+        }
         violations.extend(check_source(&name, &src));
     }
-    // The seven I-06 sites plus the fetch sentinel exist today; if the count
-    // collapses to zero the scan is looking in the wrong place.
-    assert!(sites >= 8, "expected the known `{PHRASE}` sites, scanned {sites}");
+    // v0.2.100 F-W4-02: the seven I-06 sites now render through ONE helper,
+    // `vct_launcher_core::process::failure_evidence` (status mandatory by its
+    // signature); the git fetch keeps its own git-aware evidence line. Any
+    // other production file spelling the fallback is a new copy of the rule.
+    let expected: std::collections::BTreeSet<String> = [
+        "vct-launcher-core/src/process.rs",
+        "src/commands/upstream_fetch.rs",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    assert_eq!(
+        homes, expected,
+        "the `{PHRASE}` fallback must be rendered by `process::failure_evidence` (or the \
+         fetch's own evidence line) — not spelled again at a call site"
+    );
     assert!(
         violations.is_empty(),
         "spawned-process failures without exit-status evidence:\n  {}",

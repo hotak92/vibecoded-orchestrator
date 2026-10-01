@@ -1,4 +1,6 @@
-//! Cross-OS process-liveness helpers.
+//! Cross-OS process helpers: liveness, the `.silent()` spawn flag, the ONE
+//! bounded runner for blocking children ([`output_bounded`]) and the ONE
+//! rendering of a failed child's evidence ([`failure_evidence`]).
 //!
 //! Moved to core in v0.2.21 Step 5 because both the launcher's
 //! self-update pre-pull-rename sweep AND vct-hub's lockfile machinery
@@ -308,6 +310,195 @@ pub fn epoch_secs_now() -> u64 {
         .unwrap_or(0)
 }
 
+/// Why [`output_bounded`] produced no [`std::process::Output`].
+#[derive(Debug)]
+pub enum BoundedError {
+    /// The child could not be started.
+    Spawn(std::io::Error),
+    /// The child was still running at the deadline; it was killed and
+    /// reaped. Carries what it had written by then.
+    TimedOut {
+        after: std::time::Duration,
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+    },
+    /// Waiting on the child failed; it was killed and reaped.
+    Wait(std::io::Error),
+}
+
+impl std::fmt::Display for BoundedError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BoundedError::Spawn(e) => write!(f, "spawn failed: {e}"),
+            BoundedError::TimedOut { after, .. } => {
+                write!(f, "timed out after {} s (killed)", after.as_secs())
+            }
+            BoundedError::Wait(e) => write!(f, "wait failed: {e}"),
+        }
+    }
+}
+
+/// What a child run by [`output_bounded`] left behind — `std::process::Output`'s
+/// fields, plus the error (if any) from writing `stdin` (a child that exits
+/// without reading its input is evidence a caller may want to name).
+#[derive(Debug)]
+pub struct BoundedOutput {
+    pub status: std::process::ExitStatus,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdin_error: Option<std::io::Error>,
+}
+
+/// Run `cmd` to completion with a HARD deadline — the ONE bounded runner for
+/// a blocking child process (v0.2.100 F-W4-05 / W4R-05).
+///
+/// `std::process::Command::output()` has no timeout: a child that hangs (a
+/// Python on a stalled network filesystem, an import waiting on a lock)
+/// parks its caller forever — on the quit path that is a launcher that never
+/// exits, on the hub's watchdog tick a supervision loop that never ticks
+/// again. This spawns `cmd` with piped stdout/stderr (drained on their own
+/// threads, so a chatty child cannot deadlock on a full pipe), writes
+/// `stdin` when given (then closes it; `None` = the null device), polls for
+/// exit, and at `limit` kills and reaps the child.
+///
+/// Blocking: call it from a sync context, or from async code through
+/// `tokio::task::spawn_blocking`, so a slow child never pins a runtime
+/// worker. Callers that log-and-swallow get a `Display`-able error that
+/// names the bound.
+pub fn output_bounded(
+    cmd: &mut std::process::Command,
+    stdin: Option<&[u8]>,
+    limit: std::time::Duration,
+) -> Result<BoundedOutput, BoundedError> {
+    use std::io::{Read, Write};
+    use std::process::Stdio;
+
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    cmd.stdin(if stdin.is_some() { Stdio::piped() } else { Stdio::null() });
+    // Its own process group on POSIX, so the deadline kill reaches what the
+    // child started too (`sh -c 'x; sleep 30'`): a surviving grandchild
+    // would hold the pipes open and the bound would not be one.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
+    let mut child = cmd.spawn().map_err(BoundedError::Spawn)?;
+
+    type Shared = std::sync::Arc<std::sync::Mutex<Vec<u8>>>;
+    fn drain<P: Read + Send + 'static>(pipe: Option<P>, done: std::sync::mpsc::Sender<()>) -> Shared {
+        let buf: Shared = Default::default();
+        let sink = buf.clone();
+        std::thread::spawn(move || {
+            if let Some(mut p) = pipe {
+                let mut chunk = [0u8; 8192];
+                loop {
+                    match p.read(&mut chunk) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => sink.lock().unwrap_or_else(|e| e.into_inner()).extend_from_slice(&chunk[..n]),
+                    }
+                }
+            }
+            let _ = done.send(());
+        });
+        buf
+    }
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let out_buf = drain(child.stdout.take(), done_tx.clone());
+    let err_buf = drain(child.stderr.take(), done_tx);
+    // Written, then dropped: the child reads its stdin to EOF.
+    let stdin_error = match (stdin, child.stdin.take()) {
+        (Some(body), Some(mut sink)) => sink.write_all(body).err(),
+        _ => None,
+    };
+
+    let deadline = std::time::Instant::now() + limit;
+    let outcome = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                kill_tree(&mut child);
+                break Err(None);
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => {
+                kill_tree(&mut child);
+                break Err(Some(e));
+            }
+        }
+    };
+    // The pipes reach EOF once every holder exits. A detached grandchild that
+    // inherited them would keep them open past the child's own exit, so the
+    // wait for EOF is itself bounded; what was read by then is kept.
+    let grace = std::time::Duration::from_secs(2);
+    for _ in 0..2 {
+        if done_rx.recv_timeout(grace).is_err() {
+            break;
+        }
+    }
+    let take = |b: &Shared| std::mem::take(&mut *b.lock().unwrap_or_else(|e| e.into_inner()));
+    let (stdout, stderr) = (take(&out_buf), take(&err_buf));
+    match outcome {
+        Ok(status) => Ok(BoundedOutput { status, stdout, stderr, stdin_error }),
+        Err(None) => Err(BoundedError::TimedOut { after: limit, stdout, stderr }),
+        Err(Some(e)) => Err(BoundedError::Wait(e)),
+    }
+}
+
+/// Kill `child` — on POSIX its whole process group ([`output_bounded`] made
+/// it a group leader) — and reap it.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        if let Ok(pgid) = i32::try_from(child.id()) {
+            if pgid > 0 {
+                // SAFETY: kill(2) with a negative pid signals that process
+                // group; pgid > 0 so this is never kill(0/-1, …).
+                unsafe {
+                    libc::kill(-pgid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// How much of a failed child's stderr [`failure_evidence`] keeps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StderrKeep {
+    /// The first non-empty line, capped at [`STDERR_LINE_CAP`] characters —
+    /// for one-line log entries and toasts.
+    FirstLine,
+    /// The whole trimmed text as given (callers cap it while reading).
+    Whole,
+}
+
+/// Character cap of a [`StderrKeep::FirstLine`] snippet.
+pub const STDERR_LINE_CAP: usize = 300;
+
+/// The ONE rendering of "why did this child fail" (v0.2.100 F-W4-02 / I-06):
+/// the process status — `ExitStatus`'s Display, `exit status: 1` /
+/// `signal: 9 (SIGKILL)` / Windows `exit code: 1`, never a made-up `-1` —
+/// then what stderr said, or `no stderr` when it said nothing. Shape:
+/// `"<status>: <stderr evidence>"`.
+pub fn failure_evidence(status: &std::process::ExitStatus, stderr: &str, keep: StderrKeep) -> String {
+    let text = match keep {
+        StderrKeep::FirstLine => stderr
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .map(|l| l.chars().take(STDERR_LINE_CAP).collect::<String>())
+            .unwrap_or_default(),
+        StderrKeep::Whole => stderr.trim().to_string(),
+    };
+    if text.is_empty() {
+        format!("{status}: no stderr")
+    } else {
+        format!("{status}: {text}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -463,4 +654,89 @@ mod tests {
         assert!(now < 4_102_444_800, "{now}");
     }
 
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn sh(script: &str) -> std::process::Command {
+        if cfg!(windows) {
+            let mut c = std::process::Command::new("cmd");
+            c.args(["/C", script]);
+            c
+        } else {
+            let mut c = std::process::Command::new("sh");
+            c.args(["-c", script]);
+            c
+        }
+    }
+
+    #[test]
+    fn a_child_that_finishes_returns_its_output() {
+        let out = output_bounded(&mut sh("echo hi"), None, Duration::from_secs(20)).expect("ran");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "hi");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hung_child_is_killed_at_the_bound() {
+        let started = Instant::now();
+        let err = output_bounded(&mut sh("echo partial; sleep 30"), None, Duration::from_millis(400))
+            .expect_err("must time out");
+        assert!(started.elapsed() < Duration::from_secs(10), "bound not honoured");
+        match err {
+            BoundedError::TimedOut { stdout, .. } => {
+                assert_eq!(String::from_utf8_lossy(&stdout).trim(), "partial")
+            }
+            other => panic!("expected TimedOut, got {other}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stdin_is_delivered_and_closed() {
+        let out = output_bounded(&mut sh("cat"), Some(b"body"), Duration::from_secs(20)).expect("ran");
+        assert_eq!(out.stdout, b"body");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_large_output_does_not_deadlock_the_pipe() {
+        let out = output_bounded(
+            &mut sh("head -c 2000000 /dev/zero"),
+            None,
+            Duration::from_secs(20),
+        )
+        .expect("ran");
+        assert_eq!(out.stdout.len(), 2_000_000);
+    }
+
+    #[test]
+    fn a_missing_program_is_a_spawn_error() {
+        let mut c = std::process::Command::new("/definitely/not/a/program-vco");
+        assert!(matches!(output_bounded(&mut c, None, Duration::from_secs(5)), Err(BoundedError::Spawn(_))));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_evidence_carries_the_status_and_the_first_line() {
+        let out = output_bounded(&mut sh("printf '\\n  boom  \\nmore\\n' >&2; exit 3"), None, Duration::from_secs(20))
+            .expect("ran");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(failure_evidence(&out.status, &stderr, StderrKeep::FirstLine), "exit status: 3: boom");
+        assert!(failure_evidence(&out.status, &stderr, StderrKeep::Whole).ends_with("boom  \nmore"));
+        assert_eq!(failure_evidence(&out.status, "  \n", StderrKeep::FirstLine), "exit status: 3: no stderr");
+    }
+
+    #[test]
+    fn a_long_first_line_is_capped() {
+        let out = output_bounded(&mut sh("exit 1"), None, Duration::from_secs(20)).expect("ran");
+        let long = "x".repeat(STDERR_LINE_CAP * 2);
+        let got = failure_evidence(&out.status, &long, StderrKeep::FirstLine);
+        assert!(got.ends_with(&"x".repeat(STDERR_LINE_CAP)));
+        assert!(!got.ends_with(&"x".repeat(STDERR_LINE_CAP + 1)));
+    }
 }

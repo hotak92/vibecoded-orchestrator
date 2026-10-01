@@ -2446,7 +2446,9 @@ pub fn record_unlabelled_modules(unlabelled: &[String]) {
         let detected = format!(
             "Module container(s) {} match a module the launcher manages and look like leftovers \
              (orphaned, stale image, or a broken command), but carry no launcher ownership label \
-             ({}) — they were created before v0.2.100 or not by this launcher.",
+             ({}) — they were created before v0.2.100, by another launcher, or by a launcher \
+             whose install root did not resolve from its executable (a bootstrap or test binary \
+             creates module containers without the label and logs why).",
             unlabelled.join(", "),
             super::container_ownership::LAUNCHER_LABEL
         );
@@ -2472,6 +2474,16 @@ pub fn record_unlabelled_modules(unlabelled: &[String]) {
     };
     if let Err(e) = result {
         tracing::warn!("[container_runtime] module_container_unlabelled record not updated: {}", e);
+    }
+}
+
+/// [`record_unlabelled_modules`] from async code: the record spawns a
+/// bounded Python payload (up to `deferral_bridge::DEFERRAL_PAYLOAD_TIMEOUT`),
+/// so it runs on the blocking pool and never pins a runtime worker of the
+/// reaper's caller (the hub's resume sweep, the launcher's module service).
+pub async fn record_unlabelled_modules_off_runtime(unlabelled: Vec<String>) {
+    if let Err(e) = tokio::task::spawn_blocking(move || record_unlabelled_modules(&unlabelled)).await {
+        tracing::warn!("[container_runtime] module_container_unlabelled record task failed: {}", e);
     }
 }
 

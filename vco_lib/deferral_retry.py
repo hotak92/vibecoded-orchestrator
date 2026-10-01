@@ -581,6 +581,20 @@ def retry_ollama_models(ctx: RetryContext) -> RetryResult:
                        {DONE: RETRIED, _BLOCKED: SKIPPED}.get(status, FAILED), detail)
 
 
+def retry_code_embed_backend(ctx: RetryContext) -> RetryResult:
+    """v0.2.100 W4R-06 — ``code_embed_backend_unavailable`` (a VCO-managed
+    code_embed that was DOWN at an update). No owed work beyond the service
+    answering: the session-start ensure hook starts VCO's container, and the
+    child :func:`vco_lib.ollama_pull.clear_code_embed_outage` re-reads the
+    service and clears the row itself only when ``/health`` answers (the
+    dispatcher's ledger re-read is then the proof). The code-graph work the
+    outage skipped is owed under its own rows (``code_graph_*``)."""
+    from vco_lib.ollama_pull import DONE, clear_code_embed_outage
+
+    status, detail = clear_code_embed_outage(ctx.folder)
+    return RetryResult(ctx.condition_id, RETRIED if status == DONE else SKIPPED, detail)
+
+
 @dataclass(frozen=True)
 class Handler:
     """One retry handler plus the backend ITS work needs.
@@ -622,6 +636,7 @@ HANDLERS: dict[str, Handler] = {
         needs_current_code_embed_image=True,
     ),
     "ollama_models": Handler(retry_ollama_models, TEXT_BACKEND),
+    "code_embed_backend": Handler(retry_code_embed_backend, CODE_BACKEND),
 }
 
 

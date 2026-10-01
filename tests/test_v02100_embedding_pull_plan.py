@@ -160,14 +160,14 @@ def test_record_written_by_install_is_what_the_launcher_reads(tmp_path):
 
 
 def test_install_probes_code_embed_only_for_codesage(tmp_path):
-    with mock.patch("vco_lib.ollama_pull.code_embed_state", return_value="down") as probe:
+    with mock.patch("vco_lib.ollama_pull.code_embed_verdict", return_value=("down", "x")) as probe:
         pp = epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["gpu"],
                                   capability_tier=["qwen3.5:0.8b"],
                                   code_embed_url="http://localhost:11440",
                                   launcher_db=tmp_path / "absent.db")
     assert probe.call_count == 1 and probe.call_args.args == ("http://localhost:11440",)
     assert pp.code_backend_unavailable and pp.embedding == ("qwen3-embedding:0.6b",)
-    with mock.patch("vco_lib.ollama_pull.code_embed_state") as probe:
+    with mock.patch("vco_lib.ollama_pull.code_embed_verdict") as probe:
         epp.plan_for_install(tmp_path, install.EMBEDDING_CONFIGS["cpu"],
                              capability_tier=[], launcher_db=tmp_path / "absent.db")
     probe.assert_not_called()

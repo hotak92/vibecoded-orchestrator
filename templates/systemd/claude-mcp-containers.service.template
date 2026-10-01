@@ -25,10 +25,15 @@
 #      ExecStop, and took down ALL the other (healthy) containers as
 #      collateral.
 #
-#   2. `SuccessExitStatus=0 125` — exit 125 from podman-compose means
+#   2. `SuccessExitStatus=0 6 125` — exit 125 from podman-compose means
 #      "one or more containers failed to start". We tolerate that at
 #      the unit level (other containers' `restart: unless-stopped`
-#      policy still recovers them individually).
+#      policy still recovers them individually). Exit 6 is the wrapper's
+#      own "the data-identity guard refused a service (nothing removed;
+#      the cleared ones were composed)" — the refusal is already in
+#      UPDATE_DEFERRED.md, so it is not a unit failure either (v0.2.100
+#      W4R-10; must match launch-claude-mcp-stack.{sh,ps1} and
+#      lifecycle.rs WRAPPER_GUARD_REFUSED_EXIT).
 #
 # Template substitutions (filled in by install.py):
 #   {{INSTALLED_AT_PATH}}  — absolute path where this unit landed
@@ -61,8 +66,9 @@ Environment=VCT_STACK_LOG_FILE={{LOG_FILE}}
 # Override at user level if you ship overrides under a different name.
 Environment=VCT_STACK_COMPOSE_OVERRIDE=compose.override.yaml
 ExecStart=/usr/bin/env bash {{WRAPPER_SCRIPT}}
-# Tolerate exit 125 from podman-compose (some containers failed, others OK).
-SuccessExitStatus=0 125
+# Tolerate exit 125 from podman-compose (some containers failed, others OK)
+# and the wrapper's exit 6 (the data guard refused a service; ledgered).
+SuccessExitStatus=0 6 125
 StandardOutput=append:{{LOG_FILE}}
 StandardError=append:{{LOG_FILE}}
 

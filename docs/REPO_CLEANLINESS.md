@@ -88,12 +88,30 @@ PR-4 fixes both:
 
 ## 4. The `copy_recursive_sync` gitignore-aware contract
 
-The launcher's copy-based install (`copy_orchestrator_to_sync`; until
-v0.2.100 also the retired `update_orchestrator_at` cross-clone update)
-copies one orchestrator tree into another. Pre-PR-4
-the walker was gitignore-blind, so machine-local files inside kept
-allowlist entries (`tools/`, `.claude/`, `infrastructure/`) silently
-propagated cross-clone. Specifically:
+One launcher command copies orchestrator files from one tree into
+another: the onboarding wizard's **Install** (`install_orchestrator`,
+launcher/src-tauri/src/commands/installer.rs). It locates the source
+checkout the launcher runs from, then copies every entry of
+`ORCHESTRATOR_MANAGED_PATHS` into the chosen install folder —
+`copy_orchestrator_to_sync` for a fresh target, or the chosen
+conflict strategy (`apply_conflict_strategy`) when the folder already
+holds orchestrator files. Both go through `copy_recursive_sync`
+(launcher/src-tauri/src/commands/installer/file_ops.rs), and the
+contract below is that function's. The wizard's lightweight
+re-install skips the copy entirely and only re-runs `install.py`.
+
+Nothing else copies a tree any more. Up to v0.2.99 the MenuBar's
+"Update N orchestrator clones" button and the project page's update
+button also used this copy to "update" a second orchestrator clone;
+that file-copy update was retired in v0.2.100 because it moved files
+without git and without `install.py`, leaving a partial install. A
+second install is updated by its own launcher, or by
+`python install.py --update` run in that install's folder (see
+docs/GETTING_STARTED.md).
+
+Pre-PR-4 the walker was gitignore-blind, so machine-local files
+inside kept allowlist entries (`tools/`, `.claude/`, `infrastructure/`)
+silently propagated into the target. Specifically:
 
 - `tools/vct-secrets/foo.token` (matched by `*.token` in source's
   `.gitignore` but copied verbatim) — REAL leak risk

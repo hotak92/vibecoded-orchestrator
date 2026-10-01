@@ -498,7 +498,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `notify-stop.sh` — desktop notification (`notify-send`).
 
 **StopFailure**:
-- `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`. The notification is coalesced to at most one per 5 minutes per (project, error class), with the suppressed count carried on the next one; the ledger line is written for **every** event regardless. `VCO_STOP_FAILURE_NOTIFY=0` silences the pop-up only — never the ledger, which is the diagnostic worth keeping.
+- `stop-failure-notify.sh` — urgent notification + failure logging to `failures.jsonl` in the metrics directory (`$VCT_STATE_DIR/metrics`, default `~/.vct/metrics`). The notification is coalesced to at most one per 5 minutes per (project, error class), with the suppressed count carried on the next one; the ledger line is written for **every** event regardless. `VCO_STOP_FAILURE_NOTIFY=0` silences the pop-up only — never the ledger, which is the diagnostic worth keeping.
 
 **All available hook events**:
 

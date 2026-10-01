@@ -1061,18 +1061,16 @@ async fn run_build_task(
                     prov,
                 )
             } else {
-                let head = stderr_str
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .unwrap_or("");
-                let snippet: String = head.chars().take(200).collect();
                 (
                     build_status::FAILED.to_string(),
                     0,
                     Some(format!(
-                        "code-graph-analyze failed ({}): {}",
-                        out.status,
-                        if snippet.is_empty() { "no stderr" } else { &snippet }
+                        "code-graph-analyze failed: {}",
+                        vct_launcher_core::process::failure_evidence(
+                            &out.status,
+                            &stderr_str,
+                            vct_launcher_core::process::StderrKeep::FirstLine,
+                        )
                     )),
                     Some(tail),
                     false, // joern_used: v0.2.73 CG-3 removed Joern CFG/PDG (zero readers)
@@ -2159,12 +2157,10 @@ fn spawn_metadata_backfill(db: &Db, canonical_identity: String) {
         match cmd.output().await {
             Ok(out) if out.status.success() => {}
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(
-                    "[vct] warning: metadata backfill for '{}' failed ({}): {}",
+                    "[vct] warning: metadata backfill for '{}' failed: {}",
                     canonical_identity,
-                    out.status,
-                    stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
+                    vct_launcher_core::process::failure_evidence(&out.status, &String::from_utf8_lossy(&out.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
                 );
             }
             Err(e) => {

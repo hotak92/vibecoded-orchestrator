@@ -1798,10 +1798,10 @@ pub(crate) async fn create_reset_backup(
         .sum();
     progress(&format!(
         "Saving your work before the reset: {} local commit(s), uncommitted changes and {} \
-         untracked file(s) ({:.1} MB)...",
+         untracked file(s) ({})...",
         local_commits,
         captured.len(),
-        bytes as f64 / 1_048_576.0
+        vct_launcher_core::units::human_bytes(bytes)
     ));
 
     // The working-tree snapshot, through a throwaway index.
@@ -1910,19 +1910,23 @@ async fn save_backup_refs_and_bundle(
         });
     }
 
-    std::fs::create_dir_all(backups_dir)
-        .map_err(|e| format!("could not create {}: {}", backups_dir.display(), e))?;
-    let bundle = backups_dir.join(format!("orchestrator-reset-{}.bundle", stamp));
-    let bundle_s = bundle.to_string_lossy().to_string();
+    // v0.2.100 F-W3-13: create + verify (+ removing a partial file) is the
+    // ONE Python home `vco_lib.git_bundle_backup`, shared with
+    // `vco_lib.hard_cut`. The refs above stay here: they are the reset's own
+    // rescue points, not part of the bundle sequence.
+    let name = format!("orchestrator-reset-{}.bundle", stamp);
     let exclude = format!("^{}", upstream_ref);
-    let mut args = vec!["bundle", "create", bundle_s.as_str(), branch];
-    for b in [&tip_branch, &wip_branch].into_iter().flatten() {
-        args.push(b.as_str());
-    }
-    args.push(exclude.as_str());
-    *bundle_written = Some(bundle.clone());
-    backup_git(root, &args, &[]).await?;
-    backup_git(root, &["bundle", "verify", bundle_s.as_str()], &[]).await?;
+    let mut refs: Vec<String> = vec![branch.to_string()];
+    refs.extend([&tip_branch, &wip_branch].into_iter().flatten().cloned());
+    refs.push(exclude);
+    *bundle_written = Some(backups_dir.join(&name));
+    let (repo, dir) = (root.to_path_buf(), backups_dir.to_path_buf());
+    let bundle = tokio::task::spawn_blocking(move || {
+        let refs: Vec<&str> = refs.iter().map(String::as_str).collect();
+        crate::services::vco_lib_bridge::create_verified_bundle(&repo, &dir, &name, &refs)
+    })
+    .await
+    .map_err(|e| format!("the bundle backup task failed: {}", e))??;
     Ok(ResetBackup {
         branch: branch.to_string(),
         uncommitted_branch: wip_branch,
@@ -2001,9 +2005,9 @@ where
             )))
         })?;
     let branch = reset_branch(root, &state);
-    crate::commands::self_update::serialized_fetch_upstream(
+    crate::commands::upstream_fetch::serialized_fetch_upstream(
         root,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&branch),
     )
     .await

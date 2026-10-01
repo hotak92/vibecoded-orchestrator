@@ -2866,7 +2866,7 @@ where
             report.reaped, report.errors
         );
     }
-    vct_launcher_core::services::container_runtime::record_unlabelled_modules(&report.unlabelled);
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules_off_runtime(report.unlabelled.clone()).await;
 }
 
 /// Test-friendly variant: same logic as `resume_containers_on_startup`

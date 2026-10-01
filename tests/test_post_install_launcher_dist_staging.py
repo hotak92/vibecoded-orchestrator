@@ -4,8 +4,9 @@
 
 Background (v0.2.55 launcher self-update bug):
 
-The launcher GUI "Fetch + Install" button runs update_orchestrator (Rust),
-which shells out to `install.py --update`, which runs the desktop-icon step
+The launcher GUI "Fetch + Install" button ran update_orchestrator (Rust; since
+v0.2.100 the one update pipeline, `run_orchestrator_update`, which does the
+same), which shells out to `install.py --update`, which runs the desktop-icon step
 `scripts/post-install-launcher.sh`. When the bundled binary at
 launcher/dist/<arch>/vct-launcher was rejected as stale (its metadata
 source_hash didn't match the freshly-pulled launcher subtree — the window

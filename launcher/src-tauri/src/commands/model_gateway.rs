@@ -898,12 +898,10 @@ fn run_gateway_cli(args: &[&str]) -> Result<(i32, String, String), String> {
     run_to_completion(cmd, "vct-model-gateway")
 }
 
-/// Spawn, wait with a deadline, then drain both pipes.
-///
-/// Draining after exit is safe because of the deadline: a child that filled
-/// a pipe buffer never exits, so it is killed here rather than deadlocking
-/// the GUI thread. Every payload this module reads is a single small JSON
-/// object, far below any platform's pipe capacity.
+/// Spawn and wait with a deadline through
+/// [`vct_launcher_core::process::output_bounded`]: both pipes are drained
+/// while the child runs, and a child still running at the deadline is killed
+/// rather than parking the GUI thread.
 fn run_to_completion(cmd: Command, label: &str) -> Result<(i32, String, String), String> {
     run_to_completion_within(cmd, label, PY_TIMEOUT)
 }
@@ -916,44 +914,15 @@ pub(crate) fn run_to_completion_within(
     label: &str,
     limit: Duration,
 ) -> Result<(i32, String, String), String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{}: spawn failed: {}", label, e))?;
-
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{}: timed out after {} s",
-                        label,
-                        limit.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => return Err(format!("{}: wait failed: {}", label, e)),
-        }
-    };
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stdout);
-    }
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stderr);
-    }
-    Ok((status.code().unwrap_or(-1), stdout, stderr))
+    // The ONE bounded runner (v0.2.100 F-W4-05): pipes drained while the
+    // child runs, killed and reaped at the deadline.
+    let out = vct_launcher_core::process::output_bounded(&mut cmd, None, limit)
+        .map_err(|e| format!("{}: {}", label, e))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 // ─── vco_lib.vscode_settings bridge ───────────────────────────────────────

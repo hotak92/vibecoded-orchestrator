@@ -6,8 +6,10 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 # Fires on StopFailure event — when a turn ends due to API error (rate limit, auth failure, etc).
 # Sends urgent desktop notification and logs the failure.
 #
-# Payload available via stdin:
-#   {"session_id":"...", "error": {"type":"...", "message":"..."}, ...}
+# Payload available via stdin (Claude Code, measured):
+#   {"session_id":"...", "error":"rate_limit", "error_details":"...",
+#    "last_assistant_message":"API Error: ...", "agent_type":"...", ...}
+# (older clients sent "error": {"type":"...", "message":"..."}; both parse)
 #
 # v0.2.96 WP-8 (register issue 14 — the 2026-09-20 304-toast storm):
 #   * dedup — at most ONE desktop notification per 5 minutes per
@@ -20,6 +22,12 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 #   * individual kill switch — VCO_STOP_FAILURE_NOTIFY=0 suppresses the
 #     desktop notification only (the ledger keeps recording); distinct from
 #     VCT_DISABLE_HOOKS, which exits before any work.
+#
+# v0.2.100 WP-17: the ledger promise above is now true on EVERY path, not just
+# the happy one. The real payload's string `error` + `last_assistant_message`
+# are parsed (F1); a core that cannot run (no Python, or it crashed) no longer
+# drops the event — the shell writes a pure-ASCII fallback line itself; and a
+# line that cannot be written at all is reported on stderr, never swallowed.
 
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/stderr-cap.sh"
 
@@ -57,6 +65,15 @@ _VCO_SF_CORE=$(cat <<'VCO_STOP_FAILURE_CORE'
 # stdin: the raw StopFailure payload. Prints two lines on stdout:
 #   line 1: "1" (notify) or "0" (suppressed by the dedup window)
 #   line 2: "<error class>: <message>" for the desktop notification
+# A ledger line that could NOT be written is reported on stderr (never
+# silently): the ledger promise is "every event", toast or no toast.
+#
+# v0.2.100 WP-17 (F1): Claude Code's StopFailure payload carries `error` as
+# a STRING class ("rate_limit", "authentication_failed", "unknown", ...) and
+# the human text in `error_details` / `last_assistant_message` -- measured on
+# this machine's ledger, 14/14 real events. The parser read only a dict-shaped
+# `error`, so every real event became "unknown: raw payload ...". Both shapes
+# are read; the dict shape stays for older clients.
 import json
 import os
 import re
@@ -65,6 +82,7 @@ import time
 
 WINDOW_SECS = 300  # dedup: at most one notification per (project, class)
 RAW_CAP = 500      # truncated raw payload length for unexpected shapes
+MSG_CAP = 200      # one-line message length (notification + ledger)
 
 
 def _one_line(s):
@@ -90,6 +108,7 @@ def main():
     etype = "unknown"
     emsg = ""
     sid = ""
+    agent_type = ""
     try:
         d = json.loads(raw)
         if not isinstance(d, dict):
@@ -101,13 +120,24 @@ def main():
         if isinstance(err, dict):
             t = err.get("type")
             m = err.get("message")
-            if isinstance(t, str) and t:
+            if isinstance(t, str) and t.strip():
                 etype = _one_line(t)
-            if isinstance(m, str) and m:
-                emsg = _one_line(m)[:120]
+            if isinstance(m, str) and m.strip():
+                emsg = _one_line(m)[:MSG_CAP]
+        elif isinstance(err, str) and err.strip():
+            etype = _one_line(err)
+        if not emsg:
+            for key in ("error_details", "last_assistant_message"):
+                m = d.get(key)
+                if isinstance(m, str) and m.strip():
+                    emsg = _one_line(m)[:MSG_CAP]
+                    break
         v = d.get("session_id")
         if isinstance(v, str):
             sid = v[:8]
+        v = d.get("agent_type")
+        if isinstance(v, str):
+            agent_type = _one_line(v)[:64]
     if not emsg:
         # 2026-09-20 storm: 304 identical "unknown: No details" toasts
         # because the trust-failure payload has NO `error` key and the old
@@ -169,23 +199,33 @@ def main():
             # and a silent hook is worse than a repeated toast.
             notify = True
 
-    if metrics_dir:
-        line = json.dumps(
-            {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "project": project,
-                "session_id": sid,
-                "error_type": etype,
-                "error_message": emsg,
-            }
+    row = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "project": project,
+        "session_id": sid,
+        "error_type": etype,
+        "error_message": emsg,
+    }
+    if agent_type:
+        row["agent_type"] = agent_type
+    if not metrics_dir:
+        sys.stderr.write(
+            "stop-failure-notify: ledger line NOT written -- the metrics "
+            "directory could not be resolved (hooks/_lib/metrics-dir missing "
+            "or no HOME/VCT_STATE_DIR). Event: %s: %s\n" % (etype, emsg)
         )
+    else:
         try:
             with open(
                 os.path.join(metrics_dir, "failures.jsonl"), "a", encoding="utf-8"
             ) as fh:
-                fh.write(line + "\n")
-        except Exception:
-            pass
+                fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            sys.stderr.write(
+                "stop-failure-notify: ledger line NOT written to %s (%s). "
+                "Event: %s: %s\n"
+                % (os.path.join(metrics_dir, "failures.jsonl"), exc, etype, emsg)
+            )
 
     msg = etype + ": " + emsg
     if notify and suppressed_note > 0:
@@ -202,17 +242,45 @@ PAYLOAD=$(cat)
 # Parse + dedup + ledger in ONE interpreter run. The old hook spent three
 # separate `$PY -c` calls re-parsing the payload and built the ledger line by
 # string interpolation -- any quote in a message corrupted the JSON.
+# The core's stderr is NOT discarded: it reports a ledger line it could not
+# write (stderr-cap.sh bounds the volume).
 SF_OUT=""
 if [ -n "${PY:-}" ]; then
-    SF_OUT="$(printf '%s' "$PAYLOAD" | "$PY" -c "$_VCO_SF_CORE" "$LOG_DIR" "$PROJECT_NAME" 2>/dev/null)" || SF_OUT=""
+    SF_OUT="$(printf '%s' "$PAYLOAD" | "$PY" -c "$_VCO_SF_CORE" "$LOG_DIR" "$PROJECT_NAME")" || SF_OUT=""
 fi
 NOTIFY_FLAG="$(printf '%s\n' "$SF_OUT" | head -n 1)"
 NOTIFY_MSG="$(printf '%s\n' "$SF_OUT" | tail -n +2)"
+
+# v0.2.100 WP-17 — the ledger promise when the core did not run (no
+# interpreter) or produced nothing (crashed before its ledger write): the
+# event is still recorded, by the shell, without any parser. The line is
+# pure ASCII (control bytes -> space, non-ASCII -> '?') so it is valid JSON
+# whatever the payload held. MUST MATCH the fallback in
+# stop-failure-notify.ps1 (same keys, same `ledger_writer` marker).
+_sf_json_str() {
+    printf '%s' "$1" | LC_ALL=C tr '\000-\037' ' ' | LC_ALL=C tr '\200-\377' '?' \
+        | LC_ALL=C sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+if [ -z "$SF_OUT" ]; then
+    _sf_why="core unavailable"
+    [ -n "${PY:-}" ] || _sf_why="no Python interpreter"
+    if [ -n "$LOG_DIR" ]; then
+        _sf_raw="$(printf '%s' "$PAYLOAD" | LC_ALL=C head -c 500)"
+        _sf_ts="$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null || printf 'unknown')"
+        if ! printf '{"timestamp": "%s", "project": "%s", "session_id": "", "error_type": "unknown", "error_message": "raw payload (%s): %s", "ledger_writer": "shell-fallback"}\n' \
+            "$_sf_ts" "$(_sf_json_str "$PROJECT_NAME")" "$_sf_why" "$(_sf_json_str "$_sf_raw")" \
+            >> "$LOG_DIR/failures.jsonl" 2>/dev/null; then
+            echo "stop-failure-notify: ledger line NOT written to $LOG_DIR/failures.jsonl ($_sf_why; append failed)." >&2
+        fi
+    else
+        echo "stop-failure-notify: ledger line NOT written -- $_sf_why and the metrics directory could not be resolved (hooks/_lib/metrics-dir.sh missing?)." >&2
+    fi
+fi
 # Core CRASHED (interpreter present): fail OPEN (notify) with an honest
 # message -- an unparseable payload must never silence the urgent signal.
 # (WP-8 review MINOR-2: the interpreter-ABSENT arm cannot notify at all --
-# the notifier itself needs $PY -- and is visible only as the absence of a
-# ledger row; find-python is a hard prerequisite of this hook.)
+# the notifier itself needs $PY. Since v0.2.100 it is still RECORDED: the
+# shell fallback above writes the ledger row, marked "shell-fallback".)
 if [ -z "$NOTIFY_FLAG" ] || [ -z "$NOTIFY_MSG" ]; then
     NOTIFY_FLAG=1
     [ -z "$NOTIFY_MSG" ] && NOTIFY_MSG="unknown: (core unavailable; see metrics ledger)"

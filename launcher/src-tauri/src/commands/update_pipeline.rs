@@ -556,9 +556,9 @@ async fn reconcile_and_pull(
     // the bare pull below surfaces the real error; we still attempt pre-merge
     // with whatever refs exist. The mutex + `--no-write-fetch-head` protect
     // against the FETCH_HEAD race with the startup badge check (A-RC3).
-    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+    if let Err(e) = crate::commands::upstream_fetch::serialized_fetch_upstream(
         &install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&pull_branch),
     )
     .await
@@ -1370,9 +1370,9 @@ pub(crate) async fn merge_upstream(
     let branch = crate::commands::installer::resolve_pull_branch(install_path).await;
     progress(window, "Fetching upstream for pre-merge...", 7.0);
     // Soft-fail: a failed fetch falls through to the pull, which reports it.
-    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+    if let Err(e) = crate::commands::upstream_fetch::serialized_fetch_upstream(
         install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&branch),
     )
     .await
@@ -1473,9 +1473,9 @@ pub(crate) async fn rebase_onto_upstream(
 ) -> Result<RecoveryGitOp, UpdatePipelineError> {
     let branch = crate::commands::installer::resolve_pull_branch(install_path).await;
     progress(window, "Fetching upstream for rebase...", 10.0);
-    crate::commands::self_update::serialized_fetch_upstream(
+    crate::commands::upstream_fetch::serialized_fetch_upstream(
         install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&branch),
     )
     .await

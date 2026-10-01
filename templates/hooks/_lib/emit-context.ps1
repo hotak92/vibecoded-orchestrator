@@ -19,6 +19,48 @@
 #
 # OS support: pure PowerShell — no Python or external tools required.
 
+# ---------------------------------------------------------------------------
+# Limit-VcoHookContext -Text <s> [-Pointer <s>]
+#
+# v0.2.100 WP-17 -- THE cap for text a hook injects into the model's context.
+# Claude Code's hooks contract: injected hook output past 10 000 characters is
+# NOT shown -- the model gets a file path and a 2 000-character preview
+# instead (compact-context-reinject exceeded it on 223 of 235 measured runs,
+# diff-context-inject on 374 of 707). The text is cut at VCO_HOOK_CONTEXT_CAP
+# characters (default 9 500, clamped to 1 000..10 000) and ENDS with a marker
+# saying what was cut and where the rest is. .Length counts UTF-16 code units
+# (>= characters), so the limit holds; a surrogate pair split by the cut is
+# dropped. MUST MATCH _lib/emit-context.sh's vco_cap_context.
+function Get-VcoHookContextCap {
+    $cap = 9500
+    $raw = [string]$env:VCO_HOOK_CONTEXT_CAP
+    if ($raw -match '^[0-9]+$') {
+        $trimmed = $raw.TrimStart('0')
+        if ($trimmed) {
+            if ($trimmed.Length -gt 5) { $cap = 10000 } else { $cap = [int]$trimmed }
+        }
+    }
+    if ($cap -gt 10000) { $cap = 10000 }
+    if ($cap -lt 1000) { $cap = 1000 }
+    return $cap
+}
+
+function Limit-VcoHookContext {
+    param([string]$Text, [string]$Pointer = '')
+    if (-not $Text) { return $Text }
+    $cap = Get-VcoHookContextCap
+    $total = $Text.Length
+    if ($total -le $cap) { return $Text }
+    $suffix = if ($Pointer) { " $Pointer" } else { "" }
+    $marker = "`n[VCO: output cut at $cap of $total characters to stay under Claude Code's 10 000-character hook-injection limit.$suffix]"
+    $keep = [Math]::Max(0, $cap - $marker.Length)
+    $head = $Text.Substring(0, $keep)
+    if ($head.Length -gt 0 -and [char]::IsHighSurrogate($head[$head.Length - 1])) {
+        $head = $head.Substring(0, $head.Length - 1)
+    }
+    return $head + $marker
+}
+
 function Emit-AdditionalContext {
     param(
         [string]$Ctx,
@@ -30,7 +72,7 @@ function Emit-AdditionalContext {
     # Whitespace-only → treat as empty.
     if (-not ($Ctx -match '\S')) { return }
 
-    $truncated = if ($Ctx.Length -gt 10000) { $Ctx.Substring(0, 10000) } else { $Ctx }
+    $truncated = Limit-VcoHookContext -Text $Ctx
 
     $envelope = [ordered]@{
         hookSpecificOutput = [ordered]@{

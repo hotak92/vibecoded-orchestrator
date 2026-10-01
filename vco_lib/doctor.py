@@ -431,6 +431,29 @@ class DoctorResolvers:
     #: None when the ledger could not be read. Injected so the RL-loss probe
     #: is driven from a described ledger, no filesystem.
     rl_loss_summary: Optional[Callable[[int], Optional[dict]]] = None
+    #: (folder) -> :func:`vco_lib.module_gated_delivery.check_agent_model_ids`
+    #: problems for the definitions Claude Code reads for ``folder``, or None
+    #: when the gateway registry is not importable. Injected so the agent-id
+    #: probe is driven from described definitions, no filesystem.
+    agent_id_problems: Optional[Callable[[Path], Optional[list]]] = None
+
+    def resolve_agent_id_problems(self, folder: Path) -> Optional[list]:
+        """Agent definitions naming a gateway model id the router does not know.
+
+        Composes :func:`vco_lib.module_gated_delivery.check_agent_model_ids` —
+        the router's own validation, the ONE home the launcher's gate payload
+        also reads — over :func:`agent_definition_dirs` (the project's
+        ``.claude/agents`` and the user's ``~/.claude/agents``). ``None`` when
+        the gateway package is not importable: no registry, no verdict.
+        """
+        if self.agent_id_problems is not None:
+            return self.agent_id_problems(folder)
+        from vco_lib import module_gated_delivery as mgd  # noqa: PLC0415
+
+        try:
+            return mgd.check_agent_model_ids(mgd.agent_definition_dirs(folder))
+        except ImportError:
+            return None
 
     def resolve_rl_loss_summary(self, since_ms: int) -> Optional[dict]:
         """The RL telemetry loss ledger, summarised since ``since_ms``.
@@ -2537,7 +2560,7 @@ def collect_source_facts(folder: Path, *, ask_remote: bool = True) -> SourceFact
     currency verdict built from it can then never be ``ok``: a local
     remote-tracking ref carries no evidence of WHEN it was last updated, and
     the launcher's own fetch passes ``--no-write-fetch-head``
-    (``self_update.rs::serialized_fetch_upstream``), so not even
+    (``upstream_fetch.rs::serialized_fetch_upstream``), so not even
     ``FETCH_HEAD``'s mtime answers it. Reporting "level with
     ``vco_upstream/main``" off a ref last written five weeks ago would be a
     fresh instance of the exact defect this probe exists to catch, so the
@@ -4249,6 +4272,54 @@ def probe_retired_endpoint_env(folder: Path, res: DoctorResolvers, ctx: dict) ->
     )]
 
 
+def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Does every agent definition name a gateway model id the router knows?
+
+    F-W1-11a / F-W3-05: a hand-written definition (the project's
+    ``.claude/agents`` or the user's ``~/.claude/agents``) whose ``model:``
+    is a mistyped ``claude-gw/…`` id used to reach the gateway and fail the
+    chat. The shipped set is pinned by a contract test; this is the check for
+    everything else. Only ``claude-gw/``-namespaced ids are judged (first-
+    party ids and aliases are the client's to validate). No registered
+    condition: the files are the user's, so the finding names each one and
+    the closest valid ids, and the fix is an edit only the user makes.
+    Read-only: file reads + the router's in-process validation.
+    """
+    problems = res.resolve_agent_id_problems(folder)
+    if problems is None:
+        return [Finding(
+            probe="agent_model_ids",
+            status=STATUS_UNKNOWN,
+            summary=("agent model ids not checked: the model gateway package "
+                     "is not importable, so there is no registry to check against"),
+        )]
+    if not problems:
+        return [Finding(
+            probe="agent_model_ids",
+            status=STATUS_OK,
+            summary="every agent definition names a known gateway model id",
+        )]
+    parts = []
+    lines = []
+    for pr in problems:
+        hint = (" (did you mean " + " or ".join(pr["suggestions"]) + "?)"
+                if pr.get("suggestions") else "")
+        parts.append(f"{display_path(pr['path'])}: {pr['model']!r}{hint}")
+        fix_line = f"# edit {pr['path']}: model: {pr['model']}"
+        if pr.get("suggestions"):
+            fix_line += f"  ->  model: {pr['suggestions'][0]}"
+        lines.append(fix_line)
+    return [Finding(
+        probe="agent_model_ids",
+        status=STATUS_PROBLEM,
+        summary=(f"{len(problems)} agent definition(s) name a gateway model id "
+                 "the router does not know: " + "; ".join(parts)),
+        fix=FIX_DEFER,
+        command="\n".join(lines),
+        detail={"agent_id_problems": problems},
+    )]
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4318,6 +4389,10 @@ PROBES: dict = {
     # ledger's surface (lost hub POSTs, skipped dual-log twins). No registered
     # condition: a loss is a count to watch, not a ledger entry to clear.
     "rl_telemetry_loss": (probe_rl_telemetry_loss, (SCOPE_FULL,)),
+    # v0.2.100 F-W3-05: full-only — no registered condition (the definitions
+    # are the user's files; nothing VCO runs can clear the finding), so the
+    # boot counter must never point at it (the v0.2.92 promise reason).
+    "agent_model_ids": (probe_agent_model_ids, (SCOPE_FULL,)),
 }
 
 
@@ -5122,6 +5197,7 @@ __all__ = [
     "main",
     "measure_disk_space",
     "parse_vct_guards",
+    "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",
     "probe_install_completeness",

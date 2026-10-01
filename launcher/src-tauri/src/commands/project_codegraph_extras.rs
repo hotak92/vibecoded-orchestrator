@@ -1092,13 +1092,8 @@ async fn run_analyzer_with_stream(
             String::new()
         };
         return Err(format!(
-            "analyzer {}: {}",
-            status,
-            if stderr_text.is_empty() {
-                "no stderr".to_string()
-            } else {
-                stderr_text
-            }
+            "analyzer {}",
+            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole)
         ));
     }
 
