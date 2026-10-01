@@ -5037,6 +5037,8 @@ _RL_ENRICHMENT_EXPORTS = (
     "TRUNCATED_SLOTS_PROP", "SECONDARY_TRUNCATED_SLOTS_PROP",
     "_rl_enrich_nodes_with_linked_embs", "_resolve_dual_rl_log_enabled",
     "_resolve_dual_rl_log_inputs", "_slot_short_source", "_rl_cache_and_rerank",
+    # v0.2.100 F1: the ONE dual-log resolve+enrich home (MCP + hook + CLI).
+    "resolve_and_enrich_dual", "_dual_rl_log_expected",
     # X-4 (v0.2.75): enrichment fan-out gate (TTL-cached skip predicate).
     "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
     "_rl_enrich_gate_reset_for_test",
@@ -5044,7 +5046,7 @@ _RL_ENRICHMENT_EXPORTS = (
 #
 # The re-export itself is written out as ONE explicit ``from .rl_enrichment
 # import (...)`` per name (v0.2.94), NOT the ``globals()[n] = getattr(mod, n)``
-# loop it replaced. Same 44 objects, same binding moment, same names — but a
+# loop it replaced. Same objects (44 at v0.2.94; 46 since v0.2.100 F1), same binding moment, same names — but a
 # dynamic loop is invisible to static analysis: ruff read every call-site below
 # as an undefined name (44× F821) and a TYPO in the inventory above would have
 # surfaced only at runtime, on the first request that touched the mistyped
@@ -5053,7 +5055,7 @@ _RL_ENRICHMENT_EXPORTS = (
 # tests/test_v0294_lint_rl_enrichment_export_parity.py.
 try:
     # ``X as X`` is the PEP 484 explicit-re-export form, honoured by ruff and
-    # pyright alike: 37 of these 44 are not called from THIS file — they exist
+    # pyright alike: most of these are not called from THIS file — they exist
     # so `server.<name>` stays the resolution point for rl_client's
     # `from …weaviate_mcp.server import <fn>` and for the tests that patch
     # `server.<fn>`. Written plainly they would read as 37 unused imports; the
@@ -5101,6 +5103,8 @@ try:
         _resolve_dual_rl_log_inputs as _resolve_dual_rl_log_inputs,
         _slot_short_source as _slot_short_source,
         _rl_cache_and_rerank as _rl_cache_and_rerank,
+        resolve_and_enrich_dual as resolve_and_enrich_dual,
+        _dual_rl_log_expected as _dual_rl_log_expected,
         _rl_enrichment_gate_open as _rl_enrichment_gate_open,
         _rl_enrichment_consumer_exists as _rl_enrichment_consumer_exists,
         _rl_enrich_gate_reset_for_test as _rl_enrich_gate_reset_for_test,
@@ -5673,27 +5677,17 @@ async def _semantic_graph_search_body(
     # below). When the fan-out had zero successful collections both
     # remain at their initial None / "" sentinels; the helper degrades
     # to a no-op-with-empty-fields write.
-    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
-    # dual-log AND dual-write env). None → bare single-log path. The other-slot
-    # query vector comes from the canonical embed fan-out; the per-node other
-    # vectors are attached by the enrich call below from the SAME fetched objects.
-    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
-    try:
-        _rl_enrich_nodes_with_linked_embs(
-            all_formatted,
-            query_emb=query_vector,
-            active_slot=query_target,
-            model_name=EMBEDDING_MODEL,
-            other_slot=(_dual_inputs or {}).get("other_slot", ""),
-            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
-            other_model_name=(_dual_inputs or {}).get("other_model", ""),
-            backfill_other=_dual_inputs is not None,
-        )
-    except Exception as exc:
-        logger.debug(
-            "semantic_graph_search: RL enrich failed (%s); proceeding without linked_embs",
-            exc,
-        )
+    # v0.2.71 Sweep-C / v0.2.100 F1: resolve the dual-RL-log other-slot inputs
+    # ONCE and enrich, through the ONE shared home every KG-search entry point
+    # (MCP tools, hook/CLI scripts) calls. None → bare single-log path.
+    _dual_inputs = await resolve_and_enrich_dual(
+        all_formatted,
+        query=query,
+        query_vector=query_vector,
+        active_slot=query_target,
+        model_name=EMBEDDING_MODEL,
+        task_type="mcp_interactive",
+    )
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     # v0.2.24: propagate partial-fan-out schema failures so telemetry
@@ -6548,22 +6542,16 @@ async def _hybrid_search_body(
     # the nodes as-is and the v3 retrieval event ships with whatever
     # was already attached by the search-time near_vector enrichment
     # (typically `emb` + `cos_qn`).
-    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
-    # dual-log AND dual-write env). None → bare single-log path.
-    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
-    try:
-        _rl_enrich_nodes_with_linked_embs(
-            all_results,
-            query_emb=query_vector,
-            active_slot=query_target,
-            model_name=EMBEDDING_MODEL,
-            other_slot=(_dual_inputs or {}).get("other_slot", ""),
-            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
-            other_model_name=(_dual_inputs or {}).get("other_model", ""),
-            backfill_other=_dual_inputs is not None,
-        )
-    except Exception as exc:
-        logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)
+    # v0.2.71 Sweep-C / v0.2.100 F1: dual-RL-log resolve + enrich through the
+    # ONE shared home (see semantic_graph_search). None → bare single-log path.
+    _dual_inputs = await resolve_and_enrich_dual(
+        all_results,
+        query=query,
+        query_vector=query_vector,
+        active_slot=query_target,
+        model_name=EMBEDDING_MODEL,
+        task_type="mcp_interactive",
+    )
 
     # RL: rerank + cache using all candidates; return top-k.
     # v0.2.24: propagate any per-collection schema failures from the

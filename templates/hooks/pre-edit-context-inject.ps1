@@ -180,8 +180,8 @@ if (-not (Test-Path $SeenDir)) {
 $SeenInjectFile = ""
 $SeenReadsFile = ""
 if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+    $SeenInjectFile = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
+    $SeenReadsFile  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
 }
 $SeenNodesFile = if ($SeenInjectFile) { $SeenInjectFile } else { Join-Path $SeenDir "seen_inject_$SessionId.txt" }
 
@@ -403,7 +403,18 @@ $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 # Final fallback: if no venv resolved, leave $VenvPy as $null — the
 # (Test-Path $VenvPy) gate below skips the KG search subprocess and the
 # hook still exits 0 without blocking the edit.
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
+# there (same roots as the venv), never under the project root. It still runs
+# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
+# shared + granted collections apply. MUST MATCH the .sh sibling.
+$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path: every Test-Path below then
+# reads "not installed" without binding an empty -Path.
+if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+$env:CLAUDE_PROJECT_DIR = $ProjectRoot
 
 # v0.2.95 (lane F10): "is this a code file" is ONE decision with ONE home,
 # _lib/code-extensions.ps1. v0.2.70 Stream C kept it as a C-tier mirror here,

@@ -65,8 +65,16 @@ fi
 VENV="${VCO_VENV_PYTHON:-}"
 [ -n "$VENV" ] && [ -x "$VENV" ] || exit 0
 
-DRAIN="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_drain_citations.py"
-[ -f "$DRAIN" ] || exit 0
+# v0.2.100 F3: the drain ships ONLY in the orchestrator root — locate it there
+# (same roots as the venv above). It drains THIS project's pending dir: the
+# CLAUDE_PROJECT_DIR=$PROJECT_ROOT prefix below pins the identity. Pre-F3 the
+# lookup under $PROJECT_ROOT meant no user project ever drained a citation.
+DRAIN=""
+if command -v resolve_vco_orchestrator_script >/dev/null 2>&1; then
+    resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_drain_citations.py"
+    DRAIN="${VCO_ORCHESTRATOR_SCRIPT:-}"
+fi
+[ -n "$DRAIN" ] && [ -f "$DRAIN" ] || exit 0
 
 # v0.2.76 P5 (hook-latency): DETACH the drain so its answer-window embed
 # COMPUTE + telemetry write NEVER block the Stop return (the user waits for

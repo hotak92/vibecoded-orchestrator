@@ -576,7 +576,18 @@ fi
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
-RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
+# there (same roots as the venv above), never under $PROJECT_ROOT. It still
+# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
+# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path, so every existence check
+# below reads "not installed" exactly as before.
+RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 
 MATCHES=""
 MATCH_COUNT=0

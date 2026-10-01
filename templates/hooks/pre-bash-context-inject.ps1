@@ -118,7 +118,7 @@ $WriteModule = ""
 if ((Get-Command Test-VcoWriteSuspicious -ErrorAction SilentlyContinue) -and
     (Test-VcoWriteSuspicious $Command)) {
     Initialize-VcoBashWriteTargets -HooksDir $ScriptDir -FallbackPython $PY
-    $parts = Get-VcoBashWritePreBash -Command $Command -ProjectRoot $ProjectRoot
+    $parts = Get-VcoBashWritePreBash -Command $Command
     if ($parts.Count -ge 1) { $WriteTarget = [string]$parts[0] }
     if ($parts.Count -ge 2) { $WriteSnippet = [string]$parts[1] }
 }
@@ -163,8 +163,8 @@ if ($cgRaw) {
     $cgInj = ""
     $cgRd = ""
     if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-        $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $cgInj = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
+        $cgRd  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
     }
     if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
         $cgRaw = Invoke-VcoFilterSeenBlocks -InputText $cgRaw -InjectFile $cgInj -ReadsFile $cgRd
@@ -310,7 +310,18 @@ except Exception:
 }
 
 $KgTmp = New-TemporaryFile
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
+# there (same roots as the venv), never under the project root. It still runs
+# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
+# shared + granted collections apply. MUST MATCH the .sh sibling.
+$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path: every Test-Path below then
+# reads "not installed" without binding an empty -Path.
+if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+$env:CLAUDE_PROJECT_DIR = $ProjectRoot
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
         # v0.2.77 Part 9 task 2: route through the shared TTL result-cache
@@ -338,8 +349,8 @@ if (Get-Command Invoke-VcoFilterSeenBlocks -ErrorAction SilentlyContinue) {
     $pbInject = ""
     $pbReads = ""
     if (Get-Command Get-VcoSeenStorePath -ErrorAction SilentlyContinue) {
-        $pbInject = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
-        $pbReads  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw -ProjectRoot $ProjectRoot
+        $pbInject = Get-VcoSeenStorePath -Kind "inject" -SessionId $SessionIdRaw
+        $pbReads  = Get-VcoSeenStorePath -Kind "reads"  -SessionId $SessionIdRaw
     }
     $KgResult = Invoke-VcoFilterSeenBlocks -InputText $KgResult -InjectFile $pbInject -ReadsFile $pbReads
 }

@@ -494,6 +494,21 @@ except Exception:
             return 1536
         return 1024
 
+# v0.2.100 F1: the ONE dual-RL-log resolve+enrich home (shared with the MCP
+# tools and rl_kg_search.py) and its RerankRequest field mapping. Soft-import
+# on the same terms as the pipeline above: without the orchestrator venv the
+# CLI still searches, it just emits no telemetry.
+try:
+    from weaviate_mcp.server import (  # type: ignore[import-not-found]
+        resolve_and_enrich_dual as _resolve_and_enrich_dual,
+    )
+    from claude_mcp_servers.rl_client.search_pipeline import (  # type: ignore[import-not-found]
+        dual_log_request_fields as _dual_log_request_fields,
+    )
+except Exception:
+    _resolve_and_enrich_dual = None  # type: ignore[assignment]
+    _dual_log_request_fields = None  # type: ignore[assignment]
+
 
 def get_weaviate_client():
     """Get Weaviate client"""
@@ -545,6 +560,12 @@ def _get_or_create_embedding_service():
     except Exception as e:
         print(f"⚠️  EmbeddingService construction failed: {e}", file=sys.stderr)
         return None
+
+
+#: v0.2.100 F1: cap on the dual-RL-log secondary query embed on this CLI path
+#: (it also runs under hooks). Past it the twin is skipped and the skip is
+#: recorded in the RL telemetry loss ledger; the primary event is unaffected.
+_CLI_DUAL_EMBED_BUDGET_S = 1.0
 
 
 def _get_target_vector_slot() -> str:
@@ -882,21 +903,53 @@ def search_knowledge(
                         "content": props.get("content", "") or "",
                         "distance": distance,
                         "score": max(0.0, min(1.0, 1.0 - distance)),
+                        # v0.2.100 F1: the enrich step fetches per-node vectors
+                        # (active AND the dual-log other slot) per collection.
+                        "collection": getattr(obj, "_collection_source", "") or "",
                     })
                 import asyncio as _asyncio
                 import uuid as _uuid
-                _req = RerankRequest(
-                    query=query,
-                    candidates=_candidates,
-                    limit=limit,
-                    query_emb=list(query_vector) if query_vector else None,
-                    embedding_source=_ACTIVE_EMBEDDING_SOURCE,
-                    embedding_dim=_embedding_dim_for(_ACTIVE_EMBEDDING_MODEL),
-                    embedding_model=_ACTIVE_EMBEDDING_MODEL,
-                    task_id=f"kg_cli_{_uuid.uuid4().hex[:8]}",
-                    task_type="kg_search_cli",
-                )
-                _rerank_result = _asyncio.run(rerank_and_emit(_req))
+
+                async def _enrich_and_rerank():
+                    # v0.2.100 F1: dual-RL-log through the ONE shared home.
+                    # CLI-shaped like the hook path: secondary embed capped,
+                    # no lazy node backfill. Pre-F1 this path emitted NO node
+                    # vectors and never the `<task_id>:<slot>` twin.
+                    _dual = None
+                    if _resolve_and_enrich_dual is not None and query_vector:
+                        try:
+                            _dual = await _resolve_and_enrich_dual(
+                                _candidates,
+                                query=query,
+                                query_vector=list(query_vector),
+                                active_slot=_get_target_vector_slot(),
+                                model_name=_ACTIVE_EMBEDDING_MODEL,
+                                embed_budget_s=_CLI_DUAL_EMBED_BUDGET_S,
+                                backfill_other=False,
+                                task_type="kg_search_cli",
+                            )
+                        except Exception:
+                            _dual = None
+                    _dual_fields = (
+                        _dual_log_request_fields(_dual)
+                        if _dual_log_request_fields is not None
+                        else {}
+                    )
+                    _req = RerankRequest(
+                        query=query,
+                        candidates=_candidates,
+                        limit=limit,
+                        query_emb=list(query_vector) if query_vector else None,
+                        embedding_source=_ACTIVE_EMBEDDING_SOURCE,
+                        embedding_dim=_embedding_dim_for(_ACTIVE_EMBEDDING_MODEL),
+                        embedding_model=_ACTIVE_EMBEDDING_MODEL,
+                        task_id=f"kg_cli_{_uuid.uuid4().hex[:8]}",
+                        task_type="kg_search_cli",
+                        **_dual_fields,
+                    )
+                    return await rerank_and_emit(_req)
+
+                _rerank_result = _asyncio.run(_enrich_and_rerank())
                 # Re-order unique_results by ranked titles so the print
                 # loop honors the RL output. Titles are unique because
                 # we already deduplicated above.

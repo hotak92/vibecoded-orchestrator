@@ -1619,6 +1619,35 @@ class CodeGraphQuery:
             self.client.close()
 
 
+def _calling_project_root():
+    """The project whose code-graph identity this run must use (v0.2.100 F3).
+
+    The workspace Claude Code says we serve (``CLAUDE_PROJECT_DIR``), else the
+    nearest VCO project above the cwd — the SAME ladder the MCP uses
+    (``weaviate_mcp.server._resolution_context``, the one home). Its last-resort
+    rung (wherever ``server.py`` is installed, i.e. the ORCHESTRATOR) is NOT
+    taken here: a run that cannot name its project falls back to the cwd, as it
+    always did, rather than borrowing the orchestrator root's code graph and
+    grants. Pre-F3 this was ``Path.cwd()`` alone, so a hook firing while the
+    session's cwd sat in another checkout resolved THAT directory's identity
+    instead of the calling project's.
+    """
+    from pathlib import Path as _Path
+
+    try:
+        from weaviate_mcp.server import (  # type: ignore[import-not-found]
+            _CTX_MODULE,
+            _resolution_context,
+        )
+
+        root, kind = _resolution_context()
+        if kind != _CTX_MODULE:
+            return root
+    except Exception:
+        pass
+    return _Path.cwd()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Query code graph with semantic and structural search",
@@ -1702,8 +1731,7 @@ def main():
     if not effective_project:
         try:
             from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
-            from pathlib import Path as _Path
-            _cfg = _vco_resolve(_Path.cwd())
+            _cfg = _vco_resolve(_calling_project_root())
             # v0.2.70 Bug C1a: use the canonical binding-row prefix
             # (code_graph_collection_prefix), NOT the slug alias
             # code_graph_project. The slug sanitises to a nonexistent

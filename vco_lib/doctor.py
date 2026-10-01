@@ -427,6 +427,26 @@ class DoctorResolvers:
     #: () -> the environment the retired-endpoint-env probe judges. Defaults
     #: to this process's ``os.environ``; injected so a test describes it.
     environ: Optional[Callable[[], Any]] = None
+    #: (since_ms) -> :func:`vco_lib.rl_telemetry_loss.summarize` payload, or
+    #: None when the ledger could not be read. Injected so the RL-loss probe
+    #: is driven from a described ledger, no filesystem.
+    rl_loss_summary: Optional[Callable[[int], Optional[dict]]] = None
+
+    def resolve_rl_loss_summary(self, since_ms: int) -> Optional[dict]:
+        """The RL telemetry loss ledger, summarised since ``since_ms``.
+
+        Composes :func:`vco_lib.rl_telemetry_loss.summarize` — the ledger's
+        ONE reader. Soft-fail: an unreadable ledger is ``None`` (the probe
+        renders ``unknown``), never "no losses".
+        """
+        if self.rl_loss_summary is not None:
+            return self.rl_loss_summary(since_ms)
+        from vco_lib import rl_telemetry_loss  # noqa: PLC0415
+
+        try:
+            return rl_telemetry_loss.summarize(since_ms=since_ms)
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
+            return None
 
     def resolve_former_launcher_cli(self) -> list:
         """Copies of the launcher CLI under a former name reachable on PATH.
@@ -1147,6 +1167,68 @@ def probe_summary_pending(folder: Path, res: DoctorResolvers, ctx: dict) -> list
                 "kg_missing": kg_missing,
                 "code_stale": code_stale,
                 "condition_live": live,
+            },
+        )
+    ]
+
+
+#: Window the RL-loss probe counts over. A week covers "since I last looked"
+#: without letting one long-gone hub outage read as a current problem.
+RL_LOSS_WINDOW_DAYS = 7
+
+
+def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """How many RL training events were lost recently, and why (v0.2.100 F1/F4).
+
+    Standing rule: RL is optional, but its training logs are ALWAYS collected.
+    Losses are recorded by their writers in the RL telemetry loss ledger
+    (:mod:`vco_lib.rl_telemetry_loss`): a vct-hub POST that did not land
+    (``hub_post_failed``) or a dual-log twin that was wanted but not produced
+    (``dual_skip``). This probe is that ledger's surface.
+
+    Informational (``ok``) with the counts in the summary: no single loss is a
+    machine defect to fix — a hub that was down for an hour, a cold secondary
+    model — but a count that keeps growing is the signal, and before this
+    probe nothing showed it at all. ``unknown`` when the ledger is unreadable.
+    ``full`` scope only (a file read whose answer matters at review time, not
+    at boot).
+    """
+    import time as _time  # noqa: PLC0415
+
+    since_ms = int((_time.time() - RL_LOSS_WINDOW_DAYS * 86400) * 1000)
+    summary = res.resolve_rl_loss_summary(since_ms)
+    if not isinstance(summary, dict):
+        return [
+            Finding(
+                probe="rl_telemetry_loss",
+                status=STATUS_UNKNOWN,
+                summary="the RL telemetry loss ledger could not be read",
+            )
+        ]
+    total = int(summary.get("total") or 0)
+    by_kind = summary.get("by_kind") or {}
+    if total == 0:
+        text = f"no RL training events lost in the last {RL_LOSS_WINDOW_DAYS} days"
+    else:
+        parts = []
+        for kind in sorted(by_kind):
+            reasons = by_kind[kind] or {}
+            detail = ", ".join(f"{r} x{n}" for r, n in sorted(reasons.items()))
+            parts.append(f"{kind}: {detail}")
+        text = (
+            f"{total} RL training event(s) lost in the last "
+            f"{RL_LOSS_WINDOW_DAYS} days ({'; '.join(parts)})"
+        )
+    return [
+        Finding(
+            probe="rl_telemetry_loss",
+            status=STATUS_OK,
+            summary=text,
+            detail={
+                "window_days": RL_LOSS_WINDOW_DAYS,
+                "total": total,
+                "by_kind": by_kind,
+                "last_ts_ms": summary.get("last_ts_ms"),
             },
         )
     ]
@@ -4210,6 +4292,10 @@ PROBES: dict = {
     # entry can clear), so the boot counter must never point at it. It runs
     # where it is read: `vco doctor` and install/update's end-of-run report.
     "retired_endpoint_env": (probe_retired_endpoint_env, (SCOPE_FULL,)),
+    # v0.2.100 F1/F4: full-only, informational — the RL telemetry loss
+    # ledger's surface (lost hub POSTs, skipped dual-log twins). No registered
+    # condition: a loss is a count to watch, not a ledger entry to clear.
+    "rl_telemetry_loss": (probe_rl_telemetry_loss, (SCOPE_FULL,)),
 }
 
 

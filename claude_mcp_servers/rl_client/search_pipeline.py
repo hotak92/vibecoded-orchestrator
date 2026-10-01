@@ -108,6 +108,26 @@ class RerankRequest:
     other_embedding_model: str = ""
 
 
+def dual_log_request_fields(dual_inputs: Optional[dict]) -> dict[str, Any]:
+    """Map a dual-inputs dict to the ``RerankRequest`` dual fields (v0.2.100 F1).
+
+    ``dual_inputs`` is what ``rl_enrichment.resolve_and_enrich_dual`` (or its
+    ``_resolve_dual_rl_log_inputs`` step) returns — ``{other_slot,
+    other_source, other_dim, other_model, other_query_emb}`` — or None for the
+    single-log path. ONE home for the mapping, so no call site (MCP adapter,
+    ``rl_kg_search.py``, ``search_knowledge.py``) can forget one of the five
+    fields: ``RerankRequest(..., **dual_log_request_fields(dual))``.
+    """
+    di = dual_inputs or {}
+    return {
+        "dual_log": bool(di),
+        "other_query_emb": di.get("other_query_emb"),
+        "other_embedding_source": di.get("other_source", ""),
+        "other_embedding_dim": di.get("other_dim", 0),
+        "other_embedding_model": di.get("other_model", ""),
+    }
+
+
 @dataclass(frozen=True)
 class RerankResult:
     """Output of one rerank-and-emit pass."""
@@ -149,16 +169,15 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
     ranked: list[dict[str, Any]]
     rl_used = False
     if rl_enabled and req.candidates:
-        ranked = await _do_rerank(
+        reranked = await _do_rerank(
             query=req.query,
             candidates=req.candidates,
             limit=req.limit,
             task_id=task_id,
             session_id=req.session_id,
         )
-        rl_used = ranked is not None
-        if not rl_used:
-            ranked = list(req.candidates[: req.limit])
+        rl_used = reranked is not None
+        ranked = reranked if reranked is not None else list(req.candidates[: req.limit])
     else:
         # Free tier OR empty candidates → return Weaviate order. Free
         # tier still benefits from the telemetry emit below so the
@@ -259,7 +278,7 @@ async def rerank_and_emit(req: RerankRequest) -> RerankResult:
             # Same blocking-POST concern as the primary emit above — the
             # other-slot event is a second ~0.5 MB urllib POST. Offload so the
             # dual-log fan-out never blocks the retrieval coroutine.
-            await asyncio.to_thread(_emit_other_slot_event, task_id, req)
+            await asyncio.to_thread(_emit_other_slot_event, task_id, req, ranked, rl_used)
         except Exception as exc:
             logger.debug("rerank_and_emit: dual-log second emit raised (%s)", exc)
 
@@ -285,23 +304,7 @@ async def _emit_retrieval_event(
     the pre-extraction inline path — pure move.
     """
     log_nodes = _build_log_nodes(req.candidates, req.limit)
-    # v0.2.73 RL-1: stamp the post-rerank SHOWN order onto the log nodes.
-    # Pre-RL-1 the event carried only the pre-rerank candidate order (the
-    # ``tier`` field is the pre-rerank index gate) and the ranked list was
-    # discarded — so citation labels conditioned on an order the user never
-    # saw whenever the RL rerank actually reordered. ``shown_rank`` = the
-    # node's 0-based position in the list the caller RETURNS; absent for
-    # candidates that were truncated out of the shown top-k.
-    _shown_ranks: dict[str, int] = {}
-    for _i, _n in enumerate(ranked):
-        if isinstance(_n, dict):
-            _t = _n.get("title", "")
-            if _t and _t not in _shown_ranks:
-                _shown_ranks[_t] = _i
-    for _rec in log_nodes:
-        _sr = _shown_ranks.get(_rec.get("title", ""))
-        if _sr is not None:
-            _rec["shown_rank"] = _sr
+    _stamp_shown_ranks(log_nodes, ranked)
     emit_success = False
     try:
         ev = RetrievalEvent(
@@ -343,6 +346,30 @@ async def _emit_retrieval_event(
 
 
 # ---- internal helpers ----------------------------------------------
+
+
+def _stamp_shown_ranks(log_nodes: list[dict[str, Any]], ranked: list[Any]) -> None:
+    """Stamp the post-rerank SHOWN order onto log nodes, in place.
+
+    v0.2.73 RL-1: pre-RL-1 the event carried only the pre-rerank candidate
+    order (the ``tier`` field is the pre-rerank index gate) and the ranked list
+    was discarded — so citation labels conditioned on an order the user never
+    saw whenever the RL rerank actually reordered. ``shown_rank`` = the node's
+    0-based position in the list the caller RETURNS; absent for candidates that
+    were truncated out of the shown top-k. ONE home since v0.2.100 F2: both the
+    active event and the dual-log twin stamp through here, so the twin carries
+    the same label.
+    """
+    shown: dict[str, int] = {}
+    for i, n in enumerate(ranked or []):
+        if isinstance(n, dict):
+            t = n.get("title", "")
+            if t and t not in shown:
+                shown[t] = i
+    for rec in log_nodes:
+        sr = shown.get(rec.get("title", ""))
+        if sr is not None:
+            rec["shown_rank"] = sr
 
 
 def _drive_retention_housekeeping() -> None:
@@ -977,58 +1004,72 @@ def slot_suffixed_task_id(task_id: str, embedding_source: str) -> str:
     return f"{task_id}:{embedding_source}"
 
 
+#: Fields of an ACTIVE-slot log record that live in the ACTIVE embedding space
+#: (vectors, or cosines computed against active-space vectors). The dual-log
+#: twin must never carry them — they would be a qwen3-space feature inside an
+#: arctic-space sample. ``linked_type_names`` is the index-parallel label array
+#: of ``linked_embs`` and goes with it.
+_ACTIVE_SPACE_ONLY_FIELDS = (
+    "emb", "n_emb", "cos_qn", "cos_ql", "cos_nl",
+    "linked_embs", "linked_type_names", "emb_truncated",
+)
+
+
 def _build_other_slot_log_nodes(
-    candidates: list[dict[str, Any]], limit: int
+    candidates: list[dict[str, Any]],
+    limit: int,
+    ranked: Optional[list[Any]] = None,
 ) -> list[dict[str, Any]]:
     """Reduce candidates to telemetry log-nodes using the OTHER slot's vectors.
 
-    Same shape + tiering as ``_build_log_nodes`` but reads ``emb_other`` /
-    ``cos_qn_other`` (attached by the enrichment site for the non-active slot)
-    in place of ``emb`` / ``cos_qn`` / ``n_emb``. Candidates lacking an
-    ``emb_other`` are SKIPPED entirely (the second event only carries nodes for
-    which the other slot's vector genuinely exists — never fabricates). All
-    other fields (score, links, node_type) are reused verbatim from the
-    identical per-node candidate set (case-(a) 1:1 fan-out).
+    v0.2.100 F2: built FROM ``_build_log_nodes`` output with the vectors
+    swapped, so the two builders cannot drift. Pre-F2 this was a separate
+    reducer that silently dropped ``shown_rank`` (the RL-1 presented-order
+    label), ``chunks_matched`` and ``best_chunk_number`` — the arctic net got
+    poorer samples than the qwen3 net from the very same retrieval.
+
+    Per node: every non-space field of the active record is kept verbatim
+    (title, score, tier, node_type, links, score_cosine, chunks_matched,
+    best_chunk_number, and ``shown_rank`` when ``ranked`` is given); the
+    active-space fields (:data:`_ACTIVE_SPACE_ONLY_FIELDS`) are dropped and
+    replaced by the other slot's: ``emb`` / ``n_emb`` ← ``emb_other``,
+    ``cos_qn`` ← ``cos_qn_other``, ``emb_truncated`` ← ``emb_other_truncated``
+    (only-when-known). Candidates lacking an ``emb_other`` are SKIPPED (the
+    twin only carries nodes whose other-slot vector genuinely exists — never
+    fabricates); ``tier`` keeps the candidate's ORIGINAL index, as before.
     """
+    base = _build_log_nodes(candidates, limit)
+    if ranked is not None:
+        _stamp_shown_ranks(base, ranked)
+    # _build_log_nodes skips non-dict candidates, so re-pair by filtering the
+    # same way (order is preserved).
+    dict_cands = [n for n in candidates if isinstance(n, dict)]
     out: list[dict[str, Any]] = []
-    for idx, n in enumerate(candidates):
-        if not isinstance(n, dict):
-            continue
+    for n, rec in zip(dict_cands, base):
         emb_other = n.get("emb_other")
         if not emb_other:
-            # No other-slot vector for this node — skip rather than fabricate.
             continue
-        rec: dict[str, Any] = {
-            "title": n.get("title", ""),
-            "score": _clamp_unit_score(n.get("score", 0.0)),
-            "tier": "top_k" if idx < limit else "extra_reference",
-            # The other slot's per-node vector serves as BOTH ``emb`` and
-            # ``n_emb`` (the citation cosine side reads ``n_emb`` first).
-            "emb": emb_other,
-            "n_emb": emb_other,
-        }
-        # v4 (2026-09-04): carry the other slot's per-node truncation state so
-        # the second event identifies truncated secondary vectors from the
-        # EVENT ALONE — the trainer reads launcher.db, not Weaviate. Set by
-        # the enrichment site via the ONE shared reader
-        # (rl_enrichment._stored_slot_truncation_state); routed through the
-        # same only-when-known carry helper the MAIN builder uses, so the two
-        # legs cannot drift on the rule.
-        _apply_emb_truncation(rec, n.get("emb_other_truncated"))
-        if n.get("node_type"):
-            rec["node_type"] = n["node_type"]
-        if n.get("links"):
-            rec["links"] = n["links"]
+        twin = {k: v for k, v in rec.items() if k not in _ACTIVE_SPACE_ONLY_FIELDS}
+        # The other slot's per-node vector serves as BOTH ``emb`` and ``n_emb``
+        # (the citation cosine side reads ``n_emb`` first).
+        twin["emb"] = emb_other
+        twin["n_emb"] = emb_other
+        # v4 (2026-09-04): the other slot's per-node truncation state, through
+        # the same only-when-known carry helper the MAIN builder uses.
+        _apply_emb_truncation(twin, n.get("emb_other_truncated"))
         cos_other = n.get("cos_qn_other")
         if cos_other is not None:
-            rec["cos_qn"] = cos_other
-        if n.get("score_cosine") is not None:
-            rec["score_cosine"] = _clamp_unit_score(n["score_cosine"])
-        out.append(rec)
+            twin["cos_qn"] = cos_other
+        out.append(twin)
     return out
 
 
-def _emit_other_slot_event(task_id: str, req: "RerankRequest") -> None:
+def _emit_other_slot_event(
+    task_id: str,
+    req: "RerankRequest",
+    ranked: Optional[list[Any]] = None,
+    rl_used: bool = False,
+) -> None:
     """Emit the second (other-slot) retrieval event. Soft-fail, no-op when empty.
 
     Builds the other-slot log-nodes (skipping candidates with no other-slot
@@ -1038,7 +1079,7 @@ def _emit_other_slot_event(task_id: str, req: "RerankRequest") -> None:
     keyed on ``other_embedding_source`` (the per-(project, emb_source) cache
     already isolates the two writers — no new caching code).
     """
-    other_nodes = _build_other_slot_log_nodes(req.candidates, req.limit)
+    other_nodes = _build_other_slot_log_nodes(req.candidates, req.limit, ranked)
     if not other_nodes:
         logger.debug(
             "dual-log: no candidate carries the other slot; suppressing second event"
@@ -1069,6 +1110,8 @@ def _emit_other_slot_event(task_id: str, req: "RerankRequest") -> None:
         session_id=req.session_id,
         failure_mode=req.failure_mode,
         failed_collections=list(req.failed_collections),
+        # F2: the twin describes the SAME presented list as the active event.
+        rl_used=rl_used,
     )
     try:
         emit_rl_event(other_ev, writer_factory=_other_writer_factory)

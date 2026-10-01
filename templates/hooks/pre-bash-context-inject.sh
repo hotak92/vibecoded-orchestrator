@@ -284,6 +284,18 @@ find "$STATE_DIR" -maxdepth 1 -type f -name "bash_task_*.json" -mtime +1 -delete
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
+# there (same roots as the venv above), never under $PROJECT_ROOT. It still
+# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
+# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path, so every existence check
+# below reads "not installed" exactly as before.
+RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
 
 # === Run KG search using command as query ===
 # Truncate the query to ~500 chars so the embedding model isn't fed
@@ -384,7 +396,7 @@ except Exception:
 fi
 
 KG_TMP=$(mktemp)
-if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" ]; then
+if [ -n "$VENV" ] && [ -f "$RL_SCRIPT" ]; then
     # v0.2.77 Part 9 task 2: route through the shared TTL result-cache wrapper
     # so a repeat command-derived query is served from disk (~ms) instead of
     # re-paying the ~1.3 s round-trip. Falls back to the direct call when the
@@ -393,12 +405,12 @@ if [ -n "$VENV" ] && [ -f "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search
         # WP-E (v0.2.92): prompt_id scopes the cache key; transcript_path
         # threads to the producer's --transcript flag (path only — see the
         # parse block above for the privacy rationale).
-        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
+        ( vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
         KG_PID=$!
     else
         _FALLBACK_ARGS=("$QUERY" --limit 1 --hook-format)
         [ -n "$TRANSCRIPT_PATH" ] && _FALLBACK_ARGS+=(--transcript "$TRANSCRIPT_PATH")
-        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "${_FALLBACK_ARGS[@]}" 2>/dev/null \
+        ("$VENV" "$RL_SCRIPT" "${_FALLBACK_ARGS[@]}" 2>/dev/null \
             | head -40 > "$KG_TMP") &
         KG_PID=$!
     fi

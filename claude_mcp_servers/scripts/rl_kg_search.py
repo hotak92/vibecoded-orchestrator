@@ -18,9 +18,29 @@ import asyncio
 import argparse
 import os
 import sys
+from typing import Any
 
-# Add parent dir so we can import weaviate_mcp
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Add parent dir so we can import weaviate_mcp, and the orchestrator root so
+# `claude_mcp_servers.*` / `vco_lib` import without relying on the caller's cwd.
+# v0.2.100 F3: hooks in EVERY project now run THIS file from the orchestrator
+# root (located via VCT_ORCHESTRATOR_ROOT / VCT_INSTALL_ROOT), with cwd in the
+# calling project — so the cwd can no longer be assumed to be the root.
+# Identity is NOT taken from this file's location: `weaviate_mcp.server`
+# resolves the project from CLAUDE_PROJECT_DIR (the calling project), and the
+# collections/permissions come from that project's hub config and env.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+_ORCH_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+if _ORCH_ROOT not in sys.path:
+    sys.path.insert(1, _ORCH_ROOT)
+
+#: v0.2.100 F1: hard cap on the dual-RL-log SECONDARY query embed on this
+#: (hook) path. Past it the twin event is skipped and the skip is recorded in
+#: the RL telemetry loss ledger; the primary event is unaffected. Sized well
+#: inside the hook's 7 s inner timeout (warm secondary embed: ~30-150 ms).
+HOOK_DUAL_EMBED_BUDGET_S = 1.0
+
+TASK_TYPE = "pre_edit_kg_search"
 
 
 async def main():
@@ -67,7 +87,7 @@ async def main():
         _kg_collections_to_search,
         _embedding_dim_for,
         _collapse_to_one_per_node,
-        _rl_enrich_nodes_with_linked_embs,
+        resolve_and_enrich_dual,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
         EMBEDDING_MODEL,
@@ -75,6 +95,7 @@ async def main():
     )
     from claude_mcp_servers.rl_client.search_pipeline import (
         RerankRequest,
+        dual_log_request_fields,
         rerank_and_emit,
     )
     import uuid
@@ -144,7 +165,7 @@ async def main():
                             return_metadata=["distance"],
                         )
                     else:
-                        nv_kwargs = dict(
+                        nv_kwargs: dict[str, Any] = dict(
                             near_vector=q_vector,
                             limit=q_limit,
                             return_metadata=["distance"],
@@ -185,7 +206,10 @@ async def main():
         # rl_client.query_chunking (one home, reuses chunking.py + _cosine).
         from claude_mcp_servers.rl_client import query_chunking as _qc
 
-        if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(effective_query, EMBEDDING_MODEL):
+        oversized = EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(
+            effective_query, EMBEDDING_MODEL
+        )
+        if oversized:
             query_chunks = _qc.chunk_query(effective_query, EMBEDDING_MODEL)
             per_chunk_limit = _qc.kg_results_per_chunk(args.limit) * _RL_OVERFETCH
             pooled_per_chunk: list[list[dict]] = []
@@ -246,16 +270,46 @@ async def main():
         # node vectors → cosine citations were impossible for ~72% of all
         # retrievals (the pre_edit_kg_search cohort).
         all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+        # v0.2.100 F1: dual-RL-log resolve + enrich through the ONE shared home
+        # the MCP tools use. Pre-F1 this path (~99% of all retrievals) called
+        # the bare enrich and never produced the other slot's `<task_id>:<slot>`
+        # twin. Hook-shaped: the secondary query embed is capped at
+        # HOOK_DUAL_EMBED_BUDGET_S and the lazy node backfill is OFF. An
+        # oversized query (chunked above) embeds per chunk, which the twin
+        # cannot mirror without duplicating the chunk logic — it goes out
+        # single-slot and the skip is recorded, never silent.
+        dual_inputs = None
         if vector is not None:
+            if oversized:
+                from weaviate_mcp.server import _dual_rl_log_expected
+
+                if _dual_rl_log_expected():
+                    from vco_lib.rl_telemetry_loss import KIND_DUAL_SKIP, record_loss
+
+                    record_loss(KIND_DUAL_SKIP, "oversized_query", task_type=TASK_TYPE)
             try:
-                _rl_enrich_nodes_with_linked_embs(
-                    all_formatted, query_emb=vector, active_slot=query_target,
-                    model_name=EMBEDDING_MODEL,
-                )
+                if not oversized:
+                    dual_inputs = await resolve_and_enrich_dual(
+                        all_formatted,
+                        query=effective_query,
+                        query_vector=vector,
+                        active_slot=query_target,
+                        model_name=EMBEDDING_MODEL,
+                        embed_budget_s=HOOK_DUAL_EMBED_BUDGET_S,
+                        backfill_other=False,
+                        task_type=TASK_TYPE,
+                    )
+                else:
+                    from weaviate_mcp.server import _rl_enrich_nodes_with_linked_embs
+
+                    _rl_enrich_nodes_with_linked_embs(
+                        all_formatted, query_emb=vector, active_slot=query_target,
+                        model_name=EMBEDDING_MODEL,
+                    )
             except Exception:
                 # Soft-fail: enrichment is best-effort telemetry; never break
                 # the user-facing context injection.
-                pass
+                dual_inputs = None
 
         # RL rerank + telemetry emit via the V52-J canonical pipeline.
         # NEW-8 (2026-05-28): query embedding is carried into the
@@ -299,9 +353,11 @@ async def main():
             embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
             embedding_model=EMBEDDING_MODEL,
             task_id=task_id,
-            task_type="pre_edit_kg_search",
+            task_type=TASK_TYPE,
             session_id=resolved_session,
             spawn_answer_monitor=False,
+            # v0.2.100 F1: the twin's inputs; empty → single-log (unchanged).
+            **dual_log_request_fields(dual_inputs),
         )
         # F-A (v0.2.70): no in-process monitor on the hook path; the staged
         # pending file (written inside rerank_and_emit → _populate_citation_cache

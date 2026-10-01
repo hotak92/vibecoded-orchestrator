@@ -96,3 +96,41 @@ function Resolve-VcoVenvPython {
     # using. NEVER fall back to $env:PROJECT_ROOT/.venv (user's venv).
     return $null
 }
+
+# Resolve-VcoOrchestratorScript -ScriptDir <dir> -RelPath <rel>
+# Returns the absolute path of <rel> inside the VCO orchestrator root, or $null.
+#
+# v0.2.100 F3 — see resolve_vco_orchestrator_script in resolve-vco-venv.sh for
+# the full rationale. Same order as the interpreter ladder above, so the script
+# and the venv come from one install: $VCT_INSTALL_ROOT, $VCT_ORCHESTRATOR_ROOT,
+# <ScriptDir>/../.. (only a real VCO clone). No project-root tier, by the
+# same contract as the interpreter ladder above.
+# IDENTITY IS NOT TAKEN FROM HERE: the caller runs the script with its own
+# CLAUDE_PROJECT_DIR / cwd / environment, so the CALLING project's KG
+# collection, shared-KG gate, access grants and code-graph prefix apply.
+#
+# MUST MATCH: resolve_vco_orchestrator_script in resolve-vco-venv.sh.
+function Resolve-VcoOrchestratorScript {
+    param(
+        [string]$ScriptDir,
+        [string]$RelPath
+    )
+    if (-not $RelPath) { return $null }
+    foreach ($root in @($env:VCT_INSTALL_ROOT, $env:VCT_ORCHESTRATOR_ROOT)) {
+        if (-not $root) { continue }
+        $candidate = Join-Path $root $RelPath
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+            return $candidate
+        }
+    }
+    if ($ScriptDir) {
+        $cloneRoot = Resolve-Path -LiteralPath (Join-Path $ScriptDir "../..") -ErrorAction SilentlyContinue
+        if ($cloneRoot -and (Test-VcoOrchestratorClone -Candidate $cloneRoot.Path)) {
+            $candidate = Join-Path $cloneRoot.Path $RelPath
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
