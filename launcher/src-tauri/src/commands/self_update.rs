@@ -1160,8 +1160,16 @@ pub async fn get_latest_source_release_tag() -> Result<Option<String>, String> {
     // Keep the local tag refs warm too. Soft-fail and NOT load-bearing: the
     // answer comes from the remote, so a failed fetch no longer silently
     // changes what we report — it just means `.git/refs/tags/` stays stale
-    // for other consumers.
-    let _ = serialized_fetch_upstream(&repo, FetchPolicy::Tags, None).await;
+    // for other consumers. v0.2.100 final review: run it in the BACKGROUND —
+    // a fetch may now legitimately take minutes on a slow link (stall
+    // detection, not a 30 s total cap, ends it), and an answer that does not
+    // depend on it must not wait for it.
+    {
+        let repo = repo.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = serialized_fetch_upstream(&repo, FetchPolicy::Tags, None).await;
+        });
+    }
 
     git_cmd::latest_remote_tag(&repo, VCO_UPSTREAM_REMOTE).await
 }

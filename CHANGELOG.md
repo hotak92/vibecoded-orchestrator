@@ -68,6 +68,7 @@ Release mechanics: versions are strictly `X.Y.Z` from this release on — no `rc
 - **A flaky Weaviate mock** in the launcher tests (about 1 in 4–12 red) is fixed.
 
 ### Removed
+- **The `install.py --update` "paper trail" stub is retired.** Since v0.2.13 a clean update wrote an empty `UPDATE_DEFERRED.md`; the owner rule is that the file appears only when something is actually deferred and every writer adds to it rather than replacing it, so the stub writer and its help-text promise are gone.
 
 - **Nine per-surface update commands** (`update_orchestrator`, merge/rebase/resume, `apply_pending_install`, `apply_launcher_update`, `force_resync_launcher`, `update_orchestrator_at`, `get_cached_update_status_refreshed`), replaced by the one pipeline.
 - **The "Update N orchestrator clones" button and the per-project "update this orchestrator clone" action.** A second VCO install is updated from its own launcher or with `python install.py --update` in that clone.

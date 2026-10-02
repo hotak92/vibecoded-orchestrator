@@ -1603,9 +1603,12 @@ where
 
 /// v0.2.100 (W4R-01): what a module START may do with an existing container
 /// that already has the name it is about to `run` under. The reaper's label
-/// gate ([`reap_decision`]) and this are the only two places a module
-/// container is removed, and both read the container's own
-/// [`super::container_ownership::LAUNCHER_LABEL`] before an `rm -f`. A
+/// gate ([`reap_decision`]) and this are the two ownership-checked removal
+/// paths; both read the container's own
+/// [`super::container_ownership::LAUNCHER_LABEL`] before an `rm -f`. (The
+/// hub's global restart and the explicit stop paths also remove a module's
+/// container by name — owner-deferred to v0.2.102 to route them through the
+/// same check, v0.2.100 final review NB-R2.) A
 /// container with NO label (created before v0.2.100, by any install) is
 /// removed here only on the DB claim PLUS [`PreLabelEvidence`] read from the
 /// container itself (R18-08) — never on the DB claim alone.

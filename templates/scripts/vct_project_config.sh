@@ -921,9 +921,8 @@ Usage:
   $0 hub-port
 
 hub-port prints the port the hub is reached on (VCT_HUB_PORT -> hub.port ->
-7700, the same ladder every request here uses). It is how a hook that must
-know the hub port without a request (the pre-tool-use SSRF allowlist) asks
-the ONE shell resolver instead of re-deriving it.
+7700, the same ladder every request here uses), for a shell caller that
+must know the hub port without making a request.
 
 Exit codes:
   0  success

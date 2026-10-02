@@ -76,8 +76,10 @@ function Emit-AdditionalContext {
 
     $envelope = [ordered]@{
         hookSpecificOutput = [ordered]@{
+            # No permissionDecision: on PreToolUse 'allow' SKIPS the user's
+            # permission prompt (official hooks docs). Context injection must
+            # never approve the tool call — must match emit-context.sh.
             hookEventName      = $EventName
-            permissionDecision = 'allow'
             additionalContext  = $truncated
         }
     }

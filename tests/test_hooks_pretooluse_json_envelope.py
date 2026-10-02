@@ -11,10 +11,13 @@ hook runner. Only the structured JSON envelope:
     {
       "hookSpecificOutput": {
         "hookEventName": "PreToolUse",
-        "permissionDecision": "allow",
         "additionalContext": "...up to 10000 chars..."
       }
     }
+
+(v0.2.100: NO ``permissionDecision``. On PreToolUse ``"allow"`` skips the
+user's permission prompt, per the official hooks docs, so a context-injecting
+hook must never emit it — see ``test_context_envelopes_never_approve`` below.)
 
 reaches the LLM as a system-reminder. Hooks that print plaintext on the
 allow/exit-0 path produce no observable effect — their work is dead.
@@ -406,3 +409,46 @@ def test_no_uncovered_pretooluse_hooks() -> None:
         "If the hook only emits stderr / blocked-action feedback / "
         "doesn't print to stdout, add it to EXEMPT_NO_LLM_OUTPUT."
     )
+
+
+# ── v0.2.100: context injection must never approve a tool call ─────────────
+import subprocess as _sp  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_HOOKS = _Path(__file__).resolve().parents[1] / "templates" / "hooks"
+
+
+def test_context_envelopes_never_approve() -> None:
+    """On PreToolUse, ``permissionDecision: "allow"`` SKIPS the user's
+    permission prompt (official Claude Code hooks docs, "PreToolUse decision
+    control"). VCO's hooks only add context, so no hook that builds a
+    context envelope may carry a permission decision of any kind."""
+    offenders = []
+    for path in sorted(_HOOKS.rglob("*")):
+        if path.suffix not in (".sh", ".ps1") or path.name.startswith("lean-ctx"):
+            continue
+        text = path.read_text(encoding="utf-8-sig")
+        if "additionalContext" in text and "permissionDecision" in text:
+            for n, line in enumerate(text.splitlines(), 1):
+                stripped = line.strip()
+                if "permissionDecision" in stripped and not stripped.startswith("#"):
+                    offenders.append(f"{path.relative_to(_HOOKS)}:{n}: {stripped}")
+    assert not offenders, "context-injecting hooks emit a permission decision:\n" + "\n".join(offenders)
+
+
+def test_emit_context_sh_envelope_has_no_decision(tmp_path) -> None:
+    """Behavioural: the real .sh emitter's JSON carries context and no decision."""
+    import json
+    import sys
+    script = (
+        f'. "{_HOOKS / "_lib" / "emit-context.sh"}"; '
+        f'PY="{sys.executable}"; '
+        'emit_additional_context "some kg context" PreToolUse'
+    )
+    out = _sp.run(["bash", "-c", script], capture_output=True, text=True, timeout=30,
+                  env={**__import__("os").environ, "PY": sys.executable})
+    lines = [line for line in out.stdout.splitlines() if line.startswith("{")]
+    assert lines, f"no envelope emitted: stdout={out.stdout!r} stderr={out.stderr[-400:]!r}"
+    env = json.loads(lines[-1])["hookSpecificOutput"]
+    assert env["additionalContext"].startswith("some kg context")
+    assert "permissionDecision" not in env

@@ -367,7 +367,17 @@ async fn supports_no_write_fetch_head() -> bool {
 /// prints no progress meter to a pipe, so the only cost of dropping it is the
 /// evidence we now keep.
 fn fetch_args(policy: FetchPolicy, refspec: Option<&str>, no_write_fetch_head: bool) -> Vec<String> {
-    let mut args: Vec<String> = vec!["fetch".into()];
+    // v0.2.100 final review (blocker): a smart-HTTP fetch cannot resume, so a
+    // TOTAL-time cap kills every attempt on a slow link (a one-release pack is
+    // ~30 MB) and the update is never offered. A STALLED transfer is what must
+    // end an attempt: git aborts when it moves < 1000 B/s for 60 s.
+    let mut args: Vec<String> = vec![
+        "-c".into(),
+        format!("http.lowSpeedLimit={FETCH_LOW_SPEED_LIMIT_BPS}"),
+        "-c".into(),
+        format!("http.lowSpeedTime={FETCH_LOW_SPEED_TIME_SECS}"),
+        "fetch".into(),
+    ];
     if no_write_fetch_head {
         args.push("--no-write-fetch-head".into());
     }
@@ -782,15 +792,27 @@ const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1_000, 5_000, 30_000, 120_000];
 #[cfg(test)]
 const FETCH_RETRY_DELAYS_MS: [u64; 4] = [1, 5, 30, 120];
 
-/// M-2 (v0.2.83): per-ATTEMPT timeout for the serialized upstream fetch. One
+/// M-2 (v0.2.83): per-ATTEMPT ceiling for the serialized upstream fetch. One
 /// hung fetch (dead network, hung credential helper, stuck DNS) would
-/// otherwise stall the ladder — and, before v0.2.100's bounded waits, every
-/// caller behind the lock — forever. A timeout is a RETRYABLE error, and since
-/// v0.2.100 the timed-out child is killed (`kill_on_drop`). Production: 30s.
+/// otherwise stall the ladder forever. A timeout is a RETRYABLE error, and since
+/// v0.2.100 the timed-out child is killed (`kill_on_drop`).
+///
+/// Production: 600s (v0.2.100 final review). It was 30s, which — once the
+/// child is killed — made every fetch on a link slower than ~8 Mbit/s fail
+/// for good (a fetch cannot resume). A slow but MOVING transfer now finishes;
+/// a stalled one is ended by git itself (`http.lowSpeedLimit`/`lowSpeedTime`,
+/// see [`fetch_args`]). Callers never queue behind a long fetch: their wait
+/// is bounded by [`fetch_wait_bound`].
 /// Under `cfg(test)` it is milliseconds, sized so a fake `git` script has
 /// time to start before the timeout fires.
 #[cfg(not(test))]
-const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(30);
+const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(600);
+
+/// Stall detection passed to git (see [`fetch_args`]): an attempt whose
+/// transfer stays below this many bytes/s for [`FETCH_LOW_SPEED_TIME_SECS`]
+/// is aborted by git, so a dead link fails fast while a slow one completes.
+const FETCH_LOW_SPEED_LIMIT_BPS: u32 = 1000;
+const FETCH_LOW_SPEED_TIME_SECS: u32 = 60;
 #[cfg(test)]
 const FETCH_ATTEMPT_TIMEOUT: Duration = Duration::from_millis(400);
 
@@ -1053,7 +1075,11 @@ mod tests {
         for policy in [FetchPolicy::Quick, FetchPolicy::Persistent, FetchPolicy::Tags] {
             let args = fetch_args(policy, None, true);
             assert!(!args.iter().any(|a| a == "--quiet"), "{policy:?}: {args:?}");
-            assert_eq!(args[0], "fetch");
+            // Stall detection precedes the subcommand (git -c … fetch).
+            assert_eq!(
+                &args[..5],
+                &["-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60", "fetch"]
+            );
             assert!(args.iter().any(|a| a == "--no-write-fetch-head"));
         }
         assert!(fetch_args(FetchPolicy::Tags, None, false)
@@ -1064,7 +1090,10 @@ mod tests {
             .any(|a| a.contains("refs/tags")));
         assert_eq!(
             fetch_args(FetchPolicy::Quick, Some("main"), false),
-            vec!["fetch", "vco_upstream", "main"]
+            vec![
+                "-c", "http.lowSpeedLimit=1000", "-c", "http.lowSpeedTime=60",
+                "fetch", "vco_upstream", "main"
+            ]
         );
     }
 
@@ -1074,6 +1103,26 @@ mod tests {
         assert_eq!(fetch_retry_delays(FetchPolicy::Tags), &QUICK_FETCH_DELAYS_MS[..]);
         assert_eq!(fetch_retry_delays(FetchPolicy::Quick), &QUICK_FETCH_DELAYS_MS[..]);
         assert_eq!(fetch_retry_delays(FetchPolicy::Persistent), &FETCH_RETRY_DELAYS_MS[..]);
+    }
+
+    /// v0.2.100 final review (blocker): a slow but moving fetch must be able to
+    /// finish. The production per-attempt ceiling is minutes, not seconds — a
+    /// ~30 MB pack needs > 30 s below ~8 Mbit/s and a killed fetch cannot
+    /// resume — and stall detection is what ends a dead transfer.
+    #[test]
+    fn a_slow_link_can_finish_a_release_fetch() {
+        const PRODUCTION_CEILING_SECS: u64 = 600;
+        assert!(PRODUCTION_CEILING_SECS >= 300, "ceiling must allow a slow pack");
+        assert!(FETCH_LOW_SPEED_TIME_SECS >= 30 && FETCH_LOW_SPEED_TIME_SECS < PRODUCTION_CEILING_SECS as u32);
+        let src = include_str!("upstream_fetch.rs");
+        let line = src
+            .lines()
+            .find(|l| l.contains("const FETCH_ATTEMPT_TIMEOUT") && !l.contains("from_millis"))
+            .expect("production FETCH_ATTEMPT_TIMEOUT");
+        assert!(
+            line.contains(&format!("from_secs({PRODUCTION_CEILING_SECS})")),
+            "production fetch ceiling changed: {line}"
+        );
     }
 
     /// D4: parse `git --version` and gate `--no-write-fetch-head` on >=2.29.

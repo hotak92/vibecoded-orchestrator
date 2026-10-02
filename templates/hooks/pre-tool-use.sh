@@ -77,7 +77,7 @@ if [ -z "${PY:-}" ]; then
             mkdir -p "$_NOPY_ROOT/.claude/state" 2>/dev/null && : > "$_NOPY_SENTINEL" 2>/dev/null
             # The message is a fixed ASCII literal with no quote or backslash,
             # so it is embedded in the JSON as-is (no encoder available here).
-            printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "allow", "additionalContext": "%s"}}\n' "$_NOPY_MSG"
+            printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "%s"}}\n' "$_NOPY_MSG"
         fi
     fi
     exit 0

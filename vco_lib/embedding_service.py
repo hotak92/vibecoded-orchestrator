@@ -2838,8 +2838,8 @@ class EmbeddingService:
         active vector (the dual-RL-log query embed on a latency-bounded hook,
         which used to re-embed the active slot inside its 1 s budget).
 
-        Returns ``{slot_name: vector}``. ALWAYS includes the active slot
-        (``self._text_slot``). The SECONDARY enrichment slots (qwen3,
+        Returns ``{slot_name: vector}``. Includes the active slot
+        (``self._text_slot``) unless ``include_active=False`` (see above). The SECONDARY enrichment slots (qwen3,
         openai, and — WP-O, opt-in via ``DUAL_EMBEDDING_ARCTIC_SECONDARY`` —
         arctic ``arctic2_embed``) are added only when
         ``DUAL_EMBEDDING_WRITE_ALL_SLOTS`` is enabled (v0.2.71 Piece 5c —

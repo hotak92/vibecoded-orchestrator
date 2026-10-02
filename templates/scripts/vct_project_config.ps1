@@ -24,8 +24,9 @@
 #       Print the project_id (UUID) for <folder>.
 #   .\vct_project_config.ps1 -HubPort
 #       Print the port the hub is reached on (Get-HubPort: VCT_HUB_PORT ->
-#       hub.port -> 7700). MUST MATCH the .sh `hub-port` subcommand; the
-#       pre-tool-use SSRF allowlist (_lib/ssrf-allowlist.ps1) calls it.
+#       hub.port -> 7700). MUST MATCH the .sh `hub-port` subcommand. (The
+#       SSRF guard no longer calls it: since v0.2.100 vco_lib.ssrf_url resolves
+#       the hub port itself.)
 #
 # Exit codes (identical to bash):
 #   0  success

@@ -113,12 +113,15 @@ emit_additional_context() {
     local truncated
     truncated=$(vco_cap_context "$ctx")
 
+    # No permissionDecision in the envelope: on PreToolUse "allow" SKIPS the
+    # user's permission prompt (official hooks docs, "PreToolUse decision
+    # control"). Injecting context must never approve the tool call; the
+    # documented context-only envelope is hookEventName + additionalContext.
     EVENT="$event_name" "$py" -c "
 import json, os, sys
 print(json.dumps({
     'hookSpecificOutput': {
         'hookEventName': os.environ.get('EVENT', 'PreToolUse'),
-        'permissionDecision': 'allow',
         'additionalContext': sys.stdin.read(),
     }
 }))
