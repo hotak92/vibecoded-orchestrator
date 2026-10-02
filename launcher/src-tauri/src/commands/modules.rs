@@ -93,11 +93,11 @@ pub struct ModuleCatalogEntry {
     /// `DEPRECATED` badge in the launcher's Modules card head; does NOT
     /// block install/run (deprecated modules keep working until EOL).
     ///
-    /// Populated at catalog-build time once the v0.2.32 poller wires the
-    /// Supabase response into `apply_deprecation_state`. v0.2.31 ships
-    /// the field with a `false` default so the UI is forward-compatible;
-    /// manual flips via the `apply_deprecation_state` Tauri command set
-    /// the env vars + audit row independently of this catalog field.
+    /// Populated at catalog-build time by `ModuleCatalogEntry::from_l0`,
+    /// which copies the L0 catalog's `deprecated` / message / EOL fields
+    /// (the deprecation poller writes the same state through
+    /// `apply_deprecation_state_impl`). Entries built without an L0 row
+    /// (this default constructor) are `false`.
     #[serde(default)]
     pub deprecated: bool,
     /// Optional human-readable deprecation message (rendered in the badge
@@ -173,8 +173,8 @@ impl ModuleCatalogEntry {
             cta_route: String::new(),
             coming_soon_tier: String::new(),
             coming_soon_target: String::new(),
-            // v0.2.31: defaults — catalog-build time doesn't yet read
-            // `runtime.update_endpoint`. See struct doc comment.
+            // Defaults for entries with no L0 row; `from_l0` fills the
+            // deprecation fields from the L0 catalog. See struct doc comment.
             deprecated: false,
             deprecation_message: String::new(),
             deprecation_eol_date: String::new(),
@@ -624,19 +624,13 @@ pub(crate) fn list_module_catalog_impl_with_l0(
         // candidate status — small constant number of queries.
         let install_state = lookup_install_state(db, &l0.id);
 
+        let mut version_warning: Option<String> = None;
         let (kind, version_override): (&str, Option<&str>) = match &install_state {
             InstallState::None => ("available", None),
             InstallState::Installed { version } => {
-                if version == &l0.version {
-                    ("installed", Some(version.as_str()))
-                } else if semver_less(version, &l0.version) {
-                    // L0 is newer than installed → update available.
-                    ("update_available", Some(version.as_str()))
-                } else {
-                    // Installed is newer than (or equal to a previous-
-                    // rolled-back) L0. Silent per review §J4-d.
-                    ("installed", Some(version.as_str()))
-                }
+                let (kind, warning) = installed_catalog_kind(version, &l0.version);
+                version_warning = warning;
+                (kind, Some(version.as_str()))
             }
             InstallState::Broken { version } => ("broken", Some(version.as_str())),
             InstallState::Pending { status, version } => {
@@ -649,7 +643,11 @@ pub(crate) fn list_module_catalog_impl_with_l0(
             }
         };
 
-        modules.push(ModuleCatalogEntry::from_l0(l0, is_licensed, kind, version_override));
+        let mut entry = ModuleCatalogEntry::from_l0(l0, is_licensed, kind, version_override);
+        if let Some(w) = version_warning {
+            entry.catalog_warning = w;
+        }
+        modules.push(entry);
     }
 
     // Walk installed rows for any module_id NOT present in L0 (deprecated /
@@ -905,31 +903,30 @@ fn synthetic_legacy_entry(legacy: &InstalledLegacyEntry) -> ModuleCatalogEntry {
     }
 }
 
-/// Coarse semver `a < b` test (matches `ModuleCatalog.svelte::semverLess`'s
-/// shape so renderer + catalog agree). Splits on '.', parses the leading
-/// integer of each segment, lex-compares.
-fn semver_less(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split('.')
-            .map(|s| {
-                let digits: String = s.chars().take_while(|c| c.is_ascii_digit()).collect();
-                digits.parse::<u64>().unwrap_or(0)
-            })
-            .collect()
-    };
-    let aa = parse(a);
-    let bb = parse(b);
-    for i in 0..aa.len().max(bb.len()) {
-        let x = aa.get(i).copied().unwrap_or(0);
-        let y = bb.get(i).copied().unwrap_or(0);
-        if x < y {
-            return true;
-        }
-        if x > y {
-            return false;
+/// Catalog `kind` for an INSTALLED module against the L0 catalog version,
+/// plus a `catalog_warning` when the versions cannot be ordered.
+///
+/// v0.2.100 WP-01: ordering goes through the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). Superseded: a private
+/// leading-digit `semver_less` (mirroring the TS one) read `0.2.8-dev` as
+/// `0.2.8` and garbage as `0`. Tri-state now: an unreadable version is
+/// never `update_available` — the tile stays `installed` and carries the
+/// warning "version unreadable: <s>" instead of a verdict.
+fn installed_catalog_kind(installed: &str, l0: &str) -> (&'static str, Option<String>) {
+    if installed == l0 {
+        return ("installed", None);
+    }
+    match vct_launcher_core::version::is_older(installed, l0) {
+        // L0 is newer than installed → update available.
+        Ok(true) => ("update_available", None),
+        // Installed is newer than (or a rolled-back equal of) L0. Silent
+        // per review §J4-d.
+        Ok(false) => ("installed", None),
+        Err(e) => {
+            tracing::warn!("[modules] catalog update check: {}", e);
+            ("installed", Some(format!("version unreadable: {}", e.text)))
         }
     }
-    false
 }
 
 fn read_and_parse_manifest(path: &std::path::Path) -> Result<ModuleManifest, (String, String)> {
@@ -1210,6 +1207,111 @@ fn install_path_manifest_lookup(
     ))
 }
 
+/// Every installed module manifest (`<modules_dir>/<id>/vct-module.json`)
+/// that exists but does not parse: `(module dir name, file, why)` — the
+/// `why` is `ModuleManifest::from_json`'s own error, which names the field
+/// and the offending value. Sorted by module. Unreadable directories are
+/// skipped (nothing to name).
+pub(crate) fn invalid_installed_manifests(modules_dir: &std::path::Path) -> Vec<(String, PathBuf, String)> {
+    let Ok(rd) = std::fs::read_dir(modules_dir) else { return Vec::new() };
+    let mut out: Vec<(String, PathBuf, String)> = rd
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path().join("vct-module.json");
+            let raw = std::fs::read_to_string(&path).ok()?;
+            let err = ModuleManifest::from_json(&raw).err()?;
+            Some((entry.file_name().to_string_lossy().to_string(), path, err))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+/// The `module_manifest_invalid` entry text for `invalid` (pure).
+pub(crate) fn invalid_manifest_entry_text(invalid: &[(String, PathBuf, String)]) -> (String, String) {
+    let detected = format!(
+        "Installed module manifest(s) this launcher can no longer read: {}. The module no longer \
+         resolves from its installed copy; the launcher falls back to the module catalog, and \
+         offline (or for a module the catalog no longer lists) to nothing.",
+        invalid
+            .iter()
+            .map(|(id, path, why)| format!("{id} ({}: {why})", path.display()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    let ids: Vec<&str> = invalid.iter().map(|(id, _, _)| id.as_str()).collect();
+    let command = format!(
+        "Open the launcher's Modules tab and Update (or Reinstall) {}: the catalog's release is \
+         installed and its manifest replaces the unreadable one. Versions are strictly X.Y.Z \
+         since v0.2.100 (a suffix such as `-beta` is refused), so if the catalog does not list a \
+         module, ask its publisher for an X.Y.Z release. Nothing was removed.",
+        ids.join(", ")
+    );
+    (detected, command)
+}
+
+/// Emit (or resolve, for an empty set) `module_manifest_invalid` in the
+/// install root's ledger. Under `cfg(test)` the write goes to
+/// [`TEST_MANIFEST_LEDGER`] instead — a unit test must never write the
+/// checkout's own `UPDATE_DEFERRED.md`.
+fn write_invalid_manifest_record(now: &[(String, PathBuf, String)]) -> Result<(), String> {
+    #[cfg(test)]
+    {
+        let entry = if now.is_empty() { "resolve".to_string() } else { invalid_manifest_entry_text(now).0 };
+        TEST_MANIFEST_LEDGER.lock().unwrap_or_else(|p| p.into_inner()).push(entry);
+        Ok(())
+    }
+    #[cfg(not(test))]
+    {
+        let root = crate::commands::installer::find_local_repo_root()?;
+        if now.is_empty() {
+            return crate::services::deferral::resolve_deferral_conditions(&root, &root, &["module_manifest_invalid"]);
+        }
+        let (detected, command) = invalid_manifest_entry_text(now);
+        crate::services::deferral::emit_deferral_entry(
+            &root,
+            &root,
+            &crate::services::deferral::DeferralEntryFields {
+                condition_id: "module_manifest_invalid",
+                title: "An installed module's manifest can no longer be read",
+                detected: &detected,
+                why_deferred: "The launcher refuses a module version it cannot order (strict X.Y.Z, \
+                               v0.2.100) instead of guessing; it never edits or removes an installed \
+                               module's files on its own.",
+                command_to_apply: &command,
+                severity: "warning",
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+pub(crate) static TEST_MANIFEST_LEDGER: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// The last invalid-manifest set this process recorded (emit on change only).
+static LAST_INVALID_MANIFESTS: std::sync::Mutex<Option<Vec<(String, PathBuf, String)>>> = std::sync::Mutex::new(None);
+
+/// Keep `module_manifest_invalid` true (paired-resolution: this is the site
+/// its registry row names) — written while an installed manifest does not
+/// parse, resolved once none is left (the module was updated / reinstalled /
+/// uninstalled). Called on every [`resolve_manifest_for_install`]; the
+/// ledger is touched only when the set changes. Best-effort.
+pub(crate) fn record_invalid_installed_manifests() {
+    let now = invalid_installed_manifests(&crate::paths::vct_root_dir().join("modules"));
+    let mut last = LAST_INVALID_MANIFESTS.lock().unwrap_or_else(|p| p.into_inner());
+    if last.as_ref() == Some(&now) {
+        return;
+    }
+    for (id, path, why) in &now {
+        tracing::warn!("[modules] installed manifest of {} is unreadable ({}): {}", id, path.display(), why);
+    }
+    let result = write_invalid_manifest_record(&now);
+    match result {
+        Ok(()) => *last = Some(now),
+        Err(e) => tracing::warn!("[modules] module_manifest_invalid record not updated: {}", e),
+    }
+}
+
 /// Which lookup branch produced the manifest in
 /// [`resolve_manifest_for_install`]. Carried alongside the manifest so
 /// callers (`install_module_for_project`, `update_module_for_project`)
@@ -1249,38 +1351,6 @@ impl ManifestSource {
             ManifestSource::L0Synth => "l0-synth".to_string(),
         }
     }
-}
-
-/// v0.2.45 V45-C: tiny semver parser used by `resolve_manifest_for_install`
-/// to compare the on-disk manifest version against the L0 catalog version.
-///
-/// We don't pull in the `semver` crate just for this — splitting on `.` and
-/// parsing three `u64` components covers every published module version
-/// (v0.2.7, v0.2.8, 1.0.0, …). Pre-release and build-metadata suffixes are
-/// not supported; if a version string carries one (e.g. "0.2.8-rc1") we
-/// return None and the caller's safety net (`None` → on-disk wins) keeps
-/// behaviour conservative — we won't synthesize from a version we can't
-/// confidently compare.
-fn parse_semver(s: &str) -> Option<(u64, u64, u64)> {
-    let s = s.trim().trim_start_matches('v');
-    let mut parts = s.split('.');
-    let major = parts.next()?.parse::<u64>().ok()?;
-    let minor = parts.next()?.parse::<u64>().ok()?;
-    let patch_raw = parts.next()?;
-    // Reject anything with a pre-release / build-metadata suffix on the
-    // patch component (e.g. "0.2.8-rc1", "0.2.8+build42"). The safety net
-    // (None → on-disk wins) covers these — we'd rather honour the
-    // user's last-installed version than guess at suffix ordering.
-    if patch_raw.chars().any(|c| !c.is_ascii_digit()) {
-        return None;
-    }
-    let patch = patch_raw.parse::<u64>().ok()?;
-    // Reject trailing components ("0.2.8.4") — same reason: ambiguous
-    // ordering semantics. Pure 3-component versions only.
-    if parts.next().is_some() {
-        return None;
-    }
-    Some((major, minor, patch))
 }
 
 /// v0.2.33 B2: three-phase install manifest resolver. Returns the
@@ -1364,12 +1434,24 @@ pub(crate) fn resolve_manifest_for_install(
             let l0_v_opt = resolve_install_metadata(db, module_id)
                 .ok()
                 .map(|l0| l0.version);
-            let l0_is_newer = match (
-                parse_semver(&on_disk_v),
-                l0_v_opt.as_deref().and_then(parse_semver),
-            ) {
-                (Some(od), Some(l0)) => l0 > od,
-                _ => false, // any parse failure → on-disk wins (safety net)
+            // v0.2.100 WP-01: the ONE comparator (strict X.Y.Z). Superseded
+            // the private `parse_semver`, which had the same strictness.
+            // Any parse failure → on-disk wins (safety net): we never
+            // synthesize from L0 when the versions cannot be compared.
+            let l0_is_newer = match l0_v_opt.as_deref() {
+                None => false,
+                Some(l0_v) => {
+                    match vct_launcher_core::version::is_newer(l0_v.trim(), on_disk_v.trim()) {
+                        Ok(newer) => newer,
+                        Err(e) => {
+                            tracing::warn!(
+                                "[modules] {}: cannot order L0 {:?} vs on-disk {:?}: {} — on-disk wins",
+                                module_id, l0_v, on_disk_v, e
+                            );
+                            false
+                        }
+                    }
+                }
             };
             if l0_is_newer {
                 tracing::info!(
@@ -1406,6 +1488,7 @@ pub(crate) fn resolve_manifest_for_install(
                         "decision": "on_disk_winner",
                     }),
                 );
+                record_invalid_installed_manifests();
                 return Ok((on_disk_m, ManifestSource::Installed(on_disk_path)));
             }
         }
@@ -1413,7 +1496,14 @@ pub(crate) fn resolve_manifest_for_install(
             // No on-disk manifest at all — true cold-start. No
             // authoritative on-disk scope to preserve; the synth's
             // L0-derived scope is the only source.
+            //
+            // v0.2.100 W4R-07: OR an installed manifest that no longer
+            // parses (a version a ≤0.2.99 launcher accepted, e.g.
+            // "1.0.0-beta", is refused since F-W1-02). The fall-through is
+            // unchanged, but the cause is now RECORDED (module, file, value)
+            // instead of the module silently ceasing to resolve.
             on_disk_scope = None;
+            record_invalid_installed_manifests();
             // fall through to phase 2/3.
         }
     }
@@ -4539,6 +4629,7 @@ mod tests {
         // it's the cheaper path (no JSON to serialise).
         std::fs::write(install_root.join("CLAUDE.md"), "# stub").unwrap();
         std::fs::write(install_root.join("install.py"), "# stub").unwrap();
+        std::fs::write(install_root.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06
         std::fs::create_dir_all(install_root.join(".venv")).unwrap();
         db.app_state_set("launcher.install_path", install_root.to_str().unwrap())
             .unwrap();
@@ -5356,19 +5447,52 @@ mod tests {
 
     }
 
-    /// Case 5 (safety net): on-disk version unparseable ("abc"), L0 v0.2.8
-    /// → parse_semver returns None on on-disk → l0_is_newer = false →
-    /// phase 1 wins. We never synthesize from L0 when we can't confidently
-    /// compare versions; honour the user's last-installed manifest.
+    /// Case 5: on-disk version unparseable ("abc"), L0 v0.2.8.
+    ///
+    /// v0.2.100 (F-W1-02, owner rule Q7): a manifest whose `version` is not
+    /// X.Y.Z is refused AT PARSE (`ModuleManifest::from_json`) — the producer
+    /// boundary — so it is no longer an "installed manifest" the resolver
+    /// could honour. (Before, `from_json` accepted any non-empty string and
+    /// this case exercised the comparator's "incomparable → on-disk wins"
+    /// net.) The resolver falls through to the validated L0 entry, and the
+    /// invalid file is never read back as the module's identity. No shipped
+    /// producer emits such a version (bump-version.sh pins X.Y.Z; the L0 seed
+    /// and bundled manifests are X.Y.Z).
     #[test]
-    fn test_v0245_on_disk_wins_when_parse_fails() {
+    fn w4r07_an_unreadable_installed_manifest_is_named_with_its_file_and_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The good one: the full fixture manifest at a strict X.Y.Z version.
+        plant_installed_manifest(tmp.path(), "1.2.3");
+        let good = tmp.path().join("modules");
+        // The bad one: the same shape, a version a <=0.2.99 launcher accepted.
+        let raw = std::fs::read_to_string(good.join("vct-rl-reranker").join("vct-module.json")).unwrap();
+        let bad = good.join("beta-mod");
+        std::fs::create_dir_all(&bad).unwrap();
+        std::fs::write(
+            bad.join("vct-module.json"),
+            raw.replace("\"vct-rl-reranker\"", "\"beta-mod\"").replace("\"1.2.3\"", "\"1.0.0-beta\""),
+        )
+        .unwrap();
+        std::fs::create_dir_all(good.join("no-manifest")).unwrap();
+        let tmp_root = good;
+
+        let invalid = invalid_installed_manifests(&tmp_root);
+        assert_eq!(invalid.len(), 1, "{invalid:?}");
+        assert_eq!(invalid[0].0, "beta-mod");
+        assert!(invalid[0].2.contains("1.0.0-beta"), "the offending value is named: {}", invalid[0].2);
+        let (detected, command) = invalid_manifest_entry_text(&invalid);
+        assert!(detected.contains("beta-mod") && detected.contains("vct-module.json"), "{detected}");
+        assert!(command.contains("Update (or Reinstall) beta-mod"), "{command}");
+        // Leave-alone: valid manifests and module dirs without one are not named.
+        assert!(!detected.contains("vct-rl-reranker") && !detected.contains("no-manifest"));
+        assert!(invalid_installed_manifests(&tmp.path().join("absent")).is_empty());
+    }
+
+    #[test]
+    fn test_v0245_an_invalid_on_disk_version_is_not_honoured() {
         let (_lock, tmp) = isolate_state();
         let db = open_db();
 
-        // Plant an on-disk manifest with an unparseable version string.
-        // ModuleManifest::from_json accepts any non-empty string for
-        // version — the SchemaVersion check is on `manifest_version`, not
-        // on `version` (which is free-form).
         plant_installed_manifest(tmp.path(), "abc");
         let envelope = L0CatalogResponse {
             schema_version: 1,
@@ -5381,74 +5505,44 @@ mod tests {
         )
         .unwrap();
 
-        let (manifest, source) =
-            resolve_manifest_for_install(&db, "vct-rl-reranker")
-                .expect("phase 1 safety-net must succeed when parse fails");
-        match &source {
-            ManifestSource::Installed(_) => {}
-            other => panic!(
-                "unparseable on-disk version → safety net says on-disk \
-                 wins (refuse to synthesize from L0 when versions are \
-                 incomparable), got {:?}",
-                other,
-            ),
-        }
-        assert_eq!(manifest.version, "abc");
-
+        let (manifest, source) = resolve_manifest_for_install(&db, "vct-rl-reranker")
+            .expect("the validated L0 entry resolves");
+        assert!(
+            !matches!(source, ManifestSource::Installed(_)),
+            "a manifest with version \"abc\" must not be honoured as installed, got {:?}",
+            source
+        );
+        assert_eq!(manifest.version, "0.2.8");
+        // W4R-07: the fall-through is RECORDED, naming the module's file and
+        // the value that no longer parses.
+        let ledger = TEST_MANIFEST_LEDGER.lock().unwrap().clone();
+        assert!(
+            ledger.iter().any(|e| e.contains("vct-rl-reranker") && e.contains("abc")),
+            "the unreadable installed manifest must be recorded: {ledger:?}"
+        );
     }
 
-    // ─── parse_semver unit tests ─────────────────────────────────────────
+    // ─── catalog kind for an installed module (v0.2.100 WP-01) ─────────
+    // `parse_semver`'s accept/reject/ordering tests were removed with the
+    // function: the same strict contract is now table-tested once, in
+    // vct_launcher_core::version against tests/fixtures/version_order_cases.json.
 
-    /// Pin the parser's accept-set against a representative range of
-    /// version strings: stable releases, leading-v prefix, multi-digit
-    /// components. Pure 3-component digits-only must all parse.
     #[test]
-    fn test_v0245_parse_semver_accepts_canonical_forms() {
-        assert_eq!(parse_semver("0.2.7"), Some((0, 2, 7)));
-        assert_eq!(parse_semver("0.2.8"), Some((0, 2, 8)));
-        assert_eq!(parse_semver("v0.2.45"), Some((0, 2, 45)));
-        assert_eq!(parse_semver("1.0.0"), Some((1, 0, 0)));
-        assert_eq!(parse_semver("12.34.56"), Some((12, 34, 56)));
-        assert_eq!(parse_semver("  0.2.7  "), Some((0, 2, 7)));
+    fn installed_catalog_kind_orders_numerically() {
+        assert_eq!(installed_catalog_kind("0.2.99", "0.2.100"), ("update_available", None));
+        assert_eq!(installed_catalog_kind("0.2.100", "0.2.99"), ("installed", None));
+        assert_eq!(installed_catalog_kind("0.2.100", "0.2.100"), ("installed", None));
     }
 
-    /// Pin the parser's reject-set against everything the safety net is
-    /// supposed to bail on: pre-release suffixes, build-metadata, missing
-    /// components, trailing components, non-numeric components. Any None
-    /// here is the signal for `l0_is_newer = false` → on-disk wins.
     #[test]
-    fn test_v0245_parse_semver_rejects_uncertain_forms() {
-        // Pre-release / build-metadata suffixes — ordering is ambiguous.
-        assert_eq!(parse_semver("0.2.8-rc1"), None);
-        assert_eq!(parse_semver("0.2.8+build42"), None);
-        // Missing patch.
-        assert_eq!(parse_semver("0.2"), None);
-        // Trailing component (CalVer-style).
-        assert_eq!(parse_semver("0.2.8.4"), None);
-        // Non-numeric components.
-        assert_eq!(parse_semver("abc"), None);
-        assert_eq!(parse_semver("0.a.0"), None);
-        // Empty.
-        assert_eq!(parse_semver(""), None);
-    }
-
-    /// Pin the strict-ordering predicate that drives the
-    /// `l0_is_newer` decision: tuple comparison gives the lexicographic
-    /// semver ordering for free, but the tests double-check the cases
-    /// that matter for the v0.2.7 → v0.2.8 fix path.
-    #[test]
-    fn test_v0245_parse_semver_ordering_is_strict() {
-        let a = parse_semver("0.2.7").unwrap();
-        let b = parse_semver("0.2.8").unwrap();
-        assert!(b > a, "0.2.8 must be strictly greater than 0.2.7");
-        assert!(a < b);
-        assert!(!(a > b));
-        // Equal is NOT greater.
-        let c = parse_semver("0.2.7").unwrap();
-        assert!(!(a > c));
-        // Minor / major bumps.
-        assert!(parse_semver("0.3.0").unwrap() > parse_semver("0.2.99").unwrap());
-        assert!(parse_semver("1.0.0").unwrap() > parse_semver("0.99.99").unwrap());
+    fn installed_catalog_kind_never_offers_an_update_it_cannot_read() {
+        // Old leading-digit parser: "0.2.7-dev" < "0.2.8" → update_available.
+        let (kind, warning) = installed_catalog_kind("0.2.7-dev", "0.2.8");
+        assert_eq!(kind, "installed");
+        assert_eq!(warning.as_deref(), Some("version unreadable: 0.2.7-dev"));
+        let (kind, warning) = installed_catalog_kind("0.2.7", "0.2.8.1");
+        assert_eq!(kind, "installed");
+        assert_eq!(warning.as_deref(), Some("version unreadable: 0.2.8.1"));
     }
 
     // ─── v0.2.49 Bug D / Path 1 (install_scope exposure) ───────────

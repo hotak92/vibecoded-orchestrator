@@ -141,17 +141,19 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
     # so it is pinned here on an ordinary user-editable file.
     # -----------------------------------------------------------------
 
-    def test_a_sidecar_the_entry_never_named_keeps_the_entry(self):
-        """LEAVE-ALONE: every NAMED sidecar is gone and the list is complete,
-        but an earlier run's orphan is still parked. RED before the fix: the
-        complete-list arm returned False and deleted the last record of it."""
+    def test_a_sidecar_the_entry_never_named_does_not_keep_it(self):
+        """v0.2.100 U17 (owner plan, PLAN-V0300-FIX WP-12) SUPERSEDES the
+        v0.2.95 F4 leave-alone that stood here: an entry that NAMED sidecars
+        clears when those are gone — a sidecar no entry names is not this
+        entry's (the whole-root sweep made named entries immortal on unrelated
+        leftovers). The list-less legacy arm below still sweeps."""
         self._touch("README.md.from-upstream-f1f5488")
         entry = _sidecar_entry("README.md.from-upstream-89a5530")
         self.assertIs(
             dp.orchestrator_sidecars_still_present(
                 dp.ProbeContext(folder=self.folder, entry=entry)
             ),
-            True,
+            False,
         )
 
     def test_a_sidecar_under_a_build_named_dir_inside_docs_is_seen(self):
@@ -159,8 +161,7 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
         called that "the set of trees the emitter provably cannot write into".
         Not so inside the allowlisted trees: `docs/**/*.md` is user-editable,
         so `docs/build/guide.md` gets a sidecar like any other file — and the
-        sweep used to walk straight past it, letting the entry clear on an
-        orphan it never saw."""
+        (list-less) sweep used to walk straight past it."""
         for rel in (
             "docs/build/guide.md.from-upstream-4c44eb8",
             "knowledge/target/n.md.from-upstream-4c44eb8",
@@ -168,10 +169,9 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
         ):
             with self.subTest(rel=rel):
                 self._touch(rel)
-                entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
                 self.assertIs(
                     dp.orchestrator_sidecars_still_present(
-                        dp.ProbeContext(folder=self.folder, entry=entry)
+                        dp.ProbeContext(folder=self.folder, entry=self._listless_entry())
                     ),
                     True,
                 )
@@ -182,24 +182,25 @@ class UpstreamSidecarProbeTests(unittest.TestCase):
         what keeps the sweep from having to visit a node_modules tree."""
         self._touch("node_modules/pkg/README.md.from-upstream-4c44eb8")
         self._touch("target/debug/x.md.from-upstream-4c44eb8")
-        entry = _sidecar_entry("CLAUDE.md.from-upstream-89a5530")
         self.assertIs(
             dp.orchestrator_sidecars_still_present(
-                dp.ProbeContext(folder=self.folder, entry=entry)
+                dp.ProbeContext(folder=self.folder, entry=self._listless_entry())
             ),
             False,
         )
 
-    def test_the_named_arm_is_unknown_when_the_sweep_cannot_complete(self):
-        """Same positive-evidence rule as the list-less arm: a sweep that
-        could not finish must not resolve the entry."""
+    def test_the_named_arm_never_sweeps(self):
+        """v0.2.100 U17: an entry that named files is decided by those files
+        alone — the walk is not even started (so it cannot fail it either)."""
         entry = _sidecar_entry("docs/A.md.from-upstream-5a9ae53")
-        with mock.patch.object(dp.os, "walk", side_effect=OSError("boom")):
-            self.assertIsNone(
+        with mock.patch.object(dp.os, "walk", side_effect=OSError("boom")) as walk:
+            self.assertIs(
                 dp.orchestrator_sidecars_still_present(
                     dp.ProbeContext(folder=self.folder, entry=entry)
-                )
+                ),
+                False,
             )
+        walk.assert_not_called()
 
     # -----------------------------------------------------------------
     # v0.2.91 dogfood fix — the LEGACY / list-less arm.

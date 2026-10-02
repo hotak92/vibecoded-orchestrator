@@ -24,7 +24,7 @@ This module is consumed by:
   * templates/hooks/ensure-containers.{sh,ps1} (skips startup if active)
 
 Mirror in Rust: ``launcher/src-tauri/src/commands/update_gate.rs`` (used
-by the launcher's update_orchestrator + MCP supervisor).
+by the launcher's update pipeline, ``update_run::run_update``, + MCP supervisor).
 
 Schema (canonical, kept in sync with Rust)::
 

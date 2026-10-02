@@ -108,26 +108,26 @@ class PullListMatchesSummaryBackendTests(unittest.TestCase):
             )
             pull_list = _inference_models_for_capability(sysinfo)
         self.assertIsNone(summary_pick)
-        # Floor model always pulled as universal fallback
+        # The floor IS this tier's one model
         self.assertEqual(pull_list, ["qwen3.5:0.8b"])
 
-    def test_floor_always_present(self):
-        # Floor (qwen3.5:0.8b) ships in EVERY pull list regardless of tier.
+    def test_exactly_one_model_per_tier(self):
+        """v0.2.100 (owner 2026-09-29): pull ONLY the single model the tier
+        uses — no lower rungs beside it (the floor is pulled only by the tier
+        whose model it IS). A missing lower rung at runtime degrades to the
+        next summary backend, never a pull."""
         configurations = [
-            (_sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0), 8),
-            (_sysinfo(has_gpu=True, vram_gb=8.0, ram_gb=64.0), 8),
-            (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=64.0), 8),
-            (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=16.0), 4),
-            (_sysinfo(has_gpu=True, vram_gb=4.0, ram_gb=8.0), 2),
+            (_sysinfo(has_gpu=True, vram_gb=24.0, ram_gb=64.0), 8, ["qwen3.5:9b"]),
+            (_sysinfo(has_gpu=True, vram_gb=8.0, ram_gb=64.0), 8, ["gemma4:e4b"]),
+            (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=64.0), 8, ["gemma4:e4b"]),
+            (_sysinfo(has_gpu=False, vram_gb=0.0, ram_gb=16.0), 4, ["qwen3.5:0.8b"]),
+            (_sysinfo(has_gpu=True, vram_gb=4.0, ram_gb=8.0), 2, ["qwen3.5:0.8b"]),
         ]
-        for sysinfo, cores in configurations:
+        for sysinfo, cores, want in configurations:
             with patch.object(install, "_probe_cpu_cores", return_value=cores):
                 pull_list = _inference_models_for_capability(sysinfo)
-            self.assertIn(
-                "qwen3.5:0.8b", pull_list,
-                f"floor missing from pull list for vram={sysinfo.vram_gb} "
-                f"ram={sysinfo.ram_gb} cores={cores}",
-            )
+            self.assertEqual(pull_list, want,
+                             f"vram={sysinfo.vram_gb} ram={sysinfo.ram_gb} cores={cores}")
 
 
 if __name__ == "__main__":

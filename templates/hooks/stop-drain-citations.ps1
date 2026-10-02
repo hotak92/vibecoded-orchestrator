@@ -41,8 +41,11 @@ try {
 . (Join-Path $ScriptDir "_lib/resolve-powershell.ps1")
 $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
 
-$Drain = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_drain_citations.py"
-if (-not (Test-Path $Drain)) { exit 0 }
+# v0.2.100 F3: the drain ships ONLY in the orchestrator root - locate it there
+# (same roots as the venv). It drains THIS project's pending dir: the
+# CLAUDE_PROJECT_DIR pin below keeps the identity. MUST MATCH the .sh sibling.
+$Drain = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_drain_citations.py"
+if (-not $Drain -or -not (Test-Path $Drain)) { exit 0 }
 if (-not $VenvPy -or -not (Test-Path $VenvPy)) { exit 0 }
 
 # v0.2.76 P5 (hook-latency): DETACH the drain via Start-Process so its

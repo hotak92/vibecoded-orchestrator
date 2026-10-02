@@ -453,6 +453,34 @@ impl Db {
         Ok(out)
     }
 
+    /// v0.2.100 W5R-13: one project's rl_events grouped by
+    /// `(embedding_source, event_type)`, so the dashboard can show WHICH
+    /// embedding spaces are being collected (qwen3 / arctic / codesage — the
+    /// dual-log twin lands under the other slot's source). All rows count
+    /// (same semantics as `count_rl_events(.., quarantined = None)`).
+    /// A NULL source is reported as `None`. Ordered by source, then type.
+    pub fn count_rl_events_by_source(
+        &self,
+        project_id: &str,
+    ) -> Result<Vec<(Option<String>, String, i64)>, String> {
+        let guard = self.lock();
+        let mut stmt = guard
+            .prepare(
+                "SELECT embedding_source, event_type, COUNT(*) FROM rl_events
+                  WHERE project_id = ?1
+                  GROUP BY embedding_source, event_type
+                  ORDER BY embedding_source, event_type",
+            )
+            .map_err(|e| format!("count_rl_events_by_source: {}", e))?;
+        let rows = stmt
+            .query_map(params![project_id], |r| {
+                Ok((r.get::<_, Option<String>>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?))
+            })
+            .map_err(|e| format!("count_rl_events_by_source: {}", e))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("count_rl_events_by_source: {}", e))
+    }
+
     /// Count rl_events for a project / event-type / time-range.
     /// Used by the launcher Identity-tab event-rate badge.
     ///

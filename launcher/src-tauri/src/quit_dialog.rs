@@ -440,10 +440,8 @@ pub fn confirm_and_quit<R: Runtime>(app: &AppHandle<R>) {
 /// Stop services then exit. Service-stop failure is logged but does NOT
 /// block the exit — the user explicitly asked to quit and we honour that.
 ///
-/// The container-stop call delegates to whichever service module is
-/// available. This indirection keeps the Quit dialog independent from
-/// the (parallel) container-lifecycle work: today it's a no-op, once
-/// `commands::lifecycle::services_stop_all` lands it will be wired here.
+/// The container stop is `commands::lifecycle::services_stop_all`, run
+/// within [`QUIT_STOP_BUDGET`] — past it the launcher exits anyway.
 fn full_shutdown<R: Runtime>(app: AppHandle<R>) {
     // v0.2.91 WP-F2: the quit is DECIDED from here on. Latch FORCE_QUIT
     // before anything else so that any `CloseRequested` the teardown emits
@@ -452,18 +450,44 @@ fn full_shutdown<R: Runtime>(app: AppHandle<R>) {
     // tray menu's Quit a real quit even though X→tray is the default.
     force_quit();
     tauri::async_runtime::spawn(async move {
-        if let Err(e) = stop_services(&app).await {
+        if let Err(e) = bounded_stop(stop_services(&app), QUIT_STOP_BUDGET).await {
             tracing::warn!("[vct] stop_services failed during quit: {} (exiting anyway)", e);
         }
         app.exit(0);
     });
 }
 
+/// The most "Quit and stop services" waits for the stop before it exits
+/// anyway (v0.2.100 F-W4-05, L2-F09 remainder). Each piece is bounded on its
+/// own — every runtime call by the ownership runner's timeout, the
+/// `services_stop_incomplete` record by the deferral bridge's — and this is
+/// the whole: the user asked to quit, so the exit happens even when a stuck
+/// runtime or interpreter would otherwise hold it.
+/// Sized to cover the slowest legitimate stop: three services stopped in
+/// turn, each `stop --time 30` under the runner's 60 s bound, plus the 30 s
+/// deferral record.
+pub(crate) const QUIT_STOP_BUDGET: std::time::Duration = std::time::Duration::from_secs(210);
+
+/// `stop` within `budget`: its own result, or an `Err` naming the budget.
+async fn bounded_stop<F>(stop: F, budget: std::time::Duration) -> Result<(), String>
+where
+    F: std::future::Future<Output = Result<(), String>>,
+{
+    match tokio::time::timeout(budget, stop).await {
+        Ok(result) => result,
+        Err(_) => Err(format!(
+            "stopping the services did not finish within {} s",
+            budget.as_secs()
+        )),
+    }
+}
+
 /// Best-effort container shutdown.
 ///
-/// Delegates to `commands::lifecycle::services_stop_all` which runs
-/// `<runtime> compose stop` (no `--volumes` flag — volumes are
-/// preserved). Idempotent: succeeds even when nothing is up.
+/// Delegates to `commands::lifecycle::services_stop_all`, which stops each
+/// compose-managed service's container BY NAME (`stop --time`, then reads
+/// the state back) — nothing is removed, volumes are untouched. Idempotent:
+/// succeeds even when nothing is up.
 ///
 /// Failure here is logged but never propagates — the user clicked
 /// "Quit and stop services" and `app.exit(0)` must run regardless of
@@ -538,6 +562,41 @@ mod tests {
             "calling force_quit multiple times must not toggle the flag back"
         );
         reset_flag();
+    }
+
+    /// F-W4-05: a stop that never finishes is cut at the budget — the quit
+    /// then exits anyway.
+    #[tokio::test]
+    async fn a_stop_that_hangs_is_cut_at_the_budget() {
+        // The outer timeout turns a missing bound into a failed assertion,
+        // not a stalled suite.
+        let outer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            bounded_stop(std::future::pending(), std::time::Duration::from_millis(50)),
+        )
+        .await
+        .expect("bounded_stop must return at its budget, not hang");
+        let err = outer.expect_err("a hung stop must not be awaited forever");
+        assert!(err.contains("did not finish within"), "got: {err}");
+    }
+
+    /// Leave-alone: a stop that finishes inside the budget keeps its result.
+    #[tokio::test]
+    async fn a_stop_that_finishes_keeps_its_result() {
+        let budget = std::time::Duration::from_secs(5);
+        assert_eq!(bounded_stop(async { Ok(()) }, budget).await, Ok(()));
+        assert_eq!(
+            bounded_stop(async { Err("x: still running".to_string()) }, budget).await,
+            Err("x: still running".to_string())
+        );
+    }
+
+    #[test]
+    fn the_quit_budget_covers_one_graceful_stop_per_service() {
+        // Three services x (30 s grace + 30 s runner slack) + the 30 s
+        // deferral record must fit.
+        let record = vct_launcher_core::services::deferral_bridge::DEFERRAL_PAYLOAD_TIMEOUT;
+        assert!(QUIT_STOP_BUDGET >= std::time::Duration::from_secs(3 * 60) + record);
     }
 
     #[test]

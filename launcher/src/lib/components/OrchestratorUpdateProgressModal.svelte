@@ -73,6 +73,7 @@
     updateOpRestartsOnSuccess,
   } from '$lib/stores/updater';
   import { ui } from '$lib/stores/ui';
+  import { progressTick } from './update-progress-phase';
 
   const COMPLETED_HOLD_MS = 1800;
   const FADE_OUT_MS = 400;
@@ -104,62 +105,64 @@
 
   $effect(() => {
     const isUpdating = upd.updating;
-    const hasError = !!upd.error;
+    // v0.2.100 (F-W2-04): the decision lives in `update-progress-phase.ts`,
+    // and the failure signal is `upd.failed` (the store's one home for it),
+    // never the truthiness of `upd.error` — an error string can exist without a failed op.
+    const tick = progressTick({
+      updating: isUpdating,
+      failed: upd.failed,
+      handover: !!(upd.nonFf || upd.conflict || upd.untrackedCollision || upd.autostashPop),
+      prevUpdating,
+    });
 
-    // Error trumps everything — show the failed state and stop the
-    // auto-close timer. The user dismisses manually.
-    if (hasError) {
-      clearTimers();
-      phase = 'failed';
-      fadingOut = false;
-      prevUpdating = isUpdating;
-      return;
-    }
-
-    // Rising edge: updating just became true (or it's already true on
-    // first run). Reset to running, kill any pending timers from a
-    // previous lifecycle.
-    if (isUpdating) {
-      clearTimers();
-      phase = 'running';
-      fadingOut = false;
-      prevUpdating = true;
-      return;
-    }
-
-    // Falling edge: updating just became false.
-    if (prevUpdating && !isUpdating) {
-      clearTimers();
-      // v0.2.93 (field incident 2026-09-07): HAND-OVER, not completion.
-      // If the op ended by surfacing a decision modal (non-FF divergence,
-      // merge conflict, untracked collision, autostash-pop), the update is
-      // PAUSED — action needed. Never hold at "Update complete 100%" over
-      // a modal the user has to act on: close immediately and hand over.
-      // The modals live in +layout.svelte (same root stacking context as
-      // this overlay), so the hand-over is a plain visibility swap.
-      if (upd.nonFf || upd.conflict || upd.untrackedCollision || upd.autostashPop) {
+    switch (tick) {
+      case 'failed':
+        // Failure trumps everything — show the failed state and stop the
+        // auto-close timer. The user dismisses manually.
+        clearTimers();
+        phase = 'failed';
+        fadingOut = false;
+        prevUpdating = isUpdating;
+        return;
+      case 'running':
+        // Rising edge (or already running on first run): reset to running,
+        // kill any pending timers from a previous lifecycle.
+        clearTimers();
+        phase = 'running';
+        fadingOut = false;
+        prevUpdating = true;
+        return;
+      case 'handover':
+        // v0.2.93 (field incident 2026-09-07): HAND-OVER, not completion.
+        // The op ended by surfacing a decision modal — the update is PAUSED.
+        // Never hold at "Update complete 100%" over a modal the user has to
+        // act on: close immediately. The modals live in +layout.svelte (same
+        // root stacking context), so the hand-over is a visibility swap.
+        clearTimers();
         phase = 'running';
         fadingOut = false;
         prevUpdating = false;
         ui.closeOrchestratorUpdateProgress();
         return;
-      }
-      // Genuine completion: hold COMPLETED_HOLD_MS → fade FADE_OUT_MS → close.
-      phase = 'completed';
-      fadingOut = false;
-      holdTimer = setTimeout(() => { fadingOut = true; }, COMPLETED_HOLD_MS);
-      hideTimer = setTimeout(() => {
-        ui.closeOrchestratorUpdateProgress();
-        // After the layout unmounts us, the bound state is irrelevant —
-        // but reset anyway so a remount starts clean.
-        phase = 'running';
+      case 'completed':
+        // Genuine completion: hold COMPLETED_HOLD_MS → fade FADE_OUT_MS → close.
+        clearTimers();
+        phase = 'completed';
         fadingOut = false;
-      }, COMPLETED_HOLD_MS + FADE_OUT_MS);
-      prevUpdating = false;
-      return;
+        holdTimer = setTimeout(() => { fadingOut = true; }, COMPLETED_HOLD_MS);
+        hideTimer = setTimeout(() => {
+          ui.closeOrchestratorUpdateProgress();
+          // After the layout unmounts us, the bound state is irrelevant —
+          // but reset anyway so a remount starts clean.
+          phase = 'running';
+          fadingOut = false;
+        }, COMPLETED_HOLD_MS + FADE_OUT_MS);
+        prevUpdating = false;
+        return;
+      case 'idle':
+        prevUpdating = isUpdating;
+        return;
     }
-
-    prevUpdating = isUpdating;
   });
 
   // Percentage 0–100, clamped, with the "force 100 when completed" rule

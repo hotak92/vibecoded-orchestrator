@@ -149,3 +149,56 @@ resolve_vco_venv_python() {
     # host Edit tool"). Test pin: tests/test_hooks_venv_resolution.py.
     return 0
 }
+
+# resolve_vco_orchestrator_script <script_dir> <relpath>
+# Sets VCO_ORCHESTRATOR_SCRIPT to the absolute path of <relpath> (e.g.
+# claude_mcp_servers/scripts/rl_kg_search.py) inside the VCO orchestrator
+# root, or to the empty string when no candidate holds it.
+#
+# v0.2.100 F3. The KG-search producer, the dual-search driver and the citation
+# drain ship ONLY in the orchestrator root, but the hooks used to look for them
+# under $PROJECT_ROOT — so in every user project the KG hook leg (and the
+# turn-end citation drain) never ran at all. This locates the SCRIPT from the
+# SAME roots this file already resolves the interpreter from, in the same
+# order, so the script and the venv always come from one install:
+#
+#   1. $VCT_INSTALL_ROOT        (launcher-provided, canonical — the venv's root)
+#   2. $VCT_ORCHESTRATOR_ROOT   (written into every project's settings/env)
+#   3. <script_dir>/../..       (only when it is a real VCO clone — this is
+#                                also how the orchestrator root finds itself)
+#
+# There is deliberately NO project-root tier: like the interpreter ladder, this
+# helper never resolves anything from the user's project tree (the v0.2.46
+# venv-drift contract, pinned by tests/test_v0246_venv_resolver_drift.py).
+#
+# IDENTITY IS NOT TAKEN FROM HERE. Only the file's location comes from the
+# orchestrator; the caller runs it with its own CLAUDE_PROJECT_DIR / cwd /
+# environment, from which the script resolves the CALLING project's KG
+# collection, shared-KG gate, access grants and code-graph prefix (hub
+# per-project config, else that project's .claude/settings.json env). Never
+# export anything from the orchestrator root's settings here.
+#
+# MUST MATCH: Resolve-VcoOrchestratorScript in resolve-vco-venv.ps1.
+resolve_vco_orchestrator_script() {
+    local script_dir="${1:-}" rel="${2:-}"
+    VCO_ORCHESTRATOR_SCRIPT=""
+    [ -n "$rel" ] || return 0
+    local root
+    for root in "${VCT_INSTALL_ROOT:-}" "${VCT_ORCHESTRATOR_ROOT:-}"; do
+        [ -n "$root" ] || continue
+        if [ -f "$root/$rel" ]; then
+            VCO_ORCHESTRATOR_SCRIPT="$root/$rel"
+            return 0
+        fi
+    done
+    if [ -n "$script_dir" ]; then
+        local clone_root
+        clone_root="$(cd "$script_dir/../.." 2>/dev/null && pwd)" || clone_root=""
+        if [ -n "$clone_root" ] && _is_vco_orchestrator_clone "$clone_root" \
+            && [ -f "$clone_root/$rel" ]; then
+            VCO_ORCHESTRATOR_SCRIPT="$clone_root/$rel"
+            return 0
+        fi
+    fi
+    return 0
+}

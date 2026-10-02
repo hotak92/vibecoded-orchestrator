@@ -306,35 +306,57 @@ def reap_stale_sidecars(
 # importing the installer.
 # ---------------------------------------------------------------------------
 
-#: Placeholder names :func:`render_entry` knows how to resolve. A table entry
-#: naming anything else fails that entry loudly — the renderer never writes a
-#: file carrying a literal ``{{NAME}}``.
-_KNOWN_SUBSTITUTIONS = ("ORCHESTRATOR_ROOT",)
-
-
 @dataclass(frozen=True)
 class RenderOutcome:
     """Result of rendering ONE entry.
 
     ``status`` is one of ``created`` / ``auto_block_updated`` / ``full_rewrite``
-    / ``template_missing`` / ``unknown_substitution`` / ``failed``; ``detail``
-    is the human-readable suffix the installer prints and logs.
-    ``reaped_sidecars`` names the stale ``.from-upstream-`` sidecars
-    :func:`render_all` removed after a successful render (v0.2.97); ``detail``
-    says so too, which is how the installer's print + log line shows it.
+    / ``template_missing`` / ``failed``; ``detail`` is the human-readable
+    suffix the installer prints and logs. ``reaped_sidecars`` names the stale
+    ``.from-upstream-`` sidecars :func:`render_all` removed after a successful
+    render (v0.2.97); ``detail`` says so too, which is how the installer's
+    print + log line shows it.
+
+    v0.2.100 WP-18: ``unrendered`` / ``missing_paths`` carry the
+    materializer's findings (``NAME@line`` / ``NAME=value``). The file IS
+    written in that case (owner rule: a placeholder never fails the
+    materialization), a warning goes to stderr and a deferral row is recorded
+    — the pre-v0.2.100 ``unknown_substitution`` status ("nothing written") is
+    retired with it.
     """
 
     path: str
     status: str
     detail: str
     reaped_sidecars: tuple[str, ...] = ()
+    unrendered: tuple[str, ...] = ()
+    missing_paths: tuple[str, ...] = ()
 
     @property
     def is_failure(self) -> bool:
-        return self.status in ("failed", "unknown_substitution")
+        """True for anything the installer must log at ``warn`` level: a
+        failed write, or a render that left a placeholder / a missing path."""
+        return self.status == "failed" or bool(self.unrendered or self.missing_paths)
 
 
-def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
+def _render_template_text(install_root: Path, entry: RenderedRootFile, text: str,
+                          context=None, *, db_path: Path | None = None):
+    """The registry pass for one entry (``vco_lib.materialize``). The table's
+    ``substitutions`` is the entry's ALLOWED set; a name it lists that the
+    registry does not know, or one the body uses that the table does not list,
+    is left in place and reported — never a silent pass, never a failed run.
+    ``context`` overrides the install's own (the completeness gate renders
+    under synthetic POSIX and Windows installs)."""
+    from vco_lib import materialize as _mz
+
+    ctx = _mz.LazyContext(context if context is not None
+                          else _mz.MaterializeContext(install_root, install_root,
+                                                      db_path=db_path))
+    return _mz.render(text, ctx, allowed=frozenset(entry.substitutions), escape="none")
+
+
+def render_entry(install_root: Path, entry: RenderedRootFile, *,
+                 db_path: Path | None = None) -> RenderOutcome:
     """Render one entry into ``install_root``. Never raises.
 
     The template's placeholders are substituted, then the body is written
@@ -342,7 +364,12 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
     so anything the user wrote outside the markers is preserved (that text is
     uncommitted and exists nowhere else, which is why it is protected all the
     way through the update).
+
+    Owner rules 1+2 (v0.2.100): findings are warned about on stderr and
+    settled as deferral rows in ``install_root`` (a clean render clears them).
     """
+    from vco_lib import materialize as _mz
+
     template_path = install_root / Path(entry.template)
     target_path = install_root / Path(entry.path)
 
@@ -351,20 +378,27 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
             entry.path, "template_missing", f"SKIP (template missing: {entry.template})"
         )
 
-    unknown = [s for s in entry.substitutions if s not in _KNOWN_SUBSTITUTIONS]
-    if unknown:
-        return RenderOutcome(
-            entry.path,
-            "unknown_substitution",
-            f"FAILED (unknown substitution(s) {', '.join(unknown)} — nothing written)",
-        )
-
-    values = {"ORCHESTRATOR_ROOT": str(install_root)}
     try:
-        rendered = template_path.read_text(encoding="utf-8")
-        for name in entry.substitutions:
-            rendered = rendered.replace("{{" + name + "}}", values[name])
-
+        result = _render_template_text(
+            install_root, entry, template_path.read_text(encoding="utf-8"),
+            db_path=db_path)
+    except OSError as exc:
+        return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
+    rendered = result.text
+    findings = dict(
+        unrendered=tuple(f"{u.name}@{u.line}" for u in result.unresolved),
+        missing_paths=tuple(f"{m.name}={m.value}" for m in result.missing_paths),
+    )
+    suffix = ""
+    if not result.clean:
+        _mz.warn(entry.path, result)
+        parts = []
+        if result.unresolved:
+            parts.append("placeholder(s) left: " + ", ".join(findings["unrendered"]))
+        if result.missing_paths:
+            parts.append("missing path(s): " + ", ".join(findings["missing_paths"]))
+        suffix = " — WARNING: " + "; ".join(parts) + " (recorded in UPDATE_DEFERRED.md)"
+    try:
         if target_path.is_file():
             existing = target_path.read_text(encoding="utf-8")
             begin_idx = existing.find(entry.begin_marker)
@@ -377,29 +411,59 @@ def render_entry(install_root: Path, entry: RenderedRootFile) -> RenderOutcome:
                 )
                 if merged != existing:  # avoid a no-op write that bumps mtime
                     target_path.write_text(merged, encoding="utf-8")
-                return RenderOutcome(
-                    entry.path, "auto_block_updated", "OK (AUTO block updated)"
+                outcome = RenderOutcome(
+                    entry.path, "auto_block_updated", "OK (AUTO block updated)" + suffix,
+                    **findings,
                 )
-            # No markers: they ARE the "preserve me" contract, so without them
-            # the template is the source of truth.
+            else:
+                # No markers: they ARE the "preserve me" contract, so without
+                # them the template is the source of truth.
+                target_path.write_text(rendered, encoding="utf-8")
+                outcome = RenderOutcome(
+                    entry.path, "full_rewrite",
+                    "OK (full rewrite — no AUTO markers found)" + suffix, **findings,
+                )
+        else:
+            target_path.parent.mkdir(parents=True, exist_ok=True)
             target_path.write_text(rendered, encoding="utf-8")
-            return RenderOutcome(
-                entry.path, "full_rewrite", "OK (full rewrite — no AUTO markers found)"
-            )
-
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        target_path.write_text(rendered, encoding="utf-8")
-        return RenderOutcome(entry.path, "created", "OK (created)")
+            outcome = RenderOutcome(entry.path, "created", "OK (created)" + suffix, **findings)
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
+    _mz.settle_deferrals(install_root, {entry.path: result}, surface=ROOT_FILE_SURFACE)
+    return outcome
+
+
+def _carries_markers(target: Path, entry: RenderedRootFile) -> bool:
+    try:
+        text = target.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+    begin = text.find(entry.begin_marker)
+    return begin >= 0 and text.find(entry.end_marker) > begin
 
 
 #: Statuses after which the file on disk IS the fresh render.
 _RENDERED_OK = ("created", "auto_block_updated", "full_rewrite")
 
 
-def render_all(install_root: Path) -> tuple[RenderOutcome, ...]:
+#: The deferral-row surface of this renderer (``materialize.settle_deferrals``).
+ROOT_FILE_SURFACE = "root-file"
+
+
+def render_all(install_root: Path, *, db_path: Path | None = None,
+               only_marked: bool = False) -> tuple[RenderOutcome, ...]:
     """Render every table entry into ``install_root``, in table order.
+
+    ``db_path`` selects the launcher.db whose ``service_endpoints`` rows the
+    endpoint placeholders read (``None`` = this machine's default).
+
+    ``only_marked`` (v0.2.100 review R18-12): re-render an entry ONLY when its
+    target already exists and carries both AUTO markers — i.e. an install has
+    rendered it before. The ``service_endpoints`` follow-up chain uses this to
+    keep the baked endpoint values current after a ``move`` without ever
+    CREATING or wholly REWRITING a file (a source checkout's tracked
+    ``CLAUDE.md`` has no markers and is left alone). Skipped entries report
+    ``not_rendered_here``.
 
     After an entry renders successfully its stale ``.from-upstream-`` sidecars
     are reaped (see :func:`reap_stale_sidecars`) — the re-render is the merge
@@ -407,7 +471,12 @@ def render_all(install_root: Path) -> tuple[RenderOutcome, ...]:
     """
     outcomes: list[RenderOutcome] = []
     for entry in entries():
-        outcome = render_entry(install_root, entry)
+        if only_marked and not _carries_markers(install_root / Path(entry.path), entry):
+            outcomes.append(RenderOutcome(
+                entry.path, "not_rendered_here",
+                "SKIP (no rendered AUTO block to refresh)"))
+            continue
+        outcome = render_entry(install_root, entry, db_path=db_path)
         if outcome.status in _RENDERED_OK:
             reaped = reap_stale_sidecars(install_root, entry)
             if reaped:

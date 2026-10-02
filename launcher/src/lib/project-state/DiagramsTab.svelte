@@ -24,6 +24,7 @@
     SnapshotTrigger,
   } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
+  import { deleteSnapshotWithConfirm } from './diagram-snapshots';
 
   // ─── Props ────────────────────────────────────────────────────────────
   let { projectId }: { projectId: string } = $props();
@@ -668,6 +669,24 @@
     }
   }
 
+  // v0.2.100: per-snapshot delete. Confirm first; a declined confirm changes
+  // nothing (see `diagram-snapshots.ts`, which carries the act / leave-alone
+  // decision so it is testable).
+  async function deleteSnapshot(snap: DiagramSnapshotRow) {
+    try {
+      const outcome = await deleteSnapshotWithConfirm(snap, fmtDate(snap.created_at), {
+        confirm: (m) => confirm(m),
+        remove: (id) => invoke('delete_diagram_snapshot', { snapshotId: id }),
+      });
+      if (outcome === 'deleted') {
+        toast.success('Snapshot deleted');
+        await loadSnapshots();
+      }
+    } catch (e) {
+      toast.error(e);
+    }
+  }
+
   async function openInEditor() {
     if (!selected) return;
     try {
@@ -1202,16 +1221,25 @@
               <span class="ps-hint">No snapshots yet.</span>
             {:else}
               {#each snapshots as snap (snap.id)}
-                <button
-                  class="diagrams-snap"
-                  onclick={() => restoreSnapshot(snap)}
-                  title="Restore snapshot from {fmtDate(snap.created_at)}"
-                  aria-label="Restore snapshot {snap.label ?? snap.trigger} from {fmtDate(snap.created_at)}"
-                >
-                  <span class="diagrams-snap-trigger">{snap.trigger}</span>
-                  <span class="diagrams-snap-label">{snap.label ?? '—'}</span>
-                  <span class="diagrams-snap-time">{fmtDate(snap.created_at)}</span>
-                </button>
+                <div class="diagrams-snap-wrap">
+                  <button
+                    class="diagrams-snap"
+                    onclick={() => restoreSnapshot(snap)}
+                    title="Restore snapshot from {fmtDate(snap.created_at)}"
+                    aria-label="Restore snapshot {snap.label ?? snap.trigger} from {fmtDate(snap.created_at)}"
+                  >
+                    <span class="diagrams-snap-trigger">{snap.trigger}</span>
+                    <span class="diagrams-snap-label">{snap.label ?? '—'}</span>
+                    <span class="diagrams-snap-time">{fmtDate(snap.created_at)}</span>
+                  </button>
+                  <button
+                    class="diagrams-snap-delete"
+                    data-testid="diagrams-snap-delete"
+                    onclick={() => deleteSnapshot(snap)}
+                    title="Delete snapshot from {fmtDate(snap.created_at)}"
+                    aria-label="Delete snapshot {snap.label ?? snap.trigger} from {fmtDate(snap.created_at)}"
+                  >×</button>
+                </div>
               {/each}
             {/if}
           </div>
@@ -1388,6 +1416,17 @@
     display: flex; flex-direction: column; gap: 2px;
     font-size: 10px; min-width: 80px;
   }
+  .diagrams-snap-wrap { position: relative; display: flex; }
+  .diagrams-snap-delete {
+    position: absolute; top: -5px; right: -5px;
+    width: 16px; height: 16px; padding: 0; line-height: 14px;
+    border-radius: 50%; font-size: 11px; cursor: pointer;
+    background: rgba(255,79,160,0.15); color: rgb(255,79,160);
+    border: 1px solid rgba(255,79,160,0.4);
+    opacity: 0; transition: opacity 0.12s ease;
+  }
+  .diagrams-snap-wrap:hover .diagrams-snap-delete,
+  .diagrams-snap-delete:focus-visible { opacity: 1; }
   .diagrams-snap:hover { background: rgba(0,191,166,0.10); border-color: rgba(0,191,166,0.4); }
   .diagrams-snap-trigger { color: #888; font-size: 9px; }
   .diagrams-snap-label { color: #ccc; }

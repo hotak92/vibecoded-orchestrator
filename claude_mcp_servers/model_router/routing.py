@@ -45,8 +45,9 @@ window exists at all.
 
 from __future__ import annotations
 
+import difflib
 from dataclasses import dataclass
-from typing import Mapping, Optional
+from typing import Collection, Mapping, Optional
 
 from .vendors import (
     ANTHROPIC_FAMILY,
@@ -100,6 +101,9 @@ class RouteError:
     #: string-matching prose: one of ``empty_model``, ``unknown_model``,
     #: ``empty_namespaced_id``, ``claude_id_to_vendor``.
     reason: str
+    #: The closest valid ids, fully spelled (namespace included), for an
+    #: ``unknown_model`` refusal; empty otherwise. Also in ``message``.
+    suggestions: tuple[str, ...] = ()
 
 
 def strip_1m(model_id: str) -> str:
@@ -160,8 +164,109 @@ def _bare_prefix_match(
     return winner
 
 
-def _vendor_route(vendor: Vendor, raw_remainder: str) -> Route | RouteError:
-    """Build a vendor route, applying both invariants."""
+#: How many suggestions an ``unknown_model`` refusal names at most.
+MAX_SUGGESTIONS = 3
+
+#: ``difflib`` similarity floor for a suggestion. Low enough that a missing
+#: namespace segment or a dropped version letter still finds its id
+#: (``model-4.1-flash`` -> ``model-v4.1-flash``), high enough that an
+#: unrelated id is not offered as a correction.
+SUGGESTION_CUTOFF = 0.6
+
+
+def _known_ids(
+    vendor: Vendor, extra: Optional[Mapping[str, Collection[str]]],
+) -> frozenset[str]:
+    """Every bare id this row is KNOWN to serve, lower-cased.
+
+    The row's declared lists (``static_ids``, ``verified_ids``, hidden ids —
+    hidden is "routable by name") plus ``extra[vendor_id]``: the ids the
+    server's catalog last read from the vendor's own model list. Data only;
+    no vendor is named here.
+    """
+    ids = {*vendor.static_ids, *vendor.verified_ids, *vendor.catalog_hide_ids}
+    if extra is not None:
+        ids.update(extra.get(vendor.vendor_id, ()))
+    retired = {i.strip().lower() for i in vendor.retired_ids}
+    return frozenset(
+        i.strip().lower() for i in ids
+        if i and i.strip() and i.strip().lower() not in retired
+    )
+
+
+def _owns_family(vendor: Vendor, remainder: str) -> bool:
+    lowered = remainder.lower()
+    return any(lowered.startswith(p.lower()) for p in vendor.bare_id_prefixes)
+
+
+def _suggest(
+    remainder: str,
+    vendors: Mapping[str, Vendor],
+    extra: Optional[Mapping[str, Collection[str]]],
+    one_m: bool,
+) -> tuple[str, ...]:
+    """The closest known ids across every row, spelled with their namespace."""
+    spelled: dict[str, str] = {}
+    for vendor in vendors.values():
+        for model_id in _known_ids(vendor, extra):
+            full = f"{vendor.namespace}{model_id}"
+            spelled.setdefault(model_id, with_1m(full) if one_m else full)
+    lowered = remainder.lower()
+    # Exact bare match under another row first (a missing/extra namespace
+    # segment is the commonest slip), then the fuzzy neighbours.
+    ranked: list[str] = [spelled[lowered]] if lowered in spelled else []
+    for bare in difflib.get_close_matches(
+        lowered, list(spelled), n=MAX_SUGGESTIONS, cutoff=SUGGESTION_CUTOFF,
+    ):
+        if spelled[bare] not in ranked:
+            ranked.append(spelled[bare])
+    return tuple(ranked[:MAX_SUGGESTIONS])
+
+
+def _unknown_for_vendor(
+    vendor: Vendor,
+    raw_id: str,
+    remainder: str,
+    vendors: Mapping[str, Vendor],
+    extra: Optional[Mapping[str, Collection[str]]],
+    one_m: bool,
+) -> RouteError:
+    suggestions = _suggest(remainder, vendors, extra, one_m)
+    hint = (
+        " Did you mean " + " or ".join(repr(s) for s in suggestions) + "?"
+        if suggestions else ""
+    )
+    return RouteError(
+        400,
+        f"unknown model id {raw_id!r}: {remainder!r} is not a model the "
+        f"{vendor.vendor_id!r} upstream ({vendor.namespace}<id>) is known to "
+        "serve, so the gateway refuses it here instead of forwarding it to "
+        "that vendor (which would fail with its own error, or answer with a "
+        f"different model).{hint}",
+        "unknown_model",
+        suggestions,
+    )
+
+
+def _vendor_route(
+    vendor: Vendor,
+    raw_remainder: str,
+    *,
+    raw_id: str = "",
+    vendors: Optional[Mapping[str, Vendor]] = None,
+    known_ids: Optional[Mapping[str, Collection[str]]] = None,
+) -> Route | RouteError:
+    """Build a vendor route, applying all three invariants.
+
+    The third (v0.2.100, F-W1-11a): a remainder this row is not known to
+    serve — not in its declared or last-read model lists, and not in its own
+    bare-id family — is REFUSED locally with the closest valid ids. The shared
+    namespace used to accept anything, so ``<shared namespace><other vendor's
+    id>`` (a nested namespace segment missing) went to the default vendor, failed there,
+    and surfaced as a chat failure with the vendor's unrelated message. A row
+    that declares neither a family nor a model list cannot be judged and is
+    routed as before.
+    """
     remainder = strip_1m(raw_remainder).strip()
     if not remainder:
         return RouteError(
@@ -181,6 +286,26 @@ def _vendor_route(vendor: Vendor, raw_remainder: str) -> Route | RouteError:
             f"{vendor.vendor_id!r}'s real models.",
             "claude_id_to_vendor",
         )
+    if remainder.lower() in {i.lower() for i in vendor.retired_ids}:
+        # Retired by the owner: refused like an unknown id, even though the
+        # vendor's own list may still carry it and its family owns the prefix.
+        return _unknown_for_vendor(
+            vendor, raw_id or raw_remainder, remainder,
+            vendors if vendors is not None else {vendor.vendor_id: vendor},
+            known_ids, raw_remainder.endswith(ONE_M_SUFFIX),
+        )
+    known = _known_ids(vendor, known_ids)
+    judgeable = bool(known or vendor.bare_id_prefixes)
+    if (
+        judgeable
+        and remainder.lower() not in known
+        and not _owns_family(vendor, remainder)
+    ):
+        return _unknown_for_vendor(
+            vendor, raw_id or raw_remainder, remainder,
+            vendors if vendors is not None else {vendor.vendor_id: vendor},
+            known_ids, raw_remainder.endswith(ONE_M_SUFFIX),
+        )
     return Route(
         upstream=vendor.upstream,
         forward_model=remainder,
@@ -195,17 +320,26 @@ def route(
     model_id: str,
     vendors: Mapping[str, Vendor] = VENDORS,
     anthropic: AnthropicFamily = ANTHROPIC_FAMILY,
+    known_ids: Optional[Mapping[str, Collection[str]]] = None,
 ) -> Route | RouteError:
     """Decide where ``model_id`` goes.
 
     Resolution order, first match wins:
 
-    1. an explicit vendor namespace (``<namespace><id>``);
+    1. an explicit vendor namespace (``<namespace><id>``) — refused with the
+       closest valid ids when the row is not known to serve the remainder
+       (see :func:`_vendor_route`);
     2. a vendor's bare-id prefix (so the CLI can use the vendor's real id);
     3. a Claude marker anywhere in the id -> the first-party OAuth route,
        with ``[1m]`` stripped (no upstream model is named that; the 1M window
        travels as a beta header) and recorded in ``one_m_requested``;
-    4. otherwise a local 400 that lists the namespaces that do exist.
+    4. otherwise a local 400 that lists the namespaces that do exist and the
+       closest valid ids.
+
+    ``known_ids`` maps ``vendor_id`` to the bare ids the caller's catalog
+    last read from that vendor's own model list (the server passes its
+    cache; no fetch happens on the request path). Omitted, only the rows'
+    declared lists count.
     """
     if not isinstance(model_id, str) or not model_id.strip():
         return RouteError(
@@ -218,11 +352,17 @@ def route(
 
     vendor, remainder = split_namespace(model_id, vendors)
     if vendor is not None:
-        return _vendor_route(vendor, remainder)
+        return _vendor_route(
+            vendor, remainder, raw_id=model_id, vendors=vendors,
+            known_ids=known_ids,
+        )
 
     bare = _bare_prefix_match(model_id, vendors)
     if bare is not None:
-        return _vendor_route(bare, model_id)
+        return _vendor_route(
+            bare, model_id, raw_id=model_id, vendors=vendors,
+            known_ids=known_ids,
+        )
 
     if has_claude_marker(model_id):
         return Route(
@@ -237,12 +377,54 @@ def route(
     known = ", ".join(
         sorted(f"{v.namespace}<id>" for v in vendors.values())
     ) or "(no vendor rows configured)"
+    suggestions = _suggest(
+        strip_1m(model_id), vendors, known_ids, model_id.endswith(ONE_M_SUFFIX),
+    )
+    hint = (
+        " Did you mean " + " or ".join(repr(s) for s in suggestions) + "?"
+        if suggestions else ""
+    )
     return RouteError(
         400,
         f"no backend serves model {model_id!r}. Ids containing "
         f"{' or '.join(CLAUDE_ID_MARKERS)} go to the first-party Claude route "
-        f"under your Claude login; vendor models are named {known}.",
+        f"under your Claude login; vendor models are named {known}.{hint}",
         "unknown_model",
+        suggestions,
+    )
+
+
+def validate_model_id(
+    model_id: str,
+    vendors: Mapping[str, Vendor] = VENDORS,
+    anthropic: AnthropicFamily = ANTHROPIC_FAMILY,
+    known_ids: Optional[Mapping[str, Collection[str]]] = None,
+) -> tuple[bool, str, tuple[str, ...]]:
+    """``(valid, reason, suggestions)`` for an id a CONFIG names (not a request).
+
+    Stricter than :func:`route`, on purpose: a definition file is checked
+    before anything is sent, so "the row's family would accept it" is not
+    enough — the id must be one the registry KNOWS the row serves (declared
+    lists, plus ``known_ids`` when the caller has a catalog). A first-party
+    Claude id is valid by construction (the client validates those).
+    Used by the shipped-definition contract test and by
+    ``python -m vco_lib.module_gated_delivery check-agent-ids``.
+    """
+    decision = route(model_id, vendors, anthropic, known_ids)
+    if isinstance(decision, RouteError):
+        return False, decision.message, decision.suggestions
+    if decision.is_anthropic or decision.vendor is None:
+        return True, "first-party route", ()
+    if decision.forward_model.lower() in _known_ids(decision.vendor, known_ids):
+        return True, f"known to the {decision.vendor.vendor_id!r} row", ()
+    suggestions = _suggest(
+        decision.forward_model, vendors, known_ids, decision.one_m_requested,
+    )
+    return (
+        False,
+        f"{model_id!r} routes to the {decision.vendor.vendor_id!r} upstream, but "
+        f"{decision.forward_model!r} is not in that row's known model list",
+        suggestions,
     )
 
 
@@ -259,6 +441,7 @@ def advertised_id(vendor: Vendor, model_id: str, one_m: bool) -> str:
 
 
 __all__ = [
+    "MAX_SUGGESTIONS",
     "ONE_M_SUFFIX",
     "Route",
     "RouteError",
@@ -267,5 +450,6 @@ __all__ = [
     "route",
     "split_namespace",
     "strip_1m",
+    "validate_model_id",
     "with_1m",
 ]

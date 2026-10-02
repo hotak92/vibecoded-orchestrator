@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "v0.2.100 WP-18B: ONE case table for the service URLs the bundled MCP entries carry in ~/.claude.json.",
+    "Executed by launcher/src-tauri/src/mcp_registration.rs tests (Rust: service_ports_from_rows ->",
+    "build_default_mcp_entries, the authoritative registrar) AND by tests/test_v02100_wp18b_materialization_gaps.py",
+    "(Python: vco_lib.service_endpoints.urls_from_rows -> install_mcp._build_python_mcp_entries, the Tier-4",
+    "fallback install.py uses when the Rust binary is unusable). Before v0.2.100 the Python fallback rebuilt",
+    "http://localhost:<port> from the ports alone and dropped the row's host and scheme.",
+    "rows: service -> a service_endpoints row (unset fields at the DDL defaults), null = no row (compiled default).",
+    "expect_weaviate_kg_env: the weaviate-kg entry's service keys, as written. A new case goes HERE, never in one side's tests."
+  ],
+  "cases": [
+    {
+      "name": "no rows: the compiled defaults on localhost",
+      "rows": {"weaviate": null, "ollama": null, "code_embed": null},
+      "expect_weaviate_kg_env": {
+        "WEAVIATE_URL": "http://localhost:8081",
+        "OLLAMA_URL": "http://localhost:11435",
+        "GRPC_PORT": "50052",
+        "CODE_EMBED_SERVICE_URL": "http://localhost:11440"
+      }
+    },
+    {
+      "name": "VCO-managed on moved ports via 127.0.0.1",
+      "rows": {
+        "weaviate": {"mode": "vco_managed", "host": "127.0.0.1", "port": 18081, "grpc_port": 50061},
+        "ollama": {"mode": "vco_managed", "host": "127.0.0.1", "port": 21435},
+        "code_embed": {"mode": "vco_managed", "host": "127.0.0.1", "port": 21440}
+      },
+      "expect_weaviate_kg_env": {
+        "WEAVIATE_URL": "http://127.0.0.1:18081",
+        "OLLAMA_URL": "http://127.0.0.1:21435",
+        "GRPC_PORT": "50061",
+        "CODE_EMBED_SERVICE_URL": "http://127.0.0.1:21440"
+      }
+    },
+    {
+      "name": "adopted remote Ollama keeps its host; https Weaviate on its default port drops the port",
+      "rows": {
+        "weaviate": {"mode": "adopted_external", "scheme": "https", "host": "weaviate.example.com", "port": 443, "grpc_port": 443},
+        "ollama": {"mode": "adopted_external", "host": "gpu.lan", "port": 11434},
+        "code_embed": null
+      },
+      "expect_weaviate_kg_env": {
+        "WEAVIATE_URL": "https://weaviate.example.com",
+        "OLLAMA_URL": "http://gpu.lan:11434",
+        "GRPC_PORT": "443",
+        "CODE_EMBED_SERVICE_URL": "http://localhost:11440"
+      }
+    },
+    {
+      "name": "IPv6 loopback Weaviate and an http code-embed on port 80",
+      "rows": {
+        "weaviate": {"mode": "adopted_external", "host": "[::1]", "port": 8090, "grpc_port": 50051},
+        "ollama": {"mode": "adopted_container", "port": 11435, "container_name": "vco_ollama"},
+        "code_embed": {"mode": "adopted_external", "host": "embed.lan", "port": 80}
+      },
+      "expect_weaviate_kg_env": {
+        "WEAVIATE_URL": "http://[::1]:8090",
+        "OLLAMA_URL": "http://localhost:11435",
+        "GRPC_PORT": "50051",
+        "CODE_EMBED_SERVICE_URL": "http://embed.lan"
+      }
+    }
+  ]
+}

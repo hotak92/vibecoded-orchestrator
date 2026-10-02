@@ -11,10 +11,16 @@
   //   * Keep the updated version (discard the stashed local change), or
   //   * Keep local (back up the updated version first, then restore local).
   // Backend: `resolve_autostash_pop_and_retry(path, files, keep_updated)` then
-  // finishes the update (install.py + binary refresh + auto-restart).
+  // finishes the update through the ONE pipeline (`Resume`: install.py +
+  // binary refresh + auto-restart). v0.2.100 (W3-FIX): the command rejects
+  // with the pipeline's JSON error contract, so the invoke is bracketed by
+  // `updater.beginOp` / `endOp` and a failure goes through `updater.failOp`
+  // (the store's error router) — one normalised message, or the decision
+  // modal a structured payload names.
 
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
+  import { modalFailure, updater } from '$lib/stores/updater';
   import type { OrchestratorAutostashPopConflictPayload } from '$lib/stores/updater';
 
   let {
@@ -37,6 +43,7 @@
     resolving = true;
     mode = keepUpdated ? 'keep-updated' : 'keep-local';
     error = null;
+    updater.beginOp('resume');
     try {
       await invoke<unknown>('resolve_autostash_pop_and_retry', {
         path: installPath,
@@ -44,6 +51,7 @@
         keepUpdated,
       });
       resolved = true;
+      updater.endOp();
       toast.success(
         keepUpdated
           ? 'Kept the updated version — finishing the update.'
@@ -51,8 +59,10 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      error = `Resolve failed: ${e}`;
+      const outcome = modalFailure(updater.failOp(e), 'Resolve failed', 'autostashPop');
+      error = outcome.inline;
       mode = null;
+      if (outcome.closeSelf) onClose();
     } finally {
       resolving = false;
     }

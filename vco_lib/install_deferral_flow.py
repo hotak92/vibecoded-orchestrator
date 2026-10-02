@@ -40,13 +40,26 @@ Failure posture: the late merge inside ``finalize()`` soft-fails into
 failure must not also lose the run's own entries); a WRITE failure
 propagates to the caller, which logs-and-continues (install completion
 never blocks on the deferral file).
+
+* **AD-9 every exit path flushes** (v0.2.100, L1-F09 / I-07 / F-W3-02): a run
+  that stops early — ``sys.exit(1)`` at step 5, a ``return 1`` from a step,
+  an uncaught exception — used to lose every entry it had accumulated,
+  because ``finalize()`` ran only at the end of a COMPLETED run.
+  :func:`run_main` wraps ``main()`` in :func:`flush_on_exit`; when the armed
+  flow was not finalized it calls ``finalize(partial=True)``. A PARTIAL
+  finalize keeps every on-disk entry this run neither re-detected nor
+  resolved — install-owned ids included, because an early stop never reached
+  the steps that would have re-detected them, so their absence from memory
+  proves nothing (drop-when-absent is a completed-run rule).
 """
 
 from __future__ import annotations
 
+import contextlib
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, Optional, Tuple
+from typing import Callable, Iterable, Iterator, Optional, Tuple
 
 from vco_lib.atomic import exclusive_file_lock
 from vco_lib.deferral_emit import LOCK_REL
@@ -123,6 +136,19 @@ class InstallDeferralFlow:
         #: so ``is`` cleanly separates "still the stale seeded copy" from
         #: "re-detected this run", with no heuristic about field contents.
         self._seeded_entries: dict = {}
+        #: True once :meth:`finalize` ran (completed OR partial) — the
+        #: exit-path flush must never write a second time.
+        self.finalized = False
+
+    def arm(self) -> None:
+        """Make this the flow :func:`flush_on_exit` flushes when the run
+        stops before its own :meth:`finalize` (one armed flow per process).
+
+        Called once the run starts doing work — NOT at construction: the
+        read-only exits before that point (``--adopt-project-dry-run``, a
+        refused adopt) must leave the ledger untouched."""
+        global _ARMED
+        _ARMED = self
 
     def _merge_foreign_from_disk(self) -> int:
         """One home for the exclusion-scoped disk merge (A-2 seed and the
@@ -180,8 +206,12 @@ class InstallDeferralFlow:
             vanished.append(cid)
         return vanished
 
-    def finalize(self) -> FinalizeResult:
+    def finalize(self, *, partial: bool = False) -> FinalizeResult:
         """P1 pre-write re-merge, then the run's SINGLE authoritative write.
+
+        ``partial=True`` (AD-9, the exit-path flush): the late merge keeps
+        on-disk entries of install-OWNED ids too, because a run that stopped
+        early never re-detected them — see the module docstring.
 
         The re-merge soft-fails into ``merge_error`` (best-effort — its
         failure must not also discard the run's own entries). The write
@@ -220,9 +250,13 @@ class InstallDeferralFlow:
             except Exception as exc:  # noqa: BLE001 — reconcile is best-effort
                 vanish_error = str(exc)
             try:
-                late_merged = self._merge_foreign_from_disk()
+                late_merged = (
+                    self.report.merge_from_disk(self.folder) if partial
+                    else self._merge_foreign_from_disk()
+                )
             except Exception as exc:  # noqa: BLE001 — re-merge is best-effort
                 merge_error = str(exc)
+            self.finalized = True
             wrote_entries = self.report.write(self.folder)
         # Trail lines go OUTSIDE the lock: `record_auto_resolution` appends to
         # its own JSONL and must never be reachable while we hold the deferral
@@ -236,3 +270,51 @@ class InstallDeferralFlow:
             vanished=tuple(vanished),
             vanish_error=vanish_error,
         )
+
+
+#: The flow the exit-path flush writes (set by :meth:`InstallDeferralFlow.arm`).
+_ARMED: Optional[InstallDeferralFlow] = None
+
+
+def armed_flow() -> Optional[InstallDeferralFlow]:
+    return _ARMED
+
+
+def _flush_partial(reason: str) -> None:
+    """Write the armed flow's report if its own finalize never ran. Soft-fail:
+    the flush must never replace the error the user is about to see."""
+    flow = _ARMED
+    if flow is None or flow.finalized:
+        return
+    try:
+        flow.finalize(partial=True)
+        print(f"  (deferral report written before exit: {reason})", file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 — never mask the original failure
+        print(f"  (could not write the deferral report before exit: {exc})",
+              file=sys.stderr)
+
+
+@contextlib.contextmanager
+def flush_on_exit() -> Iterator[None]:
+    """AD-9: around ``main()``'s step sequence — on ``SystemExit``, an
+    uncaught exception or an early return, the armed flow is finalized
+    (``partial=True``) unless the run already finalized it. The exception
+    propagates unchanged."""
+    global _ARMED
+    _ARMED = None
+    try:
+        yield
+    except SystemExit as exc:
+        _flush_partial(f"exit {exc.code}")
+        raise
+    except BaseException as exc:
+        _flush_partial(type(exc).__name__)
+        raise
+    else:
+        _flush_partial("the run returned before its final write")
+
+
+def run_main(main: Callable[[], int]) -> int:
+    """``sys.exit(run_main(main))`` — install.py's entry point."""
+    with flush_on_exit():
+        return main()

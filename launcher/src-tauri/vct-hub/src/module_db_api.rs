@@ -23,7 +23,7 @@
 //! ### Authorization
 //!
 //! Every route requires `Authorization: Bearer <module-access-token>`,
-//! issued via the launcher's `issue_module_access_token` Tauri command
+//! issued by the launcher (`commands::module_db::get_or_issue_module_token`)
 //! and stored in `module_access_tokens` (launcher.db, migration 019).
 //! The token is scoped to a specific (module_id, project_id) pair —
 //! routes whose URL paths name a different module / project than the
@@ -68,7 +68,7 @@ use vct_launcher_core::services::boot_token;
 use super::modules_api::LauncherDbHandle;
 
 /// Default refresh-token TTL: 1 hour, matching the launcher's
-/// `issue_module_access_token` initial-issue TTL. v0.2.32 swaps both
+/// `get_or_issue_module_token` initial-issue TTL. v0.2.32 swaps both
 /// surfaces to JWT-signed claims; the row-replace mechanism stays.
 const REFRESH_TTL_MS: i64 = 60 * 60 * 1000;
 

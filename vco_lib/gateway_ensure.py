@@ -36,7 +36,10 @@ deliberate:
 CLI
 ---
 ``python -m vco_lib.gateway_ensure status [--json|--shell]``
-    Report the state. Never starts anything, never writes anything.
+    Report the state. Never starts anything, never writes anything. The
+    ``--json`` payload also carries ``machine_signal`` (v0.2.100, AD-7):
+    :func:`machine_gateway_signal`, the machine-level "gateway configured"
+    answer.
 
 ``python -m vco_lib.gateway_ensure ensure [--json|--shell] [--folder DIR]``
     Start a REGISTERED gateway that is not running. ``--folder`` is the
@@ -75,6 +78,8 @@ __all__ = [
     "gateway_pid",
     "gateway_status",
     "is_running",
+    "machine_gateway_signal",
+    "MachineGatewaySignal",
     "main",
 ]
 
@@ -280,6 +285,178 @@ def gateway_status(
 
 
 # ---------------------------------------------------------------------------
+# Machine signal — "is a model gateway configured on THIS machine?"
+# ---------------------------------------------------------------------------
+
+#: :attr:`MachineGatewaySignal.panel` values.
+PANEL_POINTED = "pointed"
+PANEL_NOT_POINTED = "not_pointed"
+PANEL_UNKNOWN = "unknown"
+PANEL_NOT_CHECKED = "not_checked"
+
+
+@dataclass(frozen=True)
+class MachineGatewaySignal:
+    """The ONE answer to "does this machine route its panel through VCO's gateway?".
+
+    v0.2.100 (AD-7, U20). The gateway is configured MACHINE-wide — a login
+    registration plus the VS Code panel's base URL in the editor's GLOBAL
+    settings — so the signal that decides machine-level behaviour (today: the
+    delivery of ``templates/agents/module-gateway/``) is read from exactly
+    those two places. The launcher's Services page reads this same answer
+    through ``python -m vco_lib.module_gated_delivery status --json``; it
+    does not recompute it (rule A, one home).
+
+    ``configured`` is TRI-STATE on purpose: ``None`` means "could not ask"
+    (a settings file that does not parse, a registration that cannot run, an
+    exception while reading), and a caller that feeds a reconcile-with-delete
+    must carry the previous state forward on ``None`` rather than read it as
+    ``False``.
+    """
+
+    configured: Optional[bool]
+    #: :class:`GatewayState` value of the registration read, or ``"error"``.
+    registration: str
+    #: One of :data:`PANEL_POINTED` / :data:`PANEL_NOT_POINTED` /
+    #: :data:`PANEL_UNKNOWN` / :data:`PANEL_NOT_CHECKED`.
+    panel: str
+    reason: str
+    #: Settings files whose panel base URL is this machine's VCO gateway.
+    panel_paths: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "configured": self.configured,
+            "registration": self.registration,
+            "panel": self.panel,
+            "reason": self.reason,
+            "panel_paths": list(self.panel_paths),
+        }
+
+
+def _gateway_has_run_here(state_dir: Optional[Path]) -> bool:
+    """True when the gateway's host-token file EXISTS (it is created on the
+    first run). Existence only — the credential is never read here."""
+    try:
+        from model_router.config import (  # pyright: ignore[reportMissingImports]
+            token_path,
+        )
+    except Exception:  # noqa: BLE001 — no gateway package ⇒ no evidence
+        return False
+    path = Path(token_path())
+    if state_dir is not None:
+        path = state_dir / path.name
+    try:
+        return path.is_file()
+    except OSError:
+        return False
+
+
+def machine_gateway_signal(
+    *,
+    home: Optional[Path] = None,
+    system: Optional[str] = None,
+    state_dir: Optional[Path] = None,
+    settings_paths: Optional[Sequence[Path]] = None,
+) -> MachineGatewaySignal:
+    """Read the machine signal. Starts nothing, writes nothing, never raises.
+
+    Two legs, BOTH required for ``configured=True``:
+
+    1. **The gateway is set up here** — registered at login and runnable
+       (:func:`gateway_status` with ``verify=False``: no spawn on a bundle
+       path that runs once per project), OR running right now, OR its host
+       token exists (it has run on this machine; a gateway stopped for the
+       afternoon is still this machine's gateway). A registration that names
+       no entry point is "could not ask" (``None``), not "no": the install is
+       broken and will be repaired, and a delete driven by it would churn.
+    2. **The panel points at it** — some VS Code-family GLOBAL settings file
+       (:func:`vco_lib.vscode_settings.detect_targets`, per-OS paths and
+       variants included) whose ``ANTHROPIC_BASE_URL`` is this machine's VCO
+       gateway (:func:`vco_lib.vscode_settings.inspect_target`, read-only).
+       If none points at it and at least one file could not be parsed, the
+       answer is ``None`` — the unparseable file may be the one that does.
+
+    ``settings_paths`` overrides discovery (tests; a caller that already
+    holds the list).
+    """
+    try:
+        reg = gateway_status(
+            home=home, system=system, state_dir=state_dir, verify=False,
+        )
+    except Exception as exc:  # noqa: BLE001 — a signal answers, it never raises
+        return MachineGatewaySignal(
+            configured=None, registration="error", panel=PANEL_NOT_CHECKED,
+            reason=f"the gateway registration could not be read: {exc}",
+        )
+    if reg.state is GatewayState.REGISTERED_BUT_UNRUNNABLE:
+        return MachineGatewaySignal(
+            configured=None, registration=reg.state.value,
+            panel=PANEL_NOT_CHECKED,
+            reason=f"the gateway is registered but cannot run ({reg.reason})",
+        )
+    set_up = reg.state in (
+        GatewayState.RUNNING, GatewayState.REGISTERED_NOT_RUNNING,
+    ) or is_running(state_dir) or _gateway_has_run_here(state_dir)
+    if not set_up:
+        return MachineGatewaySignal(
+            configured=False, registration=reg.state.value,
+            panel=PANEL_NOT_CHECKED,
+            reason=(
+                "no model gateway is set up on this machine (not registered "
+                "at login, not running, never run)"
+            ),
+        )
+
+    try:
+        from vco_lib import vscode_settings as _vs
+
+        if settings_paths is None:
+            paths = [Path(t.path) for t in _vs.detect_targets(home=home)]
+        else:
+            paths = [Path(p) for p in settings_paths]
+        pointed: list[str] = []
+        unreadable: list[str] = []
+        for path in paths:
+            probe = _vs.inspect_target(path)
+            if probe.get("parseable") is False:
+                unreadable.append(str(path))
+            elif probe.get("points_at_vco_gateway"):
+                pointed.append(str(path))
+    except Exception as exc:  # noqa: BLE001
+        return MachineGatewaySignal(
+            configured=None, registration=reg.state.value, panel=PANEL_UNKNOWN,
+            reason=f"the VS Code panel settings could not be read: {exc}",
+        )
+    if pointed:
+        return MachineGatewaySignal(
+            configured=True, registration=reg.state.value, panel=PANEL_POINTED,
+            reason=(
+                "the model gateway is set up on this machine and the VS Code "
+                f"panel points at it ({', '.join(pointed)})"
+            ),
+            panel_paths=tuple(pointed),
+        )
+    if unreadable:
+        return MachineGatewaySignal(
+            configured=None, registration=reg.state.value, panel=PANEL_UNKNOWN,
+            reason=(
+                "no readable VS Code settings file points the panel at the "
+                "gateway, and these could not be parsed: "
+                f"{', '.join(unreadable)}"
+            ),
+        )
+    return MachineGatewaySignal(
+        configured=False, registration=reg.state.value,
+        panel=PANEL_NOT_POINTED,
+        reason=(
+            "the model gateway is set up on this machine but no VS Code panel "
+            "points at it (Services → Model gateway → Point panel at gateway)"
+        ),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Ensure — the SessionStart action
 # ---------------------------------------------------------------------------
 
@@ -452,7 +629,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         )
 
     if args.json:
-        print(json.dumps(res.to_dict(), sort_keys=True))
+        payload = res.to_dict()
+        if args.cmd == "status":
+            payload["machine_signal"] = machine_gateway_signal().to_dict()
+        print(json.dumps(payload, sort_keys=True))
     elif args.shell:
         print(f"VCO_GATEWAY_STATE={shlex.quote(res.state.value)}")
         print(f"VCO_GATEWAY_PID={shlex.quote(str(res.pid) if res.pid else '')}")

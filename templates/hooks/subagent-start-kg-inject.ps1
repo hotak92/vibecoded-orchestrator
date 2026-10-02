@@ -125,14 +125,34 @@ $ResolveVenv = Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1"
 $Venv = ""
 if (Test-Path $ResolveVenv) {
     . $ResolveVenv
-    Resolve-VcoVenvPython -ScriptDir $ScriptDir
-    if ($script:VCO_VENV_PYTHON) { $Venv = $script:VCO_VENV_PYTHON }
+    # v0.2.100: Resolve-VcoVenvPython RETURNS the interpreter (it sets no
+    # variable). This used to read a never-set $script:VCO_VENV_PYTHON, so the
+    # venv never resolved and this hook exited before searching on Windows.
+    $resolvedVenv = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+    if ($resolvedVenv) { $Venv = $resolvedVenv }
 }
 
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+$RlScript = ""
+if (Get-Command Resolve-VcoOrchestratorScript -ErrorAction SilentlyContinue) {
+    # v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
+    # there (same roots as the venv), never under the project root. It still runs
+    # with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
+    # shared + granted collections apply. MUST MATCH the .sh sibling.
+    $RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
+    # Unresolved -> the legacy (absent) project path: every Test-Path below then
+    # reads "not installed" without binding an empty -Path.
+    if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
+    # Pin the CALLING project's identity for the producer (a no-op whenever the
+    # harness already set it): the script lives in the orchestrator root, so its
+    # own location must never be what names the project.
+    $env:CLAUDE_PROJECT_DIR = $ProjectRoot
+    # v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+    # (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+    $env:VCO_RL_TASK_TYPE = "subagent_kg_search"
+}
 
 # Bail silently if the venv didn't resolve or the script is missing.
-if (-not $Venv -or -not (Test-Path $RlScript)) { exit 0 }
+if (-not $Venv -or -not $RlScript -or -not (Test-Path $RlScript)) { exit 0 }
 
 # Run the search with --hook-format. Limit to 3 matches to stay under
 # the additionalContext cap.
@@ -142,7 +162,10 @@ if (-not $Venv -or -not (Test-Path $RlScript)) { exit 0 }
 # of re-running the ~3.8 s search. Cache the RAW (pre-filter) output so the
 # identical post-filtering below applies to a hit exactly as to a live result.
 # MUST MATCH subagent-start-kg-inject.sh.
-$Matches = ""
+# NOT `$Matches`: that is PowerShell's automatic variable, overwritten by every
+# -match below — the injection used to render as "System.Collections.Hashtable"
+# (latent until v0.2.100, because the venv never resolved on this path).
+$KgMatches = ""
 try {
     $rawOut = $null
     $sakgKey = ""
@@ -165,16 +188,16 @@ try {
         # we don't blow past the emit-context.ps1 cap with verbose
         # bodies. Match the .sh sibling's 60-line cap.
         $lines = @($rawOut -split "`r?`n" | Where-Object { $_ -notmatch '^KG: no-results' } | Select-Object -First 60)
-        $Matches = ($lines -join "`n").TrimEnd()
+        $KgMatches = ($lines -join "`n").TrimEnd()
     }
 } catch { }
 
 # Whitespace-only / empty match: silent exit.
-if (-not $Matches -or -not ($Matches -match '\S')) { exit 0 }
+if (-not $KgMatches -or -not ($KgMatches -match '\S')) { exit 0 }
 
 # Format the additionalContext block.
 $HeaderLabel = if ($AgentType) { $AgentType } else { "subagent" }
-$Output = "[KG context for $HeaderLabel task]:`n`n$Matches`n"
+$Output = "[KG context for $HeaderLabel task]:`n`n$KgMatches`n"
 
 if (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue) {
     Emit-AdditionalContext $Output SubagentStart

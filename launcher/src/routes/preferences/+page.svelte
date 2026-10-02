@@ -1,8 +1,27 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { getVersion } from '@tauri-apps/api/app';
   import { goto } from '$app/navigation';
   import { invoke, safeInvoke, listen as tauriListen } from '$lib/tauri';
+  // v0.2.100 (WP-16): every READ this page makes goes through the ONE loader
+  // registry; eager loaders run at mount (budgeted), the rest when their
+  // section scrolls into view. See `$lib/preferences/README.md`.
+  import {
+    PREF_LOADERS,
+    createPreferenceLoaders,
+    lazySection,
+    RL_LOCAL_OFF_KEY,
+    APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL,
+    APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL,
+    APP_STATE_KEY_KG_SUMMARY_CONSENT,
+    APP_STATE_KEY_KG_SUMMARY_MODEL,
+    APP_STATE_KEY_KG_SUMMARY_OVERRIDE,
+    APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL,
+    APP_STATE_KEY_CODE_EMBED_OVERRIDE,
+    APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL,
+    APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL,
+    APP_STATE_KEY_ACTIVE_EMBEDDING,
+    OLLAMA_URL,
+  } from '$lib/preferences/loaders';
   import { selectedProject } from '$lib/stores/projects';
   import { toast } from '$lib/stores/toast';
   import { ui } from '$lib/stores/ui';
@@ -30,6 +49,12 @@
     resolveSessionAutostart,
     sessionAutostartHint,
   } from '$lib/session-autostart';
+  import {
+    resolveModuleUpdateAutoCheck,
+    moduleUpdateAutoCheckHint,
+    DEFAULT_MODULE_UPDATE_AUTO_CHECK,
+  } from '$lib/module-update-autocheck';
+  import { setModuleUpdateAutoCheckEnabled } from '$lib/api/module_updates';
   import type {
     EmbeddingCatalog,
     ModelChoice,
@@ -112,12 +137,9 @@
 
   async function loadPat() {
     try {
-      patPresent = await invoke<boolean>('has_github_pat');
-      if (patPresent) {
-        patPreview = await invoke<string | null>('get_github_pat_preview');
-      } else {
-        patPreview = null;
-      }
+      const r = await PREF_LOADERS.pat.load();
+      patPresent = r.present;
+      patPreview = r.preview;
     } catch (e) {
       patError = String(e);
     }
@@ -234,10 +256,7 @@
     // sees the current hardware fingerprint even before clicking
     // Re-detect. Soft-fail: an empty / missing app_state row just leaves
     // the section in the "no snapshot yet" state.
-    const raw = await safeInvoke<{ value: string | null; is_set: boolean }>(
-      'app_state_get',
-      { key: 'launcher.hardware_snapshot' },
-    );
+    const raw = await PREF_LOADERS.hardwareSnapshot.load();
     if (raw && raw.is_set && raw.value) {
       try {
         const snap = JSON.parse(raw.value) as HardwareSnapshot;
@@ -410,27 +429,17 @@
 
   async function loadEmbeddingCatalog() {
     embCatalogError = null;
-    try {
-      embCatalog = await invoke<EmbeddingCatalog>('get_embedding_catalog', {
-        projectId: null,
-      });
-      if (embCatalog.errors && embCatalog.errors.length > 0) {
-        embCatalogError = embCatalog.errors.join('; ');
-      }
-    } catch (e) {
-      embCatalog = null;
-      embCatalogError = String(e);
+    const r = await PREF_LOADERS.embeddingCatalog.load<EmbeddingCatalog, DefaultEmbeddingModels>();
+    embCatalog = r.catalog;
+    embCatalogError = r.catalogError;
+    if (r.catalog?.errors && r.catalog.errors.length > 0) {
+      embCatalogError = r.catalog.errors.join('; ');
     }
-    try {
-      const cur = await invoke<DefaultEmbeddingModels>(
-        'get_default_embedding_models',
-      );
-      defaultTextModel = cur.text_model ?? '';
-      defaultCodeModel = cur.code_model ?? '';
-    } catch (e) {
-      // Soft-fail: row absent (never set) is the common case on first
-      // boot — leave fields empty so the dropdown shows the placeholder.
-      console.warn('[vct] get_default_embedding_models:', e);
+    // Soft: row absent (never set) is the common case on first boot —
+    // leave fields empty so the dropdown shows the placeholder.
+    if (r.defaults) {
+      defaultTextModel = r.defaults.text_model ?? '';
+      defaultCodeModel = r.defaults.code_model ?? '';
     }
   }
 
@@ -564,7 +573,7 @@
     | { status: 'invalid'; reason: string; http_status: number | null }
     | { status: 'error'; detail: string };
 
-  /** Pre-fill the row at mount. If a key is present in the keychain we
+  /** Pre-fill the row when the section opens (registry key `openAi`). If a key is present in the keychain we
    *  show a masked placeholder (•••• prefix) so the user understands
    *  there's a key without exposing it; if absent we leave the input
    *  empty. Soft-fail: a keychain read error renders as "no key" plus
@@ -576,19 +585,17 @@
    *  prior session. */
   async function loadOpenAi() {
     openaiStatus = { kind: 'idle' };
+    let r: { present: boolean; preview: string | null };
     try {
-      openaiPresent = await invoke<boolean>('has_openai_api_key');
+      r = await PREF_LOADERS.openAi.load();
     } catch (e) {
       openaiPresent = false;
       openaiStatus = { kind: 'error', detail: String(e) };
       return;
     }
+    openaiPresent = r.present;
     if (openaiPresent) {
-      try {
-        openaiPreview = await invoke<string | null>('get_openai_api_key_preview');
-      } catch {
-        openaiPreview = null;
-      }
+      openaiPreview = r.preview;
       // Show a masked placeholder so Apply / Re-check make sense to
       // the user without having to retype the key. The actual input
       // value stays empty — typing replaces; submitting empty uses the
@@ -707,7 +714,8 @@
    *  value, re-validates against OpenAI's free /v1/models/<model>
    *  probe, and runs the recovery state machine. The state machine
    *  emits `vct-openai-key-invalidated` / `vct-openai-key-restored`
-   *  events on its own — our event listener (registered in onMount)
+   *  events on its own — our event listener (the eager `openAiKeyEvents`
+   *  registry entry, subscribed at mount)
    *  shows the toasts for those.
    *
    *  We update the local `openaiStatus` indicator from the validation
@@ -819,15 +827,14 @@
   }
 
   async function subscribeOpenAiEvents() {
-    unlistenOpenAiInvalidated = await tauriListen<InvalidatedPayload>(
-      'vct-openai-key-invalidated',
-      (event) => {
+    const [invalidated, restored] = await PREF_LOADERS.openAiKeyEvents.load<InvalidatedPayload, RestoredPayload>({
+      onInvalidated: (payload: InvalidatedPayload) => {
         // Suppress the toast on repeat launches that just confirm "still
         // broken" — the banner-style status indicator below already
         // surfaces this. The state machine emits with already_fallen_back=true
         // on every boot after the first invalidation to keep the GUI
         // banner sticky, but we only want a single toast per session.
-        if (event.payload.already_fallen_back) return;
+        if (payload.already_fallen_back) return;
         toast.error(
           '⚠️ OpenAI key is failing validation. Falling back to local models. ' +
             'Click Re-check or update your key.',
@@ -837,11 +844,8 @@
         void loadEmbeddingCatalog();
         void loadOpenAi();
       },
-    );
-    unlistenOpenAiRestored = await tauriListen<RestoredPayload>(
-      'vct-openai-key-restored',
-      (event) => {
-        const slots = event.payload.restored_slots;
+      onRestored: (payload: RestoredPayload) => {
+        const slots = payload.restored_slots;
         const parts: string[] = [];
         if (slots?.text) parts.push(`text → ${slots.text}`);
         if (slots?.code) parts.push(`code → ${slots.code}`);
@@ -850,7 +854,9 @@
         void loadEmbeddingCatalog();
         void loadOpenAi();
       },
-    );
+    });
+    unlistenOpenAiInvalidated = invalidated;
+    unlistenOpenAiRestored = restored;
   }
 
   const project = $derived($selectedProject);
@@ -862,7 +868,7 @@
   async function loadWindowPrefs() {
     windowPrefsLoading = true;
     try {
-      const p = await invoke<TrayWindowPrefs>('get_tray_window_prefs');
+      const p = await PREF_LOADERS.windowPrefs.load<TrayWindowPrefs>();
       windowPrefs = {
         tray_close_to_tray: p.close_to_tray,
         tray_minimize_to_tray: p.minimize_to_tray,
@@ -908,7 +914,8 @@
   //      flips ConsentFlags.rl_data.
   //   3. "Clear local cache" button → telemetry_clear_rl_local_cache.
   // All three carry mouseover tooltips explaining the data flow.
-  const RL_LOCAL_OFF_KEY = 'RL_LOCAL_LOGGING_DISABLED';
+  // (RL_LOCAL_OFF_KEY is imported from `$lib/preferences/loaders` — one home
+  // for the key the loader reads and the toggle below writes.)
   // Per-project: whether the local logger is currently disabled by
   // the .claude/env override. Default = enabled.
   let rlLocalLoggingDisabled = $state(false);
@@ -922,8 +929,7 @@
   // disable overrides ALL projects while a global-enabled state still lets one
   // project opt out locally. Keys MUST match the Rust
   // (APP_STATE_KEY_RL_*_GLOBAL) + Python (config_projection) constants.
-  const APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL = 'rl.local_logging_disabled_global';
-  const APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL = 'rl.online_training_disabled_global';
+  // (APP_STATE_KEY_RL_*_GLOBAL: imported from `$lib/preferences/loaders`.)
   // UI holds the ENABLED sense (checked = enabled); the stored value is the
   // DISABLED flag, so the two are inverse. Default: both enabled.
   let rlLocalLoggingGlobalDisabled = $state(false);
@@ -941,10 +947,7 @@
     const projectId = $selectedProject?.id;
     if (!projectId) return;
     try {
-      const v = await invoke<string | null>('get_claude_env_value', {
-        projectId,
-        key: RL_LOCAL_OFF_KEY,
-      });
+      const v = await PREF_LOADERS.rlLocal.load({ projectId });
       // Truthy → disabled. Anything else → enabled (the default).
       rlLocalLoggingDisabled =
         v !== null && v !== undefined &&
@@ -957,7 +960,7 @@
 
   async function loadRlUploadConsent() {
     try {
-      const status = await safeInvoke<TelemetryStatus>('telemetry_status');
+      const status = await PREF_LOADERS.rlUploadConsent.load<TelemetryStatus>();
       if (status) {
         rlConsentFlags = status.consent;
         rlUploadConsent = !!status.consent.rl_data;
@@ -1000,14 +1003,7 @@
     // Read both global master flags from app_state (bool). Absent → false
     // (not disabled = enabled). Soft-fail: leave defaults on any error.
     try {
-      const [localG, onlineG] = await Promise.all([
-        invoke<boolean | null>('app_state_get_bool', {
-          key: APP_STATE_KEY_RL_LOCAL_LOGGING_DISABLED_GLOBAL,
-        }),
-        invoke<boolean | null>('app_state_get_bool', {
-          key: APP_STATE_KEY_RL_ONLINE_TRAINING_DISABLED_GLOBAL,
-        }),
-      ]);
+      const [localG, onlineG] = await PREF_LOADERS.rlGlobalTelemetry.load();
       rlLocalLoggingGlobalDisabled = localG === true;
       rlOnlineTrainingGlobalDisabled = onlineG === true;
     } catch (e) {
@@ -1131,10 +1127,7 @@
   //
   // The OpenAI consent gate is shared with the F4 Code Graph Embeddings
   // section below — one consent decision unlocks both surfaces.
-  const APP_STATE_KEY_KG_SUMMARY_CONSENT = 'kg_summary_openai_consent';
-  const APP_STATE_KEY_KG_SUMMARY_MODEL = 'kg_summary_openai_model';
-  const APP_STATE_KEY_KG_SUMMARY_OVERRIDE = 'kg_summary_backend_override';
-  const APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL = 'kg_summary_ollama_model';
+  // (APP_STATE_KEY_KG_SUMMARY_*: imported from `$lib/preferences/loaders`.)
   // Hardcoded allowlist of OpenAI chat models known to work as summary
   // backends. Ordered cheapest → most expensive so the default lands
   // first. Future work: fetch from /v1/models when the launcher has an
@@ -1184,28 +1177,23 @@
   let ollamaModelsLoading = $state(false);
   let ollamaModelsError = $state<string | null>(null);
 
-  // Default Ollama URL. The launcher pins this to 11435 (not 11434) to
-  // avoid collisions with users' pre-existing Ollama installs — see
-  // CLAUDE.md "Default ports".
-  const OLLAMA_URL = 'http://localhost:11435';
+  // The Ollama URL (11435, not 11434 — see CLAUDE.md "Default ports") and
+  // the probe itself live in `PREF_LOADERS.ollamaModels` (lazy: slow when
+  // Ollama is down).
 
   /**
    * Fetch the list of locally-installed Ollama models. Returns just
    * the model names (e.g. `["qwen3.5:9b", "gemma4:e4b", "qwen3-embedding:0.6b"]`).
-   * Shared between F3 (KG Summaries) and F4 (Code Graph Embeddings) so
-   * we only fetch once per page render.
+   * Shared between F3 (KG Summaries) and F4 (Code Graph Embeddings): both
+   * sections name the one registry key `ollamaModels`, which the registry
+   * activates once, whichever section opens first.
    */
   async function fetchOllamaModels() {
     if (ollamaModelsLoading) return;
     ollamaModelsLoading = true;
     ollamaModelsError = null;
     try {
-      const resp = await fetch(`${OLLAMA_URL}/api/tags`);
-      if (!resp.ok) {
-        throw new Error(`HTTP ${resp.status}`);
-      }
-      const data: { models?: Array<{ name: string }> } = await resp.json();
-      ollamaModels = (data.models ?? []).map((m) => m.name).sort();
+      ollamaModels = await PREF_LOADERS.ollamaModels.load();
     } catch (e) {
       // Soft-fail — Ollama not running or unreachable. The UI shows a
       // hint and the dropdowns become disabled.
@@ -1220,23 +1208,7 @@
     kgSummaryLoading = true;
     kgSummaryError = null;
     try {
-      const [consentRes, modelRes, overrideRes, ollamaRes] = await Promise.all([
-        invoke<boolean | null>('app_state_get_bool', {
-          key: APP_STATE_KEY_KG_SUMMARY_CONSENT,
-        }),
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_KG_SUMMARY_MODEL },
-        ),
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_KG_SUMMARY_OVERRIDE },
-        ),
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_KG_SUMMARY_OLLAMA_MODEL },
-        ),
-      ]);
+      const [consentRes, modelRes, overrideRes, ollamaRes] = await PREF_LOADERS.kgSummary.load();
       kgSummaryConsent = consentRes === true;
       kgSummaryModel = (modelRes.is_set && modelRes.value)
         ? modelRes.value
@@ -1387,9 +1359,7 @@
   // `default_code_embedding` row that `install.py` writes during
   // hardware selection. We pull it from the existing
   // `get_default_embedding_models` Tauri command (no new backend code).
-  const APP_STATE_KEY_CODE_EMBED_OVERRIDE = 'code_embed_backend_override';
-  const APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL = 'code_embed_openai_model';
-  const APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL = 'code_embed_ollama_model';
+  // (APP_STATE_KEY_CODE_EMBED_*: imported from `$lib/preferences/loaders`.)
   // OpenAI embedding models that have been validated against the
   // EmbeddingService (vco_lib/embedding_service.py). Same ordering
   // logic as the KG Summary list — cheapest first.
@@ -1412,20 +1382,7 @@
     codeEmbedLoading = true;
     codeEmbedError = null;
     try {
-      const [overrideRes, openaiModelRes, ollamaModelRes] = await Promise.all([
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_CODE_EMBED_OVERRIDE },
-        ),
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_CODE_EMBED_OPENAI_MODEL },
-        ),
-        invoke<{ key: string; is_set: boolean; value: string | null }>(
-          'app_state_get',
-          { key: APP_STATE_KEY_CODE_EMBED_OLLAMA_MODEL },
-        ),
-      ]);
+      const [overrideRes, openaiModelRes, ollamaModelRes] = await PREF_LOADERS.codeEmbed.load();
       const ov = (overrideRes.is_set ? (overrideRes.value ?? '') : '') as CodeEmbedOverride;
       const allowed: CodeEmbedOverride[] = ['', 'auto', 'codesage', 'qwen3', 'jina', 'openai', 'ollama'];
       codeEmbedOverride = (allowed.includes(ov) ? ov : '') as CodeEmbedOverride;
@@ -1548,7 +1505,7 @@
 
   async function loadBootAutostart() {
     try {
-      const state = await invoke<string>('get_hub_boot_autostart');
+      const state = await PREF_LOADERS.bootAutostart.load();
       bootAutostartState =
         state === 'enabled' || state === 'disabled' || state === 'unsupported'
           ? state
@@ -1596,7 +1553,7 @@
   async function loadSessionAutostart() {
     try {
       sessionAutostart = resolveSessionAutostart(
-        await invoke<boolean>('get_launcher_session_autostart'),
+        await PREF_LOADERS.sessionAutostart.load(),
       );
     } catch (e) {
       // Unreachable command (browser mode / partial install): show the
@@ -1622,6 +1579,40 @@
     }
   }
 
+  // ── Module updates: the 24 h automatic check (v0.2.100) ───────────────
+  // Opt-out for `spawn_module_update_check_loop`. The shipped default is ON;
+  // the switch renders that default while the read is in flight or fails.
+  let moduleUpdateAutoCheck = $state(DEFAULT_MODULE_UPDATE_AUTO_CHECK);
+  let moduleUpdateAutoCheckBusy = $state(false);
+  let moduleUpdateAutoCheckError = $state<string | null>(null);
+
+  async function loadModuleUpdateAutoCheck() {
+    try {
+      moduleUpdateAutoCheck = resolveModuleUpdateAutoCheck(
+        await PREF_LOADERS.moduleUpdateAutoCheck.load(),
+      );
+    } catch (e) {
+      moduleUpdateAutoCheck = resolveModuleUpdateAutoCheck(null);
+      console.warn('get_module_update_auto_check_enabled failed', e);
+    }
+  }
+
+  async function toggleModuleUpdateAutoCheck(event: Event) {
+    const target = event.currentTarget as HTMLInputElement;
+    const enable = target.checked;
+    moduleUpdateAutoCheckBusy = true;
+    moduleUpdateAutoCheckError = null;
+    try {
+      await setModuleUpdateAutoCheckEnabled(enable);
+      moduleUpdateAutoCheck = enable;
+    } catch (e) {
+      moduleUpdateAutoCheckError = e instanceof Error ? e.message : String(e);
+      target.checked = moduleUpdateAutoCheck;
+    } finally {
+      moduleUpdateAutoCheckBusy = false;
+    }
+  }
+
   // ── Shared services live status (v0.2.23 F2 wave 2b, relocated) ───────
   // Read-only probe of the per-machine Weaviate / Ollama / code_embed
   // instances every orchestrator install reuses (per-install isolation
@@ -1641,7 +1632,7 @@
     servicesLoading = true;
     servicesError = null;
     try {
-      services = await invoke<ServicesStatus>('detect_existing_services');
+      services = await PREF_LOADERS.services.load<ServicesStatus>();
     } catch (e) {
       servicesError = String(e);
     } finally {
@@ -1656,7 +1647,6 @@
   // envs via `ProjectEnvSettings::populate` (see
   // commands/project_env_settings.rs).
   type EmbeddingProfile = 'qwen3' | 'arctic' | 'codesage' | 'openai';
-  const APP_STATE_KEY_ACTIVE_EMBEDDING = 'embedding.active_profile';
   const EMBEDDING_DEFAULT: EmbeddingProfile = 'qwen3';
   let activeEmbedding = $state<EmbeddingProfile>(EMBEDDING_DEFAULT);
   let activeEmbeddingLoading = $state(false);
@@ -1668,10 +1658,7 @@
     activeEmbeddingLoading = true;
     activeEmbeddingError = null;
     try {
-      const res = await invoke<{ key: string; is_set: boolean; value: string | null }>(
-        'app_state_get',
-        { key: APP_STATE_KEY_ACTIVE_EMBEDDING },
-      );
+      const res = await PREF_LOADERS.activeEmbedding.load();
       if (res.is_set && res.value) {
         const known: EmbeddingProfile[] = ['qwen3', 'arctic', 'codesage', 'openai'];
         if ((known as string[]).includes(res.value)) {
@@ -1723,7 +1710,7 @@
   //
   //   consumer: `vct_launcher_core::logging::resolve_log_level`
   //     · written here through the dedicated `set_logging_level` command
-  //       (NOT `set_setting_v2` — a test pins that too, and not the generic
+  //       (NOT `set_module_setting` — a test pins that too, and not the generic
   //       `app_state_set` either, because the command also validates the
   //       value, applies it to the running process and re-projects env);
   //     · read at launcher startup (`crate::logging::init_early` →
@@ -1780,7 +1767,7 @@
     logLevelLoading = true;
     logLevelError = null;
     try {
-      applyLogLevelState(await invoke<LoggingLevelState>('get_logging_level'));
+      applyLogLevelState(await PREF_LOADERS.logLevel.load<LoggingLevelState>());
     } catch (e) {
       logLevelError = String(e);
     } finally {
@@ -1870,7 +1857,7 @@
     volumesLoading = true;
     volumesError = null;
     try {
-      volumesConfig = await invoke<VolumesConfig>('get_volumes_config');
+      volumesConfig = await PREF_LOADERS.volumes.load<VolumesConfig>();
     } catch (e) {
       volumesError = String(e);
     } finally {
@@ -1955,7 +1942,7 @@
   let appVersion = $state('');
   async function loadAppVersion() {
     try {
-      appVersion = await getVersion();
+      appVersion = await PREF_LOADERS.appVersion.load();
     } catch {
       appVersion = '';
     }
@@ -1981,7 +1968,7 @@
   async function loadStateDir() {
     stateDirError = null;
     try {
-      stateDir = await invoke<string>('get_resolved_vct_root_dir');
+      stateDir = await PREF_LOADERS.stateDir.load();
     } catch (e) {
       stateDirError = String(e);
       stateDir = '';
@@ -2011,42 +1998,42 @@
     }
   }
 
-  onMount(() => {
-    void loadPat();
-    void loadInitialHardwareSnapshot();
-    void loadEmbeddingCatalog();
-    void loadOpenAi();
-    // Subscribe to the openai recovery events (no-op in browser mode).
-    void subscribeOpenAiEvents();
-    // Stream 1: local data collection controls.
-    void loadRlLocalState();
-    void loadRlUploadConsent();
-    // v0.2.73 Concern-A/C: global RL telemetry master toggles.
-    void loadRlGlobalTelemetryState();
-    // F2/F3/F4: KG summaries + code-embed override settings, plus the
-    // Ollama tags probe shared between the two sections.
-    void loadKgSummarySettings();
-    void loadCodeEmbedSettings();
-    void fetchOllamaModels();
-    // F2 wave 2b: sections relocated from the user-icon Settings popover.
-    void refreshServices();
-    void loadActiveEmbedding();
-    void refreshVolumes();
-    void loadAppVersion();
-    // v0.2.34 (Agent I): resolve the launcher's state-root for the
-    // Preferences → Storage discoverability surface.
-    void loadStateDir();
-    // Startup section: read the hub boot-autostart state.
-    void loadBootAutostart();
-    // Startup section: and the launcher's own session-start switch (R2).
-    void loadSessionAutostart();
-    // v0.2.91 WP-F2: window behaviour is launcher-global — loaded once,
-    // independent of whether a project is selected.
-    void loadWindowPrefs();
-    // v0.2.91 WP-L: the diagnostic log level is launcher-global too.
-    void loadLogLevel();
+  // v0.2.100 (WP-16): ONE handler per registry entry — the `Record` type in
+  // `PrefLoaderHandlers` makes a missing or misspelt key a type error. The
+  // registry, not this page, decides which run at mount.
+  let shownPanels = $state({ artifactTool: false, dualFlags: false });
+  const loaders = createPreferenceLoaders({
+    windowPrefs: loadWindowPrefs,
+    embeddingCatalog: loadEmbeddingCatalog,
+    openAiKeyEvents: subscribeOpenAiEvents,
+    artifactTool: () => { shownPanels.artifactTool = true; },
+    kgSummary: loadKgSummarySettings,
+    codeEmbed: loadCodeEmbedSettings,
+    ollamaModels: fetchOllamaModels,
+    stateDir: loadStateDir,
+    pat: loadPat,
+    openAi: loadOpenAi,
+    rlLocal: loadRlLocalState,
+    rlUploadConsent: loadRlUploadConsent,
+    rlGlobalTelemetry: loadRlGlobalTelemetryState,
+    dualFlags: () => { shownPanels.dualFlags = true; },
+    logLevel: loadLogLevel,
+    hardwareSnapshot: loadInitialHardwareSnapshot,
+    bootAutostart: loadBootAutostart,
+    sessionAutostart: loadSessionAutostart,
+    moduleUpdateAutoCheck: loadModuleUpdateAutoCheck,
+    services: refreshServices,
+    activeEmbedding: loadActiveEmbedding,
+    volumes: refreshVolumes,
+    appVersion: loadAppVersion,
   });
-  $effect(() => { if ($selectedProject) void loadRlLocalState(); });
+
+  onMount(() => {
+    loaders.mountEager();
+  });
+  // Re-read the per-project RL flag when the selected project changes — but
+  // only once its section has been opened (the registry owns first load).
+  $effect(() => { if ($selectedProject) loaders.refresh('rlLocal'); });
 
   onDestroy(() => {
     // Existing hwprogress cleanup is in the earlier onDestroy; both
@@ -2132,8 +2119,8 @@
 
          No heading here on purpose — the component renders its own, next to
          the copy that explains which two keys it writes and why both. -->
-    <section class="pr-section">
-      <ArtifactToolPanel />
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['artifactTool'] }}>
+      {#if shownPanels.artifactTool}<ArtifactToolPanel />{/if}
     </section>
 
     <!--
@@ -2218,10 +2205,12 @@
       <h2 class="pr-section-title">Updates</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
-          <strong>Launcher self-update</strong>
+          <strong>Orchestrator updates</strong>
           <span class="pr-onboarding-hint">
-            Pulls launcher updates from the upstream repo. Daily check, manual apply.
-            User-owned files (CONTEXT_STATE.md, logs, runtime state) are never overwritten.
+            Updates the orchestrator — source, install and launcher — from the
+            upstream repo, with the same action as the update badge. Automatic
+            checks, manual apply. User-owned files (CONTEXT_STATE.md, logs,
+            runtime state) are never overwritten.
           </span>
         </div>
         <button class="pr-btn" onclick={() => goto('/preferences/updates')}>
@@ -2300,7 +2289,7 @@
          so changes take effect on the next summary generation without
          restarting anything. F3 adds the local Ollama dropdown next
          to the existing OpenAI model picker. -->
-    <section class="pr-section" aria-labelledby="pr-kgsum-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['kgSummary', 'ollamaModels'] }} aria-labelledby="pr-kgsum-title">
       <h2 class="pr-section-title" id="pr-kgsum-title">KG Summaries</h2>
       <p class="pr-hint" style="margin-bottom: 10px;">
         LLM-written descriptions and per-chunk summaries used by
@@ -2433,7 +2422,9 @@
         {/if}
 
         <!-- F3: local Ollama model picker. Reads ollamaModels populated
-             on mount via `fetchOllamaModels`. Stays visible (even when
+             by `fetchOllamaModels` when this section (or Code Graph
+             Embeddings) first scrolls into view (registry key
+             `ollamaModels`, lazy — the probe is slow when Ollama is down). Stays visible (even when
              the override isn't "ollama") so the user can pre-select a
              model before switching the override — same UX shape as the
              OpenAI model picker. -->
@@ -2519,7 +2510,7 @@
          dropdown layout, different app_state keys. Read-only "detected"
          row reflects `default_code_embedding` (set by install.py during
          hardware selection). -->
-    <section class="pr-section" aria-labelledby="pr-codeembed-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['codeEmbed', 'ollamaModels'] }} aria-labelledby="pr-codeembed-title">
       <h2 class="pr-section-title" id="pr-codeembed-title">Code Graph Embeddings</h2>
       <p class="pr-hint" style="margin-bottom: 10px;">
         Override the backend the code-graph indexer uses for code-entity
@@ -2685,7 +2676,7 @@
          storage picker. Adjacent to Updates because both are about
          runtime infrastructure (container data location vs. orchestrator
          self-update). -->
-    <section class="pr-section">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['stateDir'] }}>
       <h2 class="pr-section-title">Storage</h2>
       <!-- v0.2.34 (Agent I): state-directory discoverability.
            Read-only display of the launcher's resolved state-root
@@ -2836,7 +2827,7 @@
       </div>
     </section>
 
-    <section class="pr-section">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['pat'] }}>
       <h2 class="pr-section-title">GitHub access token</h2>
       <div class="pr-pat-row">
         <div class="pr-onboarding-text">
@@ -2914,7 +2905,7 @@
          breadcrumbs. Per the v0.2.18 locked rule, post-Apply success
          shows a styled-modal consent prompt before flipping the new-
          project defaults to openai-*. -->
-    <section class="pr-section" aria-labelledby="pr-openai-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['openAi'] }} aria-labelledby="pr-openai-title">
       <h2 class="pr-section-title" id="pr-openai-title">OpenAI API key (optional)</h2>
       <div class="pr-pat-row">
         <div class="pr-onboarding-text">
@@ -3059,7 +3050,7 @@
            2. Toggle upload consent (default OFF, opt-in).
            3. Clear local cache button (irreversible).
          All controls carry mouseover tooltips explaining the data flow. -->
-    <section class="pr-section" aria-labelledby="pr-rl-data-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['rlLocal', 'rlUploadConsent', 'rlGlobalTelemetry'] }} aria-labelledby="pr-rl-data-title">
       <h2 class="pr-section-title" id="pr-rl-data-title">Local data collection</h2>
       <p class="pr-onboarding-hint">
         The orchestrator collects retrieval-time embedding data for the optional
@@ -3172,8 +3163,8 @@
          its `scope` prop. A wrapper heading would be a second name for the
          same thing that this page — not the component — controls, which is
          exactly how two mounts start describing each other wrongly. -->
-    <section class="pr-section">
-      <DualWriteFlagsPanel scope="global" />
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['dualFlags'] }}>
+      {#if shownPanels.dualFlags}<DualWriteFlagsPanel scope="global" />{/if}
     </section>
 
     <!-- v0.2.91 WP-L (decision #21): machine-global diagnostic log level.
@@ -3183,7 +3174,7 @@
          reads and `crate::logging::apply_stored_level` applies to the running
          launcher, and which projects to `.claude/env` as VCO_LOG_LEVEL.
          `tests/test_v0291_pref_keys_have_consumers.py` asserts that chain. -->
-    <section class="pr-section" aria-labelledby="pr-loglevel-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['logLevel'] }} aria-labelledby="pr-loglevel-title">
       <h2 class="pr-section-title" id="pr-loglevel-title">Diagnostic log level</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
@@ -3233,7 +3224,7 @@
          Two-stage UX: Re-detect → optional Apply reconfig. The persisted
          snapshot is seeded at first launcher boot so the "currently
          detected" panel renders even before the user clicks Re-detect. -->
-    <section class="pr-section">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['hardwareSnapshot'] }}>
       <h2 class="pr-section-title">Hardware</h2>
       <div class="pr-hw-card">
         <div class="pr-hw-header">
@@ -3399,7 +3390,7 @@
     <!-- Startup: two independent switches — the background hub's OS boot
          registration (login), and the launcher's own tray-only start with
          a Claude Code session / VS Code folder open (v0.2.95, R2). -->
-    <section class="pr-section" aria-labelledby="pr-startup-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['bootAutostart', 'sessionAutostart'] }} aria-labelledby="pr-startup-title">
       <h2 class="pr-section-title" id="pr-startup-title">Startup</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
@@ -3447,12 +3438,35 @@
       </div>
     </section>
 
+    <!-- v0.2.100: module-update automatic check (opt-out). -->
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['moduleUpdateAutoCheck'] }} aria-labelledby="pr-module-updates-title">
+      <h2 class="pr-section-title" id="pr-module-updates-title">Module updates</h2>
+      <div class="pr-onboarding-row">
+        <div class="pr-onboarding-text">
+          <strong>Check for module updates automatically</strong>
+          <span class="pr-onboarding-hint">
+            {moduleUpdateAutoCheckHint(moduleUpdateAutoCheck)}
+          </span>
+          {#if moduleUpdateAutoCheckError}
+            <span class="pr-onboarding-hint pr-startup-error">{moduleUpdateAutoCheckError}</span>
+          {/if}
+        </div>
+        <input
+          type="checkbox"
+          data-testid="module-update-auto-check"
+          checked={moduleUpdateAutoCheck}
+          disabled={moduleUpdateAutoCheckBusy}
+          onchange={toggleModuleUpdateAutoCheck}
+        />
+      </div>
+    </section>
+
     <!-- v0.2.23 F2 wave 2b: Shared services live status. Relocated from
          the popover. Read-only display of the per-machine Weaviate /
          Ollama / code-embed instances every orchestrator install reuses.
          Per-install isolation comes from KG_COLLECTION namespacing, not
          separate containers. -->
-    <section class="pr-section" aria-labelledby="pr-services-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['services'] }} aria-labelledby="pr-services-title">
       <h2 class="pr-section-title" id="pr-services-title">Shared services</h2>
       <div class="pr-onboarding-row pr-services-row">
         <div class="pr-onboarding-text">
@@ -3503,7 +3517,7 @@
          per-new-project "Default embedding models" rows further up the
          page. Backed by app_state key `embedding.active_profile`; flows
          into per-project envs via ProjectEnvSettings::populate. -->
-    <section class="pr-section" aria-labelledby="pr-active-emb-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['activeEmbedding'] }} aria-labelledby="pr-active-emb-title">
       <h2 class="pr-section-title" id="pr-active-emb-title">Embedding profile (global)</h2>
       <div class="pr-onboarding-row">
         <div class="pr-onboarding-text">
@@ -3554,7 +3568,7 @@
          backend copies, verifies new bind-mounts come up healthy, then
          removes the old volumes. On any failure the migration rolls back
          without touching your data. -->
-    <section class="pr-section" aria-labelledby="pr-volumes-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['volumes'] }} aria-labelledby="pr-volumes-title">
       <h2 class="pr-section-title" id="pr-volumes-title">Volume location</h2>
       <p class="pr-hint">
         Where Weaviate's vector index, Ollama's models, and the
@@ -3633,7 +3647,7 @@
     </section>
 
     <!-- v0.2.23 F2 wave 2b: About. Bottom of page (universal pattern). -->
-    <section class="pr-section" aria-labelledby="pr-about-title">
+    <section class="pr-section" use:lazySection={{ loaders, keys: ['appVersion'] }} aria-labelledby="pr-about-title">
       <h2 class="pr-section-title" id="pr-about-title">About</h2>
       <div class="pr-about-card">
         <div class="pr-about-logo">

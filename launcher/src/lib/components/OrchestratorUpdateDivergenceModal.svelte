@@ -1,9 +1,10 @@
 <script lang="ts">
   // v0.2.27: orchestrator-update divergence modal — rewrite.
   //
-  // Surfaced when `update_orchestrator` returns a structured error with
-  // `event: "orchestrator_update_non_ff"` — the user's local clone has
-  // diverged from upstream and `git pull --ff-only` failed.
+  // Surfaced when an update run (v0.2.100: `run_orchestrator_update`) reports
+  // a non-fast-forward (payload tag `event: "orchestrator_update_non_ff"`) —
+  // the user's local clone has diverged from upstream and
+  // `git pull --ff-only` failed.
   //
   // Design goals for this rewrite (vs the v0.2.23 original):
   //
@@ -37,19 +38,11 @@
   //    "dialog"` + `aria-modal` + `aria-labelledby`, Escape closes,
   //    focus is parked on a sensible primary action on mount.
 
-  import { invoke } from '$lib/tauri';
-  import { orchestrator } from '$lib/stores/orchestrator';
+  import { invoke } from '@tauri-apps/api/core';
   import { updater, type OrchestratorNonFfPayload } from '$lib/stores/updater';
-  // v0.2.93 (field incident 2026-09-07): ONE tolerant parser for every
-  // structured Err payload (leading whitespace / `Error:` label / Error
-  // instance). The local `startsWith('{')` parser this replaces is the
-  // exact reason the conflict payload rendered NOTHING on 2026-09-07.
-  // The conflict payload type lives there too — no more per-file copies.
-  import {
-    parseTaggedErrorPayload,
-    parseOrchestratorConflictError,
-    errorText,
-  } from '$lib/tauri-error-payload';
+  import { resetConfirmLines, resetFailureView, resetResultText, runResetToUpstream } from './divergence-reset-logic';
+  // v0.2.100 (WP-08): errors are parsed ONCE, by the updater store's
+  // `routeUpdateError` (inside `updater.run`); this modal reads the route.
 
   // v0.2.78 ITEM #0 (F2): payload for an UNTRACKED-file collision where the
   // local file's content DIFFERS from the incoming upstream-added blob. The
@@ -61,7 +54,7 @@
   // keep-mine/take-upstream commands and points at that agent-resolvable path.
   type OrchestratorUntrackedCollisionPayload = {
     event: 'orchestrator_untracked_collision';
-    operation: 'merge' | 'rebase';
+    operation: 'merge' | 'rebase' | 'update';
     branch: string;
     divergent_files: string[];
   };
@@ -77,7 +70,13 @@
   } = $props();
 
   let busy = $state(false);
-  let busyOp = $state<'merge' | 'rebase' | null>(null);
+  let busyOp = $state<'merge' | 'rebase' | 'reset' | null>(null);
+  // v0.2.100 (WP-03b, owner ruling F-W2-03): the third choice. The confirm
+  // step names BOTH backup locations before anything runs; `resetResult` is
+  // the backend's own sentence naming them exactly afterwards.
+  let confirmingReset = $state(false);
+  let vctRoot = $state<string | null>(null);
+  let resetResult = $state<string | null>(null);
   // v0.2.27: retry state. Tracks which operations the user has tried
   // AND seen fail in this modal session. Drives button priority.
   let mergeFailed = $state(false);
@@ -128,85 +127,74 @@
   }
 
   /**
-   * v0.2.78 ITEM #0 (F2): parse a Tauri error as a DIVERGENT untracked-collision
-   * payload. Returns null for any other shape. v0.2.93: via the shared
-   * tolerant parser (the conflict payload uses `parseOrchestratorConflictError`).
+   * v0.2.100 (WP-08, AD-1): Merge / Rebase run through the ONE update action,
+   * `updater.run(kind)` (overlay, typed-error routing, re-check). A conflict
+   * hands over to the hoisted conflict modal inside the store; a DIVERGENT
+   * untracked collision is rendered by THIS modal (`handleLocally`), as
+   * before; any other failure feeds this modal's retry state with the same
+   * single message the overlay shows.
    */
-  function parseUntrackedCollision(
-    raw: unknown,
-  ): OrchestratorUntrackedCollisionPayload | null {
-    return parseTaggedErrorPayload<OrchestratorUntrackedCollisionPayload>(
-      raw,
-      'event',
-      'orchestrator_untracked_collision',
-    );
-  }
-
-  async function runMerge() {
+  async function runKind(kind: 'Merge' | 'Rebase') {
+    const op = kind === 'Merge' ? 'merge' : 'rebase';
     busy = true;
-    busyOp = 'merge';
+    busyOp = op;
     lastError = null;
-    // v0.2.93 (field incident 2026-09-07): drive the ONE live progress
-    // overlay. Before this, the merge ran behind a static disabled
-    // "Merging…" label — indistinguishable from a hang.
-    updater.beginOp('merge');
     try {
-      // The Rust command auto-restarts on success — we typically don't
-      // return here. If we DO, refresh the store state.
-      await invoke<void>('merge_orchestrator_with_upstream', { path: installPath });
-      await orchestrator.checkStatus();
-      onClose();
-      updater.endOp();
-    } catch (e) {
-      const conf = parseOrchestratorConflictError(e);
-      const untracked = parseUntrackedCollision(e);
-      if (conf) {
-        // Hand over to the hoisted conflict modal. Payload FIRST, then
-        // endOp: the overlay's falling edge must see the hand-over and
-        // close, never hold at "Update complete".
-        updater.setConflict(conf);
-        updater.endOp();
-      } else if (untracked) {
-        untrackedCollision = untracked;
-        updater.endOp();
-      } else {
-        const detail = errorText(e);
-        lastError = { title: 'Merge failed', detail };
-        mergeFailed = true;
-        // The overlay renders FAILED + the error text + Dismiss; this
-        // modal keeps its own copy for after the dismiss.
-        updater.endOp(detail);
+      const result = await updater.run(kind, { handleLocally: ['untrackedCollision'] });
+      if (result.ok) {
+        onClose();
+        return;
       }
+      const routed = result.routed;
+      if (routed.to === 'untrackedCollision') {
+        untrackedCollision = routed.payload;
+      } else if (routed.to === 'failed') {
+        lastError = { title: kind === 'Merge' ? 'Merge failed' : 'Rebase failed', detail: routed.message };
+        if (kind === 'Merge') mergeFailed = true;
+        else rebaseFailed = true;
+      }
+      // conflict / autostash-pop / non-FF: the store opened that modal.
     } finally {
       busy = false;
       busyOp = null;
     }
   }
 
+  async function runMerge() {
+    await runKind('Merge');
+  }
+
   async function runRebase() {
-    busy = true;
-    busyOp = 'rebase';
+    await runKind('Rebase');
+  }
+
+  /** Open the reset confirmation; resolve the launcher state dir so the
+   *  dialog can name where the bundle will be written. */
+  async function askReset() {
+    if (busy) return;
     lastError = null;
-    updater.beginOp('rebase');
+    confirmingReset = true;
     try {
-      await invoke<void>('rebase_orchestrator_onto_upstream', { path: installPath });
-      await orchestrator.checkStatus();
-      onClose();
-      updater.endOp();
-    } catch (e) {
-      const conf = parseOrchestratorConflictError(e);
-      const untracked = parseUntrackedCollision(e);
-      if (conf) {
-        updater.setConflict(conf);
-        updater.endOp();
-      } else if (untracked) {
-        untrackedCollision = untracked;
-        updater.endOp();
-      } else {
-        const detail = errorText(e);
-        lastError = { title: 'Rebase failed', detail };
-        rebaseFailed = true;
-        updater.endOp(detail);
+      vctRoot = await invoke<string>('get_resolved_vct_root_dir');
+    } catch {
+      vctRoot = null; // named generically — the backup still happens
+    }
+  }
+
+  /** Confirmed: back up, then reset through the ONE update action. */
+  async function confirmReset() {
+    busy = true;
+    busyOp = 'reset';
+    lastError = null;
+    try {
+      const result = await runResetToUpstream((kind) => updater.run(kind));
+      confirmingReset = false;
+      if (result.ok) {
+        resetResult = resetResultText(result.outcome);
+        return;
+      }
+      if (result.routed.to === 'failed') {
+        lastError = resetFailureView(result.routed);
       }
     } finally {
       busy = false;
@@ -495,6 +483,40 @@
         </div>
       {/if}
 
+      {#if resetResult}
+        <div class="dvg-manual-prompt" role="status">
+          <strong>Reset to upstream done.</strong>
+          <span class="dvg-reset-result">{resetResult}</span>
+        </div>
+        <div class="dvg-actions">
+          <button type="button" class="dvg-btn dvg-btn-primary" onclick={cancel}>Close</button>
+        </div>
+      {:else if confirmingReset}
+        <div class="dvg-reset-confirm" role="alertdialog" aria-labelledby="dvg-reset-title">
+          <strong id="dvg-reset-title">Reset to upstream — discard local commits?</strong>
+          {#each resetConfirmLines(vctRoot) as line (line)}
+            <span>{line}</span>
+          {/each}
+        </div>
+        <div class="dvg-actions">
+          <button
+            type="button"
+            class="dvg-btn"
+            disabled={busy}
+            onclick={() => (confirmingReset = false)}
+          >
+            Back
+          </button>
+          <button
+            type="button"
+            class="dvg-btn dvg-btn-danger"
+            disabled={busy}
+            onclick={confirmReset}
+          >
+            {busyOp === 'reset' ? 'Backing up and resetting…' : 'Back up, then reset'}
+          </button>
+        </div>
+      {:else}
       <div class="dvg-actions">
         <button
           type="button"
@@ -504,6 +526,19 @@
           title="Dismiss this dialog. You can resolve manually with `git pull` or `git rebase` in a terminal."
         >
           Cancel
+        </button>
+
+        <button
+          type="button"
+          class="dvg-btn dvg-btn-with-sub"
+          disabled={busy}
+          onclick={askReset}
+          title="Saves your local commits and changes to a backup branch + git bundle, then resets the clone to the upstream release and runs the update."
+        >
+          <span class="dvg-btn-label">Reset to upstream (discard local commits)</span>
+          <span class="dvg-btn-sub">
+            Backs up everything local first; asks before resetting
+          </span>
         </button>
 
         <button
@@ -556,6 +591,8 @@
           </span>
         </button>
       </div>
+
+      {/if}
 
       {#if !bothFailed}
         <div class="dvg-manual-link">
@@ -814,6 +851,29 @@
     color: var(--color-text);
     font-size: 11.5px;
     line-height: 1.55;
+  }
+
+  .dvg-reset-confirm {
+    margin: 0 0 10px;
+    padding: 8px 10px;
+    background: rgba(255, 79, 160, 0.08); /* --color-pink at 8% */
+    border: 1px solid rgba(255, 79, 160, 0.3);
+    border-radius: 4px;
+    color: var(--color-text);
+    font-size: 11.5px;
+    line-height: 1.55;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+  .dvg-reset-result {
+    display: block;
+    margin-top: 4px;
+    word-break: break-word;
+  }
+  .dvg-btn-danger {
+    border-color: rgba(255, 79, 160, 0.55);
+    color: var(--color-pink);
   }
 
   .dvg-actions {

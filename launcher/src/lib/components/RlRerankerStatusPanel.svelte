@@ -35,6 +35,7 @@
   import { invoke, tauriAvailable } from '$lib/tauri';
   import RlRerankerDashboardWidget from './RlRerankerDashboardWidget.svelte';
   import { summarizeRlFlags } from '$lib/rl-settings-summary';
+  import { summarizeCollection, type RlCollectionCounts } from '$lib/rl-collection-stat';
 
   let { projectId }: { projectId: string } = $props();
 
@@ -43,6 +44,24 @@
   let useGlobal = $state<boolean | undefined>(undefined);
   let onlineDisabled = $state<boolean | undefined>(undefined);
   let globalSource = $state<boolean | undefined>(undefined);
+
+  // v0.2.100: training-data collection counters, read from the `rl_events`
+  // table (launcher.db) through `get_rl_dashboard_state`. Independent of the
+  // module install, the reranking switch and the container.
+  let collection = $state<RlCollectionCounts | null>(null);
+
+  async function loadCollection() {
+    if (!tauriAvailable() || !projectId) {
+      collection = null;
+      return;
+    }
+    try {
+      collection = await invoke<RlCollectionCounts>('get_rl_dashboard_state', { projectId });
+    } catch (e) {
+      console.warn('[RlRerankerStatusPanel] collection count failed:', e);
+      collection = null;
+    }
+  }
 
   let loading = $state(true);
   let loadError = $state<string | null>(null);
@@ -87,10 +106,12 @@
   // active project without re-mounting the panel).
   $effect(() => {
     void loadFlags();
+    void loadCollection();
   });
 
   onMount(() => {
     void loadFlags();
+    void loadCollection();
   });
 
   const flagsReady = $derived(
@@ -98,6 +119,8 @@
       onlineDisabled !== undefined &&
       globalSource !== undefined,
   );
+
+  const collectionSummary = $derived(summarizeCollection(collection));
 
   const summary = $derived(
     flagsReady
@@ -111,6 +134,27 @@
 
   <div class="flags-card">
     <h3>RL Reranker — training mode</h3>
+    {#if collectionSummary}
+      <dl class="flag-grid">
+        <div class="row">
+          <dt>Training data</dt>
+          <dd
+            class="value collection-{collectionSummary.key}"
+            data-testid="rl-collection-count"
+          >
+            {collectionSummary.headline}
+          </dd>
+        </div>
+        {#each collectionSummary.bySource as line (line)}
+          <!-- v0.2.100 W5R-13: per embedding source (qwen3 / arctic /
+               codesage), so the owner can see each space being saved. -->
+          <div class="row">
+            <dt></dt>
+            <dd class="value" data-testid="rl-collection-by-source">{line}</dd>
+          </div>
+        {/each}
+      </dl>
+    {/if}
     {#if loading && !flagsReady}
       <p class="loading">Loading…</p>
     {:else if loadError && !flagsReady}
@@ -230,6 +274,12 @@
   /* Subtle status colouring — frozen/read-only are a bit muted, active
      is full-strength. No tone for the global-corpus row (binary opt-in
      state, no value judgement). */
+  dd.collection-collecting {
+    color: var(--color-success, #00bfa6);
+  }
+  dd.collection-none {
+    color: var(--color-mid, #9ca3af);
+  }
   dd.training-local-active {
     color: var(--color-success, #00bfa6);
   }

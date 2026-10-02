@@ -1014,6 +1014,95 @@ mod tests {
         assert!(!body.contains("__VCT_STATE_DIR__"));
     }
 
+    // ------- the shared key table (v0.2.100 WP-18B) -------
+
+    /// The table's `token_regex` (`__[A-Z][A-Z0-9_]*__`) as a scanner — no
+    /// regex dependency in this crate. Leftmost, non-overlapping, like
+    /// Python's `re.findall`.
+    fn hub_placeholder_tokens(body: &str) -> Vec<String> {
+        let b = body.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < b.len() {
+            if b[i] == b'_' && b[i + 1] == b'_' && i + 2 < b.len() && b[i + 2].is_ascii_uppercase() {
+                let mut j = i + 3;
+                while j < b.len() && (b[j].is_ascii_uppercase() || b[j].is_ascii_digit() || b[j] == b'_') {
+                    j += 1;
+                }
+                // Backtrack to the last `__` inside [i+2, j) that closes the token
+                // (the class includes `_`, so the greedy run swallows the closer).
+                let mut end = None;
+                let mut k = j;
+                while k >= i + 4 {
+                    if b[k - 1] == b'_' && b[k - 2] == b'_' && k - 2 > i + 2 {
+                        end = Some(k);
+                        break;
+                    }
+                    k -= 1;
+                }
+                if let Some(e) = end {
+                    out.push(body[i..e].to_string());
+                    i = e;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
+
+    /// `tests/fixtures/hub_unit_placeholders.json` is the ONE key table of
+    /// this renderer (R7). Every template's placeholder set equals its row,
+    /// and each `render_*` leaves no placeholder token behind — so a token
+    /// added to a template without a renderer arm (or the reverse) fails
+    /// here and in the Python twin.
+    #[test]
+    fn hub_unit_placeholder_table_matches_templates() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        let text = std::fs::read_to_string(root.join("tests/fixtures/hub_unit_placeholders.json"))
+            .expect("read hub_unit_placeholders.json");
+        let table: serde_json::Value = serde_json::from_str(&text).expect("table parses");
+        assert_eq!(table["token_regex"], "__[A-Z][A-Z0-9_]*__", "scanner below implements this");
+        let bodies: [(&str, &str); 4] = [
+            ("vct-hub.service.template", include_str!("../templates/vct-hub.service.template")),
+            (
+                "com.vibecodedtools.vct-hub.plist.template",
+                include_str!("../templates/com.vibecodedtools.vct-hub.plist.template"),
+            ),
+            ("vct-hub-task.xml.template", include_str!("../templates/vct-hub-task.xml.template")),
+            ("vct-hub-boot.cmd.template", include_str!("../templates/vct-hub-boot.cmd.template")),
+        ];
+        let rows = table["templates"].as_object().unwrap();
+        assert_eq!(rows.len(), bodies.len(), "table rows vs include_str! templates");
+        for (name, body) in bodies {
+            let mut found = hub_placeholder_tokens(body);
+            found.sort();
+            found.dedup();
+            let mut want: Vec<String> = rows[name]
+                .as_array()
+                .unwrap_or_else(|| panic!("no table row for {name}"))
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect();
+            want.sort();
+            assert_eq!(found, want, "{name}: template tokens vs table row");
+        }
+        let bin = PathBuf::from("/opt/vct/vct-hub");
+        let state = PathBuf::from("/home/me/.vct");
+        let rendered = [
+            render_systemd_unit(&bin, &state),
+            render_launchd_plist(&bin, &state),
+            render_win_task_xml("S-1-5-21-1", &PathBuf::from("C:/vct/boot.cmd"), &PathBuf::from("C:/vct")),
+            render_win_shim(&state),
+        ];
+        for body in rendered {
+            assert!(
+                hub_placeholder_tokens(&body).is_empty(),
+                "a placeholder survived the render:\n{body}"
+            );
+        }
+    }
+
     // ------- render_launchd_plist -------
 
     #[test]

@@ -127,25 +127,44 @@ class TestTransformContract:
         out = rewire.rewire_bytes(src, Path("/opt/vco"), filename="x.sh")
         assert 'R="${VCT_ORCHESTRATOR_ROOT}"' in out.decode("utf-8")
 
-    def test_vocabulary_matches_the_stale_root_heal_map(self):
+    def test_vocabulary_matches_the_stale_root_heal_map(self, tmp_path):
         """The moved-clone heal (`_stale_orchestrator_root_heal_match`)
-        re-derives "what would this file have been under the OLD root?" with
-        its own inline map. A placeholder present here but absent there would
-        silently defeat that heal, so the key sets must stay equal — and
-        `{{PROJECT_ROOT}}` is deliberately excluded from BOTH."""
-        import inspect
-        heal_src = inspect.getsource(
-            project_init._stale_orchestrator_root_heal_match)
+        re-derives "what would this file have been under the OLD root?". A
+        placeholder the forward render fills but the heal's round-trip does
+        not would silently defeat that heal, so the vocabularies must be equal.
+
+        v0.2.100 WP-18 retarget: both now come from ONE function,
+        `vco_lib.materialize.path_subs` (the old source-scan of an inline map
+        has no inline map left to scan), and `{{PROJECT_ROOT}}` is IN the
+        shared vocabulary — the R1/R3/R4 drift the survey found is closed by
+        construction. The claim is proven behaviourally: a file using EVERY
+        rewire key, rendered under an old root, must heal under a new one."""
+        from vco_lib import materialize
+
         keys = set(rewire.rewire_subs(Path("/opt/vco")))
-        heal_keys = {
-            k for k in (
-                "{{ORCHESTRATOR_ROOT}}", "{{PROJECTS_ROOT}}", "{{HOME}}",
-                "{{VCT_ORCHESTRATOR_ROOT}}", "{{PROJECT_ROOT}}",
-            )
-            if f'"{k}":' in heal_src
-        }
-        assert keys == heal_keys
-        assert "{{PROJECT_ROOT}}" not in keys
+        assert keys == {"{{" + k + "}}" for k in materialize.PATH_KEYS}
+        assert "{{PROJECT_ROOT}}" in keys
+        old_root = tmp_path / "old" / "vco"
+        project = tmp_path / "proj"
+        project.mkdir(parents=True)
+        body = "".join(f"line {k}\n" for k in sorted(keys))
+        raw = ("anchor: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/x\n" + body).encode()
+        old_render = raw.decode()
+        for k, v in materialize.path_subs(old_root, project).items():
+            old_render = old_render.replace(k, v)
+        target = project / "agent.md"
+        target.write_text(old_render, encoding="utf-8")
+        new_root = tmp_path / "new" / "vco"
+        # v0.2.100 review R18-06: the heal re-runs the op's OWN transform.
+        transform = materialize.Transform(
+            "agent.md", materialize.RenderSpec(allowed=materialize.PATH_KEYS),
+            materialize.MaterializeContext(new_root, project))
+        assert project_init._stale_orchestrator_root_heal_match(
+            raw, target, new_root, project, transform)
+        # And a key the heal did NOT fill would break the round-trip:
+        target.write_text(old_render.replace(str(project), "/elsewhere"), encoding="utf-8")
+        assert not project_init._stale_orchestrator_root_heal_match(
+            raw, target, new_root, project, transform)
 
 
 class TestWindowsPathEscaping:

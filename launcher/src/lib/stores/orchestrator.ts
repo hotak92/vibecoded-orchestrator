@@ -1,5 +1,8 @@
 import { writable, derived } from 'svelte/store';
 import { invoke as tauriInvoke, safeInvoke, listen as tauriListenWrapper } from '$lib/tauri';
+// Type-only (erased at build): the run-kind + outcome shapes are declared once,
+// in the updater store that owns the ONE update action.
+import type { UpdateRunKind, UpdateOutcome } from './updater';
 
 async function tauriListen<T>(event: string, handler: (e: { payload: T }) => void) {
   await tauriListenWrapper<T>(event, handler);
@@ -59,20 +62,21 @@ export interface InstallResult {
  * v0.2.16 (W4 / 0.5): three-state update status surfaced by the
  * `UpdateBadge` banner. Mirror of Rust `commands::installer::UpdateStatus`.
  *
- * The banner renders the highest-priority state when more than one
- * flag is true (priority: binary_stale > install_stale > remote_ahead).
+ * The banner renders the highest-priority state when more than one flag
+ * is true — the order is `updater.ts::pickKind` (the one home; pinned by
+ * its tests).
  *
- * Each flag has a distinct resolver:
- * - remote_ahead   → invoke('update_orchestrator')  // git pull + install
- * - install_stale  → invoke('apply_pending_install') // install.py only
- * - binary_stale   → invoke('restart_launcher')      // re-exec dist binary
+ * Each flag's resolver is `updater.ts::actionForKind` (v0.2.100, AD-1):
+ * - remote_ahead   → updater.run('PullFf')    // run_orchestrator_update
+ * - install_stale  → updater.run('ApplyOnly') // install.py only, no pull
+ * - binary_stale   → updater.runRestart()     // re-exec dist binary
  */
 export interface UpdateStatus {
   remote_ahead: boolean;
   install_stale: boolean;
   binary_stale: boolean;
-  /** v0.2.51 (Bug A): a prior `update_orchestrator` / `merge_*` / `rebase_*`
-   *  surfaced a conflict modal and the user resolved the conflict outside
+  /** v0.2.51 (Bug A): a prior orchestrator update (pull / merge / rebase —
+   *  since v0.2.100 `run_orchestrator_update`) surfaced a conflict modal and the user resolved the conflict outside
    *  the launcher (CLI `git add` + `git commit`) without re-entering the
    *  install flow. Detected via a sentinel file at
    *  `.claude/state/orchestrator-update-resume-needed.json` AND absence of
@@ -461,56 +465,22 @@ function createOrchestratorStore() {
       }
     },
 
-    /** Update orchestrator */
-    async update_orchestrator(): Promise<InstallResult> {
-      let currentPath = '';
-      const unsub = subscribe((s) => { currentPath = s.installPath; });
-      unsub();
-
-      update((s) => ({ ...s, status: 'updating', error: null, progress: null }));
-
-      try {
-        const result = await tauriInvoke<InstallResult>('update_orchestrator', { path: currentPath });
-        update((s) => ({
-          ...s,
-          status: 'installed',
-          updateAvailable: false,
-          error: null,
-        }));
-        return result;
-      } catch (err) {
-        const message = err instanceof Error ? err.message : String(err);
-        update((s) => ({ ...s, status: 'installed', error: message }));
-        throw err;
-      }
-    },
-
     /**
-     * v0.2.16 (W4 / 0.5): apply a pending install (install.py --update)
-     * WITHOUT a preceding git pull. Resolves the install_stale banner
-     * state. The source tree is already current — this just refreshes
-     * `.claude/`, MCP registrations, and bumps
-     * `state/install-manifest.json::version`.
+     * v0.2.100 (WP-08, AD-1): the ONE invoker of the backend update command
+     * `run_orchestrator_update`. Every update kind goes through here, so the
+     * store's `status` is `updating` for all of them (L3-F07: the old resume
+     * path invoked its command directly and never set it). Rejections are
+     * re-thrown UNWRAPPED — the updater's `routeUpdateError` parses the raw
+     * typed-error JSON.
      *
-     * Distinct from `update_orchestrator` to avoid wasting ~30s pulling
-     * an already-current tree (and to avoid noising the launcher's
-     * git output for no value).
+     * Callers: `updater.run(kind)` only. Components call the updater.
      */
-    async apply_pending_install(): Promise<InstallResult> {
-      let currentPath = '';
-      const unsub = subscribe((s) => { currentPath = s.installPath; });
-      unsub();
-
+    async runUpdate(kind: UpdateRunKind): Promise<UpdateOutcome | null> {
       update((s) => ({ ...s, status: 'updating', error: null, progress: null }));
-
       try {
-        const result = await tauriInvoke<InstallResult>('apply_pending_install', { path: currentPath });
-        update((s) => ({
-          ...s,
-          status: 'installed',
-          error: null,
-        }));
-        return result;
+        const outcome = await tauriInvoke<UpdateOutcome | null>('run_orchestrator_update', { kind });
+        update((s) => ({ ...s, status: 'installed', updateAvailable: false, error: null }));
+        return outcome ?? null;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         update((s) => ({ ...s, status: 'installed', error: message }));
@@ -526,6 +496,39 @@ function createOrchestratorStore() {
 }
 
 export const orchestrator = createOrchestratorStore();
+
+/** The periodic status poll cadence (the slow backstop; the remote-check
+ *  retry burst above is the fast recovery). */
+export const STATUS_POLL_INTERVAL_MS = 60 * 60 * 1000;
+
+/**
+ * v0.2.100 (WP-08, L3-F09): one PERIODIC status poll tick. Honours the
+ * "Check for updates automatically" preference (`get_auto_check_enabled` —
+ * the same setting the daily background check reads), which the hourly poll
+ * used to ignore. An unreadable preference counts as ON (the backend
+ * default) so a transient IPC hiccup never silences checks. The launch-time
+ * check and every manual check are NOT gated: they are the user opening the
+ * app or asking.
+ */
+export async function scheduledStatusCheck(): Promise<void> {
+  const enabled = await safeInvoke<boolean>('get_auto_check_enabled');
+  if (enabled === false) return;
+  await orchestrator.checkStatus();
+}
+
+/**
+ * v0.2.100 (WP-08, L3-F13): start the status polling — an immediate
+ * `checkStatus()` plus the hourly {@link scheduledStatusCheck}. Returns the
+ * teardown. `+layout.svelte` calls this FIRST in `onMount`, so nothing that
+ * runs before it can skip the registration. The timer is the global
+ * `setInterval` CALLED directly (never a detached reference — the v0.2.97
+ * "Illegal invocation" class).
+ */
+export function startStatusPolling(): () => void {
+  void orchestrator.checkStatus();
+  const handle = setInterval(() => void scheduledStatusCheck(), STATUS_POLL_INTERVAL_MS);
+  return () => clearInterval(handle);
+}
 
 /** Derived: is the orchestrator in a working state? */
 export const isOrchestratorReady = derived(orchestrator, ($o) => $o.status === 'installed');

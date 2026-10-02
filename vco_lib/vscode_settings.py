@@ -137,7 +137,7 @@ exactly one operation, and the boundary is hard:
 * PERMITTED — appending the client's context-window hint ``[1m]`` to the
   SAME model id, when the version-keyed table
   (``model_router.context_table``, exact full-id match, never a wildcard:
-  ``glm-5.2`` is 1M while ``glm-5.1`` is 200K) marks it 1M-windowed. The
+  ``glm-5.3`` is 1M while ``glm-5.1`` is 200K) marks it 1M-windowed. The
   gateway strips the suffix before routing, so the model that answers is
   unchanged. Every healed value is reported by name in the done message.
 * FORBIDDEN — everything else, above all changing which model an id names
@@ -1282,7 +1282,9 @@ def dogfood_gateway(
     if _time.monotonic() - started > DOGFOOD_TOTAL_BUDGET_S:
         return finish("skipped", None, "the dogfood budget ran out")
     version_ok, version_detail = _dogfood_version(port, timeout)
-    record("version", version_ok, version_detail)
+    record("version", version_ok is True, version_detail)
+    if version_ok is None:  # freshness UNKNOWN is never "fresh" (W1R-12)
+        return finish("skipped", None, version_detail)
     if not version_ok:
         return finish("refused", "dogfood:version", version_detail)
 
@@ -1416,8 +1418,12 @@ def _dogfood_vendor_model_id(
     return None
 
 
-def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
+def _dogfood_version(port: int, timeout: float) -> "tuple[Optional[bool], str]":
     """The daemon answering must not be older than this package.
+
+    Tri-state (v0.2.100 W1R-12): ``True`` fresh, ``False`` older (refuse),
+    ``None`` freshness UNKNOWN — a side is absent or not ``X.Y.Z`` — which the
+    caller reports as ``skipped``, never as a pass.
 
     A gateway left running from a previous install answers happily and
     without any of this release's fixes — the exact shape of the 2026-09-09
@@ -1438,8 +1444,20 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
     running = str(payload.get("version") or "")
     mine = _this_package_version()
     if not running or not mine:
-        return True, f"version comparison unavailable (running={running or '?'})"
-    if _version_tuple(running) < _version_tuple(mine):
+        return None, f"version comparison unavailable (running={running or '?'})"
+    running_key, mine_key = _version_tuple(running), _version_tuple(mine)
+    if running_key is None or mine_key is None:
+        # Freshness UNKNOWN — the same answer as an absent version above,
+        # never "fresh" and never "stale": a string that is not X.Y.Z was
+        # not read, so it cannot be ranked either way. Name it so the user
+        # sees which side is malformed.
+        bad = running if running_key is None else mine
+        side = "running daemon" if running_key is None else "this install"
+        return None, (
+            f"version comparison unavailable: the {side} reports {bad!r}, "
+            "which is not X.Y.Z"
+        )
+    if running_key < mine_key:
         return False, (
             f"the daemon answering is v{running}, older than this install "
             f"(v{mine}). Restart the gateway so the running code is the "
@@ -1448,20 +1466,23 @@ def _dogfood_version(port: int, timeout: float) -> "tuple[bool, str]":
     return True, f"v{running}"
 
 
-def _version_tuple(text: str) -> tuple:
-    """Comparable version key — see :mod:`vco_lib.version_compare`.
+def _version_tuple(text: str) -> "Optional[tuple[int, int, int]]":
+    """Comparable version key, or ``None`` when ``text`` is not ``X.Y.Z``.
 
-    This used to FILTER digits out of each dotted chunk, so ``0.2.95rc1``
-    became ``(0, 2, 951)`` and ranked above ``0.2.100``. The freshness proof
-    below reports whether the RUNNING gateway is the INSTALLED code, and an
-    editable install's metadata version carries a suffix routinely — so the
-    one comparison a user relies on to answer "is my restart needed" could
-    answer backwards. Now the leading-digit rule the rest of the codebase
-    already used.
+    Delegates to the ONE parser, :func:`vco_lib.version_compare.parse_version`
+    (strict three numeric parts, owner ruling v0.2.100). History: this used
+    to FILTER digits out of each dotted chunk (``0.2.95rc1`` -> ``(0, 2,
+    951)``, ranked above ``0.2.100``), then (v0.2.96) took each chunk's
+    leading digit run (``0.2.95rc1`` == ``0.2.95``). Both ranked a string
+    nobody should have produced; now it is not ranked at all, and the caller
+    reports freshness as unknown.
     """
-    from vco_lib.version_compare import version_parts
+    from vco_lib.version_compare import VersionParseError, parse_version
 
-    return tuple(version_parts(text))
+    try:
+        return parse_version(text)
+    except VersionParseError:
+        return None
 
 
 def _this_package_version() -> str:

@@ -18,9 +18,65 @@ import asyncio
 import argparse
 import os
 import sys
+from typing import Any
 
-# Add parent dir so we can import weaviate_mcp
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+# Add parent dir so we can import weaviate_mcp, and the orchestrator root so
+# `claude_mcp_servers.*` / `vco_lib` import without relying on the caller's cwd.
+# v0.2.100 F3: hooks in EVERY project now run THIS file from the orchestrator
+# root (located via VCT_ORCHESTRATOR_ROOT / VCT_INSTALL_ROOT), with cwd in the
+# calling project — so the cwd can no longer be assumed to be the root.
+# Identity is NOT taken from this file's location: `weaviate_mcp.server`
+# resolves the project from CLAUDE_PROJECT_DIR (the calling project), and the
+# collections/permissions come from that project's hub config and env.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, ".."))
+_ORCH_ROOT = os.path.abspath(os.path.join(_HERE, "..", ".."))
+if _ORCH_ROOT not in sys.path:
+    sys.path.insert(1, _ORCH_ROOT)
+
+#: v0.2.100 F1: hard cap on the dual-RL-log SECONDARY query embed on this
+#: (hook) path. Past it the twin event is skipped and the skip is recorded in
+#: the RL telemetry loss ledger; the primary event is unaffected. Sized well
+#: inside the hook's 7 s inner timeout (warm secondary embed: ~30-150 ms).
+HOOK_DUAL_EMBED_BUDGET_S = 1.0
+#: v0.2.100 W5R-07: pre-tool-use runs SYNCHRONOUSLY under a 3 s harness
+#: timeout on every Edit/Write (pre-edit has 8 s). Interpreter + imports
+#: (~0.9 s) + search (~1.3 s) + a 1 s cap could overrun it and lose the
+#: injection, so that hook's twin embed gets a tighter cap. A warm secondary
+#: embed takes ~30-150 ms; a cold one is recorded as a timeout, not hidden.
+PRE_TOOL_USE_DUAL_EMBED_BUDGET_S = 0.4
+
+
+def dual_embed_budget_s(task_type: str) -> float:
+    """The secondary-embed cap for this hook (see the two constants above)."""
+    if task_type == "pre_tool_use_kg_search":
+        return min(PRE_TOOL_USE_DUAL_EMBED_BUDGET_S, HOOK_DUAL_EMBED_BUDGET_S)
+    return HOOK_DUAL_EMBED_BUDGET_S
+
+#: v0.2.100 W5R-14: each caller says which search this is, so pre-edit,
+#: pre-bash, pre-tool-use and subagent-start events (and their loss-ledger
+#: lines) stay distinguishable. ``--task-type`` wins; else the hook's
+#: ``VCO_RL_TASK_TYPE``; else an interactive CLI run.
+TASK_TYPE_ENV = "VCO_RL_TASK_TYPE"
+DEFAULT_TASK_TYPE = "cli_kg_search"
+KNOWN_TASK_TYPES = (
+    "pre_edit_kg_search",
+    "pre_bash_kg_search",
+    "pre_tool_use_kg_search",
+    "subagent_kg_search",
+    "cli_kg_search",
+)
+
+
+def resolve_task_type(arg: "str | None") -> str:
+    """The task_type for this run: ``--task-type`` > ``$VCO_RL_TASK_TYPE`` >
+    ``cli_kg_search``. Unknown values fall back to the default rather than
+    writing free text into the training corpus's partition key."""
+    for cand in (arg, os.environ.get(TASK_TYPE_ENV)):
+        val = (cand or "").strip()
+        if val in KNOWN_TASK_TYPES:
+            return val
+    return DEFAULT_TASK_TYPE
 
 
 async def main():
@@ -43,7 +99,14 @@ async def main():
         default=None,
         help="Path to the live Claude Code JSONL transcript (for query enrichment)",
     )
+    parser.add_argument(
+        "--task-type",
+        default=None,
+        choices=KNOWN_TASK_TYPES,
+        help=f"RL task_type of this search (default: ${TASK_TYPE_ENV}, else {DEFAULT_TASK_TYPE})",
+    )
     args = parser.parse_args()
+    task_type = resolve_task_type(args.task_type)
     header_prefix = "KG: " if args.hook_format else ""
 
     # Import the MCP server's internals
@@ -67,7 +130,7 @@ async def main():
         _kg_collections_to_search,
         _embedding_dim_for,
         _collapse_to_one_per_node,
-        _rl_enrich_nodes_with_linked_embs,
+        resolve_and_enrich_dual,
         KG_COLLECTION,
         EMBEDDING_SOURCE,
         EMBEDDING_MODEL,
@@ -75,10 +138,13 @@ async def main():
     )
     from claude_mcp_servers.rl_client.search_pipeline import (
         RerankRequest,
+        dual_log_request_fields,
+        hand_off_deferred,
         rerank_and_emit,
     )
     import uuid
 
+    deferred_events: tuple = ()
     client = get_weaviate_client()
     try:
         # P1-D (2026-05-08): fan out across self + shared + peer KGs from
@@ -144,7 +210,7 @@ async def main():
                             return_metadata=["distance"],
                         )
                     else:
-                        nv_kwargs = dict(
+                        nv_kwargs: dict[str, Any] = dict(
                             near_vector=q_vector,
                             limit=q_limit,
                             return_metadata=["distance"],
@@ -185,7 +251,10 @@ async def main():
         # rl_client.query_chunking (one home, reuses chunking.py + _cosine).
         from claude_mcp_servers.rl_client import query_chunking as _qc
 
-        if EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(effective_query, EMBEDDING_MODEL):
+        oversized = EMBEDDING_SOURCE != "weaviate" and _qc.is_oversized(
+            effective_query, EMBEDDING_MODEL
+        )
+        if oversized:
             query_chunks = _qc.chunk_query(effective_query, EMBEDDING_MODEL)
             per_chunk_limit = _qc.kg_results_per_chunk(args.limit) * _RL_OVERFETCH
             pooled_per_chunk: list[list[dict]] = []
@@ -246,16 +315,46 @@ async def main():
         # node vectors → cosine citations were impossible for ~72% of all
         # retrievals (the pre_edit_kg_search cohort).
         all_formatted = _collapse_to_one_per_node(all_formatted, score_field="score")
+        # v0.2.100 F1: dual-RL-log resolve + enrich through the ONE shared home
+        # the MCP tools use. Pre-F1 this path (~99% of all retrievals) called
+        # the bare enrich and never produced the other slot's `<task_id>:<slot>`
+        # twin. Hook-shaped: the secondary query embed is capped at
+        # HOOK_DUAL_EMBED_BUDGET_S and the lazy node backfill is OFF. An
+        # oversized query (chunked above) embeds per chunk, which the twin
+        # cannot mirror without duplicating the chunk logic — it goes out
+        # single-slot and the skip is recorded, never silent.
+        dual_inputs = None
         if vector is not None:
+            if oversized:
+                from weaviate_mcp.server import _dual_rl_log_expected
+
+                if _dual_rl_log_expected():
+                    from vco_lib.rl_telemetry_loss import KIND_DUAL_SKIP, record_loss
+
+                    record_loss(KIND_DUAL_SKIP, "oversized_query", task_type=task_type)
             try:
-                _rl_enrich_nodes_with_linked_embs(
-                    all_formatted, query_emb=vector, active_slot=query_target,
-                    model_name=EMBEDDING_MODEL,
-                )
+                if not oversized:
+                    dual_inputs = await resolve_and_enrich_dual(
+                        all_formatted,
+                        query=effective_query,
+                        query_vector=vector,
+                        active_slot=query_target,
+                        model_name=EMBEDDING_MODEL,
+                        embed_budget_s=dual_embed_budget_s(task_type),
+                        backfill_other=False,
+                        task_type=task_type,
+                    )
+                else:
+                    from weaviate_mcp.server import _rl_enrich_nodes_with_linked_embs
+
+                    _rl_enrich_nodes_with_linked_embs(
+                        all_formatted, query_emb=vector, active_slot=query_target,
+                        model_name=EMBEDDING_MODEL,
+                    )
             except Exception:
                 # Soft-fail: enrichment is best-effort telemetry; never break
                 # the user-facing context injection.
-                pass
+                dual_inputs = None
 
         # RL rerank + telemetry emit via the V52-J canonical pipeline.
         # NEW-8 (2026-05-28): query embedding is carried into the
@@ -266,12 +365,13 @@ async def main():
         # a single canonical chokepoint shared with the MCP server +
         # search_knowledge.py CLI.
         #
-        # task_type = "pre_edit_kg_search" so offline analysis can
-        # distinguish hook-triggered context-injection events from
-        # interactive MCP `hybrid_search` calls. The rl_events schema
-        # accepts arbitrary task_type strings (varchar column, no
-        # enum constraint — see launcher/src-tauri/migrations/*.sql).
-        task_id = f"pre_edit_{uuid.uuid4().hex[:8]}"
+        # task_type (W5R-14: pre_edit / pre_bash / pre_tool_use / subagent /
+        # cli ``_kg_search``) so offline analysis can tell the hook-triggered
+        # context-injection events apart from each other and from interactive
+        # MCP `hybrid_search` calls. The rl_events schema accepts arbitrary
+        # task_type strings (varchar column, no enum constraint — see
+        # launcher/src-tauri/migrations/*.sql).
+        task_id = f"{task_type.removesuffix('_kg_search')}_{uuid.uuid4().hex[:8]}"
         # F-A (v0.2.70): do NOT spawn the in-process answer monitor on the
         # CLI/hook path. ``asyncio.run(main())`` tears the event loop down the
         # instant ``main()`` returns (and ``client.close()`` runs in the
@@ -299,15 +399,22 @@ async def main():
             embedding_dim=_embedding_dim_for(EMBEDDING_MODEL),
             embedding_model=EMBEDDING_MODEL,
             task_id=task_id,
-            task_type="pre_edit_kg_search",
+            task_type=task_type,
             session_id=resolved_session,
             spawn_answer_monitor=False,
+            # v0.2.100 F1: the twin's inputs; empty → single-log (unchanged).
+            **dual_log_request_fields(dual_inputs),
+            # v0.2.100 W5R-07: a hook is WAITING for this process's stdout, so
+            # the hub POSTs (primary + twin, up to 2 s each on a slow hub) must
+            # not sit in front of it. Build them now, send after printing.
+            defer_emit=bool(args.hook_format),
         )
         # F-A (v0.2.70): no in-process monitor on the hook path; the staged
         # pending file (written inside rerank_and_emit → _populate_citation_cache
         # with stage_pending_file=True) is the SINGLE source the Stop-hook drain
         # consumes at turn-end. No separate hook-side re-stage (S1).
         rerank_result = await rerank_and_emit(req)
+        deferred_events = rerank_result.deferred
         results = rerank_result.ranked
         for r in results:
             if "score" not in r:
@@ -379,6 +486,18 @@ async def main():
             print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
     finally:
         client.close()
+        # W5R-07: the results are out; NOW send the training events, off the
+        # hook's critical path (a detached child; inline if none can start).
+        # In `finally` so a rendering error never costs the events.
+        if deferred_events:
+            try:
+                sys.stdout.flush()
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                hand_off_deferred(deferred_events)
+            except Exception:  # noqa: BLE001 — telemetry never breaks the hook
+                pass
 
 
 if __name__ == "__main__":

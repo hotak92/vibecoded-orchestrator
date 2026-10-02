@@ -1,66 +1,39 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // Copyright (c) 2026 VibeCoded Tools
-//! The orchestrator-repo update pipeline: everything between "a user asked for
-//! an update" and "the tree is at the upstream tip".
+//! The orchestrator-repo update pipeline's building blocks: everything
+//! between "a user asked for an update" and "the tree is at the upstream tip",
+//! plus `install.py --update`.
 //!
-//! WHY THIS FILE EXISTS. Two commands update the SAME git clone —
-//! `installer::update_orchestrator` (the MenuBar badge) and
-//! `self_update::apply_launcher_update` (Preferences → Launcher updates). Every
-//! shared STEP between them was extracted over six releases
-//! (`git_user_editable_merge` holds the pull plan, the 3-way merge, F1, the
-//! generated-file reconcile, the branch resolver); nobody ever extracted the
-//! SEQUENCE, so the two still read as two programs that happen to call the same
-//! subroutines in a similar order — and drifted in twelve places. See
-//! `.claude/context/reviews/UPDATE-SURFACES-DUPLICATION-2026-09-18.md` §2 for
-//! the step-by-step ledger.
+//! HISTORY. Two commands used to update the SAME git clone — the MenuBar
+//! badge's and the Preferences page's — and each was its own program over
+//! shared subroutines; they drifted in twelve places (see
+//! `.claude/context/reviews/UPDATE-SURFACES-DUPLICATION-2026-09-18.md` §2).
+//! v0.2.95 moved the shared SEQUENCE here; v0.2.100 (AD-1) went the rest of
+//! the way: `update_run::run_update` is the ONE pipeline, composing the
+//! phase-level pieces below under its phase ledger, and every per-surface
+//! command it replaced — with its own tail, error renderer and restart — is
+//! gone (WP-03b).
 //!
-//! WHAT THIS FILE IS, TODAY (phase 2 — both surfaces). The body below started
-//! as `installer::update_orchestrator`'s pre-flight-through-HEAD-advance span,
-//! MOVED (phase 1: same steps, same order, same side effects, same strings).
-//! Phase 2 gave it its SECOND caller, `self_update::apply_launcher_update`,
-//! which is how the twelve gaps closed: B now gets the in-progress-merge
-//! refusal, the MCP kill-sweep + update gate, the hub stop, the hub-binary
-//! rename, the serialized fetch, the A0 pre-merge, the untracked-collision
-//! classification, the resume sentinel, the HEAD-advance backstop and the
-//! "already up to date" heal by CALLING this, not by copying it.
+//! WHAT LIVES HERE: the in-progress refusal ([`run_preflight_refusals`]), the
+//! hub stop + binary renames ([`stop_hub_and_rename_binaries_aside`]), the
+//! git operation of each kind — [`pull_to_upstream`] (`PullFf`),
+//! [`merge_upstream`], [`rebase_onto_upstream`], [`classify_resume`] — and the
+//! `install.py --update` runner ([`run_install_py_update`]).
 //!
-//! ORDERING IS LOAD-BEARING. Four comments inside the moved code say why an
+//! ORDERING IS LOAD-BEARING. Comments inside the moved code say why an
 //! adjacent pair must stay in its order (the in-progress refusal before the
 //! sentinel clear; the pre-pull rename before F1 and the reconcile; the
-//! generated-reconcile deferral after the pull). They moved WITH their code.
-//! Nothing here may be reordered for tidiness.
+//! generated-reconcile deferral after the pull). Nothing here may be
+//! reordered for tidiness.
 //!
-//! WHAT THE CALLER STILL OWNS. Error RENDERING (each surface has its own
-//! hand-rolled JSON payload shape that three Svelte modals parse — see
-//! `installer::serialize_orchestrator_non_ff_error` and
-//! `self_update::serialize_non_ff_error`, both of which stay where they are),
-//! the audit-row WRITES (this pipeline only collects), `install.py`, the
-//! finalize/restart tail, and the module-retry sweep.
+//! WHAT THE CALLER OWNS: the claim, the audit-row WRITES (this module only
+//! collects them), error RENDERING (`update_failure`, one home), the restore
+//! on failure, and the relaunch.
 //!
-//! DELIBERATE DEVIATIONS from the review's §5.2 sketch, and why:
-//!   * **`stop_hub` and `run_pre_merge_a0` do not exist, and phase 2 decided
-//!     they never should.** Phase 1 deferred the decision because §5.5 gave
-//!     both planned callers `true`; phase 2 is the caller that settles it. Both
-//!     surfaces update the SAME clone, whose `launcher/dist/*/vct-hub*` are
-//!     TRACKED files — so there is no caller that provably owns no hub, and a
-//!     `false` arm would be unread configuration whose only effect could be to
-//!     switch OFF a guard over a destructive act. Same for A0: B pulls the whole
-//!     repo, so the ledger's "justified only if B is launcher-only" does not
-//!     hold. Both steps are therefore UNCONDITIONAL, and B gets them by
-//!     construction. Do not add the toggles back.
-//!   * `DirtyTrackedAtRisk` is NOT a decision this pipeline makes. It is a
-//!     caller-REQUESTED refusal ([`ExtraPreflight`]) that travels back as its
-//!     own error variant carrying only the offending path, so the surface that
-//!     asked for it words it. See [`ExtraPreflight`] for the asymmetry it
-//!     encodes and why exactly one surface wants it.
-//!   * no `gen_reconcile` in the outcome. Neither caller's tail reads it; an
-//!     unread field is the same defect one layer down.
-//!
-//! WHAT IS STILL NOT SHARED, on purpose. The single-flight claim (ledger 40)
-//! is taken by each COMMAND, under its own key, because the two are separate
-//! operations a user may legitimately want to refuse independently — and
-//! because a claim taken inside this function would be released when it
-//! returns, leaving `install.py` and the restart hop unguarded.
+//! `stop_hub` / `run_pre_merge_a0` toggles do not exist on purpose: the clone's
+//! `launcher/dist/*/vct-hub*` are TRACKED files, so no caller provably owns no
+//! hub, and a `false` arm would be unread configuration whose only effect
+//! could be to switch OFF a guard over a destructive act. Do not add them.
 
 use std::path::{Path, PathBuf};
 
@@ -85,38 +58,6 @@ use crate::commands::installer::{
 use crate::commands::update_gate::UpdateInProgressGuard;
 use crate::services::binary_freshness::pre_pull_rename_running_binary;
 
-/// A refusal the CALLER wants, run after the pipeline's own
-/// in-progress-merge refusal and before anything it would mutate.
-///
-/// This is the one genuine asymmetry between the two surfaces, and the ledger
-/// (§2 row 4) grades it "justified": **what each surface offers as its forward
-/// action out of a divergence decides how afraid of a dirty tracked file it
-/// should be.**
-///
-/// * `installer::update_orchestrator` → a Merge / Rebase / Cancel modal.
-///   Nothing it offers destroys local content, so a dirty tracked file is not
-///   a reason to refuse — v0.2.58 REMOVED exactly that gate after a real
-///   install hit the modal with 540 dirty entries and zero overlap with what
-///   upstream changed.
-/// * `self_update::apply_launcher_update` → the resync modal, whose only
-///   forward action is `force_resync_launcher` = `git reset --hard`. There a
-///   file that is both locally modified and changed upstream is content the
-///   user can actually lose, so the surface refuses BY NAME before the pull
-///   can put them in front of that button.
-///
-/// Both arms have a caller. The order matters as much as the choice: a clone
-/// wedged mid-merge must reach the merge-in-progress payload, NOT a confusing
-/// "uncommitted changes" refusal about the `UU` entries that merge left behind
-/// — which is what B would say if it kept running this pre-flight first.
-pub(crate) enum ExtraPreflight<'a> {
-    /// No caller refusal beyond the pipeline's own.
-    None,
-    /// Refuse when a dirty TRACKED path is also changed upstream, naming it
-    /// (`self_update::first_change_at_risk`). `branch` is the caller's already
-    /// resolved pull branch — the risk set is only answerable against the
-    /// upstream tip, so this cannot be derived before the branch is known.
-    RefuseDirtyTrackedAtRisk { branch: &'a str },
-}
 
 /// What the calling surface has to tell the pipeline about ITSELF.
 ///
@@ -149,40 +90,17 @@ pub(crate) struct UpdatePipelineOptions<'a> {
     /// Start of the update, for the `duration_ms` field of the audit rows the
     /// pipeline collects.
     pub update_start_ms: i64,
-    /// A refusal this surface wants in addition to the pipeline's own. See
-    /// [`ExtraPreflight`] — the two arms are not a preference, they follow
-    /// from what each surface offers as its recovery.
-    pub extra_preflight: ExtraPreflight<'a>,
 }
 
-/// What the caller needs after a successful pull.
-///
-/// `gate_guard` is MOVED out to the caller on purpose: the lockfile must stay
-/// armed across `install.py` and the binary-refresh window, which are the
-/// caller's steps, and the caller advances its phase.
-pub(crate) struct UpdatePipelineOutcome {
-    /// The pull reported "Already up to date" — nothing was fetched. The
-    /// caller returns success WITHOUT running `install.py`.
-    pub already_up_to_date: bool,
-    /// Only meaningful when `already_up_to_date`: the at-rest dist binary is
-    /// NEWER than the running one, so the user must relaunch to pick it up.
-    pub dist_binary_stale: bool,
-    pub pull_branch: String,
-    pub pre_pull_renamed: Option<PathBuf>,
-    pub pre_pull_renamed_hub: Option<PathBuf>,
-    pub gate_guard: UpdateInProgressGuard,
-    /// Audit rows the pipeline DECIDED but did not write — the caller owns the
-    /// Db handle, so it writes them. Order is the order they were produced.
-    pub db_audit: Vec<(String, serde_json::Value)>,
-}
 
 /// Why the pipeline stopped, in terms of the CONDITION rather than of any one
 /// surface's payload string.
 ///
-/// Each surface renders this into ITS OWN payload shape — `installer` into the
-/// `orchestrator_update_*` events its three modals parse, `self_update` into
-/// its `kind:"non_fast_forward"` resync payload. That is the whole point of the
-/// enum: one classification, two renderings, no duplicated decision.
+/// ONE rendering (v0.2.100 WP-03b): `update_failure::from_pipeline_error`
+/// turns it into the `{kind, message, …}` contract whose payload kinds keep
+/// the `orchestrator_update_*` event names the decision modals parse. The
+/// per-surface renderings (`installer`'s events, `self_update`'s resync
+/// payload) went with their commands.
 ///
 /// The two payload-carrying variants are the ones whose payload is produced by
 /// a SHARED handler that also writes a sentinel (`handle_*`), so splitting the
@@ -191,15 +109,7 @@ pub(crate) enum UpdatePipelineError {
     /// A merge or rebase was already in progress — before the pull (the
     /// pre-flight) or reported by the pull itself. `payload` is what the
     /// shared handler produced, alongside the sentinel it wrote.
-    ///
-    /// `at_preflight` separates the two: only the PRE-flight refusal carries an
-    /// audit row today, and the post-pull (TOCTOU) sibling must not silently
-    /// gain one by being folded into the same variant.
-    MergeInProgress { payload: String, at_preflight: bool },
-    /// The caller's [`ExtraPreflight`] refused: `path` is a dirty TRACKED file
-    /// this update also changes. Nothing was mutated — the refusal runs before
-    /// the sentinel clear, the kill-sweep, the hub stop and the renames.
-    DirtyTrackedAtRisk { path: String },
+    MergeInProgress { payload: String },
     /// The pull conflicted.
     ///
     /// `record_binary_clobber_averted` asks the caller for its
@@ -275,8 +185,8 @@ fn capitalise_first(s: &str) -> String {
 /// Pure, so BOTH arms of a branch that gates a destructive act are unit-
 /// testable — the house rule (cf. `installer::tracked_gate_refuses`, whose doc
 /// gives the same reason). The act it gates is whichever tree-write follows:
-/// a `git pull`, a `git rebase`, an `install.py --update`, or
-/// `force_resync_launcher`'s `git reset --hard`.
+/// a `git pull`, a `git merge`/`rebase`, an `install.py --update`, or the
+/// `ResetHard` kind's `git reset --hard`.
 ///
 /// `Ok(_)` from the stop — `true` "a hub was stopped", `false` "none was
 /// running" — both mean the same thing here: nothing holds the binaries.
@@ -321,7 +231,8 @@ pub(crate) fn gate_destructive_write_on_hub_stop(
 /// own progress line, so the four drifted in wording while agreeing in
 /// substance; the fifth (resync) was simply missing. Adding a fifth copy is
 /// the case the project's modularity rule forbids outright, so all four were
-/// migrated onto this BEFORE the resync call site was added.
+/// migrated onto this BEFORE the resync call site was added. Since v0.2.100
+/// its one caller is `update_run`'s phase 5, for every kind.
 ///
 /// WHY it protects what it protects (`07101d30`, v0.2.21 Step 12, Reviewer B
 /// blocker B1):
@@ -380,115 +291,112 @@ pub(crate) fn stop_hub_and_rename_binaries_aside(
     })
 }
 
-/// Run every step between "the user asked" and "the tree is at the upstream
-/// tip": the in-progress-merge pre-flight, the sentinel clear, the MCP
-/// kill-sweep + update gate, the upstream remote, the hub stop, the pre-pull
-/// binary renames, the branch resolution, the fetch, the A0 user-editable
-/// pre-merge, F1, the generated-file reconcile, the pull-plan decision, the
-/// pull, every failure classification, the "already up to date" short-circuit
-/// and the HEAD-advance backstop.
+
+/// The one read-only refusal the hub stop can produce, run BEFORE the
+/// kill-sweep so it costs nothing: `<vct_root>/hub.pid` exists but cannot be
+/// read. `ensure_hub_stopped_for_update` refuses on exactly that condition
+/// (it cannot tell whether a hub is running), and it used to do so AFTER the
+/// sweep had already killed the MCP servers. An absent file is "no hub" and
+/// passes; every other outcome of the stop (a hub that will not die) needs the
+/// stop itself and stays in [`stop_hub_and_rename_binaries_aside`].
+pub(crate) fn hub_stop_precheck() -> Result<(), String> {
+    hub_stop_precheck_at(&vct_launcher_core::paths::vct_root_dir().join("hub.pid"))
+}
+
+/// [`hub_stop_precheck`] with the pid-file path injected (tests).
+pub(crate) fn hub_stop_precheck_at(pid_file: &Path) -> Result<(), String> {
+    match std::fs::read_to_string(pid_file) {
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!(
+            "Update refused before anything was changed: {} exists but cannot be read ({}), \
+             so the launcher cannot tell whether vct-hub is running and would not be able to \
+             stop it before the update. Check the file's permissions, or stop the hub with \
+             `vct-hub --stop`, then try again.",
+            pid_file.display(),
+            e
+        )),
+    }
+}
+
+/// v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a prior
+/// half-finished update. A fresh update supersedes it — either it succeeds (no
+/// resume needed) or it hits a new conflict and rewrites both with current
+/// SHAs/branch. MUST run after [`run_preflight_refusals`]: a clone wedged
+/// mid-merge needs the first click's sentinel to reopen its modal.
+pub(crate) fn clear_prior_resume_state(install_path: &Path) {
+    clear_update_resume_sentinel(install_path);
+    clear_update_resume_deferral_if_solo(install_path);
+}
+
+/// V52-AI (v0.2.52): the MCP kill-sweep + the update gate, as one step.
 ///
-/// Returns with the gate guard still ARMED — the caller holds it across
-/// `install.py` and the binary refresh, then drops it.
-pub(crate) async fn prepare_and_pull_orchestrator_repo(
-    repo: &Path,
-    opts: UpdatePipelineOptions<'_>,
-) -> Result<UpdatePipelineOutcome, UpdatePipelineError> {
-    // `install_path` is the name — and the TYPE, owned — that every moved line
-    // below already used. Binding it here keeps the move mechanical, and
-    // therefore reviewable as a move: no `&install_path` had to become
-    // `install_path`, so a reviewer diffing against the pre-extraction span
-    // sees only the edits that carry meaning.
-    let install_path = repo.to_path_buf();
-    let surface = opts.surface;
-    let progress = |stage: &str, message: &str, percentage: f32| {
-        if let Some(window) = opts.emit_progress_to {
-            emit_progress(window, stage, message, percentage);
-        }
-    };
-
-    // Every refusal, before anything this function would mutate. See
-    // `run_preflight_refusals` for the ordering argument.
-    run_preflight_refusals(&install_path, surface, &opts.extra_preflight).await?;
-
-    // v0.2.51 Bug A: clear any leftover resume sentinel + deferral from a
-    // prior half-finished update. A fresh `update_orchestrator` run
-    // supersedes it — either we'll succeed (no resume needed), or we'll
-    // hit a new conflict and rewrite both with current SHAs/branch.
-    clear_update_resume_sentinel(&install_path);
-    clear_update_resume_deferral_if_solo(&install_path);
-
-    // V52-AI (v0.2.52, 2026-06-09): MCP fork-bomb mitigation. The user
-    // reported ~97 python (claude_mcp_servers + vct-coordination) and
-    // ~77 node (@upstash/context7 + @modelcontextprotocol/*) processes
-    // accumulating during update, requiring manual taskkill. Root cause
-    // is Windows mandatory file locks + Claude Code's MCP-respawn loop
-    // racing the binary refresh.
-    //
-    // Strategy:
-    //   1. Pre-sweep: terminate currently-running MCP processes whose
-    //      commandlines match strict MCP patterns. Soft-fail.
-    //   2. Acquire a RAII lockfile guard. The lockfile lives at
-    //      <vct_root>/.update-in-progress.json and is what the MCP
-    //      servers themselves read at startup (see
-    //      claude_mcp_servers/_lib/update_gate.py); any respawn during
-    //      the update window exits cleanly with code 75 before doing
-    //      any work, breaking the fork-bomb loop.
-    //   3. The guard's Drop impl deletes the lockfile on ALL exit paths
-    //      (success, ?-bail, panic), so even a crashed update doesn't
-    //      leave a stuck lockfile blocking future MCP spawns. The
-    //      boot-time stale-cleanup is the second line of defense.
+/// The user reported ~97 python and ~77 node MCP processes accumulating
+/// during an update (Windows mandatory file locks + Claude Code's MCP-respawn
+/// loop racing the binary refresh). Strategy:
+///   1. Pre-sweep: terminate currently-running MCP processes whose
+///      commandlines match strict MCP patterns. Soft-fail.
+///   2. Arm a RAII lockfile guard at `<vct_root>/.update-in-progress.json`;
+///      the MCP servers read it at startup (`claude_mcp_servers/_lib/
+///      update_gate.py`) and exit 75 during the window.
+///   3. The guard's Drop deletes the lockfile on ALL exit paths.
+///
+/// A lockfile write failure is soft (worst case: the pre-fix fork-bomb
+/// behaviour); the guard's Drop is a no-op when it never armed.
+///
+/// ORDER: callers run this only after every refusal that needs no mutation
+/// (L2-F14) — the sweep kills processes that nothing restarts.
+pub(crate) fn arm_update_gate(surface: &str) -> UpdateInProgressGuard {
     let pre_sweep_count = crate::commands::update_gate::pre_update_mcp_kill_sweep();
     if pre_sweep_count > 0 {
         tracing::info!(
-            "[vct] {}: pre-sweep terminated {} MCP-shaped \
-             process(es) before update",
+            "[vct] {}: pre-sweep terminated {} MCP-shaped process(es) before update",
             surface,
             pre_sweep_count
         );
     }
-    let (update_gate_guard, _gate_write_result) =
-        crate::commands::update_gate::UpdateInProgressGuard::new();
-    // _gate_write_result is intentionally discarded — soft-fail.
-    // If lockfile write fails (permission denied, FS full), we proceed
-    // with the update anyway (worst case: user sees the same pre-fix
-    // fork-bomb behaviour, same as today's status quo). The guard's
-    // Drop impl is a no-op when armed=false.
+    let (guard, _gate_write_result) = UpdateInProgressGuard::new();
+    guard
+}
 
-    // v0.2.21 (Stream A Design B extension): pin the canonical public
-    // AGPL upstream BEFORE any network ops. Same posture as the launcher
-    // self-update (see commands/self_update.rs): we never trust `origin`
-    // for upstream tracking because forks reset it to the fork URL.
-    // Hard-fail here — if we can't even configure the remote, the pull
-    // below would silently fall back to `origin` and pull the wrong
-    // commits. Better to surface the error to the GUI and let the user
-    // retry (or override via `VCO_UPSTREAM_URL` for self-hosters).
-    crate::commands::self_update::ensure_upstream_remote(&install_path)
-        .await
-        .map_err(UpdatePipelineError::Raw)?;
+/// What [`pull_to_upstream`] established.
+pub(crate) struct PulledToUpstream {
+    pub already_up_to_date: bool,
+    pub dist_binary_stale: bool,
+    pub pull_branch: String,
+    pub db_audit: Vec<(String, serde_json::Value)>,
+}
 
-    // Stage 0a/0b/0c — stop the hub, rename the two binaries aside. ONE home
-    // for the whole trio (see `stop_hub_and_rename_binaries_aside`); the
-    // messages this surface used are reproduced verbatim from `operation`.
-    let renames =
-        stop_hub_and_rename_binaries_aside(&install_path, "update", Some("git pull"), &progress)
-            .map_err(UpdatePipelineError::Raw)?;
-    let pre_pull_renamed_hub = renames.hub;
-    let pre_pull_renamed = renames.launcher;
-
-    // Stage 1: Pull latest
-    progress("update", "Pulling latest changes...", 10.0);
+/// The git operation of a fast-forward update: resolve the branch, then the
+/// fetch → A0 → F1 → reconcile → pull → classification → HEAD-advance
+/// sequence. The hub must already be stopped and the binaries renamed aside
+/// (`renames`); every failure leg below restores them before returning.
+pub(crate) async fn pull_to_upstream(
+    install_path: &Path,
+    opts: &UpdatePipelineOptions<'_>,
+    renames: &PrePullRenames,
+) -> Result<PulledToUpstream, UpdatePipelineError> {
+    let surface = opts.surface;
+    if let Some(window) = opts.emit_progress_to {
+        emit_progress(window, "update", "Pulling latest changes...", 10.0);
+    }
 
     // Detect the current branch so the explicit `git pull <remote>
     // <branch>` invocation below doesn't depend on upstream tracking
     // config (which would point at `origin/<branch>` on a fork).
-    // v0.2.92 WP-13: through the ONE resolver (was an inline copy of the
-    // `HEAD → main` rule). A detached HEAD is logged, not blocked: the pull
-    // fast-forwards a detached HEAD perfectly well — verified empirically,
-    // see the comment on the `GitPullFailed` arm below.
-    let pull_branch_state = crate::commands::git_cmd::resolve_branch(&install_path)
-        .await
-        .map_err(|e| UpdatePipelineError::Raw(format!("git rev-parse failed: {}", e)))?;
+    // v0.2.92 WP-13: through the ONE resolver. A detached HEAD is logged, not
+    // blocked: the pull fast-forwards a detached HEAD perfectly well.
+    let pull_branch_state = match crate::commands::git_cmd::resolve_branch(install_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            abort_update_restore_binaries_and_hub(
+                install_path,
+                renames.launcher.as_deref(),
+                renames.hub.as_deref(),
+            );
+            return Err(UpdatePipelineError::Raw(format!("git rev-parse failed: {}", e)));
+        }
+    };
     let pull_branch = pull_branch_state.name.clone();
     if pull_branch_state.detached {
         tracing::warn!(
@@ -503,61 +411,45 @@ pub(crate) async fn prepare_and_pull_orchestrator_repo(
     }
 
     let sequence = reconcile_and_pull(
-        &install_path,
+        install_path,
         pull_branch.clone(),
         &PullSequenceCtx {
             surface,
             emit_progress_to: opts.emit_progress_to,
             install_path_label: opts.install_path_label,
             start_branch: opts.start_branch,
-            head_sha_before: opts.head_sha_before,
+            head_sha_before: opts.head_sha_before.clone(),
             update_start_ms: opts.update_start_ms,
-            pre_pull_renamed: pre_pull_renamed.clone(),
-            pre_pull_renamed_hub: pre_pull_renamed_hub.clone(),
+            pre_pull_renamed: renames.launcher.clone(),
+            pre_pull_renamed_hub: renames.hub.clone(),
         },
     )
     .await?;
 
-    Ok(UpdatePipelineOutcome {
+    Ok(PulledToUpstream {
         already_up_to_date: sequence.already_up_to_date,
         dist_binary_stale: sequence.dist_binary_stale,
         pull_branch,
-        pre_pull_renamed,
-        pre_pull_renamed_hub,
-        gate_guard: update_gate_guard,
         db_audit: sequence.db_audit,
     })
 }
 
-/// Every refusal, in the one order that is correct, before ANY mutation.
+/// The in-progress merge/rebase refusal (v0.2.93 field incident), before ANY
+/// mutation: a clone left mid-merge reopens the conflict modal on the stalled
+/// state instead of starting a pull git would refuse. Nothing is mutated on
+/// this path — no sentinel clear, no kill-sweep, no hub stop, no rename.
 ///
-/// Split out of [`prepare_and_pull_orchestrator_repo`] for the same reason
-/// `reconcile_and_pull` is: the steps that follow it reach the live process
-/// table (the MCP kill-sweep, the hub stop), so a test driving the whole
-/// function would SIGTERM the developer's MCP servers and stop their hub.
-/// Everything HERE is git reads, so both arms of the caller-refusal branch are
-/// drivable over a temp repo — which is what this project requires of a branch
-/// that gates a destructive act, and the acts it gates are the kill-sweep, the
-/// hub stop, the binary renames and the pull itself.
+/// v0.2.100 (WP-03b): the caller-specific second refusal
+/// (`ExtraPreflight::RefuseDirtyTrackedAtRisk`, the dirty-tracked-file guard
+/// of `apply_launcher_update`, whose only forward action was the destructive
+/// resync) is retired with that surface: `ResetHard` now SAVES the working
+/// tree before resetting (`update_run::create_reset_backup`) instead of
+/// refusing on it.
 ///
-/// ORDER IS LOAD-BEARING, and it is the reason the caller's refusal moved in
-/// here rather than staying at its call site:
-///
-/// 1. **The in-progress merge/rebase refusal first** (v0.2.93 field incident).
-///    A clone left mid-merge must reopen the conflict modal on the stalled
-///    state. Running a caller refusal first would answer a wedged tree with a
-///    message about the `UU` entries the wedge itself left behind — which is
-///    precisely what `apply_launcher_update` used to do, having no
-///    in-progress pre-flight at all and a dirty-tree guard that fired on the
-///    conflict markers.
-/// 2. **Then the caller's own refusal** ([`ExtraPreflight`]).
-///
-/// Both are refusals, so nothing is mutated on either path: no sentinel clear,
-/// no kill-sweep, no hub stop, no rename.
-async fn run_preflight_refusals(
+/// Git reads only, so it is drivable over a temp repo.
+pub(crate) async fn run_preflight_refusals(
     install_path: &Path,
     surface: &'static str,
-    extra: &ExtraPreflight<'_>,
 ) -> Result<(), UpdatePipelineError> {
     // v0.2.93 (field incident 2026-09-07): a merge/rebase is ALREADY in
     // progress in the clone → do NOT start a fresh pull (it would only be
@@ -575,40 +467,16 @@ async fn run_preflight_refusals(
         // lands before the caller returns, exactly as it does today.
         return Err(UpdatePipelineError::MergeInProgress {
             payload,
-            at_preflight: true,
         });
     }
 
-    let ExtraPreflight::RefuseDirtyTrackedAtRisk { branch } = extra else {
-        return Ok(());
-    };
-
-    // v0.2.95: the guard asks whether any dirty tracked path can be HURT by
-    // this pull, which is only answerable against the upstream tip — so the
-    // caller has already fetched. A `git status` we cannot read is itself a
-    // refusal: this surface's recovery is destructive, and inspecting the tree
-    // is the whole basis for offering it.
-    let dirty = crate::commands::git_cmd::run_git_raw(install_path, &["status", "--porcelain", "-z"])
-        .await
-        .map_err(UpdatePipelineError::Raw)?;
-    if !dirty.status.success() {
-        return Err(UpdatePipelineError::Raw(format!(
-            "git status failed in {} — refusing to update a tree we could not inspect.",
-            install_path.display()
-        )));
-    }
-    match crate::commands::self_update::first_change_at_risk(install_path, branch, &dirty.stdout)
-        .await
-    {
-        Some(path) => Err(UpdatePipelineError::DirtyTrackedAtRisk { path }),
-        None => Ok(()),
-    }
+    Ok(())
 }
 
 /// The git-only core of the pipeline: fetch → A0 → F1 → generated reconcile →
 /// pull-plan → pull → classification → HEAD-advance.
 ///
-/// Split out from [`prepare_and_pull_orchestrator_repo`] so it can be driven in
+/// Split out from [`pull_to_upstream`] so it can be driven in
 /// a test against a temp repo pair. The steps it does NOT contain are exactly
 /// the ones a test must not run on a developer's machine: the MCP kill-sweep
 /// and the hub stop both reach into the live process table.
@@ -688,9 +556,9 @@ async fn reconcile_and_pull(
     // the bare pull below surfaces the real error; we still attempt pre-merge
     // with whatever refs exist. The mutex + `--no-write-fetch-head` protect
     // against the FETCH_HEAD race with the startup badge check (A-RC3).
-    if let Err(e) = crate::commands::self_update::serialized_fetch_upstream(
+    if let Err(e) = crate::commands::upstream_fetch::serialized_fetch_upstream(
         &install_path,
-        crate::commands::self_update::FetchPolicy::Quick,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
         Some(&pull_branch),
     )
     .await
@@ -777,9 +645,9 @@ async fn reconcile_and_pull(
     // modal surfaces, never a wrong silent auto-merge.)
     //
     // v0.2.71 (Piece 3): the pull-strategy decision is now the SHARED
-    // `resolve_divergence_pull_plan` in `git_user_editable_merge` (used by
-    // BOTH update surfaces — this command AND `self_update::apply_launcher_update`
-    // — so the two can't drift). The decision tree is identical to the
+    // `resolve_divergence_pull_plan` in `git_user_editable_merge` (then used
+    // by both update surfaces so they couldn't drift; since v0.2.100 this
+    // sequence is the only caller). The decision tree is identical to the
     // pre-v0.2.71 inline block: pre_merge_committed → RebaseAutostash; else
     // resolve theirs/base + pop-conflict-risk + merge-tree probe → RealMerge
     // when clean & no risk, FfOnly otherwise (conservative on any uncertainty).
@@ -805,16 +673,16 @@ async fn reconcile_and_pull(
     // locally-modified file between our pre-check and the pull's own fetch)
     // → caught by the post-pull autostash-pop backstop below, NOT silently
     // continued. NOTE (review C1): after a RealMerge, local HEAD is a merge
-    // commit; if the user updated inside the post-tag binary-refresh window,
-    // `WaitForBinaryRefresh`'s `--ff-only` re-pull soft-fails+times out and
-    // the v0.2.55 finalize recovery handles it (self-heals next update).
+    // commit. (The post-tag binary-refresh window no longer re-pulls: since
+    // v0.2.100 phase 11 reads the dist sidecars once — `update_run::
+    // decide_binary_refresh` — and records a not-yet-published binary.)
     // v0.2.78 ITEM #0 (F1): before deciding the pull plan, auto-restore any
     // TRACKED uncommitted file whose working-tree content is byte-identical to
     // the incoming upstream blob. Such a file is not a real modification (its
     // content already == the merge target), so it should not force the
     // divergence modal via the pop-conflict-risk set. Byte-identity-gated
     // (never mtime/size); divergent files are left in the risk set → modal.
-    // Shared helper — the self_update surface calls the SAME fn (one home).
+    // Shared helper (one home).
     let f1_restored =
         crate::commands::git_user_editable_merge::auto_restore_byte_identical_tracked_mods(
             &install_path,
@@ -981,7 +849,6 @@ async fn reconcile_and_pull(
                     &combined,
                 )
                 .await,
-                at_preflight: false,
             });
         }
 
@@ -993,7 +860,8 @@ async fn reconcile_and_pull(
         // rendered zero files and no actionable resolution, degrading to a bare
         // FAILED toast. The colliding paths ARE in the stderr, unparsed.
         //
-        // `update_orchestrator`'s inline pull is the ONE surface that lacked the
+        // The pull sequence (pre-v0.2.100: `update_orchestrator`'s inline pull)
+        // is the ONE path that lacked the
         // pre-pull `handle_untracked_collisions_pre_pull` guard (which only
         // fronts the modal-triggered merge/rebase resolvers). This POST-pull
         // classifier closes that gap by parsing the file list out of the stderr
@@ -1418,20 +1286,427 @@ async fn reconcile_and_pull(
 }
 
 // ---------------------------------------------------------------------------
+// v0.2.100 WP-03b (F-W2-06): the Merge / Rebase / Resume git operations
+// ---------------------------------------------------------------------------
+//
+// Moved out of the three legacy `#[command]`s (`merge_orchestrator_with_
+// upstream`, `rebase_orchestrator_onto_upstream`, `resume_orchestrator_update`)
+// that each ran their own copy of the update tail. Here they are ONLY the git
+// operation of phase 6 of `update_run::run_update`: the hub stop, the binary
+// renames, install.py, the restart and every recovery are the pipeline's.
+// None of these functions restores the binaries or restarts the hub — the
+// driver does, once, on every failure leg.
+
+/// What a divergence-recovery git operation established.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RecoveryGitOp {
+    /// Nothing was merged/replayed — install.py is not run.
+    pub already_up_to_date: bool,
+    pub branch: String,
+}
+
+fn progress(window: Option<&Window>, message: &str, pct: f32) {
+    if let Some(w) = window {
+        emit_progress(w, "update", message, pct);
+    }
+}
+
+/// A merge/rebase that stopped on conflicts: write the resume sentinel +
+/// deferral (the badge's "Continue update"), then report the condition.
+async fn stopped_on_conflict(
+    install_path: &Path,
+    surface: &'static str,
+    operation: &'static str,
+    branch: &str,
+    conflicted: Vec<String>,
+    detail: &str,
+) -> UpdatePipelineError {
+    let sentinel_written = write_resume_sentinel_and_deferral(install_path, operation, branch).await;
+    log_conflict_payload_return(surface, operation, &conflicted, sentinel_written);
+    UpdatePipelineError::Conflict {
+        operation,
+        branch: branch.to_string(),
+        conflicted,
+        detail: detail.trim().to_string(),
+        record_binary_clobber_averted: false,
+    }
+}
+
+/// `git pull --autostash` can EXIT 0 with the stash pop conflicted (`UU`
+/// entries + a dangling stash). The index is the authority: unmerged entries
+/// route to the conflict modal; an autostash marker with none is a clean pop.
+async fn unmerged_after_success(install_path: &Path, surface: &'static str, output: &str) -> Vec<String> {
+    let marker = output.contains("autostash resulted in conflicts")
+        || output.contains("Applying autostash")
+        || output.contains("could not apply autostash");
+    let unmerged = collect_conflicted_files(install_path).await;
+    if marker && unmerged.is_empty() {
+        tracing::warn!(
+            "[vct] {}: autostash marker present but the index has NO unmerged entries — \
+             the pop left the tree clean; continuing.",
+            surface
+        );
+    }
+    unmerged
+}
+
+fn combined_output(out: &std::process::Output) -> String {
+    format!(
+        "{}\n{}",
+        String::from_utf8_lossy(&out.stderr),
+        String::from_utf8_lossy(&out.stdout)
+    )
+}
+
+/// `Merge`: merge `vco_upstream/<branch>` into the diverged clone
+/// (`git pull --no-rebase --no-edit --autostash`), after the §A0 pre-merge of
+/// user-editable files, the untracked-collision pre-pass and the
+/// generated-file reconcile — the same preparation the legacy command ran.
+pub(crate) async fn merge_upstream(
+    install_path: &Path,
+    surface: &'static str,
+    window: Option<&Window>,
+) -> Result<RecoveryGitOp, UpdatePipelineError> {
+    let branch = crate::commands::installer::resolve_pull_branch(install_path).await;
+    progress(window, "Fetching upstream for pre-merge...", 7.0);
+    // Soft-fail: a failed fetch falls through to the pull, which reports it.
+    if let Err(e) = crate::commands::upstream_fetch::serialized_fetch_upstream(
+        install_path,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
+        Some(&branch),
+    )
+    .await
+    {
+        tracing::warn!("[vct] {}: pre-merge fetch failed: {} — continuing", surface, e);
+    }
+    let pre_merge = run_pre_merge_user_editable(install_path, &branch).await;
+    maybe_emit_pre_merge_deferrals(install_path, &pre_merge, &branch);
+
+    progress(window, "Checking for untracked-file collisions...", 8.0);
+    crate::commands::installer::handle_untracked_collisions_pre_pull(install_path, "merge", &branch)
+        .await
+        .map_err(|payload| UpdatePipelineError::UntrackedCollision { payload })?;
+
+    progress(window, "Reconciling generated files to upstream...", 9.0);
+    let gen_reconcile =
+        crate::commands::git_user_editable_merge::resolve_generated_files_to_upstream(
+            install_path,
+            &branch,
+        )
+        .await;
+
+    // --no-rebase: git 2.34+ refuses a divergent pull without an explicit
+    // reconcile mode. --no-edit: no tty for the merge message. --autostash:
+    // the divergence modal is reached on dirty trees (v0.2.71).
+    progress(window, "Merging upstream into local...", 10.0);
+    let pull = crate::commands::git_cmd::run_git_raw(
+        install_path,
+        &[
+            "pull",
+            "--no-rebase",
+            "--no-edit",
+            "--autostash",
+            crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+            branch.as_str(),
+        ],
+    )
+    .await
+    .map_err(|e| UpdatePipelineError::Raw(format!("git pull (merge) failed: {}", e)))?;
+    let combined = combined_output(&pull);
+
+    if !pull.status.success() {
+        // The first click's merge is still in progress (v0.2.93 incident).
+        if crate::commands::git_user_editable_merge::is_merge_in_progress_refusal(&combined) {
+            let payload =
+                handle_merge_in_progress_refusal(install_path, surface, &branch, "merge", &combined)
+                    .await;
+            return Err(UpdatePipelineError::MergeInProgress {
+                payload,
+            });
+        }
+        if is_merge_or_rebase_conflict(&combined) {
+            let conflicted = collect_conflicted_files(install_path).await;
+            return Err(
+                stopped_on_conflict(install_path, surface, "merge", &branch, conflicted, &combined)
+                    .await,
+            );
+        }
+        let stderr = String::from_utf8_lossy(&pull.stderr).to_string();
+        log_generic_pull_failure(surface, "git pull (merge)", &stderr);
+        return Err(UpdatePipelineError::Raw(format!(
+            "git pull (merge) failed: {}",
+            stderr.trim()
+        )));
+    }
+
+    let unmerged = unmerged_after_success(install_path, surface, &combined).await;
+    if !unmerged.is_empty() {
+        return Err(
+            stopped_on_conflict(install_path, surface, "merge", &branch, unmerged, &combined).await,
+        );
+    }
+    if String::from_utf8_lossy(&pull.stdout).contains("Already up to date") {
+        return Ok(RecoveryGitOp {
+            already_up_to_date: true,
+            branch,
+        });
+    }
+    // After the merge landed, not before: the audit deferral injects a block
+    // into the tracked CLAUDE.md (v0.2.89 MINOR-1).
+    crate::commands::git_user_editable_merge::emit_generated_reconcile_deferrals(
+        install_path,
+        &gen_reconcile,
+    );
+    Ok(RecoveryGitOp {
+        already_up_to_date: false,
+        branch,
+    })
+}
+
+/// `Rebase`: replay the clone's local commits onto `vco_upstream/<branch>`
+/// (`git rebase --autostash`), after a HARD fetch (the rebase needs the ref)
+/// and the untracked-collision pre-pass.
+pub(crate) async fn rebase_onto_upstream(
+    install_path: &Path,
+    surface: &'static str,
+    window: Option<&Window>,
+) -> Result<RecoveryGitOp, UpdatePipelineError> {
+    let branch = crate::commands::installer::resolve_pull_branch(install_path).await;
+    progress(window, "Fetching upstream for rebase...", 10.0);
+    crate::commands::upstream_fetch::serialized_fetch_upstream(
+        install_path,
+        crate::commands::upstream_fetch::FetchPolicy::Quick,
+        Some(&branch),
+    )
+    .await
+    .map_err(|e| UpdatePipelineError::Raw(format!("git fetch failed: {}", e)))?;
+
+    progress(window, "Checking for untracked-file collisions...", 15.0);
+    crate::commands::installer::handle_untracked_collisions_pre_pull(install_path, "rebase", &branch)
+        .await
+        .map_err(|payload| UpdatePipelineError::UntrackedCollision { payload })?;
+
+    progress(window, "Rebasing local onto upstream...", 20.0);
+    let upstream_ref = format!(
+        "{}/{}",
+        crate::commands::self_update::VCO_UPSTREAM_REMOTE,
+        branch
+    );
+    let rebase = crate::commands::git_cmd::run_git_raw(
+        install_path,
+        &["rebase", "--autostash", upstream_ref.as_str()],
+    )
+    .await
+    .map_err(|e| UpdatePipelineError::Raw(format!("git rebase failed: {}", e)))?;
+    let combined = combined_output(&rebase);
+
+    if !rebase.status.success() {
+        if is_merge_or_rebase_conflict(&combined) {
+            let conflicted = collect_conflicted_files(install_path).await;
+            return Err(
+                stopped_on_conflict(install_path, surface, "rebase", &branch, conflicted, &combined)
+                    .await,
+            );
+        }
+        let stderr = String::from_utf8_lossy(&rebase.stderr).to_string();
+        log_generic_pull_failure(surface, "git rebase", &stderr);
+        return Err(UpdatePipelineError::Raw(format!(
+            "git rebase failed: {}",
+            stderr.trim()
+        )));
+    }
+    let unmerged = unmerged_after_success(install_path, surface, &combined).await;
+    if !unmerged.is_empty() {
+        return Err(
+            stopped_on_conflict(install_path, surface, "rebase", &branch, unmerged, &combined)
+                .await,
+        );
+    }
+    let up_to_date = combined.contains("is up to date");
+    Ok(RecoveryGitOp {
+        already_up_to_date: up_to_date,
+        branch,
+    })
+}
+
+/// `Resume`'s verdict on the clone, decided from the resume sentinel and git
+/// state. Read-only: preflight asks it (refusals before any mutation) and the
+/// git operation asks it again (the tree may have moved in between).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ResumeVerdict {
+    /// A resolved merge/rebase awaits install.py.
+    Proceed { branch: String },
+    /// HEAD never moved past the conflict SHA and the clone is not behind:
+    /// the merge was aborted and there is nothing to resume or apply.
+    NothingPending { branch: String },
+    /// Refused. `stale_sentinel`: the sentinel provably describes nothing
+    /// (HEAD unchanged) — the caller clears it so the badge stops offering a
+    /// resume that cannot happen.
+    Refuse {
+        code: &'static str,
+        message: String,
+        stale_sentinel: bool,
+    },
+}
+
+pub(crate) async fn classify_resume(install_path: &Path) -> ResumeVerdict {
+    use crate::commands::installer::{
+        classify_resume_noop, detect_remaining_conflict_markers, read_update_resume_sentinel,
+        resume_head_unchanged_is_benign_noop, ResumeNoopKind,
+    };
+    let refuse = |code, message: String, stale_sentinel| ResumeVerdict::Refuse {
+        code,
+        message,
+        stale_sentinel,
+    };
+    let Some(sentinel) = read_update_resume_sentinel(install_path) else {
+        return refuse(
+            "resume_not_pending",
+            "No resume pending: no update halted at a conflict in this clone. Refresh the \
+             update status; nothing was changed."
+                .into(),
+            false,
+        );
+    };
+    if sentinel.sha_at_conflict.is_empty() {
+        return refuse(
+            "resume_sentinel_unverifiable",
+            "The resume record is missing the conflict-time commit, so the clone's baseline \
+             cannot be verified and the resume is refused. Run the normal update (it writes a \
+             fresh record), or finish/abort the merge with `git status` in the clone."
+                .into(),
+            false,
+        );
+    }
+    let head = read_head_sha(install_path).await.unwrap_or_default();
+    let branch = if sentinel.branch.is_empty() {
+        crate::commands::installer::resolve_pull_branch(install_path).await
+    } else {
+        sentinel.branch.clone()
+    };
+    if resume_head_unchanged_is_benign_noop(&sentinel.sha_at_conflict, &head) {
+        let remote = crate::commands::self_update::VCO_UPSTREAM_REMOTE;
+        return match crate::commands::git_cmd::commits_behind(install_path, remote, &branch).await {
+            Err(e) => refuse(
+                "resume_state_unverifiable",
+                format!(
+                    "Nothing was resumed, and the update state could not be verified (couldn't \
+                     count commits behind {}/{}: {}). Run the normal update to be sure you are \
+                     on the latest version.",
+                    remote, branch, e
+                ),
+                true,
+            ),
+            Ok(behind) => match classify_resume_noop(behind) {
+                ResumeNoopKind::TrulyNothingPending => ResumeVerdict::NothingPending { branch },
+                ResumeNoopKind::UpdateStillPending { behind } => refuse(
+                    "resume_nothing_to_resume",
+                    format!(
+                        "Nothing to resume — the earlier update never applied (HEAD is still \
+                         {} commit(s) behind {}/{}). Run the normal update to fetch and \
+                         install the new version.",
+                        behind, remote, branch
+                    ),
+                    true,
+                ),
+            },
+        };
+    }
+    let markers = detect_remaining_conflict_markers(install_path).await;
+    if !markers.is_empty() {
+        let head_list = markers.iter().take(8).cloned().collect::<Vec<_>>().join(", ");
+        let more = if markers.len() > 8 { ", …" } else { "" };
+        let how = if sentinel.operation == "autostash-pop" {
+            "For EACH file pick one side — `git checkout --ours -- <file>` (keep the update) or \
+             `git checkout --theirs -- <file>` (keep your edit) — then `git add -- <file>` and \
+             `git stash drop 'stash@{0}'` (see .claude/context/UPDATE_DEFERRED.md). Do NOT \
+             `git commit --amend` — the merge already committed."
+        } else {
+            "Remove the `<<<<<<<` / `=======` / `>>>>>>>` markers, `git add` + commit the fix."
+        };
+        return refuse(
+            "resume_conflict_markers_remain",
+            format!(
+                "Found unresolved conflict markers in {} file(s): {}{}. {} Then continue the \
+                 update again.",
+                markers.len(),
+                head_list,
+                more,
+                how
+            ),
+            false,
+        );
+    }
+    ResumeVerdict::Proceed { branch }
+}
+
+// ---------------------------------------------------------------------------
 // `install.py --update` — the artefact-application step, one home
 // ---------------------------------------------------------------------------
 
 /// What `install.py --update` did. Everything the callers branch on, and
 /// nothing they do not: the recovery (revert the binaries, restart the hub,
 /// reopen the DB) is each caller's, because each holds different things open.
+///
+/// v0.2.100 (WP-03a, L2-F10): the failure REASON travels with the run. The
+/// docstring used to promise "stdout is deliberately NOT carried … no caller
+/// branches on it"; that was true, and it is exactly why a failure whose only
+/// text was on stdout (or a signal death with empty stderr) reached the user as
+/// "Update failed: Update failed:". The promise is superseded by the reader
+/// that now exists — `update_failure::failure_message` — which is why the exit
+/// facts and a BOUNDED stdout tail are carried below.
 pub(crate) struct InstallPyRun {
     pub success: bool,
-    /// install.py's stderr, for the caller's failure message. `stdout` is
-    /// deliberately NOT carried: it is consumed inside — streamed to the
-    /// progress modal when the caller asked for that, and handed to
-    /// `handle_install_phase_exit` either way — and no caller branches on it.
-    /// An unread field is the same defect one layer down.
+    /// install.py's full stderr. The legacy surfaces still quote it; the one
+    /// pipeline renders [`crate::commands::update_failure::failure_message`].
     pub stderr: String,
+    /// `ExitStatus::code()` — `None` when the process was killed by a signal.
+    pub exit_code: Option<i32>,
+    /// The terminating signal on Unix when `exit_code` is `None`.
+    pub signal: Option<i32>,
+    /// The last `[N/M]` step banner install.py printed, from the FULL output
+    /// (computed before the stdout tail is cut, so an early marker survives).
+    pub last_step: Option<String>,
+    /// The last [`STDOUT_TAIL_MAX_LINES`] lines of stdout (at most
+    /// [`STDOUT_TAIL_MAX_BYTES`]) — the failure reason when stderr is empty.
+    pub stdout_tail: String,
+}
+
+/// Bound on the stdout tail [`InstallPyRun`] keeps. install.py's stdout is the
+/// whole install transcript (thousands of lines); only its end explains a
+/// failure, and the message it feeds is a modal, not a log.
+pub(crate) const STDOUT_TAIL_MAX_LINES: usize = 40;
+/// Byte bound on the same tail (a single pathological line cannot blow it up).
+pub(crate) const STDOUT_TAIL_MAX_BYTES: usize = 16 * 1024;
+
+/// The last `max_lines` lines of `text`, then at most `max_bytes` from the end
+/// (cut on a char boundary). Pure; one home for "bounded tail".
+pub(crate) fn bounded_tail(text: &str, max_lines: usize, max_bytes: usize) -> String {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let start = lines.len().saturating_sub(max_lines);
+    let joined = lines[start..].join("\n");
+    if joined.len() <= max_bytes {
+        return joined;
+    }
+    let mut cut = joined.len() - max_bytes;
+    while !joined.is_char_boundary(cut) {
+        cut += 1;
+    }
+    joined[cut..].to_string()
+}
+
+/// The terminating signal of a finished process, when there is one.
+fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
 }
 
 /// Run `python install.py --update` in `install_path`, record the outcome, and
@@ -1439,7 +1714,7 @@ pub(crate) struct InstallPyRun {
 ///
 /// ONE HOME, because this is ledger step 31 — "artefact application" was a true
 /// duplicate of intent with three implementations, and phase 2 adds a fourth
-/// caller (`self_update::apply_launcher_update`, which until now applied
+/// caller (`self_update::apply_launcher_update`, which until then applied
 /// artefacts with `cargo build` instead and shipped a half-updated install).
 /// Writing a fourth copy is the thing the project's modularity rule forbids, so
 /// the two `--update` spawns that differ only in whether they stream progress
@@ -1675,9 +1950,20 @@ pub(crate) async fn run_install_py_update(
         &stderr,
     );
 
+    let last_step = crate::commands::installer::classify_install_phase_exit(
+        false,
+        status.code(),
+        &stdout,
+        &stderr,
+    )
+    .and_then(|f| f.last_step);
     Ok(InstallPyRun {
         success: status.success(),
         stderr,
+        exit_code: status.code(),
+        signal: exit_signal(&status),
+        last_step,
+        stdout_tail: bounded_tail(&stdout, STDOUT_TAIL_MAX_LINES, STDOUT_TAIL_MAX_BYTES),
     })
 }
 
@@ -1891,6 +2177,65 @@ mod tests {
         );
     }
 
+    /// v0.2.100 WP-03a (L2-F10): a failing install.py's reason travels with
+    /// the run — exit code, the last `[N/M]` marker from the FULL output (an
+    /// early marker survives the tail cut), and a BOUNDED stdout tail — so a
+    /// stdout-only failure is no longer rendered as an empty reason.
+    #[tokio::test]
+    async fn install_py_run_carries_exit_code_step_marker_and_bounded_stdout_tail() {
+        let Some(python) = python_cmd_for_tests() else {
+            eprintln!("skipping: no python on PATH");
+            return;
+        };
+        let td = tempfile::tempdir().expect("tempdir");
+        std::fs::write(
+            td.path().join("install.py"),
+            "import sys\n\
+             print('[5/10] Starting services')\n\
+             for i in range(200):\n    print('noise line %d' % i)\n\
+             print('ERROR: compose up failed')\n\
+             sys.stdout.flush()\n\
+             sys.exit(3)\n",
+        )
+        .unwrap();
+        let run = run_install_py_update(td.path(), python, "wp03a_stdout_tail", None)
+            .await
+            .expect("spawned");
+        assert!(!run.success);
+        assert_eq!(run.exit_code, Some(3));
+        assert_eq!(run.signal, None);
+        assert_eq!(run.last_step.as_deref(), Some("[5/10]"), "marker from the full output");
+        assert!(run.stdout_tail.ends_with("ERROR: compose up failed"), "{:?}", run.stdout_tail);
+        assert!(run.stdout_tail.lines().count() <= STDOUT_TAIL_MAX_LINES);
+        assert!(!run.stdout_tail.contains("[5/10]"), "the tail is bounded, the marker is not");
+    }
+
+    #[test]
+    fn bounded_tail_keeps_the_end_by_lines_then_bytes() {
+        let text = (1..=10).map(|i| format!("l{i}")).collect::<Vec<_>>().join("\n");
+        assert_eq!(bounded_tail(&text, 3, 1000), "l8\nl9\nl10");
+        assert_eq!(bounded_tail(&text, 3, 3), "l10");
+        assert_eq!(bounded_tail("", 3, 10), "");
+        // never splits a multi-byte char
+        assert_eq!(bounded_tail("é€", 1, 3), "€");
+    }
+
+    /// The hub-stop pre-check refuses ONLY an unreadable pid file — the one
+    /// refusal of the hub stop decidable without killing anything — and lets
+    /// an absent or readable one through (leave-alone).
+    #[test]
+    fn hub_stop_precheck_refuses_only_an_unreadable_pid_file() {
+        let td = tempfile::tempdir().unwrap();
+        let pid = td.path().join("hub.pid");
+        assert!(hub_stop_precheck_at(&pid).is_ok(), "absent = no hub");
+        std::fs::write(&pid, "12345\n").unwrap();
+        assert!(hub_stop_precheck_at(&pid).is_ok(), "readable = the stop decides");
+        std::fs::remove_file(&pid).unwrap();
+        std::fs::create_dir(&pid).unwrap(); // a directory cannot be read as a file
+        let err = hub_stop_precheck_at(&pid).expect_err("unreadable refuses");
+        assert!(err.contains("before anything was changed"), "{err}");
+    }
+
     /// The rendered body an install writes over the tracked stub: the user's
     /// own text OUTSIDE the AUTO markers plus the rendered template between
     /// them. That outside text is uncommitted and exists NOWHERE else, which is
@@ -2014,8 +2359,8 @@ mod tests {
     // -----------------------------------------------------------------
     //
     // BOTH ARMS of the branch that gates the destructive tree-write on every
-    // update surface. The act it gates differs per caller — a `git pull`, a
-    // `git rebase`, `force_resync_launcher`'s `git reset --hard` — but the
+    // update kind. The act it gates differs per kind — a `git pull`, a
+    // `git rebase`, `ResetHard`'s `git reset --hard` — but the
     // decision is one, which is why it is a pure fn: the arms are drivable
     // without ever touching the live process table.
 
@@ -2102,7 +2447,7 @@ mod tests {
     // These are the both-arms tests this project requires of a branch that
     // gates a destructive act. The acts gated here are the MCP kill-sweep, the
     // HUB STOP, the two binary renames and the pull itself — everything
-    // `prepare_and_pull_orchestrator_repo` does after `run_preflight_refusals`
+    // the pipeline does after `run_preflight_refusals`
     // returns Ok. The refusal path is the "leave alone" arm, and it is the one
     // that matters: it is why a launcher update no longer stops the user's hub
     // before discovering it was never going to pull.
@@ -2122,49 +2467,6 @@ mod tests {
         (tmp, local)
     }
 
-    #[tokio::test]
-    async fn preflight_refuses_a_dirty_tracked_file_at_risk_only_when_the_caller_asks() {
-        if git_missing() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
-
-        // ARM 1 — the launcher-update surface ASKS, and is refused BY NAME.
-        // Its only forward action out of a divergence is a hard reset, so the
-        // pull must not put the user in front of that button.
-        let (_tmp, local) = clone_with_a_dirty_tracked_file_upstream_also_changed();
-        let refused = run_preflight_refusals(
-            &local,
-            "test_pipeline",
-            &ExtraPreflight::RefuseDirtyTrackedAtRisk { branch: "main" },
-        )
-        .await;
-        match refused {
-            Err(UpdatePipelineError::DirtyTrackedAtRisk { path }) => assert_eq!(
-                path, "README.md",
-                "the refusal must NAME the file whose content is at risk"
-            ),
-            other => panic!(
-                "a dirty tracked file upstream also changed must refuse on the surface \
-                 whose recovery is destructive; got {}",
-                describe(&other)
-            ),
-        }
-
-        // ARM 2 — the installer surface does NOT ask, and must NOT refuse, on
-        // the SAME tree. v0.2.58 removed exactly this gate after a real install
-        // hit the modal with 540 dirty entries; its recovery is a Merge /
-        // Rebase / Cancel modal, which destroys nothing.
-        let (_tmp2, local2) = clone_with_a_dirty_tracked_file_upstream_also_changed();
-        let allowed =
-            run_preflight_refusals(&local2, "test_pipeline", &ExtraPreflight::None).await;
-        assert!(
-            allowed.is_ok(),
-            "the installer surface must proceed on a tree the launcher surface refuses; \
-             got {}",
-            describe(&allowed)
-        );
-    }
 
     /// The v0.2.58 NARROWING, on the arm that asks: a dirty tracked file
     /// upstream did NOT touch is not at risk, and refusing on it is the blunt
@@ -2181,12 +2483,7 @@ mod tests {
         push_upstream_change(&seed, &local, "vco_lib/foo.py", "def upstream(): pass\n");
         std::fs::write(local.join("README.md"), "# dirty, but nobody upstream cares\n").unwrap();
 
-        let outcome = run_preflight_refusals(
-            &local,
-            "test_pipeline",
-            &ExtraPreflight::RefuseDirtyTrackedAtRisk { branch: "main" },
-        )
-        .await;
+        let outcome = run_preflight_refusals(&local, "test_pipeline").await;
         assert!(
             outcome.is_ok(),
             "only `tracked-modified ∩ upstream-changed` is at risk; got {}",
@@ -2218,18 +2515,12 @@ mod tests {
         )
         .unwrap();
 
-        let outcome = run_preflight_refusals(
-            &local,
-            "test_pipeline",
-            &ExtraPreflight::RefuseDirtyTrackedAtRisk { branch: "main" },
-        )
-        .await;
+        let outcome = run_preflight_refusals(&local, "test_pipeline").await;
         assert!(
             matches!(
                 outcome,
                 Err(UpdatePipelineError::MergeInProgress {
-                    at_preflight: true,
-                    ..
+                            ..
                 })
             ),
             "a wedged clone must reopen on the merge, not be told about the dirt the \
@@ -2238,124 +2529,6 @@ mod tests {
         );
     }
 
-    /// ANTI-DRIFT, and this time it can fail.
-    ///
-    /// REPLACES `git_user_editable_merge::tests::resolve_plan_anti_drift_both_
-    /// surfaces_agree`, which called ONE function TWICE with identical
-    /// arguments and asserted the results equal. `f(x) == f(x)` holds for every
-    /// possible implementation, including two surfaces that had drifted
-    /// completely — and its own doc named `pre_merge_committed` as the axis the
-    /// surfaces differ on while passing `false` on both sides.
-    ///
-    /// What actually needs guarding is the seam phase 2 created: ONE
-    /// classification, TWO renderings, because each surface's frontend parses
-    /// its own payload shape (`installer` → the three `orchestrator_update_*`
-    /// modals; `self_update` → `kind:"non_fast_forward"` → the resync modal).
-    /// So this drives the REAL pull sequence into a REAL divergence, takes the
-    /// ONE `UpdatePipelineError` it produces, and renders it through BOTH
-    /// surfaces' serialisers — asserting each produces the discriminator its
-    /// own modal keys on AND that the facts they share are identical.
-    ///
-    /// It fails if either surface stops rendering that classification, if a
-    /// discriminator is renamed out from under a modal, or if the two start
-    /// reporting different SHAs for one pull.
-    #[tokio::test]
-    async fn both_surfaces_render_the_same_pipeline_error_into_their_own_payload() {
-        if git_missing() {
-            eprintln!("skipping: git not on PATH");
-            return;
-        }
-        let (tmp, _remote, local) = init_repo_pair();
-        let seed = tmp.path().join("seed");
-
-        // A divergence neither the generated-file reconcile nor the merge-tree
-        // probe can fold: both sides changed the SAME source file, in the same
-        // place, in different ways. That is what forces the non-FF arm.
-        push_upstream_change(&seed, &local, "vco_lib/conflict.py", "UPSTREAM = 1\n");
-        std::fs::write(local.join("vco_lib/conflict.py"), "LOCAL = 2\n").unwrap();
-        let commit = |args: &[&str]| {
-            let out = StdCommand::new("git")
-                .args(args)
-                .current_dir(&local)
-                .output()
-                .expect("git");
-            assert!(out.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&out.stderr));
-        };
-        commit(&["add", "vco_lib/conflict.py"]);
-        commit(&["commit", "-m", "local edit to the same file"]);
-
-        let outcome = reconcile_and_pull(&local, "main".to_string(), &test_ctx()).await;
-        let Err(UpdatePipelineError::NonFastForward {
-            branch,
-            local_sha,
-            remote_sha,
-            diverged,
-            upstream_only,
-            local_only,
-            detail,
-        }) = outcome
-        else {
-            panic!(
-                "a both-sides conflicting change must classify as NonFastForward; got {}",
-                describe(&outcome)
-            );
-        };
-
-        // Surface A renders the divergence modal's payload …
-        let installer_payload = crate::commands::installer::serialize_orchestrator_non_ff_error(
-            &branch,
-            local_sha.as_deref(),
-            remote_sha.as_deref(),
-            &diverged,
-            &upstream_only,
-            &local_only,
-            &detail,
-        );
-        // … surface B renders the resync modal's, from the SAME values.
-        let self_update_payload = crate::commands::self_update::serialize_non_ff_error(
-            &branch,
-            local_sha.as_deref(),
-            remote_sha.as_deref(),
-            &detail,
-        );
-
-        let a: serde_json::Value =
-            serde_json::from_str(&installer_payload).expect("surface A's payload must be JSON");
-        let b: serde_json::Value =
-            serde_json::from_str(&self_update_payload).expect("surface B's payload must be JSON");
-
-        // Each carries the discriminator ITS OWN frontend keys on. These two
-        // strings are contracts with `lib/stores/updater.ts` and
-        // `routes/preferences/updates/+page.svelte`; renaming either silently
-        // degrades a modal to an opaque toast.
-        assert_eq!(
-            a.get("event").and_then(|v| v.as_str()),
-            Some("orchestrator_update_non_ff"),
-            "UpdateBadge's divergence modal keys on this event"
-        );
-        assert_eq!(
-            b.get("kind").and_then(|v| v.as_str()),
-            Some("non_fast_forward"),
-            "the Preferences resync modal keys on this kind"
-        );
-
-        // The FACTS must not diverge between the renderings — one pull, one
-        // branch, one pair of SHAs, however the two shapes spell them.
-        for field in ["branch", "local_sha", "remote_sha"] {
-            assert_eq!(
-                a.get(field),
-                b.get(field),
-                "the two surfaces must report the same `{field}` for one pull\n  A: {}\n  B: {}",
-                installer_payload,
-                self_update_payload
-            );
-        }
-        assert!(
-            a.get("local_sha").and_then(|v| v.as_str()).is_some(),
-            "the fixture must produce a real local SHA, else the equality above is vacuous: {}",
-            installer_payload
-        );
-    }
 
     /// Name an outcome for a panic message without needing `Debug` on the enum
     /// (its payload variants carry rendered JSON, which would swamp the line).
@@ -2363,7 +2536,6 @@ mod tests {
         match outcome {
             Ok(_) => "Ok",
             Err(UpdatePipelineError::MergeInProgress { .. }) => "Err(MergeInProgress)",
-            Err(UpdatePipelineError::DirtyTrackedAtRisk { .. }) => "Err(DirtyTrackedAtRisk)",
             Err(UpdatePipelineError::Conflict { .. }) => "Err(Conflict)",
             Err(UpdatePipelineError::AutostashPopConflict { .. }) => "Err(AutostashPopConflict)",
             Err(UpdatePipelineError::UntrackedCollision { .. }) => "Err(UntrackedCollision)",
@@ -2414,9 +2586,9 @@ mod tests {
     /// swap) had no path back to a fresh binary — every later update said
     /// "Already up to date" and changed nothing, forever.
     ///
-    /// `tests/test_v0291_binary_delivery_chain.py` pins the SIBLING branch
-    /// (inside `merge_orchestrator_with_upstream`, a Tauri command a Rust unit
-    /// test cannot reach) by source scan. This branch IS reachable, so it gets
+    /// `tests/test_v0291_binary_delivery_chain.py` pins the SIBLING leg
+    /// (`update_run::finish_recovery_git_op`, the Merge/Rebase/Resume
+    /// up-to-date result) by source scan. This branch IS reachable, so it gets
     /// the real thing: a clone at the upstream tip whose dist sidecar claims a
     /// version NEWER than the running binary must come back reporting the
     /// staleness. Only an actual `reconcile_dist_at_rest` call can produce

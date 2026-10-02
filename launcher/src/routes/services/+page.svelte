@@ -48,7 +48,9 @@
     describeSecretScope,
     describeSupervision,
     describeUsageLedger,
+    describeAgentDelivery,
     gatewayIsConfigured,
+    gatewayPanelReady,
     getModelGatewayStatus,
     inspectVSCodeTarget,
     listVSCodeTargets,
@@ -68,6 +70,7 @@
     VSCodeTarget,
     VSCodeWriteResult,
   } from '$lib/types/model-gateway';
+  import type { GatewayAgentsGate } from '$lib/api/model_gateway';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
@@ -160,7 +163,24 @@
   // Only ever set by a START, and only shown when the proof REFUSED.
   const gwDogfood = $derived(describeDogfood(gw));
   const gwWarnings = $derived(pointPanelWarnings(vsInspection));
-  const gwConfigured = $derived(gatewayIsConfigured(gw));
+  const gwConfigured = $derived(gatewayPanelReady(gw));
+  // v0.2.100 (AD-7): whether projects get the gateway agent definitions is
+  // decided in Python (`vco_lib.module_gated_delivery`); this card only
+  // shows the answer. Asked on mount and after an action that can change it
+  // — not on the 5 s poll, because it spawns a Python process.
+  let agentsGate = $state<GatewayAgentsGate | null>(null);
+  let agentsGateError = $state<string | null>(null);
+  const agentDelivery = $derived(describeAgentDelivery(agentsGate));
+
+  async function refreshAgentsGate() {
+    try {
+      agentsGate = await gatewayIsConfigured();
+      agentsGateError = null;
+    } catch (e) {
+      agentsGate = null;
+      agentsGateError = String(e);
+    }
+  }
 
   async function refreshGateway() {
     try {
@@ -224,6 +244,7 @@
         port: pointPanelPort(gw),
       });
       await refreshInspection();
+      await refreshAgentsGate();
     });
   }
 
@@ -254,6 +275,7 @@
     await gwAction(async () => {
       await setProjectRoutingGuidance(projectId, enabled);
       guidance = { ...guidance, [projectId]: enabled };
+      await refreshAgentsGate();
     });
   }
 
@@ -455,6 +477,7 @@
     await refresh();
     // Model gateway: its own probes, on the same 5 s cadence as the table.
     await refreshGateway();
+    await refreshAgentsGate();
     await refreshVSCodeTargets();
     // The per-project guidance list needs the project rows; load them if
     // this page was the entry point.
@@ -975,6 +998,29 @@
     {/if}
 
     <!-- ── CLAUDE.md routing guidance ────────────────────────────────── -->
+    <!-- ── Gateway agent definitions (v0.2.100, AD-7) ─────────────────── -->
+    {#if agentDelivery}
+      <p class="muted small" data-testid="gw-agent-delivery">
+        <strong>{agentDelivery.label}</strong> — {agentDelivery.detail}
+      </p>
+    {:else if agentsGateError}
+      <p class="muted small">Agent definitions: could not ask ({agentsGateError}).</p>
+    {/if}
+    {#if agentsGate?.agent_id_problems?.length}
+      <div class="banner warn" data-testid="gw-agent-id-problems">
+        These agent definitions name a gateway model id the gateway does not
+        know, so dispatching them fails:
+        <ul>
+          {#each agentsGate.agent_id_problems as pr}
+            <li>
+              <code>{pr.path}</code>: <code>{pr.model}</code>{#if pr.suggestions.length}
+                — did you mean <code>{pr.suggestions.join(' or ')}</code>?{/if}
+            </li>
+          {/each}
+        </ul>
+      </div>
+    {/if}
+
     {#if gwConfigured && $projects.projects.length > 0}
       <h3>Model-routing guidance in project CLAUDE.md</h3>
       <p class="muted small">
@@ -985,6 +1031,15 @@
         advice about models it cannot reach. Toggling re-renders only the
         VCO-managed region of that file; anything you wrote around it is
         untouched.
+      </p>
+      <p class="muted small">
+        The gateway <strong>agent definitions</strong> (<code>@glm-implementer</code>,
+        <code>@qwen-implementer</code> and the rest) do not depend on this
+        switch: they follow this machine — delivered to every project on its
+        next bundle update whenever the gateway is set up here and the panel
+        points at it. A project switched ON here always receives them; one
+        switched OFF has them removed. Each toggle runs that project's bundle
+        update straight away.
       </p>
       <ul class="gw-projects">
         {#each $projects.projects as p}

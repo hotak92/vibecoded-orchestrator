@@ -90,6 +90,27 @@ _RUST_STRIPPABLE_CONDITION_IDS = frozenset({
     "launcher_restart_required",
 })
 
+# v0.2.100 (WP-15, owner rule F-W2-08(c) — the ledger is merged into, never
+# clobbered): condition IDs a STANDALONE non-Python writer adds to the Markdown ONLY
+# (it runs when install.py did not complete, so Python cannot be assumed, and
+# it never writes the JSON sidecar). With a co-present JSON, `read()` used to
+# take the JSON verbatim — the Rust entry was invisible and the next Python
+# write erased it. It is now read from the Markdown and kept.
+#
+# MUST MATCH the callers of launcher/src-tauri/src/commands/
+# git_user_editable_merge.rs ``write_update_deferred_atomically`` (the one
+# standalone Rust writer): ``write_launcher_update_diverged_deferral``,
+# ``write_launcher_update_post_pull_unverified_deferral`` and
+# ``installer::write_update_resume_deferral`` — plus the hook-side Markdown
+# append in templates/hooks/_lib/route-touched-path.{sh,ps1}
+# (``gate_skipped_no_project_id``), the only other non-Python writer.
+_MARKDOWN_ONLY_CONDITION_IDS = frozenset({
+    "launcher_update_diverged",
+    "launcher_update_post_pull_unverified",
+    "update_resume_required",
+    "gate_skipped_no_project_id",
+})
+
 # Sidecar schema version — bump when the JSON shape changes so old readers
 # can detect/skip an incompatible sidecar and fall back to the Markdown.
 _JSON_SCHEMA_VERSION = 1
@@ -1488,6 +1509,7 @@ class DeferralReport:
             # (the surface Rust edits) so a restart-cleared section is
             # honoured even though Rust doesn't touch the JSON.
             md_present_cids: Optional[set] = None
+            md_text = ""
             if target.exists():
                 try:
                     md_text = target.read_text(encoding="utf-8")
@@ -1507,6 +1529,12 @@ class DeferralReport:
                     # Markdown = stale/partial .md → keep (P2a v0.2.75).
                     continue
                 report._entries.append(entry)
+            json_cids = {e.condition_id for e in json_entries}
+            if md_present_cids and (md_present_cids - json_cids) & _MARKDOWN_ONLY_CONDITION_IDS:
+                for entry in _parse_entries(md_text):
+                    if (entry.condition_id in _MARKDOWN_ONLY_CONDITION_IDS
+                            and entry.condition_id not in json_cids):
+                        report._entries.append(entry)
             return report
 
         # Fallback: no usable JSON sidecar → parse the Markdown.

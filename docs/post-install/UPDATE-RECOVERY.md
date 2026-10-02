@@ -137,6 +137,28 @@ Scope and caveats:
     (If you wait instead, the launcher's next boot self-heals once the
     deadline lapses.)
 
+### `<vct_root>/update.lock` (one update at a time, v0.2.100)
+
+- Written by the launcher while it runs an orchestrator update: two lines,
+  the launcher's pid and the Unix time of the claim. Removed when the
+  update ends inside that launcher; an update that ends by relaunching the
+  launcher can leave it behind naming the exited pid, and such a stale
+  claim (dead pid, or a pid reused by a newer process) is reaped by the
+  next launcher update and ignored by `install.py`.
+- A terminal `python install.py --update` reads it first
+  (`vco_lib/update_lock.py`). A live claim held by another process →
+  it stops with `ERROR: another update of this orchestrator is running`
+  and exit 1; wait for the launcher's update to finish. It proceeds when
+  the claim is stale, or when the holder is its own parent (the launcher
+  running this very install step). It never deletes the file.
+- When it cannot tell whether the holder is alive, it proceeds and prints
+  `[!] update.lock: could not tell …` followed by WHY — normally that the
+  interpreter has no `psutil` (and, on Windows, that the Win32 process
+  query failed too) — and the remedy: run `install.py` with the
+  orchestrator venv's Python, which has `psutil`, to enforce the lock.
+- Only delete it by hand when no launcher update is on screen and the pid
+  it names is not a running launcher.
+
 ### `<vct_root>/update.lock.json` (stage1 handoff contract, V52-AH, Windows)
 
 - Written by the launcher (or terminal `install.py --update`) when a
@@ -263,7 +285,7 @@ Scope and caveats:
 | **Update says "Already up to date", source IS current, but the launcher version never changes** | **stale dist binary (frozen exe) — see the stale-exe recipe below** | **v0.2.91+ heals it at boot/update-check; on older builds use the manual recipe** |
 | Hub still on old version after update | pre-v0.2.54 hub-restart-before-staging ordering | `vct-hub --stop` then relaunch the launcher |
 | **Preferences → Launcher updates has said "Up to date" for weeks, `Branch: HEAD`, `Commits behind: 0`, `Running:` and `Latest source release:` show the SAME version** | **detached HEAD on a build before v0.2.92 — the check was structurally blind, see below** | **update once by hand (below), then use the GUI's Reattach button** |
-| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **take this one hop from the MenuBar update badge instead (it runs `update_orchestrator`, which has used the precise risk set since v0.2.58); the refusal is narrowed on both surfaces from v0.2.95. Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
+| **Preferences → Launcher updates → "Update now" refuses with "Uncommitted changes on tracked file 'CLAUDE.md' would be lost"** | **you are on a build ≤ v0.2.94, whose clean-tree assertion predates the rendered-file class — `install.py` renders `CLAUDE.md` over its tracked blob on every run, so every orchestrator-root install is dirty there by construction and this surface refused all of them** | **on that build, take this one hop from the MenuBar update badge instead — on builds up to v0.2.94 the badge ran a separate update whose tree check already used the precise risk set (since v0.2.58); from v0.2.95 the two surfaces share that check, and from v0.2.100 they are one update. Or update from a terminal (`docs/INSTALL_RECOVERY.md` → "Update from the shell"). Do NOT revert `CLAUDE.md` — it discards your edits and the next render brings the refusal straight back** |
 | **GUI update stuck at "Seeding Weaviate KG" (or "Applying updates…") forever, no progress for many minutes** | **pipe deadlock on launchers ≤ v0.2.94 (2026-09-20 field incident): the old launcher read install.py's stdout to EOF before draining stderr, and install.py's KG-sync child inherited those pipes — its stderr (per-node tracebacks against a stale schema) filled the ~64 KiB OS pipe buffer, blocking the child mid-write, which blocked install.py in `subprocess.run`, which kept stdout open, so the launcher never saw EOF. Fixed on both ends: v0.2.95's launcher drains both pipes concurrently, and v0.2.96 routes every install child's output to per-run log files under `~/.vct/logs/` (`vco_lib/child_process.py`) so nothing large is ever written to the inherited pipes at all. A terminal run of `python install.py --update` cannot hang this way — a terminal drains both streams** | **kill the wedged `install.py` and its sync child (`ps -ef | grep -E "install.py|sync_knowledge_graph"`; the launcher's abort-recovery then records the failed phase as designed), relaunch the launcher, and finish via the update-resume flow (Continue Update badge, or `python install.py --update` from the install root). On v0.2.96+ the child's full output is in `~/.vct/logs/<stem>-*.log`, named in the failure message** |
 
 ---
@@ -416,16 +438,21 @@ running.
 
 ## Ordering guarantees (for maintainers)
 
-The shared finalize tail (`installer.rs::finalize_update_and_restart`)
-enforces, in order:
+Since v0.2.100 the ONE update pipeline (`update_run.rs::run_update`, the
+`run_orchestrator_update` command) enforces, in order, after install.py:
 
-1. `WaitForBinaryRefresh` (don't restart into a stale binary, V45-B);
-2. update-gate disarm (BEFORE any exit hop — `app.exit(0)` can kill the
-   process before RAII `Drop` runs on Windows);
-3. stage locked binaries (`<target>.new`) + handoff decision;
-4. **handoff active** → exit with the hub still STOPPED (so
-   `vct-hub.exe` is swappable; the relaunched launcher starts the new
-   hub) — **no handoff** → start the hub, then `restart_launcher`.
+1. update-gate disarm (phase 10, BEFORE any exit hop — `app.exit(0)` can
+   kill the process before RAII `Drop` runs on Windows); on POSIX the hub
+   restarts here, on Windows it waits for the handoff decision;
+2. the binary check (phase 11, `decide_binary_refresh`: one read of the
+   source, dist-launcher and dist-hub versions — no restart into a binary
+   that is not newer, V45-B; a lagging binary is recorded, not waited for);
+3. bookkeeping (phase 12: desktop shortcut, hardware re-detect flag);
+4. the relaunch (phase 13, `restart::relaunch`): version guard, then stage
+   locked binaries (`<target>.new`) + handoff decision — **handoff active**
+   → exit with the hub still STOPPED (so `vct-hub.exe` is swappable; the
+   relaunched launcher starts the new hub) — **no handoff** → start the
+   hub (Windows), then spawn the dist launcher.
 
 `vct-updater` enforces: swaps → write `update.result.json` → delete
 lock iff full success → relaunch → write `update.log`. The result file
@@ -433,10 +460,10 @@ preceding the relaunch is what makes the post-update toast reliable.
 
 ### v0.2.91: one home for the delivery chain, and repair at rest
 
-Step 3's staging + handoff pair now lives in
-`launcher/src-tauri/src/services/binary_freshness.rs` and is called from BOTH
-update surfaces (`installer::finalize_update_and_restart` and
-`self_update::finish_apply_after_pull`), so they cannot drift. The same module
+Step 4's staging + handoff pair lives in
+`launcher/src-tauri/src/services/binary_freshness.rs` (until v0.2.100 it was
+called from both update surfaces, so they could not drift; now from the one
+relaunch). The same module
 owns the Windows pre-pull rename, its **non-clobbering** revert, and the
 at-rest reconcile.
 

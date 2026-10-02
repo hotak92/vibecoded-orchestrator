@@ -27,7 +27,7 @@ use super::{ConflictStrategy, ORCHESTRATOR_MANAGED_PATHS, MERGE_BLOCK_END, MERGE
 /// a git repository (any ancestor contains `.git/`), the walker honors
 /// `.gitignore` + `.git/info/exclude` + `core.excludesFile` + `.ignore`
 /// files via the `ignore` crate (`WalkBuilder::standard_filters(true)`).
-/// This prevents `update_orchestrator_at` from propagating machine-local
+/// This prevents a copy install from propagating machine-local
 /// files between clones — `tools/vct-secrets/*.token`,
 /// `.claude/agents/`, `.claude/skills/`, `.claude/logs/`,
 /// `infrastructure/docker-compose.override.yml`, `state/`, etc. — which

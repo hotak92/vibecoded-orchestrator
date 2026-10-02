@@ -9,7 +9,7 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # PowerShell sibling of verify-container-ports.sh. Engine-agnostic:
 # detects "container says running but host port doesn't answer" for
 # both podman (state-DB desync) and docker (silent app-level crash).
-# Recovery is engine-specific: podman → rm -f + compose up; docker
+# Recovery is engine-specific: podman → guarded remove + compose up; docker
 # → restart.
 #
 # Engine selection: $env:VCT_CONTAINER_RUNTIME wins; otherwise prefer
@@ -31,7 +31,6 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 # MUST MATCH the record verify-container-ports.sh writes.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-. "$PSScriptRoot/_lib/compose-invocation.ps1"
 # R10 J5: the detached record-boot-refusal spawn below goes through the ONE
 # guarded spawn home (argument quoting, hidden window, soft-fail).
 . "$PSScriptRoot/_lib/resolve-powershell.ps1"
@@ -367,34 +366,23 @@ if ($zombies.Count -eq 0) {
 Write-Output "🩺 Container port-binding watchdog: $($zombies.Count) zombie state(s) detected"
 Write-Output "   (container says 'running' but host port is unbound AND container PID is dead)"
 
-$projectRoot = Resolve-Path (Join-Path $PSScriptRoot "..\..")
-# v0.2.97: the installer's compose (infrastructure/) FIRST — a VCO-managed
-# service is re-created under the project that owns it, never under the
-# legacy claude_mcp_servers/ home. Same tiers as ensure-containers (parity
-# with the .sh sibling).
-$composeDir = $null
-$composeCandidates = @(
-    $env:VCT_COMPOSE_DIR,
-    $env:VCT_INFRASTRUCTURE_DIR,
-    $(if ($env:VCT_ORCHESTRATOR_ROOT) { Join-Path $env:VCT_ORCHESTRATOR_ROOT "infrastructure" } else { $null }),
-    (Join-Path $projectRoot "infrastructure"),
-    (Join-Path $projectRoot "claude_mcp_servers"),
-    [string]$projectRoot
-)
-foreach ($path in $composeCandidates) {
-    if (-not $path) { continue }
-    if ((Test-Path (Join-Path $path "compose.yaml")) -or `
-        (Test-Path (Join-Path $path "compose.yml")) -or `
-        (Test-Path (Join-Path $path "docker-compose.yml"))) {
-        $composeDir = $path
-        break
-    }
-}
+$projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..")).Path
+# The compose dir: ONE home, _lib/compose-dir.ps1 (shared with
+# ensure-containers; parity with the .sh sibling) - the installer's
+# infrastructure\ first. v0.2.100 (L1-F17): a directory whose parent is not
+# the orchestrator clone is REFUSED.
+. (Join-Path $PSScriptRoot "_lib\compose-dir.ps1")
+$VcoComposeDir = Resolve-VcoComposeDir -RepoRoot $projectRoot
+$composeDir = $VcoComposeDir.Dir
+$composeDirRefusal = $VcoComposeDir.Refusal
 
 # v0.2.97 (plan invariant I1 + the zombie gate, parity with the .sh
 # sibling): only a VCO-managed service (launcher.db service_endpoints plan,
-# re-read above after the reconcile) is `rm -f`'d and re-created, by compose
-# naming that ONE service with `--no-deps`. An adopted container, or one
+# re-read above after the reconcile) is removed and re-created - by
+# `python -m vco_lib.service_lifecycle up --recreate` (v0.2.100 AD-4), which
+# removes it only AFTER the data-identity guard proved compose mounts its
+# live data, and composes that ONE service with `--no-deps` through the one
+# retry/heal home. An adopted container, or one
 # whose service has no row yet, is never removed. No readable plan ->
 # nothing is re-created.
 
@@ -424,46 +412,34 @@ foreach ($z in $zombies) {
             continue
         }
         $service = [string]$policy.service
-        $upArgs = $null
-        try {
-            $upArgs = @(((& $RunPy -m vco_lib.service_lifecycle compose-args --json --services $service 2>$null | Out-String) | ConvertFrom-Json).args)
-        } catch { $upArgs = $null }
-        if (-not $upArgs -or $upArgs.Count -eq 0) {
-            Write-Output "     ! no compose argv for $service - $name left as is"
-            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "no compose argv"
+        # Podman state-DB desync: remove + recreate (`podman restart` is a
+        # no-op because Podman thinks the container is alive) - through the
+        # ONE guarded verb, never an `rm` here.
+        if ($composeDirRefusal) {
+            Write-Output "     ! $composeDirRefusal ($name left as is)"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "compose dir is not the orchestrator's infrastructure/"
             continue
         }
-        # Podman state-DB desync: force-rm + recreate. `podman restart`
-        # is a no-op because Podman thinks the container is alive.
-        & $runtime rm -f $name *>$null
-        if ($LASTEXITCODE -eq 0) {
-            if ($composeDir) {
-                Push-Location $composeDir
-                try {
-                    # v0.2.92: `$composeArgs[1..($composeArgs.Length - 1)]` is
-                    # the range `1..0` for a ONE-token compose command
-                    # (standalone `podman-compose`), which PowerShell evaluates
-                    # DESCENDING as @(1, 0) — invoking `podman-compose
-                    # podman-compose up -d <svc>`. Routed through the shared
-                    # splitter so all four hook sites share one correct rule.
-                    $composeInvocation = Split-VcoComposeCommand -ComposeCmd ($composeArgs -join ' ')
-                    & $composeInvocation.Head @($composeInvocation.Rest) @upArgs *>$null
-                    if ($LASTEXITCODE -ne 0) {
-                        Write-Output "     ! $($composeArgs -join ' ') $($upArgs -join ' ') failed; manual: cd $composeDir; $($composeArgs -join ' ') $($upArgs -join ' ')"
-                        Add-VcoLogRecovery -Name $name -Action "failed" -Detail "removed; compose up failed"
-                    } else {
-                        Add-VcoLogRecovery -Name $name -Action "recreated" -Detail ($upArgs -join ' ')
-                    }
-                } finally {
-                    Pop-Location
-                }
-            } else {
-                Write-Output "     ! could not auto-detect compose dir; manual: $($composeArgs -join ' ') $($upArgs -join ' ')"
-                Add-VcoLogRecovery -Name $name -Action "failed" -Detail "removed; no compose directory found"
-            }
-        } else {
-            Write-Output "     ! $runtime rm -f $name failed"
-            Add-VcoLogRecovery -Name $name -Action "failed" -Detail "$runtime rm -f failed"
+        if (-not $composeDir) {
+            Write-Output "     ! could not auto-detect the compose dir - $name left as is (set VCT_ORCHESTRATOR_ROOT; manual: $runtime start $name)"
+            Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "no compose directory found"
+            continue
+        }
+        $upRc = 1
+        try {
+            $upOut = @(& $RunPy -m vco_lib.service_lifecycle up --shell --services $service `
+                --recreate $service --compose-dir $composeDir --compose-cmd ($composeArgs -join ' ') `
+                --runtime $runtime 2>&1)
+            $upRc = $LASTEXITCODE
+        } catch { $upOut = @("$_"); $upRc = 1 }
+        foreach ($line in $upOut) {
+            $text = [string]$line
+            if ($text -and $text -notmatch '^vco_up_') { Write-Output "     $text" }
+        }
+        switch ($upRc) {
+            0 { Add-VcoLogRecovery -Name $name -Action "recreated" -Detail "service_lifecycle up --recreate $service" }
+            3 { Add-VcoLogRecovery -Name $name -Action "left_as_is" -Detail "recreate refused: data identity not proven" }
+            default { Add-VcoLogRecovery -Name $name -Action "failed" -Detail "service_lifecycle up exited $upRc" }
         }
     } else {
         # Docker silent-crash: state DB is reliable, so the app inside

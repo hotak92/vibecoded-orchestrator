@@ -20,6 +20,12 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #   * individual kill switch — VCO_STOP_FAILURE_NOTIFY=0 suppresses the
 #     desktop notification only (the ledger keeps recording); distinct from
 #     VCT_DISABLE_HOOKS, which exits before any work.
+#
+# v0.2.100 WP-17: the ledger promise above is now true on EVERY path, not just
+# the happy one. The real payload's string `error` + `last_assistant_message`
+# are parsed (F1); a core that cannot run (no Python, or it crashed) no longer
+# drops the event — PowerShell writes the fallback line itself; and a line
+# that cannot be written at all is reported on stderr, never swallowed.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
 
@@ -54,6 +60,15 @@ $StopFailureCore = @'
 # stdin: the raw StopFailure payload. Prints two lines on stdout:
 #   line 1: "1" (notify) or "0" (suppressed by the dedup window)
 #   line 2: "<error class>: <message>" for the desktop notification
+# A ledger line that could NOT be written is reported on stderr (never
+# silently): the ledger promise is "every event", toast or no toast.
+#
+# v0.2.100 WP-17 (F1): Claude Code's StopFailure payload carries `error` as
+# a STRING class ("rate_limit", "authentication_failed", "unknown", ...) and
+# the human text in `error_details` / `last_assistant_message` -- measured on
+# this machine's ledger, 14/14 real events. The parser read only a dict-shaped
+# `error`, so every real event became "unknown: raw payload ...". Both shapes
+# are read; the dict shape stays for older clients.
 import json
 import os
 import re
@@ -62,6 +77,7 @@ import time
 
 WINDOW_SECS = 300  # dedup: at most one notification per (project, class)
 RAW_CAP = 500      # truncated raw payload length for unexpected shapes
+MSG_CAP = 200      # one-line message length (notification + ledger)
 
 
 def _one_line(s):
@@ -87,6 +103,7 @@ def main():
     etype = "unknown"
     emsg = ""
     sid = ""
+    agent_type = ""
     try:
         d = json.loads(raw)
         if not isinstance(d, dict):
@@ -98,13 +115,24 @@ def main():
         if isinstance(err, dict):
             t = err.get("type")
             m = err.get("message")
-            if isinstance(t, str) and t:
+            if isinstance(t, str) and t.strip():
                 etype = _one_line(t)
-            if isinstance(m, str) and m:
-                emsg = _one_line(m)[:120]
+            if isinstance(m, str) and m.strip():
+                emsg = _one_line(m)[:MSG_CAP]
+        elif isinstance(err, str) and err.strip():
+            etype = _one_line(err)
+        if not emsg:
+            for key in ("error_details", "last_assistant_message"):
+                m = d.get(key)
+                if isinstance(m, str) and m.strip():
+                    emsg = _one_line(m)[:MSG_CAP]
+                    break
         v = d.get("session_id")
         if isinstance(v, str):
             sid = v[:8]
+        v = d.get("agent_type")
+        if isinstance(v, str):
+            agent_type = _one_line(v)[:64]
     if not emsg:
         # 2026-09-20 storm: 304 identical "unknown: No details" toasts
         # because the trust-failure payload has NO `error` key and the old
@@ -166,23 +194,33 @@ def main():
             # and a silent hook is worse than a repeated toast.
             notify = True
 
-    if metrics_dir:
-        line = json.dumps(
-            {
-                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                "project": project,
-                "session_id": sid,
-                "error_type": etype,
-                "error_message": emsg,
-            }
+    row = {
+        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "project": project,
+        "session_id": sid,
+        "error_type": etype,
+        "error_message": emsg,
+    }
+    if agent_type:
+        row["agent_type"] = agent_type
+    if not metrics_dir:
+        sys.stderr.write(
+            "stop-failure-notify: ledger line NOT written -- the metrics "
+            "directory could not be resolved (hooks/_lib/metrics-dir missing "
+            "or no HOME/VCT_STATE_DIR). Event: %s: %s\n" % (etype, emsg)
         )
+    else:
         try:
             with open(
                 os.path.join(metrics_dir, "failures.jsonl"), "a", encoding="utf-8"
             ) as fh:
-                fh.write(line + "\n")
-        except Exception:
-            pass
+                fh.write(json.dumps(row) + "\n")
+        except Exception as exc:
+            sys.stderr.write(
+                "stop-failure-notify: ledger line NOT written to %s (%s). "
+                "Event: %s: %s\n"
+                % (os.path.join(metrics_dir, "failures.jsonl"), exc, etype, emsg)
+            )
 
     msg = etype + ": " + emsg
     if notify and suppressed_note > 0:
@@ -201,15 +239,51 @@ try { $Payload = [Console]::In.ReadToEnd() } catch { }
 # by string interpolation -- any quote in a message corrupted the JSON.
 $NotifyFlag = "1"
 $NotifyMsg = "unknown: (core unavailable; see metrics ledger)"
-if ($PY -and $Payload -ne "") {
+# The core's stderr is NOT discarded: it reports a ledger line it could not
+# write. An EMPTY payload still runs the core -- an event with no payload is
+# still an event, and the ledger records it ("raw payload: ").
+$CoreRan = $false
+if ($PY) {
     try {
-        $CoreOut = ($Payload | & $PY -c $StopFailureCore $LogDir $ProjectName 2>$null)
+        $CoreOut = ($Payload | & $PY -c $StopFailureCore $LogDir $ProjectName)
         $CoreLines = @($CoreOut)
         if ($CoreLines.Count -ge 2) {
+            $CoreRan = $true
             $NotifyFlag = [string]$CoreLines[0]
             $NotifyMsg = ($CoreLines | Select-Object -Skip 1) -join " "
         }
     } catch { }
+}
+
+# v0.2.100 WP-17 -- the ledger promise when the core did not run (no
+# interpreter) or produced nothing (crashed before its ledger write): the
+# event is still recorded, natively. MUST MATCH the fallback in
+# stop-failure-notify.sh (same keys, same `ledger_writer` marker; ASCII-only
+# text so the line is valid JSON whatever the payload held).
+if (-not $CoreRan) {
+    $sfWhy = if ($PY) { "core unavailable" } else { "no Python interpreter" }
+    if ($LogDir) {
+        $sfRaw = if ($Payload.Length -gt 500) { $Payload.Substring(0, 500) } else { $Payload }
+        $sfRaw = ($sfRaw -replace '[\x00-\x1f]', ' ') -replace '[^\x00-\x7f]', '?'
+        $sfName = ($ProjectName -replace '[\x00-\x1f]', ' ') -replace '[^\x00-\x7f]', '?'
+        $sfRow = [ordered]@{
+            timestamp     = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+            project       = $sfName
+            session_id    = ""
+            error_type    = "unknown"
+            error_message = "raw payload ($sfWhy): $sfRaw"
+            ledger_writer = "shell-fallback"
+        }
+        $sfLedger = Join-Path $LogDir "failures.jsonl"
+        try {
+            $sfLine = ($sfRow | ConvertTo-Json -Compress -Depth 3)
+            [System.IO.File]::AppendAllText($sfLedger, $sfLine + "`n", (New-Object System.Text.UTF8Encoding $false))
+        } catch {
+            [Console]::Error.WriteLine("stop-failure-notify: ledger line NOT written to $sfLedger ($sfWhy; $($_.Exception.Message)).")
+        }
+    } else {
+        [Console]::Error.WriteLine("stop-failure-notify: ledger line NOT written -- $sfWhy and the metrics directory could not be resolved (hooks/_lib/metrics-dir.ps1 missing?).")
+    }
 }
 
 # Individual kill switch (v0.2.96 WP-8): VCO_STOP_FAILURE_NOTIFY=0 suppresses

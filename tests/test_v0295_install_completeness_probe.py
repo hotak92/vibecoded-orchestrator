@@ -2,9 +2,11 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.95 WP-2 — ``install_completeness``, the half-executed-install detector.
 
-The state under test, in one sentence: the launcher's ``apply_launcher_update``
-/ ``force_resync_launcher`` / ``update_orchestrator_at`` advance the whole
-source tree, rebuild only the launcher, never run ``install.py``, and then call
+The state under test, in one sentence: on launchers up to v0.2.99 the
+``apply_launcher_update`` / ``force_resync_launcher`` / ``update_orchestrator_at``
+commands (all retired in v0.2.100 — the one update pipeline always runs
+install.py; the probe stays for installs they left in this state) advanced the
+whole source tree, rebuilt only the launcher, never ran ``install.py``, and then called
 ``manifest.rs::refresh_install_manifest``, which re-asserts ``installed: true``
 over them — so the completion marker attests work nothing did, over a venv /
 hooks / templates / MCP-registration / KG / schema set still at the old

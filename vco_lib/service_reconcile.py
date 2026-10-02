@@ -582,6 +582,10 @@ class Outcome:
     adopted_without_prompt: Optional[_det.Candidate] = None
     consumed: list[Statement] = field(default_factory=list)
     unimported: list[Statement] = field(default_factory=list)
+    #: the row's NULL ``data_mount`` must REPLACE the recorded one (the
+    #: recorded mount is another container's data — never VCO's copy's);
+    #: otherwise ``write_rows`` keeps a recorded mount (v0.2.100 AD-4).
+    clear_mount: bool = False
 
 
 def _free_port(start: int, inp: ServiceInputs, *, avoid: Iterable[int] = ()) -> Optional[int]:
@@ -645,7 +649,8 @@ def _managed_row(inp: ServiceInputs, port: int, *, source: str, grpc: Optional[i
 
 
 def _free_managed_row(inp: ServiceInputs, *, source: str, enabled: Optional[bool] = None,
-                      confirmed: bool = False, avoid: Iterable[int] = ()) -> Optional[_se.EndpointRow]:
+                      confirmed: bool = False, avoid: Iterable[int] = (),
+                      mount: Optional[Mapping[str, str]] = None) -> Optional[_se.EndpointRow]:
     """VCO's own copy on the canonical port if free, else the next free one
     (Weaviate's gRPC port moves with it)."""
     default = _se.DEFAULT_PORTS[inp.service]
@@ -657,7 +662,8 @@ def _free_managed_row(inp: ServiceInputs, *, source: str, enabled: Optional[bool
         grpc = _free_port(_se.DEFAULT_WEAVIATE_GRPC_PORT + (port - default), inp, avoid=[port])
         if grpc is None:
             return None
-    return _managed_row(inp, port, source=source, grpc=grpc, enabled=enabled, confirmed=confirmed)
+    return _managed_row(inp, port, source=source, grpc=grpc, enabled=enabled, confirmed=confirmed,
+                        mount=mount)
 
 
 def _source_for(inp: ServiceInputs, c: _det.Candidate, fallback: str = "install_probe") -> str:
@@ -934,17 +940,31 @@ def _decide_code_embed(inp: ServiceInputs) -> Outcome:
     return _decide_nothing_live(inp, out)
 
 
-def _container_drift(inp: ServiceInputs, row: _se.EndpointRow) -> Optional[_se.EndpointRow]:
-    """The same pinned container now publishing a different port (or mount)."""
+#: What :func:`_container_drift` refreshes: everything for an ADOPTED row
+#: (VCO follows somebody else's container), only the data identity and the
+#: owning project for a ``vco_managed`` row (its ports are VCO's decision —
+#: a container publishing another port is recreated onto the row's).
+_DRIFT_ALL = ("port", "grpc_port", "data_mount", "compose_project")
+_DRIFT_MANAGED = ("data_mount", "compose_project")
+
+
+def _container_drift(inp: ServiceInputs, row: _se.EndpointRow,
+                     fields: Sequence[str] = _DRIFT_ALL) -> Optional[_se.EndpointRow]:
+    """The same pinned container now publishing a different port, mounting
+    different data, or labelled with another compose project. v0.2.100
+    (U12/U19, L1-F08): also run for ``vco_managed`` rows (with
+    :data:`_DRIFT_MANAGED`), in every phase — the recorded mount is what
+    ``infrastructure/.env`` projects, and a stale or missing one is how a
+    recreate lands on an empty default volume."""
     c = next((x for x in inp.containers if x.name == row.container_name), None)
     if c is None:
         return None
     port = c.host_ports.get(_det.CONTAINER_PORTS[inp.service])
     grpc = c.host_ports.get(_det.WEAVIATE_CONTAINER_GRPC_PORT) if inp.service == "weaviate" else None
     changes: dict[str, Any] = {}
-    if port and port != row.port:
+    if "port" in fields and port and port != row.port:
         changes["port"] = port
-    if grpc and grpc != row.grpc_port:
+    if "grpc_port" in fields and grpc and grpc != row.grpc_port:
         changes["grpc_port"] = grpc
     mount = _mount_of(inp.service, c)
     if mount and mount != (dict(row.data_mount) if row.data_mount else None):
@@ -995,16 +1015,18 @@ def _decide_existing(inp: ServiceInputs) -> Outcome:
             out.how = "legacy_container_adopted"
         elif foreign is not None:
             return _decide_foreign_at_managed_port(inp, row, foreign)
-        elif svc == "code_embed":
-            cur = row
+        else:
+            # VCO's own container: its data mount and owning project are
+            # refreshed from what the runtime shows (every phase, every
+            # service). The row KEEPS the data identity after the container
+            # is gone (plan §4c.1): nothing observed is never "no data".
+            drifted = _container_drift(inp, row, _DRIFT_MANAGED)
+            if drifted is not None:
+                out.row, out.how = drifted, "live_reconcile"
+        if svc == "code_embed":
+            cur = out.row if out.row is not None else row
             if inp.has_gpu is not None and cur.enabled != bool(inp.has_gpu):
                 cur = replace(cur, enabled=bool(inp.has_gpu))
-            if c is not None:
-                # The row KEEPS the cache identity after the container is gone
-                # (plan §4c.1): refreshed only from a live container.
-                mount = _mount_of(svc, c.container)
-                if mount and mount != (dict(cur.data_mount) if cur.data_mount else None):
-                    cur = replace(cur, data_mount=mount, source="live_reconcile")
             # Eligibility does not depend on the container RUNNING: a stopped
             # code-embed container another compose project owns still holds
             # the name VCO's compose would create — `compose up` would fail on
@@ -1101,12 +1123,39 @@ def _find_choice_candidate(inp: ServiceInputs) -> Optional[_det.Candidate]:
                  if c.port == port and _norm_host(c.host) == _norm_host(host)), None)
 
 
+def _recorded_mount_is_the_containers(inp: ServiceInputs,
+                                      row: _se.EndpointRow) -> Optional[bool]:
+    """Was ``row.data_mount`` OBSERVED on the adopted container? ``True`` its
+    live mount is exactly the recorded one; ``False`` the container is there
+    and mounts something else or nothing (the recorded mount is VCO's, kept by
+    :func:`vco_lib.service_endpoints.keep_recorded_mount`); ``None`` the
+    container is not in the listing (gone, or not looked at) — nothing proves
+    whose data the mount is, so the caller keeps the conservative clear."""
+    live = next((c for c in inp.containers if c.name == row.container_name), None)
+    if live is None:
+        return None
+    return _mount_of(inp.service, live) == dict(row.data_mount or {})
+
+
 def _decide_choice(inp: ServiceInputs) -> Outcome:
     svc = inp.service
     ch = inp.choice
     assert ch is not None
     out = Outcome(svc, how="explicit")
     if ch.kind == "vco":
+        # VCO's copy keeps VCO's recorded data mount (v0.2.100 AD-4): a
+        # vco_managed row's own, or the one an adopted row still carries from
+        # when VCO ran it. An adopted CONTAINER's OWN mount is that container's
+        # data — never given to VCO's copy (two services on one data
+        # directory), so only THAT is cleared (W2R-11: adopting a container
+        # with no data mount kept VCO's old bind on the row; clearing every
+        # adopted row's mount threw VCO's bind away on the way back).
+        existing = inp.existing
+        theirs = (existing is not None and existing.mode == "adopted_container"
+                  and existing.data_mount is not None
+                  and _recorded_mount_is_the_containers(inp, existing) is not False)
+        mount = existing.data_mount if existing is not None and not theirs else None
+        out.clear_mount = theirs
         if ch.value:
             port = int(ch.value)
             if port in inp.taken_ports or not inp.port_free(port):
@@ -1117,9 +1166,10 @@ def _decide_choice(inp: ServiceInputs) -> Outcome:
             if svc == "weaviate":
                 grpc = _free_port(_se.DEFAULT_WEAVIATE_GRPC_PORT + (port - _se.DEFAULT_PORTS[svc]),
                                   inp, avoid=[port])
-            out.row = _managed_row(inp, port, source="user_cli", grpc=grpc, confirmed=True)
+            out.row = _managed_row(inp, port, source="user_cli", grpc=grpc, confirmed=True,
+                                   mount=mount)
         else:
-            row = _free_managed_row(inp, source="user_cli", confirmed=True)
+            row = _free_managed_row(inp, source="user_cli", confirmed=True, mount=mount)
             if row is None:
                 out.abort = f"{svc}: no free port for VCO's own copy"
                 return out
@@ -1390,6 +1440,7 @@ def reconcile(
             wr, report = _se.commit_rows(
                 [result.rows[s] for s in SERVICES if s in result.rows],
                 orchestrator_root=root, db_path=db_path, now_ms=now,
+                clear_mount=[s for s, o in result.outcomes.items() if o.clear_mount],
                 out=lambda line: result.lines.append(f"  {line}"),
                 propagate=phase != "session",
                 **dict(apply_kwargs or {}),
@@ -1886,13 +1937,51 @@ def _runtime() -> Optional[str]:
 # ─── user verbs (the CLI in vco_lib.service_endpoints delegates here) ───
 
 
+def _holds_data(service: str, url: str, fetch: Optional[_det.FetchFn]) -> bool:
+    """Does the instance at *url* hold data a switch away from it would
+    leave behind? Weaviate: VCO's classes (``/v1/schema``). Ollama
+    (v0.2.100, L1-F20): ANY pulled model (``/api/tags``) — the user's models
+    are data too, whether VCO pulled them or not. Unreadable → ``False``
+    (the Weaviate rule; nothing is claimed that was not seen)."""
+    fetch = fetch or _det.default_fetch
+    if service == "weaviate":
+        return bool(_det.probe_endpoint(service, url, fetch=fetch).vco_markers)
+    if service == "ollama":
+        tags = _det._json(fetch(f"{url.rstrip('/')}/api/tags", 3.0))
+        return bool(isinstance(tags, dict) and isinstance(tags.get("models"), list)
+                    and tags["models"])
+    return False
+
+
 def _current_holds_data(service: str, rows: Mapping[str, _se.EndpointRow],
                         fetch: Optional[_det.FetchFn]) -> bool:
     row = rows.get(service)
-    if row is None or service != "weaviate":
+    if row is None:
         return False
-    probe = _det.probe_endpoint(service, _se.render_url(service, row), fetch=fetch or _det.default_fetch)
-    return bool(probe.vco_markers)
+    return _holds_data(service, _se.render_url(service, row), fetch)
+
+
+#: The switch-away refusal, per service (the flag is the same for both).
+_EMPTY_SWITCH_HINT = {
+    "weaviate": ("The Weaviate VCO uses now holds VCO data", "--accept-empty-kg",
+                 "the KG re-seeds from knowledge/, the code graph re-analyses"),
+    "ollama": ("The Ollama VCO uses now holds pulled models", "--accept-empty",
+               "every model VCO needs is pulled again; your other models stay where they are"),
+}
+
+
+def _candidate_holds_data(service: str, cand: _det.Candidate,
+                          fetch: Optional[_det.FetchFn]) -> bool:
+    """:func:`_holds_data` for a detected candidate — Weaviate's answer is
+    already in its probe; an Ollama's model list is read (any model counts)."""
+    if service == "weaviate":
+        return cand.has_vco_data
+    return _holds_data(service, cand.url, fetch)
+
+
+def _empty_switch_refusal(service: str, target: str) -> str:
+    what, flag, then = _EMPTY_SWITCH_HINT[service]
+    return f"{what} and {target} holds none. Re-run with {flag} to switch ({then})."
 
 
 def adopt_endpoint(service: str, *, container: Optional[str] = None, url: Optional[str] = None,
@@ -1922,23 +2011,29 @@ def adopt_endpoint(service: str, *, container: Optional[str] = None, url: Option
         out(decision.abort or "nothing to adopt")
         return 1
     chosen = decision.chosen
-    if (not accept_empty_kg and chosen is not None and not chosen.has_vco_data
+    if (not accept_empty_kg and chosen is not None
+            and not _candidate_holds_data(service, chosen, fetch)
             and _current_holds_data(service, rows, fetch)):
-        out("The Weaviate VCO uses now holds VCO data and this one holds none. Re-run with "
-            "--accept-empty-kg to switch (the KG re-seeds from knowledge/, the code graph re-analyses).")
+        out(_empty_switch_refusal(service, "this one"))
         return 1
-    return _commit(decision.row, orchestrator_root, db_path, out, apply_kwargs)
+    return _commit(decision.row, orchestrator_root, db_path, out, apply_kwargs,
+                   clear_mount=decision.clear_mount)
 
 
 def use_vco_copy(service: str, *, port: Optional[int] = None, orchestrator_root: Path,
                  accept_empty_kg: bool = False, db_path: Optional[Path] = None,
                  fetch: Optional[_det.FetchFn] = None, port_free: Optional[PortFreeFn] = None,
                  out: LogFn = print, apply_kwargs: Optional[Mapping[str, Any]] = None) -> int:
-    """``use-vco-copy --service S [--port N]`` — VCO runs its own copy."""
+    """``use-vco-copy --service S [--port N]`` — VCO runs its own copy.
+    When VCO already runs it (``vco_managed``) the copy keeps its recorded
+    data mount, so nothing is switched away from; otherwise a current
+    instance holding data (Weaviate: VCO's classes; Ollama: any model)
+    refuses without ``--accept-empty-kg`` / ``--accept-empty``."""
     rows = _se.load_rows(db_path)
-    if not accept_empty_kg and _current_holds_data(service, rows, fetch):
-        out("The Weaviate VCO uses now holds VCO data. Re-run with --accept-empty-kg to switch to "
-            "a new, empty VCO Weaviate (the KG re-seeds from knowledge/, the code graph re-analyses).")
+    current = rows.get(service)
+    switching = current is not None and current.mode != "vco_managed"
+    if switching and not accept_empty_kg and _current_holds_data(service, rows, fetch):
+        out(_empty_switch_refusal(service, "a new VCO copy"))
         return 1
     taken = {r.port for s, r in rows.items() if s != service} | {
         r.grpc_port for r in rows.values() if r.grpc_port}
@@ -1950,17 +2045,18 @@ def use_vco_copy(service: str, *, port: Optional[int] = None, orchestrator_root:
     if decision.abort or decision.row is None:
         out(decision.abort or "no row decided")
         return 1
-    rc = _commit(decision.row, orchestrator_root, db_path, out, apply_kwargs)
+    rc = _commit(decision.row, orchestrator_root, db_path, out, apply_kwargs,
+                 clear_mount=decision.clear_mount)
     if rc == 0:
         out(f"VCO's own {service} starts at the next session start (or `python install.py --update`).")
     return rc
 
 
 def _commit(row: _se.EndpointRow, root: Path, db_path: Optional[Path], out: LogFn,
-            apply_kwargs: Optional[Mapping[str, Any]]) -> int:
+            apply_kwargs: Optional[Mapping[str, Any]], *, clear_mount: bool = False) -> int:
     try:
         _se.commit_rows([row], orchestrator_root=root, db_path=db_path, out=out,
-                        **dict(apply_kwargs or {}))
+                        clear_mount=clear_mount, **dict(apply_kwargs or {}))
     except (_se.ServiceRegistryUnavailable, _se.InvalidEndpointRow) as exc:
         out(f"could not record the endpoint: {exc}")
         return 1
@@ -2050,10 +2146,12 @@ def move_endpoint(
             out(f"{target} does not answer as a usable {service}"
                 + (f" ({cand.reason})" if cand is not None and cand.reason else ""))
             return 1
-        if (service == "weaviate" and not accept_empty_kg and not cand.has_vco_data
+        if (not accept_empty_kg and not _candidate_holds_data(service, cand, fetch)
                 and _current_holds_data(service, rows, fetch)):
-            out(f"{_se.render_url(service, row)} holds VCO data and {target} holds none. Re-run with "
-                "--accept-empty-kg if that is really where your Weaviate is now.")
+            flag = _EMPTY_SWITCH_HINT[service][1]
+            out(f"{_se.render_url(service, row)} holds {'VCO data' if service == 'weaviate' else 'models'} "
+                f"and {target} holds none. Re-run with {flag} if that is really where your "
+                f"{service.capitalize()} is now.")
             return 1
         new = replace(row, scheme=scheme, host=host, port=new_port,
                       grpc_port=(grpc_port or cand.grpc_port or row.grpc_port) if service == "weaviate" else None,
@@ -2132,6 +2230,12 @@ def _move_managed(row: _se.EndpointRow, rows: Mapping[str, _se.EndpointRow], *,
         from vco_lib.service_lifecycle import migrate_managed_service as migrate  # noqa: PLC0415
     result = migrate(root, new, runtime=runtime or _runtime() or "podman", log=out,
                      db_path=db_path, commit=commit)
+    entries = getattr(result, "entries", None)
+    entries = list(entries) if isinstance(entries, list) else []
+    if entries:  # a refused compose heal is ledgered (v0.2.100 F-W1-13)
+        from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
+
+        emit_entries(root, entries)
     status = getattr(result, "status", "failed")
     if status == "not_needed":  # no container yet: the next compose up creates it on the new port
         rc = _commit(new, root, db_path, out, apply_kwargs)
@@ -2238,6 +2342,14 @@ def hand_to_vco(service: str, *, orchestrator_root: Path, runtime: Optional[str]
         container_refs={service: name})
     for line in result.lines:
         out(line)
+    entries = getattr(result, "entries", None)
+    entries = list(entries) if isinstance(entries, list) else []
+    if entries:
+        # A refused compose heal (e.g. a network another tool labelled, with
+        # containers attached) is ledgered, never swallowed (v0.2.100 F-W1-13).
+        from vco_lib.deferral_emit import emit_entries  # noqa: PLC0415
+
+        emit_entries(Path(orchestrator_root), entries)
     return 0 if service in result.adopted else 1
 
 

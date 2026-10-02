@@ -35,12 +35,11 @@ if (Test-Path $VctUpdateLockfile) {
 # Ensure all required containers are running (background, non-blocking).
 # Mirror of ensure-containers.sh.
 #
-# Compose-dir resolution order (PR-2 portability fix 2026-05-06):
-#   1. $env:VCT_COMPOSE_DIR              — explicit override
-#   2. $env:VCT_INFRASTRUCTURE_DIR       — orchestrator clone's infrastructure/
-#   3. $env:VCT_ORCHESTRATOR_ROOT\infrastructure   — env-resolved orch root
-#   4. <project>\infrastructure          — bundled compose copy (per-project)
-#   5. <project>\claude_mcp_servers      — orchestrator clone fallback (legacy)
+# Compose-dir resolution: ONE home, `_lib/compose-dir.ps1` (v0.2.100) - the
+# same order as before, but a directory whose parent is not the orchestrator
+# clone (no vct-module.json with id "orchestrator") is REFUSED: a project's
+# copy of the compose files would create containers on EMPTY default
+# volumes. The refusal names VCT_ORCHESTRATOR_ROOT.
 #
 # WHICH containers, and what may be done to each (v0.2.97): ONE call,
 # `python -m vco_lib.service_lifecycle plan --json`, reads the launcher.db
@@ -59,13 +58,14 @@ if (Test-Path $VctUpdateLockfile) {
 #   podman's DB but its PID does not exist. `podman restart` then fails
 #   with "container with given ID already exists: OCI runtime error".
 #   We probe State.Pid via Get-Process; if dead, run `runc delete --force`;
-#   a VCO-managed container is then `podman rm --force`d and re-created by
-#   compose, an adopted one only gets `start` (v0.2.97). Each recovery
+#   a VCO-managed container is then removed and re-created by
+#   `python -m vco_lib.service_lifecycle up --recreate` - ONLY after the
+#   data-identity guard proved compose mounts its live data (v0.2.100; a
+#   refusal removes nothing), an adopted one only gets `start` (v0.2.97). Each recovery
 #   attempt is appended to
 #   $env:LOCALAPPDATA\vct\container-recovery.jsonl for audit.
 
 . "$PSScriptRoot/_lib/stderr-cap.ps1"
-. "$PSScriptRoot/_lib/compose-invocation.ps1"
 
 $ScriptDir = $PSScriptRoot
 $RepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
@@ -83,22 +83,12 @@ if (Test-Path $LibFile) {
     }
 }
 
-# Resolve compose dir.
-$ComposeDir = $env:VCT_COMPOSE_DIR
-if (-not $ComposeDir) {
-    if ($env:VCT_INFRASTRUCTURE_DIR -and (Test-Path $env:VCT_INFRASTRUCTURE_DIR)) {
-        $ComposeDir = $env:VCT_INFRASTRUCTURE_DIR
-    } elseif ($env:VCT_ORCHESTRATOR_ROOT -and (Test-Path (Join-Path $env:VCT_ORCHESTRATOR_ROOT "infrastructure"))) {
-        $ComposeDir = Join-Path $env:VCT_ORCHESTRATOR_ROOT "infrastructure"
-    } elseif (Test-Path (Join-Path $RepoRoot "infrastructure")) {
-        $ComposeDir = Join-Path $RepoRoot "infrastructure"
-    } elseif (Test-Path (Join-Path $RepoRoot "claude_mcp_servers")) {
-        # Legacy fallback — only the orchestrator clone has this layout.
-        $ComposeDir = Join-Path $RepoRoot "claude_mcp_servers"
-    } else {
-        $ComposeDir = ""
-    }
-}
+# Resolve the compose dir (see the header): $ComposeDir, or $ComposeDirRefusal
+# when the only candidate is not the orchestrator's own infrastructure\.
+. (Join-Path $ScriptDir "_lib\compose-dir.ps1")
+$VcoComposeDir = Resolve-VcoComposeDir -RepoRoot $RepoRoot
+$ComposeDir = $VcoComposeDir.Dir
+$ComposeDirRefusal = $VcoComposeDir.Refusal
 
 # Resolve orchestrator root (used to locate the GPU-safe wrapper script).
 $OrchRoot = $env:VCT_ORCHESTRATOR_ROOT
@@ -410,78 +400,72 @@ function Test-IsGpuService {
 
 # ---------------------------------------------------------------------------
 # Invoke-ComposeUpServices :: bring up EXACTLY the named compose services
-# (`--no-deps`, never a bare `up -d`). Mirrors compose_up_services in the
-# .sh sibling: the CDI-wait wrapper when a GPU service is among them, else
-# direct compose with the argv from `vco_lib.service_lifecycle
-# compose-args`. Returns 0 on success, 1 on failure, 2 when no compose
-# command / dir is available. Its messages (and compose's own output) go
-# straight to stdout via [Console]::Out: a function's pipeline output would
-# otherwise become part of its RETURN value.
+# through ONE Python verb, `vco_lib.service_lifecycle up` (v0.2.100; mirrors
+# compose_up_services in the .sh sibling): each service is first cleared by
+# the data-identity guard (a refused one is never removed or composed, and is
+# ledgered), the zombies in $script:ZombieServices are removed only AFTER
+# their guard passed, and compose runs through the one retry/heal home -
+# this hook never retries `--build` or spells a compose command itself. For
+# GPU services the CDI-wait wrapper composes, after the verb guarded
+# (`--guard-only`). Sets $script:UpCleared / UpRefused / UpRemoved. Returns
+# 0 composed (or nothing left), 1 failed, 2 no compose/dir, 3 dir refused.
+# Messages go straight to stdout via [Console]::Out: a function's pipeline
+# output would otherwise become part of its RETURN value.
 # ---------------------------------------------------------------------------
 function Invoke-ComposeUpServices {
     param([bool]$Build, [string[]]$Services)
     $Services = @($Services | Where-Object { $_ })
+    $script:UpCleared = @(); $script:UpRefused = @(); $script:UpRemoved = @()
     if ($Services.Count -eq 0) { return 0 }
-    $wantsGpu = @($Services | Where-Object { Test-IsGpuService -Service $_ }).Count -gt 0
-    if ($wantsGpu -and $WrapperScript -and (Test-Path $WrapperScript)) {
-        # The wrapper is bash; on Windows we need WSL/Git-Bash. Try `bash`.
-        $bash = Get-Command bash -ErrorAction SilentlyContinue
-        if ($bash) {
-            if (-not $env:VCT_STACK_WORKING_DIR -and $ComposeDir) {
-                $env:VCT_STACK_WORKING_DIR = $ComposeDir
-            }
-            $env:VCT_STACK_BUILD = if ($Build) { '1' } else { '' }
-            & $bash.Source $WrapperScript up @Services | ForEach-Object { [Console]::Out.WriteLine($_) }
-            $wrapperRc = $LASTEXITCODE
-            Remove-Item Env:VCT_STACK_BUILD -ErrorAction SilentlyContinue
-            if ($wrapperRc -eq 0) {
-                [Console]::Out.WriteLine("Ran launch-claude-mcp-stack.sh wrapper for: $($Services -join ' ')")
-                return 0
-            }
-            [Console]::Error.WriteLine("ensure-containers: wrapper invocation failed for: $($Services -join ' ')")
-            return 1
-        }
-        # No bash on Windows host -> fall through to direct compose.
+    if ($ComposeDirRefusal) {
+        [Console]::Out.WriteLine("ensure-containers: $ComposeDirRefusal")
+        return 3
     }
     if (-not $ComposeCmd -or -not $ComposeDir -or -not (Test-Path $ComposeDir)) { return 2 }
-    $argSets = @($true, $false)
-    if (-not $Build) { $argSets = @($false) }
-    foreach ($withBuild in $argSets) {
-        $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'compose-args', '--json', '--services', ($Services -join ' '))
-        if ($withBuild) { $pyArgs += '--build' }
-        $upArgs = $null
-        try {
-            $upJson = & $RunPy @pyArgs 2>$null
-            if ($LASTEXITCODE -eq 0) { $upArgs = @((($upJson | Out-String) | ConvertFrom-Json).args) }
-        } catch { $upArgs = $null }
-        if ($null -eq $upArgs) {
-            [Console]::Error.WriteLine("ensure-containers: vco_lib.service_lifecycle compose-args failed for: $($Services -join ' ')")
-            return 1
-        }
-        if ($upArgs.Count -eq 0) { return 0 }
-        $rc = 1
-        Push-Location $ComposeDir
-        try {
-            $composeInvocation = Split-VcoComposeCommand -ComposeCmd $ComposeCmd
-            $cmdHead = $composeInvocation.Head
-            $cmdRest = @($composeInvocation.Rest)
-            & $cmdHead @cmdRest @upArgs | ForEach-Object { [Console]::Out.WriteLine($_) }
-            $rc = $LASTEXITCODE
-        } finally { Pop-Location }
-        if ($Build -and -not $withBuild) {
-            # Report which invocation ACTUALLY ran (parity with the .sh
-            # sibling): claiming "--build" after falling back would be a
-            # promise not kept.
-            [Console]::Out.WriteLine("Ran '$ComposeCmd $($upArgs -join ' ')' in $ComposeDir ('--build' was rejected, so the code-embedding image was NOT refreshed - run 'python install.py --update' from the orchestrator root)")
-            return 0
-        }
-        if ($rc -eq 0) {
-            [Console]::Out.WriteLine("Ran '$ComposeCmd $($upArgs -join ' ')' in $ComposeDir")
-            return 0
-        }
-        if (-not $withBuild) { return 1 }
+    $wantsGpu = @($Services | Where-Object { Test-IsGpuService -Service $_ }).Count -gt 0
+    $bash = $null
+    if ($wantsGpu -and $WrapperScript -and (Test-Path $WrapperScript)) {
+        # The wrapper is bash; on Windows we need WSL/Git-Bash.
+        $bash = Get-Command bash -ErrorAction SilentlyContinue
     }
-    return 1
+    $pyArgs = @('-m', 'vco_lib.service_lifecycle', 'up', '--shell', '--services', ($Services -join ' '),
+                '--recreate', (@($script:ZombieServices) -join ' '), '--compose-dir', $ComposeDir,
+                '--compose-cmd', $ComposeCmd, '--runtime', $Runtime)
+    if ($Build) { $pyArgs += '--build' }
+    if ($bash) { $pyArgs += '--guard-only' }
+    $rc = 1
+    try {
+        $lines = @(& $RunPy @pyArgs)
+        $rc = $LASTEXITCODE
+    } catch { $lines = @(); $rc = 1 }
+    foreach ($line in $lines) {
+        if ($line -match "^vco_up_(cleared|refused|removed)='?(.*?)'?$") {
+            $vals = @($Matches[2] -split '\s+' | Where-Object { $_ })
+            switch ($Matches[1]) {
+                'CLEARED' { $script:UpCleared = $vals }
+                'REFUSED' { $script:UpRefused = $vals }
+                'REMOVED' { $script:UpRemoved = $vals }
+            }
+        } elseif ($line) {
+            [Console]::Out.WriteLine($line)
+        }
+    }
+    if ($bash) {
+        if ($script:UpCleared.Count -eq 0) { return 0 }
+        if (-not $env:VCT_STACK_WORKING_DIR) { $env:VCT_STACK_WORKING_DIR = $ComposeDir }
+        $env:VCT_STACK_BUILD = if ($Build) { '1' } else { '' }
+        & $bash.Source $WrapperScript up @($script:UpCleared) | ForEach-Object { [Console]::Out.WriteLine($_) }
+        $wrapperRc = $LASTEXITCODE
+        Remove-Item Env:VCT_STACK_BUILD -ErrorAction SilentlyContinue
+        if ($wrapperRc -eq 0) {
+            [Console]::Out.WriteLine("Ran launch-claude-mcp-stack.sh wrapper for: $($script:UpCleared -join ' ')")
+            return 0
+        }
+        [Console]::Error.WriteLine("ensure-containers: wrapper invocation failed for: $($script:UpCleared -join ' ')")
+        return 1
+    }
+    if ($rc -eq 1) { return 1 }
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -507,8 +491,9 @@ function Clear-ZombieState {
 # ---------------------------------------------------------------------------
 # Invoke-ZombieAction :: act on a zombie container per its lifecycle policy
 # (mirrors handle_zombie in the .sh sibling).
-#   recreate (VCO-managed) -> runc cleanup + `rm --force`, and the service is
-#     queued for the ONE compose call below.
+#   recreate (VCO-managed) -> runc cleanup, and the service is queued for the
+#     ONE guarded `up` below, which removes the container only after the
+#     data-identity guard passed (never here: a refused recreate keeps it).
 #   start (adopted / unlisted) -> runc cleanup + `start` BY NAME. Never `rm`:
 #     a compose re-create would bring it back on the installer's EMPTY volume.
 # ---------------------------------------------------------------------------
@@ -528,19 +513,10 @@ function Invoke-ZombieAction {
     switch ($Action) {
         'recreate' {
             Clear-ZombieState -Name $Name
-            # podman rm --force cleans the state DB row even if the OCI
-            # bundle is gone.
-            $rmOk = $false
-            try {
-                & $Runtime rm --force $Name 2>$null | Out-Null
-                $rmOk = ($LASTEXITCODE -eq 0)
-            } catch { $rmOk = $false }
-            if (-not $rmOk) {
-                Write-RecoveryLog -Container $Name -Action "failed" -Reason "podman rm --force failed"
-                [Console]::Error.WriteLine("ensure-containers: failed to remove zombie '$Name' -- manual cleanup required")
-                return
-            }
+            # The `rm --force` (which cleans the state DB row even when the
+            # OCI bundle is gone) runs inside the guarded `up` verb.
             $script:ComposeList += $Service
+            $script:ZombieServices += $Service
             $script:ZombieRecreated += $Name
         }
         'start' {
@@ -571,6 +547,7 @@ $script:recovered = 0
 # (parity with compose_list in the .sh sibling). Adopted containers never
 # land here.
 $script:ComposeList = @()
+$script:ZombieServices = @()
 $script:ZombieRecreated = @()
 # v0.2.92 BLOCKER-1 (parity with needs_code_embed_build in the .sh sibling):
 # code_embed is the ONE compose service BUILT from the checkout, so a stale
@@ -640,12 +617,16 @@ if ($script:ComposeList.Count -gt 0) {
         }
     }
     foreach ($name in $script:ZombieRecreated) {
-        if ($upRc -eq 0) {
-            Write-RecoveryLog -Container $name -Action "recovered" -Reason "zombie pid; runc+rm+recreate"
-            Write-Output "ensure-containers: recovered zombie container '$name'"
-            $script:recovered++
+        if (@($script:UpRemoved) -contains $name) {
+            if ($upRc -eq 0) {
+                Write-RecoveryLog -Container $name -Action "recovered" -Reason "zombie pid; runc+rm+recreate (data identity proven)"
+                Write-Output "ensure-containers: recovered zombie container '$name'"
+                $script:recovered++
+            } else {
+                Write-RecoveryLog -Container $name -Action "failed" -Reason "removed; compose up failed"
+            }
         } else {
-            Write-RecoveryLog -Container $name -Action "failed" -Reason "no wrapper or compose available for recreate"
+            Write-RecoveryLog -Container $name -Action "left_as_is" -Reason "zombie pid; recreate refused or not run (data identity not proven)"
         }
     }
 }

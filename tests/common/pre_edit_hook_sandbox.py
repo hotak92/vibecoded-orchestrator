@@ -17,7 +17,6 @@ without touching the real project tree:
       templates/hooks/_lib/…                       (REAL helpers + minimal stubs)
       claude_mcp_servers/scripts/rl_kg_search.py   (STUB producer)
       .claude/scripts/code-graph-query             (STUB producer)
-      .claude/scripts/detect-project.sh            (stub)
       .claude/state/                               (per-session stores + caches)
       .venv/bin/python -> system python3
 
@@ -94,10 +93,8 @@ def build_sandbox(tmp_path: Path) -> dict:
         if src.exists():
             shutil.copy(src, lib_dir / name)
 
-    # detect-project stub — multi-codebase detection is irrelevant here.
-    (install_root / ".claude" / "scripts" / "detect-project.sh").write_text(
-        'detect_project_for_file() { echo ""; }\n', encoding="utf-8"
-    )
+    # (No detect-project stub: v0.2.100 W5R-03 removed the hook's folder-name
+    # project override; the code-graph leg always runs as the calling project.)
 
     # Fake .venv pointing at system python3 (the hook resolves the venv via the
     # REAL resolve-vco-venv.sh against $VCT_INSTALL_ROOT).

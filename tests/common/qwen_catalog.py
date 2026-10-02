@@ -20,8 +20,8 @@ re-deriving.
 from __future__ import annotations
 
 #: The live ``/v1/models`` list the QwenCloud compatible-mode base returns
-#: (live-verified 2026-09-22): fifteen ids, of which six never reach the
-#: picker.
+#: (live-verified 2026-09-22): fifteen ids, of which seven never reach the
+#: picker (six excluded, one retired).
 QWEN_LIVE_IDS = (
     "auto",
     "deepseek-v4-flash-0731", "deepseek-v4-pro", "deepseek-v4.1-flash",
@@ -35,13 +35,18 @@ QWEN_LIVE_IDS = (
 #: That list as the endpoint serves it.
 QWEN_LIVE_MODELS = {"data": [{"id": model_id} for model_id in QWEN_LIVE_IDS]}
 
-#: The nine chat ids the picker may publish from it — and exactly the shipped
+#: The eight chat ids the picker may publish from it — and exactly the shipped
 #: row's declared fallback.
-QWEN_CHAT_NINE = (
+QWEN_CHAT_EIGHT = (
     "qwen3.8-max", "qwen3.8-flash", "qwen3.7-max", "qwen3.7-plus",
-    "qwen3.6-flash", "glm-5.3", "glm-5.2", "deepseek-v4.1-flash",
+    "qwen3.6-flash", "glm-5.3", "deepseek-v4.1-flash",
     "deepseek-v4-pro",
 )
+
+#: Live ids the endpoint still carries that the gateway does NOT provide at
+#: all (owner ruling 2026-10-01): the row's ``retired_ids``. Neither published
+#: nor reported hidden, and refused by name.
+QWEN_RETIRED = ("glm-5.2",)
 
 #: The six ids ``catalog_exclude_prefixes`` drops: a router alias, two voice
 #: modalities, two image modalities, and the dated deepseek flash snapshot
@@ -58,17 +63,18 @@ def assert_matches_shipped_row(test, vendor) -> None:
     """Tie these hand-written expectations to the row that actually ships.
 
     Every id is accounted for exactly once, the excluded set is what the
-    row's own prefixes select, and the published nine are the row's declared
+    row's own prefixes select, and the published eight are the row's declared
     fallback. Pass ``VENDORS["qwen"]``.
     """
     live = set(QWEN_LIVE_IDS)
     test.assertEqual(len(QWEN_LIVE_IDS), len(live), "duplicate id in the payload")
     test.assertEqual(
-        live, set(QWEN_CHAT_NINE) | set(QWEN_EXCLUDED_SIX),
-        "every live id is either published or excluded",
+        live, set(QWEN_CHAT_EIGHT) | set(QWEN_EXCLUDED_SIX) | set(QWEN_RETIRED),
+        "every live id is either published, excluded or retired",
     )
     test.assertEqual(
-        set(QWEN_CHAT_NINE) & set(QWEN_EXCLUDED_SIX), set(),
+        (set(QWEN_CHAT_EIGHT) & set(QWEN_EXCLUDED_SIX))
+        | (set(QWEN_CHAT_EIGHT) & set(QWEN_RETIRED)), set(),
         "and never both",
     )
     prefixes = tuple(vendor.catalog_exclude_prefixes)
@@ -77,6 +83,10 @@ def assert_matches_shipped_row(test, vendor) -> None:
         "the shipped prefixes select exactly the excluded six",
     )
     test.assertEqual(
-        tuple(vendor.static_ids), QWEN_CHAT_NINE,
-        "the row's declared fallback is the published nine",
+        tuple(vendor.retired_ids), QWEN_RETIRED,
+        "the row retires exactly glm-5.2",
+    )
+    test.assertEqual(
+        tuple(vendor.static_ids), QWEN_CHAT_EIGHT,
+        "the row's declared fallback is the published eight",
     )

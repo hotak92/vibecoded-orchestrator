@@ -4,6 +4,22 @@ This guide documents the per-project tabs in the VCT Launcher window. Each proje
 
 ---
 
+## Updating the orchestrator — badge, tray, Updates page
+
+Three surfaces start an orchestrator update, and since v0.2.100 they run **the same update** (one store action, `updater.run`, calling the one backend command `run_orchestrator_update`) with the same wording, the same progress window and the same decision dialogs:
+
+- **The MenuBar update badge** — lights by itself when the hourly check (or the check at launch) finds a newer release; its popover's button starts the update.
+- **The tray menu item** — reads "Check for updates", "⚠ Update available (N commits behind)" or "⚠ Couldn't check for updates". Clicking it opens Preferences → Updates and runs one check there.
+- **Preferences → Updates** — "Check now" runs the same check as the badge; "Update now" asks for confirmation (checks are automatic, applying an update is always your action) and then runs the same update the badge runs. The page also shows the install-wide deferral ledger.
+
+Every surface shows the update's progress window while `install.py --update` runs. When your checkout has diverged from upstream (local commits), the divergence dialog offers merge, rebase, or a reset that saves your work first; a merge or rebase that stops at a conflict hands over to the conflict dialog, and the purple **Continue Update** badge finishes the run after you resolve it.
+
+**A second VCO install on this machine** (another clone of the repository) is not updated from here: the launcher updates the install recorded as its install root. Update the other clone from a terminal in its own folder — `git fetch --tags --force vco_upstream`, `git pull --ff-only vco_upstream main`, `python install.py --update` (see [INSTALL_RECOVERY.md → Update from the shell](INSTALL_RECOVERY.md#update-from-the-shell-no-launcher-gui)). The MenuBar's "Update N orchestrator clones" button and the project page's equivalent, which file-copied the running install into other clones, were retired in v0.2.100: a copy made without git and without `install.py` leaves a partial install.
+
+When the launcher itself cannot run an update (v0.2.97/0.2.98, whose badge never lights), use the terminal route above — see [TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-update-badge-never-lights-on-v0297v0298-fixed-in-v0299).
+
+---
+
 ## Secrets, Permissions, and Rules tabs
 
 > **Heads up on "Rules"**: there is no tab literally labeled `Rules` in the launcher today. What people usually mean by "rules" is split across two tabs:

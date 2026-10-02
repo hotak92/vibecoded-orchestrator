@@ -80,6 +80,7 @@ from vco_lib import jsonc_edit as _jsonc_edit
 from vco_lib import manifest_paths as _manifest_paths
 from vco_lib import shipped_artifact as _shipped
 from vco_lib import bundle_skip_deferral as _bsd
+from vco_lib import bundle_preserve as _bundle_preserve
 from vco_lib import weaviate_helpers as _wh
 # v0.2.82 L4: the ONE home for named-vector round-trip cleaning (dropping
 # configured-but-empty ``{slot: []}`` slots that weaviate rejects on re-insert).
@@ -3169,9 +3170,10 @@ def _write_bootstrap_deferral(
         _find_existing_container("weaviate")
         or _all_known_names("weaviate")[0]  # canonical (vco_weaviate)
     )
-    _cmd_hint = (
-        f"podman start {_restart_target}  # or: docker start {_restart_target}"
-    )
+    # v0.2.100 WP-18: the printed command names THIS machine's runtime
+    # (`vco_lib.containers.runtime_command_hint`), not podman-then-docker.
+    from vco_lib.containers import runtime_command_hint as _runtime_hint
+    _cmd_hint = _runtime_hint(f"start {_restart_target}")
     if _find_existing_container("weaviate") is None:
         # No container yet on host. Show the full candidate list so the
         # user can pick whichever one matches their install era.
@@ -3237,8 +3239,8 @@ def _write_bootstrap_deferral(
 
 
 # ---------------------------------------------------------------------------
-# Bundle install (PR 4) — copy hooks/scripts/agents/skills/settings/
-# infrastructure into a user project folder.
+# Bundle install (PR 4) — copy hooks/scripts/agents/skills/settings into a
+# user project folder (compose files stopped shipping in v0.2.100, owner Q3).
 #
 # Single source of truth for the per-project bundle. `install.py` keeps
 # its own copy logic for the orchestrator-clone case (in-place install);
@@ -3503,19 +3505,22 @@ def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
         return False
 
 
-# Placeholder substitutions applied to agent .md files (mirrors
-# install.py:5564). Skill .md files use the same map.
+# Placeholder substitutions applied to agent .md files. Skill .md files use
+# the same map.
 #
 # PR-2 portability (2026-05-06):
 #
 # `{{ORCHESTRATOR_ROOT}}` resolves to an ABSOLUTE PATH at install time.
 # This is necessary because Claude Code's agent .md frontmatter parses
 # YAML mcpServers `command:` fields straight to `execvp()` — shell-style
-# `${VAR}` expansion does NOT happen there. Baking the absolute path is
-# the only mechanism that lets Claude Code spawn the orchestrator-tools
-# MCP. Trade-off: moving the orchestrator clone breaks every project's
-# MCP wiring until `install-bundle --update` is rerun (which the launcher
-# triggers on rename and adoption). The manifest-driven hash compare in
+# `${VAR}` expansion does NOT happen there, so an agent-scoped MCP server
+# can only be spawned through a baked absolute path (`{{VENV_PYTHON}}` for
+# the interpreter, v0.2.100). No shipped agent declares one today — the
+# `orchestrator-tools` block that did named a server that never existed and
+# was removed with the owner's approval (v0.2.100 WP-18). Trade-off of any
+# baked path: moving the orchestrator clone leaves it stale until
+# `install-bundle --update` is rerun (which the launcher triggers on rename
+# and adoption). The manifest-driven hash compare in
 # `_file_action` already heals stale baked paths when the prior-shipped
 # hash matches the installed file (i.e. user hasn't customised it).
 #
@@ -3533,22 +3538,19 @@ def clear_bundle_update_resume_sentinel(folder: Path) -> bool:
 # orchestrator self-install (where there's no separate project folder);
 # in that case `{{PROJECT_ROOT}}` resolves to the orchestrator root
 # itself, since the orchestrator IS its own project at install time.
+#
+# v0.2.100 WP-18: the map is no longer written here. It is a view of
+# `vco_lib.materialize.path_subs` — the ONE path vocabulary the rewire
+# renderer and the moved-clone heal share — and agents/skills now render
+# through `vco_lib.materialize` (registry-wide names, YAML-aware escaping,
+# unknown placeholders warned about + recorded instead of passed silently).
 def _agent_subs(
     orchestrator_root: Path,
     project_root: Path | None = None,
 ) -> dict[str, str]:
-    return {
-        "{{ORCHESTRATOR_ROOT}}": str(orchestrator_root),
-        "{{PROJECT_ROOT}}": str(project_root if project_root else orchestrator_root),
-        "{{PROJECTS_ROOT}}": str(orchestrator_root.parent),
-        "{{HOME}}": str(Path.home()),
-        # Runtime-resolvable form for shell / Python contexts. The literal
-        # ${VCT_ORCHESTRATOR_ROOT} string survives substitution as-is so the
-        # consumer expands it at use time. Templates SHOULD prefer this
-        # placeholder unless the consumer is a YAML execvp boundary (see
-        # the {{ORCHESTRATOR_ROOT}} note above).
-        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
-    }
+    from vco_lib.materialize import path_subs
+
+    return path_subs(orchestrator_root, project_root)
 
 
 def _hook_globs_for_os() -> tuple[str, ...]:
@@ -3698,6 +3700,10 @@ class _BundleFileOp:
 def _enumerate_bundle_files(
     orchestrator_root: Path,
     project_root: Path | None = None,
+    gate_outcomes: list | None = None,
+    *,
+    sink: "Any" = None,
+    project_name: Optional[str] = None,
 ) -> list[_BundleFileOp]:
     """Build the list of files to install. Hooks ship BOTH .sh + .ps1
     flavours on every OS (vco_lib.bundle_globs policy, v0.2.54 Track G).
@@ -3717,14 +3723,16 @@ def _enumerate_bundle_files(
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
       .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
-      .claude/scripts/<name>               from templates/scripts/  (all flavours)
+      .claude/scripts/<rel>                from templates/scripts/<rel>  (recursive, all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
       .claude/agents/<name>.md             from templates/agents/module-gateway/
-                                           (ONLY when the model_gateway module is
-                                           active for the target — v0.2.96 WP-10)
+                                           (ONLY when the gateway gate says
+                                           DELIVER — v0.2.100 AD-7; each gated
+                                           verdict is appended to `gate_outcomes`)
       .claude/skills/<rel>                 from templates/skills/<rel>  (recursive; .md substituted)
-      infrastructure/<name>                from infrastructure/<name>   (only docker/podman compose)
     Settings template handled separately (smart-merge, not a plain copy).
+    Compose files are NOT shipped (v0.2.100 owner Q3); earlier copies are
+    retired by ``vco_lib.bundle_leftovers.retire_compose_copies``.
     """
     ops: list[_BundleFileOp] = []
     templates = orchestrator_root / "templates"
@@ -3767,14 +3775,17 @@ def _enumerate_bundle_files(
     # generate-workflow wrappers, so project bundles silently skipped them).
     from vco_lib.bundle_globs import script_patterns as _script_patterns
     from vco_lib.rewire import has_rewire_region, rewire_transform
+    # v0.2.100 WP-15 (L5-F08): recursive — a script in a subdirectory ships to
+    # the same subpath under `.claude/scripts/` (never `__pycache__`).
     scripts_src = templates / "scripts"
     if scripts_src.exists():
-        seen: set[str] = set()
+        seen: set[Path] = set()
         for pat in _script_patterns():
-            for script_file in sorted(scripts_src.glob(pat)):
-                if script_file.is_dir() or script_file.name in seen:
+            for script_file in sorted(scripts_src.rglob(pat)):
+                if (script_file.is_dir() or script_file in seen
+                        or "__pycache__" in script_file.relative_to(scripts_src).parts):
                     continue
-                seen.add(script_file.name)
+                seen.add(script_file)
                 # v0.2.92 WP-16 (R4/R21): a script carrying a `VCO-REWIRE`
                 # region gets the install-time rewriter as its transform, so
                 # the installed copy KNOWS its orchestrator root instead of
@@ -3790,63 +3801,69 @@ def _enumerate_bundle_files(
                     _needs_rewire = has_rewire_region(script_file.read_bytes())
                 except OSError:
                     _needs_rewire = True
+                _script_dest = str(Path(".claude") / "scripts"
+                                   / script_file.relative_to(scripts_src))
                 ops.append(_BundleFileOp(
-                    dest_rel=str(Path(".claude") / "scripts" / script_file.name),
+                    dest_rel=_script_dest,
                     source_abs=script_file,
                     source_rel=str(script_file.relative_to(orchestrator_root)),
                     transform=(
                         rewire_transform(
                             orchestrator_root, filename=script_file.name,
+                            project_root=project_root, label=_script_dest,
+                            sink=sink,
                         )
                         if _needs_rewire else None
                     ),
                     always_overwrite=False,
                 ))
 
-    # Agents (with placeholder substitution).
+    # Agents (with placeholder substitution). v0.2.100 WP-18: every rendered
+    # Markdown file goes through the ONE materializer — registry vocabulary,
+    # YAML-aware escaping of the frontmatter, and the owner rule for a name it
+    # cannot fill (token left, stderr warning, deferral row via `sink`).
+    from vco_lib import materialize as _mz
     agents_src = templates / "agents" / "free"
-    subs = _agent_subs(orchestrator_root, project_root)
+    _md_context = _mz.MaterializeContext(
+        orchestrator_root, project_root, project_name=project_name,
+    )
+    _md_spec = _mz.BUNDLE_MARKDOWN_SPEC
 
-    def _apply_subs(buf: bytes) -> bytes:
-        text = buf.decode("utf-8", errors="replace")
-        for k, v in subs.items():
-            text = text.replace(k, v)
-        return text.encode("utf-8")
+    def _apply_subs(dest_rel: str) -> "_mz.Transform":
+        return _mz.Transform(dest_rel, _md_spec, _md_context, sink=sink)
 
     if agents_src.exists():
         for agent_file in sorted(agents_src.glob("*.md")):
+            _agent_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                dest_rel=_agent_dest,
                 source_abs=agent_file,
                 source_rel=str(agent_file.relative_to(orchestrator_root)),
-                transform=_apply_subs,
+                transform=_apply_subs(_agent_dest),
                 always_overwrite=False,
             ))
 
-    # v0.2.96 WP-10: model-gateway-gated agents (hardcoded `claude-gw/*`
-    # frontmatter ids) ship ONLY to projects with the model_gateway module
-    # ACTIVE — never via `free/`, the unconditional bucket. The gate, the
-    # folder→UUID key resolution (module rows are UUID-keyed, not
-    # folder-keyed — a folder-keyed gate never fires) and the
-    # runnability-posture rationale live in `vco_lib.module_gated_delivery`
-    # (one home, shared with the env projections' resolvers).
-    # `project_root is None` = orchestrator self-install: the root IS the
-    # target there (same convention as `_agent_subs` /
-    # `_is_root_bundle_target`).
-    from vco_lib.module_gated_delivery import (
-        GATEWAY_AGENTS_DIR,
-        module_gateway_agents_active,
-    )
-    gateway_agents_src = templates / "agents" / GATEWAY_AGENTS_DIR
-    if gateway_agents_src.exists() and module_gateway_agents_active(
-        orchestrator_root if project_root is None else project_root,
-    ):
-        for agent_file in sorted(gateway_agents_src.glob("*.md")):
+    # Model-gateway-gated agents (hardcoded `claude-gw/*` ids) — never via
+    # `free/`. v0.2.100 AD-7: a TRI-STATE gate on the machine signal (explicit
+    # per-project row wins); the verdict goes to `gate_outcomes` so the orphan
+    # loop carries an UNKNOWN bucket forward and the run records every skip.
+    # The table and rationale live in `vco_lib.module_gated_delivery`. Root
+    # installs (`project_root is None`) go through the same gate.
+    from vco_lib import module_gated_delivery as _mgd
+    gateway_agents_src = templates / "agents" / _mgd.GATEWAY_AGENTS_DIR
+    if gateway_agents_src.exists():
+        verdict = _mgd.gateway_agents_gate(
+            orchestrator_root if project_root is None else project_root)
+        if gate_outcomes is not None:
+            gate_outcomes.append((_mgd.GATEWAY_AGENTS_SOURCE_PREFIX, verdict))
+        for agent_file in (sorted(gateway_agents_src.glob("*.md"))
+                           if verdict.delivers else ()):
+            _gw_dest = str(Path(".claude") / "agents" / agent_file.name)
             ops.append(_BundleFileOp(
-                dest_rel=str(Path(".claude") / "agents" / agent_file.name),
+                dest_rel=_gw_dest,
                 source_abs=agent_file,
                 source_rel=str(agent_file.relative_to(orchestrator_root)),
-                transform=_apply_subs,
+                transform=_apply_subs(_gw_dest),
                 always_overwrite=False,
             ))
 
@@ -3863,7 +3880,7 @@ def _enumerate_bundle_files(
                     dest_rel=dest_rel,
                     source_abs=f,
                     source_rel=str(f.relative_to(orchestrator_root)),
-                    transform=_apply_subs if f.suffix == ".md" else None,
+                    transform=_apply_subs(dest_rel) if f.suffix == ".md" else None,
                     always_overwrite=False,
                 ))
 
@@ -3884,35 +3901,6 @@ def _enumerate_bundle_files(
             transform=None,
             always_overwrite=False,
         ))
-
-    # Infrastructure compose files. Copy all docker-* / podman-* yml at
-    # the top level of `infrastructure/`. The hook `ensure-containers.sh`
-    # picks the right overlay at runtime; we just need the files present.
-    # v0.2.92 delivery audit m7: `*override*` files are EXCLUDED — the
-    # launcher writes `docker-compose.override.yml` into the clone as a
-    # machine-local volume-location config (gitignored, "per-machine"),
-    # and replicating it into every project tree would copy this
-    # machine's paths into other projects' installs.
-    infra_src = orchestrator_root / "infrastructure"
-    if infra_src.exists():
-        for compose_file in sorted(infra_src.iterdir()):
-            if not compose_file.is_file():
-                continue
-            n = compose_file.name
-            if "override" in n:
-                continue
-            if not (
-                (n.startswith("docker-compose") or n.startswith("podman-compose"))
-                and (n.endswith(".yml") or n.endswith(".yaml"))
-            ):
-                continue
-            ops.append(_BundleFileOp(
-                dest_rel=str(Path("infrastructure") / n),
-                source_abs=compose_file,
-                source_rel=str(compose_file.relative_to(orchestrator_root)),
-                transform=None,
-                always_overwrite=False,
-            ))
 
     # v0.2.52 V52-C / v0.2.81: shipped KG nodes live under
     # `templates/knowledge/`. Curated nodes (concepts/tools/models/patterns)
@@ -4217,85 +4205,35 @@ def _stale_orchestrator_root_heal_match(
     raw: bytes,
     target_path: Path,
     orchestrator_root: Path,
+    project_root: Path | None = None,
+    transform: "Any" = None,
 ) -> bool:
-    """PR-2 portability heal (2026-05-06).
+    """PR-2 portability heal (2026-05-06): True when the installed file is the
+    render of ``raw`` under an OLD orchestrator root (the user moved the clone),
+    not a user edit — the caller may then overwrite without a backup.
 
-    Detect the case where an agent .md was install-stamped against an
-    OLD orchestrator-clone path (e.g. user moved/renamed the clone) and
-    is now stale. If we substitute the SAME placeholders against an
-    `old_root` extracted from the installed file and reproduce the
-    installed bytes, then the user did NOT customise — they just have
-    a stale baked path. Return True in that case so the caller can
-    overwrite safely.
-
-    Conservative: returns False on any ambiguity. Only matches when
-    the installed file contains a path-shaped string of the form
-    `<old_root>/claude_mcp_servers/...` and round-tripping with that
-    `old_root` reproduces the file byte-for-byte. False on Windows
-    paths (case-insensitive FS makes the round-trip unreliable).
-
-    SCOPE (v0.2.92 WP-16, stated so the next reader does not over-trust it):
-    the `/claude_mcp_servers/` anchor means this helper heals AGENT/SKILL
-    bodies, which name that path in prose. It does NOT generally fire for the
-    `VCO-REWIRE`-marked scripts, whose baked value is a bare root with no such
-    suffix — and they do not need it, because the manifest records their
-    POST-transform hash so a moved clone is already an `installed_hash ==
-    prior_hash` `overwrite`. The subs map below is kept EQUAL to
-    `vco_lib.rewire.rewire_subs` (pinned by a test) so that when the anchor
-    does happen to be present, the two round-trips cannot disagree.
+    v0.2.100 (review R18-06): a thin caller of
+    :func:`vco_lib.materialize.renders_under_moved_root`, which re-runs the
+    op's OWN ``Transform`` (same escaping, regions and non-path keys) under
+    the old root; the raw ``str.replace`` round-trip is retired. Here only:
+    ``{{PROJECT_ROOT}}`` is the project being updated — a moved CLONE does not
+    move the project — except on a self-install, where the project IS the
+    (old) clone.
     """
+    from vco_lib import materialize as _mz
+
     try:
         installed = target_path.read_bytes()
-        installed_text = installed.decode("utf-8", errors="strict")
-    except (OSError, UnicodeDecodeError):
+    except OSError:
         return False
-
-    # Look for a baked path of the form `<root>/claude_mcp_servers/`. Use
-    # a byte-anchor + back-walk so we don't try to grep arbitrary regex
-    # over the whole file. The first match wins; we tolerate at most one
-    # candidate orchestrator-root prefix per file.
-    needle = "/claude_mcp_servers/"
-    idx = installed_text.find(needle)
-    if idx <= 0:
-        return False
-    # Walk back to the start of the path. Acceptable path chars: anything
-    # that's not whitespace, quote, colon (YAML separator), or comma.
-    end = idx
-    start = end
-    while start > 0:
-        c = installed_text[start - 1]
-        if c.isspace() or c in ('"', "'", ":", ",", "(", ")", "<", ">"):
-            break
-        start -= 1
-    if start == end:
-        return False
-    candidate = installed_text[start:end]
-    if not candidate.startswith("/"):
-        # POSIX absolute paths only. Skip Windows / relative.
-        return False
-    old_root = Path(candidate).resolve()
-    if old_root == orchestrator_root.resolve():
-        # Same path → not a stale-root case (the hash compare would have
-        # caught it as noop).
-        return False
-
-    # Round-trip: build subs map for the OLD root, transform the source,
-    # compare to the installed bytes. If they match, the user didn't
-    # touch it; the stale path is the only difference.
-    subs = {
-        "{{ORCHESTRATOR_ROOT}}": str(old_root),
-        "{{PROJECTS_ROOT}}": str(old_root.parent),
-        "{{HOME}}": str(Path.home()),
-        "{{VCT_ORCHESTRATOR_ROOT}}": "${VCT_ORCHESTRATOR_ROOT}",
-    }
-    try:
-        text = raw.decode("utf-8", errors="replace")
-        for k, v in subs.items():
-            text = text.replace(k, v)
-        round_trip = text.encode("utf-8")
-    except Exception:
-        return False
-    return round_trip == installed
+    heal_project = (
+        None if project_root is None or _canonical_path_eq(project_root, orchestrator_root)
+        else project_root
+    )
+    return _mz.renders_under_moved_root(
+        transform, raw, installed, orchestrator_root, heal_project,
+        same_path=_canonical_path_eq,
+    )
 
 
 def _agent_or_skill_already_present(
@@ -4368,8 +4306,8 @@ def _bundle_op_kind(dest_rel: str) -> Optional[str]:
     (v0.2.85 PLAN-v0285 D6).
 
     Returns one of `"hooks"`, `"scripts"`, `"agents"`, `"skills"`, or None
-    (for anything not covered by a skip-kind — infrastructure compose files,
-    curated/per-project knowledge nodes, `.vscode/tasks.json`, etc.).
+    (for anything not covered by a skip-kind — curated/per-project knowledge
+    nodes, `.vscode/tasks.json`, etc.).
 
     `hooks` INCLUDES `.claude/hooks/_lib/...` (the always-overwrite lib files
     ship as part of the hooks kind). `settings` is deliberately absent: the
@@ -4544,7 +4482,8 @@ def _file_action(
     if (
         op.transform is not None
         and orchestrator_root is not None
-        and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root)
+        and _stale_orchestrator_root_heal_match(raw, target_path, orchestrator_root,
+                                               project_root, op.transform)
     ):
         return ("overwrite", source_bytes)
 
@@ -4602,7 +4541,7 @@ def _file_action(
     # R2 verbatim: "we don't expect users to edit any VCO CODEFILE". The
     # bundle-shipped destination set that R2 covers is the CODE surface:
     # `.claude/hooks/*`, `.claude/scripts/*`, `.claude/agents/*.md`,
-    # `.claude/skills/**`, `infrastructure/` compose (per the P5 anchor). For
+    # `.claude/skills/**` (compose copies too, until v0.2.100 retired them). For
     # those, a divergent copy is a STALE shipped version — the old `preserve`
     # outcome froze them forever + nagged with an eternal deferral (P5 incident:
     # 11 files stuck), so we adopt.
@@ -4692,66 +4631,13 @@ def _write_file_atomic(target: Path, data: bytes, *, mode: Optional[int] = None)
     return redirect_target
 
 
-def _adopt_backup_timestamp() -> str:
-    """UTC basic-ISO timestamp for the per-run adoption-backup sub-dir.
-
-    Basic ISO (``20260717T031500Z``) rather than extended (with ``:``) so the
-    directory name is filesystem-safe on Windows (``:`` is illegal in NTFS
-    path components). One value is computed per install run and reused for
-    every file adopted in that run (a single ``<ts>`` dir per run per D7).
-    """
-    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-
-
-def _backup_bytes_for_adoption(
-    folder: Path, dest_rel: str, ts: str, current_bytes: bytes,
-) -> str:
-    """v0.2.84 PLAN-v0284 D7 (P5/R2): copy the CURRENT on-disk bytes of a file
-    about to be ADOPTED into the per-run backup tree, atomically.
-
-    Backup layout::
-
-        <folder>/.claude/backups/bundle-adoptions/<ts>/<dest_rel>
-
-    ``dest_rel`` is the bundle destination-relative path (e.g.
-    ``.claude/hooks/foo.sh``), reused verbatim under the timestamp dir so the
-    backup mirrors the project tree and is trivially discoverable. Uses the
-    shared ``_write_file_atomic`` primitive (parents created, atomic replace,
-    symlink guards apply).
-
-    Returns the backup path RELATIVE to ``folder`` (POSIX-normalised, for the
-    NOTICE / JSONL trail). Raises on any write failure — the caller MUST treat a
-    raise as "do NOT adopt" and fall back to preserve + deferral (never destroy
-    bytes without a captured copy).
-
-    v0.2.84 PLAN-v0284 AMENDMENTS A4: ``dest_rel`` is host-OS-shaped (``_enumerate_bundle_
-    files`` builds it via ``str(Path(...))`` → ``knowledge\\concepts\\foo.md`` on
-    Windows). We normalize the separator to ``/`` via the shared
-    ``vco_lib.paths.to_posix_rel`` helper (the v0.2.81 lesson — never inline a
-    2nd copy) and JOIN via the individual POSIX parts so the backup mirror tree
-    is byte-identical across OSes AND stays path-length-aware (component-wise
-    join, no monolithic string that could overflow a Windows MAX_PATH check).
-    """
-    from vco_lib.paths import to_posix_rel
-    rel_parts = PurePosixPath(to_posix_rel(dest_rel)).parts
-    backup_abs = folder / _ADOPT_BACKUPS_REL / ts
-    for part in rel_parts:
-        backup_abs = backup_abs / part
-    # `_write_file_atomic` may redirect through a symlink-blocking `.vco-new`
-    # sibling; if it does, the ORIGINAL backup destination did not receive the
-    # bytes. Treat a redirect as a backup failure (be conservative — we must
-    # have the bytes at the documented path before we overwrite the original).
-    redirect = _write_file_atomic(backup_abs, current_bytes)
-    if redirect is not None:
-        raise OSError(
-            f"adoption backup for {dest_rel} was redirected to a .vco-new "
-            f"sibling ({redirect}) — refusing to adopt without a captured copy "
-            "at the documented backup path"
-        )
-    backup_rel = PurePosixPath(to_posix_rel(str(_ADOPT_BACKUPS_REL))) / ts
-    for part in rel_parts:
-        backup_rel = backup_rel / part
-    return str(backup_rel)
+# v0.2.100 (WP-15): the adoption-backup writer moved to `vco_lib.bundle_backup`
+# (the leftover pass is its second caller; this module is ratchet-capped). The
+# names stay HERE as the patch point the adoption tests use.
+from vco_lib.bundle_backup import (  # noqa: E402
+    adopt_backup_timestamp as _adopt_backup_timestamp,
+    backup_bytes_for_adoption as _backup_bytes_for_adoption,
+)
 
 
 def _format_file_list_md(paths: list[str], cap: int = 100) -> str:
@@ -4932,31 +4818,12 @@ _PROJECT_LEVEL_TEMPLATES = (
 )
 
 
-def _project_template_subs(
-    orchestrator_root: Path,
-    project_root: Path,
-    project_name: str,
-) -> dict[str, str]:
-    """Placeholder map for project-level templates. Superset of
-    ``_agent_subs`` plus ``{{PROJECT_NAME}}``.
+def _render_project_template(template_text: str, **kwargs: Any) -> str:
+    """Thin alias — the pipeline lives in ``vco_lib.project_templates``
+    (v0.2.100 WP-18 extraction; the project_init ratchet)."""
+    from vco_lib.project_templates import render_project_template
 
-    Plain-text substitution via ``str.replace`` (per coordinator: no fancy
-    templating engine). Keep keys delimited so partial matches don't
-    accidentally substitute. The orchestrator root is included so the
-    auto-generated `--orchestrator-root` lines in CLAUDE.md point at the
-    user's actual clone.
-    """
-    base = _agent_subs(orchestrator_root, project_root)
-    base["{{PROJECT_NAME}}"] = project_name
-    return base
-
-
-def _apply_template_subs(buf: bytes, subs: dict[str, str]) -> bytes:
-    """Apply placeholder substitutions; UTF-8 in / UTF-8 out (emoji-safe)."""
-    text = buf.decode("utf-8", errors="replace")
-    for k, v in subs.items():
-        text = text.replace(k, v)
-    return text.encode("utf-8")
+    return render_project_template(template_text, **kwargs)
 
 
 # ---------------------------------------------------------------------------
@@ -5293,17 +5160,12 @@ def merge_managed_region(
 # it is the resolved value for "no launcher has ever expressed an opinion".
 # ---------------------------------------------------------------------------
 
-# v0.2.96 (ship-gate F-N5): the DEFAULT-ON SET, and it is a SET, not a
-# policy. A module NOT named here and with no `project_modules` row is
-# INACTIVE — which is exactly what the WP-10 model-gateway delivery gate
-# relies on (`module_gated_delivery.module_gateway_agents_active`, pinned by
-# `test_install_bundle.py::test_unregistered_folder_does_not_deliver`). The
-# comment here used to say "any module with no row … is considered active",
-# describing a default-on-for-everything policy the code has never had; a
-# reader who believed it would have added a gated module expecting opt-out
-# semantics and shipped it to every install. The constant lives here so the
-# no-DB path and the live-DB path share a single source of truth.
-_DEFAULT_ACTIVE_MODULES: frozenset[str] = frozenset({"diagrams"})
+# The DEFAULT-ON SET (v0.2.96 ship-gate F-N5) — a module NOT in it and with no
+# `project_modules` row is INACTIVE. Its one home moved to
+# `vco_lib.module_gated_delivery` in v0.2.100 with the tri-state reader.
+from vco_lib.module_gated_delivery import (  # noqa: E402
+    DEFAULT_ACTIVE_MODULES as _DEFAULT_ACTIVE_MODULES,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (vco_lib.project_templates reads it off this module)
+)
 
 
 def _launcher_db_path() -> Path:
@@ -5332,101 +5194,37 @@ def resolve_active_modules(
 ) -> set[str]:
     """Return the set of active module names for ``project_id``.
 
-    The set is ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus
-    every module with an ``enabled=1`` row in the launcher SQLite DB's
-    ``project_modules`` table, minus every default-on module with an
-    ``enabled=0`` row.
+    ``_DEFAULT_ACTIVE_MODULES`` (today: ``{"diagrams"}``) plus every module
+    with an ``enabled=1`` row in launcher.db ``project_modules``, minus every
+    default-on module with an ``enabled=0`` row. **A module with NO row is
+    active only if it is in :data:`_DEFAULT_ACTIVE_MODULES`** (v0.2.96 F-N5;
+    pinned by ``tests/test_v0296_lane_python_core.py``).
 
-    **A module with NO row is active only if it is in
-    :data:`_DEFAULT_ACTIVE_MODULES`.** v0.2.96 (ship-gate F-N5): until this
-    release the text here described a default-on-for-everything policy and
-    called the no-DB answer a temporary stub awaiting a migration. Both were
-    false — the migration shipped long ago, and a row-less module outside the
-    default-on set has always resolved INACTIVE. That is load-bearing, not
-    incidental: the WP-10 model-gateway delivery gate is built on it (an
-    unregistered or opinion-less project must NOT receive ``claude-gw/*``
-    agent definitions), so a reader who took the old text at face value and
-    "fixed the code to match" would ship gateway ids onto every stock
-    install. Pinned by ``tests/test_v0296_lane_python_core.py``.
-
-    No-DB / no-table is therefore a RESOLVED answer, not a fallback: a CLI
-    install that never booted the launcher has expressed no opinion, and
-    "no opinion" means the default-on set, exactly as it does for a
-    registered project with no rows.
+    v0.2.100 (AD-7): a thin delegate of
+    :func:`vco_lib.module_gated_delivery.active_modules_verdict`, which opens
+    the DB READ-ONLY and tells "could not ask" apart. This set view — used by
+    the CLAUDE.md renderer, whose output the next render recomputes — maps
+    "could not ask" to the default-on set; a caller that DELETES on the
+    answer (the gated delivery) reads the verdict instead.
 
     Args:
-        project_id: The project's UUID-or-slug as stored in
-            ``project_modules.project_id``. The launcher writes the
-            ``projects``-table UUID; resolve a folder to it with
-            ``vco_lib.module_gated_delivery.resolve_project_id_for_folder``
-            rather than passing ``str(folder)``, which can never match.
-        db_path: Override the default ``~/.vct/launcher.db`` resolution
-            (used by tests to point at a fixture DB).
-
-    Returns:
-        Set of module name strings considered active for this project.
+        project_id: the ``projects``-table UUID the launcher writes (resolve a
+            folder with ``module_gated_delivery.resolve_project_id_for_folder``;
+            ``str(folder)`` can never match).
+        db_path: override the default ``~/.vct/launcher.db`` (tests).
     """
-    import sqlite3
+    from vco_lib.module_gated_delivery import active_modules_verdict
 
-    target = db_path if db_path is not None else _launcher_db_path()
-    if not target.is_file():
-        # No launcher DB: a CLI-only install, or one before the launcher's
-        # first boot. No opinion recorded → the default-on set.
-        return set(_DEFAULT_ACTIVE_MODULES)
-
-    try:
-        conn = sqlite3.connect(str(target))
-    except sqlite3.Error:
-        return set(_DEFAULT_ACTIVE_MODULES)
-    try:
-        # Probe for the table. The launcher's migration set owns it; a DB
-        # written by a build that predates the table (or a foreign-schema
-        # file) carries no opinion either → the default-on set.
-        try:
-            cur = conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' "
-                "AND name='project_modules'"
-            )
-            if cur.fetchone() is None:
-                return set(_DEFAULT_ACTIVE_MODULES)
-        except sqlite3.Error:
-            return set(_DEFAULT_ACTIVE_MODULES)
-
-        try:
-            cur = conn.execute(
-                "SELECT module_name, enabled FROM project_modules "
-                "WHERE project_id = ?",
-                (project_id,),
-            )
-            rows = cur.fetchall()
-        except sqlite3.Error:
-            return set(_DEFAULT_ACTIVE_MODULES)
-    finally:
-        conn.close()
-
-    # Build the active-set: start with defaults, then apply explicit rows.
-    # A row with enabled=0 REMOVES a default-on module from the set; a
-    # row with enabled=1 adds (or keeps) the module.
-    active = set(_DEFAULT_ACTIVE_MODULES)
-    for module_name, enabled in rows:
-        if not isinstance(module_name, str):
-            continue
-        if enabled:
-            active.add(module_name)
-        else:
-            active.discard(module_name)
-    return active
+    return set(active_modules_verdict(project_id, db_path=db_path).active)
 
 
 # v0.2.92 WP-15: the "meaningfully differs" rule moved to
-# `vco_lib.template_divergence` (ONE home, with its own tests). Thin aliases
-# under the historical names so existing importers are unaffected.
+# `vco_lib.template_divergence` (ONE home, with its own tests). Its consumer,
+# the project-level-template install, moved to `vco_lib.project_templates` in
+# v0.2.100 and imports it from there directly; the historical alias below is
+# kept for callers that read it off this module.
 from vco_lib.template_divergence import (  # noqa: E402
-    meaningfully_differs as _meaningfully_differs,
-    # Re-exported under its historical name for callers that import it from
-    # here; `meaningfully_differs` is what this module itself now uses.
     normalise_for_diff as _normalise_for_diff,  # noqa: F401  # pyright: ignore[reportUnusedImport] — re-export (test reads it via module attr)
-    remove_stale_root_claude_md_sidecar as _remove_stale_root_sidecar,
 )
 
 
@@ -5622,281 +5420,22 @@ def _emit_template_review_pending_deferral(
     _de.emit(folder, entry)
 
 
-def _install_project_level_templates(
-    folder: Path,
-    *,
-    orchestrator_root: Path,
-    project_name: str,
-    dry_run: bool,
-) -> dict:
-    """Install (or refresh) the three project-level template stubs.
+def _install_project_level_templates(folder: Path, **kwargs: Any) -> dict:
+    """Thin alias — see ``vco_lib.project_templates.install_project_level_templates``
+    (v0.2.100 WP-18 extraction: the managed-region re-render grew this past the
+    project_init ratchet, so the whole project-level-template half moved)."""
+    from vco_lib.project_templates import install_project_level_templates
 
-    Returns a result dict for the install_project_bundle response::
-
-        {
-          "live_created":  [<rel>...],  # template stub installed as the
-                                        # actual project file (was missing).
-          "reference_written": [<rel>...],  # .reference.md sidecar refreshed.
-          "diverged":      [<rel>...],  # existing file ≠ reference template.
-        }
-
-    Idempotent. On every run the reference sidecars are rewritten with
-    the current shipping shape (atomic write, no-op when bytes match).
-
-    v0.2.70 (Bug B / B-1): the `.claude/CONTEXT_STATE.md` live file and the
-    `.claude/context/templates/*.reference.md` sidecars are written via
-    `_write_file_atomic`, so when `.claude` itself is a symlink VCO refused to
-    write through, those writes redirect to `.vco-new`. We surface every such
-    redirect via the `symlink_redirects` key so `install_project_bundle` folds
-    them into the SAME consolidated symlink deferral as the main file loop.
-    (CLAUDE.md / MEMORY.md live at the project ROOT — never under `.claude/` —
-    so their live writes don't redirect; only their `.reference.md` sidecars,
-    which live under `.claude/`, can.)
-    """
-    out: dict = {
-        "live_created": [],
-        "reference_written": [],
-        "diverged": [],
-        "symlink_redirects": [],  # list[tuple[Path, Path]] of (orig, vco_new)
-    }
-
-    templates_dir = orchestrator_root / "templates"
-    subs = _project_template_subs(orchestrator_root, folder, project_name)
-    # Reuses the EXISTING root-identity home (`_canonical_path_eq`, symlink-
-    # and case-safe) rather than adding a second `folder == orchestrator_root`
-    # comparison — §9.3 sweep 7 wants exactly one such idiom in this module.
-    is_root_target = _is_root_bundle_target(orchestrator_root, folder)
-
-    for template_name, live_rel, ref_rel in _PROJECT_LEVEL_TEMPLATES:
-        # v0.2.92 WP-15 half 2 — ROOT EXCLUSION. On the orchestrator root,
-        # `CLAUDE.md` is rendered by install.py from
-        # `templates/ORCHESTRATOR-CLAUDE.md.template` (an 889-line document
-        # with its own AUTO-region owner). This loop walks the PROJECT
-        # template, so comparing them compared two DIFFERENT DOCUMENTS and
-        # every orchestrator root was reported diverged by construction —
-        # forever, with no user action able to clear it. Skip the entry
-        # entirely (a skip, not a fork: the other two entries still run,
-        # because `.claude/CONTEXT_STATE.md` and `MEMORY.md` ARE the
-        # project-shaped files on the root and their reference IS this
-        # template's render). The stale sidecar is removed below.
-        if is_root_target and live_rel == Path("CLAUDE.md"):
-            if not dry_run:
-                _remove_stale_root_sidecar(folder, ref_rel, log=_log_auto)
-            continue
-
-        src = templates_dir / template_name
-        if not src.exists():
-            # Templates not shipped on this orchestrator clone — skip
-            # silently. The bundle pre-install gate (`orchestrator_root`
-            # validation) covers the catastrophic case.
-            continue
-
-        try:
-            raw = src.read_bytes()
-        except OSError:
-            continue
-        # Phase 1.5.B: run the conditional-blocks pre-pass BEFORE the
-        # dict-substitution pass. CLAUDE.md.template is the primary
-        # consumer (per-module sections); the pre-pass is a no-op on
-        # templates that don't contain any conditional tags, so applying
-        # it uniformly is safe. Use the project folder as the resolver's
-        # project_id — Phase 1.1's launcher DB uses the project folder
-        # path (sanitised) as the slug key.
-        try:
-            active = resolve_active_modules(str(folder))
-        except Exception:
-            # Defensive: any unexpected resolver failure falls back to
-            # defaults so install never breaks.
-            active = set(_DEFAULT_ACTIVE_MODULES)
-        try:
-            raw_text = raw.decode("utf-8", errors="replace")
-            rendered_text = render_conditional_blocks(raw_text, active_modules=active)
-            raw = rendered_text.encode("utf-8")
-        except TemplateError:
-            # If the template itself is malformed, skip the conditional
-            # pass and let the original bytes flow through. The reference
-            # sidecar will surface the issue on diff.
-            pass
-        substituted = _apply_template_subs(raw, subs)
-
-        live_target = folder / live_rel
-        if not live_target.exists():
-            # Missing project-level file → install the stub.
-            # For CLAUDE.md specifically, wrap the substituted body in
-            # the VCO-managed-region markers so future re-renders can
-            # safely replace only the managed body (preserving any
-            # user-added content below the closing marker).
-            if live_rel == Path("CLAUDE.md"):
-                wrapped = merge_managed_region(
-                    existing_claude_md="",
-                    new_managed_body=substituted.decode("utf-8", errors="replace"),
-                )
-                substituted = wrapped.encode("utf-8")
-            if not dry_run:
-                try:
-                    _redirect = _write_file_atomic(live_target, substituted)
-                    if _redirect is not None:
-                        out["symlink_redirects"].append((live_target, _redirect))
-                except OSError:
-                    # Best-effort: skip this template if the write fails;
-                    # don't fail the whole install.
-                    continue
-            out["live_created"].append(str(live_rel))
-            # Don't write the reference sidecar in this case — the live
-            # file IS the reference at this moment, so a sidecar is
-            # redundant. A future install run (after the user edits the
-            # live file) will create the sidecar then.
-            continue
-
-        # Live file already exists → refresh the reference sidecar.
-        ref_target = folder / ref_rel
-        if not dry_run:
-            try:
-                _redirect = _write_file_atomic(ref_target, substituted)
-                if _redirect is not None:
-                    out["symlink_redirects"].append((ref_target, _redirect))
-            except OSError:
-                continue
-        out["reference_written"].append(str(ref_rel))
-
-        # Compare existing vs reference. "Meaningfully differs" =
-        # anything beyond whitespace + trailing-newline normalisation
-        # (per coordinator: keep the check simple).
-        try:
-            existing_text = live_target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            # Can't read — don't flag for review; the user has a bigger
-            # problem than a template diff.
-            continue
-        reference_text = substituted.decode("utf-8", errors="replace")
-        # v0.2.92 WP-15 half 1 — COMPARE LIKE AGAINST LIKE. The rule (strip
-        # VCO's OWN injected regions from BOTH sides, THEN normalise
-        # whitespace) lives in `vco_lib.template_divergence`.
-        if _meaningfully_differs(existing_text, reference_text):
-            out["diverged"].append(str(live_rel))
-
-    return out
+    return install_project_level_templates(folder, **kwargs)
 
 
-# ---------------------------------------------------------------------------
-# CLAUDE.md re-render entrypoint (Phase 1.5.B)
-#
-# Wired into the DiagramsTab toggle (Phase 1.3 — sibling): when the user
-# flips a module toggle, the launcher's Tauri command
-# ``set_project_module_enabled`` calls this CLI via subprocess (Option A
-# pattern from Phase 0.B's config_projection — Rust shells out to Python
-# for byte-layout authority over template rendering).
-#
-# Pipeline:
-#   1. Read ``templates/CLAUDE.md.template`` from the orchestrator clone.
-#   2. ``render_conditional_blocks`` strips per-module sections.
-#   3. ``_apply_template_subs`` resolves ``{{PROJECT_NAME}}`` etc.
-#   4. ``merge_managed_region`` replaces the body inside the markers
-#      while preserving any user-added content outside.
-#   5. Atomic write via ``_write_file_atomic``.
-# ---------------------------------------------------------------------------
+def render_claude_md(folder: Path, **kwargs: Any) -> dict:
+    """Thin alias — see ``vco_lib.project_templates.render_claude_md`` (the
+    launcher's ``re-render-claude-md`` entry point; same pipeline as the
+    bundle update)."""
+    from vco_lib.project_templates import render_claude_md as _render
 
-
-def render_claude_md(
-    folder: Path,
-    *,
-    orchestrator_root: Path,
-    project_name: str,
-    project_id: str | None = None,
-    db_path: Path | None = None,
-) -> dict:
-    """Re-render ``<folder>/CLAUDE.md`` from the orchestrator template,
-    preserving any user content outside the VCO-managed-region markers.
-
-    Used by the launcher's ``set_project_module_enabled`` Tauri command
-    (via the ``re-render-claude-md`` CLI subcommand) when the user
-    toggles a module on/off in DiagramsTab or any future per-module
-    settings UI.
-
-    Idempotent on the managed body: feeding the same active-modules set
-    in twice produces byte-identical output.
-
-    Args:
-        folder: Target project folder containing (or about to contain)
-            ``CLAUDE.md``.
-        orchestrator_root: Orchestrator clone root (source of the
-            ``templates/CLAUDE.md.template`` file).
-        project_name: Display name used to resolve ``{{PROJECT_NAME}}``.
-        project_id: Project id/slug used to look up
-            ``project_modules`` rows. Defaults to ``str(folder)`` so the
-            stub resolver (no DB) returns default-on modules — matches
-            the install-time behaviour.
-        db_path: Override the default ``~/.vct/launcher.db`` resolution
-            (used by tests).
-
-    Returns:
-        A result dict::
-
-            {
-              "wrote_path": "<abs path>",
-              "active_modules": [<sorted module names>],
-              "managed_region_present_before": bool,
-              "rendered_bytes": <int>,
-            }
-
-    Raises:
-        FileNotFoundError: ``templates/CLAUDE.md.template`` missing on
-            the orchestrator clone.
-        TemplateError: malformed conditional tag or out-of-order markers
-            in the existing CLAUDE.md.
-        OSError: write failure (atomic-write: no partial file on disk).
-    """
-    template_path = orchestrator_root / "templates" / "CLAUDE.md.template"
-    if not template_path.is_file():
-        raise FileNotFoundError(
-            f"CLAUDE.md template not found at {template_path}. The "
-            f"orchestrator clone may be incomplete; re-run install.py "
-            f"--update."
-        )
-
-    raw_bytes = template_path.read_bytes()
-    raw_text = raw_bytes.decode("utf-8", errors="replace")
-
-    # Resolve active modules. Default project_id to the folder path so
-    # the stub resolver (no DB) returns the default-on set — matches
-    # install-time behaviour.
-    effective_project_id = project_id if project_id is not None else str(folder)
-    active = resolve_active_modules(effective_project_id, db_path=db_path)
-
-    # Pipeline: conditional → substitution.
-    rendered = render_conditional_blocks(raw_text, active_modules=active)
-    subs = _project_template_subs(orchestrator_root, folder, project_name)
-    rendered_bytes = _apply_template_subs(rendered.encode("utf-8"), subs)
-    rendered_body = rendered_bytes.decode("utf-8", errors="replace")
-
-    # Read existing CLAUDE.md (may not exist).
-    target = folder / "CLAUDE.md"
-    if target.is_file():
-        try:
-            existing = target.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            existing = ""
-    else:
-        existing = ""
-
-    had_markers = (
-        MANAGED_REGION_OPEN in existing and MANAGED_REGION_CLOSE in existing
-    )
-
-    merged = merge_managed_region(
-        existing_claude_md=existing,
-        new_managed_body=rendered_body,
-    )
-
-    merged_bytes = merged.encode("utf-8")
-    _write_file_atomic(target, merged_bytes)
-
-    return {
-        "wrote_path": str(target),
-        "active_modules": sorted(active),
-        "managed_region_present_before": had_markers,
-        "rendered_bytes": len(merged_bytes),
-    }
+    return _render(folder, **kwargs)
 
 
 def _run_rl_client_setup(folder: Path) -> dict:
@@ -6966,56 +6505,12 @@ _COMPOSE_OVERRIDE_RECONCILE_CONDITION_IDS = (
 )
 
 
-def _classify_compose_override_conflict(legacy_path: Path, canonical_path: Path) -> str:
-    """v0.2.83 PLAN-v0283 B-F2: classify a coexisting legacy+canonical compose
-    override pair for auto-resolution.
-
-    Returns one of:
-      * ``"identical"``     — byte-for-byte identical. The v0.2.54 C-RT-5 mirror
-        (``volumes.rs`` writes the SAME body to BOTH names by design) so this is
-        the SANCTIONED pair. B-F2(i): suppress the deferral, KEEP BOTH FILES.
-      * ``"semantic_equal"`` — bytes differ but ``yaml.safe_load`` of each parses
-        cleanly AND compares equal (comment/whitespace drift only). B-F2(ii):
-        re-mirror the legacy file to the canonical bytes (canonical wins per the
-        user's "update to use the new one" ruling), NO deferral.
-      * ``"divergent"``     — genuinely different (parse failure on either side,
-        yaml unavailable, or parsed-unequal). B-F2(iii): keep today's
-        ``compose_override_filename_conflict`` deferral verbatim.
-
-    Conservative on every uncertainty: unreadable file, import-yaml failure, or
-    a parse error anywhere ⇒ ``"divergent"`` (defer to human judgement).
-    """
-    try:
-        legacy_bytes = legacy_path.read_bytes()
-        canonical_bytes = canonical_path.read_bytes()
-    except OSError:
-        return "divergent"
-    if legacy_bytes == canonical_bytes:
-        return "identical"
-    # Byte-different → try a semantic (YAML-structure) comparison.
-    try:
-        import yaml  # PyYAML — a hard dep of the orchestrator venv.
-    except ImportError:
-        # yaml unavailable → cannot prove semantic equality → conservative.
-        return "divergent"
-    try:
-        legacy_doc = yaml.safe_load(legacy_bytes.decode("utf-8"))
-        canonical_doc = yaml.safe_load(canonical_bytes.decode("utf-8"))
-    except (yaml.YAMLError, UnicodeDecodeError, ValueError):
-        return "divergent"
-    # Only claim semantic equality for a MEANINGFUL parsed structure. A
-    # comment-only / empty override parses to ``None`` (or a bare scalar), and
-    # two byte-different comment-only files must NOT be read as "identical
-    # config" (that would re-mirror away genuine hand-edits with no config to
-    # prove equivalence). Require BOTH sides to be a non-empty mapping/sequence
-    # (a real compose document is a mapping) before treating them as equal.
-    if not isinstance(legacy_doc, (dict, list)) or not legacy_doc:
-        return "divergent"
-    if not isinstance(canonical_doc, (dict, list)) or not canonical_doc:
-        return "divergent"
-    if legacy_doc == canonical_doc:
-        return "semantic_equal"
-    return "divergent"
+# v0.2.100: the pair classifiers (B-F2 + U16) live in vco_lib.compose_override_pair
+# (project_init.py is past its line ratchet); these names keep their call sites.
+from vco_lib.compose_override_pair import (  # noqa: E402
+    classify_pair as _classify_compose_override_conflict,
+    reconcile_vco_generated_pair as _reconcile_vco_generated_override_pair,
+)
 
 
 def _reconcile_compose_override_deferrals(
@@ -7143,6 +6638,7 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
     # cleared on disk (the resolve_conditions tombstone is per-instance — it
     # lives on the throwaway report inside locked_report, not on the run report).
     auto_resolved_condition_ids: set[str] = set()
+    backup_ts = _adopt_backup_timestamp()  # one backup dir per run (U16)
 
     for subdir in _COMPOSE_OVERRIDE_SEARCH_SUBDIRS:
         legacy_path = install_root / subdir / _LEGACY_COMPOSE_OVERRIDE_NAME
@@ -7203,6 +6699,17 @@ def _detect_and_rename_legacy_compose_override(install_root: Path) -> Optional[d
                     detail,
                     log=_log_auto,
                 )
+                auto_resolved.append(detail)
+                auto_resolved_condition_ids.add("compose_override_filename_conflict")
+                continue
+            # U16 (v0.2.100): both halves are VCO's own generated output →
+            # reconcile them here; never ask the user to pick between them.
+            detail = _reconcile_vco_generated_override_pair(
+                install_root, legacy_path, target_path, backup_ts)
+            if detail is not None:
+                _de.record_auto_resolution(
+                    install_root, "compose_override_filename_conflict",
+                    "reconciled_vco_generated_pair", detail, log=_log_auto)
                 auto_resolved.append(detail)
                 auto_resolved_condition_ids.add("compose_override_filename_conflict")
                 continue
@@ -10112,7 +9619,25 @@ def install_project_bundle(
     # is what makes the entry actionable, and only this site has it.
     backup_failures: list[tuple[str, str]] = []
 
-    ops = _enumerate_bundle_files(orchestrator_root, project_root=folder)
+    _gate_outcomes: list = []  # v0.2.100 AD-7: (source_prefix, GateVerdict)
+    # v0.2.100 WP-18: every render this run reports into ONE sink; the sink
+    # warns (stderr) once per finding and settles the placeholder/path
+    # deferral rows after the project-level templates below.
+    from vco_lib import materialize as _mz
+    _materialize_sink = _mz.FindingsSink(
+        rerender_command=_mz.bundle_rerender_command(folder, orchestrator_root),
+        surface="bundle",
+    )
+    ops = _enumerate_bundle_files(orchestrator_root, project_root=folder,
+                                  gate_outcomes=_gate_outcomes,
+                                  sink=_materialize_sink,
+                                  project_name=project_name)
+    # Review R18-09: every label this release still SHIPS (before the
+    # skip-kinds filter — a kind skipped this run is still shipped, and its
+    # rows stay true). The settle below resolves a bundle row whose file is
+    # no longer in this set (a template removed in a later release).
+    _shipped_labels = {op.dest_rel for op in ops} | {
+        str(live_rel) for _t, live_rel, _r in _PROJECT_LEVEL_TEMPLATES}
     # v0.2.85 PLAN-v0285 D6 LEG 1 (exclude from enumeration): drop the ops of
     # any skipped file-kind BEFORE the classify/write loop, so a skipped kind's
     # files are never touched on disk. `settings` is NOT a file-kind (it is the
@@ -10306,7 +9831,10 @@ def install_project_bundle(
             # location is the source-of-truth, not a divergent edit).
             # Pure no-op other than the result["actions"]["skip-disabled"]
             # append below for caller introspection.
-            pass
+            # Review R18-09: the transform already RAN (to hash the bytes);
+            # its findings describe no file on disk, so they create no row,
+            # and a row the file had while enabled is resolved.
+            _materialize_sink.retire(op.dest_rel)
 
         elif action == "keep-regenerated":
             # v0.2.57: regenerated per-project data file (e.g.
@@ -10377,6 +9905,7 @@ def install_project_bundle(
             }
 
         result["actions"][action].append(op.dest_rel)
+    _bundle_preserve.record_knowledge_kept(result, knowledge_preserved_paths)
 
     # v0.2.24 §A0 audit item #1 (2026-05-22): detect orphans — files
     # the orchestrator previously shipped (recorded in manifest["files"])
@@ -10409,11 +9938,20 @@ def install_project_bundle(
     # retired path the moment it was also preserved. (v0.2.92: this comment
     # described a `new_files_keys` set that was built and never read.)
     seen_in_ops = {op.dest_rel for op in ops}
+    from vco_lib import bundle_leftovers as _bl
+    compose_prior: dict = {}  # v0.2.100 WP-15 (owner Q3)
     for prior_rel, prior_entry in prior_files.items():
         if prior_rel in seen_in_ops:
             # Re-shipped this run; not an orphan. (The allowlisted per-
             # project knowledge files — TAG_HIERARCHY.md etc. — are in ops
             # for every target, so they're excluded from retirement here.)
+            continue
+        # v0.2.100 WP-15 (owner Q3): compose copies are no longer shipped and
+        # `bundle_leftovers.retire_compose_copies` owns their removal. At the
+        # root these paths ARE the live compose files: drop the entry only.
+        if _bl.is_compose_copy(prior_rel):
+            if not is_root_target:
+                compose_prior[prior_rel] = prior_entry
             continue
         # v0.2.85 PLAN-v0285 D6 LEGS 2+3 (exclude from orphan processing +
         # carry manifest entry forward VERBATIM): a prior manifest entry whose
@@ -10431,6 +9969,12 @@ def install_project_bundle(
         # is safe either way — but skip-kind carry-forward is the more specific
         # intent and takes precedence.
         if _op_kinds_to_skip and _bundle_op_kind(prior_rel) in _op_kinds_to_skip:
+            new_files[prior_rel] = prior_entry
+            continue
+        # v0.2.100 AD-7 (L5-F02): same carry-forward for a gated bucket whose
+        # gate could not be evaluated — "could not ask" never deletes.
+        from vco_lib.module_gated_delivery import carries_forward
+        if carries_forward(prior_entry, _gate_outcomes):
             new_files[prior_rel] = prior_entry
             continue
         # v0.2.81 knowledge-retirement branch (data-safety, constraint 3):
@@ -10509,6 +10053,10 @@ def install_project_bundle(
 
     result["actions"]["orphan-deleted"] = orphan_deleted
     result["actions"]["orphan-preserved"] = orphan_preserved
+    # v0.2.100 AD-7 (L5-F04): every gated skip is visible (log + ledger row).
+    from vco_lib.module_gated_delivery import record_gate_outcomes
+    record_gate_outcomes(folder, _gate_outcomes, dry_run=dry_run,
+                         log=lambda m: _log("4.bundle.gated", "info", m))
     result["actions"]["orphan-retired"] = orphan_retired
     result["actions"]["knowledge-retired"] = knowledge_retired
     # v0.2.83 B-F5: one honest auto-resolution record per retired orphan (file
@@ -10539,6 +10087,20 @@ def install_project_bundle(
              f"retired {len(knowledge_retired)} curated knowledge/ manifest "
              f"entries (files left on disk, read via shared collection)",
              data={"count": len(knowledge_retired)})
+
+    # v0.2.100 WP-15: the leftovers policy (compose copies; retired VCO files
+    # outside the manifest) — one home, `vco_lib.bundle_leftovers`.
+    def _backup_ts() -> str:
+        nonlocal _adopt_backup_ts
+        if _adopt_backup_ts is None:
+            _adopt_backup_ts = _adopt_backup_timestamp()
+        return _adopt_backup_ts
+
+    _leftover_outcomes = _bl.run_leftover_policy(
+        folder, orchestrator_root, result, new_files,
+        compose_prior=compose_prior, known_rels=set(prior_files) | seen_in_ops,
+        skip_kinds=_op_kinds_to_skip, update_mode=update_mode, dry_run=dry_run,
+        backup_ts=_backup_ts, log=lambda m: _log("4.bundle.leftovers", "info", m))
 
     # ── v0.2.89 §7 (wave-2): bundled-knowledge residue cleanup +
     # BUG-3 foreign-row repair. NON-root targets only; placed AFTER the
@@ -10918,13 +10480,19 @@ def install_project_bundle(
     # from its `projects.name`, the basename resolves to a DIFFERENT collection
     # family than the one the project reads, and the detectors emit migrate/DROP
     # commands against the project's own live data.
+    #
+    # v0.2.100 WP-18: `{{PROJECT_NAME}}` now has ONE source for both CLAUDE.md
+    # render paths — `vco_lib.materialize.project_display_name` (registered
+    # name → `project_name` → this basename). The variable below is only the
+    # last rung, passed as the fallback.
     derived_project_name = folder.name or "Project"
     try:
         templates_result = _install_project_level_templates(
             folder,
             orchestrator_root=orchestrator_root,
-            project_name=derived_project_name,
+            project_name=project_name or derived_project_name,
             dry_run=dry_run,
+            sink=_materialize_sink,
         )
         # v0.2.70 (Bug B / B-1): fold any `.claude/`-redirected template writes
         # (CONTEXT_STATE.md, *.reference.md sidecars) into the SAME consolidated
@@ -10947,6 +10515,19 @@ def install_project_bundle(
              f"project-level templates failed: {err}",
              data={"error": err})
         result["warnings"].append(f"project-level templates failed: {err}")
+
+    # v0.2.100 WP-18 (owner rules 1+2): settle the materializer's findings —
+    # one row per file still carrying a placeholder or a missing path, and a
+    # clean render of a file clears the row it had. Soft-fail.
+    if not dry_run:
+        _mz_summary = _materialize_sink.settle(folder, shipped=_shipped_labels)
+        if any(_mz_summary.values()):
+            result["materialize_deferrals"] = _mz_summary
+            _log("4.bundle.materialize", "warn" if _mz_summary["emitted"] or
+                 _mz_summary["error"] else "ok",
+                 f"materialize deferrals: emitted={len(_mz_summary['emitted'])}, "
+                 f"resolved={len(_mz_summary['resolved'])}",
+                 data=_mz_summary)
 
     # RL client per-project setup (Stream 1, v0.2.20). Creates the local
     # data directories used by the rl_client logger so the free-tier
@@ -11603,6 +11184,7 @@ def install_project_bundle(
                 # legacy .vscode MCP_* env detection so a future run
                 # where the user has cleaned the keys clears the entry.
                 still_legacy_vscode_mcp=legacy_vscode_mcp_detected,
+                still_leftovers=_leftover_outcomes,
             )
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
@@ -11813,6 +11395,8 @@ def install_project_bundle(
             log=_log,
         ))
 
+    from vco_lib.bundle_run_log import append_run  # v0.2.100 F-W2-08(b)
+    append_run(folder, result)
     return result
 
 
@@ -11883,6 +11467,7 @@ def _reconcile_bundle_deferrals(
     still_legacy_vscode_mcp: bool = False,
     still_stale_wrapper: Optional[bool] = None,
     still_user_secret_retained: Optional[bool] = None,
+    still_leftovers: dict = {},  # noqa: B006 — read-only; cid -> removed-this-run
 ) -> None:
     """Trim bundle-specific deferral entries that this install resolved.
 
@@ -11939,6 +11524,11 @@ def _reconcile_bundle_deferrals(
         # the inert keys (via the deferral's command OR the v0.2.83 B-F4
         # auto-prune) the next install sees `action=none` and clears it.
         "legacy_vscode_mcp_env_keys_present": still_legacy_vscode_mcp,
+        # v0.2.100 WP-15: one-shot records, cleared by the next update that
+        # removed nothing (bundle_leftovers.run_leftover_policy).
+        "bundle_leftover_removed": bool(still_leftovers.get("bundle_leftover_removed")),
+        "bundle_compose_copies_removed": bool(
+            still_leftovers.get("bundle_compose_copies_removed")),
     }
 
     report = DeferralReport.read(folder)
@@ -14054,6 +13644,8 @@ def format_bundle_result_lines(result: dict) -> list[str]:
         # byte-for-byte from the pre-v0.2.85 `_cmd_install_bundle` source so the
         # golden byte-parity pin proves a faithful extraction.
         lines.append(f"  manifest written: .claude/.vco-manifest.json")  # noqa: F541
+    for n in result.get("notes", ()):  # v0.2.100: informational, never a warning
+        lines.append(f"  NOTE {n}")
     for w in result["warnings"]:
         lines.append(f"  WARNING {w}")
     for err in result["errors"]:
@@ -14066,7 +13658,8 @@ def _cmd_install_bundle(args: argparse.Namespace) -> int:
     [--update] [--force] [--dry-run] [--project-folder <path>]
     [--skip-kind KIND ...] --json`
 
-    Copies `templates/` + `infrastructure/` into the user project folder.
+    Copies `templates/` into the user project folder (no compose files since
+    v0.2.100 — earlier copies are retired by `vco_lib.bundle_leftovers`).
     See `install_project_bundle` for full semantics.
 
     Exit 0 on clean install (including update with deferred entries).
@@ -15264,7 +14857,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     p_bundle = sub.add_parser(
         "install-bundle",
         help=(
-            "Copy hooks/scripts/agents/skills/settings/infrastructure "
+            "Copy hooks/scripts/agents/skills/settings "
             "into a user-project folder. Manifest-driven on --update. "
             "Used by launcher create_project_v2 + (PR 5) update_project_v2."
         ),
@@ -15275,8 +14868,8 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     p_bundle.add_argument(
         "--orchestrator-root", default=None,
-        help="Orchestrator clone root (source of truth for templates/ + "
-             "infrastructure/). Default: walk up from this module looking "
+        help="Orchestrator clone root (source of truth for templates/). "
+             "Default: walk up from this module looking "
              "for vct-module.json.",
     )
     p_bundle.add_argument(

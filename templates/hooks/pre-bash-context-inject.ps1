@@ -310,7 +310,21 @@ except Exception:
 }
 
 $KgTmp = New-TemporaryFile
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
+# there (same roots as the venv), never under the project root. It still runs
+# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
+# shared + granted collections apply. MUST MATCH the .sh sibling.
+$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path: every Test-Path below then
+# reads "not installed" without binding an empty -Path.
+if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+$env:CLAUDE_PROJECT_DIR = $ProjectRoot
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+$env:VCO_RL_TASK_TYPE = "pre_bash_kg_search"
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {
         # v0.2.77 Part 9 task 2: route through the shared TTL result-cache

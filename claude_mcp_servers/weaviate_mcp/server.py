@@ -1037,52 +1037,15 @@ def _emit_gate_skipped_deferral(collection: str) -> None:
         return
 
     try:
-        from vco_lib.deferral_emit import (
-            DeferralEntry,
-            emit,
-        )
+        # v0.2.100 WP-17: the entry has ONE home, shared with the write hooks
+        # (`vco_lib.gate_skipped_deferral`), written through the locked emitter.
+        from vco_lib.gate_skipped_deferral import emit_gate_skipped
     except Exception:
         # vco_lib not on sys.path — silent skip. The metric still fired.
         return
 
     try:
-        # Upsert: the emitter's `add_entry` de-dups on condition_id, so
-        # even if a prior session left the entry behind it gets refreshed
-        # rather than duplicated.
-        entry = DeferralEntry(
-            condition_id="gate_skipped_no_project_id",
-            title=(
-                "Phase-8 access-matrix gate skipped (VCT_PROJECT_ID "
-                "missing from MCP env)"
-            ),
-            detected=(
-                "The MCP server reached store_knowledge_node with no "
-                "VCT_PROJECT_ID env. The Phase-8 WRITE gate cannot "
-                "identify this project against the hub's access matrix, "
-                "so writes are proceeding via the silent-allow path. "
-                "The write itself was permitted; this entry records the "
-                "remediation so future writes go through the gate "
-                f"properly. (target collection: {collection})"
-            ),
-            why_deferred=(
-                "Seeding VCT_PROJECT_ID requires either an orchestrator "
-                "install run (which queries launcher.db for the "
-                "project's UUID) or a Launcher GUI project "
-                "re-registration. Both are user-initiated; the MCP "
-                "server cannot self-heal."
-            ),
-            command_to_apply=(
-                "# Option A — orchestrator-root install / update:\n"
-                "python install.py --update\n"
-                "\n"
-                "# Option B — per-project (pre-v0.2.49 install): re-register the\n"
-                "# project via Launcher GUI → Projects → Identity tab. The\n"
-                "# launcher's apply_project_env pass seeds VCT_PROJECT_ID\n"
-                "# into <project>/.claude/env from launcher.db."
-            ),
-            severity="warning",
-        )
-        emit(project_root, entry)
+        emit_gate_skipped(project_root, collection, surface="mcp")
     except Exception:
         # Any I/O failure here must not break the allow contract.
         pass
@@ -4166,21 +4129,28 @@ def _build_unreachable_hint(exc: Exception) -> str:
     # may have `weaviate` (v0.1.x unprefixed) or `weaviate_claude`
     # (pre-VCO maintainer-machine name). The authoritative registry is
     # in vco_lib/containers.py — see CANONICAL_CONTAINERS["weaviate"] and
-    # HISTORICAL_ALIASES["weaviate"]. We don't import vco_lib here to
-    # keep the MCP server free of repo-root sys.path coupling; this
-    # string is intentionally a copy of the canonical value.
+    # HISTORICAL_ALIASES["weaviate"]; this server already imports vco_lib at
+    # module scope, so the name comes from there.
+    # v0.2.100 WP-18B: the printed commands name the DETECTED runtime and the
+    # resolved WEAVIATE_URL — they used to say `podman …` and
+    # `http://localhost:8081` to every docker user / moved-port install.
+    from vco_lib.containers import canonical_name, runtime_command_hint
+    _name = canonical_name("weaviate")
+    _rt = runtime_command_hint("").strip()
     return (
         f"Weaviate unreachable at {WEAVIATE_URL} (gRPC :{GRPC_PORT}). "
         "This is the loud-fail behaviour added 2026-05-08 — earlier the MCP "
         "would silently return success:true count:0 on connection refused, "
         "which let multi-hour sessions run thinking the KG was empty. "
         "Common causes + fixes:\n"
-        "  1. Container down: `podman ps | grep weaviate` and check status.\n"
+        f"  1. Container down: `{_rt} ps -a --filter name=weaviate` and check status.\n"
         "  2. Host port unbound while container reports 'running' (Podman state-DB "
-        "desync): `curl -sf http://localhost:8081/v1/meta` from host. If it fails, "
-        "force-recreate: `podman rm -f vco_weaviate && podman-compose up -d weaviate` "
+        f"desync): `curl -sf {WEAVIATE_URL.rstrip('/')}/v1/meta` from host. If it fails, "
+        f"force-recreate: `{_rt} rm -f {_name}`, then start it from the launcher's "
+        "Services page (or open a new session — the SessionStart ensure-containers "
+        "hook brings it back up from the orchestrator's compose) "
         "(legacy installs may use `weaviate` or `weaviate_claude` in place of "
-        "`vco_weaviate` — check `podman ps -a --format '{{.Names}}'`).\n"
+        f"`{_name}` — check `{_rt} ps -a --format '{{{{.Names}}}}'`).\n"
         "  3. Stuck healthcheck restart-loop (pre-2026-05-08 compose used the "
         "strict `/v1/.well-known/ready` endpoint that 503s during legitimate "
         "operations): verify compose.yaml's healthcheck uses `/v1/meta` + "
@@ -5030,6 +5000,8 @@ _RL_ENRICHMENT_EXPORTS = (
     "TRUNCATED_SLOTS_PROP", "SECONDARY_TRUNCATED_SLOTS_PROP",
     "_rl_enrich_nodes_with_linked_embs", "_resolve_dual_rl_log_enabled",
     "_resolve_dual_rl_log_inputs", "_slot_short_source", "_rl_cache_and_rerank",
+    # v0.2.100 F1: the ONE dual-log resolve+enrich home (MCP + hook + CLI).
+    "resolve_and_enrich_dual", "_dual_rl_log_expected",
     # X-4 (v0.2.75): enrichment fan-out gate (TTL-cached skip predicate).
     "_rl_enrichment_gate_open", "_rl_enrichment_consumer_exists",
     "_rl_enrich_gate_reset_for_test",
@@ -5037,7 +5009,7 @@ _RL_ENRICHMENT_EXPORTS = (
 #
 # The re-export itself is written out as ONE explicit ``from .rl_enrichment
 # import (...)`` per name (v0.2.94), NOT the ``globals()[n] = getattr(mod, n)``
-# loop it replaced. Same 44 objects, same binding moment, same names — but a
+# loop it replaced. Same objects (44 at v0.2.94; 46 since v0.2.100 F1), same binding moment, same names — but a
 # dynamic loop is invisible to static analysis: ruff read every call-site below
 # as an undefined name (44× F821) and a TYPO in the inventory above would have
 # surfaced only at runtime, on the first request that touched the mistyped
@@ -5046,7 +5018,7 @@ _RL_ENRICHMENT_EXPORTS = (
 # tests/test_v0294_lint_rl_enrichment_export_parity.py.
 try:
     # ``X as X`` is the PEP 484 explicit-re-export form, honoured by ruff and
-    # pyright alike: 37 of these 44 are not called from THIS file — they exist
+    # pyright alike: most of these are not called from THIS file — they exist
     # so `server.<name>` stays the resolution point for rl_client's
     # `from …weaviate_mcp.server import <fn>` and for the tests that patch
     # `server.<fn>`. Written plainly they would read as 37 unused imports; the
@@ -5094,6 +5066,8 @@ try:
         _resolve_dual_rl_log_inputs as _resolve_dual_rl_log_inputs,
         _slot_short_source as _slot_short_source,
         _rl_cache_and_rerank as _rl_cache_and_rerank,
+        resolve_and_enrich_dual as resolve_and_enrich_dual,
+        _dual_rl_log_expected as _dual_rl_log_expected,
         _rl_enrichment_gate_open as _rl_enrichment_gate_open,
         _rl_enrichment_consumer_exists as _rl_enrichment_consumer_exists,
         _rl_enrich_gate_reset_for_test as _rl_enrich_gate_reset_for_test,
@@ -5666,27 +5640,17 @@ async def _semantic_graph_search_body(
     # below). When the fan-out had zero successful collections both
     # remain at their initial None / "" sentinels; the helper degrades
     # to a no-op-with-empty-fields write.
-    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
-    # dual-log AND dual-write env). None → bare single-log path. The other-slot
-    # query vector comes from the canonical embed fan-out; the per-node other
-    # vectors are attached by the enrich call below from the SAME fetched objects.
-    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
-    try:
-        _rl_enrich_nodes_with_linked_embs(
-            all_formatted,
-            query_emb=query_vector,
-            active_slot=query_target,
-            model_name=EMBEDDING_MODEL,
-            other_slot=(_dual_inputs or {}).get("other_slot", ""),
-            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
-            other_model_name=(_dual_inputs or {}).get("other_model", ""),
-            backfill_other=_dual_inputs is not None,
-        )
-    except Exception as exc:
-        logger.debug(
-            "semantic_graph_search: RL enrich failed (%s); proceeding without linked_embs",
-            exc,
-        )
+    # v0.2.71 Sweep-C / v0.2.100 F1: resolve the dual-RL-log other-slot inputs
+    # ONCE and enrich, through the ONE shared home every KG-search entry point
+    # (MCP tools, hook/CLI scripts) calls. None → bare single-log path.
+    _dual_inputs = await resolve_and_enrich_dual(
+        all_formatted,
+        query=query,
+        query_vector=query_vector,
+        active_slot=query_target,
+        model_name=EMBEDDING_MODEL,
+        task_type="mcp_interactive",
+    )
 
     # RL: rerank + cache using all over-fetched nodes; return top-k primary results.
     # v0.2.24: propagate partial-fan-out schema failures so telemetry
@@ -6541,22 +6505,16 @@ async def _hybrid_search_body(
     # the nodes as-is and the v3 retrieval event ships with whatever
     # was already attached by the search-time near_vector enrichment
     # (typically `emb` + `cos_qn`).
-    # v0.2.71 Sweep-C: resolve the dual-RL-log other-slot inputs ONCE (gated on
-    # dual-log AND dual-write env). None → bare single-log path.
-    _dual_inputs = await _resolve_dual_rl_log_inputs(query, query_target)
-    try:
-        _rl_enrich_nodes_with_linked_embs(
-            all_results,
-            query_emb=query_vector,
-            active_slot=query_target,
-            model_name=EMBEDDING_MODEL,
-            other_slot=(_dual_inputs or {}).get("other_slot", ""),
-            other_query_emb=(_dual_inputs or {}).get("other_query_emb"),
-            other_model_name=(_dual_inputs or {}).get("other_model", ""),
-            backfill_other=_dual_inputs is not None,
-        )
-    except Exception as exc:
-        logger.debug("hybrid_search: RL enrich failed (%s); proceeding without linked_embs", exc)
+    # v0.2.71 Sweep-C / v0.2.100 F1: dual-RL-log resolve + enrich through the
+    # ONE shared home (see semantic_graph_search). None → bare single-log path.
+    _dual_inputs = await resolve_and_enrich_dual(
+        all_results,
+        query=query,
+        query_vector=query_vector,
+        active_slot=query_target,
+        model_name=EMBEDDING_MODEL,
+        task_type="mcp_interactive",
+    )
 
     # RL: rerank + cache using all candidates; return top-k.
     # v0.2.24: propagate any per-collection schema failures from the

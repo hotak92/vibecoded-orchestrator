@@ -8,12 +8,12 @@
 //! `crate::commands::modules::read_orchestrator_manifest`. Once the hub
 //! becomes a separate binary that crate-cross is gone.
 //!
-//! Privacy note (2026-05-06): `find_orchestrator_manifest` deliberately
-//! uses `std::env::current_exe()` rather than `env!("CARGO_MANIFEST_DIR
-//! ")` so the developer's build-host path is NOT embedded as a static
-//! string in the release binary.
+//! Privacy note (2026-05-06): the clone is resolved from
+//! `std::env::current_exe()` (through `services::install_root`), never
+//! `env!("CARGO_MANIFEST_DIR")`, so the developer's build-host path is NOT
+//! embedded as a static string in the release binary.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -74,37 +74,97 @@ fn default_orchestrator_secret_module_id() -> String {
     "user".to_string()
 }
 
-/// Find `vct-module.json` at the repo root by walking up from the
-/// running binary. Handles both shipped binaries (`<clone>/launcher/
-/// dist/<arch>/vct-launcher`, walks up 4 levels) and `cargo run` builds
-/// (`<clone>/launcher/src-tauri/target/<profile>/`, walks up 4-5
-/// levels — both find the clone root).
+/// `vct-module.json` of the orchestrator clone this binary belongs to.
+///
+/// v0.2.100 (F-W1-09, AD-2): a delegation to the ONE install-root resolver
+/// (`services::install_root`). This used to be a SECOND resolver — an
+/// unbounded walk to the first `vct-module.json` above the exe, with no
+/// identity check — so a binary sitting under ANY directory carrying a
+/// module manifest (another VCT module, a user project with a bundled copy)
+/// took that directory for the clone. Now: the bounded (8-level) exe walk
+/// accepting only a `vct-module.json` whose id is `orchestrator`, then the
+/// process-level cache the launcher sets at boot. Shipped binaries
+/// (`<clone>/launcher/dist/<arch>/…`) and `cargo` builds
+/// (`<clone>/launcher/src-tauri/target/<profile>/…`) both resolve as before.
 pub fn find_orchestrator_manifest() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let mut p = exe.parent()?;
-    loop {
-        let candidate = p.join("vct-module.json");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-        match p.parent() {
-            Some(parent) => p = parent,
-            None => return None,
-        }
-    }
+    orchestrator_install_root().map(|root| root.join("vct-module.json"))
 }
 
-/// The orchestrator clone root — the directory holding `vct-module.json`
-/// ([`find_orchestrator_manifest`]'s parent). The ONE core answer to "where
-/// is this binary's install", used where `state/install/runtime.txt` must be
-/// read (`services::runtime`, the hub supervisor) and by the hub's gateway /
-/// hook-enforcement subprocess `cwd`.
+/// The orchestrator clone root — the ONE core answer to "where is this
+/// binary's install", used where `state/install/runtime.txt` must be read
+/// (`services::runtime`, the hub supervisor) and by the hub's gateway /
+/// hook-enforcement subprocess `cwd`. See [`find_orchestrator_manifest`].
 pub fn orchestrator_install_root() -> Option<PathBuf> {
-    find_orchestrator_manifest().and_then(|p| p.parent().map(std::path::Path::to_path_buf))
+    let exe = std::env::current_exe().ok()?;
+    orchestrator_install_root_for(&exe)
+}
+
+/// [`orchestrator_install_root`] for an explicit exe path (tests).
+pub fn orchestrator_install_root_for(exe: &Path) -> Option<PathBuf> {
+    crate::services::install_root::resolve_without_db(exe)
+        .ok()
+        .map(|r| r.path)
 }
 
 pub fn read_orchestrator_manifest() -> Option<OrchestratorManifest> {
     let path = find_orchestrator_manifest()?;
     let raw = std::fs::read_to_string(&path).ok()?;
     serde_json::from_str(&raw).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write(p: &Path, body: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    /// Identity-true case: a binary in the shipped dist layout resolves its
+    /// clone, and the manifest path is that clone's `vct-module.json` — the
+    /// behaviour every caller relied on.
+    #[test]
+    fn resolves_the_orchestrator_clone_above_a_dist_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("clone");
+        write(
+            &root.join("vct-module.json"),
+            r#"{"id":"orchestrator","version":"0.2.100","description":"x"}"#,
+        );
+        let exe = root.join("launcher/dist/linux-x64/vct-hub");
+        write(&exe, "");
+        assert_eq!(orchestrator_install_root_for(&exe), Some(root));
+    }
+
+    /// The finding (F-W1-09): the old unbounded walk took the FIRST
+    /// `vct-module.json` above the exe, whatever module it described. A
+    /// manifest with another id is not the clone and is never returned.
+    #[test]
+    fn refuses_a_directory_whose_manifest_is_not_the_orchestrator() {
+        let tmp = tempfile::tempdir().unwrap();
+        let other = tmp.path().join("some-module");
+        write(
+            &other.join("vct-module.json"),
+            r#"{"id":"rl-retrieval","version":"1.0.0","description":"x"}"#,
+        );
+        let exe = other.join("bin/vct-hub");
+        write(&exe, "");
+        assert_ne!(orchestrator_install_root_for(&exe), Some(other));
+    }
+
+    /// The bound: a clone more than `MAX_WALK_LEVELS` above the exe is not
+    /// reached by the walk (the old loop walked to `/`).
+    #[test]
+    fn the_walk_is_bounded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("clone");
+        write(
+            &root.join("vct-module.json"),
+            r#"{"id":"orchestrator","version":"0.2.100","description":"x"}"#,
+        );
+        let exe = root.join("a/b/c/d/e/f/g/h/i/j/vct-hub");
+        write(&exe, "");
+        assert_ne!(orchestrator_install_root_for(&exe), Some(root));
+    }
 }

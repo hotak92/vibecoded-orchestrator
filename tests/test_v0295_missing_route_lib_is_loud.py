@@ -201,7 +201,13 @@ def _env(project: Path) -> dict:
         + os.environ.get("PATH", ""),
     )
     env.pop("VCT_DISABLE_HOOKS", None)
-    env.pop("VCT_VENV", None)
+    # v0.2.100 WP-17: a HEALTHY install resolves the VCO venv — the routing
+    # lib's gate-skipped deferral is written through it
+    # (`python -m vco_lib.gate_skipped_deferral`) and says "broken install"
+    # when it cannot be found. This checkout has no `.venv`, so the venv is
+    # pinned to the test's own interpreter (child_env puts vco_lib on its path)
+    # instead of inheriting whatever VCT_VENV the operator exported.
+    env["VCT_VENV"] = sys.executable
     return env
 
 

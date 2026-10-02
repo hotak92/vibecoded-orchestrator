@@ -77,6 +77,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Sequence
 
+from vco_lib.containers import runtime_command_hint
+
 #: The two condition ids the analyzer owns. Named once so the emitters and the
 #: paired clear can never drift apart.
 CODE_GRAPH_BACKEND_CIDS: tuple[str, ...] = (
@@ -172,7 +174,7 @@ def emit_no_backend(install_root: Path, exc: BaseException) -> bool:
         ),
         command_to_apply=(
             "# Restart embedding services then re-run analysis:\n"
-            "podman start vco_code_embed vco_ollama   # or: docker start ...\n"
+            f"{runtime_command_hint('start vco_code_embed vco_ollama')}\n"
             ".claude/scripts/code-graph-analyze . --project <name>"
         ),
         severity="warning",
@@ -185,7 +187,7 @@ def _service_hint(slot: str) -> tuple[str, str]:
     if "codesage" in slot:
         return (
             "CodeEmbed service (vco_code_embed container on port 11440)",
-            "podman start vco_code_embed",
+            runtime_command_hint("start vco_code_embed"),
         )
     if "openai" in slot:
         return (
@@ -197,7 +199,7 @@ def _service_hint(slot: str) -> tuple[str, str]:
         )
     return (
         "Ollama (vco_ollama container on port 11435)",
-        "podman start vco_ollama",
+        runtime_command_hint("start vco_ollama"),
     )
 
 

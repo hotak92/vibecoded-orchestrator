@@ -396,7 +396,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 ## Infrastructure Overview
 
 ### Weaviate Vector Database
-- **URL**: `http://localhost:8081` (HTTP), port 50052 (gRPC)
+- **URL**: `{{WEAVIATE_URL}}` (HTTP), gRPC port `{{WEAVIATE_GRPC_PORT}}` — this machine's `service_endpoints` row, rendered at install/update (defaults `http://localhost:8081` / `50052`)
 - **Purpose**: Semantic search across knowledge, code, docs, conversations.
 - **Text embeddings**: `qwen3-embedding:0.6b` via Ollama (1024-dim, Apache 2.0). `num_ctx` is resolved per model from the one table that also sizes the chunks (`chunking.MODEL_TOKEN_LIMITS`) — 10 240 for `qwen3-embedding:0.6b`. Ollama's default is far smaller, and an unset value silently truncates.
 - **Code embeddings**: hardware-spec ladder via FastAPI service at port 11440 — CodeSage-Large-v2 (2048-dim, GPU VRAM >=12 GB) → `qwen3-embedding:0.6b` (1024-dim, VRAM >=6 GB or capable CPU with RAM >24 GB + >=8 physical cores) → `jina-embeddings-v2-base-code` (768-dim) as the universal CPU / low-VRAM floor. All non-CodeSage tiers run via Ollama.
@@ -418,7 +418,7 @@ PowerShell variants (`*.ps1`) ship for Windows users.
 If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on a slow Ollama backend when you expected arctic), check the resolution chain in this order: `echo $ACTIVE_EMBEDDING` → `sqlite3 ~/.vct/launcher.db "SELECT value FROM app_state WHERE key='embedding.active_profile'"` → set the right value at whichever level is empty.
 
 ### Ollama Local LLM
-- **URL**: `http://localhost:11435`
+- **URL**: `{{OLLAMA_URL}}` (this machine's `service_endpoints` row; default `http://localhost:11435`)
 - **Purpose**: Local embeddings for Weaviate; code-embedding service CPU fallback. Ollama is backend infrastructure, not an MCP tool — for reasoning, file reading, and vision, use Claude's native capabilities (`Read`, built-in vision) directly.
 - **Models**:
   - `qwen3-embedding:0.6b` — text embeddings (1024 dim, primary; `num_ctx` 10 240,
@@ -426,7 +426,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
   - KG-summary generation models (fallback only — see below): `gemma4:e4b` (low-VRAM/CPU), `qwen3.5:9b` (16 GB+ VRAM). Used by `generate-kg-summary.py` only when the `claude` CLI is not on PATH.
 
 ### Code Embedding Service
-- **URL**: `http://localhost:11440` (default; the machine's `service_endpoints` row decides the actual port — change it via the launcher's Services page or `python -m vco_lib.service_endpoints move`, never by hand-editing env files)
+- **URL**: `{{CODE_EMBED_URL}}` (this machine's `service_endpoints` row, rendered at install/update; default `http://localhost:11440` — change it via the launcher's Services page or `python -m vco_lib.service_endpoints move`, never by hand-editing env files)
 - **Purpose**: GPU-accelerated code embeddings via sentence-transformers.
 - **Model**: CodeSage-Large-v2 (1.3B params, 2048-dim, Apache 2.0).
 - **Env**: `CODE_EMBED_BACKEND` (`gpu`/`ollama`), `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`.
@@ -434,7 +434,7 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
 - Started automatically by the orchestrator's container ensure-hook on session start.
 
 ### vct-hub
-- **URL**: `http://127.0.0.1:7700` (default; configurable via `VCT_HUB_PORT`)
+- **URL**: `http://127.0.0.1:{{HUB_PORT}}` — the port as resolved when this file was last rendered (install/update); the hub can come up on a different one later (a restart on a fallback port, a changed `VCT_HUB_PORT`), and this line does not follow it. The LIVE port is `$VCT_HUB_PORT` if set, else `<vct_root_dir>/hub.port` (written by the running hub), else `7700`; print it with `templates/scripts/vct_project_config.sh hub-port` (`.ps1` sibling on Windows), which applies exactly that ladder.
 - **Purpose**: Detached background service that resolves per-project configuration (KG collection, codegraph prefix, embedding model, secrets) for hooks, MCPs, and scripts. Started by `install.py`'s post-install step, by the `session-start-ensure-hub.sh` Claude Code hook on every session, and by the launcher GUI. Outlives the launcher GUI (close the GUI; hooks/MCPs/scripts still reach the hub).
 - **Lockfile**: `<vct_root_dir>/hub.pid` — single-instance per user. CLI: `vct-hub --start-if-not-running` / `--stop` / `--status` / `--register-boot` / `--unregister-boot` / `--boot-status` / `--foreground`.
 - **Auth**: bearer token at `<vct_root_dir>/hub.token` (regenerated every startup, mode 0o600), required on every `/api/v1/*` route except `/api/v1/health` (liveness probe — no auth). The two per-project routes `/env` and `/config` require a PROJECT-SCOPED token `hub.token.<project_id>` — the coarse global `hub.token` is REFUSED there (the bundled resolvers already prefer the scoped token; the hub lazy-mints one for a mid-session project). Every OTHER `/api/v1/*` route accepts the global token.
@@ -498,7 +498,7 @@ Located in `.claude/hooks/` — automated workflow actions. On Windows the bash 
 - `notify-stop.sh` — desktop notification (`notify-send`).
 
 **StopFailure**:
-- `stop-failure-notify.sh` — urgent notification + failure logging to `~/.claude/metrics/failures.jsonl`. The notification is coalesced to at most one per 5 minutes per (project, error class), with the suppressed count carried on the next one; the ledger line is written for **every** event regardless. `VCO_STOP_FAILURE_NOTIFY=0` silences the pop-up only — never the ledger, which is the diagnostic worth keeping.
+- `stop-failure-notify.sh` — urgent notification + failure logging to `failures.jsonl` in the metrics directory (`$VCT_STATE_DIR/metrics`, default `~/.vct/metrics`). The notification is coalesced to at most one per 5 minutes per (project, error class), with the suppressed count carried on the next one; the ledger line is written for **every** event regardless. `VCO_STOP_FAILURE_NOTIFY=0` silences the pop-up only — never the ledger, which is the diagnostic worth keeping.
 
 **All available hook events**:
 
@@ -839,7 +839,7 @@ hybrid_search("code graph collections schema")      # What does KG say about thi
 Two distinct "update" actions live in the launcher:
 
 - **Update orchestrator** (Settings → Updates) — refreshes the orchestrator clone itself (the global venv, bundled hooks/MCP servers, the templates folder, the launcher and hub binaries). Stops the detached `vct-hub` before the update so the binary swap isn't blocked on Windows, then restarts it and the launcher.
-- **Update bundle** (per-project Settings page → "Update bundle" button; the Projects page's "⟳ Update all" button runs it on every registered project) — propagates newly-shipped orchestrator files to an existing user project. CLI equivalent, from the orchestrator root: `python -m vco_lib.project_init install-bundle --folder <project> --orchestrator-root <orchestrator-root> --update`.
+- **Update bundle** (per-project Settings page → "Update bundle" button; the Projects page's "⟳ Update all" button runs it on every registered project) — propagates newly-shipped orchestrator files to an existing user project. CLI equivalent: `'{{VENV_PYTHON}}' -m vco_lib.project_init install-bundle --folder <project> --orchestrator-root '{{ORCHESTRATOR_ROOT}}' --update`.
 
 The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest.json`:
 - New shipped file → created in the project.
@@ -959,8 +959,8 @@ Run these once to confirm the install landed correctly:
 claude mcp list
 # Expected: weaviate-kg ✓ Connected, search ✓ Connected (Ollama runs as infrastructure, not as an MCP)
 
-curl -s http://localhost:8081/v1/.well-known/ready    # Weaviate ready
-curl -s http://localhost:11435/api/tags               # Ollama models
+curl -s {{WEAVIATE_URL}}/v1/.well-known/ready    # Weaviate ready
+curl -s {{OLLAMA_URL}}/api/tags               # Ollama models
 ```
 
 Inside a Claude Code session, run `/context` to print the active workspace path and KG collection name. If the collection is wrong (e.g. it's reusing another project's KG), you opened Claude in the wrong directory — see the per-project isolation note above and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).

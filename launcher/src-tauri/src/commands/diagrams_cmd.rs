@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use serde::Deserialize;
 use tauri::{command, State};
 
-use crate::db::diagrams::{AccessRow, DiagramRow, ModuleRow, SnapshotRow, ToolGrant};
+use crate::db::diagrams::{AccessRow, DiagramRow, SnapshotRow, ToolGrant};
 use crate::db::mcp_tool_defaults::McpToolDefault;
 use crate::db::Db;
 use vct_launcher_core::process::CommandExt as _;
@@ -63,14 +63,6 @@ pub async fn list_project_mcp_tools(
     db: State<'_, Db>,
 ) -> Result<Vec<ToolGrant>, String> {
     db.list_project_mcp_tools(&project_id, &mcp_name)
-}
-
-#[command]
-pub async fn list_project_modules(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<Vec<ModuleRow>, String> {
-    db.list_project_modules(&project_id)
 }
 
 // ─── Diagram registry mutations ─────────────────────────────────────────
@@ -611,7 +603,65 @@ pub async fn set_project_module_enabled(
     // side-effect.
     spawn_re_render_claude_md(&db, &project_id);
 
+    // v0.2.100 (AD-7, L5-F03): a module row can change what the bundle
+    // DELIVERS (today: the model-gateway agent definitions), so the toggle
+    // runs the ordinary bundle update instead of leaving the delivery — and
+    // the re-rendered CLAUDE.md's claim about it — to whenever the user next
+    // updates. The decision of WHAT to deliver stays in Python
+    // (`vco_lib.module_gated_delivery`); this only triggers the engine.
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+
     Ok(())
+}
+
+/// Resolve `project_id`'s folder and hand it to `run`. Split from the spawn
+/// so the "a toggle triggers delivery" wiring is testable without a Tauri
+/// runtime. Soft-fail: an unknown project or a missing folder is logged and
+/// nothing runs (the DB row already landed; the next update delivers).
+fn schedule_bundle_update_for_project(db: &Db, project_id: &str, run: impl FnOnce(String, PathBuf)) {
+    match db.get_project(project_id) {
+        Ok(Some(p)) => {
+            let folder = PathBuf::from(&p.folder_path);
+            if folder.is_dir() {
+                run(project_id.to_string(), folder);
+            } else {
+                tracing::warn!(
+                    "[vct] module toggle: project folder {} does not exist; the next \
+                     bundle update delivers",
+                    folder.display()
+                );
+            }
+        }
+        Ok(None) => tracing::warn!(
+            "[vct] module toggle: project {} not found; no bundle update",
+            project_id
+        ),
+        Err(e) => tracing::warn!(
+            "[vct] module toggle: db lookup for {} failed: {}; no bundle update",
+            project_id,
+            e
+        ),
+    }
+}
+
+/// Background `install-bundle --update` for one project. Never two engines on
+/// one manifest: the engine itself takes the per-folder turn
+/// (`single_flight::bundle_engine_turn`, v0.2.100 W3R-06), which "Update all"
+/// and the per-project update share — a toggle during either WAITS and then
+/// delivers, instead of racing it (or being refused and losing the delivery).
+fn spawn_bundle_update(project_id: String, folder: PathBuf) {
+    tauri::async_runtime::spawn(async move {
+        let (warnings, _summary) =
+            crate::commands::projects_v2::run_install_bundle_update(&folder).await;
+        for w in &warnings {
+            tracing::warn!("[vct] module toggle bundle update ({}): {}", project_id, w);
+        }
+        tracing::info!(
+            "[vct] module toggle: bundle update finished for project {} ({} warning(s))",
+            project_id,
+            warnings.len()
+        );
+    });
 }
 
 /// Background re-render of `<project_folder>/CLAUDE.md` after a module
@@ -1293,31 +1343,6 @@ async fn open_editor_for_rel_path(
     Ok(url)
 }
 
-/// Read the diagrams local server's per-boot save token from
-/// `<vct_root_dir>/diagrams.token` (written by
-/// `diagrams_local_server::spawn_server` with mode 0o600).
-///
-/// This is the sanctioned channel for the Svelte frontend to obtain
-/// the token if it ever needs to POST /save directly — the token is
-/// deliberately NOT baked into the frontend bundle (a bundle ships to
-/// every install; the token is per-boot and per-machine). Errors if
-/// the editor server hasn't been started yet this session (no token
-/// file, or a stale one from a previous boot would fail auth anyway —
-/// callers should invoke `open_diagrams_editor` first, which starts
-/// the server and mints the token).
-#[command]
-pub async fn get_diagrams_token() -> Result<String, String> {
-    let path = vct_launcher_core::paths::vct_root_dir()
-        .join(crate::commands::diagrams_local_server::TOKEN_FILE);
-    vct_launcher_core::services::boot_token::read_token_file(&path).map_err(|e| {
-        format!(
-            "get_diagrams_token: {} (the diagrams editor server may not \
-             have started yet this session — open an editor first)",
-            e,
-        )
-    })
-}
-
 /// Minimal URL-encoder for query-string values. Encodes the printable
 /// ASCII subset that's unsafe in a query value (`&`, `=`, ` `, `#`,
 /// `?`, `+`) plus all bytes outside `[A-Za-z0-9_.~-/]`. We don't pull
@@ -1623,6 +1648,24 @@ mod tests {
         let db = make_db_with_project("p1", "Acme", dir.path());
         let r = db.is_module_active("p1", "diagrams").unwrap();
         assert!(!r, "unknown module should be inactive (got {})", r);
+    }
+
+    /// v0.2.100 (AD-7, L5-F03): the toggle triggers the bundle update for
+    /// the toggled project's folder (act) — and runs nothing for a project
+    /// whose folder is gone or that is not registered (leave-alone).
+    #[test]
+    fn module_toggle_schedules_the_bundle_update_for_the_project_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = make_db_with_project("p1", "Acme", dir.path());
+        let mut seen: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "p1", |id, f| seen.push((id, f)));
+        assert_eq!(seen, vec![("p1".to_string(), dir.path().to_path_buf())]);
+
+        let mut none: Vec<(String, PathBuf)> = Vec::new();
+        schedule_bundle_update_for_project(&db, "missing", |id, f| none.push((id, f)));
+        let gone = make_db_with_project("p2", "Gone", &dir.path().join("absent"));
+        schedule_bundle_update_for_project(&gone, "p2", |id, f| none.push((id, f)));
+        assert!(none.is_empty(), "nothing may run without a real folder: {none:?}");
     }
 
     #[test]

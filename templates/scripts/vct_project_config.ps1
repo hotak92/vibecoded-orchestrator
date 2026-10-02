@@ -22,6 +22,11 @@
 #       Print the full config JSON for <folder>, or one field's value.
 #   .\vct_project_config.ps1 -ResolveProject <folder>
 #       Print the project_id (UUID) for <folder>.
+#   .\vct_project_config.ps1 -HubPort
+#       Print the port the hub is reached on (Get-HubPort: VCT_HUB_PORT ->
+#       hub.port -> 7700). MUST MATCH the .sh `hub-port` subcommand. (The
+#       SSRF guard no longer calls it: since v0.2.100 vco_lib.ssrf_url resolves
+#       the hub port itself.)
 #
 # Exit codes (identical to bash):
 #   0  success
@@ -47,7 +52,10 @@ param(
     [string]$Field,
 
     [Parameter(ParameterSetName = 'ResolveOnly', Mandatory = $true)]
-    [string]$ResolveProject
+    [string]$ResolveProject,
+
+    [Parameter(ParameterSetName = 'HubPortOnly', Mandatory = $true)]
+    [switch]$HubPort
 )
 
 # VCO-REWIRE-BEGIN: orchestrator-root-resolution
@@ -843,6 +851,11 @@ function Get-Config {
 }
 
 # ── Main ────────────────────────────────────────────────────────────────
+if ($PSCmdlet.ParameterSetName -eq 'HubPortOnly') {
+    [Console]::Out.WriteLine([string](Get-HubPort))
+    exit 0
+}
+
 if ($PSCmdlet.ParameterSetName -eq 'ResolveOnly') {
     $resolved = Resolve-ProjectId -ArgValue $ResolveProject
     if ($resolved.ExitCode -ne 0) {

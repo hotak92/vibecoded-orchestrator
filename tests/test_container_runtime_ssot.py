@@ -401,7 +401,10 @@ def test_install_py_helpers_are_thin_calls_into_the_home():
         if isinstance(node, ast.FunctionDef) and node.name in names:
             seen.add(node.name)
             body_src = ast.get_source_segment(src, node) or ""
-            assert "_containers." in body_src, node.name
+            # v0.2.100: `_container_runtime_reachable` is thin over
+            # vco_lib.compose_provider (which adds the podman API-socket check
+            # on top of `containers.daemon_responsive`) — the same one home.
+            assert "_containers." in body_src or "_compose_provider." in body_src, node.name
             for call in ast.walk(node):
                 if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
                     owner = getattr(call.func.value, "id", None)

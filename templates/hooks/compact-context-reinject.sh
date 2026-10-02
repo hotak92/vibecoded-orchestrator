@@ -13,6 +13,15 @@
 # injected right after it with a 120-line sub-cap, so the two together plus the
 # downstream caps (plan 30 + commits 8 + snapshot 50 + pruned 30 = ~118) stay
 # within the ~250-line budget.
+#
+# v0.2.100 WP-17: the line budget never bounded CHARACTERS, and Claude Code
+# shows the model only a file path + a 2 000-character preview of hook output
+# past 10 000 characters — measured: 223 of 235 runs of this hook were over
+# (up to 144 891 characters), so after a compaction the model saw a preview
+# of the state this hook exists to restore. The whole output now goes through
+# the shared cap (_lib/emit-context.sh vco_cap_context_stream), which keeps
+# the START (CONTEXT_STATE — the most critical section) and ends with a marker
+# naming the files to Read for the rest.
 
 # Scrub sensitive env vars (this hook doesn't need credentials)
 unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_API_KEY AWS_SECRET_ACCESS_KEY AWS_ACCESS_KEY_ID TELEGRAM_BOT_TOKEN POSTGRES_PASSWORD VERCEL_TOKEN CLAUDE_API_KEY 2>/dev/null
@@ -40,6 +49,20 @@ PROJECT_DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 # .ps1 sibling's Get-VcoHookSessionId.
 HOOK_STDIN=$(cat 2>/dev/null || echo "")
 SESSION_ID=$(vco_hook_session_id "$HOOK_STDIN")
+
+# The shared injection cap. A missing helper is a broken install; the hook
+# still re-injects (uncapped) rather than dropping the user's state.
+# shellcheck source=_lib/emit-context.sh disable=SC1091
+[ -f "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh" ] && . "$(dirname "${BASH_SOURCE[0]}")/_lib/emit-context.sh"
+_reinject_cap() {
+    if command -v vco_cap_context_stream >/dev/null 2>&1; then
+        vco_cap_context_stream "The rest is on disk: Read .claude/CONTEXT_STATE.md (and .claude/context/CONTEXT_STATE_<session>.md, the active plan under .claude/context/plans/, .claude/context/pre-compact-snapshot.md)."
+    else
+        cat
+    fi
+}
+
+{
 
 # 1. Current task state -- START position (most critical, uncapped)
 if [ -f "$PROJECT_DIR/.claude/CONTEXT_STATE.md" ]; then
@@ -96,3 +119,4 @@ if [ -s "$PRUNED" ]; then
     echo ""
     : > "$PRUNED"
 fi
+} | _reinject_cap

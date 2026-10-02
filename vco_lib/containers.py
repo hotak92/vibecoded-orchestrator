@@ -66,6 +66,7 @@ the section header below for the history and the Rust mirror contract.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import platform
 import re
@@ -97,6 +98,9 @@ __all__ = [
     "own_compose_project",
     "compose_identity_of",
     "foreign_compose_identity",
+    "compose_label_family",
+    "ExternalContainer",
+    "list_external_containers",
     # v0.2.92 (§3.5 / R13): runtime + compose resolution, the ONE Python home.
     "RuntimeState",
     "RuntimeResolution",
@@ -111,6 +115,8 @@ __all__ = [
     "PIN_VIA_ENV",
     "PIN_VIA_RUNTIME_TXT",
     "installed_runtime",
+    "hint_runtime",
+    "runtime_command_hint",
     "binary_works",
     "daemon_responsive",
     "compose_command",
@@ -366,6 +372,12 @@ def classify_container_probe(
 COMPOSE_PROJECT_LABEL = "com.docker.compose.project"
 COMPOSE_WORKING_DIR_LABEL = "com.docker.compose.project.working_dir"
 COMPOSE_CONFIG_FILES_LABEL = "com.docker.compose.project.config_files"
+#: v0.2.100 (L1-F05): podman-compose ALSO writes `com.docker.compose.project`,
+#: so the project label alone cannot say WHICH tool created a container. These
+#: two can: podman-compose stamps its own project label, docker-compose v2 a
+#: config hash podman-compose never writes.
+PODMAN_COMPOSE_PROJECT_LABEL = "io.podman.compose.project"
+DOCKER_COMPOSE_CONFIG_HASH_LABEL = "com.docker.compose.config-hash"
 
 _COMPOSE_NAME_KEY_RE = re.compile(r"^name:\s*['\"]?([^'\"\s#]+)", re.MULTILINE)
 
@@ -377,6 +389,11 @@ class ComposeIdentity:
     project: str
     working_dir: str = ""
     config_files: str = ""
+    #: The label family of the compose tool that created it — ``podman``
+    #: (podman-compose), ``docker`` (docker-compose v2 / docker compose), or
+    #: ``""`` when the labels do not say. Compared against
+    #: :attr:`vco_lib.compose_provider.ComposeProvider.label_family`.
+    provider: str = ""
 
     def describe(self) -> str:
         parts = [f"project '{self.project}'"]
@@ -453,6 +470,8 @@ def compose_identity_of(
             COMPOSE_PROJECT_LABEL,
             COMPOSE_WORKING_DIR_LABEL,
             COMPOSE_CONFIG_FILES_LABEL,
+            PODMAN_COMPOSE_PROJECT_LABEL,
+            DOCKER_COMPOSE_CONFIG_HASH_LABEL,
         )
     )
     argv = [bin_name, "inspect", "--type", "container", "--format", fmt, container]
@@ -468,11 +487,81 @@ def compose_identity_of(
     project = fields[0].strip() if fields else ""
     if not project:
         return None
+    def _field(i: int) -> str:
+        return fields[i].strip() if len(fields) > i else ""
+
     return ComposeIdentity(
         project=project,
-        working_dir=fields[1].strip() if len(fields) > 1 else "",
-        config_files=fields[2].strip() if len(fields) > 2 else "",
+        working_dir=_field(1),
+        config_files=_field(2),
+        provider=compose_label_family(_field(3), _field(4)),
     )
+
+
+def compose_label_family(podman_project: str, docker_config_hash: str) -> str:
+    """Pure: which compose tool's labels these are (see the label constants).
+    ``""`` when neither distinguishing label is present."""
+    if (podman_project or "").strip():
+        return "podman"
+    if (docker_config_hash or "").strip():
+        return "docker"
+    return ""
+
+
+@dataclass(frozen=True)
+class ExternalContainer:
+    """One row of ``podman ps -a --external``: ``storage_only`` is a container
+    Podman's database no longer knows but whose STORAGE record still owns the
+    name (status ``Storage``) — the leftover of a failed unmount."""
+
+    id: str
+    names: tuple[str, ...]
+    state: str
+    storage_only: bool
+
+
+def list_external_containers(
+    runtime: str = "podman",
+    *,
+    run: Optional[Callable[..., "subprocess.CompletedProcess[str]"]] = None,
+) -> Optional[list[ExternalContainer]]:
+    """Every container including storage-only ones (``podman ps -a --external
+    --format json``). ``None`` when it could not be listed (docker has no
+    storage-only containers and no ``--external``: not applicable → ``None``;
+    a probe failure is also ``None`` — "could not look" is never "none")."""
+    if runtime != "podman":
+        return None
+    try:
+        res = (run or _tsd.run)(
+            [runtime, "ps", "-a", "--external", "--format", "json"],
+            capture_output=True, text=True, timeout=15,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if res.returncode != 0:
+        return None
+    try:
+        rows = json.loads((res.stdout or "").strip() or "[]")
+    except ValueError:
+        return None
+    if not isinstance(rows, list):
+        return None
+    out: list[ExternalContainer] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        names = row.get("Names") or []
+        if isinstance(names, str):
+            names = [names]
+        state = str(row.get("State") or "")
+        status = str(row.get("Status") or "")
+        out.append(ExternalContainer(
+            id=str(row.get("Id") or row.get("ID") or ""),
+            names=tuple(str(n).lstrip("/") for n in names),
+            state=state,
+            storage_only=state.lower() == "storage" or status.lower().startswith("storage"),
+        ))
+    return out
 
 
 def foreign_compose_identity(
@@ -788,6 +877,35 @@ def installed_runtime(
     return ""
 
 
+def hint_runtime(
+    *, env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
+    install_root: object = _DEFAULT_ROOT,
+) -> str:
+    """The runtime a PRINTED container command names (v0.2.100 WP-18B).
+
+    Messages, deferral remedies and CLI hints used to spell ``podman start …``
+    literally, which is wrong for every docker user. This is the ONE answer
+    for them: the pinned runtime when installed, else the first installed
+    candidate (:func:`installed_runtime` — no daemon probe, cheap enough for
+    an error path), else the canonical first candidate so a machine with no
+    runtime still gets a command shaped like the default install.
+    """
+    return (installed_runtime(env=env, which=which, install_root=install_root)
+            or RUNTIME_CANDIDATES[0])
+
+
+def runtime_command_hint(
+    args: str, *, runtime: Optional[str] = None,
+    env: Optional[Mapping[str, str]] = None, which: Optional[WhichFn] = None,
+    install_root: object = _DEFAULT_ROOT,
+) -> str:
+    """``"<runtime> <args>"`` — e.g. ``runtime_command_hint("start vco_ollama")``
+    → ``"docker start vco_ollama"`` on a docker machine. *runtime* overrides
+    the detection (a caller that already resolved it)."""
+    rt = runtime or hint_runtime(env=env, which=which, install_root=install_root)
+    return f"{rt} {args}"
+
+
 def _probe(
     argv: Sequence[str], timeout: int, run: RunFn,
 ) -> Optional[bool]:
@@ -808,11 +926,15 @@ def binary_works(runtime: str, *, run: Optional[RunFn] = None) -> Optional[bool]
 def daemon_responsive(
     runtime: str, *, which: Optional[WhichFn] = None, run: Optional[RunFn] = None,
 ) -> Optional[bool]:
-    """``<runtime> info`` — round-trips to the daemon / socket / machine,
-    the same code path compose-up needs. Catches a stopped Docker Desktop
-    on macOS, a stopped ``podman.socket`` on Linux, an unstarted podman
-    machine on Windows. ``False`` when the binary is not installed — neither
-    on PATH nor in the usual install locations (:mod:`vco_lib.tool_search_dirs`)."""
+    """``<runtime> info`` — round-trips to the daemon (docker) or the podman
+    machine (macOS / Windows). Catches a stopped Docker Desktop, an unstarted
+    podman machine. ``False`` when the binary is not installed — neither on
+    PATH nor in the usual install locations (:mod:`vco_lib.tool_search_dirs`).
+
+    It does NOT prove the podman API SOCKET on Linux: ``podman info`` talks to
+    libpod directly and passes while ``podman.sock`` is missing, which is the
+    socket a docker-compose provider dials (v0.2.100, L1-F02). Ask
+    :func:`vco_lib.compose_provider.socket_status` for that."""
     if not runtime or not (which or _tsd.which)(runtime):
         return False
     return _probe([runtime, "info"], DAEMON_PROBE_TIMEOUT_S, run or _tsd.run)

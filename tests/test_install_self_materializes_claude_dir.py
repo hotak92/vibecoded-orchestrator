@@ -202,6 +202,8 @@ class DelegatedIsIdempotentTest(unittest.TestCase):
             for rel, first_bytes in first.items():
                 if rel not in second:
                     continue  # a new run may add e.g. deferral files — tolerate.
+                if Path(rel).parts[:2] == (".claude", "logs"):
+                    continue  # run records (v0.2.100 bundle-install.log) append per run.
                 if rel == manifest_rel:
                     a = json.loads(first_bytes.decode("utf-8"))
                     b = json.loads(second[rel].decode("utf-8"))

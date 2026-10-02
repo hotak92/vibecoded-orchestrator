@@ -562,6 +562,39 @@ def _project_name(folder: Path) -> Optional[str]:
         return None
 
 
+def retry_ollama_models(ctx: RetryContext) -> RetryResult:
+    """v0.2.100 — the work a run that found Ollama down skipped (model pulls,
+    then the KG seed); ``ollama_not_ready_at_update`` /
+    ``ollama_model_pull_failed``. ONE home for that work:
+    :func:`vco_lib.ollama_pull.retry_owed_model_work`, which clears both rows
+    itself only on proven success (the dispatcher's ledger re-read is then the
+    proof). The seed is :func:`retry_kg_seed` — no second seeding path."""
+    from vco_lib.ollama_pull import BLOCKED as _BLOCKED, DONE, retry_owed_model_work
+
+    if condition_cleared(ctx.folder, ctx.condition_id) is True:
+        return RetryResult(ctx.condition_id, RETRIED, "already completed by the sibling retry")
+    # The seed counts only on PROOF: exit 0 AND no "ran without a backend" row.
+    status, detail = retry_owed_model_work(ctx.folder, seed=lambda: (
+        retry_kg_seed(ctx).status == RETRIED
+        and condition_cleared(ctx.folder, "kg_sync_no_embedding_backend") is True))
+    return RetryResult(ctx.condition_id,
+                       {DONE: RETRIED, _BLOCKED: SKIPPED}.get(status, FAILED), detail)
+
+
+def retry_code_embed_backend(ctx: RetryContext) -> RetryResult:
+    """v0.2.100 W4R-06 — ``code_embed_backend_unavailable`` (a VCO-managed
+    code_embed that was DOWN at an update). No owed work beyond the service
+    answering: the session-start ensure hook starts VCO's container, and the
+    child :func:`vco_lib.ollama_pull.clear_code_embed_outage` re-reads the
+    service and clears the row itself only when ``/health`` answers (the
+    dispatcher's ledger re-read is then the proof). The code-graph work the
+    outage skipped is owed under its own rows (``code_graph_*``)."""
+    from vco_lib.ollama_pull import DONE, clear_code_embed_outage
+
+    status, detail = clear_code_embed_outage(ctx.folder)
+    return RetryResult(ctx.condition_id, RETRIED if status == DONE else SKIPPED, detail)
+
+
 @dataclass(frozen=True)
 class Handler:
     """One retry handler plus the backend ITS work needs.
@@ -602,6 +635,8 @@ HANDLERS: dict[str, Handler] = {
         retry_codegraph_resync, CODE_BACKEND,
         needs_current_code_embed_image=True,
     ),
+    "ollama_models": Handler(retry_ollama_models, TEXT_BACKEND),
+    "code_embed_backend": Handler(retry_code_embed_backend, CODE_BACKEND),
 }
 
 

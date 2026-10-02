@@ -17,7 +17,7 @@
     <!-- Keep alive only on abnormal exit; SuccessfulExit=false means
          "restart if the process exits with a non-zero status OR is signalled."
          We do NOT use a bare KeepAlive=true because that would restart even
-         on clean `vct-hub --stop`. -->
+         on a clean vct-hub stop subcommand. -->
     <key>KeepAlive</key>
     <dict>
         <key>SuccessfulExit</key>

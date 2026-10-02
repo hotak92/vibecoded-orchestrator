@@ -397,10 +397,10 @@ class RouteTests(unittest.TestCase):
     def test_the_shared_namespace_does_not_shadow_the_nested_one(self) -> None:
         """Both spellings of the shared family id work and land on the row
         the spelling names — the whole point of longest-match resolution."""
-        nested = routing.route("claude-gw/qwen/glm-5.2")
+        nested = routing.route("claude-gw/qwen/glm-5.3")
         assert isinstance(nested, Route)
         self.assertEqual(nested.family_id, "qwen")
-        flat = routing.route("claude-gw/glm-5.2")
+        flat = routing.route("claude-gw/glm-5.3")
         assert isinstance(flat, Route)
         self.assertEqual(flat.family_id, "zai")
 

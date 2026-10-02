@@ -183,8 +183,8 @@ class ManagedPathsConsistencyTests(unittest.TestCase):
 
     def test_self_reference_present_in_file(self) -> None:
         """The .txt lists itself. Without this entry,
-        update_orchestrator_at would not propagate edits to the
-        list across existing installs."""
+        a copy install (install_orchestrator) would not carry edits to
+        the list along."""
         parsed = _independent_parse(self.text)
         self.assertIn("orchestrator-managed-paths.txt", parsed)
 

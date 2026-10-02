@@ -6,8 +6,8 @@
 //! path may have shifted, e.g. the user copied their install elsewhere).
 //!
 //! Why a Rust mirror of the shell script:
-//!   - `apply_launcher_update` (self-update) and `update_orchestrator_at`
-//!     ("Check Update") both run in-process; re-exec'ing post-install-
+//!   - the update pipeline (`update_run::run_update`, its bookkeeping
+//!     phase) runs in-process; re-exec'ing post-install-
 //!     launcher.sh from a long-running Tauri app is fiddly (we'd have to
 //!     locate the script relative to the running binary, then shell-out
 //!     into bash, and PATH may have been stripped by the spawn parent).
@@ -45,9 +45,9 @@ use vct_launcher_core::process::CommandExt as _;
 ///   * Windows: intentional no-op. The `.lnk` shortcut is created once
 ///              by `first-install.bat` at install time and points at
 ///              the launcher binary in its install directory. Because
-///              the launcher binary path is stable across self-update
-///              (`apply_launcher_update` rebuilds in place via cargo
-///              and never relocates the binary), there is nothing to
+///              the launcher binary path is stable across updates
+///              (the update pipeline swaps the dist binary in place
+///              and never relocates it), there is nothing to
 ///              refresh post-update. If a user manually moves their
 ///              install directory the .lnk becomes stale and must be
 ///              recreated by re-running `first-install.bat` — that

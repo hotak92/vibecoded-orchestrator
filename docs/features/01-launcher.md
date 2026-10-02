@@ -216,14 +216,12 @@ Three scopes with distinct keychain service namespaces: `PerProject { project_id
 The "Set?" column is a **live two-store probe**, not the row's stored `is_set` column. That column is a snapshot the ref's writer left behind (the hub's `.env` migration registers rows with `is_set = true` and nothing revises it), so rendering it reported "set" for keys the user had since deleted and "missing" for keys that resolve from the tier-2 file store. The tab now asks `get_secret_status_v2` per ref — the same command the Preferences → Secrets panel uses — and renders the shared `badgeOf` verdict: `set` / `paused` / `set — file store` / `unknown` / `not set`. `unknown` is a distinct state on purpose: a store that could not be read is never reported as an absence. Derivation + tests: `launcher/src/lib/project-state/secret-ref-status.ts`.
 
 ### Secrets / settings Tauri commands (`commands/secrets_cmd.rs`)
-Seven commands cover the GUI keychain + module settings surface:
+These commands cover the GUI keychain surface:
 - `set_secret_v2(scope, module_id, key, value)` — write a secret to the OS keychain. The plaintext value never reaches SQLite.
 - `clear_secret_v2(scope, module_id, key)` — delete a keychain entry.
-- `is_secret_set(scope, module_id, key)` — boolean presence check (no read). Answers the launcher's **permission** question — true ⇔ the OS keychain holds a value AND the per-`(secret, requester)` active flag is set — so it deliberately ignores the tier-2 file store, which that matrix does not govern. It has no in-tree caller: every launcher surface uses `get_secret_status_v2`, which returns the same `is_set` boolean *plus* the two-store `StoreReport` the GUI badges need. Kept as a stable IPC surface for module authors who want the gate alone. **Do not widen it to consult the file store** — that would silently extend a permission decision over a store the matrix has no authority over; render presence from `StoreReport` instead.
+- `get_secret_status_v2(scope, module_id, key, requester_project_id?)` — presence check (no read). Its `is_set` answers the launcher's **permission** question — true ⇔ the OS keychain holds a value AND the per-`(secret, requester)` active flag is set — so it deliberately ignores the tier-2 file store, which that matrix does not govern; it also returns the two-store `StoreReport` the GUI badges render from. (The boolean-only `is_secret_set` command was retired in v0.2.100; this is its replacement.) **Do not widen `is_set` to consult the file store** — that would silently extend a permission decision over a store the matrix has no authority over; render presence from `StoreReport` instead.
 - `get_secret_preview(scope, module_id, key)` — first 4 + last 4 chars (never the full value); used for "currently set" display.
-- `get_setting_v2(project_id, module_id, setting_key)` — read a non-secret per-(project, module) setting from `module_settings`.
-- `set_setting_v2(project_id, module_id, setting_key, value_json)` — write a non-secret per-project setting (JSON value) through the one settings write gate (`module_settings_schema::write_module_setting`, as `set_module_setting` does): a declared setting is validated against its manifest declaration, a setting whose value lives elsewhere is refused, and an installed module's setting is stored only for a project it is enabled in (v0.2.97).
-- `list_module_settings_v2(project_id, module_id)` — return all settings for one module.
+- Module settings are served by `module_gui.rs`, not this file: `get_module_setting`, `set_module_setting` (the one settings write gate, `module_settings_schema::write_module_setting`: a declared setting is validated against its manifest declaration, a setting whose value lives elsewhere is refused, and an installed module's setting is stored only for a project it is enabled in — v0.2.97) and `list_module_settings`. The `get_setting_v2` / `set_setting_v2` / `list_module_settings_v2` commands were retired in v0.2.100 in their favour.
 
 ---
 
@@ -279,9 +277,9 @@ The launcher edits `~/.claude.json` and the project's `.claude/settings.json` to
 "+ Add custom MCP server" form writes to three locations: `~/.vct/orchestrator.json` (launcher config), `~/.claude.json` (Claude Code reads this), `.claude/settings.json` env block (orchestrator subprocess). Documented in `launcher/docs/MCP_INTEGRATION.md`.
 
 ### Dashboard Tauri commands (`commands/dashboard.rs`)
-Nine commands back the orchestrator-config and MCP-management surfaces in the launcher dashboard:
+These commands back the orchestrator-config and MCP-management surfaces in the launcher dashboard:
 - `get_feature_flags(user_apps)` — derives enabled feature flags from the user's purchased apps + tier.
-- `get_orchestrator_config()` / `save_orchestrator_config(config)` — read/write `~/.vct/orchestrator.json` (free/pro orchestrator settings).
+- `get_orchestrator_config()` — read `~/.vct/orchestrator.json` (free/pro orchestrator settings). Writes go through the per-field commands below (`update_orchestrator_setting`, `toggle_mcp_server`, `add_custom_mcp_server`, `remove_mcp_server`); the whole-config `save_orchestrator_config` was retired in v0.2.100 because it bypassed their guards.
 - `update_orchestrator_setting(key, value, user_apps)` — patch a single setting and return the updated config.
 - `get_mcp_servers()` — list MCP servers known to the launcher (built-in + custom) with enabled state.
 - `toggle_mcp_server(mcp_id, enabled, user_apps)` — flip the enabled flag for one server.
@@ -325,7 +323,7 @@ Migration emits phase-level `volumes://migrate-progress` Tauri events so the UI 
 - **Runtime decision** (`services/runtime.rs`): one verdict, asked from Python (`python -m vco_lib.runtime_reconcile decide --json` — the same answer the session hooks and the boot service use): `VCT_CONTAINER_RUNTIME` if set, else the runtime the install recorded (`state/install/runtime.txt`), else podman-first auto-detection; a pinned runtime that is down is refused with Python's refusal text shown as is. The macOS/Windows Podman-Machine check (`podman machine list`) is kept as a prompt hint only.
 - **Service endpoints rows** (v0.2.97): the launcher.db `service_endpoints` table (migration 047) is the one source of truth for where each service runs — mode (`vco_managed` / `adopted_container` / `adopted_external`), host/port, container identity and data mount. When detection finds a foreign Weaviate or Ollama, `ExternalServicesDialog.svelte` prompts with the candidates from `python -m vco_lib.service_endpoints candidates --json` (name, compose project, image, port, whether VCO data was found, compatibility verdict); the actions are **Use this one** and **Run VCO's own copy**, landing in the row via `service_endpoints adopt` / `use-vco-copy`. The Services page shows a "Where it runs" column with the mode badge, a **Change…** action, and — for adopted containers — the opt-in **Let VCO manage it** transfer (`hand-to-vco`, with the data mount named and verified).
 - **Frontend events**: `vct-services-lifecycle` (start/stop/restart progress) and `vct-external-services-detected` (adoption prompt trigger). Lets the UI render real-time state without polling.
-- **Zombie recovery**: when a service's runtime state reports `zombie: true` (a container stuck in a wedged state), the Services route renders a **"stuck"** badge in the Status cell and a **Recover** button (shown only when the service is zombie and has a container name). Recover calls `recover_zombie`; on failure it surfaces a page banner and refreshes the services snapshot.
+- **Zombie recovery**: when a service's runtime state reports `zombie: true` (a container stuck in a wedged state), the Services route renders a **"stuck"** badge in the Status cell and a **Recover** button (shown only when the service is zombie and has a container name). Recover calls `recover_zombie`; on failure it surfaces a page banner and refreshes the services snapshot. Recover removes and re-creates a stuck container only when its own labels prove it is VCO's (and its data guard passes); any other stuck container is only **started**, by name, with a message naming why VCO will not remove it. The per-service Stop and Restart buttons act on the container **by the name its row records** without consulting its labels — they are your explicit action on whatever container carries that name (the label check is the hub watchdog's rule, which only ever acts on containers it can prove are VCO's).
 
 ### Model Gateway Supervision (hub-side, v0.2.95)
 
@@ -438,17 +436,8 @@ Lists which other projects can read this project's code graph (or none).
 ### `codegraph_grant_access(grantor_project, grantee_project, access)`
 Sets the access level (`read` / `none`) between two projects. Audits the grant.
 
-### `codegraph_check_access(grantor_project, grantee_project)`
-Returns the current access level. Used by the search MCP to gate cross-project code-graph queries.
-
-### `codegraph_summary(project_id)`
-Returns counts per code-graph collection (modules, classes, functions, APIs, interactions) plus last-analyzed SHA — drives the `/codegraph` summary panel.
-
-### `codegraph_load_graph(project_id, scope, limit)`
-Returns nodes + edges for the SigmaGraph viz (functions and their `calls` edges, classes and their `extends` chains).
-
-### `codegraph_set_entity_access_bulk(project_id, entries)`
-Batch per-entity access overrides (v1.1) for fine-grained gating of specific functions/classes across project boundaries.
+### Reading access and counts
+`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the search MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph; a subgraph is available through the `codegraph-diagram` skill) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
 
 ---
 
@@ -505,18 +494,16 @@ Twenty-one commands wired in `lib.rs` cover the orchestrator-installer surface u
 ### State / version
 - `check_install_status(path)` — true/false: is an orchestrator installed at that path?
 - `check_install_health(path)` — runs the lightweight health probe (containers up, schema seeded).
-- `read_install_log(path)` — returns the last install/update log content for the diagnostics panel.
+- `read_install_log()` — returns the parsed install log (`state/logs/install.jsonl`). The diagnostics panel that would render it is deferred by the owner to v0.2.102; no launcher screen calls it yet.
 - `get_installed_version(path)` — reads version from installed `.env` or repo state.
 - `check_for_updates(path)` — compares installed vs latest available.
 - `inspect_orchestrator_at(path)` — full state probe of an existing install at a given path.
 - `inspect_project_leftovers(path)` — checks for residual `.claude/` artefacts after uninstall.
 
 ### Install / update flow
-- `preview_install(config)` — diff-style preview of what an install would change. Read-only.
-- `preflight_install_safety_check(config)` — hard-path-whitelist enforcement; refuses installs that would touch user code outside whitelisted dirs.
-- `install_orchestrator(config, window)` — runs the install, emits `installer://progress` events.
-- `update_orchestrator(window)` — re-runs install in update mode (preserves `.env`, restarts services).
-- `update_orchestrator_at(path, window)` — variant that targets a specific existing install path.
+- `preflight_install_safety_check(target)` — read-only report of what an install would overwrite, preserve and add. It does not itself refuse anything (the refusal is `install_orchestrator`'s `diff_install` conflict check); its preflight panel is deferred by the owner to v0.2.102.
+- `install_orchestrator(config, window)` — runs the install, emits `installer://progress` events. It runs the same `diff_install` a preview would and, on an existing install, returns `InstallConflictError` to the 4-option conflict modal (the standalone `preview_install` command was retired in v0.2.100).
+- `run_orchestrator_update(window, kind)` — THE orchestrator update (v0.2.100): one thirteen-phase pipeline for every kind (`PullFf`, `Merge`, `Rebase`, `Resume`, `ApplyOnly`, `ResetHard`) — git operation, `install.py --update`, version-guarded relaunch. It replaced `update_orchestrator` and the other per-surface update commands. The v0.2.99 file-copy update of a second orchestrator clone (the MenuBar "Update N orchestrator clones" button) was retired with no replacement command: a second install updates through its own launcher or `python install.py --update` in its own folder.
 
 ### GitHub PAT (OS keychain)
 - `has_github_pat()` — boolean: is a PAT stored in the OS keychain under `vct.global.github`?
@@ -603,6 +590,7 @@ The hub HTTP server (`hub/server.rs`, port 7700) nests four sub-routers under `/
 - `DELETE /api/v1/projects/{project_id}/secrets/{secret_key}` — clear a secret ref.
 - `POST /api/v1/projects/{project_id}/kg-binding` — set the project's primary KG binding.
 - `POST /api/v1/projects/{project_id}/codegraph-binding` — set the code graph binding.
+- `POST /api/v1/projects/{project_id}/codegraph/extras/indexed` — record that an extra code-graph path was re-indexed at a commit (`{path, commit, files_analyzed?, entities_indexed?, duration_ms?}`; 404 unknown path, 409 disabled path). Written by the Stop hook's automatic extra-path refresh so the hook never opens launcher.db.
 
 ### CLI-facing endpoints (`hub/cli_api.rs`)
 Mirror of Tauri commands so the headless `vct-cli` can drive the launcher without IPC into the Tauri app. All actions audit with `via: "cli"` tagged in the detail JSON.
@@ -778,7 +766,7 @@ Twenty-one Tauri commands mutate or read the per-project Claude Code registry. E
 #### Listing commands (read-only)
 - `list_project_agents(project_id)` — all agents registered for a project with `enabled` flag.
 - `list_project_skills(project_id)` — all skills registered for a project.
-- `list_project_hooks(project_id)` — the hooks the launcher has MIRRORED (event, matcher, command, `enabled`). Not the truth about what runs; the Hooks tab uses `list_project_hooks_effective` instead.
+- The hooks the launcher has MIRRORED are not exposed raw (rendering enable/disable state from the mirror was the v0.2.91 placebo); the `list_project_hooks` command was retired in v0.2.100 in favour of `list_project_hooks_effective` below.
 - `list_project_hooks_effective(project_id)` (`commands/project_hooks_settings.rs`) — reads `.claude/settings.json` and joins the mirror rows only for metadata. Returns each hook's state (`active` / `disabled` / `orphan`), the settings.json path, and an honest `settings_readable` + `error_code` when the file cannot be parsed.
 - `list_project_permissions(project_id)` — entries from `permissions.allow` / `permissions.ask` / `permissions.deny`.
 - `list_project_secret_refs(project_id)` — secret references with `is_set` presence flag.
@@ -830,7 +818,7 @@ Tauri 2 has no `WindowEvent::Minimized`, which is why a minimize is observed as 
 ### 3-Button Quit Confirmation
 Tray → Quit (and window-close when `tray_close_to_tray` is OFF) prompts with three options:
 
-- **Quit and stop services** — full shutdown cascade
+- **Quit and stop services** — full shutdown cascade. The services VCO manages (`vco_managed` rows) are stopped, never removed: the hub's watchdog is paused for each first, then each container is stopped (`stop --time`) **by the name its `service_endpoints` row records** and verified stopped; anything not verified is reported as `services_stop_incomplete` with a non-destructive command. Adopted services (rows you pointed at someone else's container or endpoint) keep running. The container's labels are not consulted here — the row's name is the target — so a row whose recorded name now belongs to another compose project's container stops that container too.
 - **Reduce to tray** — minimize-to-background convenience (services keep running)
 - **Cancel** — keep window open
 

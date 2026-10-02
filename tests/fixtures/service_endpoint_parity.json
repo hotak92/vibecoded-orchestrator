@@ -21,7 +21,12 @@
     "Python: vco_lib.service_endpoints.plan.",
     "hand_to_vco_cases: the row checks of `hand-to-vco` — Python vco_lib.service_reconcile.hand_to_vco_refusal(...)",
     "is None == Rust service_endpoints::hand_to_vco_allowed. The Services page offers 'Let VCO manage it' where this",
-    "holds AND the row is adopted_container (ServiceRuntimeState.hand_to_vco_offered)."
+    "holds AND the row is adopted_container (ServiceRuntimeState.hand_to_vco_offered).",
+    "mount_write_cases (v0.2.100 AD-4): an ollama vco_managed row upserted over a prior row (null = no row) with",
+    "write = the new data_mount (null = none observed) -> expect = what is stored. A recorded mount is NEVER",
+    "overwritten with NULL. Python: vco_lib.service_endpoints.write_rows (keep_recorded_mount; an explicit",
+    "clear_mount=True is the Python-only exception, tested in tests/test_v02100_data_identity.py); Rust: the COALESCE",
+    "upsert in vct-launcher-core/src/db/service_endpoints.rs."
   ],
   "constants": {
     "default_ports": {"weaviate": 8081, "ollama": 11435, "code_embed": 11440},
@@ -192,5 +197,17 @@
      "row": {"mode": "adopted_container", "port": 11435, "container_name": "vco_weaviate"}, "expect": false},
     {"name": "a vco_managed row naming VCO's container passes the row checks", "service": "weaviate",
      "row": {"mode": "vco_managed", "port": 8081, "grpc_port": 50052, "container_name": "vco_weaviate"}, "expect": true}
+  ],
+  "mount_write_cases": [
+    {"name": "a recorded bind survives a write that observed no mount (the 110 GB case)",
+     "prior": {"data_mount": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}}, "write": null, "expect": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}},
+    {"name": "a newly observed mount replaces the recorded one",
+     "prior": {"data_mount": {"kind": "volume", "source": "vco_ollama_data", "destination": "/root/.ollama"}}, "write": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}, "expect": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}},
+    {"name": "no recorded mount, none observed: stays NULL",
+     "prior": {"data_mount": null}, "write": null, "expect": null},
+    {"name": "no recorded mount, one observed: recorded",
+     "prior": {"data_mount": null}, "write": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}, "expect": {"kind": "bind", "source": "/some/models", "destination": "/root/.ollama"}},
+    {"name": "no prior row, none observed: NULL", "prior": null, "write": null, "expect": null},
+    {"name": "no prior row, one observed: recorded", "prior": null, "write": {"kind": "volume", "source": "vco_ollama_data", "destination": "/root/.ollama"}, "expect": {"kind": "volume", "source": "vco_ollama_data", "destination": "/root/.ollama"}}
   ]
 }

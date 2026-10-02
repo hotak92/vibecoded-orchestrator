@@ -39,6 +39,7 @@ not a design path.
 from __future__ import annotations
 
 import argparse
+import textwrap
 from pathlib import Path
 from typing import Callable, NamedTuple, Optional, Sequence
 
@@ -386,29 +387,23 @@ def emit_compose_up_failed_deferral(
     )
 
 
-def print_compose_failure_hints(stderr: str, container_cmd: str) -> None:
-    """The targeted hints under a FAIL: daemon down, port taken, stale network label."""
-    low = (stderr or "").lower()
-    if "cannot connect" in low or "daemon" in low:
-        print("\n  Hint: container daemon not running.")
-        if container_cmd == "docker":
-            print("    Linux:  sudo systemctl start docker")
-            print("    macOS:  open Docker Desktop")
-            print("    Windows: start Docker Desktop")
-        else:
-            print("    Linux:  systemctl --user start podman.socket")
-    if "address already in use" in low or "bind" in low:
-        print("\n  Hint: a host port is already in use.")
-        print("    Either stop the conflicting process, or set")
-        print("    VCT_FORCE_SEPARATE_CONTAINERS=1 + override WEAVIATE_PORT /")
-        print("    OLLAMA_PORT / CODE_EMBED_PORT to use distinct ports.")
-    if "incorrect label" in low and "com.docker.compose.network" in low:
-        print("\n  Hint: the compose network already exists but a different compose")
-        print("    tool created it (label mismatch). If")
-        print(f"    `{container_cmd} network inspect <name>` shows NO containers")
-        print("    attached, remove that network and compose recreates it with the")
-        print("    right labels. If containers ARE attached, they belong to another")
-        print("    compose project — see UPDATE_DEFERRED.md.")
+def print_compose_failure_hints(failure, container_cmd: str) -> None:
+    """The targeted hint under a FAIL, rendered from ONE typed cause.
+
+    ``failure`` is a :class:`vco_lib.compose_recovery.ComposeFailure` (a raw
+    stderr string is classified first). v0.2.100 (L1-F03): the cause comes from
+    :func:`vco_lib.compose_recovery.classify`'s anchored patterns, so a name
+    conflict or a missing socket is never reported as "daemon not running"."""
+    from vco_lib import compose_recovery as _cr  # noqa: PLC0415 — keeps the guard import-light
+
+    if not isinstance(failure, _cr.ComposeFailure):
+        failure = _cr.classify(str(failure or ""), runtime=container_cmd)
+    print(f"\n  Cause: {failure.label}.")
+    if failure.evidence:
+        print(f"    compose said: {failure.evidence}")
+    for line in textwrap.wrap(failure.remedy, width=88, break_long_words=False,
+                              break_on_hyphens=False):
+        print(f"    {line}")
 
 
 def compose_failure_followup(

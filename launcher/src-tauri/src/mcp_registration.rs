@@ -204,20 +204,35 @@ impl Default for ServicePorts {
 /// var is read: not `WEAVIATE_PORT`/`OLLAMA_PORT`/`CODE_EMBED_PORT` (the old
 /// installer hand-off), not `WEAVIATE_GRPC_PORT`.
 pub fn machine_service_ports() -> ServicePorts {
-    use vct_launcher_core::services::service_endpoints::{
-        machine_row_from_disk, render_grpc_port, render_port, render_url, CoreService,
-    };
+    use vct_launcher_core::services::service_endpoints::{machine_row_from_disk, CoreService};
     let w = machine_row_from_disk(CoreService::Weaviate);
     let o = machine_row_from_disk(CoreService::Ollama);
     let c = machine_row_from_disk(CoreService::CodeEmbed);
+    service_ports_from_rows(w.as_ref(), o.as_ref(), c.as_ref())
+}
+
+/// [`ServicePorts`] for rows the caller already holds (`None` = no row → the
+/// compiled default). The Rust twin of Python
+/// `vco_lib.service_endpoints.urls_from_rows`, which the Tier-4 fallback
+/// `install_mcp._build_python_mcp_entries` consumes; the two are pinned by the
+/// shared case table `tests/fixtures/mcp_registration_url_parity.json`
+/// (v0.2.100 WP-18B).
+pub fn service_ports_from_rows(
+    w: Option<&vct_launcher_core::db::service_endpoints::ServiceEndpointRow>,
+    o: Option<&vct_launcher_core::db::service_endpoints::ServiceEndpointRow>,
+    c: Option<&vct_launcher_core::db::service_endpoints::ServiceEndpointRow>,
+) -> ServicePorts {
+    use vct_launcher_core::services::service_endpoints::{
+        render_grpc_port, render_port, render_url, CoreService,
+    };
     ServicePorts {
-        weaviate_port: render_port(CoreService::Weaviate, w.as_ref()),
-        ollama_port: render_port(CoreService::Ollama, o.as_ref()),
-        grpc_port: render_grpc_port(w.as_ref()),
-        code_embed_port: render_port(CoreService::CodeEmbed, c.as_ref()),
-        weaviate_url: render_url(CoreService::Weaviate, w.as_ref()),
-        ollama_url: render_url(CoreService::Ollama, o.as_ref()),
-        code_embed_url: render_url(CoreService::CodeEmbed, c.as_ref()),
+        weaviate_port: render_port(CoreService::Weaviate, w),
+        ollama_port: render_port(CoreService::Ollama, o),
+        grpc_port: render_grpc_port(w),
+        code_embed_port: render_port(CoreService::CodeEmbed, c),
+        weaviate_url: render_url(CoreService::Weaviate, w),
+        ollama_url: render_url(CoreService::Ollama, o),
+        code_embed_url: render_url(CoreService::CodeEmbed, c),
     }
 }
 
@@ -972,6 +987,55 @@ mod tests {
         let weaviate = &entries.iter().find(|(n, _, _)| n == "weaviate-kg").unwrap().1;
         assert_eq!(weaviate["env"]["OLLAMA_URL"], "http://gpu.lan:11434");
         assert_eq!(weaviate["env"]["GRPC_PORT"], "50061");
+    }
+
+    /// v0.2.100 WP-18B: the shared case table the Python Tier-4 fallback
+    /// (`install_mcp._build_python_mcp_entries` over `urls_from_rows`) runs
+    /// too — the rows' host and scheme reach the registered entry on both.
+    #[test]
+    fn mcp_registration_url_parity_table() {
+        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/mcp_registration_url_parity.json");
+        let text = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let table: serde_json::Value = serde_json::from_str(&text).expect("table parses");
+        let cases = table["cases"].as_array().expect("cases");
+        assert!(!cases.is_empty());
+        let row_of = |svc: &str, v: &serde_json::Value| -> Option<ServiceEndpointRow> {
+            if v.is_null() {
+                return None;
+            }
+            let mode = EndpointMode::parse(v["mode"].as_str().unwrap()).expect("mode");
+            let mut row = ServiceEndpointRow::new(
+                svc,
+                mode,
+                v.get("host").and_then(|h| h.as_str()).unwrap_or("localhost"),
+                v["port"].as_u64().unwrap() as u16,
+            );
+            if let Some(sc) = v.get("scheme").and_then(|s| s.as_str()) {
+                row.scheme = sc.to_string();
+            }
+            row.grpc_port = v.get("grpc_port").and_then(|g| g.as_u64()).map(|g| g as u16);
+            row.container_name =
+                v.get("container_name").and_then(|c| c.as_str()).map(String::from);
+            Some(row)
+        };
+        let root = tempfile::tempdir().unwrap();
+        let py = root.path().join("python");
+        for case in cases {
+            let name = case["name"].as_str().unwrap();
+            let rows = &case["rows"];
+            let w = row_of("weaviate", &rows["weaviate"]);
+            let o = row_of("ollama", &rows["ollama"]);
+            let c = row_of("code_embed", &rows["code_embed"]);
+            let ports = service_ports_from_rows(w.as_ref(), o.as_ref(), c.as_ref());
+            let entries = build_default_mcp_entries(root.path(), &py, ports);
+            let env = &entries.iter().find(|(n, _, _)| n == "weaviate-kg").unwrap().1["env"];
+            for (key, want) in case["expect_weaviate_kg_env"].as_object().unwrap() {
+                assert_eq!(&env[key.as_str()], want, "{name}: {key}");
+            }
+        }
     }
 
     fn tmp_target() -> PathBuf {

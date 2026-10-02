@@ -14,8 +14,7 @@
 //!     That works because each guards work that already owns a row
 //!     (`project_setups`, `module_installs`) with a status and a start
 //!     timestamp, which also survives a launcher restart. `update_all_projects`
-//!     and `update_orchestrator_at` own no such row: the run is a traversal,
-//!     not an entity.
+//!     owns no such row: the run is a traversal, not an entity.
 //!   * `self_update::UPSTREAM_FETCH_LOCK` — a `tokio::sync::Mutex` held
 //!     across the work, which SERIALISES (the second caller queues, then
 //!     runs). Wrong semantics here: a queued second update-all would run the
@@ -42,46 +41,48 @@
 //! ## Deliberately NOT one key for every update
 //!
 //! `update_all_projects` (manifest-driven bundle reconcile over registered
-//! projects) and `update_orchestrator_at` (orchestrator-clone refresh, gated
-//! by `validate_source_repo`) are SEPARATE operations on separate targets —
-//! see the boundary note at `installer.rs`'s `update_orchestrator_at`. They
+//! projects) and the orchestrator update (`update_run::run_update`, the
+//! launcher's own clone) are SEPARATE operations on separate targets. They
 //! get separate keys, so guarding one never blocks the other. Do not merge
-//! them into a single "an update is running" flag.
+//! them into a single "an update is running" flag. (v0.2.100, owner Q1: a
+//! third key, for the per-clone file-copy command, was retired with that
+//! command.)
 //!
 //! ## Scope of the guarantee
 //!
-//! Process-wide, not machine-wide. A second launcher process is already
-//! prevented by the single-instance lock; this closes the in-process case the
-//! GUI can actually produce (a modal reopened mid-run, a second window, a
-//! button double-fire). A separate-process CLI race needs its own defence —
-//! the migrate path's orphan-`__staging` recovery is that.
+//! The keyed claim is process-wide, not machine-wide: it closes the in-process
+//! case the GUI can actually produce (a modal reopened mid-run, a second
+//! window, a button double-fire).
+//!
+//! v0.2.100 (WP-03a, L2-F18): the orchestrator-clone update ALSO takes a
+//! machine-wide claim, [`acquire_update_lock`] — `<vct_root>/update.lock`
+//! holding the owner's pid, reaped when that pid is dead (the same posture as
+//! `lib.rs::reap_stale_install_py_lock`). The single-instance lock does not
+//! cover a second launcher binary run from another copy or a hub-side updater,
+//! and nothing else stopped two processes interleaving a `git pull` and an
+//! `install.py --update` on one tree. The in-process claim is taken FIRST, so
+//! within one process the file lock is never contended by itself.
 
 use std::collections::HashSet;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 /// Operation key: the update-all-projects traversal (`projects_v2.rs`).
 pub const OP_UPDATE_ALL_PROJECTS: &str = "update_all_projects";
-
-/// Operation key: the orchestrator-clone refresh (`installer.rs`).
-pub const OP_UPDATE_ORCHESTRATOR_AT: &str = "update_orchestrator_at";
 
 /// Operation key: the post-update model-gateway restart
 /// (`gateway_freshness::model_gateway_restart_stale`). A second Continue while
 /// one restart is in flight would end every agent session a second time.
 pub const OP_GATEWAY_RESTART: &str = "model_gateway_restart";
 
-/// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by BOTH
-/// `installer::update_orchestrator` (the MenuBar badge) and
-/// `self_update::apply_launcher_update` (Preferences → Launcher updates).
-///
-/// ONE key for two commands, which is the opposite of the split above, and the
-/// difference is the TARGET rather than the command: `update_all_projects` and
-/// `update_orchestrator_at` act on different trees, so guarding one must not
-/// block the other. These two act on the SAME clone — the launcher's own
-/// checkout — and both `git pull` it and then run `install.py --update` against
-/// it. Two keys would let a MenuBar click and a Preferences click interleave
-/// those on one tree, which is the catastrophic case (prior review §4.8) rather
-/// than an inconvenience.
+/// Operation key: an in-place update of the ORCHESTRATOR CLONE — held by
+/// `update_run::run_update` (every surface and every kind since v0.2.100) and
+/// by the conflict resolvers that hand their claim over to it
+/// (`update_run::run_update_claimed`). One key for the launcher's own clone:
+/// two would let a badge click and a Preferences click interleave a `git pull`
+/// and an `install.py --update` on one tree — the catastrophic case (prior
+/// review §4.8), not an inconvenience.
 ///
 /// The pipeline's `UpdateInProgressGuard` does NOT close this: its lockfile is
 /// a signal the MCP servers read to exit 75, written soft-fail and never
@@ -200,6 +201,198 @@ pub fn begin_orchestrator_update_or_refuse() -> Result<SingleFlightGuard, String
     begin_or_refuse(OP_UPDATE_ORCHESTRATOR_CLONE)
 }
 
+// ---------------------------------------------------------------------------
+// v0.2.100 (WP-03a, L2-F18) — the machine-wide orchestrator-update claim
+// ---------------------------------------------------------------------------
+
+/// Basename of the cross-process update claim under `vct_root_dir()`.
+pub const UPDATE_LOCK_BASENAME: &str = "update.lock";
+
+/// RAII holder of `<vct_root>/update.lock`. Dropping it removes the file —
+/// but only while the file still names THIS holder's pid, so a guard can never
+/// delete a lock another process legitimately re-took after a reap.
+#[derive(Debug)]
+pub struct UpdateLockGuard {
+    path: PathBuf,
+    pid: u32,
+}
+
+impl Drop for UpdateLockGuard {
+    fn drop(&mut self) {
+        if lock_holder_pid(&self.path) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The pid on the first line of `path`, when the file exists and parses.
+fn lock_holder_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .lines()
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// What an existing lock file tells us about its holder. Pure (the liveness
+/// probe is injected) so both arms of the reap — the destructive act on a dead
+/// holder and the refusal on a live one — are unit-tested.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ExistingLock {
+    /// Empty file: nobody claimed it. Reap.
+    Empty,
+    /// First line is not a pid: we cannot prove it is stale. Refuse.
+    Malformed(String),
+    /// A pid that is ours (a guard of this process whose Drop could not
+    /// remove the file) or dead. Reap.
+    Stale(u32),
+    /// A live foreign pid. Refuse.
+    Live(u32),
+}
+
+fn classify_existing_lock(content: &str, own_pid: u32, is_alive: &dyn Fn(u32) -> bool) -> ExistingLock {
+    let Some(first) = content.lines().next().map(str::trim).filter(|l| !l.is_empty()) else {
+        return ExistingLock::Empty;
+    };
+    match first.parse::<u32>() {
+        Err(_) => ExistingLock::Malformed(first.to_string()),
+        // Our own pid can only be a leftover of THIS process: the in-process
+        // claim (`begin_orchestrator_update_or_refuse`) is taken first, so no
+        // live holder inside this process can exist while we try.
+        Ok(pid) if pid == own_pid => ExistingLock::Stale(pid),
+        Ok(pid) if is_alive(pid) => ExistingLock::Live(pid),
+        Ok(pid) => ExistingLock::Stale(pid),
+    }
+}
+
+/// Take the machine-wide orchestrator-update claim at
+/// `<vct_root>/update.lock`, reaping a dead holder.
+pub fn acquire_update_lock() -> Result<UpdateLockGuard, String> {
+    acquire_update_lock_at(
+        &vct_launcher_core::paths::vct_root_dir().join(UPDATE_LOCK_BASENAME),
+        std::process::id(),
+        &vct_launcher_core::process::pid_is_alive,
+    )
+}
+
+/// [`acquire_update_lock`] with the path, own pid and liveness probe injected.
+///
+/// Creation is `create_new` (atomic on every supported filesystem), so two
+/// processes racing for a free or just-reaped lock cannot both win: the loser
+/// sees `AlreadyExists`, classifies the winner as a live holder and refuses.
+pub fn acquire_update_lock_at(
+    path: &Path,
+    own_pid: u32,
+    is_alive: &dyn Fn(u32) -> bool,
+) -> Result<UpdateLockGuard, String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("could not create {}: {}", parent.display(), e))?;
+    }
+    // Two attempts: the second is only ever reached after a reap.
+    for _ in 0..2 {
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(path) {
+            Ok(mut file) => {
+                let body = format!("{}\n{}\n", own_pid, chrono::Utc::now().timestamp());
+                if let Err(e) = file.write_all(body.as_bytes()) {
+                    let _ = std::fs::remove_file(path);
+                    return Err(format!("could not write {}: {}", path.display(), e));
+                }
+                return Ok(UpdateLockGuard {
+                    path: path.to_path_buf(),
+                    pid: own_pid,
+                });
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let content = std::fs::read_to_string(path).unwrap_or_default();
+                match classify_existing_lock(&content, own_pid, is_alive) {
+                    ExistingLock::Empty | ExistingLock::Stale(_) => {
+                        tracing::info!(
+                            "[vct] update.lock: reaping a stale claim at {} ({:?})",
+                            path.display(),
+                            content.lines().next().unwrap_or("")
+                        );
+                        if let Err(e) = std::fs::remove_file(path) {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                return Err(format!(
+                                    "a stale update claim at {} could not be removed ({}); \
+                                     delete the file and try again",
+                                    path.display(),
+                                    e
+                                ));
+                            }
+                        }
+                    }
+                    ExistingLock::Live(pid) => {
+                        return Err(format!(
+                            "Another process (pid {}) is already updating this orchestrator — \
+                             refusing to start a second update. Wait for it to finish. If no \
+                             update is running, the claim at {} is left over from a process \
+                             whose pid was reused: delete that file and try again.",
+                            pid,
+                            path.display()
+                        ));
+                    }
+                    ExistingLock::Malformed(first) => {
+                        return Err(format!(
+                            "The update claim at {} does not name a process (first line {:?}), \
+                             so the launcher cannot tell whether another update is running. If \
+                             none is, delete that file and try again.",
+                            path.display(),
+                            first
+                        ));
+                    }
+                }
+            }
+            Err(e) => return Err(format!("could not create {}: {}", path.display(), e)),
+        }
+    }
+    Err(format!(
+        "the update claim at {} was taken by another process while this one was reaping a \
+         stale claim — refusing; try again once that update finishes",
+        path.display()
+    ))
+}
+
+// ─── v0.2.100 (WP-15, W3R-06): one bundle engine per project folder ─────────
+//
+// A DIFFERENT question from the claims above, so a different primitive. Every
+// launcher path that runs `install-bundle` on a project folder — the per-project
+// update, "Update all" (which calls it per project) and the module toggle's
+// background delivery — reaches `projects_v2::run_install_bundle_core`, and two
+// engines on one `.claude/.vco-manifest.json` are last-writer-wins: the loser's
+// adoptions and orphan decisions are recorded by neither. Refusing would be
+// wrong here (a toggle refused during "Update all" can lose its delivery when
+// the update already passed that project), and the engine is idempotent, so the
+// second caller WAITS for its turn and then runs against the first one's
+// result. The key is the folder, so different projects never wait on each other.
+
+static BUNDLE_ENGINE_TURNS: LazyLock<
+    Mutex<std::collections::HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+> = LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
+
+fn bundle_engine_key(folder: &Path) -> String {
+    std::fs::canonicalize(folder)
+        .unwrap_or_else(|_| folder.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Wait for, then hold, the bundle-engine turn for `folder` (released on drop).
+pub async fn bundle_engine_turn(folder: &Path) -> tokio::sync::OwnedMutexGuard<()> {
+    let slot = {
+        let mut map = BUNDLE_ENGINE_TURNS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        map.entry(bundle_engine_key(folder))
+            .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    };
+    slot.lock_owned().await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -207,15 +400,32 @@ mod tests {
     /// The guarded ops must be distinct keys — one lock for both would let a
     /// running orchestrator update block a project update-all (and the two
     /// are deliberately separate operations).
+    #[tokio::test]
+    async fn bundle_engine_turns_serialise_one_folder_not_two() {
+        let a = tempfile::tempdir().expect("tempdir");
+        let b = tempfile::tempdir().expect("tempdir");
+        let held = bundle_engine_turn(a.path()).await;
+        let a_path = a.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            let _t = bundle_engine_turn(&a_path).await;
+        });
+        // A different project is never held up by `a`.
+        tokio::time::timeout(std::time::Duration::from_secs(5), bundle_engine_turn(b.path()))
+            .await
+            .expect("another folder must not wait");
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(!waiter.is_finished(), "same folder must wait for the turn");
+        drop(held);
+        tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("released turn must be taken")
+            .expect("join");
+    }
+
     #[test]
     fn guarded_operations_have_distinct_keys() {
-        assert_ne!(OP_UPDATE_ALL_PROJECTS, OP_UPDATE_ORCHESTRATOR_AT);
         // A gateway restart must never block (or be blocked by) an update.
-        for other in [
-            OP_UPDATE_ALL_PROJECTS,
-            OP_UPDATE_ORCHESTRATOR_AT,
-            OP_UPDATE_ORCHESTRATOR_CLONE,
-        ] {
+        for other in [OP_UPDATE_ALL_PROJECTS, OP_UPDATE_ORCHESTRATOR_CLONE] {
             assert_ne!(OP_GATEWAY_RESTART, other);
         }
     }
@@ -276,12 +486,85 @@ mod tests {
         drop(second);
     }
 
-    /// The shared claim must not collide with the two per-target keys, or a
+    /// The orchestrator claim must not collide with the update-all key, or a
     /// running orchestrator update would block an unrelated update-all.
     #[test]
-    fn the_orchestrator_update_key_is_distinct_from_the_per_target_ones() {
+    fn the_orchestrator_update_key_is_distinct_from_update_all() {
         assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ALL_PROJECTS);
-        assert_ne!(OP_UPDATE_ORCHESTRATOR_CLONE, OP_UPDATE_ORCHESTRATOR_AT);
+    }
+
+    // ---- v0.2.100 WP-03a: the cross-process update.lock --------------------
+
+    /// ACT arm of the reap: a lock left by a DEAD pid is removed and the claim
+    /// is taken; the guard's Drop removes the file again.
+    #[test]
+    fn update_lock_reaps_a_dead_holder_and_takes_the_claim() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        std::fs::write(&path, "4242\n1700000000\n").unwrap();
+        let dead = |_pid: u32| false;
+        let guard = acquire_update_lock_at(&path, 777, &dead).expect("dead holder is reaped");
+        assert_eq!(lock_holder_pid(&path), Some(777), "the file now names the new holder");
+        drop(guard);
+        assert!(!path.exists(), "dropping the guard releases the claim");
+    }
+
+    /// LEAVE-ALONE arm: a LIVE foreign holder is never reaped — the second
+    /// claimant is refused and the holder's file is byte-identical afterwards.
+    #[test]
+    fn update_lock_refuses_a_live_second_holder_and_leaves_its_file_alone() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        let alive_4242 = |pid: u32| pid == 4242;
+        let first = acquire_update_lock_at(&path, 4242, &alive_4242).expect("first claim");
+        let before = std::fs::read_to_string(&path).unwrap();
+
+        let err = acquire_update_lock_at(&path, 777, &alive_4242)
+            .expect_err("a second process must be refused while the first is alive");
+        assert!(err.contains("pid 4242"), "the refusal names the holder: {err}");
+        assert!(err.contains(&path.display().to_string()), "and the file: {err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), before, "holder's claim untouched");
+
+        drop(first);
+        let again = acquire_update_lock_at(&path, 777, &alive_4242)
+            .expect("a sequential claim succeeds once the holder released");
+        drop(again);
+    }
+
+    /// A malformed claim cannot be proven stale — refuse, touch nothing.
+    #[test]
+    fn update_lock_refuses_a_malformed_claim_without_deleting_it() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        std::fs::write(&path, "not-a-pid\n").unwrap();
+        let err = acquire_update_lock_at(&path, 777, &|_| false).expect_err("malformed refuses");
+        assert!(err.contains("not-a-pid"), "{err}");
+        assert!(path.exists(), "a claim we cannot interpret is never deleted");
+    }
+
+    /// Our own pid in the file is a leftover of this process (the in-process
+    /// claim precedes this one) — reaped even though the pid is alive.
+    #[test]
+    fn update_lock_reaps_its_own_leftover_and_an_empty_file() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        std::fs::write(&path, "777\n1\n").unwrap();
+        let g = acquire_update_lock_at(&path, 777, &|_| true).expect("own leftover reaped");
+        drop(g);
+        std::fs::write(&path, "").unwrap();
+        let g = acquire_update_lock_at(&path, 777, &|_| true).expect("empty file reaped");
+        drop(g);
+    }
+
+    /// A guard never deletes a claim it no longer owns.
+    #[test]
+    fn update_lock_drop_leaves_a_foreign_claim_alone() {
+        let td = tempfile::tempdir().unwrap();
+        let path = td.path().join(UPDATE_LOCK_BASENAME);
+        let g = acquire_update_lock_at(&path, 777, &|_| false).unwrap();
+        std::fs::write(&path, "4242\n1\n").unwrap();
+        drop(g);
+        assert_eq!(lock_holder_pid(&path), Some(4242));
     }
 
     /// Claims are per-key: holding one operation never blocks another.

@@ -171,20 +171,12 @@ async fn run_install_inner(
     // required APIs. Refuse with a structured error so the GUI surfaces
     // "launcher too old: bump first" rather than a cryptic later
     // failure during post_install or first container boot.
-    if let Some(required) = manifest.compatibility.min_launcher_version.as_deref() {
-        let required = required.trim();
-        if !required.is_empty() {
-            let current = env!("CARGO_PKG_VERSION");
-            if version_lt(current, required) {
-                return Err(format!(
-                    "module '{}' requires launcher >= {} but this launcher is {}. \
-                     Update the launcher first (Settings → Updates → Update orchestrator), \
-                     then retry the install.",
-                    manifest.id, required, current,
-                ));
-            }
-        }
-    }
+    enforce_min_launcher_version(
+        &manifest.id,
+        manifest.compatibility.min_launcher_version.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        "install",
+    )?;
 
     let total_steps: u32 = 1 + manifest.install.post_install.len() as u32;
     let mut step_index: u32 = 0;
@@ -650,7 +642,7 @@ async fn container_pull(
                             );
                             (merged, class)
                         }
-                        VersionMismatchClass::MinorOrMajor => {
+                        VersionMismatchClass::MinorOrMajor | VersionMismatchClass::Unreadable => {
                             // Audit BEFORE returning Err so the audit row
                             // records the mismatch even on hard-fail. The
                             // effective_tag is the would-be-merged value
@@ -672,6 +664,15 @@ async fn container_pull(
                             );
                             let endpoint_for_msg = l0_pull_token_endpoint
                                 .unwrap_or(&container.pull_token_endpoint);
+                            if class == VersionMismatchClass::Unreadable {
+                                return Err(format!(
+                                    "pull-token gateway returned tag {:?} and the launcher's \
+                                     L0-resolved tag is {:?}; at least one is not an X.Y.Z \
+                                     version (with an optional variant suffix), so they cannot \
+                                     be compared. Please contact the module publisher at {:?}.",
+                                    server_tag, tag, endpoint_for_msg
+                                ));
+                            }
                             return Err(format!(
                                 "pull-token gateway returned tag {:?} but the launcher's \
                                  L0-resolved version is {:?}. This is server-side catalog \
@@ -1382,8 +1383,8 @@ pub(crate) fn merge_server_tag_with_client_variant(server_tag: &str, client_tag:
 /// version tag and a server-returned version tag.
 ///
 /// Pure helper so unit tests can exercise the classification logic without
-/// touching the install path. Parses dotted-numeric prefixes the same way
-/// `version_lt` above does, ignoring any non-numeric suffix (e.g. `-cuda`).
+/// touching the install path. Strips a KNOWN variant suffix (e.g. `-cuda`)
+/// and parses the rest strictly (`vct_launcher_core::version`, v0.2.100).
 ///
 /// Returns:
 ///   - `Same`: tags are byte-equal OR parse to the same major.minor.patch.
@@ -1397,34 +1398,28 @@ pub(crate) enum VersionMismatchClass {
     Same,
     PatchOnly,
     MinorOrMajor,
+    /// v0.2.100: a tag whose version part (after a known variant suffix is
+    /// removed) is not `X.Y.Z`. Hard-fails like `MinorOrMajor` — it used to
+    /// BE `MinorOrMajor`, because the old parser read garbage as `0.0.0` —
+    /// but now says why.
+    Unreadable,
 }
 
 pub(crate) fn classify_tag_mismatch(client_tag: &str, server_tag: &str) -> VersionMismatchClass {
     if client_tag == server_tag {
         return VersionMismatchClass::Same;
     }
-    // Reuse the same numeric-prefix parser as `version_lt`. We extract the
-    // FIRST three segments (major.minor.patch); extra segments (build /
-    // pre-release) are ignored for the classification — they signal a
-    // hand-tagged build, not a SemVer-meaningful jump.
-    fn parse3(v: &str) -> (u64, u64, u64) {
-        let parts: Vec<u64> = v
-            .split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .map(|s| s.parse::<u64>().unwrap_or(0))
-            .collect();
-        (
-            parts.first().copied().unwrap_or(0),
-            parts.get(1).copied().unwrap_or(0),
-            parts.get(2).copied().unwrap_or(0),
-        )
-    }
-    let (ca, cb, cc) = parse3(client_tag);
-    let (sa, sb, sc) = parse3(server_tag);
+    // v0.2.100 WP-01: a known variant suffix (`-cuda`, …) is a registry
+    // concern, not a version component — remove it, then parse STRICTLY via
+    // the one comparator. Any other suffix / fourth number / garbage is
+    // `Unreadable` (the old leading-digit parser read it as 0.0.0).
+    let parse3 = |tag: &str| {
+        let bare = extract_variant_suffix(tag).map_or(tag, |sfx| &tag[..tag.len() - sfx.len()]);
+        vct_launcher_core::version::parse(bare)
+    };
+    let (Ok((ca, cb, cc)), Ok((sa, sb, sc))) = (parse3(client_tag), parse3(server_tag)) else {
+        return VersionMismatchClass::Unreadable;
+    };
 
     if ca == sa && cb == sb && cc == sc {
         // Parsed equal — e.g. `0.1.0` vs `0.1.0-cuda` (same SemVer with
@@ -1549,6 +1544,7 @@ fn audit_pull_token_resolved(
         VersionMismatchClass::Same => "none",
         VersionMismatchClass::PatchOnly => "patch_only",
         VersionMismatchClass::MinorOrMajor => "minor_or_major",
+        VersionMismatchClass::Unreadable => "unreadable",
     };
     let detail = serde_json::json!({
         "module_id": module_id,
@@ -2087,20 +2083,12 @@ async fn run_upgrade_inner(
     // module@0.1.0 on an old launcher; the new manifest@0.2.0 bumps
     // min_launcher_version. Without this gate, the in-place upgrade
     // would proceed and then fail mid-flight on missing APIs.
-    if let Some(required) = manifest.compatibility.min_launcher_version.as_deref() {
-        let required = required.trim();
-        if !required.is_empty() {
-            let current = env!("CARGO_PKG_VERSION");
-            if version_lt(current, required) {
-                return Err(format!(
-                    "module '{}' requires launcher >= {} but this launcher is {}. \
-                     Update the launcher first (Settings → Updates → Update orchestrator), \
-                     then retry the update.",
-                    manifest.id, required, current,
-                ));
-            }
-        }
-    }
+    enforce_min_launcher_version(
+        &manifest.id,
+        manifest.compatibility.min_launcher_version.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        "update",
+    )?;
 
     let install_dir = ctx.resolve_install_dir(&manifest.install.install_dir);
     let allowed_root = ctx.vct_modules.clone();
@@ -2505,39 +2493,36 @@ async fn extract_manifest_after_refetch(
     Ok(())
 }
 
-/// v0.2.29: tiny semver comparison used by the `min_launcher_version`
-/// gate. Returns true iff `a < b` lexicographically over numeric
-/// components. Non-numeric prefixes of each dot-separated component are
-/// parsed as 0 (so `0.2.28-dev` compares as `0.2.28`). Pre-release
-/// suffixes and build metadata are ignored — same approximation used by
-/// `commands::installer::version_is_outdated`. The check is "is this
-/// launcher OLDER than the required version?" — if true, the install
-/// is refused.
-fn version_lt(a: &str, b: &str) -> bool {
-    fn parse(v: &str) -> Vec<u64> {
-        v.split('.')
-            .map(|p| {
-                p.chars()
-                    .take_while(|c| c.is_ascii_digit())
-                    .collect::<String>()
-            })
-            .map(|s| s.parse::<u64>().unwrap_or(0))
-            .collect()
+/// v0.2.29 `compatibility.min_launcher_version` gate — ONE home for the
+/// install and update paths (v0.2.100 WP-01 folded the two inline copies).
+///
+/// Ordering goes through `vct_launcher_core::version` (strict `X.Y.Z`,
+/// owner ruling Q7). Superseded: the private `version_lt` read each part's
+/// leading digits, so a garbage `min_launcher_version` parsed as `0.0.0`
+/// and the gate silently PASSED. Now an unparseable declaration is a named
+/// refusal — compatibility is never guessed.
+fn enforce_min_launcher_version(
+    module_id: &str,
+    required: Option<&str>,
+    current: &str,
+    action: &str,
+) -> Result<(), String> {
+    let Some(required) = required.map(str::trim).filter(|r| !r.is_empty()) else {
+        return Ok(());
+    };
+    match vct_launcher_core::version::is_older(current, required) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(format!(
+            "module '{module_id}' requires launcher >= {required} but this launcher is {current}. \
+             Update the launcher first (Settings → Updates → Update orchestrator), \
+             then retry the {action}."
+        )),
+        Err(e) => Err(format!(
+            "module '{module_id}': cannot check min_launcher_version against this launcher \
+             ({current}): {e}. Refusing the {action} rather than guessing compatibility — \
+             the module publisher must declare an X.Y.Z version."
+        )),
     }
-    let ai = parse(a);
-    let bi = parse(b);
-    let len = ai.len().max(bi.len());
-    for idx in 0..len {
-        let aa = *ai.get(idx).unwrap_or(&0);
-        let bb = *bi.get(idx).unwrap_or(&0);
-        if aa < bb {
-            return true;
-        }
-        if aa > bb {
-            return false;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -2768,43 +2753,33 @@ mod tests {
         );
     }
 
-    // ─── v0.2.29: version_lt + min_launcher_version gate ────────────
+    // ─── v0.2.29 min_launcher_version gate (v0.2.100: strict SSOT) ──
+    // Ordering itself is table-tested in vct_launcher_core::version; these
+    // pin the GATE's mapping. `version_lt_tolerates_suffixes` was removed as
+    // superseded (owner ruling Q7: a suffix is a parse error, not ignored).
 
     #[test]
-    fn version_lt_basic() {
-        assert!(version_lt("0.2.28", "0.2.29"));
-        assert!(version_lt("0.2.0", "0.2.1"));
-        assert!(version_lt("0.1.0", "0.2.0"));
-        assert!(version_lt("0.0.1", "1.0.0"));
+    fn min_launcher_gate_orders_numerically() {
+        assert!(enforce_min_launcher_version("m", Some("0.2.100"), "0.2.99", "install").is_err());
+        assert!(enforce_min_launcher_version("m", Some("0.2.99"), "0.2.100", "install").is_ok());
+        assert!(enforce_min_launcher_version("m", Some(" 0.2.100 "), "0.2.100", "install").is_ok());
+        assert!(enforce_min_launcher_version("m", None, "0.2.100", "install").is_ok());
+        assert!(enforce_min_launcher_version("m", Some("  "), "0.2.100", "install").is_ok());
     }
 
     #[test]
-    fn version_lt_equal_is_not_less() {
-        assert!(!version_lt("0.2.29", "0.2.29"));
-        assert!(!version_lt("1.0.0", "1.0.0"));
+    fn min_launcher_gate_refuses_an_unreadable_declaration() {
+        // Old parser: "0.2.99-rc1" read as 0.2.99 ≤ 0.2.100 → silently passed.
+        let err = enforce_min_launcher_version("m", Some("0.2.99-rc1"), "0.2.100", "update")
+            .expect_err("an unparseable min_launcher_version must refuse, never pass");
+        assert!(err.contains("0.2.99-rc1") && err.contains("update"), "{err}");
     }
 
     #[test]
-    fn version_lt_greater_is_not_less() {
-        assert!(!version_lt("0.2.30", "0.2.29"));
-        assert!(!version_lt("1.0.0", "0.2.29"));
-    }
-
-    #[test]
-    fn version_lt_handles_unequal_segment_counts() {
-        // "0.2" vs "0.2.0" → equal (missing trailing segments parse as 0).
-        assert!(!version_lt("0.2", "0.2.0"));
-        assert!(!version_lt("0.2.0", "0.2"));
-        // "0.2" < "0.2.1" (missing trailing parses as 0).
-        assert!(version_lt("0.2", "0.2.1"));
-    }
-
-    #[test]
-    fn version_lt_tolerates_suffixes() {
-        // `-dev`, `-rc1`, etc. — the parser stops at the first non-digit
-        // so suffixes are effectively ignored.
-        assert!(version_lt("0.2.28-dev", "0.2.29"));
-        assert!(!version_lt("0.2.29-rc1", "0.2.29"));
+    fn tag_mismatch_unreadable_is_its_own_class() {
+        assert_eq!(classify_tag_mismatch("0.2.8-cuda", "0.2.8-rc1"), VersionMismatchClass::Unreadable);
+        assert_eq!(classify_tag_mismatch("latest-cuda", "0.2.5"), VersionMismatchClass::Unreadable);
+        assert_eq!(classify_tag_mismatch("0.2.99-cpu", "0.2.100"), VersionMismatchClass::PatchOnly);
     }
 
     // ─── v0.2.31 #20-Fix-3: refetch_artifact (Local no-op) ──────────────

@@ -443,20 +443,8 @@ pub fn remove_compose_override() -> Result<(), String> {
 // Size probing (du -sb fallback to walk)
 // ---------------------------------------------------------------------------
 
-fn human_bytes(bytes: u64) -> String {
-    const KB: u64 = 1024;
-    const MB: u64 = KB * 1024;
-    const GB: u64 = MB * 1024;
-    if bytes >= GB {
-        format!("{:.1} GB", bytes as f64 / GB as f64)
-    } else if bytes >= MB {
-        format!("{:.1} MB", bytes as f64 / MB as f64)
-    } else if bytes >= KB {
-        format!("{:.1} KB", bytes as f64 / KB as f64)
-    } else {
-        format!("{} B", bytes)
-    }
-}
+// v0.2.100 F-W4-09: the byte rendering lives in core (one home).
+use vct_launcher_core::units::human_bytes;
 
 /// Best-effort recursive size walk. Returns None on permission errors.
 fn dir_size_bytes(path: &Path) -> Option<u64> {
@@ -1433,15 +1421,6 @@ mod tests {
         assert_eq!(volume_role("code_embed_cache"), "code_embed");
         assert_eq!(volume_role("vct_code_embed"), "code_embed");
         assert_eq!(volume_role("random_garbage"), "unknown");
-    }
-
-    #[test]
-    fn human_bytes_formats_thresholds_correctly() {
-        assert_eq!(human_bytes(0), "0 B");
-        assert_eq!(human_bytes(512), "512 B");
-        assert_eq!(human_bytes(2048), "2.0 KB");
-        assert_eq!(human_bytes(2 * 1024 * 1024), "2.0 MB");
-        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024), "3.0 GB");
     }
 
     /// Bug 31: when existing volumes are detected, the override-yml is

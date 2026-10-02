@@ -320,17 +320,23 @@ class World:
         if rest[0] == "inspect":
             i = rest.index("--format")
             return self._inspect(rest[i + 1], rest[i + 2])
+        if rest[0] == "ps" and any(a.startswith("network=") for a in rest):
+            # v0.2.100 (L1-F22): attached containers are listed with
+            # `ps -a --filter network=<n> -q`; nothing attached by default.
+            return _cp(argv, 0, "")
         if rest[0] == "ps":
             return _cp(argv, 0, "\n".join(OWNING_PROJECT_CONTAINERS) + "\n")
         if rest[0] == "stop":
             return _cp(argv)
         if rest[0] == "rm":
             return _cp(argv)
-        if rest[0] == "network" and rest[1] == "inspect":
-            return _cp(argv, 0, json.dumps(
-                [{"Name": rest[2], "Containers": {}}]))
         if rest[0] == "network" and rest[1] == "rm":
             return _cp(argv)
+        if rest[0] == "network" and rest[1] == "inspect":
+            # v0.2.100 (W1R-01): the network heal checks the network's OWN
+            # labels name the project being recovered (docker-compose v2 left
+            # its project label, podman-compose's network label is missing).
+            return _cp(argv, 0, json.dumps({"com.docker.compose.project": OWN_PROJECT}))
         if rest[0] == "compose":
             return self._compose(argv)
         raise AssertionError(f"unexpected runtime argv in tests: {argv}")
@@ -361,6 +367,9 @@ class World:
         raise AssertionError(f"unexpected inspect format in tests: {fmt}")
 
     def _compose(self, argv):
+        if argv[-1] == "version":
+            # v0.2.100: the compose PROVIDER is detected (overlay + recovery)
+            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
         if argv[-1] == "config":
             return _cp(argv, self.config_rc, "", "" if self.config_rc == 0
                        else "services.ollama.devices must be a list")
@@ -501,17 +510,13 @@ class MergeComposeSemanticsTests(unittest.TestCase):
 
 
 class GpuOverlayFormTests(unittest.TestCase):
-    def test_file_selected_by_compose_form_not_runtime_name(self):
-        self.assertEqual(
-            service_adoption.gpu_overlay_for_form("subcommand"),
-            "docker-compose.gpu.yml")
-        self.assertEqual(
-            service_adoption.gpu_overlay_for_form("standalone"),
-            "podman-compose.gpu.yml")
-
-    def test_unknown_form_has_no_overlay(self):
-        self.assertIsNone(service_adoption.gpu_overlay_for_form(None))
-        self.assertIsNone(service_adoption.gpu_overlay_for_form("weird"))
+    def test_form_only_helper_is_retired(self):
+        """v0.2.100 F-W2-15: `gpu_overlay_for_form` had no production caller
+        and is superseded by `compose_provider.overlay_for_provider` (the
+        caller passes the DETECTED provider). Its form rule is pinned in
+        tests/test_v02100_compose_provider.py."""
+        self.assertFalse(hasattr(service_adoption, "gpu_overlay_for_form"))
+        self.assertNotIn("gpu_overlay_for_form", service_adoption.__all__)
 
 
 # ===========================================================================
@@ -912,10 +917,11 @@ class AdoptionFlowTests(_TempCase):
         ups = [a for a in result.argv_log
                if "up" in a and a[-1] == "weaviate"]
         self.assertEqual(len(ups), 2)  # refused once, retried once
-        insp = [a for a in result.argv_log if a[1:3] == ["network", "inspect"]]
+        attached_probe = [a for a in result.argv_log
+                          if a[1:2] == ["ps"] and f"network={OWN_PROJECT}_default" in a]
         rm = [a for a in result.argv_log if a[1:3] == ["network", "rm"]]
-        self.assertEqual(len(insp), 1)
-        self.assertEqual(insp[0][3], f"{OWN_PROJECT}_default")
+        self.assertEqual(attached_probe, [["podman", "ps", "-a", "--filter",
+                                           f"network={OWN_PROJECT}_default", "-q"]])
         self.assertEqual(len(rm), 1)
         self.assertEqual(rm[0][3], f"{OWN_PROJECT}_default")
 
@@ -926,23 +932,24 @@ class AdoptionFlowTests(_TempCase):
         real_run = world.run
 
         def guarded(argv, **kw):
-            if argv[1:3] == ["network", "inspect"]:
+            if argv[1:2] == ["ps"] and any(a.startswith("network=") for a in argv):
                 calls.append(list(argv))
-                return _cp(argv, 0, json.dumps(
-                    [{"Name": argv[3],
-                      "Containers": {"abc": {"Name": "vco_model_router"}}}]))
+                return _cp(argv, 0, "abc123def456\n")  # vco_model_router is attached
             return real_run(argv, **kw)
 
         result, _ = world.adopt(run=guarded)
         # no retry rescue: the up failed, the service rolled back, the
-        # ATTACHED network was inspected but NOT removed
+        # ATTACHED network was probed for attachments but NOT removed
         self.assertEqual(list(result.failed), ["weaviate"])
         self.assertEqual(result.adopted, [])
         self.assertEqual(world.projects["vco_ollama"], OWNING_PROJECT)
-        self.assertEqual(calls, [["podman", "network", "inspect",
-                                  f"{OWN_PROJECT}_default"]])
+        self.assertEqual(calls, [["podman", "ps", "-a", "--filter",
+                                  f"network={OWN_PROJECT}_default", "-q"]])
         self.assertNotIn(["podman", "network", "rm", f"{OWN_PROJECT}_default"],
                          result.argv_log)
+        # v0.2.100 (F-W1-13): the refusal is LEDGERED, never swallowed.
+        self.assertEqual([e.condition_id for e in result.entries],
+                         ["compose_network_label_mismatch_attached"])
 
     # -- refusals: unreconcilable stays foreign ----------------------------
 

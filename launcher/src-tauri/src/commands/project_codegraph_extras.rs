@@ -69,8 +69,14 @@ use vct_launcher_core::process::CommandExt as _;
 const ANALYZE_TIMEOUT_SECS: u64 = 30 * 60;
 
 /// Tauri event name for progress lines emitted during sync / reindex.
-/// The GUI's "Syncing…" / "Re-indexing…" modal subscribes to this and
-/// updates the progress bar.
+/// `ExtraCodegraphPathsPanel.svelte` subscribes and folds each event
+/// (`extras-sync-progress.ts::applyExtrasProgress`, filtered by
+/// `project_id`) into its "Syncing…" / "Re-syncing…" modal
+/// (`ExtrasSyncProgressModal.svelte`), which renders a determinate bar and
+/// the analyzer's current line (v0.2.100 F-W2-05 — built; before, the modal
+/// only spun). The app shell (`stores/ui.ts`) also turns the finished
+/// `progress >= 1` event into a notice. Must match
+/// `extras-sync-progress.ts::EXTRAS_PROGRESS_EVENT`.
 const PROGRESS_EVENT: &str = "vct-codegraph-extras-progress";
 
 // ─── Types ───────────────────────────────────────────────────────────────
@@ -92,6 +98,15 @@ pub struct ExtraPath {
     /// natural label). Empty string only if `path` itself is empty
     /// (which can't happen post-canonicalisation).
     pub display_label: String,
+    /// v0.2.100 W5R-04: the path's CURRENT repo HEAD (`git rev-parse HEAD`),
+    /// `None` for a non-git path or when git is unavailable.
+    #[serde(default)]
+    pub head_commit: Option<String>,
+    /// v0.2.100 W5R-04: HEAD is known and differs from `last_indexed_commit`
+    /// — the code graph describes older code than the checkout. Decided by
+    /// the one shared rule (`codegraph_extras::extra_path_is_stale`).
+    #[serde(default)]
+    pub stale: bool,
 }
 
 impl ExtraPath {
@@ -109,7 +124,19 @@ impl ExtraPath {
             last_indexed_commit: row.last_indexed_commit,
             enabled: row.enabled,
             display_label,
+            head_commit: None,
+            stale: false,
         }
+    }
+
+    /// Attach the path's current repo HEAD and derive `stale` from it.
+    fn with_head(mut self, head: Option<String>) -> Self {
+        self.stale = vct_launcher_core::db::codegraph_extras::extra_path_is_stale(
+            head.as_deref(),
+            self.last_indexed_commit.as_deref(),
+        );
+        self.head_commit = head;
+        self
     }
 }
 
@@ -394,7 +421,18 @@ pub async fn list_project_codegraph_extra_paths(
     db: State<'_, Db>,
 ) -> Result<Vec<ExtraPath>, String> {
     let rows = db.list_codegraph_extras(&project_id)?;
-    Ok(rows.into_iter().map(ExtraPath::from_row).collect())
+    // HEAD per row (one `git rev-parse` each, off the async runtime) so the
+    // panel can badge a path whose checkout moved past its last index.
+    tokio::task::spawn_blocking(move || {
+        rows.into_iter()
+            .map(|r| {
+                let head = git_head_sha(&r.path);
+                ExtraPath::from_row(r).with_head(head)
+            })
+            .collect::<Vec<_>>()
+    })
+    .await
+    .map_err(|e| format!("list extra paths: {}", e))
 }
 
 // ─── Add ─────────────────────────────────────────────────────────────────
@@ -580,9 +618,12 @@ pub async fn set_project_codegraph_extra_path_enabled(
 
 /// Run the analyzer against a SINGLE extra path (the path's own
 /// `last_indexed_commit` may steer `--incremental --since-commit`).
-/// Does NOT pass `--prune-stale` — single-path syncs only add /
-/// refresh entities for the path itself; pruning is a project-wide
-/// concern handled by `reindex_*`.
+/// Does NOT pass `--prune-stale` — a single-path sync adds / refreshes
+/// entities for the path itself and, when incremental, removes the
+/// entities of files deleted or renamed away since `last_indexed_commit`
+/// (scoped to this path's `project_source`; `vco_lib/codegraph_deleted_files.py`).
+/// If that removal fails the analyzer exits 5 and the commit is NOT
+/// recorded. The project-wide visited-UUID prune stays with `reindex_*`.
 ///
 /// Audit log: `codegraph_extra_path_synced` with the outcome.
 #[command]
@@ -618,28 +659,16 @@ pub async fn sync_project_codegraph_extra_path(
     let prefix = resolve_collection_prefix(&db, &project)?;
 
     // Run analyzer against just this path. `--project <prefix>` makes
-    // it write into the project's codegraph collections.
+    // it write into the project's codegraph collections. The argv shape
+    // has ONE home (`extra_path_sync_args`, v0.2.100 W5R-04) shared with
+    // the automatic Stop-drain refresh, so the two triggers cannot drift.
     let label = row.label.clone().unwrap_or_else(|| basename_of(&row.path));
-    let mut args: Vec<String> = vec![
-        row.path.clone(),
-        "--project".to_string(),
-        prefix.clone(),
-        "--json-progress".to_string(),
-    ];
-    if incremental {
-        args.push("--incremental".to_string());
-        if let Some(sha) = row.last_indexed_commit.as_ref() {
-            // Agent B's analyzer extension supplies --since-commit;
-            // if it lands later, the analyzer may not yet recognise
-            // the flag — in which case it'll error 2 and we surface
-            // the message. Per the v0.2.47 fan-out plan, Agent B
-            // either ships the flag or documents the gap. We pass it
-            // unconditionally; the worst case is a clear analyzer
-            // error rather than a silent partial-sync.
-            args.push("--since-commit".to_string());
-            args.push(sha.clone());
-        }
-    }
+    let args = vct_launcher_core::db::codegraph_extras::extra_path_sync_args(
+        &row.path,
+        &prefix,
+        incremental,
+        row.last_indexed_commit.as_deref(),
+    );
 
     let started = std::time::Instant::now();
     let report = run_analyzer_with_stream(
@@ -652,76 +681,39 @@ pub async fn sync_project_codegraph_extra_path(
     .await?;
     let duration_ms = started.elapsed().as_millis() as u64;
 
-    // Update last_indexed_*. SHA: best-effort; fall back to None if
-    // git fails (non-git extra path) — the column update handles
-    // None correctly (clears prior value, see DB doc).
-    let now = chrono::Utc::now().timestamp_millis();
+    // Record through the ONE writer shared with the hub route
+    // (`record_codegraph_extra_indexed`): last_indexed_* on the row, the
+    // V52-Z `code_graph_builds` upsert, and the audit row. SHA: best-effort;
+    // `None` for a non-git extra path (clears any prior value). A row that
+    // vanished mid-run is not resurrected — the sync outcome still returns
+    // (the entities are already in Weaviate; only bookkeeping is skipped).
     let sha = git_head_sha(&row.path);
-    let _ = db.update_codegraph_extra_last_indexed(
+    let entities_indexed = report.modules + report.classes + report.functions + report.apis;
+    if let Err(e) = db.record_codegraph_extra_indexed(
         &project_id,
         &row.path,
-        now,
-        sha.as_deref(),
-    );
-
-    // V52-Z (v0.2.52): also upsert `code_graph_builds` so the launcher's
-    // "last successful build" UI reflects extra-path activity. Without
-    // this the UI shows the last PRIMARY-folder analyzer run timestamp
-    // even when an extra-path sync was the most recent activity (the
-    // launcher.db audit log already records the path-level event, but
-    // the GUI reads the timestamp from `code_graph_builds`).
-    //
-    // Schema constraint: `code_graph_builds` is PRIMARY KEY on
-    // project_id (one row per project) → we UPSERT, overwriting the
-    // previous row. This intentionally loses the primary-vs-extra
-    // discrimination at this layer; if/when V52-O.5 introduces a
-    // history table with a `source` discriminator column, this call
-    // site is the second of two that need to migrate over.
-    //
-    // Best-effort: a failing upsert MUST NOT fail the user-visible
-    // sync (the data is already in Weaviate; the row write is
-    // bookkeeping). Errors flow through eprintln! via the helper's
-    // signature contract.
-    let started_at_ms = now - duration_ms as i64;
-    if let Err(e) = db.upsert_code_graph_build(
-        &project_id,
-        "success",
-        Some(started_at_ms),
-        Some(now),
-        Some(duration_ms as i64),
-        report.files_analyzed as u32,
-        None,           // languages: not surfaced by AnalyzerFinalReport here
-        false,          // joern_used: DEPRECATED constant-false (CG-3, v0.2.73)
-        None,           // error_message: success path
-        None,           // log_tail: not captured for the row-level UI
+        &vct_launcher_core::db::codegraph_extras::ExtraPathIndexedRun {
+            commit: sha.as_deref(),
+            files_analyzed: report.files_analyzed,
+            entities_indexed,
+            duration_ms,
+            trigger: "manual_sync",
+        },
     ) {
         tracing::warn!(
-            "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
+            "[vct] warning: recording extra-path sync for project {} failed: {}",
             project_id, e
         );
     }
 
     let outcome = SyncOutcome {
         files_scanned: report.files_analyzed,
-        entities_indexed: report.modules + report.classes + report.functions + report.apis,
+        entities_indexed,
         duration_ms,
         project_codegraph_prefix: prefix,
         prune_stale: false,
         paths: vec![row.path.clone()],
     };
-
-    let _ = db.audit(
-        "codegraph_extra_path_synced",
-        Some(&project_id),
-        None,
-        &serde_json::json!({
-            "path": row.path,
-            "files_scanned": outcome.files_scanned,
-            "entities_indexed": outcome.entities_indexed,
-            "duration_ms": outcome.duration_ms,
-            "prune_stale": false,
-        }),
-    );
 
     Ok(outcome)
 }
@@ -1102,15 +1094,9 @@ async fn run_analyzer_with_stream(
         } else {
             String::new()
         };
-        let code = status.code().unwrap_or(-1);
         return Err(format!(
-            "analyzer exit {}: {}",
-            code,
-            if stderr_text.is_empty() {
-                "no stderr".to_string()
-            } else {
-                stderr_text
-            }
+            "analyzer {}",
+            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole)
         ));
     }
 
@@ -1487,6 +1473,32 @@ mod tests {
         assert!(!ep.enabled);
     }
 
+    /// v0.2.100 W5R-04: the wire row carries the checkout's HEAD and the
+    /// shared staleness verdict the panel badges.
+    #[test]
+    fn with_head_marks_stale_only_when_head_moved() {
+        let mk = |last: Option<&str>| CodegraphExtraPathRow {
+            project_id: "p1".to_string(),
+            path: "/opt/x".to_string(),
+            label: None,
+            added_at: 1,
+            last_indexed_at: None,
+            last_indexed_commit: last.map(str::to_string),
+            enabled: true,
+        };
+        let moved = ExtraPath::from_row(mk(Some("aaa"))).with_head(Some("bbb".into()));
+        assert!(moved.stale);
+        assert_eq!(moved.head_commit.as_deref(), Some("bbb"));
+        let same = ExtraPath::from_row(mk(Some("aaa"))).with_head(Some("aaa".into()));
+        assert!(!same.stale);
+        let non_git = ExtraPath::from_row(mk(None)).with_head(None);
+        assert!(!non_git.stale);
+        let never = ExtraPath::from_row(mk(None)).with_head(Some("bbb".into()));
+        assert!(never.stale);
+        let json = serde_json::to_string(&moved).unwrap();
+        assert!(json.contains("\"stale\":true") && json.contains("\"head_commit\":\"bbb\""), "{json}");
+    }
+
     // ─── AddExtraPathOutcome serialisation shape ────────────────────────
 
     #[test]
@@ -1501,6 +1513,8 @@ mod tests {
                 last_indexed_commit: None,
                 enabled: true,
                 display_label: "x".to_string(),
+                head_commit: None,
+                stale: false,
             },
             path: "/opt/x".to_string(),
         };

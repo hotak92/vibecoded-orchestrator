@@ -31,7 +31,9 @@ import {
   describeOAuthExpiry,
   describeSupervision,
   describeWriteResult,
+  gatewayPanelReady,
   gatewayIsConfigured,
+  describeAgentDelivery,
   getModelGatewayStatus,
   inspectVSCodeTarget,
   listVSCodeTargets,
@@ -460,14 +462,14 @@ describe('stop refuses what it cannot identify', () => {
   });
 });
 
-describe('gatewayIsConfigured gates the panel + guidance affordances', () => {
+describe('gatewayPanelReady gates the panel + guidance affordances', () => {
   it('a running gateway counts', () => {
-    expect(gatewayIsConfigured(makeStatus({ reachable: true }))).toBe(true);
+    expect(gatewayPanelReady(makeStatus({ reachable: true }))).toBe(true);
   });
 
   it('a stopped gateway that has run before still counts', () => {
     expect(
-      gatewayIsConfigured(
+      gatewayPanelReady(
         makeStatus({ reachable: false, health: null, token_present: true }),
       ),
     ).toBe(true);
@@ -475,7 +477,7 @@ describe('gatewayIsConfigured gates the panel + guidance affordances', () => {
 
   it('boot-registered counts even before the first run', () => {
     expect(
-      gatewayIsConfigured(
+      gatewayPanelReady(
         makeStatus({
           reachable: false,
           health: null,
@@ -488,7 +490,7 @@ describe('gatewayIsConfigured gates the panel + guidance affordances', () => {
 
   it('a machine that has never run it does NOT count', () => {
     expect(
-      gatewayIsConfigured(
+      gatewayPanelReady(
         makeStatus({
           reachable: false,
           health: null,
@@ -500,7 +502,82 @@ describe('gatewayIsConfigured gates the panel + guidance affordances', () => {
   });
 
   it('no status does not count', () => {
-    expect(gatewayIsConfigured(null)).toBe(false);
+    expect(gatewayPanelReady(null)).toBe(false);
+  });
+});
+
+describe('gatewayIsConfigured asks the ONE Python home (v0.2.100 AD-7)', () => {
+  beforeEach(() => mockInvoke.mockReset());
+
+  it('calls model_gateway_agents_gate and passes the payload through', async () => {
+    const payload = {
+      machine_signal: {
+        configured: true,
+        registration: 'running',
+        panel: 'pointed',
+        reason: 'set up and pointed',
+        panel_paths: ['/x/settings.json'],
+      },
+      gate: {
+        state: 'deliver',
+        signal: 'machine',
+        reason: 'set up and pointed',
+        machine_configured: true,
+      },
+      agent_id_problems: [],
+    };
+    mockInvoke.mockResolvedValueOnce(payload);
+    const got = await gatewayIsConfigured('/p/proj');
+    expect(mockInvoke).toHaveBeenCalledWith('model_gateway_agents_gate', {
+      folder: '/p/proj',
+    });
+    expect(got).toEqual(payload);
+  });
+
+  it('asks for the machine signal alone when no folder is given', async () => {
+    mockInvoke.mockResolvedValueOnce({
+      machine_signal: {
+        configured: null,
+        registration: 'error',
+        panel: 'not_checked',
+        reason: 'x',
+        panel_paths: [],
+      },
+      gate: null,
+      agent_id_problems: null,
+    });
+    await gatewayIsConfigured();
+    expect(mockInvoke).toHaveBeenCalledWith('model_gateway_agents_gate', {
+      folder: null,
+    });
+  });
+});
+
+describe('describeAgentDelivery keeps the tri-state', () => {
+  const g = (configured: boolean | null) => ({
+    machine_signal: {
+      configured,
+      registration: 'running',
+      panel: 'pointed',
+      reason: 'r',
+      panel_paths: [],
+    },
+    gate: null,
+    agent_id_problems: null,
+  });
+  it('configured → delivered', () => {
+    expect(describeAgentDelivery(g(true))?.tone).toBe('up');
+  });
+  it('not configured → not delivered', () => {
+    expect(describeAgentDelivery(g(false))?.tone).toBe('warn');
+  });
+  it('could not ask is NOT rendered as "not delivered"', () => {
+    const line = describeAgentDelivery(g(null));
+    expect(line?.tone).toBe('unknown');
+    expect(line?.label).toContain('could not tell');
+  });
+  it('no payload → no line', () => {
+    expect(describeAgentDelivery(null)).toBeNull();
   });
 });
 

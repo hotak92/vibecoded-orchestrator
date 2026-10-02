@@ -1,6 +1,11 @@
 # {{PROJECT_NAME}} — Project Instructions
 
-These instructions are loaded by Claude Code whenever you open this project. Adapt the placeholder sections below to reflect what {{PROJECT_NAME}} actually is.
+These instructions are loaded by Claude Code whenever you open this project. The file has two parts:
+
+- **Yours** — everything OUTSIDE the `VCO_MANAGED` marker comments: this introduction, Project Overview, Tech Stack, Key Paths, and anything you add below the closing marker. VCO writes it once, when it creates this file, and never changes it afterwards. Replace the italic placeholder text with what {{PROJECT_NAME}} actually is.
+- **VCO's** — everything BETWEEN the markers. It is re-rendered from the orchestrator's template on every bundle update, so do not edit it: an edit there is backed up under `.claude/backups/bundle-adoptions/` and replaced.
+
+When a VCO update changes the template text of YOUR part, your text is left alone: the new version is written to `.claude/context/templates/CLAUDE.md.user-section.reference.md` and a row in `.claude/context/UPDATE_DEFERRED.md` asks you to compare the two.
 
 ---
 
@@ -15,12 +20,18 @@ _(List the primary languages, frameworks, and infrastructure. Examples: "Python 
 ## Key Paths
 
 - Project root: `{{PROJECT_ROOT}}`
+
+_(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
+
+<!-- >>>VCO_MANAGED>>> -->
+---
+
+## VCO Paths
+
 - Orchestrator (VibeCoded Orchestrator): `{{ORCHESTRATOR_ROOT}}` — source-of-truth for hooks, scripts, agents, skills shipped under `.claude/`.
 - KG nodes: `knowledge/` (per-project KG; the shared cross-project KG is auto-merged into every search — name set by `SHARED_KG_COLLECTION` env, default `VibeCodedOrchestrator_KnowledgeGraph`). The orchestrator's bundled *curated* nodes (shipped from its `templates/knowledge/`) are NOT copied into this project — they live once in the shared collection (materialized into the orchestrator root's `knowledge/` at install time) and reach your searches via the shared-read fan-out. Setting `SHARED_KG_READ_DISABLED=true` forgoes those bundled nodes for this project (deliberate accept-loss); your own `knowledge/` nodes are unaffected.
 - Active context: `.claude/CONTEXT_STATE.md` (current task, recent progress, blockers).
 - Active plans: `.claude/context/plans/` (referenced, not auto-loaded).
-
-_(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 
 ---
 
@@ -74,9 +85,9 @@ Only use `Grep` / `Read` when the user provides an exact file path, you're hunti
 
 This section is here because a **model gateway is configured for this machine** (Services → Model gateway in the launcher). It would be absent otherwise — a project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise. Turn it off per-project from the same card.
 
-**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module ships ten definitions across two lanes. The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
+**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers ten definitions across two lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none). The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
 
-**When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.2 is 1M, glm-5.1 is 200K), so "the GLM one" is not a specification.
+**When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.3 is 1M on both the z.ai and the qwen route, glm-5.1 is 200K); `glm-5.2` is not provided at all — the gateway refuses it and suggests glm-5.3, so "the GLM one" is not a specification.
 
 ⚠️ **Everything below is conditional on YOU having supplied the vendor's API
 key.** VCO ships no third-party key and never writes one. Without a key and a
@@ -118,10 +129,10 @@ Two guardrails on flash, both from the same measurement: retries rescue it, more
 *Capacity* is settled data, version-keyed and cited — never guess it and never
 infer it from a family name. The shipped table
 (`claude_mcp_servers/model_router/chat_model_context.seed.json`, one row per FULL
-model id, each with its vendor citation) is the source of truth: `glm-5.3`,
-`glm-5.3-flash` and `glm-5.2` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
+model id, each with its vendor citation) is the source of truth: `glm-5.3`
+and `glm-5.3-flash` are 1M/128K; `glm-5.1`, `glm-5`, `glm-5-turbo`,
 `glm-4.7` and `glm-4.6` are 200K/128K; `glm-4.5` and `glm-4.5-air` are 128K/96K.
-So `glm-5.2` has **five times** the window of `glm-5.1` — which is exactly why a
+So `glm-5.3` has **five times** the window of `glm-5.1` — which is exactly why a
 `glm-5*` wildcard is forbidden. Claude models are deliberately absent from that
 table: the client already knows their windows natively, and overriding them
 would only introduce drift.
@@ -254,6 +265,8 @@ anything.
    Identity tab, the hub's `/config` response, and the collections that
    actually hold your objects. If the "legacy" class is the one your
    project is reading, the detector is wrong, not your data.
+
+<!-- <<<VCO_MANAGED<<< -->
 
 ---
 

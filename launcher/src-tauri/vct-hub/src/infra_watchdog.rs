@@ -19,10 +19,11 @@
 //!
 //! This module spawns a periodic `tokio` task from
 //! `server.rs::start_hub_server()` that, every tick, checks each
-//! canonical infra service and restarts it through the SAME GPU-aware
-//! start path the launcher uses (the `launch-claude-mcp-stack.sh`
-//! wrapper, with a launcher-faithful direct-compose fallback) when it is
-//! DOWN — but only when VCO actually manages it and the user hasn't
+//! canonical infra service and heals it when it is DOWN — starting VCO's
+//! own existing container by name, or creating a missing one through the
+//! guarded path (the `launch-claude-mcp-stack` wrapper, else the guarded
+//! `vco_lib.service_lifecycle up` verb; see "Ownership and a verified
+//! post-condition" below) — but only when VCO actually manages it and the user hasn't
 //! deliberately paused or adopted it, and only when the user's global
 //! auto-restart toggle is still enabled.
 //!
@@ -63,22 +64,27 @@
 //!   5. the service has not exhausted its crash-loop budget
 //!      (see [`Backoff`]).
 //!
-//! ## GPU-aware restart (BLOCKER-2 remediation)
+//! ## Ownership and a verified post-condition (v0.2.100 WP-06, AD-5)
 //!
-//! Infra containers `ollama` / `code_embed` need the GPU overlay
-//! (`docker-compose.gpu.yml` / `podman-compose.gpu.yml`), `--profile gpu`,
-//! and a CDI-readiness wait on NVIDIA+podman hosts. A raw
-//! `compose -f docker-compose.yml up -d <svc>` (the pre-remediation
-//! behavior) omits all three → ollama/code_embed heal CPU-only or fail
-//! with `unresolvable CDI devices`. The watchdog therefore PREFERS the
-//! same `launch-claude-mcp-stack.sh` wrapper the launcher prefers (it owns
-//! runtime detection + NVIDIA probe + CDI-wait + overlay/profile/override
-//! selection and is idempotent — `compose up -d` no-ops already-running
-//! containers), handing it the ONE service to heal as `VCO_COMPOSE_SERVICES`
-//! (v0.2.97). When the wrapper is not shipped, it falls back to direct
-//! compose with the `up` argv from the one rule
-//! (`vco_lib.service_lifecycle.compose_up_args`: `--no-deps`, `--profile
-//! gpu` for code_embed) — see [`restart_service`].
+//! The row is necessary, not sufficient. On 2026-09-29 a row-managed
+//! service's stopped container belonged to ANOTHER compose project; the
+//! watchdog composed against it, the container disappeared, the create
+//! failed, and "restart issued successfully" reset the crash-loop budget.
+//! Now [`heal_service`] reads the container's own labels
+//! (`vct_launcher_core::services::container_ownership`) and:
+//!   * starts (or unpauses) an existing container BY NAME only when it is
+//!     VCO's (`Owned`); never composes against it, never removes it;
+//!   * leaves a `Foreign` one alone (log + `watchdog_foreign_container`);
+//!   * skips the tick when ownership or state cannot be read, or when only
+//!     podman's storage holds the name;
+//!   * composes ONLY a name that exists in neither `inspect` nor
+//!     `ps -a --external` — through the wrapper (GPU overlay, `--profile gpu`,
+//!     CDI wait; it clears the service through the guarded
+//!     `vco_lib.service_lifecycle up` verb first) or, without a wrapper, the
+//!     guarded verb itself ([`create_missing`]);
+//!   * counts success only when the runtime reports the container running
+//!     afterwards ([`verify_running`]) — "issued" and "verified running" are
+//!     different log lines, and only the latter resets the backoff.
 //!
 //! ## Crash-loop backoff
 //!
@@ -114,7 +120,7 @@
 //! (podman/docker detection + compose-form) and `CommandExt::silent`
 //! (no console-window flash on Windows). No new OS-specific assumptions.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
@@ -124,10 +130,18 @@ use tokio::process::Command;
 use vct_launcher_core::db::models::ProjectHost;
 use vct_launcher_core::process::CommandExt as _;
 use vct_launcher_core::db::Db;
+use vct_launcher_core::db::service_endpoints::ServiceEndpointRow;
+use vct_launcher_core::services::container_ownership::{
+    act_by_name, by_name_verb, first_time, guarded_up, inspect_says_missing,
+    installer_compose_project, ownership, read_identity, verify_running, ContainerRunner,
+    ContainerState, Ownership, RuntimeRunner, UpReply, UpRequest, VerifyPolicy,
+};
+use vct_launcher_core::services::deferral_bridge;
 use vct_launcher_core::services::service_endpoints::{
-    is_compose_managed, lifecycle_container, machine_row, zombie_action, CoreService, ZombieAction,
+    is_compose_managed, lifecycle_container, machine_row, CoreService,
 };
 use vct_launcher_core::services::runtime::{detect_runtime_detailed, RuntimeDetection, RuntimeInfo};
+use vct_launcher_core::services::install_root;
 use vct_launcher_core::services::watchdog_pause;
 
 use crate::modules_api::LauncherDbHandle;
@@ -300,19 +314,15 @@ pub fn service_eligible_for_restart(running: bool, compose_managed: bool, paused
 /// `service_endpoints` row (the ONE machine resolver).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Supervision {
-    /// VCO's compose owns the container (`vco_managed` + `enabled`, or no
-    /// row) — the only case the watchdog may heal.
+    /// The row lets VCO's compose manage this service (`vco_managed` +
+    /// `enabled`, or no row). Necessary, NOT sufficient: whether the live
+    /// container is VCO's is read from its labels at heal time
+    /// ([`heal_service`], v0.2.100 AD-5).
     pub compose_managed: bool,
     /// The container to probe: the row's name, else the compose default.
     pub container: String,
-    /// R7a F3: a row positively says VCO's compose owns this container
-    /// ([`ZombieAction::Recreate`]). Without a row the ownership is UNKNOWN
-    /// (the container may be the legacy compose project's, on a bind the
-    /// installer's compose does not mount): the heal is a `start` BY NAME,
-    /// and compose only CREATES a container that does not exist — never a
-    /// compose `up` against an existing one (which re-creates it on the
-    /// installer's config when that differs).
-    pub recreate_ok: bool,
+    /// The row itself (its `compose_project` is the ownership reference).
+    pub row: Option<ServiceEndpointRow>,
 }
 
 /// [`Supervision`] for `service` on this machine. `default_container` is
@@ -325,48 +335,91 @@ pub fn supervision_for(db: &Db, service: &str, default_container: &str) -> Super
         container: svc
             .and_then(|s| lifecycle_container(s, row.as_ref()))
             .unwrap_or_else(|| default_container.to_string()),
-        recreate_ok: zombie_action(row.as_ref()) == ZombieAction::Recreate,
+        row,
     }
 }
 
-/// Did `<runtime> start` fail because the container does not exist? (The
-/// same authoritative wording [`classify_probe`] recognises.)
-pub fn start_failed_as_missing(stderr: &str) -> bool {
-    let lc = stderr.to_lowercase();
-    lc.contains("no such container") || lc.contains("no such object") || lc.contains("not found")
+/// What one heal attempt came to (v0.2.100 WP-06, AD-5). Only `Verified`
+/// is success; "the command exited 0" never is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HealOutcome {
+    /// The runtime reports the container running after `action`.
+    Verified { action: &'static str },
+    /// The action failed, or it "succeeded" and the container is not running.
+    Failed(String),
+    /// The container is not VCO's (its labels say so) — left alone: no
+    /// `up`, no `rm`, no `start`.
+    Foreign(String),
+    /// Could not be decided this tick (unreadable, transitioning, a
+    /// storage-only leftover holds the name) — nothing done, no backoff.
+    Skipped(String),
+    /// Already running when looked at (a race with another starter).
+    AlreadyRunning,
 }
 
-/// Heal a service whose ownership is UNKNOWN (no row): `start` the existing
-/// container BY NAME; only a container that does not exist is created
-/// through compose (nothing exists to lose). Never an `up` against an
-/// existing container.
-async fn heal_by_name(
-    runtime: &RuntimeInfo,
-    infra_dir: &Path,
-    service: &str,
+/// Heal ONE stopped/missing service container (AD-5):
+///
+/// * existing + [`Ownership::Owned`] → `unpause` (paused) / `start` (stopped)
+///   BY NAME — never compose against an existing container, never `rm`;
+/// * existing + `Foreign` → [`HealOutcome::Foreign`], nothing touched;
+/// * existing + ownership `Unknown`, transitioning, unreadable, or a
+///   storage-only leftover → [`HealOutcome::Skipped`];
+/// * the name exists in neither `inspect` nor `ps -a --external` → `create`
+///   (the guarded compose path) — the only compose the watchdog runs;
+/// * after any action, [`verify_running`] decides.
+pub async fn heal_service<R, C, Fut>(
+    runner: &R,
+    row: Option<&ServiceEndpointRow>,
     container: &str,
-) -> Result<(), String> {
-    let output = Command::new(&runtime.binary_path)
-        .silent()
-        .args(["start", container])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .await
-        .map_err(|e| format!("spawn {} start: {}", runtime.runtime.display_name(), e))?;
-    if output.status.success() {
-        return Ok(());
+    installer_project: Option<&str>,
+    create: C,
+    policy: VerifyPolicy,
+) -> HealOutcome
+where
+    R: ContainerRunner,
+    C: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = Result<(), String>>,
+{
+    let identity = read_identity(runner, container).await;
+    let action: &'static str = match &identity.state {
+        ContainerState::Running => return HealOutcome::AlreadyRunning,
+        ContainerState::Unknown(why) => return HealOutcome::Skipped(format!("state unreadable: {why}")),
+        ContainerState::Transitioning(s) => {
+            return HealOutcome::Skipped(format!("the runtime reports it '{s}' — already acting on it"))
+        }
+        ContainerState::StorageOnly => {
+            return HealOutcome::Skipped(
+                "only podman's storage holds this name (a leftover of a failed unmount): it can be \
+                 neither started nor re-created — `python install.py --update` inspects it and \
+                 clears it only when provably safe"
+                    .into(),
+            )
+        }
+        ContainerState::Missing => {
+            if let Err(e) = create().await {
+                return HealOutcome::Failed(e);
+            }
+            tracing::info!(container, "[vct-hub] infra watchdog: create issued (guarded compose)");
+            "create"
+        }
+        ContainerState::Paused | ContainerState::Stopped(_) => {
+            match ownership(row, &identity, installer_project) {
+                Ownership::Owned => {}
+                Ownership::Foreign { why } => return HealOutcome::Foreign(why),
+                Ownership::Unknown { why } => return HealOutcome::Skipped(format!("ownership unknown: {why}")),
+            }
+            let verb = by_name_verb(&identity.state).unwrap_or("start");
+            if let Err(e) = act_by_name(runner, verb, container).await {
+                return HealOutcome::Failed(e);
+            }
+            tracing::info!(container, verb, "[vct-hub] infra watchdog: {} issued by name", verb);
+            verb
+        }
+    };
+    match verify_running(runner, container, policy).await {
+        Ok(()) => HealOutcome::Verified { action },
+        Err(e) => HealOutcome::Failed(e),
     }
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if start_failed_as_missing(&stderr) {
-        return restart_service(runtime, infra_dir, service).await;
-    }
-    Err(format!(
-        "{} start {} failed (no service_endpoints row: VCO starts it by name only): {}",
-        runtime.runtime.display_name(),
-        container,
-        stderr.trim()
-    ))
 }
 
 /// Exponential-backoff wait (seconds) before the Nth restart attempt,
@@ -511,46 +564,60 @@ pub fn service_in_stack(service: &str) -> bool {
 // ─── Orchestrator-clone / compose-file resolution (CONCERN-5) ────────────
 
 /// Locate `<orchestrator_clone>/infrastructure` so we can run compose
-/// against `docker-compose.yml`. The hub has no `current_exe()`-walk
-/// resolver (that lives launcher-side in `commands::installer`), so we
-/// resolve via two sources, in order, keeping the compose-file existence
-/// guard on each:
+/// against `docker-compose.yml`.
+///
+/// v0.2.100 WP-02 (AD-2): root resolution delegates to the ONE resolver,
+/// `vct_launcher_core::services::install_root::resolve`. The hub's cached
+/// candidates, in order, keeping the compose-file existence guard on each:
 ///   1. The orchestrator-root project's `folder_path` from launcher.db —
 ///      the row the launcher seeds at install (read poison-tolerantly via
 ///      `list_projects_nonpanicking`, see CONCERN-6).
 ///   2. CONCERN-5 fallback: the `VCT_ORCHESTRATOR_ROOT` / `VCT_INSTALL_ROOT`
-///      env vars (the SAME vars `ensure-containers.sh` uses) when the DB
-///      row is absent/stale.
+///      env vars (the SAME vars `ensure-containers.sh` uses).
+/// The first candidate that carries a compose file is the resolver's cache;
+/// with none, the resolver's bounded identity-checked walk from the hub's
+/// own exe (`<clone>/launcher/dist/<arch>/vct-hub`) is the last source — it
+/// never selects an unrelated repository.
 ///
-/// Returns `None` (soft) when neither source yields a directory containing
+/// Returns `None` (soft) when no source yields a directory containing
 /// `docker-compose.yml` — a stale/renamed clone shouldn't make us spawn a
 /// doomed `compose up` every tick.
 pub fn infrastructure_dir(db: &LauncherDbHandle) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
     // 1. launcher.db orchestrator-root row (non-panicking read).
     if let Ok(rows) = db.0.list_projects_nonpanicking() {
         if let Some(root) = rows
             .into_iter()
             .find(|p| p.host == ProjectHost::OrchestratorRoot)
         {
-            if let Some(dir) = infrastructure_dir_from_root(Path::new(&root.folder_path)) {
-                return Some(dir);
-            }
+            candidates.push(PathBuf::from(root.folder_path));
         }
     }
-
     // 2. CONCERN-5 env fallback: VCT_ORCHESTRATOR_ROOT → VCT_INSTALL_ROOT.
     for env_key in [ENV_ORCHESTRATOR_ROOT, ENV_INSTALL_ROOT] {
         if let Ok(root) = std::env::var(env_key) {
             let root = root.trim();
             if !root.is_empty() {
-                if let Some(dir) = infrastructure_dir_from_root(Path::new(root)) {
-                    return Some(dir);
-                }
+                candidates.push(PathBuf::from(root));
             }
         }
     }
+    let exe = std::env::current_exe().unwrap_or_default();
+    infrastructure_dir_from_candidates(candidates, &exe)
+}
 
-    None
+/// Pure half of [`infrastructure_dir`]: the first candidate with a compose
+/// file becomes the resolver's cache; otherwise the resolver's exe walk.
+pub fn infrastructure_dir_from_candidates(candidates: Vec<PathBuf>, exe: &Path) -> Option<PathBuf> {
+    // F-W2-10: a candidate that fails the install-root identity check (a user
+    // project carrying a bundled compose copy, a stale env var) is SKIPPED so a
+    // valid later candidate wins, instead of the resolver rejecting the first
+    // and falling to the exe walk.
+    let cached = candidates
+        .into_iter()
+        .find(|c| install_root::is_orchestrator_clone(c) && infrastructure_dir_from_root(c).is_some());
+    let root = install_root::resolve(cached, exe).ok()?;
+    infrastructure_dir_from_root(&root.path)
 }
 
 /// Given an orchestrator root, return `<root>/infrastructure` IFF it
@@ -646,11 +713,9 @@ pub fn classify_probe(success: bool, stdout: &str, stderr: &str) -> ContainerPro
     }
     // Non-zero exit. The one authoritative case is "no such container"
     // (the container genuinely doesn't exist → down + restart-eligible).
-    let lc = stderr.to_lowercase();
-    if lc.contains("no such container")
-        || lc.contains("no such object")
-        || lc.contains("not found")
-    {
+    // v0.2.100 (AD-5): exactly the runtime's two phrasings — a `crun:
+    // executable file … not found` from some other failure is NOT "missing".
+    if inspect_says_missing(stderr) {
         return ContainerProbe::NotRunning;
     }
     // Any other non-zero exit (permission denied, daemon error, …) is
@@ -671,7 +736,7 @@ pub fn parse_running_status(stdout: &str) -> bool {
 /// orchestrator clone (the `infra_dir`'s parent is the orchestrator root).
 /// Mirrors the launcher's `find_stack_wrapper`: `.sh` on Linux/macOS,
 /// `.ps1` on Windows; `None` when the wrapper isn't shipped (minimal
-/// install) so the caller falls back to direct compose.
+/// install) so [`create_missing`] uses the guarded verb instead.
 pub fn find_stack_wrapper(infra_dir: &Path) -> Option<PathBuf> {
     let root = infra_dir.parent()?;
     let script_name = if cfg!(target_os = "windows") {
@@ -754,92 +819,113 @@ async fn run_stack_wrapper(wrapper: &Path, infra_dir: &Path, service: &str) -> R
 /// wrapper's reader (`scripts/launch-claude-mcp-stack.{sh,ps1}`).
 pub const ENV_COMPOSE_SERVICES: &str = "VCO_COMPOSE_SERVICES";
 
-/// Build the direct-compose fallback argv (WITHOUT the leading compose
-/// binary — that comes from `runtime.compose_command()`).
-///
-/// This is the wrapper-absent path: the `-f` chain, then `up_args` — the
-/// `up` argv for the ONE service being healed from the ONE rule
-/// (`vco_lib.service_lifecycle.compose_up_args` via
-/// `vct_launcher_core::services::compose_args`: `--no-deps`, `--profile gpu`
-/// for code_embed). Never a bare `up -d`, which would also create compose
-/// copies of adopted services (plan invariant I1), and never a hand-built
-/// `up -d <svc>`, which would pull code_embed's `depends_on: ollama` in.
-/// NIT-8: when the user's `docker-compose.override.yml` exists in
-/// `infra_dir` we add it explicitly with `-f` so the override isn't
-/// dropped (compose's implicit auto-load is bypassed once we pass an
-/// explicit `-f docker-compose.yml`). Pure → unit-testable.
-pub fn build_fallback_compose_args(infra_dir: &Path, up_args: &[String]) -> Vec<String> {
-    let mut args: Vec<String> = vec!["-f".into(), "docker-compose.yml".into()];
-    // NIT-8: preserve a user override the same way the boot wrapper does.
-    let override_path = infra_dir.join("docker-compose.override.yml");
-    if override_path.is_file() {
-        args.push("-f".into());
-        args.push("docker-compose.override.yml".into());
+/// Create a MISSING service container — the only compose the watchdog
+/// runs (v0.2.100 AD-5 / F-W2-14). Prefers the wrapper (GPU overlay,
+/// `--profile gpu`, CDI wait), which clears the service through the guarded
+/// verb before it composes; without a shipped wrapper, the guarded verb
+/// composes itself. A failed wrapper is a failed attempt — there is no
+/// second, unguarded path to fall back to.
+async fn create_missing(runtime: &RuntimeInfo, infra_dir: &Path, service: &str) -> Result<(), String> {
+    if let Some(wrapper) = find_stack_wrapper(infra_dir) {
+        return run_stack_wrapper(&wrapper, infra_dir, service).await;
     }
-    args.extend(up_args.iter().cloned());
-    args
-}
-
-/// Direct-compose fallback (wrapper not shipped): the rule's `up` argv for
-/// `service`. The rule running is required — failing to compute the argv is
-/// an error recorded into the backoff, never a hand-built fallback.
-async fn restart_via_direct_compose(
-    runtime: &RuntimeInfo,
-    infra_dir: &Path,
-    service: &str,
-) -> Result<(), String> {
     let root = infra_dir.parent().ok_or("infrastructure dir has no parent")?;
     let python = vct_launcher_core::services::compose_args::rule_python()?;
-    let up_args =
-        vct_launcher_core::services::compose_args::compose_up_args(&python, root, &[service], false).await?;
-    if up_args.is_empty() {
-        return Ok(());
-    }
-    let mut cmd = runtime.compose_command();
-    cmd.args(build_fallback_compose_args(infra_dir, &up_args));
-    cmd.current_dir(infra_dir);
-    let output = cmd
-        .output()
-        .await
-        .map_err(|e| format!("spawn {} compose: {}", runtime.runtime.display_name(), e))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "{} compose up -d failed (status {}): {}",
-            runtime.runtime.display_name(),
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        ))
-    }
+    let reply = guarded_up(&python, root, &watchdog_up_request(infra_dir, service, runtime.runtime.binary())).await?;
+    up_reply_result(service, &reply)
 }
 
-/// Heal `service` through the SAME GPU-aware path the launcher uses:
-/// PREFER the `launch-claude-mcp-stack` wrapper (GPU overlay +
-/// `--profile gpu` + CDI-wait) with `service` as its explicit list; fall
-/// back to a direct `compose up -d <service>` only when the wrapper isn't
-/// shipped or fails. Returns `Ok(())` on success, `Err(msg)` otherwise
-/// (caller records into [`Backoff`]). Soft — never panics.
-async fn restart_service(
-    runtime: &RuntimeInfo,
-    infra_dir: &Path,
-    service: &str,
-) -> Result<(), String> {
-    if let Some(wrapper) = find_stack_wrapper(infra_dir) {
-        match run_stack_wrapper(&wrapper, infra_dir, service).await {
-            Ok(()) => return Ok(()),
-            Err(e) => {
-                tracing::warn!(
-                    service,
-                    error = %e,
-                    "[vct-hub] infra watchdog: launch-claude-mcp-stack wrapper \
-                     failed while healing (falling back to direct compose)"
-                );
-                // Fall through to direct compose.
-            }
-        }
+/// The guarded-verb request for healing ONE service: exactly that service,
+/// nothing removed (the watchdog never recreates — it creates only what is
+/// missing). Pure.
+pub fn watchdog_up_request<'a>(infra_dir: &'a Path, service: &'a str, runtime: &'a str) -> UpRequest<'a> {
+    let services: &'a [&'a str] = match service {
+        "weaviate" => &["weaviate"],
+        "ollama" => &["ollama"],
+        _ => &["code_embed"],
+    };
+    UpRequest { services, recreate: &[], guard_only: false, build: false, compose_dir: infra_dir, runtime: Some(runtime) }
+}
+
+/// The verb's reply as the watchdog's result: `Ok` only when the verb
+/// exited 0 AND cleared `service`; a refusal names why (never retried
+/// through another path).
+pub fn up_reply_result(service: &str, reply: &UpReply) -> Result<(), String> {
+    let tail = reply.output.lines().rev().take(5).collect::<Vec<_>>().into_iter().rev().collect::<Vec<_>>().join(" | ");
+    if reply.refused.iter().any(|s| s == service) {
+        return Err(format!("the data-identity guard refused to create {service}: {tail}"));
     }
-    restart_via_direct_compose(runtime, infra_dir, service).await
+    if reply.code == Some(0) && reply.cleared.iter().any(|s| s == service) {
+        return Ok(());
+    }
+    Err(format!("service_lifecycle up for {service} exited {:?}: {tail}", reply.code))
+}
+
+/// The foreign-container record the watchdog keeps true: `Some(entry
+/// text)` when the set of foreign services CHANGED to a non-empty one (emit),
+/// `None` + `resolve = true` when it changed to empty, nothing otherwise.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ForeignLedger {
+    Unchanged,
+    Emit { detected: String },
+    Resolve,
+}
+
+/// Pure: compare this tick's foreign services with the last recorded set.
+/// `prev = None` (hub just started) with an empty set resolves once, so a
+/// row left by a previous hub run does not outlive the condition.
+pub fn foreign_ledger_change(
+    prev: Option<&BTreeMap<String, String>>,
+    now: &BTreeMap<String, String>,
+) -> ForeignLedger {
+    if prev == Some(now) {
+        return ForeignLedger::Unchanged;
+    }
+    if now.is_empty() {
+        return ForeignLedger::Resolve;
+    }
+    let detected = now
+        .iter()
+        .map(|(svc, why)| format!("{svc}: the stopped container {why}"))
+        .collect::<Vec<_>>()
+        .join("; ");
+    ForeignLedger::Emit { detected }
+}
+
+/// The last foreign set written to the ledger (this hub process).
+static LAST_FOREIGN: std::sync::Mutex<Option<BTreeMap<String, String>>> = std::sync::Mutex::new(None);
+
+/// Keep `watchdog_foreign_container` true for `root` (paired-resolution:
+/// this is the site its registry row names). Best-effort.
+fn record_foreign(root: &Path, now: &BTreeMap<String, String>) {
+    let mut last = LAST_FOREIGN.lock().unwrap_or_else(|p| p.into_inner());
+    let change = foreign_ledger_change(last.as_ref(), now);
+    let result = match &change {
+        ForeignLedger::Unchanged => return,
+        ForeignLedger::Resolve => deferral_bridge::resolve_deferral_conditions(root, root, &["watchdog_foreign_container"]),
+        ForeignLedger::Emit { detected } => deferral_bridge::emit_deferral_entry(
+            root,
+            root,
+            &deferral_bridge::DeferralEntryFields {
+                condition_id: "watchdog_foreign_container",
+                title: "The hub watchdog left a container it does not own alone",
+                detected,
+                why_deferred: "The launcher.db row says VCO manages this service, but the stopped \
+                               container's own compose labels name a different project. Acting on \
+                               it (starting, re-creating or removing it) could put another \
+                               install's data under VCO's service, so the watchdog does nothing.",
+                command_to_apply: "Nothing is removed or re-created automatically. Start the container \
+                                   with whoever created it, or run `python install.py --update` so the \
+                                   installer records who owns it (its compose-identity guard decides \
+                                   whether VCO may take it over, keeping its data mount).",
+                severity: "info",
+            },
+        ),
+    };
+    match result {
+        Ok(()) => *last = Some(now.clone()),
+        Err(e) => tracing::warn!("[vct-hub] infra watchdog: watchdog_foreign_container record not updated: {}", e),
+    }
 }
 
 // ─── Spawn + tick loop ───────────────────────────────────────────────────
@@ -1004,6 +1090,13 @@ async fn run_one_tick(
         }
     };
 
+    let runner = RuntimeRunner {
+        binary: runtime.binary_path.clone(),
+        runtime: runtime.runtime.binary().to_string(),
+    };
+    let installer_project = installer_compose_project(&infra_dir);
+    let mut foreign: BTreeMap<String, String> = BTreeMap::new();
+
     for (service, default_container) in CANONICAL_INFRA_SERVICES.iter() {
         let service = *service;
         // The row decides whether VCO may touch this service at all, and
@@ -1080,30 +1173,61 @@ async fn run_one_tick(
             continue;
         }
 
-        // Attempt the restart.
+        // Attempt the heal (v0.2.100 AD-5): ownership from the container's
+        // own labels, `start`/`unpause` by name, compose only for a missing
+        // name, and success only once the runtime says it is running.
         tracing::warn!(
             service,
             container,
             consecutive_failures = backoff.consecutive_failures,
-            "[vct-hub] infra watchdog: service is DOWN and VCO-managed; \
-             attempting restart."
+            "[vct-hub] infra watchdog: service is DOWN and its row is VCO-managed; \
+             attempting heal."
         );
-        let heal = if supervision.recreate_ok {
-            restart_service(&runtime, &infra_dir, service).await
-        } else {
-            heal_by_name(&runtime, &infra_dir, service, container).await
-        };
-        match heal {
-            Ok(()) => {
+        let outcome = heal_service(
+            &runner,
+            supervision.row.as_ref(),
+            container,
+            installer_project.as_deref(),
+            || create_missing(&runtime, &infra_dir, service),
+            VerifyPolicy::default(),
+        )
+        .await;
+        match outcome {
+            HealOutcome::Verified { action } => {
                 tracing::info!(
                     service,
                     container,
-                    "[vct-hub] infra watchdog: restart issued successfully."
+                    action,
+                    "[vct-hub] infra watchdog: verified running."
                 );
                 backoff.reset_on_success();
                 ticks_since_attempt.remove(service);
             }
-            Err(e) => {
+            HealOutcome::AlreadyRunning => {
+                backoff.reset_on_success();
+                ticks_since_attempt.remove(service);
+            }
+            HealOutcome::Foreign(why) => {
+                if first_time(&format!("watchdog-foreign:{service}:{why}")) {
+                    tracing::warn!(
+                        service,
+                        container,
+                        why = %why,
+                        "[vct-hub] infra watchdog: NOT touching a container VCO does not own \
+                         (no up, no rm, no start); recorded as watchdog_foreign_container."
+                    );
+                }
+                foreign.insert(service.to_string(), format!("'{container}' {why}"));
+            }
+            HealOutcome::Skipped(why) => {
+                tracing::info!(
+                    service,
+                    container,
+                    why = %why,
+                    "[vct-hub] infra watchdog: heal skipped this tick."
+                );
+            }
+            HealOutcome::Failed(e) => {
                 backoff.record_failure();
                 if backoff.is_given_up() {
                     tracing::error!(
@@ -1113,7 +1237,7 @@ async fn run_one_tick(
                         error = %e,
                         pause_marker = %pause_marker_path(service).display(),
                         "[vct-hub] infra watchdog: GIVING UP after repeated failed \
-                         restarts. The hub will NOT retry until the service is seen \
+                         heals. The hub will NOT retry until the service is seen \
                          running again (start it manually, or `touch` the pause \
                          marker to silence the watchdog for it)."
                     );
@@ -1124,13 +1248,22 @@ async fn run_one_tick(
                         attempt = backoff.consecutive_failures,
                         max_attempts = MAX_CONSECUTIVE_FAILURES,
                         error = %e,
-                        "[vct-hub] infra watchdog: restart failed. Backing off."
+                        "[vct-hub] infra watchdog: heal failed (not verified running). Backing off."
                     );
                 }
                 // Reset the tick counter so the next attempt waits the
                 // (now larger) backoff window.
                 ticks_since_attempt.insert(service.to_string(), 0);
             }
+        }
+    }
+    if let Some(root) = infra_dir.parent() {
+        // The record spawns a bounded Python payload (W4R-05): off the
+        // runtime's workers, so a slow interpreter never parks the tick's
+        // thread — and never longer than the payload's bound.
+        let root = root.to_path_buf();
+        if let Err(e) = tokio::task::spawn_blocking(move || record_foreign(&root, &foreign)).await {
+            tracing::warn!("[vct-hub] infra watchdog: foreign-container record task failed: {}", e);
         }
     }
 }
@@ -1295,26 +1428,20 @@ mod tests {
         assert!(!supervision_for(&db, "code_embed", "vco_code_embed").compose_managed);
     }
 
-    /// R7a F3: with NO row the ownership is unknown — the heal may start the
-    /// container by name (or create a missing one) but never compose `up`
-    /// against an existing one. Red if `recreate_ok` reads "no row" as VCO's.
+    /// With NO row the service may still be supervised (a missing container
+    /// may be created), but ownership of an EXISTING one comes from its labels
+    /// against the installer's project — pinned by
+    /// `with_no_row_ownership_is_the_installer_projects_label` (W4R-12).
     #[test]
-    fn a_service_without_a_row_is_healed_by_name_only() {
-        use vct_launcher_core::db::service_endpoints::{EndpointMode, ServiceEndpointRow};
+    fn a_service_without_a_row_is_supervised_with_no_ownership_reference() {
         // About the absent row itself (no request is made): without this the
         // test harness answers a sentinel row for an empty in-memory DB.
         let _allow = vct_launcher_core::services::service_endpoints::allow_compiled_default_on_this_thread();
         let db = Db::open_in_memory().unwrap();
         let none = supervision_for(&db, "ollama", "vco_ollama");
         assert!(none.compose_managed, "a missing container may still be created");
-        assert!(!none.recreate_ok, "no row: never an `up` against an existing container");
+        assert!(none.row.is_none());
         assert_eq!(none.container, "vco_ollama");
-        let mut o = ServiceEndpointRow::new("ollama", EndpointMode::VcoManaged, "localhost", 11435);
-        o.container_name = Some("vco_ollama".into());
-        db.service_endpoint_seed_for_tests(&o).unwrap();
-        assert!(supervision_for(&db, "ollama", "vco_ollama").recreate_ok);
-        assert!(start_failed_as_missing("Error: no such container vco_ollama"));
-        assert!(!start_failed_as_missing("Error: port 11435 is already allocated"));
     }
 
     /// Owner ruling Q1: the Weaviate "waiting for your choice" row
@@ -1550,6 +1677,15 @@ mod tests {
         );
     }
 
+    /// v0.2.100 (AD-5): only the exact phrasings mean "missing".
+    #[test]
+    fn classify_probe_not_found_elsewhere_is_not_missing() {
+        assert_eq!(
+            classify_probe(false, "", "crun: executable file `x` not found in $PATH"),
+            ContainerProbe::ProbeError
+        );
+    }
+
     #[test]
     fn classify_probe_ambiguous_failures_are_probe_error() {
         // Non-zero exit that ISN'T "no such container" → ProbeError (skip),
@@ -1623,64 +1759,261 @@ mod tests {
         assert_eq!(resolved, infra);
     }
 
-    // ----- NIT-8 + wrapper-absent fallback: direct-compose argv -----
+    // ----- v0.2.100 WP-02: delegation to the ONE install-root resolver -----
 
-    #[test]
-    fn fallback_compose_args_prefix_the_rules_argv() {
-        let dir = tempfile::tempdir().unwrap();
-        let up: Vec<String> = ["up", "-d", "--no-deps", "weaviate"].iter().map(|s| s.to_string()).collect();
-        let args = build_fallback_compose_args(dir.path(), &up);
-        assert_eq!(args, vec!["-f", "docker-compose.yml", "up", "-d", "--no-deps", "weaviate"]);
+    fn plant_clone(root: &Path, id: &str) {
+        std::fs::create_dir_all(root.join("infrastructure")).unwrap();
+        std::fs::write(root.join("infrastructure").join("docker-compose.yml"), "services: {}\n").unwrap();
+        std::fs::write(root.join("vct-module.json"), format!("{{\"id\": \"{}\"}}", id)).unwrap();
     }
 
-    /// SE-4 × SE-3 red-proof: the heal's compose argv — `-f` chain + the
-    /// rule's `up` argv, computed exactly as `restart_via_direct_compose`
-    /// does — carries `--no-deps` and names only the healed service
-    /// (code_embed: never ollama, which may be adopted). Red against a
-    /// hand-built `up -d <svc>`.
+    #[test]
+    fn infrastructure_dir_prefers_the_first_candidate_with_a_compose_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = dir.path().join("stale");
+        let clone = dir.path().join("clone");
+        plant_clone(&clone, "orchestrator");
+        let exe = dir.path().join("elsewhere").join("vct-hub");
+        assert_eq!(
+            infrastructure_dir_from_candidates(vec![stale, clone.clone()], &exe),
+            Some(clone.join("infrastructure"))
+        );
+    }
+
+    /// F-W2-10: a candidate with a compose file but no clone identity (a
+    /// user project carrying a bundled compose copy) is skipped, and the
+    /// valid second candidate wins — not the exe walk.
+    #[test]
+    fn infrastructure_dir_skips_a_candidate_that_fails_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("user_project");
+        plant_clone(&project, "some-other-module");
+        let clone = dir.path().join("clone");
+        plant_clone(&clone, "orchestrator");
+        let exe = dir.path().join("elsewhere").join("vct-hub");
+        assert_eq!(
+            infrastructure_dir_from_candidates(vec![project, clone.clone()], &exe),
+            Some(clone.join("infrastructure"))
+        );
+    }
+
+    #[test]
+    fn infrastructure_dir_walks_from_the_exe_when_no_candidate_resolves() {
+        let dir = tempfile::tempdir().unwrap();
+        let clone = dir.path().join("clone");
+        plant_clone(&clone, "orchestrator");
+        let exe = clone.join("launcher").join("dist").join("linux-x64").join("vct-hub");
+        assert_eq!(
+            infrastructure_dir_from_candidates(vec![], &exe),
+            Some(clone.join("infrastructure"))
+        );
+    }
+
+    #[test]
+    fn infrastructure_dir_never_walks_into_an_unrelated_repo() {
+        // A compose file under an unrelated tree whose manifest is some other
+        // module's: the identity-checked walk refuses it.
+        let dir = tempfile::tempdir().unwrap();
+        let other = dir.path().join("home");
+        plant_clone(&other, "dotfiles");
+        std::fs::create_dir_all(other.join(".git")).unwrap();
+        let exe = other.join("bin").join("vct-hub");
+        assert_eq!(infrastructure_dir_from_candidates(vec![], &exe), None);
+    }
+
+    // ----- v0.2.100 WP-06: the create path is the guarded verb -----
+
+    /// F-W2-14: without a wrapper the watchdog's ONLY compose is the guarded
+    /// verb, for exactly the healed service, removing nothing.
+    #[test]
+    fn the_create_request_names_only_the_healed_service_and_removes_nothing() {
+        let infra = Path::new("/opt/vco/infrastructure");
+        for svc in ["weaviate", "ollama", "code_embed"] {
+            let req = watchdog_up_request(infra, svc, "podman");
+            assert_eq!(req.services, &[svc]);
+            assert!(req.recreate.is_empty(), "the watchdog never removes");
+            assert!(!req.guard_only, "the verb composes when no wrapper is shipped");
+            let argv = vct_launcher_core::services::container_ownership::guarded_up_args(&req);
+            assert_eq!(&argv[..3], &["-m", "vco_lib.service_lifecycle", "up"]);
+        }
+    }
+
+    #[test]
+    fn the_verbs_reply_is_success_only_when_it_cleared_and_composed() {
+        let ok = UpReply { code: Some(0), cleared: vec!["ollama".into()], ..UpReply::default() };
+        assert!(up_reply_result("ollama", &ok).is_ok());
+        let refused = UpReply { code: Some(3), refused: vec!["ollama".into()], output: "  [ollama] recreate refused — data".into(), ..UpReply::default() };
+        assert!(up_reply_result("ollama", &refused).unwrap_err().contains("refused"));
+        let failed = UpReply { code: Some(1), cleared: vec!["ollama".into()], ..UpReply::default() };
+        assert!(up_reply_result("ollama", &failed).is_err());
+        let nothing = UpReply { code: Some(0), ..UpReply::default() };
+        assert!(up_reply_result("ollama", &nothing).is_err(), "exit 0 with nothing cleared is not a create");
+    }
+
+    // ----- v0.2.100 WP-06 (AD-5): heal_service over a scripted runtime -----
+
+    use vct_launcher_core::services::container_ownership::fake::{fail, inspect_line, ok, FakeRunner};
+
+    const QUICK: VerifyPolicy = VerifyPolicy {
+        timeout: Duration::from_millis(40),
+        interval: Duration::from_millis(5),
+    };
+    /// Labels a podman-compose container of `project` carries (built from
+    /// the ownership module's constants — no label key is spelled here).
+    fn compose_labels(project: &str) -> String {
+        use vct_launcher_core::services::container_ownership::{COMPOSE_PROJECT_LABEL, PODMAN_COMPOSE_PROJECT_LABEL};
+        serde_json::json!({ COMPOSE_PROJECT_LABEL: project, PODMAN_COMPOSE_PROJECT_LABEL: project }).to_string()
+    }
+
+    fn managed_row(service: &str) -> ServiceEndpointRow {
+        use vct_launcher_core::db::service_endpoints::EndpointMode;
+        ServiceEndpointRow::new(service, EndpointMode::VcoManaged, "localhost", 1)
+    }
+
+    /// The 2026-09-29 shape: a row-managed service whose stopped container
+    /// carries ANOTHER project's label is never composed, removed or
+    /// started — Foreign, and the create path is never reached.
     #[tokio::test]
-    async fn the_heal_argv_has_no_deps_and_names_only_the_healed_service() {
-        let dir = tempfile::tempdir().unwrap();
-        let checkout = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let python = vct_launcher_core::python_resolve::resolve_python_for_vco_lib_or("python3");
-        let up = vct_launcher_core::services::compose_args::compose_up_args(&python, &checkout, &["code_embed"], false)
-            .await
-            .unwrap();
-        let args = build_fallback_compose_args(dir.path(), &up);
-        assert!(args.iter().any(|a| a == "--no-deps"), "{:?}", args);
-        assert!(!args.iter().any(|a| a == "ollama" || a == "weaviate"), "{:?}", args);
-        assert_eq!(
-            args,
-            vec!["-f", "docker-compose.yml", "--profile", "gpu", "up", "-d", "--no-deps", "code_embed"]
-        );
+    async fn a_foreign_labelled_container_is_never_touched() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
+        let row = managed_row("code_embed");
+        let composed = std::cell::Cell::new(false);
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || {
+            composed.set(true);
+            async { Ok(()) }
+        }, QUICK)
+        .await;
+        assert!(matches!(&out, HealOutcome::Foreign(why) if why.contains("vibecoded")), "{out:?}");
+        assert!(!composed.get(), "no compose spawn for a foreign container");
+        assert_eq!(r.verbs(), vec!["inspect"], "no start/rm/up: only the read");
+        // … and the ledger records it (the tick's foreign set → an entry).
+        let mut now = BTreeMap::new();
+        if let HealOutcome::Foreign(why) = out {
+            now.insert("code_embed".to_string(), format!("'vco_code_embed' {why}"));
+        }
+        match foreign_ledger_change(None, &now) {
+            ForeignLedger::Emit { detected } => assert!(detected.contains("code_embed") && detected.contains("vibecoded")),
+            other => panic!("expected an entry, got {other:?}"),
+        }
+    }
+
+    /// "Issued" is never success: the create path "succeeds" and the
+    /// container is still absent → Failed (the tick records a failure and
+    /// does NOT reset the backoff).
+    #[tokio::test]
+    async fn a_create_that_leaves_no_container_is_a_failure() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vco_code_embed"));
+        r.on("ps", ok("[]"));
+        let row = managed_row("code_embed");
+        let out = heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        assert!(matches!(&out, HealOutcome::Failed(e) if e.contains("not running")), "{out:?}");
+        let mut b = Backoff::default();
+        if let HealOutcome::Failed(_) = out {
+            b.record_failure();
+        }
+        assert_eq!(b.consecutive_failures, 1, "the failure is recorded, the budget not reset");
+    }
+
+    /// An owned stopped container is STARTED by name (never composed) and
+    /// counted only once verified running.
+    #[tokio::test]
+    async fn an_owned_stopped_container_is_started_by_name_and_verified() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let row = managed_row("ollama");
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async {
+            panic!("an existing container is never composed")
+        }, QUICK)
+        .await;
+        assert_eq!(out, HealOutcome::Verified { action: "start" });
+        assert!(r.verbs().contains(&"start".to_string()));
+        assert!(!r.verbs().iter().any(|v| v == "rm"));
+    }
+
+    /// W4R-12: with NO service row, an existing container's ownership comes
+    /// from its compose label against the INSTALLER's project — a match is
+    /// Owned (started by name, verified), any other project is Foreign
+    /// (nothing touched).
+    #[tokio::test]
+    async fn with_no_row_ownership_is_the_installer_projects_label() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+            panic!("an existing container is never composed")
+        }, QUICK)
+        .await;
+        assert_eq!(out, HealOutcome::Verified { action: "start" });
+
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("vibecoded"))));
+        let out = heal_service(&r, None, "vco_ollama", Some("infrastructure"), || async {
+            panic!("never composed")
+        }, QUICK)
+        .await;
+        assert!(matches!(&out, HealOutcome::Foreign(why) if why.contains("vibecoded")), "{out:?}");
+        assert_eq!(r.verbs(), vec!["inspect"], "only the read");
+    }
+
+    /// Paused → `unpause`, never `start`/`up`.
+    #[tokio::test]
+    async fn a_paused_container_is_unpaused() {
+        let r = FakeRunner::new("docker");
+        r.on("inspect", ok(&inspect_line("paused", &compose_labels("infrastructure"))));
+        r.on("inspect", ok(&inspect_line("running", &compose_labels("infrastructure"))));
+        r.on("unpause", ok(""));
+        let row = managed_row("weaviate");
+        let out = heal_service(&r, Some(&row), "vco_weaviate", Some("infrastructure"), || async {
+            panic!("never composed")
+        }, QUICK)
+        .await;
+        assert_eq!(out, HealOutcome::Verified { action: "unpause" });
+        assert!(!r.verbs().iter().any(|v| v == "start"));
+    }
+
+    /// A start that exits 0 but leaves the container stopped is a failure.
+    #[tokio::test]
+    async fn a_start_that_does_not_stick_is_a_failure() {
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        r.on("start", ok(""));
+        let row = managed_row("ollama");
+        let out = heal_service(&r, Some(&row), "vco_ollama", Some("infrastructure"), || async { Ok(()) }, QUICK).await;
+        assert!(matches!(out, HealOutcome::Failed(_)), "{out:?}");
+    }
+
+    /// Unreadable state, a storage-only leftover, and unknown ownership all
+    /// skip the tick — nothing acted on, nothing composed.
+    #[tokio::test]
+    async fn undecidable_states_skip_the_tick() {
+        let row = managed_row("code_embed");
+        let never = || async { panic!("never composed") };
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: no such container vco_code_embed"));
+        r.on("ps", ok(r#"[{"Names":["vco_code_embed"],"State":"storage"}]"#));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        let r = FakeRunner::new("podman");
+        r.on("inspect", fail("Error: cannot connect to podman socket"));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", Some("infrastructure"), never, QUICK).await, HealOutcome::Skipped(_)));
+        let r = FakeRunner::new("podman");
+        r.on("inspect", ok(&inspect_line("exited", &compose_labels("infrastructure"))));
+        assert!(matches!(heal_service(&r, Some(&row), "vco_code_embed", None, never, QUICK).await, HealOutcome::Skipped(_)));
+        assert_eq!(r.verbs(), vec!["inspect"]);
     }
 
     #[test]
-    fn fallback_compose_args_includes_override_when_present() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(
-            dir.path().join("docker-compose.override.yml"),
-            "services: {}\n",
-        )
-        .unwrap();
-        let up: Vec<String> = ["up", "-d", "--no-deps", "weaviate"].iter().map(|s| s.to_string()).collect();
-        let args = build_fallback_compose_args(dir.path(), &up);
-        // NIT-8: the override must be appended explicitly (LAST -f wins on
-        // conflicts) since explicit `-f docker-compose.yml` bypasses
-        // compose's implicit override auto-load.
-        assert_eq!(
-            args,
-            vec![
-                "-f",
-                "docker-compose.yml",
-                "-f",
-                "docker-compose.override.yml",
-                "up",
-                "-d",
-                "--no-deps",
-                "weaviate"
-            ]
-        );
+    fn the_foreign_record_is_written_on_change_and_resolved_when_gone() {
+        let mut a = BTreeMap::new();
+        a.insert("ollama".to_string(), "x".to_string());
+        assert!(matches!(foreign_ledger_change(None, &a), ForeignLedger::Emit { .. }));
+        assert_eq!(foreign_ledger_change(Some(&a), &a), ForeignLedger::Unchanged);
+        assert_eq!(foreign_ledger_change(Some(&a), &BTreeMap::new()), ForeignLedger::Resolve);
+        assert_eq!(foreign_ledger_change(None, &BTreeMap::new()), ForeignLedger::Resolve);
     }
 
     // ----- BLOCKER-2: stack-wrapper discovery relative to infra_dir -----

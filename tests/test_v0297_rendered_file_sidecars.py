@@ -124,12 +124,15 @@ class RenderedSidecarProbeTests(unittest.TestCase):
         self._touch("CLAUDE.md.from-upstream-f1f5488")
         self.assertIs(self._probe(_entry()), False)
 
-    def test_a_genuine_sidecar_elsewhere_still_keeps_the_entry(self):
-        """LEAVE-ALONE: the rendered sidecar is not work, but a real one is —
-        the sweep still finds it and the entry stays."""
+    def test_a_sidecar_the_entry_never_named_does_not_keep_it(self):
+        """v0.2.100 U17 — the field case: the entry names only the rendered
+        `CLAUDE.md` sidecar; three UNRELATED older `knowledge/` sidecars kept it
+        "still applies" forever through the whole-root sweep. An entry that
+        named files clears when THOSE are gone (the sweep is for list-less
+        entries only)."""
         self._touch("CLAUDE.md.from-upstream-89a5530")
         self._touch("knowledge/concepts/x.md.from-upstream-4c44eb8")
-        self.assertIs(self._probe(_entry("CLAUDE.md.from-upstream-89a5530")), True)
+        self.assertIs(self._probe(_entry("CLAUDE.md.from-upstream-89a5530")), False)
 
     def test_a_named_genuine_sidecar_still_keeps_the_entry(self):
         self._touch("CLAUDE.md.from-upstream-89a5530")
@@ -143,7 +146,9 @@ class RenderedSidecarProbeTests(unittest.TestCase):
         """Only the ROOT CLAUDE.md is rendered (the table is root-relative); a
         `docs/CLAUDE.md` is an ordinary user-editable doc whose sidecar counts."""
         self._touch("docs/CLAUDE.md.from-upstream-89a5530")
-        self.assertIs(self._probe(_entry("CLAUDE.md.from-upstream-89a5530")), True)
+        self.assertIs(self._probe(_entry("docs/CLAUDE.md.from-upstream-89a5530")), True)
+        # and through the list-less sweep
+        self.assertIs(self._probe(_entry()), True)
 
 
 

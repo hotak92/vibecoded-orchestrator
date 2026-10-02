@@ -77,6 +77,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import subprocess
 import sys
 import time
@@ -97,6 +98,9 @@ from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import containers as _containers
 from vco_lib import compose_env as _compose_env
+from vco_lib import compose_mounts as _compose_mounts
+from vco_lib import compose_provider as _compose_provider
+from vco_lib import compose_recovery as _compose_recovery
 from vco_lib.atomic import atomic_write_text
 from vco_lib.paths import vct_root_dir
 
@@ -108,7 +112,6 @@ __all__ = [
     "adopt_services",
     "adopted_row",
     "existing_managed_override",
-    "gpu_overlay_for_form",
     "knob_owned_services",
     "live_http_host_port",
     "merge_compose",
@@ -207,23 +210,11 @@ _OVERRIDE_FILES: tuple[str, ...] = (
     "docker-compose.override.yml",
 )
 
-#: The mixed-provider stale-network-label refusal (install_services_guard
-#: module docstring; field 2026-09-07): "network <name> was found but has
-#: incorrect label com.docker.compose.network ...".
-_NETWORK_LABEL_REFUSAL_RE = re.compile(
-    r"network\s+(\S+)\s+was found but has incorrect label", re.IGNORECASE
-)
-
-#: GPU overlay by COMPOSE FORM (constraints #11 — normative where the plan
-#: and it disagree): the subcommand form delegates to docker-compose v2,
-#: which cannot parse the CDI ``devices: [nvidia.com/gpu=all]`` spec in
-#: ``podman-compose.gpu.yml``; the standalone form IS podman-compose.  The
-#: chosen chain is additionally verified to parse via ``compose config``
-#: before anything is stopped.
-GPU_OVERLAY_BY_FORM: dict[str, str] = {
-    "subcommand": "docker-compose.gpu.yml",
-    "standalone": "podman-compose.gpu.yml",
-}
+#: v0.2.100: the mixed-provider network-label refusal and the GPU overlay
+#: choice each have ONE home now — :mod:`vco_lib.compose_recovery` (classify +
+#: the attached-containers-proven-empty heal) and
+#: :func:`vco_lib.compose_provider.overlay_for_provider` (overlay by the
+#: provider's label family). The two functions below delegate.
 
 RunFn = Callable[..., "subprocess.CompletedProcess[str]"]
 LogFn = Callable[[str], None]
@@ -577,17 +568,6 @@ def infrastructure_env_for_substitution(infra_dir: Path) -> dict:
     return env
 
 
-def gpu_overlay_for_form(compose_form: Optional[str]) -> Optional[str]:
-    """The GPU overlay filename for the compose FORM actually in use —
-    constraints #11 (normative): picking by runtime NAME while the
-    effective provider is the other form ships an overlay the provider
-    cannot parse (``podman-compose.gpu.yml``'s CDI spec under
-    docker-compose v2).  The caller still verifies the chain parses."""
-    if not compose_form:
-        return None
-    return GPU_OVERLAY_BY_FORM.get(compose_form)
-
-
 def _compose_entrypoints(need_gpu: bool, gpu_overlay: Optional[str],
                          infra_dir: Path, env: dict) -> tuple[list[Path], dict]:
     """The -f chain (base + existing overrides) and its merged config, plus
@@ -642,78 +622,45 @@ class ServicePlan:
         return not self.reason
 
 
-#: A compose short-form mount is ``source:target[:opts]``, and on Windows the
-#: source carries its own colon: ``C:\\volumes\\ollama:/root/.ollama:Z``. A bare
-#: ``split(":")`` severs the drive letter and yields source ``"C"`` with the
-#: rest of the path as the TARGET — so the installer compares a mount that
-#: does not exist and reports a spurious drift on every Windows install.
-_WINDOWS_DRIVE_RE = re.compile(r"^[A-Za-z]:[\\/]")
-
-
-def _split_mount_entry(entry: str) -> list[str]:
-    """Split ``source:target[:opts]`` without severing a Windows drive letter."""
-    parts = entry.split(":")
-    # Re-join a drive letter ONLY when doing so still leaves an absolute
-    # container target. That is what separates a Windows bind from a
-    # one-character VOLUME name: `C:\\vol:/data` has a target after the join
-    # (`/data`), while `v:/data` does not — it is volume `v` mounted at
-    # `/data`, and joining it would invent the target `.ollama` from the
-    # tail of the host path.
-    if (
-        len(parts) >= 3
-        and len(parts[0]) == 1
-        and parts[0].isalpha()
-        and parts[1][:1] in ("\\", "/")
-        and parts[2][:1] == "/"
-    ):
-        parts = [f"{parts[0]}:{parts[1]}", *parts[2:]]
-    return parts
-
-
-def _is_bind_source(source: str) -> bool:
-    """Is this mount source a HOST PATH rather than a named volume?
-
-    POSIX absolute (``/``), home-relative (``~``) and project-relative
-    (``.``) — plus a Windows drive path, which is what every bind on that
-    platform looks like. Without the last case a real Windows bind is
-    classified as a named VOLUME, and the adoption check then looks it up in
-    the top-level ``volumes:`` mapping, finds nothing, and treats the
-    service as unadoptable for a reason that is not true.
-    """
-    return source.startswith(("/", "~", ".")) or bool(_WINDOWS_DRIVE_RE.match(source))
+# The entry shapes (short syntax with Windows drive letters, long syntax) and
+# the top-level volume-name rule live in ONE parser, vco_lib.compose_mounts
+# (v0.2.100 F-W2-13 / F-W3-10); this module keeps only the adoption's policy.
+_split_mount_entry = _compose_mounts.split_mount_entry
+_is_bind_source = _compose_mounts.is_bind_source
 
 
 def config_mounts(service_cfg: dict, top_volumes: dict) -> dict[str, MountSpec]:
-    """The installer-side mounts for one service, by destination.  Resolves
-    named volume keys through the top-level ``volumes:`` mapping (explicit
-    ``name:`` wins — the base file pins all three)."""
+    """The installer-side mounts for one service, by destination, read
+    through :func:`vco_lib.compose_mounts.parse_mount_entry` (the one parser
+    :func:`vco_lib.data_identity.render_mount` also uses).
+
+    Lenient where the adoption gate can afford it: an entry this parser
+    cannot read, or an anonymous one, is skipped — the gate then sees that
+    destination as absent from the config and refuses any live mount there
+    (``_mount_problems``: "lost by the reconciled config"). A named volume
+    resolves through :func:`vco_lib.compose_mounts.volume_real_name` (explicit
+    ``name:``/``external`` wins — the base file pins all three); a key whose
+    real name the Python merge cannot derive (no ``name:``, project not known
+    here) stays the bare key."""
     out: dict[str, MountSpec] = {}
     entries = service_cfg.get("volumes") or []
     if isinstance(entries, str):
         entries = [entries]
-    for entry in entries:
-        kind, source, dest, opts = "volume", "", "", ""
-        if isinstance(entry, str):
-            parts = _split_mount_entry(entry)
-            if len(parts) >= 2:
-                source, dest = parts[0], parts[1]
-                opts = parts[2] if len(parts) > 2 else ""
-                kind = "bind" if _is_bind_source(source) else "volume"
-        elif isinstance(entry, dict):
-            kind = str(entry.get("type", "volume") or "volume")
-            source = str(entry.get("source", "") or "")
-            dest = str(entry.get("target", "") or "")
-            ro = entry.get("read_only")
-            opts = "ro" if ro else ""
-        else:
+    for i, raw in enumerate(entries):
+        where = f"volumes[{i}]"
+        try:
+            entry = _compose_mounts.parse_mount_entry(raw, where)
+        except _compose_mounts.MountShapeError:
             continue
-        if not source or not dest:
+        if entry is None or not entry.source or not entry.target:
             continue
+        kind, source = entry.kind or "volume", entry.source
         if kind == "volume":
-            spec = (top_volumes.get(source) or {}) if isinstance(top_volumes, dict) else {}
-            if isinstance(spec, dict):
-                source = str(spec.get("name") or source)
-        out[dest] = MountSpec(kind, source, dest, opts)
+            try:
+                source = _compose_mounts.volume_real_name(top_volumes, source, where, None)
+            except _compose_mounts.MountShapeError:
+                pass
+        out[entry.target] = MountSpec(kind, source, entry.target, entry.options)
     return out
 
 
@@ -1133,6 +1080,10 @@ class AdoptionResult:
     #: every podman/compose argv executed, in order — the audit trail tests
     #: assert against (never a volume subcommand, never a project down).
     argv_log: list[list[str]] = field(default_factory=list)
+    #: ledger rows the compose recovery owes (a refused heal — e.g. a
+    #: network another tool labelled, with containers attached — v0.2.100
+    #: F-W1-13); the caller adds them to its report.
+    entries: list = field(default_factory=list)
 
 
 def _run_logged(argv: list[str], run: RunFn, result: AdoptionResult, **kw):
@@ -1174,49 +1125,6 @@ def _collateral_warning(plans: Sequence[ServicePlan], runtime: str, run: RunFn,
             "  [collateral] their service-name DNS aliases on the shared "
             "network are preserved by the generated override."
         )
-
-
-def _network_label_handling(argv: list[str], runtime: str, run: RunFn,
-                             result: AdoptionResult, stderr: str) -> bool:
-    """The expected mixed-provider refusal on the first recreate: when
-    compose refuses because a network carries another tool's labels, and
-    that network provably has NO containers attached, remove it (a network,
-    never a volume, never a project) and let the caller retry once."""
-    m = _NETWORK_LABEL_REFUSAL_RE.search(stderr or "")
-    if not m:
-        return False
-    network = m.group(1)
-    try:
-        res = _run_logged(
-            [runtime, "network", "inspect", network],
-            run, result, capture_output=True, text=True, timeout=15,
-        )
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    if res.returncode != 0:
-        return False
-    try:
-        info = json.loads((res.stdout or "").strip())
-    except ValueError:
-        return False
-    entries = info if isinstance(info, list) else [info]
-    attached = 0
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        cont = entry.get("Containers") or entry.get("containers") or {}
-        if isinstance(cont, dict):
-            attached += len(cont)
-        elif isinstance(cont, list):
-            attached += len(cont)
-    if attached:
-        return False  # somebody is on it — never remove
-    try:
-        rm = _run_logged([runtime, "network", "rm", network], run, result,
-                         capture_output=True, text=True, timeout=15)
-    except (subprocess.TimeoutExpired, OSError):
-        return False
-    return rm.returncode == 0
 
 
 def owning_service_config(identity) -> Optional[dict]:
@@ -1353,7 +1261,13 @@ def _plan_all(root: Path, runtime: str, run: RunFn, log: LogFn,
     gpu_services = [p for p in plans
                     if p.live is not None
                     and (p.live.has_devices or p.owning_declares_devices)]
-    gpu_overlay = gpu_overlay_for_form(compose_form) if gpu_services else None
+    # The overlay FILE follows the compose that parses it — the DETECTED
+    # provider (a `podman compose` may delegate to either engine), not the
+    # bare form (v0.2.100 F-W1-13 / L1-F10).
+    gpu_overlay = _compose_provider.overlay_for_provider(
+        _compose_provider.detect(runtime, argv=compose_argv, run=run)
+        or _compose_provider.provider_from_form(compose_form, runtime=runtime),
+        "nvidia") if gpu_services else None
     overlay_missing = gpu_overlay is None or not (infra_dir / gpu_overlay).is_file()
     if gpu_services and overlay_missing:
         for plan in gpu_services:
@@ -1415,10 +1329,13 @@ def _up_under_installer(compose_argv: list[str], files: Sequence[Path],
                         result: AdoptionResult, timeout: int = 900,
                         build: bool = False) -> tuple[bool, str]:
     """``compose up -d [--build] --no-deps <service>`` under the installer's
-    project, with the generated override in the -f chain.  Handles the
-    mixed-provider stale-network-label refusal (empty network → rm → ONE
-    retry).  ``build``: rebuild the image (code_embed, whose image is built
-    from the checkout — a stale one is one reason to migrate it)."""
+    project, with the generated override in the -f chain, through
+    :func:`vco_lib.compose_recovery.compose_up_with_recovery` (v0.2.100
+    F-W1-13: the one retry/heal home — a stale network label with nothing
+    attached is removed and retried, a refused heal is LEDGERED in
+    ``result.entries``, never swallowed). ``build``: rebuild the image
+    (code_embed, whose image is built from the checkout — a stale one is one
+    reason to migrate it)."""
     argv = list(compose_argv)
     for path in files:
         argv.extend(["-f", str(path)])
@@ -1426,25 +1343,23 @@ def _up_under_installer(compose_argv: list[str], files: Sequence[Path],
     if build:
         argv.append("--build")
     argv.extend(["--no-deps", service])
+
+    def logged(a, **kw):
+        return _run_logged(list(a), run, result, **kw)
+
     try:
-        res = _run_logged(argv, run, result, capture_output=True, text=True,
-                          timeout=timeout)
-    except subprocess.TimeoutExpired:
-        return False, "compose up timed out"
+        up = _compose_recovery.compose_up_with_recovery(
+            argv, env=None, timeout=timeout, runtime=runtime,
+            provider=_compose_provider.detect(runtime, argv=compose_argv, run=run),
+            run=logged, compose_run=logged, log=lambda _msg: None)
     except OSError as exc:
         return False, f"compose could not run: {exc}"
-    if res.returncode == 0:
+    result.entries.extend(_compose_recovery.deferral_entries(up, manual_cmd=shlex.join(argv)))
+    if up.timed_out:
+        return False, "compose up timed out"
+    if up.ok:
         return True, ""
-    stderr = res.stderr or ""
-    if "incorrect label" in stderr and "com.docker.compose.network" in stderr:
-        if _network_label_handling(argv, runtime, run, result, stderr):
-            try:
-                res = _run_logged(argv, run, result, capture_output=True,
-                                  text=True, timeout=timeout)
-                if res.returncode == 0:
-                    return True, ""
-            except (subprocess.TimeoutExpired, OSError):
-                pass
+    stderr = up.stderr or up.first_stderr or ""
     return False, (stderr.strip().splitlines() or ["compose up failed"])[-1]
 
 

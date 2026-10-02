@@ -193,17 +193,25 @@ function Emit-KgGateSkippedMetric {
     }
 }
 
-# v0.2.49 SB1: write an UPDATE_DEFERRED.md entry directing the user to
-# resolve the empty-VCT_PROJECT_ID condition (run install.py --update
-# OR re-register via Launcher GUI). Per user Q1 (2026-06-08), this is
-# the user-facing surface — no stderr WARNING by default.
+# v0.2.49 SB1: record an UPDATE_DEFERRED.md entry directing the user to
+# resolve the empty-VCT_PROJECT_ID condition (run install.py --update OR
+# re-register via Launcher GUI). Silent-allow remains the default at the gate;
+# this entry is the user-facing surface.
 #
-# Idempotent per (session, project) via a sentinel file in
-# .claude/state/. Mirrors the bash sibling's
-# _kg_emit_gate_skipped_deferral exactly.
+# v0.2.100 WP-17: the entry is written by the ONE locked writer,
+# `python -m vco_lib.gate_skipped_deferral` (shared with the weaviate-kg MCP
+# server), never by an Add-Content from here. The old append took no lock: it
+# raced install.py's finalize (which reads, merges and rewrites the ledger
+# under `.claude/context/.update-deferred.lock`) and could lose the entry or
+# another writer's. Writers append/merge, never clobber.
+#
+# Idempotent per (session, project) via a sentinel file in .claude/state/,
+# removed again when the write fails so the next write retries. No VCO venv
+# (a broken install) is said on stderr — never an unlocked fallback write.
+# MUST MATCH route-touched-path.sh's _kg_emit_gate_skipped_deferral.
 function Emit-KgGateSkippedDeferral {
     param([string]$Collection)
-    $deferred = Join-Path $script:VcoRouteProjectRoot ".claude/context/UPDATE_DEFERRED.md"
+    if (-not $script:VcoRouteProjectRoot) { return }
     $stateDir = Join-Path $script:VcoRouteProjectRoot ".claude/state"
     $sessionId = if ($Env:VCT_SESSION_ID) { $Env:VCT_SESSION_ID } `
                  elseif ($Env:CLAUDE_SESSION_ID) { $Env:CLAUDE_SESSION_ID } `
@@ -212,63 +220,33 @@ function Emit-KgGateSkippedDeferral {
 
     # Per-session dedup. First call writes; subsequent calls in the same
     # session are silent no-ops.
-    if (Test-Path $sentinel) { return }
+    if (Test-Path -LiteralPath $sentinel) { return }
 
     try {
         if (-not (Test-Path $stateDir)) {
             New-Item -ItemType Directory -Path $stateDir -Force -ErrorAction SilentlyContinue | Out-Null
         }
-        Set-Content -Path $sentinel -Value "" -ErrorAction SilentlyContinue
+        Set-Content -LiteralPath $sentinel -Value "" -ErrorAction SilentlyContinue
     } catch { return }
 
-    try {
-        $deferredDir = Split-Path $deferred -Parent
-        if (-not (Test-Path $deferredDir)) {
-            New-Item -ItemType Directory -Path $deferredDir -Force -ErrorAction SilentlyContinue | Out-Null
-        }
-    } catch { return }
-
-    # Idempotent body marker — if a prior session wrote a row for this
-    # condition_id, leave it in place.
-    $marker = "## gate_skipped_no_project_id"
-    if ((Test-Path $deferred) -and (Select-String -Path $deferred -SimpleMatch -Pattern $marker -Quiet -ErrorAction SilentlyContinue)) {
+    $venvPy = $null
+    $venvLib = Join-Path $script:VcoRouteHooksDir "_lib/resolve-vco-venv.ps1"
+    if (Test-Path -LiteralPath $venvLib) {
+        . $venvLib
+        $venvPy = Resolve-VcoVenvPython -ScriptDir $script:VcoRouteHooksDir
+    }
+    if (-not $venvPy) {
+        [Console]::Error.WriteLine("[VCO] gate_skipped_no_project_id: the deferral entry was NOT recorded -- the VCO venv is not resolvable (broken install; re-run the orchestrator's install / update).")
+        Remove-Item -LiteralPath $sentinel -Force -ErrorAction SilentlyContinue
         return
     }
-
-    $ts = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-
-    # Append-mode write. Without frontmatter the deferral parser still
-    # finds the entry via "^## <cid> (sev)"; the next install.py
-    # --update pass canonicalises the file with a header.
-    $body = @"
-
-$marker (warning)
-
-**Title**: Phase-8 access-matrix gate skipped (VCT_PROJECT_ID missing from hook env)
-
-**Detected**: A VCO write hook reached the Phase-8 WRITE gate with no VCT_PROJECT_ID. The Phase-8 WRITE gate cannot identify this project against the hub access matrix, so the write was permitted via the silent-allow path. Target collection: $Collection
-
-**Why deferred**: Seeding VCT_PROJECT_ID requires an orchestrator install pass (queries launcher.db for the project UUID) or a Launcher GUI re-registration. The hook cannot self-heal.
-
-**To apply**:
-``````bash
-# Option A — orchestrator-root install / update:
-python install.py --update
-
-# Option B — per-project (pre-v0.2.49 install): re-register the
-# project via Launcher GUI -> Projects -> Identity tab. The
-# launcher's apply_project_env pass seeds VCT_PROJECT_ID into
-# the project-local .claude/env from launcher.db.
-``````
-
-**Detected at**: $ts
-
----
-"@
     try {
-        Add-Content -Path $deferred -Value $body -Encoding utf8 -ErrorAction SilentlyContinue
-    } catch {
-        # Silent failure: the silent-allow contract is the priority.
+        & $venvPy -m vco_lib.gate_skipped_deferral --folder $script:VcoRouteProjectRoot `
+            "--collection=$Collection" --surface hook | Out-Null
+        $ok = ($LASTEXITCODE -eq 0)
+    } catch { $ok = $false }
+    if (-not $ok) {
+        Remove-Item -LiteralPath $sentinel -Force -ErrorAction SilentlyContinue
     }
 }
 

@@ -15,6 +15,7 @@
 import { writable, derived, get } from 'svelte/store';
 import { invoke, listen, tauriAvailable } from '$lib/tauri';
 import { toast } from '$lib/stores/toast';
+import { EVENT_UPDATES_AVAILABLE, type ModuleUpdateAvailable } from '$lib/api/module_updates';
 import type {
   CatalogResponse,
   DevAffordanceHint,
@@ -131,8 +132,38 @@ interface ModulesState {
   installingId: string | null;
   /** v0.2.67: per-module live install progress keyed by module_id. */
   installProgress: Record<string, ModuleInstallProgress>;
+  /**
+   * v0.2.100: installed modules the 24h background poll found behind the
+   * L0 catalog (payload of `vct-module-updates-available`). Drives the
+   * Sidebar "Modules" count badge. Replaced wholesale on each event (the
+   * payload is the full summary) and trimmed when an update lands.
+   */
+  updatesAvailable: ModuleUpdateAvailable[];
   loading: boolean;
   error: string | null;
+}
+
+/**
+ * v0.2.100: badge count for the Sidebar "Modules" entry. One count per
+ * module with a newer catalog version, however many projects have it.
+ */
+export function countModulesWithUpdates(list: ModuleUpdateAvailable[]): number {
+  return new Set(list.map((u) => u.module_id)).size;
+}
+
+/**
+ * v0.2.100: an update of `moduleId` for `projectId` landed, so drop it
+ * from the pending list. Global-scope rows (`project_id === ""`) match any
+ * project, since updating a global module updates it for everyone.
+ */
+export function withoutUpdated(
+  list: ModuleUpdateAvailable[],
+  projectId: string,
+  moduleId: string,
+): ModuleUpdateAvailable[] {
+  return list.filter(
+    (u) => !(u.module_id === moduleId && (u.project_id === projectId || u.project_id === '')),
+  );
 }
 
 function createModulesStore() {
@@ -153,6 +184,7 @@ function createModulesStore() {
     installedLoadError: null,
     installingId: null,
     installProgress: {},
+    updatesAvailable: [],
     loading: false,
     error: null,
   });
@@ -192,6 +224,17 @@ function createModulesStore() {
         ...s,
         installProgress: mergeInstallProgress(s.installProgress, p),
       }));
+    });
+
+    // v0.2.100: the 24h `spawn_module_update_check_loop` poll emits this
+    // when installed modules are behind the catalog. Nothing listened
+    // before, so the poll's findings never reached the screen. Store the
+    // list (Sidebar badge) and re-read the catalog so the tiles' per-row
+    // "update available" state matches what the poll just discovered.
+    listen<ModuleUpdateAvailable[]>(EVENT_UPDATES_AVAILABLE, (e) => {
+      const list = Array.isArray(e.payload) ? e.payload : [];
+      update((s) => ({ ...s, updatesAvailable: list }));
+      void loadCatalogImpl();
     });
   }
 
@@ -405,6 +448,7 @@ function createModulesStore() {
           ...s,
           installed: [...s.installed.filter((r) => r.module_id !== moduleId), row],
           installingId: null,
+          updatesAvailable: withoutUpdated(s.updatesAvailable, projectId, moduleId),
         }));
         return row;
       } catch (e) {
@@ -472,4 +516,9 @@ export const modules = createModulesStore();
 /** Set of installed module ids for the currently loaded project. */
 export const installedIds = derived(modules, ($m) =>
   new Set($m.installed.map((r) => r.module_id)),
+);
+
+/** v0.2.100: number of modules with an update waiting (Sidebar badge). */
+export const moduleUpdateCount = derived(modules, ($m) =>
+  countModulesWithUpdates($m.updatesAvailable),
 );

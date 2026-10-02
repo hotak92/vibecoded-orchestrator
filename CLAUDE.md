@@ -2,7 +2,8 @@
 
 This file is auto-materialized by `install.py` from
 `templates/ORCHESTRATOR-CLAUDE.md.template` at first-install + every
-`--update` (--update preserves user edits between AUTO markers).
+`--update` (--update regenerates the block between the AUTO markers and
+preserves user edits outside them).
 
 **First-time user**: run `bash first-install.sh` (Linux/macOS) or
 `first-install.bat` (Windows). The installer will:

@@ -110,6 +110,14 @@ pub fn populate_project_state_from_filesystem(
     db: &Db,
 ) -> PopulateReport {
     let mut report = PopulateReport::default();
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    if let Err(standby) = db.ensure_live() {
+        report
+            .warnings
+            .push(format!("project state population skipped: {}", standby));
+        return report;
+    }
 
     let claude_dir = folder_path.join(".claude");
     if !claude_dir.is_dir() {
@@ -3093,4 +3101,38 @@ mod tests {
         assert_eq!(report.kg_access_rows_inserted, 0);
         assert!(report.warnings.is_empty());
     }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn population_is_skipped_with_the_typed_reason_in_standby() {
+        let db = standby_db();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".claude")).unwrap();
+        let report = populate_project_state_from_filesystem("p1", "P1", tmp.path(), &db);
+        assert_eq!(report.warnings.len(), 1, "{:?}", report.warnings);
+        assert_typed_standby(&report.warnings[0]);
+    }
+
 }

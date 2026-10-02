@@ -22,8 +22,22 @@ from __future__ import annotations
 from install import (
     EMBEDDING_CONFIGS,
     SystemInfo,
-    _build_ollama_pull_list,
+    _inference_models_for_capability,
 )
+from vco_lib.embedding_pull_plan import plan
+
+
+def _build_ollama_pull_list(config: dict, sysinfo: SystemInfo) -> list[str]:
+    """v0.2.100: install.py's `_build_ollama_pull_list` was superseded by
+    `vco_lib.embedding_pull_plan.plan` (AD-6) — the one home for the pull list.
+    This helper feeds it the profile exactly as install step 7 does (no dual
+    opt-in; the exact-set matrix lives in test_v02100_embedding_pull_plan.py)."""
+    return list(plan(
+        kg_active=config["text_model"], dual_write_all=False, dual_arctic_secondary=False,
+        code_backend=config["code_backend"], code_model=config["code_model"],
+        capability_tier=_inference_models_for_capability(sysinfo),
+        profile_override=config.get("inference_models_override"),
+    ).models)
 
 
 def _sysinfo(*, has_gpu: bool, vram_gb: float, ram_gb: float) -> SystemInfo:

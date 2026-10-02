@@ -1497,13 +1497,16 @@ impl Db {
     ///
     /// Writes three rows (each idempotent via INSERT OR IGNORE — pre-
     /// existing user-configured rows are preserved):
-    ///   1. `<Sanitized>_KnowledgeGraph` → "write"  (project's own KG)
-    ///   2. `<Sanitized>_Development`    → "write"  (project's docs)
-    ///   3. `LAST_RESORT_SHARED_KG_COLLECTION` → "read"  (cross-project shared)
+    ///   1. own primary KG  → "write"
+    ///   2. own Development → "write"
+    ///   3. the canonical shared KG (`app_state` pointer) → "write"
     ///
-    /// Where `<Sanitized>` is `sanitize_kg_collection(project_name)`
-    /// (matches launcher-side `commands::projects_v2::sanitize_kg_collection`
-    /// byte-for-byte; see `sanitize_kg_collection_local` below).
+    /// The own names come from [`Db::own_kg_access_collections`]: the
+    /// project's `primary` binding (the root: binding, else the canonical
+    /// pointer), with the dev name suffix-swapped from it. The display name
+    /// (`sanitize_kg_collection(project_name)`) is used ONLY for a non-root
+    /// project that has no binding yet (the hub's `vct project create` seeds
+    /// before any binding exists) — v0.2.100 W5R-05.
     ///
     /// Why default-grant on the own collections + shared: the read-gate
     /// `require_kg_read` (commands::kg::require_kg_read + hub::cli_api)
@@ -1523,62 +1526,32 @@ impl Db {
         project_id: &str,
         project_name: &str,
     ) -> Result<usize, String> {
-        let pascal = sanitize_kg_collection_local(project_name);
-        let dev_collection = format!("{}_Development", pascal);
         // Resolve the canonical shared KG name from `app_state` (Phase 1
         // item #3 single-source-of-truth). White-label installers override
         // this at install time via `set_orchestrator_root_kg_collection`.
         let shared_collection = self.get_orchestrator_root_kg_collection()?;
 
-        // v0.2.77 Part 2 (5b) — orchestrator-root own-primary root-cause fix.
-        //
-        // For every OTHER project, the own-primary KG collection is
-        // `sanitize(project_name)_KnowledgeGraph`. But for the
-        // ORCHESTRATOR-ROOT project the display name is
-        // `ORCHESTRATOR_ROOT_NAME` ("VibeCoded Orchestrator") →
-        // sanitized "VibeCodedOrchestrator" → literally
-        // "VibeCodedOrchestrator_KnowledgeGraph" — which is the dead
-        // default name (`DEFAULT_ORCHESTRATOR_ROOT_KG_COLLECTION`).
-        //
-        // Since the 2026-07 consolidation the orchestrator root's OWN KG
-        // collection and the machine's SHARED collection are the SAME
-        // class — the canonical pointer resolved above. When an install
-        // has re-pointed the canonical collection away from the bundled
-        // default (e.g. a migrated install whose shared class is
-        // `VCODev_KnowledgeGraph`), the literal-derived own-primary name
-        // is a DEAD row: it names a Weaviate class that no longer exists.
-        // Populate runs on every launcher boot / update-all
-        // (`ensure_orchestrator_root_state_populated` →
-        // `populate_project_state_from_filesystem` →
-        // `populate_kg_collection_access`), so the dead row is re-seeded
-        // (via `kg_seed_access`, INSERT OR IGNORE) after any heal wiped it.
-        //
-        // Fix: when the target project IS the orchestrator root, derive
-        // the own-primary collection from the canonical pointer
-        // (`get_orchestrator_root_kg_collection`) — the same source the
-        // shared row already uses — so the own-primary and shared rows
-        // AGREE on the live collection name. The `host` field on the
-        // `projects` row is the sturdiest signal for "this is the root"
-        // (same signal `is_orchestrator_root_structural_row` uses).
-        //
-        // No regression on default installs: the canonical pointer's
-        // DEFAULT value IS "VibeCodedOrchestrator_KnowledgeGraph", so for
-        // a fresh default root install the pointer-derived name is
-        // byte-identical to the old literal-derived name.
-        //
-        // Soft-fail on the host lookup: if `get_project` errors or the
-        // row is missing, fall back to the literal-derived name (the
-        // pre-fix behavior) rather than aborting the whole populate — a
-        // conservative default on a best-effort boot path.
-        let is_root = matches!(
-            self.get_project(project_id),
-            Ok(Some(ref row)) if row.host == crate::db::models::ProjectHost::OrchestratorRoot
-        );
-        let primary_collection = if is_root {
-            shared_collection.clone()
-        } else {
-            format!("{}_KnowledgeGraph", pascal)
-        };
+        // v0.2.100 W5R-05 — the project's OWN rows come from its BINDINGS,
+        // never from its display name (see `own_kg_access_collections`).
+        // Before, the own-dev row was always `sanitize(display)_Development`:
+        // for the orchestrator root that minted `VibeCodedOrchestrator_
+        // Development` on every boot — a phantom PEER in both the env and the
+        // hub access lists of an install whose collections are named after
+        // something else — and a renamed project re-acquired `<new name>_*`.
+        let own = self.own_kg_access_collections(project_id, project_name, &shared_collection);
+        if own.is_root {
+            // The root's earlier name-derived seeds are healed here, on the
+            // same boot path that used to re-mint them (DB rows only).
+            if let Err(e) = self.heal_root_name_derived_access_rows(project_id, &own) {
+                tracing::warn!(
+                    project_id,
+                    error = %e,
+                    "[vct] root name-derived access-row heal failed (non-fatal)"
+                );
+            }
+        }
+        let primary_collection = own.primary.clone();
+        let dev_collection = own.dev.clone();
 
         // v0.2.49 access-matrix Step F SB2 fix (L2-SB1): match the
         // semantic that `resolve_default_access_level` returns ONCE
@@ -1675,6 +1648,203 @@ impl Db {
         }
 
         Ok(inserted)
+    }
+
+    /// v0.2.100 W5R-05 — a project's OWN KG access-row names, from launcher.db
+    /// alone: the `projects.host` root flag and the project's bindings.
+    ///
+    /// * Root (`host = orchestrator_root`): primary = its `primary` binding,
+    ///   else the canonical shared pointer (`shared_collection`, which the
+    ///   root's binding is seeded from). NEVER `sanitize(display name)` — the
+    ///   owner rule: "our internal DB should know what's the root project …
+    ///   should be enough to know which project is root".
+    /// * Any other project: the ONE naming rule
+    ///   ([`crate::collection_naming::resolve_project_collections`]) —
+    ///   binding-first; the display name only as the no-binding last resort.
+    ///
+    /// Dev is suffix-swapped from the primary in both cases (the same
+    /// `derive_sibling_collection` the hub and env projection use).
+    /// Soft-fail: a DB error reading the project row → treated as non-root.
+    pub fn own_kg_access_collections(
+        &self,
+        project_id: &str,
+        project_name: &str,
+        shared_collection: &str,
+    ) -> OwnKgAccessCollections {
+        use crate::collection_naming::{
+            derive_sibling_collection, resolve_project_collections, DEV_SUFFIX,
+            DIAGRAMS_SUFFIX,
+        };
+        let row = self.get_project(project_id).ok().flatten();
+        let is_root = matches!(
+            row,
+            Some(ref r) if r.host == crate::db::models::ProjectHost::OrchestratorRoot
+        );
+        let slug = row
+            .as_ref()
+            .map(|r| r.slug.clone())
+            .filter(|s| !s.trim().is_empty());
+        if is_root {
+            let bound = self
+                .list_project_kg_bindings(project_id)
+                .ok()
+                .and_then(|rows| {
+                    rows.into_iter()
+                        .find(|b| b.role == "primary")
+                        .map(|b| b.collection_name.trim().to_string())
+                })
+                .filter(|n| !n.is_empty());
+            let primary = bound.unwrap_or_else(|| shared_collection.to_string());
+            let seed = slug.as_deref().unwrap_or(project_name);
+            let dev = derive_sibling_collection(&primary, DEV_SUFFIX, seed);
+            let diagrams = derive_sibling_collection(&primary, DIAGRAMS_SUFFIX, seed);
+            OwnKgAccessCollections { primary, dev, diagrams, is_root }
+        } else {
+            let c = resolve_project_collections(
+                self,
+                Some(project_id),
+                project_name,
+                slug.as_deref(),
+            );
+            OwnKgAccessCollections {
+                primary: c.kg,
+                dev: c.dev,
+                diagrams: c.diagrams,
+                is_root,
+            }
+        }
+    }
+
+    /// v0.2.100 W5R-05 — delete the orchestrator root's DISPLAY-NAME-derived
+    /// access rows (`sanitize(root name)` + `_KnowledgeGraph` / `_Development`
+    /// / `_Diagrams`) when they are PROVABLY the root's own stale seeds.
+    ///
+    /// A candidate row is deleted only when ALL hold:
+    ///   1. `project_id` is the root (`host = orchestrator_root`) — checked
+    ///      by the caller via `own.is_root` and re-checked here;
+    ///   2. the name is not one of the root's binding-derived own names nor
+    ///      the canonical shared pointer (`own` + `app_state`);
+    ///   3. NO `project_kg_bindings` row of ANY project names it or has it as
+    ///      a `_KnowledgeGraph` sibling (it is nobody's collection);
+    ///   4. no installed global module declares it in `kg_collections`;
+    ///   5. the row is seed-authored (`created_at == updated_at`) — a row the
+    ///      user configured in the access matrix is left alone and logged.
+    ///
+    /// DB rows only: Weaviate is never consulted, dropped or touched — the
+    /// verdict is "this name is the root's own name-derived seed", which the
+    /// DB alone proves. Each deletion is audited
+    /// (`kg_access_root_phantom_removed`). Returns the rows deleted.
+    pub fn heal_root_name_derived_access_rows(
+        &self,
+        project_id: &str,
+        own: &OwnKgAccessCollections,
+    ) -> Result<usize, String> {
+        let Some(row) = self.get_project(project_id)? else {
+            return Ok(0);
+        };
+        if row.host != crate::db::models::ProjectHost::OrchestratorRoot {
+            return Ok(0);
+        }
+        let shared = self.get_orchestrator_root_kg_collection()?;
+        let protected: Vec<&str> = vec![
+            own.primary.as_str(),
+            own.dev.as_str(),
+            own.diagrams.as_str(),
+            shared.as_str(),
+        ];
+        let stem = sanitize_kg_collection_local(&row.name);
+        let candidates: Vec<String> = ["_KnowledgeGraph", "_Development", "_Diagrams"]
+            .iter()
+            .map(|sfx| format!("{}{}", stem, sfx))
+            .filter(|c| !protected.iter().any(|p| p.eq_ignore_ascii_case(c)))
+            .collect();
+        if candidates.is_empty() {
+            return Ok(0);
+        }
+
+        // Every name any binding claims, plus the `_KnowledgeGraph` siblings
+        // a binding implies (lower-cased: Weaviate class names compare
+        // case-insensitively on the first letter, so be conservative).
+        let mut claimed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        {
+            let guard = self.lock();
+            let mut stmt = guard
+                .prepare("SELECT collection_name FROM project_kg_bindings")
+                .map_err(|e| format!("prepare bindings: {}", e))?;
+            let names = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .map_err(|e| format!("query bindings: {}", e))?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("collect bindings: {}", e))?;
+            for n in names {
+                let n = n.trim().to_string();
+                if let Some(base) = n.strip_suffix("_KnowledgeGraph") {
+                    claimed.insert(format!("{}_development", base).to_lowercase());
+                    claimed.insert(format!("{}_diagrams", base).to_lowercase());
+                }
+                claimed.insert(n.to_lowercase());
+            }
+        }
+        for install in self.list_global_module_installs().unwrap_or_default() {
+            for c in &install.kg_collections {
+                claimed.insert(c.to_lowercase());
+            }
+        }
+
+        let mut removed = 0usize;
+        for cand in &candidates {
+            if claimed.contains(&cand.to_lowercase()) {
+                continue;
+            }
+            let stamps: Option<(i64, i64)> = {
+                let guard = self.lock();
+                guard
+                    .query_row(
+                        "SELECT created_at, updated_at FROM kg_collection_access \
+                          WHERE project_id = ?1 AND collection_name = ?2",
+                        params![project_id, cand],
+                        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+                    )
+                    .optional()
+                    .map_err(|e| format!("read access row: {}", e))?
+            };
+            let Some((created_at, updated_at)) = stamps else {
+                continue;
+            };
+            if created_at != updated_at {
+                tracing::warn!(
+                    project_id,
+                    collection = %cand,
+                    "[vct] root access row is name-derived but user-configured; left alone"
+                );
+                continue;
+            }
+            let n = {
+                let guard = self.lock();
+                guard
+                    .execute(
+                        "DELETE FROM kg_collection_access \
+                          WHERE project_id = ?1 AND collection_name = ?2",
+                        params![project_id, cand],
+                    )
+                    .map_err(|e| format!("delete access row: {}", e))?
+            };
+            if n > 0 {
+                removed += n;
+                let _ = self.audit(
+                    "kg_access_root_phantom_removed",
+                    Some(project_id),
+                    None,
+                    &serde_json::json!({
+                        "collection": cand,
+                        "root_display_name": row.name,
+                        "own_primary": own.primary,
+                        "reason": "root_display_name_derived_seed",
+                    }),
+                );
+            }
+        }
+        Ok(removed)
     }
 
     /// RETIRED — v0.2.89 (BUG 4): collection names are IMMUTABLE
@@ -3168,9 +3338,36 @@ mod adopt_populated_tests {
                         break;
                     }
                     let Ok(mut stream) = stream else { continue };
+                    // Read the WHOLE request: headers, then Content-Length bytes
+                    // of body. A single `read` returned only the headers when
+                    // the client sent the POST body in a second TCP segment,
+                    // so the GraphQL class was lost and every count read as 0 —
+                    // an intermittent red (v0.2.100 wave-1 gate, 1 run in 4).
+                    let mut raw: Vec<u8> = Vec::new();
                     let mut buf = [0u8; 8192];
-                    let n = stream.read(&mut buf).unwrap_or(0);
-                    let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    loop {
+                        let n = stream.read(&mut buf).unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        raw.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&raw);
+                        if let Some(hdr_end) = text.find("\r\n\r\n") {
+                            let want = text[..hdr_end]
+                                .lines()
+                                .find_map(|l| {
+                                    let (k, v) = l.split_once(':')?;
+                                    k.eq_ignore_ascii_case("content-length")
+                                        .then(|| v.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            if raw.len() >= hdr_end + 4 + want {
+                                break;
+                            }
+                        }
+                    }
+                    let req = String::from_utf8_lossy(&raw).to_string();
 
                     let body = if req.starts_with("GET /v1/schema") {
                         serde_json::json!({
@@ -3212,7 +3409,7 @@ mod adopt_populated_tests {
                     };
 
                     let response = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}",
                         body.len(),
                         body
                     );
@@ -4370,6 +4567,186 @@ mod populate_access_for_project_tests {
             .unwrap();
     }
 
+    // ── v0.2.100 W5R-05: own rows from the root flag + bindings ──────────
+
+    fn seed_root(db: &Db, id: &str, display: &str, slug: &str) {
+        let now = 1_700_000_000_000_i64;
+        db.lock()
+            .execute(
+                "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at) \
+                 VALUES (?1, ?2, '/tmp/w5r05-root', 'orchestrator_root', ?3, ?4, ?4)",
+                rusqlite::params![id, display, slug, now],
+            )
+            .unwrap();
+    }
+
+    fn bind_primary(db: &Db, id: &str, coll: &str) {
+        db.set_project_kg_binding(id, "primary", coll, None, None, None, None, &serde_json::json!({}))
+            .unwrap();
+    }
+
+    /// A seed-authored row (created_at == updated_at) — what pre-fix boots wrote.
+    fn seed_row(db: &Db, id: &str, coll: &str) {
+        db.kg_seed_access(id, coll, "write").unwrap();
+    }
+
+    fn names(db: &Db, id: &str) -> std::collections::BTreeSet<String> {
+        db.kg_list_access(id).unwrap().into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// ACT: a root whose display name ("VibeCoded Orchestrator") differs from
+    /// its collection prefix (VCODev) gets its own rows from the BINDING, and
+    /// the display-name-derived seeds of earlier boots are removed.
+    #[test]
+    fn root_own_rows_come_from_binding_and_name_derived_seeds_are_healed() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph").unwrap();
+        seed_root(&db, "root", "VibeCoded Orchestrator", "vibecoded-orchestrator");
+        bind_primary(&db, "root", "VCODev_KnowledgeGraph");
+        // What every pre-fix boot left behind.
+        seed_row(&db, "root", "VibeCodedOrchestrator_KnowledgeGraph");
+        seed_row(&db, "root", "VibeCodedOrchestrator_Development");
+
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        let got = names(&db, "root");
+        assert!(got.contains("VCODev_KnowledgeGraph"), "{got:?}");
+        assert!(got.contains("VCODev_Development"), "{got:?}");
+        assert!(
+            !got.iter().any(|c| c.starts_with("VibeCodedOrchestrator_")),
+            "the root's name-derived rows must be gone (no phantom peer): {got:?}"
+        );
+        // Second boot: nothing is re-minted.
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        assert!(!names(&db, "root").iter().any(|c| c.starts_with("VibeCodedOrchestrator_")));
+        // The removal is audited.
+        let audited = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE operation = 'kg_access_root_phantom_removed'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap();
+        assert_eq!(audited, 2);
+    }
+
+    /// ACT: a root with no binding yet derives from the canonical pointer,
+    /// never from the display name.
+    #[test]
+    fn root_without_binding_uses_pointer_not_display_name() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph").unwrap();
+        seed_root(&db, "root", "VibeCoded Orchestrator", "vibecoded-orchestrator");
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        let got = names(&db, "root");
+        assert_eq!(
+            got,
+            ["VCODev_Development", "VCODev_KnowledgeGraph"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            "{got:?}"
+        );
+    }
+
+    /// LEAVE-ALONE: a name-derived row the user configured, one another
+    /// project's binding claims, and one a global module declares all survive.
+    #[test]
+    fn root_heal_leaves_user_configured_and_claimed_rows() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph").unwrap();
+        seed_root(&db, "root", "VibeCoded Orchestrator", "vibecoded-orchestrator");
+        bind_primary(&db, "root", "VCODev_KnowledgeGraph");
+        // (a) user-configured: set_access stamps updated_at != created_at.
+        seed_row(&db, "root", "VibeCodedOrchestrator_Diagrams");
+        db.lock()
+            .execute(
+                "UPDATE kg_collection_access SET updated_at = created_at + 5 \
+                  WHERE project_id = 'root' AND collection_name = 'VibeCodedOrchestrator_Diagrams'",
+                [],
+            )
+            .unwrap();
+        // (b) a peer project genuinely owns VibeCodedOrchestrator_KnowledgeGraph
+        //     (and therefore its _Development sibling).
+        seed_project(&db, "peer");
+        bind_primary(&db, "peer", "VibeCodedOrchestrator_KnowledgeGraph");
+        seed_row(&db, "root", "VibeCodedOrchestrator_KnowledgeGraph");
+        seed_row(&db, "root", "VibeCodedOrchestrator_Development");
+
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        let got = names(&db, "root");
+        for kept in [
+            "VibeCodedOrchestrator_Diagrams",
+            "VibeCodedOrchestrator_KnowledgeGraph",
+            "VibeCodedOrchestrator_Development",
+        ] {
+            assert!(got.contains(kept), "{kept} must survive: {got:?}");
+        }
+    }
+
+    /// LEAVE-ALONE: a module-declared collection that happens to match the
+    /// root's name-derived stem is a real collection, not a phantom.
+    #[test]
+    fn root_heal_leaves_module_declared_collection() {
+        let db = Db::open_in_memory().unwrap();
+        db.set_orchestrator_root_kg_collection("VCODev_KnowledgeGraph").unwrap();
+        seed_root(&db, "root", "VibeCoded Orchestrator", "vibecoded-orchestrator");
+        bind_primary(&db, "root", "VCODev_KnowledgeGraph");
+        let install = db
+            .insert_global_module_install("i1", "m", "0.1.0", "/tmp/x")
+            .unwrap();
+        db.set_module_kg_collections(
+            &install.id,
+            Some(&["VibeCodedOrchestrator_Development".to_string()]),
+        )
+        .unwrap();
+        seed_row(&db, "root", "VibeCodedOrchestrator_Development");
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        assert!(names(&db, "root").contains("VibeCodedOrchestrator_Development"));
+    }
+
+    /// LEAVE-ALONE: the heal never runs for a non-root project, and a
+    /// default install (display-name stem == pointer stem) has no phantom.
+    #[test]
+    fn heal_is_root_only_and_noop_on_default_install() {
+        let db = Db::open_in_memory().unwrap();
+        // Non-root project carrying a "VibeCodedOrchestrator_*" grant row.
+        seed_project(&db, "p1");
+        seed_row(&db, "p1", "VibeCodedOrchestrator_Development");
+        let own = db.own_kg_access_collections("p1", "p1", "VibeCodedOrchestrator_KnowledgeGraph");
+        assert!(!own.is_root);
+        assert_eq!(db.heal_root_name_derived_access_rows("p1", &own).unwrap(), 0);
+        assert!(names(&db, "p1").contains("VibeCodedOrchestrator_Development"));
+
+        // Default install: pointer == sanitize(display)_KnowledgeGraph.
+        seed_root(&db, "root", "VibeCoded Orchestrator", "vibecoded-orchestrator");
+        db.populate_kg_collection_access_for_project("root", "VibeCoded Orchestrator")
+            .unwrap();
+        let got = names(&db, "root");
+        assert!(got.contains("VibeCodedOrchestrator_KnowledgeGraph"), "{got:?}");
+        assert!(got.contains("VibeCodedOrchestrator_Development"), "{got:?}");
+    }
+
+    /// ACT (non-root): a renamed project keeps seeding its BINDING's names,
+    /// not `<new display name>_*`.
+    #[test]
+    fn renamed_project_seeds_binding_names_not_new_display_name() {
+        let db = Db::open_in_memory().unwrap();
+        seed_project(&db, "p1");
+        bind_primary(&db, "p1", "Acme_KnowledgeGraph");
+        db.populate_kg_collection_access_for_project("p1", "Renamed Thing")
+            .unwrap();
+        let got = names(&db, "p1");
+        assert!(got.contains("Acme_KnowledgeGraph"), "{got:?}");
+        assert!(got.contains("Acme_Development"), "{got:?}");
+        assert!(!got.iter().any(|c| c.starts_with("RenamedThing_")), "{got:?}");
+    }
+
     #[test]
     fn populate_writes_three_default_rows() {
         let db = Db::open_in_memory().unwrap();
@@ -4562,11 +4939,11 @@ mod populate_access_for_project_tests {
             None,
             "root own-primary must NOT be the dead literal-derived name"
         );
-        // Dev collection is still literal-derived from the project name.
-        assert_eq!(
-            by_collection.get("VibeCodedOrchestrator_Development"),
-            Some(&"write")
-        );
+        // v0.2.100 W5R-05: the dev row is suffix-swapped from the root's own
+        // primary — this test used to pin `VibeCodedOrchestrator_Development`
+        // (display-name-derived), which was the phantom peer the review found.
+        assert_eq!(by_collection.get("VCODev_Development"), Some(&"write"));
+        assert_eq!(by_collection.get("VibeCodedOrchestrator_Development"), None);
     }
 
     #[test]
@@ -4981,4 +5358,14 @@ mod populate_access_for_project_tests {
         let listed2 = db.list_global_module_installs().unwrap();
         assert_eq!(listed2[0].kg_collections, collections);
     }
+}
+
+/// v0.2.100 W5R-05 — a project's own KG access-row names, resolved by
+/// [`Db::own_kg_access_collections`] from launcher.db (root flag + bindings).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnKgAccessCollections {
+    pub primary: String,
+    pub dev: String,
+    pub diagrams: String,
+    pub is_root: bool,
 }

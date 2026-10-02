@@ -604,23 +604,6 @@ pub async fn license_get_tier(db: State<'_, Db>) -> Result<TierCacheView, String
     Ok(to_view(row))
 }
 
-/// Bug 33: thin convenience command that returns true iff the cached
-/// orchestrator tier is `"admin"`. Frontend uses this to gate the
-/// admin sidebar group + ADMIN badge.
-///
-/// Cached value comes from the same `tier_cache` row that
-/// `license_get_tier` returns — the SOURCE OF TRUTH is the Supabase
-/// `validate-tier` edge function, which classifies `tier=admin` only
-/// when the variant_id is in `LS_ADMIN_VARIANT_IDS` (Bug 33). Patching
-/// this function to always return true unlocks client-side dev UI but
-/// does NOT unlock server-gated capabilities (paid module artifact
-/// downloads re-validate JWTs server-side).
-#[command]
-pub async fn license_is_admin(db: State<'_, Db>) -> Result<bool, String> {
-    let row = db.get_tier_cache()?;
-    Ok(row.orchestrator_tier == "admin")
-}
-
 #[command]
 pub async fn license_refresh(db: State<'_, Db>) -> Result<TierCacheView, String> {
     // L1.M (v0.2.40): canonical per-module username; the legacy
@@ -1039,7 +1022,7 @@ pub async fn module_license_deactivate(
 // `LEGACY_KEYCHAIN_USERNAME`, `ORCHESTRATOR_MODULE_ID`, and `key_prefix_of`
 // are all in scope from that hoisted import.
 
-/// Wire-shape returned by `list_license_keys` / `get_module_license_key_status`.
+/// Wire-shape returned by `list_license_keys`.
 /// Mirrors `vct_launcher_core::db::license_keys::LicenseKeyRow` but uses
 /// `redacted_key` (a display-only field) instead of exposing keychain
 /// coordinates to the frontend — the raw key never crosses the IPC
@@ -1127,7 +1110,7 @@ fn to_summary(db: &Db, row: LicenseKeyRow) -> LicenseKeySummary {
 ///   BRANCH 3 (clean install OR already-migrated): no legacy entry,
 ///   row either absent or already pointing at canonical → no-op.
 ///
-/// Called from `list_license_keys` / `get_module_license_key_status`
+/// Called from `list_license_keys`
 /// on every invocation; idempotent across all branches (a second call
 /// after the migration completes finds either no row, or a row already
 /// at the canonical username — both short-circuit without keychain
@@ -1408,23 +1391,6 @@ fn synthetic_orchestrator_placeholder(db: &Db) -> LicenseKeySummary {
     }
 }
 
-/// v0.2.40 L1: read a single per-module summary. Useful for the GUI's
-/// per-module sub-page; returns `None` when no key has been activated
-/// for that module.
-#[command]
-pub async fn get_module_license_key_status(
-    module_id: String,
-    db: State<'_, Db>,
-) -> Result<Option<LicenseKeySummary>, String> {
-    let db_ref: &Db = &db;
-    if module_id == ORCHESTRATOR_MODULE_ID {
-        // Pick up the legacy slot if we haven't migrated yet.
-        let _ = ensure_legacy_orchestrator_row_migrated(db_ref);
-    }
-    let row = db.get_license_key(&module_id)?;
-    Ok(row.map(|r| to_summary(db_ref, r)))
-}
-
 /// v0.2.40 L1: activate or rotate the license key for one paid module.
 ///
 /// Persists to the OS keychain at (service='vct.global.licensing',
@@ -1499,7 +1465,7 @@ pub async fn set_module_license_key(
     )?;
 
     // Return the freshly-stored row's summary so the GUI can render the
-    // updated state without a follow-up `get_module_license_key_status`
+    // updated state without a follow-up `list_license_keys`
     // round-trip.
     let db_ref: &Db = &db;
     let row = db
@@ -2081,10 +2047,11 @@ mod tests {
         );
     }
 
-    /// `license_is_admin` returns true iff cache says admin. Uses an
+    /// The admin gate reads the cached tier slug (`license_get_tier`, the
+    /// one reader; the frontend compares the slug to `"admin"`). Uses an
     /// in-memory db so the test doesn't touch the user's real cache.
     #[tokio::test]
-    async fn license_is_admin_reflects_tier_cache() {
+    async fn tier_cache_carries_the_admin_slug() {
         let db = Db::open_in_memory().expect("in-memory db");
         // Default tier in a fresh cache is "free".
         db.set_tier_cache("free", &serde_json::json!({}), None).unwrap();

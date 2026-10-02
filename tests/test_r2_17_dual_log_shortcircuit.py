@@ -51,8 +51,9 @@ class _SpyService:
         self._slots = slots
         self.fanout_calls = 0
 
-    def embed_text_all_configured(self, query):
+    def embed_text_all_configured(self, query, *, include_active=True):
         self.fanout_calls += 1
+        self.include_active = include_active
         return self._slots
 
 

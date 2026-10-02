@@ -8,7 +8,7 @@
    * context indicator and /compact thresholds size correctly instead of
    * assuming a conservative default for an id it does not recognise.
    *
-   * Keys are FULL model ids, never family patterns — `glm-5.2` has a 1M
+   * Keys are FULL model ids, never family patterns — `glm-5.3` has a 1M
    * window while `glm-5.1` has 200K, so a `glm-5*` rule would overstate the
    * smaller by 5x. That is the whole reason this is a table.
    *
@@ -202,7 +202,7 @@
     </p>
     <p class="hint">
       Rows are keyed by the <strong>full model id</strong>, never a family
-      pattern: <code>glm-5.2</code> has a 1M window while
+      pattern: <code>glm-5.3</code> has a 1M window while
       <code>glm-5.1</code> has 200K, so a <code>glm-5*</code> rule would
       overstate the smaller one by five times. Every row cites the page its
       numbers came from — an uncited window is a guess, and the client would
@@ -420,7 +420,7 @@
       <input
         type="text"
         bind:value={draft.model_id}
-        placeholder="glm-5.2"
+        placeholder="glm-5.3"
         disabled={editing !== '+' && editing !== null}
         readonly={editing !== '+' && editing !== null}
       />
@@ -469,7 +469,7 @@
       <input
         type="text"
         bind:value={draft.source}
-        placeholder="https://docs.z.ai/guides/llm/glm-5.2"
+        placeholder="https://docs.z.ai/guides/llm/glm-5.3"
       />
       <small class="field-hint">
         Where these numbers came from. Required — a row without a citation is

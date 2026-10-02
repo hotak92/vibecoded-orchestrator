@@ -11,6 +11,15 @@
 #   # Returns project name (e.g. "MyProject") or empty string for current project
 #
 # The returned name matches Weaviate collection prefixes (e.g. MyProject_CodeFunction).
+#
+# SCOPE (v0.2.100 W5R-03): the ONLY remaining consumer is the UNREGISTERED
+# code-graph-incremental hook (kept for users who wire it themselves; its
+# registered successor is stop-codegraph-drain, which does not use this).
+# It must NEVER pick a code graph to SEARCH: a folder name is not a grant.
+# Every search path (pre-edit included) runs as the CALLING project -- its own
+# binding prefix (which holds its extra paths) plus its own
+# VCT_CODE_GRAPH_ACCESS_LIST grants -- because the sibling-by-folder-name
+# answer read a neighbour project's code graph with no grant.
 
 detect_project_for_file() {
     local file_path="$1"

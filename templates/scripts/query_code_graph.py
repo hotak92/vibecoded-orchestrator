@@ -34,7 +34,7 @@ from pathlib import Path
 from typing import Optional, List
 
 try:
-    import weaviate
+    import weaviate  # noqa: F401 — availability check; connect() goes through vco_lib.weaviate_helpers.connect_v4
     from weaviate.classes.query import Filter, MetadataQuery, QueryReference
 except ImportError:
     print("Error: weaviate-client not installed. Install with: pip install weaviate-client", file=sys.stderr)
@@ -275,24 +275,52 @@ from vco_lib.paths import claude_user_dir  # noqa: E402 — see import disciplin
 # `mcp-config.json` win over both knobs, inverted relative to all of them. Any
 # env statement (WEAVIATE_URL or WEAVIATE_PORT) now wins outright through the
 # ONE home; the file is consulted only when the env is silent.
+from vco_lib import weaviate_helpers as _wh  # noqa: E402 — see import discipline above
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — see import discipline above
 
 CONFIG_PATH = claude_user_dir() / "workflow" / "config" / "mcp-config.json"
 
-if (os.environ.get("WEAVIATE_URL") or "").strip() or (
-    os.environ.get("WEAVIATE_PORT") or "").strip():
-    WEAVIATE_URL = weaviate_url_default()
-    GRPC_PORT = 50052
-    OLLAMA_URL = "http://localhost:11435"
-elif CONFIG_PATH.exists():
-    config = json.loads(CONFIG_PATH.read_text())
-    WEAVIATE_URL = config["weaviate"]["url"]
-    GRPC_PORT = config["weaviate"]["grpc_port"]
-    OLLAMA_URL = config.get("ollama", {}).get("url", "http://localhost:11435")
+# v0.2.100 WP-18B: GRPC_PORT and OLLAMA_URL used to be the literals 50052 /
+# http://localhost:11435 on every branch, whatever the env said, and
+# `connect()` ignored all three values and dialled localhost:8081/50052. Each
+# knob now resolves the same way WEAVIATE_URL does: the projected env
+# (`GRPC_PORT`, `OLLAMA_URL` — written from the service_endpoints rows by
+# config_projection) -> `mcp-config.json` -> the compiled default, which is a
+# last resort only. An empty value is UNSET; a non-numeric GRPC_PORT is
+# ignored rather than crashing the import.
+_DEFAULT_OLLAMA_URL = "http://localhost:11435"
+
+
+def _env_str(name: str) -> str:
+    return (os.environ.get(name) or "").strip()
+
+
+def _env_grpc_port() -> Optional[int]:
+    raw = _env_str("GRPC_PORT")
+    try:
+        return int(raw) if raw else None
+    except ValueError:
+        return None
+
+
+_config: dict = {}
+if not (_env_str("WEAVIATE_URL") or _env_str("WEAVIATE_PORT")) and CONFIG_PATH.exists():
+    _config = json.loads(CONFIG_PATH.read_text())
+    WEAVIATE_URL = _config["weaviate"]["url"]
 else:
     WEAVIATE_URL = weaviate_url_default()
-    GRPC_PORT = 50052
-    OLLAMA_URL = "http://localhost:11435"
+_env_grpc = _env_grpc_port()
+if _env_grpc is not None:
+    GRPC_PORT = _env_grpc
+elif _config:
+    GRPC_PORT = int(_config["weaviate"]["grpc_port"])
+else:
+    GRPC_PORT = _wh.DEFAULT_GRPC_PORT
+OLLAMA_URL = (
+    _env_str("OLLAMA_URL")
+    or (_config.get("ollama", {}).get("url") if _config else None)
+    or _DEFAULT_OLLAMA_URL
+)
 
 
 def _collection_name(base: str, project: str = None) -> str:
@@ -327,7 +355,7 @@ def _collection_name(base: str, project: str = None) -> str:
 # Code embedding configuration — v0.2.18: centralised via
 # EmbeddingService. Pre-v0.2.18 read CODE_EMBED_BACKEND / CODE_EMBED_-
 # SERVICE_URL / CODE_EMBED_MODEL directly and hardcoded the slot.
-CODE_EMBED_SERVICE_URL = os.getenv("CODE_EMBED_SERVICE_URL", "http://localhost:11440")
+CODE_EMBED_SERVICE_URL = _env_str("CODE_EMBED_SERVICE_URL") or "http://localhost:11440"
 
 # Import EmbeddingService — graceful fallback for half-installed venvs.
 #
@@ -469,13 +497,10 @@ class CodeGraphQuery:
     def connect(self):
         """Connect to Weaviate."""
         try:
-            self.client = weaviate.connect_to_custom(
-                http_host='localhost',
-                http_port=8081,
-                http_secure=False,
-                grpc_host='localhost',
-                grpc_port=50052,
-                grpc_secure=False
+            # v0.2.100 WP-18B: the resolved WEAVIATE_URL / GRPC_PORT, through
+            # the one connect factory — never the literals 8081 / 50052.
+            self.client = _wh.connect_v4(
+                WEAVIATE_URL, grpc_port=GRPC_PORT, skip_init_checks=False,
             )
             return True
         except Exception as e:
@@ -1594,6 +1619,35 @@ class CodeGraphQuery:
             self.client.close()
 
 
+def _calling_project_root():
+    """The project whose code-graph identity this run must use (v0.2.100 F3).
+
+    The workspace Claude Code says we serve (``CLAUDE_PROJECT_DIR``), else the
+    nearest VCO project above the cwd — the SAME ladder the MCP uses
+    (``weaviate_mcp.server._resolution_context``, the one home). Its last-resort
+    rung (wherever ``server.py`` is installed, i.e. the ORCHESTRATOR) is NOT
+    taken here: a run that cannot name its project falls back to the cwd, as it
+    always did, rather than borrowing the orchestrator root's code graph and
+    grants. Pre-F3 this was ``Path.cwd()`` alone, so a hook firing while the
+    session's cwd sat in another checkout resolved THAT directory's identity
+    instead of the calling project's.
+    """
+    from pathlib import Path as _Path
+
+    try:
+        from weaviate_mcp.server import (  # type: ignore[import-not-found]
+            _CTX_MODULE,
+            _resolution_context,
+        )
+
+        root, kind = _resolution_context()
+        if kind != _CTX_MODULE:
+            return root
+    except Exception:
+        pass
+    return _Path.cwd()
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Query code graph with semantic and structural search",
@@ -1677,8 +1731,7 @@ def main():
     if not effective_project:
         try:
             from vco_lib.project_config import resolve as _vco_resolve  # type: ignore[import-not-found]
-            from pathlib import Path as _Path
-            _cfg = _vco_resolve(_Path.cwd())
+            _cfg = _vco_resolve(_calling_project_root())
             # v0.2.70 Bug C1a: use the canonical binding-row prefix
             # (code_graph_collection_prefix), NOT the slug alias
             # code_graph_project. The slug sanitises to a nonexistent

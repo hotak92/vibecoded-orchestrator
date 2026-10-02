@@ -4,7 +4,7 @@
 
 Covers:
   * gpu-audit C-5 — `_apply_tier_overrides` keeps `code_dims` /
-    `text_dims` / `active_embedding` / pull list in lockstep with the
+    `text_dims` / `active_embedding` in lockstep with the
     swapped model (pre-v0.2.54 only the model NAME was replaced, so
     ``CODE_EMBED_DIMS=768`` was written for the 1024-dim qwen3 pick).
   * gpu-audit C-2 — AMD >=12 GB hosts are routed OFF the "gpu"
@@ -65,22 +65,10 @@ class ApplyTierOverridesTests(unittest.TestCase):
         self.assertEqual(config["text_dims"], 1024)
         self.assertEqual(config["active_embedding"], "arctic")
 
-    def test_override_appends_ollama_model_to_pull_list(self):
-        # low_resource pull list is [arctic, jina]; a qwen3 code
-        # override must land qwen3 in the pull list or the host embeds
-        # against a model Ollama never pulled.
-        config = dict(install.EMBEDDING_CONFIGS["low_resource"])
-        install._apply_tier_overrides(
-            config,
-            code_pick="qwen3-embedding:0.6b",
-            kg_pick=config["text_model"],
-        )
-        self.assertIn("qwen3-embedding:0.6b", config["embedding_models"])
-
     def test_override_does_not_mutate_shared_profile(self):
-        # config is a SHALLOW copy of the module-level profile dict —
-        # the pull-list append must be copy-on-write.
-        before = list(install.EMBEDDING_CONFIGS["low_resource"]["embedding_models"])
+        # config is a SHALLOW copy of the module-level profile dict — the
+        # override must never write through to the shared profile.
+        before = dict(install.EMBEDDING_CONFIGS["low_resource"])
         config = dict(install.EMBEDDING_CONFIGS["low_resource"])
         install._apply_tier_overrides(
             config,
@@ -88,10 +76,14 @@ class ApplyTierOverridesTests(unittest.TestCase):
             kg_pick=config["text_model"],
         )
         self.assertEqual(
-            install.EMBEDDING_CONFIGS["low_resource"]["embedding_models"],
+            install.EMBEDDING_CONFIGS["low_resource"],
             before,
             "tier override must not mutate the shared EMBEDDING_CONFIGS profile",
         )
+        # v0.2.100: the pull list is no longer carried on the config — it is
+        # derived from the final code/text model by vco_lib.embedding_pull_plan
+        # (see tests/test_v02100_embedding_pull_plan.py for the exact sets).
+        self.assertNotIn("embedding_models", config)
 
     def test_noop_when_picks_match_stock(self):
         config = dict(install.EMBEDDING_CONFIGS["cpu"])
@@ -284,14 +276,18 @@ class RocmOverlayShipsTests(unittest.TestCase):
         self.assertIn("/dev/dri", body)
 
     def test_install_py_probes_short_name_first(self):
-        # Static parity guard: the candidate list ordering in
-        # _start_services must keep the canonical short name first so
-        # this new file (not the legacy amd-rocm overlay) is selected.
-        src = (REPO_ROOT / "install.py").read_text(encoding="utf-8")
-        podman_idx = src.find('"podman-compose.rocm.yml"')
-        legacy_idx = src.find('"podman-compose.amd-rocm.yml"')
-        self.assertGreater(podman_idx, 0)
-        self.assertGreater(legacy_idx, podman_idx)
+        # The overlay pick (v0.2.100: vco_lib.compose_provider, by the
+        # provider's label family) must keep the canonical short name first
+        # so this file (not the legacy amd-rocm overlay) is selected.
+        from vco_lib import compose_provider as cp  # noqa: PLC0415
+
+        for engine, stem in ((cp.ENGINE_PODMAN_COMPOSE, "podman-compose"),
+                             (cp.ENGINE_DOCKER_COMPOSE, "docker-compose")):
+            provider = cp.ComposeProvider(
+                "standalone", engine, (), "podman" if stem == "podman-compose" else "docker",
+                "podman")
+            self.assertEqual(cp.overlay_candidates(provider, "amd"),
+                             (f"{stem}.rocm.yml", f"{stem}.amd-rocm.yml"))
 
 
 if __name__ == "__main__":

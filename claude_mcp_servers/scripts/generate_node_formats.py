@@ -112,7 +112,10 @@ def get_available_models() -> list[str]:
         return [m["name"] for m in resp.json().get("models", [])]
     except requests.RequestException as e:
         print(f"ERROR: Cannot reach Ollama at {OLLAMA_URL}: {e}", file=sys.stderr)
-        print("Make sure Ollama is running: podman-compose up -d ollama", file=sys.stderr)
+        # v0.2.100 WP-18B: the detected runtime, never a literal `podman`.
+        from vco_lib.containers import runtime_command_hint
+        print(f"Make sure Ollama is running: {runtime_command_hint('start vco_ollama')}",
+              file=sys.stderr)
         sys.exit(1)
 
 

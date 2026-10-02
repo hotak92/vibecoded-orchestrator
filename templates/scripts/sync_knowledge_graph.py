@@ -343,6 +343,7 @@ from vco_lib import progress_event as _progress_event  # noqa: E402 — same imp
 # at all; `WeaviateWrapper.__init__` already reaches this same module lazily
 # for `connect_v4`.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
+from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # noqa: E402 — same import-order constraint as the group above
 
 # Try to import query logger.
 #
@@ -5877,7 +5878,8 @@ def _emit_sync_deferral_no_backend(install_root: Path, exc: Exception) -> None:
             ),
             command_to_apply=(
                 "# Restart embedding services then re-run the seed:\n"
-                "podman start vco_ollama vco_code_embed   # or: docker start ...\n"
+                # v0.2.100 WP-18B: the detected runtime, never a literal.
+                f"{_runtime_command_hint('start vco_ollama vco_code_embed')}\n"
                 "python templates/scripts/sync_knowledge_graph.py --all"
             ),
             severity="warning",

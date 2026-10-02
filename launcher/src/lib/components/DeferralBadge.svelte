@@ -26,6 +26,9 @@
   import { goto } from '$app/navigation';
   import { deferrals } from '$lib/stores/deferrals';
   import { badgeCount, ROOT_SCOPE_LABEL } from '$lib/deferral-ledger';
+  // v0.2.100 (WP-08, L3-F11): which pending actions the UPDATE badge resolves.
+  // One list, owned by the updater store.
+  import { updater, updateDeferralCount } from '$lib/stores/updater';
 
   let popoverOpen = $state(false);
   let wrapperEl = $state<HTMLDivElement | null>(null);
@@ -35,6 +38,22 @@
   // Renders only for REAL pending work. A ledger holding nothing but records
   // is not a nag — that tiering is the entire point of WP-B.
   const visible = $derived(rootLedger.loaded && count > 0);
+  // Of the counted (action_required) entries, how many are an unfinished
+  // orchestrator update / restart — the update badge (refresh arrows, same
+  // bar) is where those are resolved, so the popover says so instead of
+  // leaving two badges to look like two problems.
+  const updateCount = $derived(
+    updateDeferralCount(
+      (rootLedger.view?.entries ?? [])
+        .filter((e) => e.disposition === 'action_required')
+        .map((e) => e.condition_id),
+    ),
+  );
+  // Point at the update badge only while it is actually rendered (same
+  // visibility rule as UpdateBadge's `visible`).
+  const updateBadgeShown = $derived(
+    $updater.available && !$updater.dismissed && $updater.kind !== null,
+  );
 
   onMount(() => {
     void deferrals.refreshRoot();
@@ -98,6 +117,19 @@
           everything open — conditions VCO retries by itself are listed in the
           panel but never badged.
         </p>
+        {#if updateCount > 0}
+          <p class="dfb-desc" data-testid="dfb-update-pointer">
+            {updateCount === count ? (count === 1 ? 'It is' : 'They are') : `${updateCount} of them ${updateCount === 1 ? 'is' : 'are'}`}
+            an unfinished orchestrator update or launcher restart.
+            {#if updateBadgeShown}
+              Use the update badge (the circular-arrows icon next to this one)
+              to finish {updateCount === 1 ? 'it' : 'them'}; Review shows the
+              details.
+            {:else}
+              Review shows how to finish {updateCount === 1 ? 'it' : 'them'}.
+            {/if}
+          </p>
+        {/if}
         {#if rootLedger.view?.folder}
           <p class="dfb-folder"><code>{rootLedger.view.folder}</code></p>
         {/if}

@@ -22,8 +22,9 @@
 //!                               One-click resume after a rotation pause.
 //!    * `remove_secret_v2`     — DELETE the keychain value AND drop the
 //!                               active-state row. The entry is gone.
-//!    * `is_secret_set`        — true ONLY when keychain has a value AND
-//!                               active=true. Returns false for inactive.
+//!    * `get_secret_status_v2` — `is_set` is true ONLY when keychain has a
+//!                               value AND active=true (false for inactive);
+//!                               also carries `is_active`/`has_saved_value`.
 //!    * `get_secret_preview`   — masked preview ONLY when active=true.
 //!                               Returns Ok(None) for inactive, never
 //!                               leaks the canary.
@@ -355,7 +356,7 @@ pub async fn set_secret_v2(
 /// Unset (Lifecycle B): flip the entry to INACTIVE without touching the
 /// keychain value. The value stays in the OS keychain so a later
 /// `reactivate_secret_v2` can resume the entry without the user re-typing
-/// the value. While inactive, `is_secret_set` returns false and
+/// the value. While inactive, `get_secret_status_v2` returns false and
 /// `get_secret_preview` returns Ok(None) — the value cannot leak through
 /// the launcher's API.
 ///
@@ -397,7 +398,7 @@ pub async fn clear_secret_v2(
 ///
 /// If the keychain has no value (e.g. a user manually deleted it via the
 /// OS keychain UI while the launcher was inactive), this still flips the
-/// flag — the next `is_secret_set` will simply return false because the
+/// flag — the next `get_secret_status_v2` will simply return false because the
 /// keychain side is empty. The flag itself is independent of the value's
 /// existence; the read gate is `keychain_has_value AND active=true`.
 #[command]
@@ -694,7 +695,7 @@ pub struct StoreReport {
     /// `is_set` is the launcher's per-(secret × requester) permission gate,
     /// and this bulk opt-out is a different question with a different
     /// remedy; conflating them would silently widen the gate's meaning for
-    /// every reader that asks it (`is_secret_set`, the hub, module code).
+    /// every reader that asks it (`get_secret_status_v2`, the hub, module code).
     pub shared_read_disabled: bool,
     /// The requesting project holds `.no-shared-fallback`, so tier 2's
     /// `shared/` directory is not read for it either
@@ -838,7 +839,7 @@ fn file_store_project_name(db: &Db, scope: &str, project_id: &str) -> Option<Str
 }
 
 /// Combined status used by the secrets panel UI. `is_set` follows the
-/// same gate as `is_secret_set` (true ⇔ keychain has value AND
+/// same gate as `get_secret_status_v2` (true ⇔ keychain has value AND
 /// active=true). `has_saved_value` reports whether the keychain still
 /// has a value REGARDLESS of the active flag — the UI uses this to tell
 /// "newly added, never set" (no saved value) apart from "Unset, value
@@ -852,7 +853,7 @@ fn file_store_project_name(db: &Db, scope: &str, project_id: &str) -> Option<Str
 ///
 /// v0.3.0: `is_set` / `has_saved_value` keep their exact pre-existing
 /// meaning (KEYCHAIN truth × the launcher's active flag) so every reader
-/// that gates on them — including `is_secret_set`, which answers the
+/// that gates on them — including `get_secret_status_v2`, which answers the
 /// launcher's own permission matrix — is byte-identical. The store
 /// question the panel actually needs to answer is carried by the ADDED
 /// `stores` field, which reports both tiers honestly. Do not "simplify"
@@ -917,7 +918,7 @@ fn get_secret_status_impl(
 ) -> Result<SecretStatus, String> {
     enforce_scope_invariants(scope, project_id, db)?;
     // 0.1.7 H3 (2026-05-08): the `is_set` field is the same boolean
-    // contract as the `is_secret_set` command — readers (GUI badge,
+    // contract as the `get_secret_status_v2` command — readers (GUI badge,
     // any module testing presence) MUST see the cross-launcher view
     // so the GUI doesn't disagree with what subprocesses see. The
     // `is_active` field stays own-DB so the GUI can distinguish "this
@@ -964,49 +965,8 @@ fn get_secret_status_impl(
     })
 }
 
-/// True only when the keychain has a value AND the launcher's active
-/// flag is set. Returns false for inactive (Unset) entries even though
-/// the keychain still has the value — that is the read-time gate.
-///
-/// 0.1.7 H3 (2026-05-08): the active-flag check is the cross-launcher
-/// variant (Option γ), matching every other secret-reader path
-/// (Subagent D's `github_pat_from_keychain`, Subagent G's user-secret
-/// resolver, the hub's `project_env` resolver). Pre-H3 this used the
-/// own-DB-only `db.is_secret_active`, which let prod's GUI report
-/// "set" while every consumer (hub + env-file emit) saw "paused"
-/// because dev launcher had paused the secret. H3 closes the
-/// last asymmetry — the GUI's "Set" badge now agrees with what
-/// subprocesses actually see.
-#[command]
-pub async fn is_secret_set(
-    project_id: String,
-    module_id: String,
-    scope: String,
-    key: String,
-    db: State<'_, Db>,
-) -> Result<bool, String> {
-    enforce_scope_invariants(&scope, &project_id, &db)?;
-    // Read-time gate: an inactive entry MUST appear "not set" to the UI
-    // and to any module asking via this command. We check the gate FIRST
-    // to avoid an unnecessary keychain round-trip when the entry is
-    // paused.
-    // 0.2.1: per-requester gate. The caller is asking "is this secret
-    // set for THIS project right now?" — same project_id is the
-    // requester. For per_project scope, owner == requester so the
-    // semantics are identical to the legacy single-row gate; for
-    // shared/global, the requester drives a per-project pause check.
-    let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
-        &db, &scope, &project_id, &module_id, &key, &project_id,
-    );
-    if !active {
-        return Ok(false);
-    }
-    let scope_enum = scope_from_manifest(&scope, &project_id);
-    secrets::is_set(scope_enum, &module_id, &key)
-}
-
 /// Return a masked preview for NON-sensitive secrets only. For sensitive
-/// secrets, the caller should use `is_secret_set` and render a "••••••••"
+/// secrets, the caller should use `get_secret_status_v2` and render a "••••••••"
 /// placeholder in the UI without calling this command.
 ///
 /// Read-time gate (Bug 3): inactive entries return Ok(None) regardless
@@ -1032,11 +992,11 @@ pub async fn get_secret_preview(
     // signal until Reactivate.
     //
     // 0.1.7 H3 (2026-05-08): cross-launcher gate (Option γ). Symmetric
-    // with the hub's `project_env` resolver and `is_secret_set` so a
+    // with the hub's `project_env` resolver and `get_secret_status_v2` so a
     // pause anywhere takes effect everywhere — no GUI/consumer
-    // disagreement. See `is_secret_set` doc comment for the asymmetry
+    // disagreement. See `get_secret_status_v2` doc comment for the asymmetry
     // we're closing.
-    // 0.2.1: per-requester gate (same rule as is_secret_set). The
+    // 0.2.1: per-requester gate (same rule as get_secret_status_v2). The
     // preview path must agree with what `project_env` will actually
     // serve, so a per-project pause hides the masked preview too.
     let active = crate::db::secret_active::is_secret_active_cross_launcher_for_requester(
@@ -1050,62 +1010,8 @@ pub async fn get_secret_preview(
     Ok(val.map(|v| secrets::mask_preview(&v)))
 }
 
-// ─── Settings ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SettingEntry {
-    pub key: String,
-    pub value: serde_json::Value,
-}
-
-#[command]
-pub async fn get_setting_v2(
-    project_id: String,
-    module_id: String,
-    key: String,
-    db: State<'_, Db>,
-) -> Result<Option<serde_json::Value>, String> {
-    db.get_setting(&project_id, &module_id, &key)
-}
-
-/// Store one module setting for a project. R7b F2: this went straight to
-/// `Db::set_setting`, around the validator, the binding table (a setting whose
-/// value lives elsewhere is never stored a second time) and the install gate;
-/// it now takes the one write path, `module_settings_schema::write_module_setting`
-/// (through `module_gui::write_setting`, the body of `set_module_setting`).
-#[command]
-pub async fn set_setting_v2(
-    project_id: String,
-    module_id: String,
-    key: String,
-    value: serde_json::Value,
-    db: State<'_, Db>,
-) -> Result<(), String> {
-    set_setting_v2_body(&db, &project_id, &module_id, &key, &value)
-}
-
-fn set_setting_v2_body(
-    db: &Db,
-    project_id: &str,
-    module_id: &str,
-    key: &str,
-    value: &serde_json::Value,
-) -> Result<(), String> {
-    crate::commands::module_gui::write_setting(db, module_id, key, Some(project_id), value)
-}
-
-#[command]
-pub async fn list_module_settings_v2(
-    project_id: String,
-    module_id: String,
-    db: State<'_, Db>,
-) -> Result<Vec<SettingEntry>, String> {
-    let rows = db.list_module_settings(&project_id, &module_id)?;
-    Ok(rows
-        .into_iter()
-        .map(|(key, value)| SettingEntry { key, value })
-        .collect())
-}
+// Module settings (get/set/list) are served by `module_gui.rs`
+// (`get_module_setting` / `set_module_setting` / `list_module_settings`).
 
 // ─── 0.2.1 grants & per-requester pause commands ─────────────────────────
 //
@@ -1338,7 +1244,7 @@ pub struct UserSecretKeyRow {
     pub project_id: String,   // owner project_id (sentinel for shared/global)
     pub module_id: String,    // always "user" — kept for symmetry with other APIs
     pub key: String,
-    /// Same gate as `is_secret_set` — true ⇔ keychain has value AND
+    /// Same gate as `get_secret_status_v2` — true ⇔ keychain has value AND
     /// per-requester active flag (with this `project_id` as the requester
     /// for shared/global) is set.
     pub is_set: bool,
@@ -1746,27 +1652,28 @@ mod tests {
         Db(Mutex::new(conn))
     }
 
-    /// R7b F2: `set_setting_v2` goes through the one write path — an invalid
+    /// R7b F2: a module setting is written through the one write path
+    /// (`module_gui::write_setting`, the body of `set_module_setting`) — an invalid
     /// value for a declared setting, and a setting whose live value lives
     /// elsewhere (the project's KG binding), are refused and store nothing;
     /// a valid value is stored.
     #[test]
-    fn set_setting_v2_validates_and_honours_the_binding_table() {
+    fn write_setting_validates_and_honours_the_binding_table() {
         let db = make_db();
         db.insert_project("p-f2", "P", "/tmp/p-f2", crate::db::models::ProjectHost::Base, "p-f2")
             .unwrap();
         let (session, lines) = ("vct-session-state", "CONTEXT_STATE_MAX_LINES");
 
-        let err = set_setting_v2_body(&db, "p-f2", session, lines, &serde_json::json!("abc")).unwrap_err();
+        let err = crate::commands::module_gui::write_setting(&db, session, lines, Some("p-f2"), &serde_json::json!("abc")).unwrap_err();
         assert!(err.contains("whole number"), "{err}");
         assert_eq!(db.get_setting("p-f2", session, lines).unwrap(), None);
 
-        let err = set_setting_v2_body(&db, "p-f2", "vct-kg", "KG_COLLECTION", &serde_json::json!("X"))
+        let err = crate::commands::module_gui::write_setting(&db, "vct-kg", "KG_COLLECTION", Some("p-f2"), &serde_json::json!("X"))
             .unwrap_err();
         assert!(err.contains("not stored in module settings"), "{err}");
         assert_eq!(db.get_setting("p-f2", "vct-kg", "KG_COLLECTION").unwrap(), None);
 
-        set_setting_v2_body(&db, "p-f2", session, lines, &serde_json::json!(300)).unwrap();
+        crate::commands::module_gui::write_setting(&db, session, lines, Some("p-f2"), &serde_json::json!(300)).unwrap();
         assert_eq!(db.get_setting("p-f2", session, lines).unwrap(), Some(serde_json::json!(300)));
     }
 
@@ -2074,7 +1981,7 @@ mod tests {
             && secrets::is_set(scope_enum, module_id, &key).unwrap();
         assert!(
             !is_set_inactive,
-            "is_secret_set leaked an inactive entry as set"
+            "get_secret_status_v2 leaked an inactive entry as set"
         );
 
         // And the preview gate MUST return None (not even a masked form):
@@ -2161,7 +2068,7 @@ mod tests {
         assert!(!is_per_project_user_bucket("shared", "installer"));
     }
 
-    /// H3 (2026-05-08): `is_secret_set` / `get_secret_preview` /
+    /// H3 (2026-05-08): `get_secret_status_v2` / `get_secret_preview` /
     /// `get_secret_status_v2` ALL use the cross-launcher active-flag
     /// gate (Option γ). Pre-H3 the GUI-facing readers used
     /// `db.is_secret_active` (own DB only) while every other secret
@@ -3318,7 +3225,7 @@ mod tests {
             "the companion marker gates tier 2 for the same reader"
         );
         // The PERMISSION GATE is untouched, deliberately. `is_set` answers
-        // "may this requester read the keychain slot", which `is_secret_set`,
+        // "may this requester read the keychain slot", which `get_secret_status_v2`,
         // the hub and module code all ask; folding a bulk display policy
         // into it would silently widen that answer for every one of them.
         assert!(

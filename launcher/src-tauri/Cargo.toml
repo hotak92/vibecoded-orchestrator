@@ -18,7 +18,7 @@ members = ["vct-launcher-core", "vct-hub", "vct-updater"]
 # propagated from this same logical version by `scripts/bump-version.sh`
 # and verified by `scripts/pre-ship-check.sh`.
 [workspace.package]
-version = "0.2.99"
+version = "0.2.100"
 
 # v0.2.92 (WP-19): SINGLE source of truth for the `serde_json` feature set.
 #
@@ -189,8 +189,9 @@ base64 = "0.22"
 # `copy_recursive_sync` in commands/installer.rs to avoid propagating
 # machine-local files (state/, .claude/agents/, tools/vct-secrets/,
 # infrastructure/docker-compose.override.yml, etc.) when
-# `update_orchestrator_at` copies one orchestrator install over
-# another. Honors `.gitignore` + `.git/info/exclude` +
+# the copy install (`install_orchestrator` → copy_orchestrator_to_sync)
+# copies one orchestrator checkout into a new install folder (the
+# clone-to-clone `update_orchestrator_at` copy was retired in v0.2.100). Honors `.gitignore` + `.git/info/exclude` +
 # `core.excludesFile` + `.ignore` files via `WalkBuilder::standard_filters(true)`.
 # Drop-in for our previous blind directory walker.
 ignore = "0.4"

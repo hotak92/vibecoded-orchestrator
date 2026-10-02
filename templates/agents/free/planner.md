@@ -14,13 +14,6 @@ tools:
   - mcp__weaviate-kg__*
 model: sonnet
 effort: medium
-mcpServers:
-  orchestrator-tools:
-    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python
-    args:
-      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/orchestrator_tools_mcp/server.py
-    env:
-      PYTHONPATH: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers
 skills:
   - task-breakdown
   - architect

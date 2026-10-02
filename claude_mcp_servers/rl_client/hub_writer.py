@@ -12,6 +12,14 @@ Soft-fail discipline (locked decision 2026-06-04):
     - No retry queue. No JSONL fallback (the JSONL path is dead going
       forward; historical events come over via the one-shot migration
       script in claude_mcp_servers/scripts/migrate_rl_jsonl_to_db.py).
+    - v0.2.100 (F4): a lost event is VISIBLE. Every failure branch records
+      one line in the RL telemetry loss ledger
+      (``vco_lib.rl_telemetry_loss``, read by ``vco doctor``) and logs one
+      WARNING per failure reason per process. A REFUSED connection (the hub
+      restarting; the request never reached it) gets ONE bounded retry. A
+      reset does not (W5R-06: the hub may already have inserted the event,
+      and a retry would store it twice); nor does a timeout (retrying it
+      would double the caller's worst-case latency).
 
 Discovery:
     - Hub port: ``$VCT_HUB_PORT`` -> ``<vct_root>/hub.port`` -> 7700.
@@ -33,6 +41,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -150,7 +159,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
     Body schema (matches the hub's ``rl_events_api::PostEventBody``):
 
         {
-            "event_type":       "retrieval" | "citation",
+            "event_type":       "retrieval" | "citation" | outcome type,
             "schema_version":   int,
             "ts_ms":            int (unix epoch ms; writer-side time),
             "project_id":       str | null,
@@ -163,8 +172,10 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
             "payload_json":     str (the full v3 event JSON, verbatim)
         }
 
-    The hub validates ``event_type`` is one of {retrieval, citation} and
-    requires non-empty ``task_id`` + ``payload_json``. Caller is responsible
+    The hub validates ``event_type`` is one of the types its handler allows
+    (``retrieval``, ``citation`` and the V52-M outcome types ``bash_outcome``,
+    ``edit_outcome``, ``pre_bash`` — ``rl_events_api.rs``) and requires
+    non-empty ``task_id`` + ``payload_json``. Caller is responsible
     for providing those — a 400 from the hub is a writer bug, not a
     soft-fail-recoverable condition.
 
@@ -189,7 +200,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
 
     token = _read_hub_token()
     if token is None:
-        logger.debug("rl_events POST skipped: no hub.token (hub not running?)")
+        _record_post_loss(event, "hub_not_running")
         return False
 
     port = _read_hub_port()
@@ -198,10 +209,11 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
     try:
         body = json.dumps(event).encode("utf-8")
     except (TypeError, ValueError) as exc:
-        # Caller bug: event isn't JSON-serializable. Surface in debug
-        # but DON'T raise — we still return False so the caller's flow
-        # is uniform with the network-failure case.
+        # Caller bug: event isn't JSON-serializable. Recorded as a loss (the
+        # label is gone either way) but DON'T raise — we still return False
+        # so the caller's flow is uniform with the network-failure case.
         logger.debug("rl_events POST skipped: not JSON-serializable (%s)", exc)
+        _record_post_loss(event, "not_serializable")
         return False
 
     req = urllib.request.Request(
@@ -213,31 +225,82 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
             "Content-Type": "application/json",
         },
     )
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                if 200 <= resp.status < 300:
+                    return True
+                _record_post_loss(event, f"http_{resp.status}")
+                return False
+        except urllib.error.HTTPError as e:
+            # The hub returned a structured 4xx/5xx — the hub IS reachable but
+            # REJECTED this event, so the label is genuinely LOST. A 413 means
+            # the payload exceeded the 16 MiB axum body limit (raised from 2 MB
+            # by WP-Q; the explicit const lives in rl_events_api.rs). The
+            # client-side size guard in
+            # telemetry_writer._trim_event_to_payload_cap should keep events
+            # under it, so a 413 here signals a pathological event worth
+            # investigating; a 4xx/5xx otherwise signals a writer bug (e.g.
+            # unknown event_type). Not retried: the same body gets the same
+            # answer.
+            _record_post_loss(event, f"http_{e.code}")
+            return False
+        except urllib.error.URLError as e:
+            # Connect-REFUSED is the hub restarting (token on disk, listener
+            # not up yet, or a respawn in flight): ONE bounded retry after a
+            # short pause. Refused is the only case where the request provably
+            # never reached the hub. A RESET may arrive after the hub already
+            # committed the INSERT (rl_events has no uniqueness), so retrying it
+            # could store the event twice and bias training (v0.2.100 W5R-06):
+            # it is recorded as lost instead. Anything else (DNS, TLS, a timeout
+            # wrapped in URLError) is not retried either.
+            if attempt == 1 and isinstance(e.reason, ConnectionRefusedError):
+                time.sleep(_RETRY_PAUSE_S)
+                continue
+            _record_post_loss(event, _url_error_reason(e))
+            return False
+        except (OSError, TimeoutError) as exc:
+            _record_post_loss(
+                event, "timeout" if isinstance(exc, TimeoutError) else "os_error"
+            )
+            return False
+    return False  # pragma: no cover — the loop always returns
+
+
+#: Pause before the single retry of a refused connection. Small: the
+#: retry exists for a hub mid-restart, and the caller may be a latency-bounded
+#: hook.
+_RETRY_PAUSE_S = 0.2
+
+
+def _url_error_reason(e: "urllib.error.URLError") -> str:
+    """Short, stable reason tag for a URLError (no free text in the ledger)."""
+    r = getattr(e, "reason", None)
+    if isinstance(r, ConnectionRefusedError):
+        return "connection_refused"
+    if isinstance(r, ConnectionResetError):
+        return "connection_reset"
+    if isinstance(r, TimeoutError):
+        return "timeout"
+    return "url_error"
+
+
+def _record_post_loss(event: Any, reason: str) -> None:
+    """Record one lost RL event in the shared loss ledger. Never raises."""
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return 200 <= resp.status < 300
-    except urllib.error.HTTPError as e:
-        # The hub returned a structured 4xx/5xx — the hub IS reachable but
-        # REJECTED this event, so the label is genuinely LOST (unlike a
-        # hub-not-running URLError, which is the expected off state). Log at
-        # WARNING so the loss is visible (R2-11): a 413 means the payload
-        # exceeded the 16 MiB axum body limit (raised from 2 MB by WP-Q; the
-        # explicit const lives in rl_events_api.rs). The client-side size guard in
-        # telemetry_writer._trim_event_to_payload_cap should keep events under
-        # it, so a 413 here signals a pathological event worth investigating; a
-        # 4xx/5xx otherwise signals a writer bug (e.g. unknown event_type). The
-        # error body carries the envelope but reading it here defeats the
-        # no-raise contract on closed connections, and the soft-fail caller
-        # doesn't need it.
-        logger.warning("rl_events POST returned HTTP %s (event dropped)", e.code)
-        return False
-    except urllib.error.URLError as e:
-        # Connect-refused / DNS / TLS / etc. Most common: hub not running.
-        logger.debug("rl_events POST URL error: %s", e.reason)
-        return False
-    except (OSError, TimeoutError) as exc:
-        logger.debug("rl_events POST failed: %s", exc)
-        return False
+        from vco_lib.rl_telemetry_loss import KIND_HUB_POST_FAILED, record_loss
+
+        ev = event if isinstance(event, dict) else {}
+        record_loss(
+            KIND_HUB_POST_FAILED,
+            reason,
+            event_type=ev.get("event_type"),
+            task_type=ev.get("task_type"),
+            embedding_source=ev.get("embedding_source"),
+            task_id=ev.get("task_id"),
+        )
+    except Exception as exc:  # noqa: BLE001 — the loss record must not raise
+        logger.debug("rl_events POST loss could not be recorded (%s)", exc)
 
 
 def post_rl_prune(

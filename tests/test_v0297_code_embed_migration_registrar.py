@@ -51,8 +51,10 @@ def test_code_embed_migration_commits_without_a_second_registrar(
     monkeypatch.setattr(se, "_default_infra_env_writer",
                         lambda _infra, _rows: None)
     monkeypatch.setattr(se, "_default_reprojector", lambda _db: None)
+    # v0.2.100 R18-12: the chain's root re-render must not touch this checkout.
+    monkeypatch.setattr(se, "_default_root_rerenderer", lambda _r, _db: None)
     monkeypatch.setattr(se, "write_rows",
-                        lambda rows, db_path=None, now_ms=None: types.SimpleNamespace(
+                        lambda rows, db_path=None, now_ms=None, clear_mount=False: types.SimpleNamespace(
                             propagating=[r.service for r in rows]))
     monkeypatch.setattr(se, "load_rows", lambda db_path=None: {"code_embed": row})
 
@@ -93,8 +95,10 @@ def test_the_shims_commit_still_runs_the_rest_of_the_chain(
     monkeypatch.setattr(se, "_default_infra_env_writer",
                         lambda _infra, _rows: ran.append("infra_env"))
     monkeypatch.setattr(se, "_default_reprojector", lambda _db: ran.append("reproject"))
+    # v0.2.100 R18-12: the chain's root re-render must not touch this checkout.
+    monkeypatch.setattr(se, "_default_root_rerenderer", lambda _r, _db: None)
     monkeypatch.setattr(se, "write_rows",
-                        lambda rows, db_path=None, now_ms=None: types.SimpleNamespace(
+                        lambda rows, db_path=None, now_ms=None, clear_mount=False: types.SimpleNamespace(
                             propagating=["code_embed"]))
     monkeypatch.setattr(se, "load_rows", lambda db_path=None: {"code_embed": row})
 

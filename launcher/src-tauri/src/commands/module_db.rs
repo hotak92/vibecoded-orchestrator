@@ -9,15 +9,20 @@
 //!    report to the GUI. Used by the dashboard's "Repair module DB"
 //!    surface for when the install-time apply soft-failed.
 //!
-//! 2. `issue_module_access_token(module_id, project_id)` — issues a
-//!    fresh per-(module, project) shared secret for hub bearer auth.
-//!    Called by the launcher when starting a module container — the
-//!    secret is threaded into the container env as `VCT_MODULE_TOKEN`.
-//!    Persisted in `module_access_tokens` (migration 019) with a 1h
-//!    TTL. The container refreshes via the hub's
-//!    `POST /api/v1/modules/{id}/token/refresh` route before expiry.
+//! 2. [`get_or_issue_module_token`] — the ONE launcher-side issuer of the
+//!    per-(module, project) shared secret used as a bearer token for the
+//!    hub's module-DB REST surface. Reads `module_access_tokens`
+//!    (migration 019) and re-issues (1h TTL) when the row is missing or
+//!    within the refresh margin of expiry. Callers: `module_db_client`
+//!    (the RL widget's `module_db_read_row`) and `module_default_weights`
+//!    (the hub upsert after a global-weights download). The RL container
+//!    does NOT use these rows: it receives an in-memory identity token
+//!    minted by the hub (`vct-hub/src/module_identity.rs`).
 //!
-//! Both commands are soft-fail at the Tauri layer: a structured
+//! The retired `issue_module_access_token` Tauri command (v0.2.100) was a
+//! third, uncalled copy of the same upsert.
+//!
+//! The command here is soft-fail at the Tauri layer: a structured
 //! `Result<_, String>` carries the error message into the GUI without
 //! crashing the launcher.
 
@@ -47,14 +52,6 @@ pub const DEFAULT_TOKEN_TTL_MS: i64 = 60 * 60 * 1000;
 #[allow(dead_code)]
 pub const TOKEN_BYTES: usize = vct_launcher_core::services::boot_token::TOKEN_BYTES;
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct AccessTokenIssued {
-    pub module_id: String,
-    pub project_id: String,
-    pub token: String,
-    pub expires_at_ms: i64,
-}
-
 /// Manually apply module-shipped DB migrations for `module_id`.
 ///
 /// Looks up the module's install dir + parsed manifest via the
@@ -81,24 +78,44 @@ pub async fn apply_module_db_migrations(
     Ok(report)
 }
 
-/// Issue a fresh shared-secret access token for the
-/// (module_id, project_id) pair. Replaces any existing token for the
-/// same pair (caller is expected to thread the new value into the
-/// container's env on next start).
-///
-/// v0.2.31 ships with a per-install shared-secret pattern; v0.2.32
-/// migrates to JWT-signed claims with refresh tokens. The Tauri
-/// command shape stays the same.
-#[tauri::command]
-pub async fn issue_module_access_token(
-    db: State<'_, Db>,
-    module_id: String,
-    project_id: String,
-) -> Result<AccessTokenIssued, String> {
-    let secret = generate_token_hex().map_err(|e| format!("OS CSPRNG: {}", e))?;
-    let now = chrono::Utc::now().timestamp_millis();
-    let expires_at = now + DEFAULT_TOKEN_TTL_MS;
+/// Margin (ms) below the token's `expires_at` at which a cached token is
+/// re-issued rather than returned. Avoids racing the hub's expiry check on
+/// the very last millisecond. 60 s is generous; tokens have a 1-hour TTL.
+pub const TOKEN_REFRESH_MARGIN_MS: i64 = 60_000;
 
+/// Get a usable per-(module, project) bearer token: the cached
+/// `module_access_tokens` row while it is fresh, otherwise a newly
+/// generated secret upserted over it (same pair, so the old token stops
+/// working). The ONE implementation — `module_db_client` and
+/// `module_default_weights` both call it.
+pub fn get_or_issue_module_token(
+    db: &Db,
+    module_id: &str,
+    project_id: &str,
+) -> Result<String, String> {
+    let now = chrono::Utc::now().timestamp_millis();
+
+    let cached: Option<(String, i64)> = {
+        let guard = db.lock();
+        guard
+            .query_row(
+                "SELECT token_secret, expires_at FROM module_access_tokens \
+                 WHERE module_id = ?1 AND project_id = ?2",
+                rusqlite::params![module_id, project_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .ok()
+    };
+    if let Some((secret, expires_at)) = cached {
+        if expires_at > now + TOKEN_REFRESH_MARGIN_MS {
+            return Ok(secret);
+        }
+        // Near expiry: fall through to re-issue.
+    }
+
+    let secret = vct_launcher_core::services::boot_token::generate_token()
+        .map_err(|e| format!("OS CSPRNG: {}", e))?;
+    let expires_at = now + DEFAULT_TOKEN_TTL_MS;
     {
         let guard = db.lock();
         guard
@@ -110,17 +127,11 @@ pub async fn issue_module_access_token(
                     token_secret = excluded.token_secret, \
                     issued_at = excluded.issued_at, \
                     expires_at = excluded.expires_at",
-                rusqlite::params![&module_id, &project_id, &secret, now, expires_at],
+                rusqlite::params![module_id, project_id, &secret, now, expires_at],
             )
             .map_err(|e| format!("upsert module_access_tokens: {}", e))?;
     }
-
-    Ok(AccessTokenIssued {
-        module_id,
-        project_id,
-        token: secret,
-        expires_at_ms: expires_at,
-    })
+    Ok(secret)
 }
 
 // ─── Internals ──────────────────────────────────────────────────────────
@@ -153,30 +164,67 @@ fn resolve_manifest_and_install_dir(
     Ok((manifest, install_dir))
 }
 
-/// Generate a hex-encoded 32-byte random token from the OS CSPRNG.
-///
-/// v0.2.54 Track J amend: delegates to
-/// `vct_launcher_core::services::boot_token::generate_token` — the
-/// "future v0.2.32 refactor" predicted in the prior comment.
-fn generate_token_hex() -> Result<String, String> {
-    vct_launcher_core::services::boot_token::generate_token()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn token_hex_is_64_lowercase_hex_chars() {
-        let t = generate_token_hex().expect("rng ok");
-        assert_eq!(t.len(), TOKEN_BYTES * 2);
-        assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+    fn token_row(db: &Db, m: &str, p: &str) -> Option<(String, i64)> {
+        db.lock()
+            .query_row(
+                "SELECT token_secret, expires_at FROM module_access_tokens \
+                 WHERE module_id = ?1 AND project_id = ?2",
+                rusqlite::params![m, p],
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)),
+            )
+            .ok()
     }
 
     #[test]
-    fn two_calls_return_different_tokens() {
-        let t1 = generate_token_hex().expect("rng ok");
-        let t2 = generate_token_hex().expect("rng ok");
-        assert_ne!(t1, t2, "tokens must differ");
+    fn issues_a_64_hex_token_when_none_exists() {
+        let db = Db::open_in_memory().unwrap();
+        let t = get_or_issue_module_token(&db, "m", "p").expect("issue");
+        assert_eq!(t.len(), TOKEN_BYTES * 2);
+        assert!(t.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert_eq!(token_row(&db, "m", "p").unwrap().0, t, "the issued token is persisted");
+    }
+
+    /// Leave-alone: a fresh cached token is returned unchanged.
+    #[test]
+    fn a_fresh_token_is_reused_not_reissued() {
+        let db = Db::open_in_memory().unwrap();
+        let t1 = get_or_issue_module_token(&db, "m", "p").unwrap();
+        let t2 = get_or_issue_module_token(&db, "m", "p").unwrap();
+        assert_eq!(t1, t2);
+    }
+
+    /// Act: a token inside the refresh margin is replaced (same pair, one row).
+    #[test]
+    fn a_near_expiry_token_is_reissued_over_the_same_row() {
+        let db = Db::open_in_memory().unwrap();
+        let t1 = get_or_issue_module_token(&db, "m", "p").unwrap();
+        let near = chrono::Utc::now().timestamp_millis() + TOKEN_REFRESH_MARGIN_MS - 1_000;
+        db.lock()
+            .execute(
+                "UPDATE module_access_tokens SET expires_at = ?1 WHERE module_id='m' AND project_id='p'",
+                rusqlite::params![near],
+            )
+            .unwrap();
+        let t2 = get_or_issue_module_token(&db, "m", "p").unwrap();
+        assert_ne!(t1, t2, "tokens must differ after a re-issue");
+        let n: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM module_access_tokens", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1);
+        assert!(token_row(&db, "m", "p").unwrap().1 > near + TOKEN_REFRESH_MARGIN_MS);
+    }
+
+    /// Distinct pairs get distinct tokens.
+    #[test]
+    fn distinct_pairs_get_distinct_tokens() {
+        let db = Db::open_in_memory().unwrap();
+        let a = get_or_issue_module_token(&db, "m", "p1").unwrap();
+        let b = get_or_issue_module_token(&db, "m", "p2").unwrap();
+        assert_ne!(a, b);
     }
 }

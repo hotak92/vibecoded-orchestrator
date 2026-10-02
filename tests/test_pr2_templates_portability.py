@@ -182,10 +182,10 @@ class StaleOrchRootHealTests(unittest.TestCase):
             "---\n"
             "name: coder\n"
             "mcpServers:\n"
-            "  orchestrator-tools:\n"
-            "    command: {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/.venv/bin/python\n"
+            "  example-mcp:\n"
+            "    command: {{ORCHESTRATOR_ROOT}}/.venv/bin/python\n"
             "    args:\n"
-            "      - {{ORCHESTRATOR_ROOT}}/claude_mcp_servers/server.py\n"
+            "      - {{ORCHESTRATOR_ROOT}}/example_mcp/server.py\n"
             "---\n"
             "# Coder\n",
             encoding="utf-8",
@@ -548,37 +548,29 @@ class EnsureContainersHookTests(unittest.TestCase):
                 )
 
     def test_hook_compose_dir_prefers_infrastructure_over_legacy(self):
-        """`ensure-containers.sh` must look at the bundled
-        `<project>/infrastructure/` (where install copies the compose
-        file) BEFORE falling back to `<project>/claude_mcp_servers/`
-        (which only exists in the orchestrator clone).
-        """
-        text = self.HOOK_SH.read_text(encoding="utf-8")
-        # Inspect only non-comment lines so descriptive comments don't
-        # poison the ordering check (the resolution chain is documented
-        # in the file header before it's implemented).
-        code_lines = [
-            line for line in text.splitlines()
-            if line.strip() and not line.lstrip().startswith("#")
-        ]
-        # Find the FIRST code-line index that assigns COMPOSE_DIR from
-        # each of the two relative-to-REPO_ROOT roots.
-        def _first_index(needle: str) -> int:
-            for i, line in enumerate(code_lines):
-                if needle in line and "COMPOSE_DIR=" in line:
-                    return i
-            return -1
-        idx_infra = _first_index('REPO_ROOT/infrastructure"')
-        idx_legacy = _first_index('REPO_ROOT/claude_mcp_servers"')
-        self.assertGreaterEqual(idx_infra, 0,
-                                "no $REPO_ROOT/infrastructure assignment in "
-                                "ensure-containers.sh")
-        self.assertGreaterEqual(idx_legacy, 0,
-                                "no $REPO_ROOT/claude_mcp_servers fallback "
-                                "in ensure-containers.sh")
-        self.assertLess(idx_infra, idx_legacy,
-                        "infrastructure assignment must come BEFORE the "
-                        "claude_mcp_servers legacy fallback")
+        """The orchestrator's `infrastructure/` wins over its legacy
+        `claude_mcp_servers/` home. v0.2.100: the resolution is ONE shared
+        home, `_lib/compose-dir.sh` (sourced by ensure-containers.sh), driven
+        here for real on a clone that has both (its `vct-module.json` makes it
+        the orchestrator — L1-F17's root sentinel)."""
+        self.assertIn('_lib/compose-dir.sh"', self.HOOK_SH.read_text(encoding="utf-8"))
+        lib = self.HOOK_SH.parent / "_lib" / "compose-dir.sh"
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "infrastructure").mkdir()
+            (root / "claude_mcp_servers").mkdir()
+            (root / "vct-module.json").write_text('{"id": "orchestrator"}', encoding="utf-8")
+            env = {k: v for k, v in os.environ.items()
+                   if k not in ("VCT_COMPOSE_DIR", "VCT_INFRASTRUCTURE_DIR", "VCT_ORCHESTRATOR_ROOT")}
+            out = subprocess.run(
+                ["bash", "-c", f'. "{lib}"; vco_resolve_compose_dir "$1"; printf %s "$COMPOSE_DIR"',
+                 "x", str(root)], env=env, capture_output=True, text=True, timeout=30).stdout
+            self.assertEqual(out, str(root / "infrastructure"))
+            (root / "infrastructure").rmdir()
+            out = subprocess.run(
+                ["bash", "-c", f'. "{lib}"; vco_resolve_compose_dir "$1"; printf %s "$COMPOSE_DIR"',
+                 "x", str(root)], env=env, capture_output=True, text=True, timeout=30).stdout
+            self.assertEqual(out, str(root / "claude_mcp_servers"))
 
     def test_hook_honors_vct_orchestrator_root_env(self):
         text = self.HOOK_SH.read_text(encoding="utf-8")

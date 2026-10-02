@@ -113,6 +113,9 @@ class ServiceWorld:
         argv = list(argv)
         self.all_argv.append(argv)
         dest, spec = self.spec["dest"], self.spec
+        if argv[1:3] == ["compose", "version"]:
+            # v0.2.100: the compose PROVIDER is detected (the recovery's refine)
+            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
         if argv[-1] == "config":
             m = self._knob_mount()
             vol = ({"type": "bind", "source": m["source"], "target": dest} if m["kind"] == "bind"

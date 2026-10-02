@@ -181,6 +181,16 @@ function Invoke-DiffContextSection {
     Copy-Item -Path $LiveFile -Destination $SnapFile -Force
 }
 
+# v0.2.100 WP-17: the changed sections go through the shared injection cap
+# (_lib/emit-context.ps1 Limit-VcoHookContext). Claude Code shows the model
+# only a file path + a 2 000-character preview of hook output past 10 000
+# characters; this hook was over on 374 of 707 measured prompts. The cut ends
+# with a marker naming the file to Read. A missing helper (broken install)
+# injects uncapped rather than nothing. MUST MATCH diff-context-inject.sh.
+$EmitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+if (Test-Path -LiteralPath $EmitLib) { . $EmitLib }
+
+$DiffOut = & {
 # 1. The shared CONTEXT_STATE.md rollup (the original, unchanged behaviour).
 Invoke-DiffContextSection -LiveFile $ContextFile -SnapFile $SnapshotFile -Label "Context"
 
@@ -190,5 +200,11 @@ Invoke-DiffContextSection -LiveFile $ContextFile -SnapFile $SnapshotFile -Label 
 if (Test-Path $SessionContextFile) {
     Invoke-DiffContextSection -LiveFile $SessionContextFile -SnapFile $SessionSnapshotFile -Label "Session context"
 }
+}
+$DiffText = (@($DiffOut) | ForEach-Object { [string]$_ }) -join "`n"
+if ($DiffText -and (Get-Command Limit-VcoHookContext -ErrorAction SilentlyContinue)) {
+    $DiffText = Limit-VcoHookContext -Text $DiffText -Pointer "Read .claude/CONTEXT_STATE.md for the full changed sections."
+}
+if ($DiffText) { Write-Output $DiffText }
 
 exit 0

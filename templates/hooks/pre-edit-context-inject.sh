@@ -453,13 +453,16 @@ if [[ "$CACHE_HIT" == "1" ]]; then
 fi
 _cache_log miss
 
-# === Auto-detect project for multi-codebase support ===
-source "$SCRIPT_DIR/../scripts/detect-project.sh"
-DETECTED_PROJECT=$(detect_project_for_file "$FILE_PATH" "$PROJECT_ROOT")
+# === Code-graph identity: ALWAYS the calling project (v0.2.100 W5R-03) ===
+# No --project override, ever. The CLI resolves the CALLING project
+# (CLAUDE_PROJECT_DIR -> hub binding prefix, which also holds its extra paths)
+# and fans out over that project's own VCT_CODE_GRAPH_ACCESS_LIST grants. The
+# old detect-project.sh sibling-by-folder-name heuristic searched a neighbour
+# folder's code graph with no grant (cross-tenant leak) and skipped the
+# project's own prefix for files under its extra paths. A file in a GRANTED
+# peer is still covered: the grant puts that peer in the fan-out.
+# MUST MATCH pre-edit-context-inject.ps1.
 CODE_GRAPH_PROJECT_ARG=""
-if [[ -n "$DETECTED_PROJECT" ]]; then
-    CODE_GRAPH_PROJECT_ARG="--project $DETECTED_PROJECT"
-fi
 
 # === Build search query ===
 # BASENAME already computed above (needed by the cache-replay branch).
@@ -487,6 +490,21 @@ CODE_TMP=$(mktemp)
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
+# there (same roots as the venv above), never under $PROJECT_ROOT. It still
+# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
+# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path, so every existence check
+# below reads "not installed" exactly as before.
+RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
+export VCO_RL_TASK_TYPE="pre_edit_kg_search"
 
 # KG search with RL reranking — same pipeline as weaviate MCP (Weaviate → RL server → top-k)
 # Falls back to raw Weaviate order if RL server is unreachable.
@@ -533,7 +551,7 @@ if command -v vco_dual_search_cached >/dev/null 2>&1; then
     # ($12) threads to BOTH legs' --transcript flag inside the driver.
     if vco_dual_search_cached \
         "$KG_TMP" "$_DUAL_CG_OUT" "$VENV" \
-        "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" \
+        "$RL_SCRIPT" \
         "$QUERY" 1 "$CODE_GRAPH_PROJECT_ARG" 2 "$FILE_PATH" "$FILE_PATH" \
         "$PROMPT_ID" "$TRANSCRIPT_PATH"; then
         DUAL_DONE=1
@@ -546,14 +564,14 @@ if [[ "$DUAL_DONE" == "0" ]]; then
     # WP-E (v0.2.92): prompt_id/transcript_path as $5/$6 — same rationale as
     # the dual-search leg above.
     if command -v vco_kg_search_cached >/dev/null 2>&1; then
-        ( vco_kg_search_cached "$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
+        ( vco_kg_search_cached "$VENV" "$RL_SCRIPT" "$QUERY" 1 "$PROMPT_ID" "$TRANSCRIPT_PATH" > "$KG_TMP" 2>/dev/null ) &
         KG_PID=$!
     elif [ -n "$TRANSCRIPT_PATH" ]; then
-        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
+        ("$VENV" "$RL_SCRIPT" "$QUERY" --limit 1 --hook-format --transcript "$TRANSCRIPT_PATH" 2>/dev/null \
             | head -40 > "$KG_TMP") &
         KG_PID=$!
     else
-        ("$VENV" "$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py" "$QUERY" --limit 1 --hook-format 2>/dev/null \
+        ("$VENV" "$RL_SCRIPT" "$QUERY" --limit 1 --hook-format 2>/dev/null \
             | head -40 > "$KG_TMP") &
         KG_PID=$!
     fi

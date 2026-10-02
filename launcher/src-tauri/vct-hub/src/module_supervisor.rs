@@ -147,6 +147,38 @@ pub async fn start_container_for_module(
     start_container_for_module_with_gpu_mode(manifest, ctx, project, rl_port, gpu_mode, db).await
 }
 
+/// The pure, runtime-free part of a supervisor start (no container is
+/// touched): the run argv ([`vct_launcher_core::services::container_runtime::spawn_args_for_project`])
+/// and the name-clear claim — whether this DB records the module install,
+/// with the mounts its manifest records (R18F-06,
+/// [`vct_launcher_core::services::container_runtime::module_claim_for_start`]).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_start_args(
+    manifest: &ModuleManifest,
+    ctx: &PlaceholderCtx,
+    project: &ProjectRow,
+    rl_port: u16,
+    container_name: &str,
+    image: &str,
+    podman: &str,
+    gpu_mode: Option<GpuMode>,
+    db: &Db,
+) -> Result<
+    (
+        vct_launcher_core::services::container_runtime::SpawnArgs,
+        vct_launcher_core::services::container_runtime::ModuleClaim,
+    ),
+    String,
+> {
+    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+        manifest, ctx, project, rl_port, container_name, image, podman, gpu_mode, db,
+    )?;
+    let claimed = vct_launcher_core::services::container_runtime::module_claim_for_start(
+        db, manifest, ctx, project, rl_port,
+    );
+    Ok((spawn, claimed))
+}
+
 /// v0.2.47: explicit-GpuMode form of `start_container_for_module`.
 /// Used by the resume sweep when the manifest resolver injected at hub
 /// startup already knows the host's GpuMode. Mirrors the launcher's
@@ -187,10 +219,11 @@ pub async fn start_container_for_module_with_gpu_mode(
 
     // v0.2.97 (lane V): the run argv with the module's listed settings
     // (`-e KEY=VALUE`) and listed secrets (a bare `-e KEY`; the values only
-    // in this spawn's env, below). Built before the pre-pull and the `rm -f`
+    // in this spawn's env, below). Built before the pre-pull and the name clear
     // so a refused start — a required secret that did not resolve — leaves
-    // the running container alone.
-    let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
+    // the running container alone. The name-clear claim is read here too
+    // ([`prepare_start_args`]).
+    let (spawn, claimed) = prepare_start_args(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
 
@@ -228,12 +261,16 @@ pub async fn start_container_for_module_with_gpu_mode(
         }
     }
 
-    let _ = Command::new(&podman).silent()
-        .args(["rm", "-f", &container_name])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .await;
+    // v0.2.100 (W4R-01): replace a same-named container only when its
+    // launcher label says it is this install's, or it is unlabelled and this
+    // DB records the module install (the ≤0.2.99 upgrade path); another
+    // install's container refuses the start. One rule, shared with the
+    // launcher's `module_service` start. `claimed` (from
+    // [`prepare_start_args`]) carries the install's recorded mounts (R18F-06).
+    vct_launcher_core::services::container_runtime::clear_module_name_for_start(
+        &podman, &container_name, &claimed,
+    )
+    .await?;
 
     ensure_volume_host_dirs(manifest, ctx, rl_port, &project.slug).await;
 
@@ -511,8 +548,6 @@ async fn reap_pathological_containers_for_resume(
     db: &Db,
     resolve_manifest: &ManifestResolver,
 ) {
-    use std::collections::HashSet;
-
     let claimed = match db.list_module_installs_with_containers() {
         Ok(v) => v,
         Err(e) => {
@@ -523,9 +558,6 @@ async fn reap_pathological_containers_for_resume(
             return;
         }
     };
-    let claimed_names: HashSet<String> =
-        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
-
     let mut expected_map: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let gpu_mode = read_persisted_gpu_mode_for_supervisor();
@@ -548,14 +580,6 @@ async fn reap_pathological_containers_for_resume(
         }
     }
 
-    let prefixes: HashSet<String> = claimed
-        .iter()
-        .map(|(_pid, mid, _cn)| mid.clone())
-        .collect();
-    let name_filter = move |name: &str| -> bool {
-        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
-    };
-
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
@@ -567,22 +591,22 @@ async fn reap_pathological_containers_for_resume(
         }
     };
 
-    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
-    let (reaped, errors) =
-        vct_launcher_core::services::container_runtime::reap_pathological_containers(
-            &runtime,
-            &claimed_names,
-            expected_lookup,
-            name_filter,
-        )
-        .await;
-    if reaped > 0 || errors > 0 {
+    // v0.2.100 (WP-06, L2-F17): the ONE reaper pass (core) — module-name
+    // filter AND the DB verdict AND this install's launcher label.
+    let report = vct_launcher_core::services::container_runtime::reap_module_containers(
+        &runtime,
+        &claimed,
+        expected_map,
+    )
+    .await;
+    if report.reaped > 0 || report.errors > 0 {
         tracing::info!(
-            reaped,
-            errors,
+            reaped = report.reaped,
+            errors = report.errors,
             "[module_supervisor] V52-D.2 reaper: pass complete"
         );
     }
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules_off_runtime(report.unlabelled.clone()).await;
 }
 
 /// Test-friendly variant of [`resume_containers_on_startup`] that takes
@@ -1963,6 +1987,46 @@ mod tests {
         let p2 = container_weights_path("../../etc", "passwd");
         assert!(p2.starts_with("/data/state/"));
         assert!(!p2.contains("../"));
+    }
+
+    /// v0.2.100 (R18F-06): the supervisor start's claim carries the module
+    /// install's recorded mounts (the manifest's volumes) when this DB
+    /// records the install, and nothing when it does not.
+    #[test]
+    fn prepare_start_args_carries_the_claimed_installs_recorded_mounts() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let manifest = make_manifest(true, true);
+        assert!(!manifest.runtime.volumes.is_empty(), "precondition: the manifest mounts something");
+        let db = Db::open_in_memory().expect("DB");
+        {
+            use rusqlite::params;
+            let now = chrono::Utc::now().timestamp_millis();
+            db.lock()
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES (?1, 'acme', '/tmp/acme', 'base', 'acme-corp', ?2, ?2)",
+                    params!["proj-uuid", now],
+                )
+                .expect("insert project");
+        }
+        let project = make_project();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let prep = |db: &Db| {
+            prepare_start_args(&manifest, &ctx, &project, 11533, "vct-rl-reranker-acme-corp", "img:1", "podman", None, db)
+                .unwrap()
+                .1
+        };
+
+        let unclaimed = prep(&db);
+        assert!(!unclaimed.claimed && unclaimed.recorded_mounts.is_empty());
+
+        db.insert_module_install("install-r18f06", "proj-uuid", &manifest.id, "0.1.0", "/tmp/r18f06").unwrap();
+        let claim = prep(&db);
+        assert!(claim.claimed);
+        let dests: Vec<&str> = claim.recorded_mounts.iter().map(|m| m.destination.as_str()).collect();
+        let want: Vec<&str> = manifest.runtime.volumes.iter().map(|v| v.container.as_str()).collect();
+        assert_eq!(dests, want);
     }
 
     #[test]

@@ -617,19 +617,14 @@
   {#snippet footer()}
     {#if phase === 'confirm'}
       <button class="btn-ghost" onclick={close}>Cancel</button>
-      <!-- P2-I1 (v0.2.91 wave 5): this button calls `update_all_projects`
-           (projects_v2.rs) — the manifest-driven bundle reconcile that runs
-           for every REGISTERED project regardless of whether its folder is
-           an orchestrator clone. It is a DIFFERENT operation from
-           MenuBar's "Update N orchestrator clone(s)", which calls
-           `update_orchestrator_at` (a git-clone refresh gated to
-           clone-shaped folders only). The VCO-clone-gate comment inside
-           `installer.rs::update_orchestrator_at` names this boundary
-           explicitly (cited by symbol, not line: the v0.2.91 single-flight
-           guard moved it, and a line citation rots on every edit above it)
-           — do NOT merge these two code paths; "project
-           bundle(s)" below is deliberately worded to not collide with
-           MenuBar's label. -->
+      <!-- This button calls `update_all_projects` (projects_v2.rs) — the
+           manifest-driven bundle reconcile that runs for every REGISTERED
+           project. It updates project BUNDLES (hooks/scripts/agents/skills),
+           never an orchestrator install: the orchestrator is updated by the
+           update badge / Preferences → Updates (`run_orchestrator_update`),
+           and a second VCO install from its own launcher (v0.2.100, owner Q1
+           retired the file-copy "orchestrator clone" update). "project
+           bundle(s)" below says exactly that. -->
       <button class="btn-primary" onclick={runUpdateAll} disabled={projectCount === 0}>
         Update {projectCount} project bundle{projectCount === 1 ? '' : 's'}
       </button>

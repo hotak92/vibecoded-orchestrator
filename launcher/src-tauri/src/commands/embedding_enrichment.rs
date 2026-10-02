@@ -320,13 +320,8 @@ async fn run_enrichment_with_stream(
             String::new()
         };
         return Err(format!(
-            "enrichment exit {}: {}",
-            status.code().unwrap_or(-1),
-            if stderr_text.is_empty() {
-                "no stderr"
-            } else {
-                stderr_text.as_str()
-            }
+            "enrichment failed: {}",
+            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole)
         ));
     }
 

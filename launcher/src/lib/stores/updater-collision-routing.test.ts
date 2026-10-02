@@ -1,19 +1,20 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 //
-// v0.2.88 (DEFECT 1 + 2 + 3): tests for the updater store's `runUpdate()`
+// v0.2.88 (DEFECT 1 + 2 + 3): tests for the updater store's update-run
+// (v0.2.100: `run('PullFf')`, which replaced `runUpdate()`)
 // error routing. The inline update pull can now fail with THREE structured,
-// actionable events; `runUpdate()` must route each to its own store field
+// actionable events; the run must route each to its own store field
 // (untrackedCollision / autostashPop) instead of a dead-end raw error, and must
 // re-check status after any resume-style honest error so the badge re-shows.
 //
 // Contract under test:
-//   - update_orchestrator rejects with `orchestrator_untracked_collision`
+//   - run_orchestrator_update rejects with `orchestrator_untracked_collision`
 //     (resolvable) ⇒ store.untrackedCollision is set, error is null.
-//   - update_orchestrator rejects with `orchestrator_autostash_pop_conflict`
+//   - run_orchestrator_update rejects with `orchestrator_autostash_pop_conflict`
 //     ⇒ store.autostashPop is set, error is null.
-//   - update_orchestrator rejects with `orchestrator_update_non_ff`
+//   - run_orchestrator_update rejects with `orchestrator_update_non_ff`
 //     ⇒ store.nonFf is set (unchanged behavior; regression guard).
-//   - update_orchestrator rejects with a plain (non-JSON) error
+//   - run_orchestrator_update rejects with a plain (non-JSON) error
 //     ⇒ store.error is the raw string, all three payload fields null.
 
 import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -63,7 +64,7 @@ const orchStore = writable<OrchValue>({
   lastCheckFailed: null,
 });
 
-// update_orchestrator is the call runUpdate() awaits. We control its rejection
+// orchestrator.runUpdate is the call run() awaits. We control its rejection
 // per-test to exercise the routing.
 let updateOrchestratorReject: unknown = null;
 const updateOrchestratorMock = vi.fn(async () => {
@@ -86,8 +87,8 @@ vi.mock('./orchestrator', () => ({
   orchestrator: {
     subscribe: orchStore.subscribe,
     checkStatus: checkStatusMock,
-    update_orchestrator: updateOrchestratorMock,
-    // v0.2.93: runUpdate() now brackets itself with beginOp(), which resets
+    runUpdate: updateOrchestratorMock,
+    // v0.2.93: the run brackets itself with beginOp(), which resets
     // the orchestrator's progress snapshot before opening the overlay.
     resetProgress: vi.fn(),
   },
@@ -117,7 +118,7 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe('runUpdate() error routing (v0.2.88)', () => {
+describe('run(PullFf) error routing (v0.2.88)', () => {
   it('routes an untracked-collision payload to store.untrackedCollision', async () => {
     updateOrchestratorReject = JSON.stringify({
       event: 'orchestrator_untracked_collision',
@@ -129,7 +130,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
       git_stderr: 'error: The following untracked working tree files...',
     });
 
-    await updater.runUpdate();
+    await updater.run('PullFf');
 
     const s = get(updater);
     expect(s.untrackedCollision).not.toBeNull();
@@ -150,7 +151,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
       git_stderr: "Merge made by the 'ort' strategy.\nApplying autostash resulted in conflicts.",
     });
 
-    await updater.runUpdate();
+    await updater.run('PullFf');
 
     const s = get(updater);
     expect(s.autostashPop).not.toBeNull();
@@ -171,7 +172,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
       git_stderr: 'Not possible to fast-forward',
     });
 
-    await updater.runUpdate();
+    await updater.run('PullFf');
 
     const s = get(updater);
     expect(s.nonFf).not.toBeNull();
@@ -184,7 +185,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
   it('surfaces a plain non-JSON error as store.error with all payload fields null', async () => {
     updateOrchestratorReject = 'git pull failed: could not resolve host';
 
-    await updater.runUpdate();
+    await updater.run('PullFf');
 
     const s = get(updater);
     expect(s.error).toContain('could not resolve host');
@@ -202,7 +203,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
       identical_files: [],
       divergent_files: ['docs/SPEC.md'],
     });
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).untrackedCollision).not.toBeNull();
     updater.dismissUntrackedCollision();
     expect(get(updater).untrackedCollision).toBeNull();
@@ -213,7 +214,7 @@ describe('runUpdate() error routing (v0.2.88)', () => {
       conflicted_files: ['a'],
       git_stderr: '',
     });
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).autostashPop).not.toBeNull();
     updater.dismissAutostashPop();
     expect(get(updater).autostashPop).toBeNull();

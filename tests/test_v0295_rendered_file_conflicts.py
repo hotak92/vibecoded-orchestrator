@@ -56,7 +56,7 @@ from vco_lib.deferral_report import DeferralReport  # noqa: E402
 
 MERGE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/git_user_editable_merge.rs"
 SELF_UPDATE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/self_update.rs"
-INSTALLER_RS = REPO_ROOT / "launcher/src-tauri/src/commands/installer.rs"
+UPDATE_RUN_RS = REPO_ROOT / "launcher/src-tauri/src/commands/update_run.rs"
 # v0.2.95 phase 2: the pull sequence BOTH update surfaces run, and therefore
 # the one place the A0 pre-merge (and with it the rendered reconcile) is wired.
 UPDATE_PIPELINE_RS = REPO_ROOT / "launcher/src-tauri/src/commands/update_pipeline.rs"
@@ -186,7 +186,8 @@ class TestCrossLanguageLockstep(unittest.TestCase):
         )
 
     def test_both_update_surfaces_reach_the_same_reconcile(self) -> None:
-        """Both update surfaces must reach the rendered reconcile.
+        """The orchestrator update must reach the rendered reconcile (there
+        were two update surfaces until v0.2.100; WP-03b left one pipeline).
 
         v0.2.95 phase 2 — the property is unchanged; the WAY the launcher
         self-update surface satisfies it is not. It used to have no A0 step and
@@ -225,18 +226,29 @@ class TestCrossLanguageLockstep(unittest.TestCase):
             pipeline_src,
             "the shared update pipeline must run the A0 pre-merge",
         )
-        # … and BOTH surfaces pull through that pipeline, which is how they
-        # reach it. `installer::update_orchestrator` and
-        # `self_update::apply_launcher_update` each call it exactly once.
-        for name, src in (
-            ("installer.rs", read_rust_code(INSTALLER_RS)),
-            ("self_update.rs", self_update_src),
-        ):
+        # … and the ONE update pipeline reaches it for the git operations that
+        # merge upstream into the clone. RETARGETED v0.2.100 (WP-03b): the two
+        # surfaces (`installer::update_orchestrator`,
+        # `self_update::apply_launcher_update`) are gone; `run_orchestrator_
+        # update`'s live git op routes `PullFf` to `pull_to_upstream` (→
+        # `reconcile_and_pull`) and `Merge` to `merge_upstream`, and each of
+        # those runs the A0 pre-merge.
+        run_src = read_rust_code(UPDATE_RUN_RS)
+        live = run_src[run_src.index("impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {") :]
+        git_op = live[live.index("    fn git_op(") :]
+        git_op = git_op[: git_op.index("\n    }\n")]
+        self.assertIn("pull_ff_git_op(", git_op)
+        self.assertIn("recovery_git_op(", git_op)
+        self.assertIn("pipeline::merge_upstream(", run_src)
+        self.assertIn("update_pipeline::pull_to_upstream(", run_src)
+        for fn in ("async fn reconcile_and_pull(", "pub(crate) async fn merge_upstream("):
+            start = pipeline_src.index(fn)
+            body = pipeline_src[start : pipeline_src.index("\n}\n", start)]
             self.assertIn(
-                "prepare_and_pull_orchestrator_repo(",
-                src,
-                f"{name}'s update surface must pull through the shared pipeline — "
-                "that is how it reaches the rendered reconcile",
+                "run_pre_merge_user_editable(",
+                body,
+                f"`{fn}` must run the A0 pre-merge — that is how the update "
+                "reaches the rendered reconcile",
             )
         # And the launcher surface must not keep a second, divergent entry
         # point into the same class.
@@ -338,20 +350,45 @@ class TestRendererIsTableDriven(_RendererCase):
         self.assertIn("Keep this line", body, "user text ABOVE the markers must survive")
         self.assertIn("Also only here", body, "user text BELOW the markers must survive")
 
-    def test_a_template_the_renderer_cannot_substitute_writes_nothing(self) -> None:
-        # A table entry naming an unknown placeholder must fail that entry
-        # loudly rather than write a file with a literal {{NAME}} in it.
+    def test_a_placeholder_the_renderer_cannot_fill_is_loud_but_never_fatal(self) -> None:
+        # Retargeted by the v0.2.100 owner rule (2026-09-30): an unknown or
+        # unresolvable placeholder must NOT fail the materialization. The claim
+        # this test always made — a gap is LOUD, never silent — now holds as:
+        # the file is written with the token left in place, the outcome is a
+        # warn-level result naming the name, a stderr warning is printed, and
+        # a registered deferral row names file + placeholder + line.
+        from vco_lib import materialize
+
+        self.template.write_text(
+            TEMPLATE_V1.replace("AUTO body v1", "AUTO body v1 {{NO_SUCH_PLACEHOLDER}}"),
+            encoding="utf-8",
+        )
         bogus = rrf.RenderedRootFile(
             path="CLAUDE.md",
             template="templates/ORCHESTRATOR-CLAUDE.md.template",
             begin_marker="<!-- BEGIN: AUTO",
             end_marker="<!-- END: AUTO -->",
-            substitutions=("NO_SUCH_PLACEHOLDER",),
+            substitutions=("ORCHESTRATOR_ROOT", "NO_SUCH_PLACEHOLDER"),
         )
-        outcome = rrf.render_entry(self.root, bogus)
-        self.assertEqual(outcome.status, "unknown_substitution")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            outcome = rrf.render_entry(self.root, bogus)
+        self.assertTrue(outcome.is_failure, "a left token is a warn-level outcome")
         self.assertIn("NO_SUCH_PLACEHOLDER", outcome.detail)
-        self.assertFalse((self.root / "CLAUDE.md").exists(), "nothing may be written")
+        self.assertIn("NO_SUCH_PLACEHOLDER", err.getvalue(), "stderr warning")
+        body = (self.root / "CLAUDE.md").read_text(encoding="utf-8")
+        self.assertIn("{{NO_SUCH_PLACEHOLDER}}", body, "written WITH the token")
+        self.assertIn(str(self.root), body, "the fillable names still rendered")
+        cid = materialize.unrendered_condition_id("CLAUDE.md")
+        report = DeferralReport.read(self.root)
+        self.assertTrue(report.has_condition(cid), report.entries)
+        self.assertIn("NO_SUCH_PLACEHOLDER", report.entry_for(cid).detected)
+        # A later CLEAN render clears it (paired resolution).
+        self.template.write_text(TEMPLATE_V1, encoding="utf-8")
+        with contextlib.redirect_stderr(io.StringIO()):
+            clean = rrf.render_entry(self.root, bogus)
+        self.assertFalse(clean.is_failure)
+        self.assertFalse(DeferralReport.read(self.root).has_condition(cid))
 
 
 class TestDeferralEmission(_RendererCase):

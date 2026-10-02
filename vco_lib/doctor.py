@@ -217,8 +217,10 @@ CID_GATEWAY_UNRUNNABLE = "gateway_registered_but_unrunnable"
 #: that this install's ``.claude/.vco-manifest.json`` — written ONLY by the
 #: bundle engine — does not corroborate. The v0.2.95 surface map's H1/H2/H3:
 #: the launcher's ``apply_launcher_update`` / ``force_resync_launcher`` /
-#: ``update_orchestrator_at`` each advance the source and refresh the marker
-#: without running install.py, so ``installed: true`` at the NEW version is
+#: ``update_orchestrator_at`` each advanced the source and refreshed the marker
+#: without running install.py (all three retired in v0.2.100 — the one update
+#: pipeline always runs install.py; the probe stays for installs a launcher
+#: ≤ 0.2.99 left in that state), so ``installed: true`` at the NEW version is
 #: written over a venv/hooks/templates/MCP/KG/schema set still at the old one.
 #: Registered ``action_required`` + install-owned (the ``vco_lib_shadowed``
 #: precedent): the exit is an install/update run, which rewrites BOTH records
@@ -425,6 +427,49 @@ class DoctorResolvers:
     #: () -> the environment the retired-endpoint-env probe judges. Defaults
     #: to this process's ``os.environ``; injected so a test describes it.
     environ: Optional[Callable[[], Any]] = None
+    #: (since_ms) -> :func:`vco_lib.rl_telemetry_loss.summarize` payload, or
+    #: None when the ledger could not be read. Injected so the RL-loss probe
+    #: is driven from a described ledger, no filesystem.
+    rl_loss_summary: Optional[Callable[[int], Optional[dict]]] = None
+    #: (folder) -> :func:`vco_lib.module_gated_delivery.check_agent_model_ids`
+    #: problems for the definitions Claude Code reads for ``folder``, or None
+    #: when the gateway registry is not importable. Injected so the agent-id
+    #: probe is driven from described definitions, no filesystem.
+    agent_id_problems: Optional[Callable[[Path], Optional[list]]] = None
+
+    def resolve_agent_id_problems(self, folder: Path) -> Optional[list]:
+        """Agent definitions naming a gateway model id the router does not know.
+
+        Composes :func:`vco_lib.module_gated_delivery.check_agent_model_ids` —
+        the router's own validation, the ONE home the launcher's gate payload
+        also reads — over :func:`agent_definition_dirs` (the project's
+        ``.claude/agents`` and the user's ``~/.claude/agents``). ``None`` when
+        the gateway package is not importable: no registry, no verdict.
+        """
+        if self.agent_id_problems is not None:
+            return self.agent_id_problems(folder)
+        from vco_lib import module_gated_delivery as mgd  # noqa: PLC0415
+
+        try:
+            return mgd.check_agent_model_ids(mgd.agent_definition_dirs(folder))
+        except ImportError:
+            return None
+
+    def resolve_rl_loss_summary(self, since_ms: int) -> Optional[dict]:
+        """The RL telemetry loss ledger, summarised since ``since_ms``.
+
+        Composes :func:`vco_lib.rl_telemetry_loss.summarize` — the ledger's
+        ONE reader. Soft-fail: an unreadable ledger is ``None`` (the probe
+        renders ``unknown``), never "no losses".
+        """
+        if self.rl_loss_summary is not None:
+            return self.rl_loss_summary(since_ms)
+        from vco_lib import rl_telemetry_loss  # noqa: PLC0415
+
+        try:
+            return rl_telemetry_loss.summarize(since_ms=since_ms)
+        except Exception:  # noqa: BLE001 — could not look is not a verdict
+            return None
 
     def resolve_former_launcher_cli(self) -> list:
         """Copies of the launcher CLI under a former name reachable on PATH.
@@ -1145,6 +1190,90 @@ def probe_summary_pending(folder: Path, res: DoctorResolvers, ctx: dict) -> list
                 "kg_missing": kg_missing,
                 "code_stale": code_stale,
                 "condition_live": live,
+            },
+        )
+    ]
+
+
+#: Window the RL-loss probe counts over. A week covers "since I last looked"
+#: without letting one long-gone hub outage read as a current problem.
+RL_LOSS_WINDOW_DAYS = 7
+
+
+def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """How many RL training events were lost recently, and why (v0.2.100 F1/F4).
+
+    Standing rule: RL is optional, but its training logs are ALWAYS collected.
+    Losses are recorded by their writers in the RL telemetry loss ledger
+    (:mod:`vco_lib.rl_telemetry_loss`): a vct-hub POST that did not land
+    (``hub_post_failed``), a dual-log twin that was wanted but not produced
+    (``dual_skip``), or a twin written with fewer nodes than its primary
+    (``dual_partial``, reported apart: no event was lost). This probe is that
+    ledger's surface. Blind spot, stated in the summary: a hook search killed
+    by its harness timeout before sending records nothing (since W5R-07 the
+    sends happen after the output, in a detached child, so this is rare).
+
+    Informational (``ok``) with the counts in the summary: no single loss is a
+    machine defect to fix — a hub that was down for an hour, a cold secondary
+    model — but a count that keeps growing is the signal, and before this
+    probe nothing showed it at all. ``unknown`` when the ledger is unreadable.
+    ``full`` scope only (a file read whose answer matters at review time, not
+    at boot).
+    """
+    import time as _time  # noqa: PLC0415
+
+    since_ms = int((_time.time() - RL_LOSS_WINDOW_DAYS * 86400) * 1000)
+    summary = res.resolve_rl_loss_summary(since_ms)
+    if not isinstance(summary, dict):
+        return [
+            Finding(
+                probe="rl_telemetry_loss",
+                status=STATUS_UNKNOWN,
+                summary="the RL telemetry loss ledger could not be read",
+            )
+        ]
+    total = int(summary.get("total") or 0)
+    by_kind = summary.get("by_kind") or {}
+    partial = int(summary.get("partial_twins") or 0)
+    missing_nodes = int(summary.get("partial_missing_nodes") or 0)
+    if total == 0:
+        text = f"no RL training events lost in the last {RL_LOSS_WINDOW_DAYS} days"
+    else:
+        parts = []
+        for kind in sorted(by_kind):
+            reasons = by_kind[kind] or {}
+            detail = ", ".join(f"{r} x{n}" for r, n in sorted(reasons.items()))
+            parts.append(f"{kind}: {detail}")
+        text = (
+            f"{total} RL training event(s) lost in the last "
+            f"{RL_LOSS_WINDOW_DAYS} days ({'; '.join(parts)})"
+        )
+    if partial:
+        # W5R-08: a twin written with fewer nodes than its primary.
+        text += (
+            f"; {partial} dual-log twin(s) partial ({missing_nodes} node(s) "
+            "had no vector for the other slot)"
+        )
+    # The one loss no writer can record: a hook search killed by its own
+    # timeout before it sent anything. Say so, so a quiet ledger is not read
+    # as proof of zero loss.
+    text += (
+        "; not counted: a hook search killed by its timeout before sending "
+        "(it records nothing)"
+    )
+    return [
+        Finding(
+            probe="rl_telemetry_loss",
+            status=STATUS_OK,
+            summary=text,
+            detail={
+                "window_days": RL_LOSS_WINDOW_DAYS,
+                "total": total,
+                "by_kind": by_kind,
+                "last_ts_ms": summary.get("last_ts_ms"),
+                "partial_twins": partial,
+                "partial_missing_nodes": missing_nodes,
+                "not_counted": "hook search killed by its timeout before sending",
             },
         )
     ]
@@ -2431,7 +2560,7 @@ def collect_source_facts(folder: Path, *, ask_remote: bool = True) -> SourceFact
     currency verdict built from it can then never be ``ok``: a local
     remote-tracking ref carries no evidence of WHEN it was last updated, and
     the launcher's own fetch passes ``--no-write-fetch-head``
-    (``self_update.rs::serialized_fetch_upstream``), so not even
+    (``upstream_fetch.rs::serialized_fetch_upstream``), so not even
     ``FETCH_HEAD``'s mtime answers it. Reporting "level with
     ``vco_upstream/main``" off a ref last written five weeks ago would be a
     fresh instance of the exact defect this probe exists to catch, so the
@@ -3026,8 +3155,8 @@ def probe_last_update_run(folder: Path, res: DoctorResolvers, ctx: dict) -> list
 INSTALL_MANIFEST_REL = ("state", "install-manifest.json")
 
 #: ``install_method`` values only the RUST writer
-#: (``launcher/src-tauri/src/commands/manifest.rs::refresh_install_manifest``)
-#: produces. install.py's own writer spells ``install.py`` / ``update`` /
+#: (``manifest.rs::refresh_install_manifest``, launchers ≤ 0.2.99; retired in
+#: v0.2.100) produced. install.py's own writer spells ``install.py`` / ``update`` /
 #: ``lightweight``, so seeing one of these means the LAST hand on the marker
 #: was a path that never ran install.py. Carried in the summary as the
 #: EXPLANATION; never the conviction on its own — a resync that pulled nothing
@@ -3071,6 +3200,11 @@ def probe_install_completeness(
     folder: Path, res: DoctorResolvers, ctx: dict
 ) -> list[Finding]:
     """Does ``install-manifest.json``'s claim rest on an installer run?
+
+    v0.2.100: the three launcher paths below and their Rust manifest writer
+    are retired — the one update pipeline always runs install.py — so no
+    CURRENT launcher produces this state. The probe stays for installs a
+    launcher ≤ 0.2.99 left in it; the history below is why it looks as it does.
 
     The state this exists for (the v0.2.95 surface map's H1/H2/H3): the
     launcher's ``apply_launcher_update`` / ``force_resync_launcher`` advance
@@ -4138,6 +4272,54 @@ def probe_retired_endpoint_env(folder: Path, res: DoctorResolvers, ctx: dict) ->
     )]
 
 
+def probe_agent_model_ids(folder: Path, res: DoctorResolvers, ctx: dict) -> list[Finding]:
+    """Does every agent definition name a gateway model id the router knows?
+
+    F-W1-11a / F-W3-05: a hand-written definition (the project's
+    ``.claude/agents`` or the user's ``~/.claude/agents``) whose ``model:``
+    is a mistyped ``claude-gw/…`` id used to reach the gateway and fail the
+    chat. The shipped set is pinned by a contract test; this is the check for
+    everything else. Only ``claude-gw/``-namespaced ids are judged (first-
+    party ids and aliases are the client's to validate). No registered
+    condition: the files are the user's, so the finding names each one and
+    the closest valid ids, and the fix is an edit only the user makes.
+    Read-only: file reads + the router's in-process validation.
+    """
+    problems = res.resolve_agent_id_problems(folder)
+    if problems is None:
+        return [Finding(
+            probe="agent_model_ids",
+            status=STATUS_UNKNOWN,
+            summary=("agent model ids not checked: the model gateway package "
+                     "is not importable, so there is no registry to check against"),
+        )]
+    if not problems:
+        return [Finding(
+            probe="agent_model_ids",
+            status=STATUS_OK,
+            summary="every agent definition names a known gateway model id",
+        )]
+    parts = []
+    lines = []
+    for pr in problems:
+        hint = (" (did you mean " + " or ".join(pr["suggestions"]) + "?)"
+                if pr.get("suggestions") else "")
+        parts.append(f"{display_path(pr['path'])}: {pr['model']!r}{hint}")
+        fix_line = f"# edit {pr['path']}: model: {pr['model']}"
+        if pr.get("suggestions"):
+            fix_line += f"  ->  model: {pr['suggestions'][0]}"
+        lines.append(fix_line)
+    return [Finding(
+        probe="agent_model_ids",
+        status=STATUS_PROBLEM,
+        summary=(f"{len(problems)} agent definition(s) name a gateway model id "
+                 "the router does not know: " + "; ".join(parts)),
+        fix=FIX_DEFER,
+        command="\n".join(lines),
+        detail={"agent_id_problems": problems},
+    )]
+
+
 PROBES: dict = {
     "mcp_commands_spawnable": (probe_mcp_commands_spawnable, (SCOPE_FULL, SCOPE_BOOT)),
     "launcher_binary_fresh": (probe_launcher_binary_fresh, (SCOPE_FULL,)),
@@ -4203,6 +4385,14 @@ PROBES: dict = {
     # entry can clear), so the boot counter must never point at it. It runs
     # where it is read: `vco doctor` and install/update's end-of-run report.
     "retired_endpoint_env": (probe_retired_endpoint_env, (SCOPE_FULL,)),
+    # v0.2.100 F1/F4: full-only, informational — the RL telemetry loss
+    # ledger's surface (lost hub POSTs, skipped dual-log twins). No registered
+    # condition: a loss is a count to watch, not a ledger entry to clear.
+    "rl_telemetry_loss": (probe_rl_telemetry_loss, (SCOPE_FULL,)),
+    # v0.2.100 F-W3-05: full-only — no registered condition (the definitions
+    # are the user's files; nothing VCO runs can clear the finding), so the
+    # boot counter must never point at it (the v0.2.92 promise reason).
+    "agent_model_ids": (probe_agent_model_ids, (SCOPE_FULL,)),
 }
 
 
@@ -4612,20 +4802,21 @@ def _install_marker_unbacked_entry(finding: Finding):
             "the `.claude/` bundle, re-registers the MCPs and may re-seed the "
             "KG), so VCO reports it rather than starting one from a read-only "
             "health check. It is reported because the failure is QUIET by "
-            "construction: `apply_launcher_update`, `force_resync_launcher` "
-            "and `update_orchestrator_at` advance the whole source tree, "
-            "rebuild only the launcher, and then re-assert `installed: true` "
-            "over a venv, hooks, templates, MCP registrations, KG seed and "
-            "schema none of them touched — after which the checkout is "
+            "construction: on launchers up to v0.2.99, "
+            "`apply_launcher_update`, `force_resync_launcher` and "
+            "`update_orchestrator_at` (all retired in v0.2.100) advanced the "
+            "whole source tree, rebuilt only the launcher, and then re-asserted "
+            "`installed: true` over a venv, hooks, templates, MCP registrations, "
+            "KG seed and schema none of them touched — after which the checkout is "
             "0-behind upstream, so the currency probe reports health and the "
             "install-age reading is dropped as not decision-relevant. Since "
-            "v0.2.95 that write leaves `version` alone (install.py owns it) "
-            "and stamps `post_source_only` instead, which does light the "
+            "v0.2.95 that write left `version` alone (install.py owns it) "
+            "and stamped `post_source_only` instead, which does light the "
             "launcher's Updates badge — but a badge is a running launcher's "
             "affordance, and the states this catches include a CLI-only "
             "install and a SECOND clone updated in place by "
             "`update_orchestrator_at`, whose launcher may never start. The "
-            "evidence used here needs none of that: the install manifest is "
+            "evidence used here needs none of that: the install manifest was "
             "written by those paths and says so, while the `.claude/` bundle "
             "manifest is written only by the bundle engine an installer run "
             "reaches. "
@@ -5006,6 +5197,7 @@ __all__ = [
     "main",
     "measure_disk_space",
     "parse_vct_guards",
+    "probe_agent_model_ids",
     "probe_diagnostic_files",
     "probe_disk_space",
     "probe_install_completeness",

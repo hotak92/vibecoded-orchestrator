@@ -1810,12 +1810,13 @@ def _orchestrator_root_from_module() -> Path | None:
     which is exactly the fact a caller that could not resolve the root is
     missing.
 
-    Confirmation is positive and two-part: an ancestor directory must carry
-    BOTH the ``vct-module.json`` manifest (the orchestrator-clone marker
-    ``project_init._find_orchestrator_root_from_module`` and
-    ``vct_launcher_core::orchestrator_manifest`` already walk for) and a
-    ``vco_lib/`` directory (so a manifest belonging to some OTHER VCT module
-    cannot be mistaken for the clone). Nothing is guessed: a non-editable copy
+    Confirmation is positive: an ancestor directory must BE the clone by the
+    install-root identity rule (:func:`vco_lib.orchestrator_identity.
+    is_orchestrator_clone` — markers AND a ``vct-module.json`` whose ``id`` is
+    exactly ``orchestrator``, so a manifest belonging to some OTHER VCT module
+    cannot be mistaken for the clone; v0.2.100 F-W1-05 replaced the older
+    "manifest + ``vco_lib/``" check with the one rule) AND contain ``vco_lib/``
+    (the module being resolved lives there). Nothing is guessed: a non-editable copy
     of ``vco_lib`` in a venv's ``site-packages`` has no manifest above it and
     yields ``None`` — the conservative answer, which leaves the three
     portability keys omitted exactly as before this fallback existed.
@@ -1833,9 +1834,11 @@ def _orchestrator_root_from_module() -> Path | None:
         here = Path(__file__).resolve()
     except (OSError, RuntimeError, ValueError):
         return None
+    from vco_lib.orchestrator_identity import is_orchestrator_clone
+
     for parent in here.parents:
         try:
-            if (parent / "vct-module.json").is_file() and (parent / "vco_lib").is_dir():
+            if is_orchestrator_clone(parent) and (parent / "vco_lib").is_dir():
                 return parent
         except OSError:
             continue

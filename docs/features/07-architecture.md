@@ -103,7 +103,7 @@ Secrets entered through the Launcher GUI are stored in the OS keychain, not in p
 Maintained blocklist of every token that has ever leaked from this repo's history. Wire as a git pre-commit hook. Refusals include the exact file and a pointer to the secrets rotation runbook (see maintainer docs).
 
 ### Hard path whitelist (install safety)
-The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. A `preflight_install_safety_check` Tauri command runs before any installation step.
+The installer and Launcher enforce a hard whitelist of orchestrator-managed paths. No write operation touches user code outside those paths. What actually gates an install today: `install_orchestrator` runs `diff_install` and refuses with a conflict when it would overwrite files it does not own. A `preflight_install_safety_check` Tauri command exists (it reports what would be overwritten, preserved and added) but no launcher screen calls it yet; the preflight panel is deferred by the owner to v0.2.102.
 
 ### Read-merge-write for all settings files
 All writes to `.claude/settings.json` perform a read-merge-write: only the managed key(s) are overwritten; any other content the user has added is preserved. As of v0.2.12 (PR-27, 2026-05-16) the launcher no longer writes the env block into `.vscode/settings.json` at all — that file is touched only by the Python-side Pylance/watcher exclude backfill, which similarly uses key-level read-merge-write to preserve user customizations.
@@ -173,6 +173,8 @@ CI uses `Swatinem/rust-cache@v2` scoped to `launcher/src-tauri` to avoid re-comp
 
 ### Semver with manual tagging
 Version numbers live in three places: `launcher/package.json` `version`, `launcher/src-tauri/Cargo.toml` `[package].version`, and `CHANGELOG.md` section headers. Tagging is manual — a tag means "this is the commit external users should pin to", and is reserved for the maintainer to do explicitly after pre-flight passes.
+
+Since v0.2.100 every version VCO orders is **strictly `X.Y.Z`** — three numbers, an optional leading `v`, no pre-release suffix and no fourth part. A value outside that shape is a parse error, never silently truncated: the Python SSOT is `vco_lib/version_compare.py`, the launcher's is `vct-launcher-core/src/version.rs`, and module manifests are held to the same rule (`docs/VCT_MODULE_MANIFEST_SPEC.md` §1).
 
 ### Prebuilt binaries, the in-repo dist lag, and the tag re-point (v0.2.64)
 The launcher / hub / updater binaries are NOT built at tag time — they are built by the `build` job in `.github/workflows/release.yml` on the tri-OS matrix *after* the tag pushes, then committed back to `main` by the `commit-dist-binaries` job as a `chore(binary): refresh ... for vN [skip ci]` commit that lands ABOVE the tag. Consequences for the three ways a user obtains binaries:

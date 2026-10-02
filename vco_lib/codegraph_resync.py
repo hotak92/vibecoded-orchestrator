@@ -166,6 +166,7 @@ from vco_lib.codegraph_row_classify import (  # noqa: E402 — grouped with the 
     is_deleted_primary_row,
     path_is_ignored,
     path_reachable_on_disk,
+    source_is_owned,
 )
 
 # v0.2.91 (Decision #21): the CLI entry points below (--prune-ignored,
@@ -826,6 +827,7 @@ def reconcile_walked_file_rows(
     audit_root: "Optional[Path]" = None,
     narrow_max_paths: int = _RECONCILE_NARROW_MAX_PATHS,
     log_prefix: str = "entity-reconcile",
+    strict_source: bool = False,
 ) -> "tuple":
     """v0.2.91 (WP-C): per-file entity reconciliation — delete rows anchored to
     a file this walk ACTUALLY walked whose UUIDs this walk did NOT upsert.
@@ -910,6 +912,9 @@ def reconcile_walked_file_rows(
         audit_root: repo root for the auto-resolutions audit row (optional).
         narrow_max_paths: walked-path count at/below which per-path narrowed
             reads are used instead of a full collection scan.
+        strict_source: v0.2.100 (``--as-extra-path``): a row with an EMPTY
+            ``project_source`` is never judged (see
+            ``codegraph_row_classify.source_is_owned``).
 
     Returns ``(deleted, failures)``; every per-collection failure soft-fails.
     """
@@ -958,8 +963,9 @@ def reconcile_walked_file_rows(
                     return False  # file not walked by THIS pass → never touch
                 row_src = str(props.get("project_source") or "").strip()
                 if _prim:
-                    if row_src and row_src not in primary_sources:
-                        return False  # extra-path tenant (B1)
+                    if not source_is_owned(row_src, primary_sources,
+                                           strict=strict_source):
+                        return False  # extra-path tenant (B1) / unprovable (strict)
                 elif row_src != _src:
                     return False  # another tenant's row
                 return str(uid) not in (keep_map.get(_cn) or ())
@@ -3000,6 +3006,66 @@ def _maybe_run_exposure_heal(repo_root: Path, project_name: str) -> bool:
     return True
 
 
+def spawn_code_summary_after_walk(
+    project_name: str,
+    repo_root: Path,
+    analyzer_path: Path,
+    *,
+    log_path: "Path | str | None" = None,
+) -> Optional[int]:
+    """Spawn ``generate-code-summary.py`` (beside the analyzer) as a detached
+    child, AFTER the analyzer has exited (v0.2.100 WP-13). Returns the pid,
+    or ``None`` when the script is absent or the spawn failed (logged).
+
+    Detached for the same reason as the other riders: its LLM budget
+    (``--max-per-run``) can take far longer than the driver's own work, and
+    nothing waits on it. Output is appended to the spawn's shared log when
+    one exists. Best-effort: a failure never changes the driver's result.
+    """
+    summary_script = Path(analyzer_path).parent / "generate-code-summary.py"
+    if not summary_script.is_file():
+        return None
+    summary_argv = [
+        _python_exe.resolve_or_current(), str(summary_script),
+        "--project", project_name,
+        "--project-root", str(repo_root),
+    ]
+    out_handle = None
+    try:
+        from vco_lib.install_companions import detached_child_env
+
+        if log_path is not None:
+            try:
+                out_handle = open(log_path, "ab")
+            except OSError as exc:
+                logger.debug("code-summary: log not opened (%s) — DEVNULL", exc)
+        child_out = out_handle if out_handle is not None else subprocess.DEVNULL
+        popen_kwargs = {
+            "cwd": str(repo_root),
+            "stdout": child_out,
+            "stderr": child_out,
+            "stdin": subprocess.DEVNULL,
+            "env": detached_child_env(),
+        }
+        if os.name == "posix":
+            popen_kwargs["start_new_session"] = True
+        print(f"[resync-driver] code-summary rider: {' '.join(summary_argv)}",
+              flush=True)
+        proc = subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
+        # Handle kept alive — see _DETACHED_CHILDREN.
+        _DETACHED_CHILDREN.append(proc)
+        return proc.pid
+    except Exception as exc:  # noqa: BLE001 — the rider is best-effort
+        logger.warning("code-summary spawn failed: %s", exc)
+        return None
+    finally:
+        if out_handle is not None:
+            try:
+                out_handle.close()
+            except OSError:
+                pass
+
+
 def run_resync_and_verify(
     project_name: str,
     repo_root: Path,
@@ -3170,6 +3236,13 @@ def run_resync_and_verify(
         start_error = f"could not start the analyzer: {exc}"
         rc = -1
     analyzer_duration_ms = int((time.monotonic() - analyzer_started) * 1000)
+
+    # v0.2.100 WP-13: the code-summary rider starts only now, after the
+    # analyzer exited — the rows it reads are the ones this walk wrote.
+    if start_error is None:
+        spawn_code_summary_after_walk(
+            project_name, Path(repo_root), Path(analyzer_path), log_path=log_path,
+        )
 
     # v0.2.91 (#31): TERMINAL report — the completion half of the R-4 spawn
     # registration. The analyzer's completion is known exactly here (rc is
@@ -3878,24 +3951,10 @@ def spawn_background_resync(
     except Exception as exc:  # noqa: BLE001 — backfill is best-effort
         logger.warning("codegraph metadata-backfill spawn failed: %s", exc)
 
-    # v0.2.73 (M2): spawn the code-summary generator as a FOURTH detached
-    # child (prune/backfill precedent above). LLM-budgeted via its own
-    # --max-per-run default (env VCO_CODE_SUMMARY_MAX_PER_RUN); writes only
-    # .claude/.code_formats.json; a spawn failure never blocks the resync.
-    try:
-        summary_script = analyzer.parent / "generate-code-summary.py"
-        if summary_script.is_file():
-            summary_argv = [
-                py, str(summary_script),
-                "--project", project_name,
-                "--project-root", str(repo_root),
-            ]
-            # Handle kept alive — see _DETACHED_CHILDREN.
-            _DETACHED_CHILDREN.append(
-                subprocess.Popen(summary_argv, **popen_kwargs)  # noqa: S603 — argv is ours
-            )
-    except Exception as exc:  # noqa: BLE001 — summary rider is best-effort
-        logger.warning("code-summary spawn failed: %s", exc)
+    # v0.2.73 (M2) code-summary generator: NOT spawned here any more. The
+    # v0.2.100 WP-13 driver (`run_resync_and_verify`) spawns it once the
+    # analyzer has exited — started beside the analyzer it summarised the
+    # rows the walk was about to replace (`spawn_code_summary_after_walk`).
 
     try:
         proc = subprocess.Popen(argv, **popen_kwargs)  # noqa: S603 — argv is ours

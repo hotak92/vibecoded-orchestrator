@@ -1,6 +1,8 @@
 <script lang="ts">
   import { invoke } from '$lib/tauri';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { rlScoringSwitchView } from '$lib/rl-scoring-default';
+  import RlScoringSwitch from '$lib/components/RlScoringSwitch.svelte';
 
   let { onClose }: { onClose: () => void } = $props();
 
@@ -43,6 +45,10 @@
   }
 
   let config = $state<OrchestratorConfig | null>(null);
+  // v0.2.100 W5R-02: the RL scoring lock, served by the backend from its one
+  // home (`vco_lib/rl_scoring_lock.toml`). `undefined` = not loaded / read
+  // failed — the switch then renders disabled + unchecked, never a guess.
+  let rlLock = $state<string | null | undefined>(undefined);
   let features = $state<FeatureFlags | null>(null);
   let loading = $state(true);
   let error = $state<string | null>(null);
@@ -54,12 +60,17 @@
     try {
       // P0-5 (v0.2.54): the backend resolves the tier from the cached
       // license state (tier_cache) — no frontend-supplied apps list.
-      const [cfg, flags] = await Promise.all([
+      const [cfg, flags, lock] = await Promise.all([
         invoke<OrchestratorConfig>('get_orchestrator_config'),
         invoke<FeatureFlags>('get_feature_flags'),
+        invoke<string | null>('rl_scoring_lock').catch((e) => {
+          console.warn('[McpDashboard] rl_scoring_lock read failed:', e);
+          return undefined;
+        }),
       ]);
       config = cfg;
       features = flags;
+      rlLock = lock;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
     } finally {
@@ -100,6 +111,15 @@
       error = e instanceof Error ? e.message : String(e);
     }
   }
+
+  // v0.2.100: the RL-Scored Retrieval switch is the global default of the
+  // per-project RL toggle. While the RL scoring lock holds it renders the
+  // truth — unchecked, disabled, with the reason (see $lib/rl-scoring-default).
+  const rlSwitch = $derived(
+    config && features
+      ? rlScoringSwitchView(config.rl_retrieval_enabled, features.has_rl_retrieval, rlLock)
+      : null,
+  );
 
   function tierLabel(tier: string): string {
     if (tier === 'free') return 'Free';
@@ -249,14 +269,18 @@
             <div class="feature-row">
               <div class="feature-info">
                 <h3>RL-Scored Retrieval</h3>
-                <p>Reinforcement learning reranking — learns from your usage patterns</p>
+                <p>Default for every project's RL reranker toggle — projects with no setting of their own follow it</p>
+                {#if rlSwitch?.notice}
+                  <p class="rl-locked-notice" data-testid="rl-scoring-locked-notice">{rlSwitch.notice}</p>
+                {/if}
+                {#if rlSwitch?.storedNote}
+                  <p class="rl-locked-notice">{rlSwitch.storedNote}</p>
+                {/if}
               </div>
-              <label class="toggle-switch">
-                <input type="checkbox" checked={config.rl_retrieval_enabled}
-                  disabled={!features.has_rl_retrieval}
-                  onchange={(e) => updateSetting('rl_retrieval_enabled', String((e.target as HTMLInputElement).checked))} />
-                <span class="toggle-slider"></span>
-              </label>
+              <RlScoringSwitch
+                view={rlSwitch}
+                onToggle={(checked) => updateSetting('rl_retrieval_enabled', String(checked))}
+              />
               {#if !features.has_rl_retrieval}
                 <span class="upgrade-hint">Pro</span>
               {/if}
@@ -455,6 +479,7 @@
   .feature-info { flex: 1; }
   .feature-info h3 { font-size: 14px; font-weight: 600; margin-bottom: 2px; }
   .feature-info p { font-size: 12px; color: var(--color-muted); }
+  .rl-locked-notice { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--color-purple, #7b5fff); }
   .upgrade-hint {
     font-size: 11px;
     color: var(--color-purple);

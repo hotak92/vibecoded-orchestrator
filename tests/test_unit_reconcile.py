@@ -781,7 +781,8 @@ def test_call_site_present_in_main_only():
     """RED-PROOF call-site pin: the reconcile shim must actually be CALLED from
     the ONE live update entry point — main()'s ``install.py --update`` flow,
     which backs the launcher's Settings→Updates "Update orchestrator" path
-    (installer.rs::update_orchestrator spawns ``install.py --update``).
+    (the one update pipeline, update_run.rs::run_orchestrator_update, spawns
+    ``install.py --update``; installer.rs::update_orchestrator before v0.2.100).
 
     L-3: the previous lightweight call site was DEAD CODE. The launcher's
     lightweight argv (installer.rs::build_lightweight_install_argv) carries NO

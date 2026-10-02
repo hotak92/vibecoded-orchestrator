@@ -13,10 +13,11 @@
   // background install runs without page reload. Two rendering paths:
   //
   //   - `restart_required` (green banner): one-click "Restart now" button
-  //     invokes `restart_launcher` Tauri command, which spawns the new
-  //     binary detached + exits the current process. The same command also
-  //     clears the entry from UPDATE_DEFERRED.md so the next launcher
-  //     start doesn't re-render the banner.
+  //     calls `updater.runRestart()` (v0.2.100, L3-F08: the SAME action and
+  //     overlay as the update badge's Restart Launcher), which invokes
+  //     `restart_launcher` — it spawns the new binary detached + exits the
+  //     current process, and clears the entry from UPDATE_DEFERRED.md so the
+  //     next launcher start doesn't re-render the banner.
   //
   //   - `swap_failed_locked` (red banner, Windows-only): inline recovery
   //     instructions ("fully quit launcher, re-run install.py from terminal,
@@ -27,9 +28,9 @@
   // which page the user is on when install.py finishes.
 
   import { onDestroy, onMount } from 'svelte';
-  import { invoke, safeInvoke } from '$lib/tauri';
-  import { toast } from '$lib/stores/toast';
+  import { safeInvoke } from '$lib/tauri';
   import { orchestrator } from '$lib/stores/orchestrator';
+  import { updater } from '$lib/stores/updater';
 
   //   - `binary_stale` (amber banner, v0.2.91 WP-A/WI-1): detected AT REST by
   //     the boot / update-check freshness probe — the binary on disk is not
@@ -54,7 +55,8 @@
   }
 
   let status = $state<LauncherRestartStatus | null>(null);
-  let restarting = $state(false);
+  // v0.2.100: the restart runs in the updater store; this is its view.
+  const restarting = $derived($updater.updating && $updater.op === 'restart');
   let dismissed = $state(false);
   let installPath = $state<string>('');
   let pollHandle: ReturnType<typeof setInterval> | null = null;
@@ -95,17 +97,10 @@
 
   async function restartNow() {
     if (restarting || !installPath) return;
-    restarting = true;
-    try {
-      // This call doesn't return on success — the launcher exits after
-      // spawning the new process. If we DO get back here, something failed
-      // before the restart actually took effect.
-      await invoke<void>('restart_launcher', { installRoot: installPath });
-      toast.success('Restarting launcher...');
-    } catch (e) {
-      toast.error(`Restart failed: ${e}`);
-      restarting = false;
-    }
+    // v0.2.100 (WP-08, L3-F08): the one restart action. It opens the same
+    // progress overlay as the badge; a failure renders there (one error
+    // display), not as a banner-local toast.
+    await updater.runRestart();
   }
 
   onMount(() => {

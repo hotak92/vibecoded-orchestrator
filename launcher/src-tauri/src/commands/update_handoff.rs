@@ -2,7 +2,7 @@
 //
 // Background
 // ----------
-// `update_orchestrator` in installer.rs runs `git pull` to fetch new
+// The update pipeline (`update_run::run_update`) runs `git pull` to fetch new
 // orchestrator sources. After the pull lands, the dist binary on disk
 // (e.g. `launcher/dist/windows-x64/vct-launcher.exe`) is the NEW
 // version but the running launcher PID still holds the OLD .exe open
@@ -16,9 +16,9 @@
 // stale binary repeatedly → infinite loop.
 //
 // This module is the launcher-side half of the stage1 updater pattern.
-// It is invoked from the SUCCESSFUL post-pull path of
-// `update_orchestrator` (after the new metadata.json is on disk + the
-// dist binary is verifiably the new version) when running on Windows.
+// It is invoked from the pipeline's relaunch (`restart::relaunch`, phase 13,
+// after install.py ran and the binary check passed — the new metadata.json
+// is on disk) when running on Windows.
 //
 // Flow (Windows only)
 // -------------------

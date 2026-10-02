@@ -9,8 +9,8 @@
   //   Abort (with a confirmation) instead of silent dismissal so the
   //   user can never finish a session with a half-applied update.
   //
-  // Surfaced when `merge_orchestrator_with_upstream` or
-  // `rebase_orchestrator_onto_upstream` return a structured error with
+  // Surfaced when `run_orchestrator_update` (kind Merge / Rebase, or the
+  // pull's own merge) rejects with a `Conflict` error carrying
   // `event: "orchestrator_update_conflict"` — the merge/rebase started
   // but produced unresolved conflicts in one or more files.
   //
@@ -46,13 +46,15 @@
   import { onMount, onDestroy } from 'svelte';
   import { invoke } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
-  // v0.2.93 (field incident 2026-09-07): every handler here brackets its
-  // invoke with `updater.beginOp` / `endOp` so the ONE progress overlay
-  // (+layout) animates for keep-local / accept-upstream / continue / abort
-  // too — these ran with no live indicator before. The payload type is the
-  // shared declaration in `$lib/tauri-error-payload`.
-  import { updater } from '$lib/stores/updater';
-  import { errorText, type OrchestratorConflictPayload } from '$lib/tauri-error-payload';
+  // v0.2.93 (field incident 2026-09-07): every handler here drives the ONE
+  // progress overlay (+layout). v0.2.100 (WP-08): Continue is
+  // `updater.run('Resume')`; keep-local / accept-upstream / abort (git
+  // operations, not update kinds) bracket their invoke with
+  // `updater.beginOp` and end through `endOp` / `failOp` (the store's error
+  // router). The payload type is the shared declaration in
+  // `$lib/tauri-error-payload`.
+  import { modalFailure, updater } from '$lib/stores/updater';
+  import type { OrchestratorConflictPayload } from '$lib/tauri-error-payload';
 
   let {
     payload,
@@ -191,6 +193,15 @@
     return 'Either choice is reasonable.';
   }
 
+  // v0.2.100 (W3-FIX follow-up): what a routed failure does to THIS modal —
+  // `failed` shows the one inline message; a route to ANOTHER recovery modal
+  // (the store has opened it) hands over by closing this one; a fresh
+  // conflict payload keeps this modal (`self`).
+  function settle(outcome: { inline: string | null; closeSelf: boolean }) {
+    error = outcome.inline;
+    if (outcome.closeSelf) onClose();
+  }
+
   async function abort() {
     if (aborting || aborted) return;
     aborting = true;
@@ -208,9 +219,9 @@
       // Give the user a beat to see the toast before dismissing.
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Abort failed: ${detail}`;
-      updater.endOp(detail);
+      // v0.2.100 (WP-08, L3-F06; W3-FIX): routed like every update failure,
+      // rendered through the ONE recovery-modal rule (modalFailure).
+      settle(modalFailure(updater.failOp(e), 'Abort failed', 'conflict'));
     } finally {
       aborting = false;
     }
@@ -263,9 +274,9 @@
   }
 
   // V52-B: one-click resolution handlers. Both invoke the Tauri command,
-  // which performs the git checkout + commit/continue + delegates to
-  // resume_orchestrator_update for install.py --update + binary refresh
-  // + auto-restart. The auto-restart kills the launcher mid-call so we
+  // which performs the git checkout + commit/continue + hands its claim to
+  // the update pipeline's Resume kind for install.py --update + binary
+  // refresh + auto-restart. The auto-restart kills the launcher mid-call so we
   // rarely reach the `resolved = true` line — it's there for the
   // crash-recovery path where the restart hop fails.
   async function keepLocal() {
@@ -288,10 +299,11 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Keep local failed: ${detail}`;
+      // v0.2.100 (WP-08, L3-F06): a structured payload (e.g. an untracked
+      // collision in the continued update) opens its modal; any other
+      // failure shows the same single message as the overlay.
+      settle(modalFailure(updater.failOp(e), 'Keep local failed', 'conflict'));
       resolutionMode = null;
-      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -317,10 +329,8 @@
       );
       setTimeout(onClose, 600);
     } catch (e) {
-      const detail = errorText(e);
-      error = `Accept upstream failed: ${detail}`;
+      settle(modalFailure(updater.failOp(e), 'Accept upstream failed', 'conflict'));
       resolutionMode = null;
-      updater.endOp(detail);
     } finally {
       resolving = false;
     }
@@ -331,25 +341,21 @@
     if (!resumeReady) return;
     resuming = true;
     error = null;
-    updater.beginOp('resume');
+    // v0.2.100 (WP-08, AD-1): the ONE update action, kind `Resume` —
+    // audit-logs, refuses on stale/dirty state, then install.py --update +
+    // binary refresh + restart. The restart usually ends the process
+    // mid-call; the success branch is the crash-recovery path.
     try {
-      // resume_orchestrator_update audit-logs, refuses on stale/dirty
-      // state, then re-enters install.py --update + binary refresh +
-      // auto-restart. The auto-restart kills the launcher mid-call —
-      // in practice we never reach the `resumed = true` line, but it's
-      // there for crash-recovery paths where the restart hop fails.
-      await invoke<unknown>('resume_orchestrator_update', { path: installPath });
-      resumed = true;
-      updater.endOp();
-      toast.success('Update resumed — install.py is running.');
-      setTimeout(onClose, 600);
-    } catch (e) {
-      // The Rust command returns human-readable errors for the bad-state
-      // cases (still mid-merge, leftover markers, no sentinel). Surface
-      // verbatim — they're written FOR the user.
-      const detail = errorText(e);
-      error = `Continue Update failed: ${detail}`;
-      updater.endOp(detail);
+      const result = await updater.run('Resume');
+      if (result.ok) {
+        resumed = true;
+        toast.success('Update resumed — install.py is running.');
+        setTimeout(onClose, 600);
+      } else {
+        // Written FOR the user by the backend (still mid-merge, leftover
+        // markers, no sentinel) — shown verbatim, once.
+        settle(modalFailure(result.routed, 'Continue Update failed', 'conflict'));
+      }
     } finally {
       resuming = false;
     }

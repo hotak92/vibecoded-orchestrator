@@ -106,10 +106,12 @@ pub const EVENT_UPDATES_AVAILABLE: &str = "vct-module-updates-available";
 /// One installed module that has a newer version available in the L0
 /// catalog. Returned as a list by `check_module_updates_available`.
 ///
-/// Comparison uses the same `semverLess` semantics as the renderer-side
-/// `module-status-display.ts::resolveTileDisplay`: leading-integer
-/// per-segment, lexicographic. Pre-release suffixes (e.g. `-dev`) are
-/// ignored.
+/// Comparison uses the ONE comparator, `vct_launcher_core::version`
+/// (strict `X.Y.Z`, v0.2.100 owner ruling Q7) — the same rule the renderer's
+/// `version-compare.ts::semverLess` applies, from the same case table.
+/// Superseded (v0.2.100): this docstring used to promise "pre-release
+/// suffixes (e.g. `-dev`) are ignored"; a suffixed version is now
+/// unreadable, and an unreadable version is never offered as an update.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ModuleUpdateAvailable {
     pub project_id: String,
@@ -137,57 +139,17 @@ pub enum UpdateModuleOutcome {
     },
 }
 
-// ─── Version comparison (mirrors module-status-display.ts::semverLess) ───
+// ─── Version comparison ─────────────────────────────────────────────────
 
-/// Returns true iff `a` is strictly less than `b` under leading-integer
-/// per-segment semver comparison.
+/// `a < b` via the ONE comparator (`vct_launcher_core::version`).
 ///
-/// Mirrors `module-status-display.ts::semverLess` so the renderer and
-/// backend agree on which installs need a badge.
-///
-/// Examples:
-///   - `semver_less("0.2.7", "0.2.8")` → true
-///   - `semver_less("0.2.8", "0.2.8")` → false
-///   - `semver_less("0.2.8-dev", "0.2.8")` → false (leading int matches)
-///   - `semver_less("0.2.7-rc1", "0.2.8-dev")` → true (7 < 8)
-pub fn semver_less(a: &str, b: &str) -> bool {
-    let parse = |v: &str| -> Vec<u64> {
-        v.split('.')
-            .map(|seg| {
-                // Leading integer prefix; "0.2.4-dev" → 4 for the third
-                // segment. Mirrors the renderer-side regex `^(\d+)`.
-                let mut n: u64 = 0;
-                let mut any = false;
-                for c in seg.chars() {
-                    if let Some(d) = c.to_digit(10) {
-                        n = n.saturating_mul(10).saturating_add(d as u64);
-                        any = true;
-                    } else {
-                        break;
-                    }
-                }
-                if any {
-                    n
-                } else {
-                    0
-                }
-            })
-            .collect()
-    };
-    let aa = parse(a);
-    let bb = parse(b);
-    let n = aa.len().max(bb.len());
-    for i in 0..n {
-        let x = aa.get(i).copied().unwrap_or(0);
-        let y = bb.get(i).copied().unwrap_or(0);
-        if x < y {
-            return true;
-        }
-        if x > y {
-            return false;
-        }
-    }
-    false
+/// v0.2.100 WP-01: superseded the private leading-integer parser (which
+/// mirrored the old TS `semverLess` and read `0.2.8-dev` as `0.2.8`). A
+/// parse error is returned, not ranked — each caller maps it to its own
+/// "unknown": [`compute_updates_available`] offers no update, and
+/// `update_module_to_latest` refuses with the offending string.
+pub fn semver_less(a: &str, b: &str) -> Result<bool, vct_launcher_core::version::VersionParseError> {
+    vct_launcher_core::version::is_older(a, b)
 }
 
 // ─── Pure summary helpers (testable without Tauri State / network) ──────
@@ -203,6 +165,8 @@ pub fn semver_less(a: &str, b: &str) -> bool {
 ///   - Skip rows whose `module_id` isn't in the catalog (manually
 ///     installed modules, or modules whose catalog entry was removed).
 ///   - Skip when `current_version >= available_version` per `semver_less`.
+///   - Skip (with a WARN naming the string) when either version is not
+///     `X.Y.Z` — an unreadable version is never "update available".
 ///
 /// Returns the entries sorted by `module_id` (stable rendering).
 pub fn compute_updates_available(
@@ -227,8 +191,16 @@ pub fn compute_updates_available(
         })
         .filter_map(|row| {
             let catalog_entry = by_id.get(row.module_id.as_str())?;
-            if !semver_less(&row.module_version, &catalog_entry.version) {
-                return None;
+            match semver_less(&row.module_version, &catalog_entry.version) {
+                Ok(true) => {}
+                Ok(false) => return None,
+                Err(e) => {
+                    tracing::warn!(
+                        "[module_updates] {}: update check skipped — {}",
+                        row.module_id, e
+                    );
+                    return None;
+                }
             }
             Some(ModuleUpdateAvailable {
                 // project_id is Option<String> on the row (global modules
@@ -325,7 +297,15 @@ pub async fn update_module_to_latest(
     //    latest" — the user might be one minor ahead of catalog due to
     //    a manual install, in which case re-running the update would
     //    *downgrade*. Don't.
-    if !semver_less(&previous_version, &catalog_version) {
+    //    v0.2.100: an unreadable version is neither "already latest" nor
+    //    an update — refuse, naming the string.
+    let is_behind = semver_less(&previous_version, &catalog_version).map_err(|e| {
+        format!(
+            "module {}: cannot compare installed {:?} with catalog {:?} — {}",
+            module_id, previous_version, catalog_version, e
+        )
+    })?;
+    if !is_behind {
         return Ok(UpdateModuleOutcome::AlreadyLatest {
             version: previous_version,
         });
@@ -407,7 +387,7 @@ pub fn spawn_module_update_check_loop<R: Runtime>(app: AppHandle<R>) {
             // v0.2.60: stand down while an orchestrator update is in
             // progress. This poller opens its OWN launcher.db connection
             // (below), which bypasses the managed-connection close
-            // `update_orchestrator` performs for the install.py window —
+            // the update pipeline performs for the install.py window —
             // so without this gate a tick here would re-contend with
             // install.py for the SQLite writer lock (the launcher-self-db-
             // lock bug). Reuses the `.update-in-progress` lockfile.
@@ -599,55 +579,36 @@ mod tests {
     use crate::db::models::{ModuleStatus, ProjectHost};
     use crate::manifest::InstallScope;
 
-    // ─── semver_less ────────────────────────────────────────────────
+    // ─── semver_less (v0.2.100: delegates to the version SSOT) ──────
+    // `semver_less_handles_prerelease_suffixes` and the mismatched-segment
+    // test were removed as superseded (owner ruling Q7): a suffixed or
+    // two-part version is a parse error now, pinned below and table-tested
+    // in vct_launcher_core::version.
 
     #[test]
     fn semver_less_basic_inequalities() {
-        assert!(semver_less("0.2.7", "0.2.8"));
-        assert!(semver_less("0.2.8", "0.3.0"));
-        assert!(semver_less("0.2.8", "1.0.0"));
+        assert_eq!(semver_less("0.2.7", "0.2.8"), Ok(true));
+        assert_eq!(semver_less("0.2.8", "0.3.0"), Ok(true));
+        assert_eq!(semver_less("0.2.8", "1.0.0"), Ok(true));
+        assert_eq!(semver_less("0.2.99", "0.2.100"), Ok(true));
     }
 
     #[test]
-    fn semver_less_equal_returns_false() {
-        assert!(!semver_less("0.2.8", "0.2.8"));
-        assert!(!semver_less("1.0.0", "1.0.0"));
-    }
-
-    #[test]
-    fn semver_less_greater_returns_false() {
-        // Catalog ahead of installed → installed is LESS → returns true.
-        // Catalog BEHIND installed → installed is NOT LESS → returns false.
+    fn semver_less_equal_and_greater_return_false() {
         // The compute fn uses (current, available) so the "manually
         // pre-installed ahead of catalog" case must NOT trigger an
         // update offer (which would downgrade).
-        assert!(!semver_less("0.2.9", "0.2.8"));
-        assert!(!semver_less("1.0.0", "0.9.9"));
+        assert_eq!(semver_less("0.2.8", "0.2.8"), Ok(false));
+        assert_eq!(semver_less("0.2.9", "0.2.8"), Ok(false));
+        assert_eq!(semver_less("1.0.0", "0.9.9"), Ok(false));
+        assert_eq!(semver_less("0.10.0", "0.9.0"), Ok(false));
     }
 
     #[test]
-    fn semver_less_handles_prerelease_suffixes() {
-        // Mirror module-status-display.ts: "0.2.4-dev" → 4 for that segment.
-        // So "0.2.8-dev" == "0.2.8" under this comparison.
-        assert!(!semver_less("0.2.8-dev", "0.2.8"));
-        assert!(!semver_less("0.2.8", "0.2.8-dev"));
-        // 7 < 8 even with suffixes.
-        assert!(semver_less("0.2.7-rc1", "0.2.8-dev"));
-    }
-
-    #[test]
-    fn semver_less_handles_mismatched_segment_counts() {
-        // Missing segments default to 0.
-        assert!(semver_less("0.2", "0.2.1"));
-        assert!(!semver_less("0.2.0", "0.2"));
-        assert!(!semver_less("0.2", "0.2.0"));
-    }
-
-    #[test]
-    fn semver_less_handles_leading_zeros_and_large_numbers() {
-        // Numerical comparison, not lexicographic — "10" > "9".
-        assert!(semver_less("0.9.0", "0.10.0"));
-        assert!(!semver_less("0.10.0", "0.9.0"));
+    fn semver_less_refuses_suffixes_and_short_versions() {
+        for (a, b) in [("0.2.8-dev", "0.2.8"), ("0.2.7-rc1", "0.2.8"), ("0.2", "0.2.1")] {
+            assert!(semver_less(a, b).is_err(), "{a} vs {b} must not be ranked");
+        }
     }
 
     // ─── compute_updates_available ─────────────────────────────────
@@ -736,6 +697,27 @@ mod tests {
         assert_eq!(out[0].current_version, "0.2.7");
         assert_eq!(out[0].available_version, "0.2.8");
         assert_eq!(out[0].project_id, "p1");
+    }
+
+    /// v0.2.100 WP-01 (act): an unreadable version is never "update
+    /// available". The leading-digit parser read `0.2.7-dev` < `0.2.8` and
+    /// offered the update. Leave-alone leg: the plain 0.2.99 → 0.2.100 row
+    /// in the same input IS offered.
+    #[test]
+    fn compute_updates_never_offers_an_unreadable_version() {
+        let installed = vec![
+            install_row("mod-a", "0.2.7-dev", Some("p1"), ModuleStatus::Installed),
+            install_row("mod-b", "0.2.7", Some("p1"), ModuleStatus::Installed),
+            install_row("mod-c", "0.2.99", Some("p1"), ModuleStatus::Installed),
+        ];
+        let catalog = catalog_response(vec![
+            catalog_module("mod-a", "0.2.8"),
+            catalog_module("mod-b", "0.2.8.1"),
+            catalog_module("mod-c", "0.2.100"),
+        ]);
+        let out = compute_updates_available(&installed, &catalog);
+        let ids: Vec<&str> = out.iter().map(|u| u.module_id.as_str()).collect();
+        assert_eq!(ids, vec!["mod-c"]);
     }
 
     #[test]

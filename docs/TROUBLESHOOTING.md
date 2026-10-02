@@ -214,7 +214,7 @@ Resolved in commit `03eb485`. Earlier launcher builds registered projects withou
 
 Click the **Refresh** button on the affected tab if you're on a build before `03eb485` and don't want to re-clone. New registrations on current builds populate immediately.
 
-(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.2.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the MCP tab.)
+(Custom MCP servers added via `.claude/settings.json` outside the launcher's "Add MCP" flow are still skipped by the initial populate — known gap on the v0.2.x backlog. Workaround: re-add via the launcher's "Add MCP" button, or click **Refresh** on the project's Hooks/Agents tabs for the parts they cover. There is no per-project MCP tab yet; one is scheduled for v0.2.102 by the owner.)
 
 ### Bundled launcher binary is stale (built from a different launcher source)
 
@@ -775,12 +775,41 @@ Two defects shipped in v0.2.97/0.2.98 hid updates from the launcher without any 
   local tag differs from upstream's — which the release flow's tag re-point makes common —
   logging only `(no stderr)` and starving other checks behind its retry ladder.
 
-**The update path itself still works on those builds.** Use the sidebar →
-**Preferences → Updates → "Check now"**, then **"Update now"** — that flow does not
-depend on the badge or on tag fetches, and it delivers v0.2.99, which fixes both defects
-(and force-updates the stale local tags on its next check). If even that page cannot
-check, run `python install.py --update` from the install root, then
-`git fetch --tags --force vco_upstream` inside it to align re-pointed tags.
+On those builds no launcher surface can be relied on to start an update, so update
+**from a terminal** — it needs no GUI. In the install root (the folder holding
+`install.py`):
+
+```bash
+git fetch --tags --force vco_upstream
+git pull --ff-only vco_upstream main
+python install.py --update
+```
+
+On Windows, quit the launcher and stop the hub first
+(`launcher\dist\windows-x64\vct-hub.exe --stop`): Windows cannot replace a running
+executable, so the pull would fail on the binaries in `launcher\dist\`. If
+`git remote get-url vco_upstream` reports no such remote, add it once:
+`git remote add vco_upstream https://github.com/hotak92/vibecoded-orchestrator.git`
+(the launcher adds the same remote itself; `origin` is never touched).
+
+Then quit any running launcher and start the one the pull delivered:
+
+| OS | launcher binary (relative to the install root) |
+|---|---|
+| Linux | `launcher/dist/linux-x64/vct-launcher` |
+| macOS (Apple Silicon) | `launcher/dist/macos-arm64/vct-launcher` |
+| Windows | `launcher\dist\windows-x64\vct-launcher.exe` |
+
+`--tags --force` is needed because release tags are re-pointed after the binaries are
+committed, so a plain `git fetch --tags` refuses to move a local tag (the second defect
+above). `install.py --update` never pulls: it applies whatever tree is checked out.
+
+**If `git pull --ff-only` refuses** ("Not possible to fast-forward" — the clone has local
+commits or uncommitted edits to shipped files), do not force it: follow
+[INSTALL_RECOVERY.md → Update from the shell](INSTALL_RECOVERY.md#update-from-the-shell-no-launcher-gui),
+which covers keeping local work (merge / rebase) and starting over from a backup branch.
+Once you are on a working launcher, its divergence dialog offers the same choices (merge
+and rebase; from v0.2.100 also a reset that saves your work first).
 
 ## Update Bundle deferrals: `UPDATE_DEFERRED.md`
 

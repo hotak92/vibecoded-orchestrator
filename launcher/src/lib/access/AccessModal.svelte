@@ -9,11 +9,14 @@
   let {
     targetLabel,
     initial,
+    notice = null,
     onSave,
     onClose,
   }: {
     targetLabel: string;
     initial: AccessMode | null;
+    /** Optional caveat shown above the options (e.g. not-yet-enforced). */
+    notice?: string | null;
     onSave: (mode: AccessMode) => Promise<void>;
     onClose: () => void;
   } = $props();
@@ -69,6 +72,9 @@
     </div>
   {/snippet}
   {#snippet body()}
+    {#if notice}
+      <p class="access-notice" role="note">{notice}</p>
+    {/if}
     <div class="access-options">
       <label class="access-opt" class:active={mode === 'shared'}>
         <input type="radio" name="mode" value="shared" bind:group={mode} />
@@ -128,6 +134,7 @@
 </DialogRoot>
 
 <style>
+  .access-notice { margin: 0 0 10px; padding: 8px 10px; border-radius: 6px; font-size: 12px; background: rgba(255, 170, 136, 0.12); color: #fa8; }
   /* Bug 26: backdrop / sizing / shell now handled by DialogRoot. */
   .access-header-row {
     display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;

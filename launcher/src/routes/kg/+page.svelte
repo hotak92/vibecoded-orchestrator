@@ -9,6 +9,7 @@
   import CollectionList from '$lib/kg/CollectionList.svelte';
   import CollectionViewer from '$lib/kg/CollectionViewer.svelte';
   import AccessModal from '$lib/access/AccessModal.svelte';
+  import { accessNoticeFor } from '$lib/kg/node-access-notice';
   import type { AccessMode } from '$lib/types/project-state';
   import type { KgNode } from '$lib/types/project-state';
 
@@ -134,7 +135,7 @@
     {#if project}
       <span class="kg-project">acting as <code>{project.name}</code></span>
     {:else}
-      <span class="kg-warn">No project selected — select one to enable access enforcement.</span>
+      <span class="kg-warn">No project selected — select one to manage access settings.</span>
     {/if}
   </header>
 
@@ -162,6 +163,7 @@
     <AccessModal
       targetLabel={modalLabel}
       initial={modalInitial}
+      notice={accessNoticeFor(modalKind)}
       onSave={handleSave}
       onClose={() => (modalOpen = false)}
     />

@@ -37,6 +37,7 @@ import type {
   CreateProjectResult,
   ProjectHost,
   ProjectSetupStatus,
+  ProjectSetupView,
   SetupProgressEvent,
   SetupWarning,
 } from '$lib/types/launcher';
@@ -109,6 +110,40 @@ export function mergeSetupProgress(
     warnings: e.warnings,
     error: e.error,
     observed_at: sameProject ? current!.observed_at : now,
+  };
+}
+
+/**
+ * v0.2.100: fold the persisted `get_project_setup_status` row into the same
+ * active-setup view-model a live event produces, so a setup that ran while the
+ * launcher was closed or reloading is shown instead of vanishing with the
+ * in-memory state. `observed_at` is the row's own time (finish time when
+ * terminal, start time while running) rather than `now`: the existing banner
+ * logic then hides an old `done`/`deferred` row by itself and keeps a
+ * `failed` one (Retry) and a running one visible. Returns null for a row with
+ * no status.
+ */
+export function viewToActiveSetup(
+  view: ProjectSetupView | null,
+  projectName: string,
+  now: number,
+): ActiveSetup | null {
+  if (!view) return null;
+  const at = (iso: string | null): number | null => {
+    if (!iso) return null;
+    const t = Date.parse(iso);
+    return Number.isNaN(t) ? null : t;
+  };
+  const terminal = isTerminal(view.status);
+  const observed = (terminal ? at(view.finished_at_iso) : at(view.started_at_iso)) ?? now;
+  return {
+    project_id: view.project_id,
+    project_name: projectName,
+    status: view.status,
+    phase: terminal ? null : view.phase,
+    warnings: view.warnings ?? [],
+    error: view.error_message,
+    observed_at: observed,
   };
 }
 
@@ -282,10 +317,36 @@ function createProjectSetupStore() {
     });
   }
 
+  // v0.2.100: ids whose restored banner the user dismissed this session, so a
+  // later re-selection of the project does not bring a dismissed banner back.
+  const dismissedIds = new Set<string>();
+
+  /**
+   * v0.2.100: restore the persisted setup status of `projectId` after a
+   * reload (`get_project_setup_status` had no caller; the banner only ever
+   * knew the events it had been alive to hear). A live event already held in
+   * the store always wins, and a dismissed project is not restored again.
+   * Soft-fails: an unreadable row simply restores nothing.
+   */
+  async function rehydrate(projectId: string, projectName: string): Promise<void> {
+    if (!tauriAvailable() || !projectId || dismissedIds.has(projectId)) return;
+    let view: ProjectSetupView | null = null;
+    try {
+      view = await invoke<ProjectSetupView | null>('get_project_setup_status', { projectId });
+    } catch (e) {
+      console.debug('[vct] get_project_setup_status failed', e);
+      return;
+    }
+    const restored = viewToActiveSetup(view, projectName, Date.now());
+    if (!restored) return;
+    update((s) => (s.active ? s : { ...s, active: restored }));
+  }
+
   return {
     subscribe,
     setCreateFn,
     enqueueAdd,
+    rehydrate,
     /** Test/edge hook: reset to empty (e.g. after a hard error). */
     reset() {
       pending.length = 0;
@@ -293,7 +354,10 @@ function createProjectSetupStore() {
     },
     /** Dismiss the active banner (terminal states). */
     dismiss() {
-      update((s) => ({ ...s, active: null }));
+      update((s) => {
+        if (s.active) dismissedIds.add(s.active.project_id);
+        return { ...s, active: null };
+      });
     },
   };
 }

@@ -1,0 +1,52 @@
+# SPDX-License-Identifier: AGPL-3.0-or-later
+# Copyright (c) 2026 VibeCoded Tools
+#
+# ═══════════════════════════════════════════════════════════════════════════
+# RL SCORING LOCK — the ONE home of "is RL scoring allowed to run at all?"
+# (v0.2.100, W5R-02). One committed table Rust, Python and (through Rust) the
+# launcher GUI all read. Never re-type the value in code.
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# OWNER RULING (2026-10-01, verbatim): "wire it, but for now we are keeping
+# the RL module off because we still didn't train the neural network, so keep
+# it unactive for now".
+#
+# While `locked = true`, RL SCORING (reranking search results through the RL
+# reranker) is OFF in every state, whatever else is set:
+#
+#   * an explicit per-project `enabled_for_project = true` row,
+#   * a host-wide (global) `true` row,
+#   * a Pro / MAO licence or a paid-module overlay,
+#   * the hub being unreachable (the MCP's old fall-open path).
+#
+# The per-project and host-wide rows are USER DATA and are never deleted or
+# rewritten by the lock: they keep their stored values, the GUI shows them as
+# "kept, applies once unlocked", and they apply again the moment this flips
+# to `false`. The GUI refuses new "turn on" writes while locked.
+#
+# WHAT THE LOCK DOES NOT TOUCH: event LOGGING / collection. Retrieval and
+# citation events are written to `rl_events` whatever this says (owner: logs
+# are ALWAYS collected). The module-enable cascade that decides which
+# projects receive the RL module's settings is also untouched — the lock
+# gates scoring, not the module.
+#
+# ## Readers (parse THIS file)
+#
+#   * Rust:   launcher/src-tauri/vct-launcher-core/src/rl_scoring_lock.rs
+#             (include_str! at compile time). Applied by
+#             `Db::rl_scoring_enabled_for_project` (served by the hub's
+#             /config as `rl_reranker_enabled_for_project`) and surfaced to
+#             the GUI through `ModuleEnableState.lock_reason` and the
+#             `rl_scoring_lock` command.
+#   * Python: vco_lib/rl_scoring_lock.py (tomllib). Applied FIRST in
+#             claude_mcp_servers/rl_client/search_pipeline.py
+#             `_resolve_rl_enabled`, so a hub-down MCP is locked too.
+#
+# To unlock once a trained model ships: set `locked = false` (keep `reason`
+# for the record) and update the tests that pin the shipped value.
+
+format_version = 1
+
+locked = true
+
+reason = "RL scoring stays inactive until the model is trained. Data collection continues regardless."

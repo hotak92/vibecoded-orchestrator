@@ -225,6 +225,24 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "this ladder entry). _CHUNKER_REVISION unchanged at v0.2.92.1; "
         "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
     ),
+    "0.2.100": (
+        "No extraction-semantics change. `git diff v0.2.99..HEAD` across the "
+        "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py) "
+        "touches ONE file, templates/scripts/analyze_code_graph.py, and only "
+        "its row-REMOVAL side: an incremental walk now deletes the rows of "
+        "files deleted or renamed away since the lower bound (the logic moved "
+        "to vco_lib/codegraph_deleted_files.py, with _filter_changed_files), "
+        "the new --as-extra-path flag makes every delete-by-source path leave "
+        "an unprovable (legacy, empty project_source) row alone, and the "
+        "deleted-file prune reports exit 5 on failure. How an entity is found, "
+        "named, hashed, chunked or truncated is unchanged; no new row content "
+        "would come from a re-walk, so a forced one would cost every user a "
+        "walk for nothing. The code-summary batching (generate-code-summary.py) "
+        "is outside the extractor surface. _CHUNKER_REVISION unchanged at "
+        "v0.2.92.1; CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7."
+    ),
 }
 
 #: The newest generation a freshly-built graph satisfies.
@@ -260,6 +278,16 @@ def parse_semver(version: str) -> "tuple[int, int, int] | None":
     Deliberately does not pull in ``packaging`` — orchestrator version strings
     are plain semver with no pre-release tags. ``vco_lib.project_init``'s
     ``_parse_semver`` delegates here so there is ONE parser.
+
+    Relation to the version SSOT (v0.2.100): the strict comparator home is
+    :mod:`vco_lib.version_compare` (``X.Y.Z`` only, owner ruling Q7, raising
+    ``VersionParseError``). This function keeps its ``None``-returning
+    contract because its callers are boundary checks where "unparseable" must
+    mean "no crossing proven", and it does not accept the ``v`` prefix. Its
+    tuple ORDERING agrees with the SSOT on every unprefixed ``order`` row of
+    ``tests/fixtures/version_order_cases.json`` and it rejects the suffixed /
+    four-part / two-part ``reject`` rows — both pinned by
+    ``tests/test_v02100_version_order.py``.
     """
     if not isinstance(version, str):
         return None

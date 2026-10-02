@@ -299,12 +299,14 @@ def test_apply_change_runs_the_chain_in_order(db: Path, tmp_path: Path) -> None:
         write_infra_env=lambda infra, rows: calls.append(("infra", infra, sorted(rows))),
         reproject=lambda path: calls.append(("reproject", path)),
         register_mcps=lambda root: calls.append(("register", root)) or True,
+        rerender_root=lambda root, path: calls.append(("root_files", root, path)),
         out=printed.append,
     )
     assert calls == [
         ("infra", tmp_path / "orch" / "infrastructure", ["ollama"]),
         ("reproject", db),
         ("register", tmp_path / "orch"),
+        ("root_files", tmp_path / "orch", db),
     ]
     assert report.ok and report.changed == ["ollama"]
     assert printed == ["ollama: http://localhost:11434 (external)"]
@@ -314,7 +316,8 @@ def test_apply_change_with_nothing_changed_runs_nothing(db: Path, tmp_path: Path
     def boom(*_a):
         raise AssertionError("no step may run")
     report = se.apply_change([], orchestrator_root=tmp_path, db_path=db,
-                             write_infra_env=boom, reproject=boom, register_mcps=boom, out=boom)
+                             write_infra_env=boom, reproject=boom, register_mcps=boom,
+                             rerender_root=boom, out=boom)
     assert report.steps == {} and report.ok
 
 
@@ -328,10 +331,12 @@ def test_a_failing_step_is_recorded_and_the_chain_goes_on(db: Path, tmp_path: Pa
         write_infra_env=infra,
         reproject=lambda _p: ran.append("reproject"),
         register_mcps=lambda _r: False,
+        rerender_root=lambda _r, _db: ran.append("root_files"),
         out=lambda _l: None,
     )
-    assert ran == ["reproject"]
-    assert report.steps == {"infra_env": "failed", "reproject": "ok", "register_mcps": "failed"}
+    assert ran == ["reproject", "root_files"]
+    assert report.steps == {"infra_env": "failed", "reproject": "ok", "register_mcps": "failed",
+                            "root_files": "ok"}
     assert "disk full" in report.errors["infra_env"] and not report.ok
 
 

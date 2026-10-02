@@ -15,7 +15,8 @@ time. Two root causes made that reachable and then permanent:
 
 Each fix is unit-tested in Rust (``services::binary_freshness``'s reactor-free
 ``#[cfg(test)] mod tests``). What Rust unit tests CANNOT reach are the
-CALL-SITES: ``update_orchestrator`` is a Tauri command with a ``Window``
+CALL-SITES: ``run_orchestrator_update`` (v0.2.100's one update command; the
+retired ``update_orchestrator`` before it) is a Tauri command with a ``Window``
 parameter, and the boot/exit hooks live inside ``tauri::Builder``. Those are
 pinned here by source scan — the same discipline as
 ``test_v0290_no_bare_tokio_spawn_in_sync_fns.py``.
@@ -46,6 +47,14 @@ SERVICES_MOD_RS = SRC / "services" / "mod.rs"
 # v0.2.91 wave-2: the at-rest swap delegates its lock-write + detached spawn
 # here, so the no-relaunch invariant is now checked across this seam.
 UPDATE_HANDOFF_RS = SRC / "commands" / "update_handoff.rs"
+# v0.2.100 WP-03b: the ONE update pipeline. `update_run.rs` is its driver +
+# live side effects, `update_failure.rs` its one error rendering, and
+# `restart.rs` its one relaunch. The per-surface commands the claims below
+# were first pinned on (`update_orchestrator`, `apply_launcher_update`,
+# `force_resync_launcher`, `merge_orchestrator_with_upstream`, …) are gone.
+UPDATE_RUN_RS = SRC / "commands" / "update_run.rs"
+UPDATE_FAILURE_RS = SRC / "commands" / "update_failure.rs"
+RESTART_RS = SRC / "commands" / "restart.rs"
 
 
 def read(p: Path) -> str:
@@ -69,6 +78,27 @@ def read(p: Path) -> str:
 #: the shared home, which is also the home the module's own docstring instructs
 #: callers to extend ("do not add a fourth copy").
 read_code = read_rust_code
+
+
+def item_body(src: str, signature: str, indent: str = "") -> str:
+    """The text of the item starting at `signature`, up to its closing brace
+    at `indent` (``""`` for a top-level fn, four spaces for an impl method).
+
+    Raises ``ValueError`` when the signature is absent, so a rename fails
+    loudly instead of turning an assertion vacuous.
+    """
+    start = src.index(signature)
+    return src[start : src.index("\n" + indent + "}\n", start)]
+
+
+#: The production `UpdateOps` impl — the LIVE side effects of the one update
+#: pipeline (the trait declaration above it names the same methods).
+_LIVE_OPS_IMPL = "impl<'w, R: Runtime> UpdateOps for LiveOps<'w, R> {"
+
+
+def live_op(src: str, signature: str) -> str:
+    """Body of one method of the production `UpdateOps` impl."""
+    return item_body(src[src.index(_LIVE_OPS_IMPL) :], signature, "    ")
 
 
 class SharedHomeTests(unittest.TestCase):
@@ -182,8 +212,27 @@ class Wi3NonClobberingRevertTests(unittest.TestCase):
         )
 
     def test_pop_conflict_site_audits_the_averted_clobber(self) -> None:
-        """WI-7 (a) at the RC-1 site specifically."""
-        self.assertIn("update_binary_clobber_averted", read(INSTALLER_RS))
+        """WI-7 (a) at the RC-1 site specifically.
+
+        RETARGETED v0.2.100 (WP-03b): the RC-1 site — the exit-0 pull whose
+        autostash POP conflicted after the merge landed — lives in the ONE
+        pipeline (`update_pipeline.rs`), no longer in installer.rs. The row is
+        not written there (the Db handle is the caller's): the site reads the
+        abort tail's outcome and carries it OUT on the error, and
+        `update_failure::from_pipeline_error` turns it into the
+        `update_binary_clobber_averted` row (behaviour-tested in
+        `update_failure::tests::pipeline_pop_conflict_maps_to_autostash_pop_
+        with_the_after_success_audit_row`). Pinned here: the site does not
+        drop the outcome on the floor.
+        """
+        pipeline = read_code(UPDATE_PIPELINE_RS)
+        self.assertIn("let record_clobber = restore.clobber_averted;", pipeline)
+        pop_at = pipeline.index("return Err(UpdatePipelineError::AutostashPopConflict {")
+        self.assertIn(
+            "record_binary_clobber_averted: record_clobber,",
+            pipeline[pop_at : pop_at + 400],
+            "the autostash-pop exit must carry the abort tail's clobber outcome",
+        )
 
 
 class Wi2AlreadyUpToDateHealsTests(unittest.TestCase):
@@ -212,8 +261,13 @@ class Wi2AlreadyUpToDateHealsTests(unittest.TestCase):
     exactly the call-site class this file exists to cover.
     """
 
-    #: Every file that may hold an "Already up to date" early return.
-    HOMES = (INSTALLER_RS, UPDATE_PIPELINE_RS)
+    #: Every file that may hold an "Already up to date" early return of the
+    #: PULL sequence. v0.2.100 (WP-03b): the merge surface's sibling branch
+    #: went with `merge_orchestrator_with_upstream`; the recovery git ops
+    #: (Merge/Rebase/Resume) now report `already_up_to_date` to
+    #: `update_run::finish_recovery_git_op`, which heals — pinned separately
+    #: in `test_the_recovery_up_to_date_leg_reconciles_before_returning`.
+    HOMES = (UPDATE_PIPELINE_RS,)
 
     def _branch_bodies(self) -> list[tuple[str, str]]:
         """`(home, body)` for every branch, across all homes."""
@@ -230,8 +284,8 @@ class Wi2AlreadyUpToDateHealsTests(unittest.TestCase):
         bodies = self._branch_bodies()
         self.assertGreaterEqual(
             len(bodies),
-            2,
-            "expected the update-pipeline + merge siblings across "
+            1,
+            "expected the pull sequence's branch in "
             f"{[p.name for p in self.HOMES]}; a DROP here is the real regression "
             "this guards (a branch deleted, not a branch relocated)",
         )
@@ -252,16 +306,39 @@ class Wi2AlreadyUpToDateHealsTests(unittest.TestCase):
                 f"the branch in {home} must reconcile BEFORE returning",
             )
 
+    def test_the_recovery_up_to_date_leg_reconciles_before_returning(self) -> None:
+        """v0.2.100 (WP-03b): the second "Already up to date" home.
+
+        Merge/Rebase/Resume run through `update_run::recovery_git_op`; an
+        up-to-date result is mapped by `finish_recovery_git_op`, which must
+        restore the binaries AND reconcile the dist binary at rest before it
+        returns — the same RC-2 heal the pull sequence performs.
+        """
+        src = read_code(UPDATE_RUN_RS)
+        body = item_body(src, "async fn finish_recovery_git_op<")
+        arm = body[body.index("Ok(done) if done.already_up_to_date =>") :]
+        arm = arm[: arm.index("Ok(done) =>")]
+        self.assertIn("abort_update_restore_binaries_and_hub(", arm)
+        self.assertIn("reconcile_dist_at_rest(", arm)
+        self.assertLess(
+            arm.index("abort_update_restore_binaries_and_hub("),
+            arm.index("reconcile_dist_at_rest("),
+            "restore the binaries first, then reconcile the at-rest state",
+        )
+        self.assertIn("dist_binary_stale: heal.is_stale()", arm)
+
 
 class Wi4SurfaceBParityTests(unittest.TestCase):
     """WI-4 — the launcher self-update surface gets the same machinery."""
 
-    def test_clean_tree_guard_excludes_generated_release_controlled_paths(self) -> None:
-        src = read(SELF_UPDATE_RS)
-        start = src.index("fn first_blocking_change(")
-        body = src[start : start + 2000]
-        self.assertIn("is_generated_release_controlled(", body)
-        self.assertIn("build_generated_release_controlled_globset(", body)
+    # RETIRED v0.2.100 (WP-03b): `test_clean_tree_guard_excludes_generated_
+    # release_controlled_paths` pinned surface B's own clean-tree guard
+    # (`self_update::first_blocking_change`). That guard went with
+    # `apply_launcher_update`; superseded by the one pipeline, which has no
+    # surface-level clean-tree refusal and reconciles the generated/release-
+    # controlled class to upstream inside `reconcile_and_pull`
+    # (`resolve_generated_files_to_upstream`, pinned by
+    # `test_renames_happen_before_the_pull_sequence_that_reconciles`).
 
     def test_surface_b_does_a_pre_pull_rename_and_reverts_it(self) -> None:
         """WI-4's property, followed across homes (v0.2.95 phase 2).
@@ -333,21 +410,31 @@ class Wi4SurfaceBParityTests(unittest.TestCase):
 
         Either link broken and the ordering guards nothing, so both are pinned.
         """
-        src = read_code(UPDATE_PIPELINE_RS)
-        start = src.index("pub(crate) async fn prepare_and_pull_orchestrator_repo")
-        body = src[start : src.index("\nasync fn reconcile_and_pull", start)]
-        idx_prepare = body.index("stop_hub_and_rename_binaries_aside(")
-        idx_sequence = body.index("reconcile_and_pull(")
+        # Level 1 (RETARGETED v0.2.100, WP-03b): `prepare_and_pull_
+        # orchestrator_repo` is gone; the driver runs phase 5 (hub stop +
+        # renames) before phase 6 (the git operation) — behaviour-tested by
+        # `update_run::tests::pull_ff_runs_the_thirteen_phases_in_order` and,
+        # per kind, `merge_rebase_resume_run_the_one_pipeline`. Pinned here:
+        # the live phase-5 op IS the one home, and the pull the live phase-6
+        # op reaches is the sequence that reconciles (and renames nothing
+        # itself — it receives the renames).
+        run_src = read_code(UPDATE_RUN_RS)
+        drive = item_body(run_src, "async fn drive_phases<")
         self.assertLess(
-            idx_prepare,
-            idx_sequence,
-            "the hub stop + renames must precede the pull sequence",
+            drive.index("ops.stop_hub_and_rename("),
+            drive.index("ops.git_op("),
+            "the hub stop + renames must precede the git operation",
         )
+        live_rename = live_op(run_src, "    fn stop_hub_and_rename(")
+        self.assertIn("stop_hub_and_rename_binaries_aside(", live_rename)
+        pull = item_body(src := read_code(UPDATE_PIPELINE_RS), "pub(crate) async fn pull_to_upstream(")
+        self.assertIn("reconcile_and_pull(", pull)
+        self.assertNotIn("stop_hub_and_rename_binaries_aside(", pull)
 
         # Level 2: the one home really does all three, in order. Without this
         # the assertion above is satisfied by a call to an empty function.
         hstart = src.index("pub(crate) fn stop_hub_and_rename_binaries_aside")
-        home = src[hstart : src.index("\npub(crate) async fn prepare_and_pull", hstart)]
+        home = item_body(src[hstart:], "pub(crate) fn stop_hub_and_rename_binaries_aside")
         idx_stop = home.index("ensure_hub_stopped_for_update(")
         idx_hub = home.index("pre_pull_rename_vct_hub_binary(")
         idx_launcher = home.index("pre_pull_rename_running_binary(")
@@ -365,69 +452,75 @@ class Wi4SurfaceBParityTests(unittest.TestCase):
         self.assertIn("resolve_generated_files_to_upstream(", seq)
 
     def test_the_resync_surface_reaches_the_same_one_home(self) -> None:
-        """v0.2.95 phase 3 — `force_resync_launcher` was the surface with NO
-        hub handling at all, and its act is `git reset --hard`, which writes
+        """v0.2.95 phase 3 — the hard-reset rescue had NO hub handling at all,
+        and its act is `git reset --hard`, which writes
         `launcher/dist/<arch>/vct-hub{,.exe}` exactly as a pull would.
 
-        Pinned here because the same class of regression (a surface quietly
-        dropping the choreography) is what this file exists to catch. The
-        BEHAVIOURAL proof lives in
-        `self_update::tests::resync_hub_choreography` — two tests over a temp
-        clone with a redirected state dir, which assert that the hub stop's own
-        side effect (a stale `hub.pid` removed) is visible even when the reset
-        FAILS, i.e. that the stop preceded the write.
+        RETARGETED v0.2.100 (WP-03b): `force_resync_launcher` is gone; the
+        reset is `UpdateKind::ResetHard` of the ONE pipeline. The driver runs
+        the hub stop + renames (phase 5) before ANY kind's git operation, so
+        the claim now rests on two facts pinned here: the live phase-5 op
+        does not skip `ResetHard`, and a failed reset hands the restore to the
+        driver (`restored: false` → `abort_restore`, behaviour-tested by
+        `update_run::tests` "A git-op failure the pull sequence already
+        restored is NOT restored a second time" — both values).
         """
-        src = read_code(SELF_UPDATE_RS)
-        start = src.index("async fn stop_hub_then_hard_reset")
-        body = src[start : src.index("\n#[command]", start)]
-        idx_prepare = body.index("stop_hub_and_rename_binaries_aside(")
-        idx_reset = body.index('"reset", "--hard"')
+        src = read_code(UPDATE_RUN_RS)
+        live_rename = live_op(src, "    fn stop_hub_and_rename(")
+        self.assertIn("UpdateKind::ResetHard =>", live_rename)
+        self.assertNotIn("return", live_rename, "no kind may skip the hub stop + renames")
+        self.assertIn("stop_hub_and_rename_binaries_aside(", live_rename)
+
+        # v0.2.100 W3R-FIX: the body moved into the injectable `_with` variant
+        # (the wrapper only wires the real abort in).
+        reset = item_body(src, "pub(crate) async fn reset_hard_git_op_with<")
+        self.assertIn("restored: false,", reset)
         self.assertLess(
-            idx_prepare,
-            idx_reset,
-            "the resync must stop the hub and rename the binaries BEFORE it "
-            "hard-resets the tree",
+            reset.index("create_reset_backup("),
+            reset.index('"reset", "--hard"'),
+            "the local work is saved BEFORE the hard reset",
         )
-        self.assertIn(
-            "abort_update_restore_binaries_and_hub(",
-            body,
-            "a failed reset must put the binaries back and restart the hub it "
-            "stopped — otherwise a failed resync leaves a perma-stopped hub",
-        )
+        drive = item_body(src, "async fn drive_phases<")
+        self.assertIn("if !f.restored {", drive)
+        self.assertIn("ops.abort_restore(", drive)
 
-    def test_both_surfaces_use_the_shared_handoff_tail(self) -> None:
-        for path in (INSTALLER_RS, SELF_UPDATE_RS):
-            self.assertIn(
-                "stage_and_handoff_after_update(",
-                read(path),
-                f"{path.name} must route through the shared finalize tail",
-            )
-
-    def test_surface_b_exits_for_the_handoff_only_after_its_bookkeeping(self) -> None:
-        """Load-bearing ordering: exiting straight out of the staging call
-        would skip the desktop-shortcut / install-manifest / hardware-redetect
-        bookkeeping below it.
-
-        CORRECTED v0.2.95 phase 2: the reason used to be "unlike the installer
-        surface, this flow never runs install.py, so those updates are the ONLY
-        place the new version gets recorded". It usually DOES run install.py
-        now, and the manifest write below stands down when it did — install.py
-        records the version itself, truthfully. The ordering still matters for
-        the shortcut refresh and the hardware-redetect flag, which nothing else
-        writes, and for the manifest on the source-only paths.
+    def test_the_one_relaunch_uses_the_shared_handoff_tail(self) -> None:
+        """RETARGETED v0.2.100 (WP-03b) from
+        `test_both_surfaces_use_the_shared_handoff_tail`: there is one update
+        surface and one relaunch (`restart::relaunch`, phase 13). It must
+        route through the shared staging + handoff tail, and the pipeline's
+        live phase-13 op must reach it.
         """
-        src = read(SELF_UPDATE_RS)
-        start = src.index("async fn finish_apply_after_pull")
-        body = src[start : src.index("\n#[command]", start)]
-        idx_stage = body.index("stage_and_handoff_after_update(")
-        idx_manifest = body.index("refresh_install_manifest(")
-        idx_exit = body.index("if handoff.handoff_active {")
-        self.assertLess(idx_stage, idx_manifest)
-        self.assertLess(
-            idx_manifest,
-            idx_exit,
-            "the handoff exit must come AFTER the manifest/shortcut bookkeeping",
-        )
+        relaunch = item_body(read_code(RESTART_RS), "pub(crate) async fn relaunch<")
+        self.assertIn("stage_and_handoff_after_update(", relaunch)
+        live = live_op(read_code(UPDATE_RUN_RS), "    fn relaunch(")
+        self.assertIn("crate::commands::restart::relaunch(", live)
+
+    def test_the_handoff_exit_comes_only_after_the_bookkeeping(self) -> None:
+        """Load-bearing ordering: exiting for the Windows handoff must not
+        skip the desktop-shortcut / hardware-redetect bookkeeping.
+
+        RETARGETED v0.2.100 (WP-03b) from `test_surface_b_exits_for_the_
+        handoff_only_after_its_bookkeeping` (`finish_apply_after_pull`, gone).
+        The bookkeeping is phase 12 and the relaunch — the only place the
+        handoff exit happens — is phase 13; the ledger order is
+        behaviour-tested (`pull_ff_runs_the_thirteen_phases_in_order`). The
+        install-manifest half of the old claim is superseded: install.py is
+        now the only writer of `state/install-manifest.json`
+        (`manifest.rs`, "Bug G … RETIRED v0.2.100").
+        """
+        src = read_code(UPDATE_RUN_RS)
+        drive = item_body(src, "async fn drive_phases<")
+        # The advancing path's relaunch is the LAST `relaunch_phase(` call; the
+        # earlier one is the already-up-to-date leg, where nothing changed and
+        # the ledger records Bookkeeping as skipped ("nothing changed").
+        self.assertLess(drive.index("ops.bookkeeping("), drive.rindex("relaunch_phase("))
+        self.assertIn("ops.relaunch(", item_body(src, "async fn relaunch_phase<"))
+        live = live_op(src, "    fn bookkeeping(")
+        self.assertIn("refresh_desktop_shortcut(", live)
+        self.assertIn("mark_hardware_redetect_pending_after_update(", live)
+        relaunch = item_body(read_code(RESTART_RS), "pub(crate) async fn relaunch<")
+        self.assertIn("if handoff.handoff_active {", relaunch)
 
     def test_update_check_reconciles_at_rest(self) -> None:
         src = read(SELF_UPDATE_RS)
@@ -739,18 +832,16 @@ class FixRoundWiringTests(unittest.TestCase):
         self.assertIn("decide_at_rest_action(&verdict)", rec_body)
         self.assertIn("action == AtRestAction::StageAndArm", rec_body)
 
-    def test_minor1_self_update_checks_the_revert_outcome(self) -> None:
-        """MINOR-1: Surface B discarded the `RevertOutcome`, so an averted
-        clobber there produced no deferral, no audit row and no trace — while
-        the installer surface recorded both.
+    def test_minor1_the_one_pipeline_records_the_revert_outcome(self) -> None:
+        """MINOR-1: a surface once discarded the `RevertOutcome`, so an averted
+        clobber there produced no deferral, no audit row and no trace.
 
-        v0.2.95 phase 2 — the invariant is unchanged, its mechanism moved. The
-        revert now happens inside the shared pipeline's abort tail, which
-        RETURNS whether a clobber was averted; the pipeline carries that on the
-        error (`record_binary_clobber_averted`), and surface B writes the audit
-        row when rendering it, because the Db handle is the command's. So the
-        thing to assert is that surface B still reacts to the outcome rather
-        than dropping it on the floor — not that it holds a particular closure.
+        RETARGETED v0.2.100 (WP-03b) from `test_minor1_self_update_checks_the_
+        revert_outcome` (`self_update::render_pipeline_error`, gone). The ONE
+        rendering is `update_failure::from_pipeline_error`, which turns both
+        clobber-carrying classifications into the audit row (behaviour-tested
+        in `update_failure::tests`); pinned here is the half no unit test can
+        reach — the live git op PERSISTS those rows through the Db it holds.
         """
         pipeline = read_code(UPDATE_PIPELINE_RS)
         self.assertIn(
@@ -764,21 +855,19 @@ class FixRoundWiringTests(unittest.TestCase):
             "…and it must read the abort tail's outcome to know, not assume",
         )
 
-        src = read_code(SELF_UPDATE_RS)
-        start = src.index("async fn render_pipeline_error")
-        body = src[start:]
-        self.assertIn("record_binary_clobber_averted", body)
-        self.assertIn(
-            '"update_binary_clobber_averted"',
-            body,
-            "surface B must still write the audit row for an averted clobber",
-        )
+        failure = item_body(read_code(UPDATE_FAILURE_RS), "pub(crate) fn from_pipeline_error(")
         self.assertEqual(
-            body.count('"update_binary_clobber_averted"'),
+            failure.count("if record_binary_clobber_averted {"),
             2,
             "both clobber-carrying classifications (conflict and "
             "autostash-pop-after-success) must record it",
         )
+        self.assertIn('"update_binary_clobber_averted"', failure)
+
+        pull = item_body(read_code(UPDATE_RUN_RS), "async fn pull_ff_git_op<")
+        at = pull.index("update_failure::from_pipeline_error(err)")
+        self.assertIn("audit(rows)", pull[at : at + 200])
+        self.assertIn("db.audit(&op", pull)
 
 
 class Wi6CommentCorrectionTests(unittest.TestCase):

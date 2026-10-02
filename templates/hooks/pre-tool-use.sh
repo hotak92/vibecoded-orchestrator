@@ -42,7 +42,46 @@ fi
 # Resolve Python portably — bare `python3` is missing on Windows.
 # shellcheck source=_lib/find-python.sh disable=SC1091
 . "$(dirname "${BASH_SOURCE[0]}")/_lib/find-python.sh"
-[ -z "${PY:-}" ] && exit 0  # No Python — silent no-op (logging+guards skipped)
+if [ -z "${PY:-}" ]; then
+    # No Python: every branch below needs it to read the payload, so the hook
+    # is a silent no-op — EXCEPT for WebFetch (review R18F-08). The SSRF guard
+    # is Python (vco_lib.ssrf_url), so without an interpreter it cannot judge
+    # any URL, and a security guard that cannot run fails CLOSED: the tool
+    # name is read from the payload by pattern (no JSON parser needed) and
+    # every WebFetch is blocked with the fix named.
+    _NOPY_STDIN="$(cat 2>/dev/null || true)"
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"WebFetch"'; then
+        {
+            echo "🔒 SSRF guard: no Python interpreter was found, so WebFetch cannot be checked and is blocked."
+            echo "   This is a broken VCO install: put Python 3 on PATH (or re-run the orchestrator's install / update,"
+            echo "   which provides the VCO venv), then retry."
+        } >&2
+        exit 2
+    fi
+    # v0.2.100 WP-17: the Bash security scans (the injection regexes read the
+    # parsed command; .claude/scripts/bash_security.py IS Python) cannot run
+    # either — say so instead of skipping in silence. stderr every time (for
+    # the human); once per session (sentinel under .claude/state) a static
+    # additionalContext envelope so the MODEL can tell the user (PreToolUse
+    # stderr on exit 0 never reaches it). Non-blocking: blocking every Bash
+    # call would make a Python-less machine unusable, and the notice names the
+    # fix. MUST MATCH pre-tool-use.ps1's Write-VcoNoPythonNotice.
+    if printf '%s' "$_NOPY_STDIN" | grep -Eq '"tool_name"[[:space:]]*:[[:space:]]*"Bash"'; then
+        _NOPY_MSG="[VCO broken install] The Bash security scans (shell-injection guard + .claude/scripts/bash_security.py) did NOT run: no Python interpreter was found (python3 / python / py on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (python install.py --update in the orchestrator root, or the launcher's Update), then retry."
+        echo "$_NOPY_MSG" >&2
+        _NOPY_SID="$(printf '%s' "$_NOPY_STDIN" | grep -Eo '"session_id"[[:space:]]*:[[:space:]]*"[A-Za-z0-9_-]+"' | head -n 1 | sed 's/.*"\([A-Za-z0-9_-]*\)"$/\1/')"
+        [ -n "$_NOPY_SID" ] || _NOPY_SID="default"
+        _NOPY_ROOT="${CLAUDE_PROJECT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
+        _NOPY_SENTINEL="$_NOPY_ROOT/.claude/state/no_python_notice_$_NOPY_SID"
+        if [ ! -e "$_NOPY_SENTINEL" ]; then
+            mkdir -p "$_NOPY_ROOT/.claude/state" 2>/dev/null && : > "$_NOPY_SENTINEL" 2>/dev/null
+            # The message is a fixed ASCII literal with no quote or backslash,
+            # so it is embedded in the JSON as-is (no encoder available here).
+            printf '{"hookSpecificOutput": {"hookEventName": "PreToolUse", "additionalContext": "%s"}}\n' "$_NOPY_MSG"
+        fi
+    fi
+    exit 0
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -202,23 +241,50 @@ except Exception:
 if [[ "$TOOL_NAME" == "WebFetch" ]]; then
     URL=$(_get_field "url")
     if [[ -n "$URL" ]]; then
-        # Whitelisted local services (Weaviate, Ollama, code-embed, Gradio).
-        # SearXNG (:8888) and the mcp__search__fetch_page tool both
+        # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
+        # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
         # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
         # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
-        if echo "$URL" | grep -qE "(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))" 2>/dev/null; then
-            : # whitelisted — fall through
-        elif echo "$URL" | grep -qE "(localhost|127\.|10\.[0-9]+\.[0-9]+\.[0-9]+|172\.(1[6-9]|2[0-9]|3[01])\.[0-9]+\.|192\.168\.[0-9]+\.|169\.254\.[0-9]+\.|0\.0\.0\.0|::1)" 2>/dev/null; then
+        # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
+        # implementation for every OS; its docstring is the contract), run
+        # once through _lib/ssrf-allowlist.sh. The allowed pairs are DERIVED
+        # from the projected env, so a moved service_endpoints port is
+        # allowed and nothing asks the user to hand-edit this hook.
+        # FAIL CLOSED: only the exact words `allow` / `pass` let the call
+        # through. The lib missing (partial install), no interpreter, vco_lib
+        # not importable, or any other output blocks, and says why.
+        _SSRF_VERDICT=""
+        _SSRF_PAIRS=""
+        _SSRF_WHY="hooks/_lib/ssrf-allowlist.sh is missing — run the bundle update to restore it"
+        _SSRF_LIB="$SCRIPT_DIR/_lib/ssrf-allowlist.sh"
+        if [[ -f "$_SSRF_LIB" ]]; then
+            # shellcheck source=_lib/ssrf-allowlist.sh disable=SC1091
+            . "$_SSRF_LIB"
+            vco_ssrf_run "$URL" "$SCRIPT_DIR"
+            _SSRF_VERDICT="$_vco_ssrf_verdict"
+            _SSRF_PAIRS="$_vco_ssrf_pairs"
+            _SSRF_WHY="the guard could not run (${_vco_ssrf_err:-unrecognised answer '$_vco_ssrf_verdict'}) — a broken VCO install: re-run the orchestrator's update (\`python install.py --update\` in the orchestrator root, or the launcher's Update), which reinstalls vco_lib into the VCO venv"
+        fi
+        if [[ "$_SSRF_VERDICT" != allow && "$_SSRF_VERDICT" != pass ]]; then
             # Block messages route to stderr — see comment in bash-
             # security branch below for why (Claude Code drops plain
             # stdout from PreToolUse hooks).
             {
-                echo "🔒 SSRF guard: '$URL' targets a private/internal network address."
-                echo "   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)"
-                echo "   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.sh"
+                if [[ "$_SSRF_VERDICT" == block ]]; then
+                    echo "🔒 SSRF guard: '$URL' targets a private/internal network address (or one the guard cannot read)."
+                    echo "   Allowed local services on this machine: ${_SSRF_PAIRS:-none}"
+                    echo "   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port — a moved service is"
+                    echo "   changed with the launcher's Services page or \`python -m vco_lib.service_endpoints move\`, never by editing this hook."
+                else
+                    echo "🔒 SSRF guard: '$URL' was blocked because $_SSRF_WHY."
+                fi
             } >&2
-            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$URL\"}" >> "$SECURITY_LOG" 2>/dev/null || true
+            # JSON-escape `\` and `"` (the backslash URLs above are exactly
+            # what this line logs), as the .ps1 sibling does.
+            _SSRF_URL_ESC="${URL//\\/\\\\}"
+            _SSRF_URL_ESC="${_SSRF_URL_ESC//\"/\\\"}"
+            echo "{\"timestamp\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\",\"event\":\"ssrf_blocked\",\"url\":\"$_SSRF_URL_ESC\"}" >> "$SECURITY_LOG" 2>/dev/null || true
             exit 2
         fi
     fi
@@ -533,7 +599,21 @@ fi
 . "$SCRIPT_DIR/_lib/resolve-vco-venv.sh"
 resolve_vco_venv_python "$SCRIPT_DIR"
 VENV="${VCO_VENV_PYTHON:-}"
-RL_SCRIPT="$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root — locate it
+# there (same roots as the venv above), never under $PROJECT_ROOT. It still
+# runs with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's
+# KG + shared + granted collections apply (see resolve_vco_orchestrator_script).
+resolve_vco_orchestrator_script "$SCRIPT_DIR" "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path, so every existence check
+# below reads "not installed" exactly as before.
+RL_SCRIPT="${VCO_ORCHESTRATOR_SCRIPT:-$PROJECT_ROOT/claude_mcp_servers/scripts/rl_kg_search.py}"
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+export CLAUDE_PROJECT_DIR="$PROJECT_ROOT"
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .ps1 sibling).
+export VCO_RL_TASK_TYPE="pre_tool_use_kg_search"
 
 MATCHES=""
 MATCH_COUNT=0

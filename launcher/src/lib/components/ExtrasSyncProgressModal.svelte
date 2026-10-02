@@ -8,7 +8,10 @@
   //   3. Reindex after enable           — title "Re-syncing after re-enabling path"
   //
   // Behaviour per spec §14.4:
-  //   - Indeterminate spinner (analyzer doesn't emit progress today).
+  //   - Progress: v0.2.100 (F-W2-05) — a determinate bar + the analyzer's
+  //     current line, fed by the `vct-codegraph-extras-progress` events the
+  //     parent panel folds into `progress` (see `extras-sync-progress.ts`).
+  //     Until the first event arrives the indeterminate spinner shows.
   //   - "Hide" button minimises to a top-right status pill that re-opens
   //     the modal on click. State (running / failed / succeeded) is
   //     mirrored in the pill so the user can see at a glance.
@@ -22,6 +25,7 @@
   // syncExtraPath vs reindexAfterExtrasChange on retry).
 
   import DialogRoot from '$lib/components/DialogRoot.svelte';
+  import { progressPercent, type ExtrasSyncProgress } from './extras-sync-progress';
 
   export type SyncModalState = 'running' | 'succeeded' | 'failed';
 
@@ -40,6 +44,9 @@
     onRetry,
     /** Click handler for "Close" + the minimised pill close. */
     onClose,
+    /** Latest analyzer progress for the running op (null until the first
+     *  event). */
+    progress = null,
   }: {
     open?: boolean;
     title: string;
@@ -48,6 +55,7 @@
     errorMessage?: string | null;
     onRetry?: () => void;
     onClose: () => void;
+    progress?: ExtrasSyncProgress | null;
   } = $props();
 
   // Minimised state — when true the modal closes itself and the parent
@@ -93,7 +101,25 @@
     <div class="extras-sync-body">
       <p class="extras-sync-text">{bodyText}</p>
 
-      {#if phase === 'running'}
+      {#if phase === 'running' && progress}
+        <div
+          class="extras-sync-bar"
+          role="progressbar"
+          aria-label="Analyzing"
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-valuenow={progressPercent(progress)}
+        >
+          <div class="extras-sync-bar-fill" style={`width: ${progressPercent(progress)}%`}></div>
+        </div>
+        <p class="extras-sync-line" aria-live="polite">
+          {progressPercent(progress)}% — {progress.line}
+        </p>
+        <p class="extras-sync-hint">
+          You can hide this dialog and keep working; the sync runs in the
+          background.
+        </p>
+      {:else if phase === 'running'}
         <div
           class="extras-sync-spinner"
           role="status"
@@ -200,6 +226,23 @@
   .extras-sync-error p {
     margin: 4px 0 0;
     font-size: 12px;
+    word-break: break-word;
+  }
+  .extras-sync-bar {
+    height: 6px;
+    background: rgba(255, 255, 255, 0.08);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .extras-sync-bar-fill {
+    height: 100%;
+    background: rgb(0, 191, 166);
+    transition: width 0.2s ease;
+  }
+  .extras-sync-line {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: #bbb;
     word-break: break-word;
   }
   .extras-sync-spinner {

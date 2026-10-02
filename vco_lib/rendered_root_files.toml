@@ -52,10 +52,17 @@
 #     only the text BETWEEN them is replaced; everything outside is the user's
 #     and is preserved. A target file without both markers is rewritten whole
 #     (the markers are the "preserve me" contract).
-#   * `substitutions` - placeholder names the renderer resolves in the template
-#     body (written `{{NAME}}` there). A name no renderer knows makes that
-#     entry FAIL loudly (printed + logged, nothing written) - the renderer
-#     never writes a file carrying an unresolved placeholder.
+#   * `substitutions` - the placeholder names this entry may use in its
+#     template body (written `{{NAME}}` there); every name must be a key of
+#     the ONE materializer registry (`vco_lib/materialize.py`, v0.2.100). A
+#     name that is not listed here, not in the registry, or has no value on
+#     this machine does NOT fail the install (owner rule 2026-09-30): the file
+#     is written with the token left in place, a warning goes to stderr, and a
+#     `template_placeholder_unrendered_<file>` deferral row names it until a
+#     clean render clears it. A rendered path that does not exist gets the
+#     sibling `template_path_missing_<file>` row. The render-every-template
+#     gate (`tests/test_template_materialization_complete.py`) keeps a shipped
+#     entry from ever relying on that fallback.
 #   * `state_file` - where the launcher's pre-pull reconcile records what it
 #     did, and where install.py's renderer reads it back to emit the
 #     `rendered_file_upstream_changed` deferral row. Both sides take the path
@@ -66,7 +73,8 @@
 #
 # The three sibling tables there (`bundled_mcp_versions.toml`,
 # `mcp_scan_rules.toml`, `deferral_conditions.toml`) are whitelisted so the
-# copy-based `update_orchestrator_at` path propagates table edits. This one is
+# copy-based install path (`copy_orchestrator_to_sync`; until v0.2.100 also
+# the retired `update_orchestrator_at`) carries table edits. This one is
 # not, on purpose: that path copies no `vco_lib/*.py`, so a whitelisted table
 # could arrive NEWER than the `rendered_root_files.py` that reads it, and a
 # format-version mismatch is a loud RuntimeError that would stop CLAUDE.md being
@@ -91,4 +99,7 @@ path = "CLAUDE.md"
 template = "templates/ORCHESTRATOR-CLAUDE.md.template"
 begin_marker = "<!-- BEGIN: AUTO"
 end_marker = "<!-- END: AUTO -->"
-substitutions = ["ORCHESTRATOR_ROOT"]
+substitutions = [
+  "ORCHESTRATOR_ROOT", "VENV_PYTHON", "WEAVIATE_URL", "WEAVIATE_GRPC_PORT",
+  "OLLAMA_URL", "CODE_EMBED_URL", "HUB_PORT",
+]

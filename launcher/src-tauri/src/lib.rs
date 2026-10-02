@@ -737,6 +737,20 @@ pub fn run() {
         tracing::warn!("[vct] warning: ensure_orchestrator_root failed: {}", e);
     }
 
+    // v0.2.100 (F-W1-06, AD-2): prime the install-root PROCESS cache while
+    // launcher.db is known-good. The resolvers answer from that cache while
+    // `install.py --update` holds the DB (standby) and never touch the DB
+    // then; a launcher whose first resolution happened DURING an update would
+    // otherwise have nothing to answer with. Read-mostly: the only write is
+    // the sticky DB cache on an exe-walk hit, exactly as any later call.
+    match commands::installer::resolve_orchestrator_root(&db_handle) {
+        Some(root) => tracing::info!("[vct] install root: {}", root.display()),
+        None => tracing::warn!(
+            "[vct] install root not resolvable at boot (no launcher.db install path and no \
+             orchestrator clone above the running binary)"
+        ),
+    }
+
     // v0.2.92 WP-11: seed the chat-model context table from the ONE shipped
     // seed file when it is empty, then export it to
     // `<vct_root>/model-gateway/chat_model_context.json`.
@@ -912,9 +926,10 @@ pub fn run() {
             // returns an error — at worst PATH is left unchanged.
             vct_launcher_core::services::runtime::augment_path_for_graphical_launch();
 
-            // Windows-only: clean up the previous launcher's .old.exe
-            // left behind by `apply_launcher_update`'s rename-then-build
-            // workaround for the running-binary lock. Best effort —
+            // Windows-only: clean up a previous launcher's .old.exe left
+            // behind by the (pre-v0.2.100) self-update's rename-then-build
+            // workaround for the running-binary lock — an upgraded install
+            // may still carry one. Best effort —
             // silently swallow errors (file missing, still locked, etc).
             #[cfg(windows)]
             {
@@ -926,7 +941,7 @@ pub fn run() {
 
             // v0.2.17 (plan 0.0): cross-OS sweep of stale `<binary>.old-<pid>`
             // and `<binary>.pending-<pid>` siblings left behind by the
-            // pre-pull-rename path in `update_orchestrator` (Windows path)
+            // pre-pull-rename path of the update pipeline (Windows path)
             // or a failed-to-revert pull on any OS. Per file:
             //   1. Parse the pid suffix.
             //   2. Check whether that PID is still alive.
@@ -960,7 +975,7 @@ pub fn run() {
             // recovery probe for the Windows stage1 updater handoff.
             //
             // On Windows, `prepare_windows_update_handoff` (invoked by
-            // the prior launcher process during update_orchestrator)
+            // the prior launcher process during its update's relaunch)
             // writes `~/.vct/update.lock.json` and spawns vct-updater.exe
             // to perform the binary swap. The updater deletes the lock
             // file when it completes successfully.
@@ -1393,8 +1408,8 @@ pub fn run() {
 
             // v0.2.34 (Agent B): if the previous launcher process flagged
             // the next boot as "needs a fresh hardware redetect" (set by
-            // `self_update::finish_apply_after_pull` right before
-            // restart), consume the flag here and spawn a background
+            // the update pipeline's bookkeeping, phase 12 of
+            // `update_run::run_update`, right before restart), consume the flag here and spawn a background
             // redetect job. Catches v0.2.20-style schema gaps where a
             // newly-shipped field needs to be backfilled on the user's
             // existing snapshot. Soft-fails — the manual Preferences
@@ -2692,7 +2707,6 @@ pub fn run() {
             // Python verbs that change them (candidates / adopt /
             // use-vco-copy / hand-to-vco). The services.toml adoption
             // commands and the container picker are retired.
-            commands::lifecycle::services_get_endpoints,
             commands::lifecycle::services_endpoint_candidates,
             commands::lifecycle::services_endpoint_action,
             // Container-runtime install (no-runtime modal). Linux uses
@@ -2743,7 +2757,6 @@ pub fn run() {
             commands::projects_v2::get_shared_kg_read_disabled_cmd,
             // Deprecated alias — delegates to set_shared_kg_write_disabled,
             // logs a deprecation warning. Slated for removal ~2026-08.
-            commands::projects_v2::set_shared_kg_opt_out,
             // P1-D (2026-05-08): re-run env writers for a project so the
             // current state of the launcher's access matrix lands in the
             // 3 surfaces. Auto-invoked by access-matrix setters; FE may
@@ -2753,7 +2766,6 @@ pub fn run() {
             // boundary — re-renders `.claude/env` + `.claude/settings.json`
             // for every project so the canonical orchestrator-root
             // resolver's newly-warm DB cache propagates everywhere.
-            commands::projects_v2::refresh_all_projects_env,
             commands::projects_v2::switch_project_host_v2,
             // v0.2.92 WP-17 (W3) — change a registered project's folder.
             // `preview_` is read-only and MUST be called first: the modal
@@ -2833,7 +2845,6 @@ pub fn run() {
             // lifecycle (Phase 1E) + weights-update polling (Phase 3C)
             // + fine-tune-after-download (Phase 4A) + dashboard widget
             // (Phase 4B scaffolding). Wired commands:
-            commands::module_service::rl_is_container_running,
             commands::module_service::restart_rl_container,
             // NEW-3 (2026-05-28): generic start for service/container modules
             // whose container_name is NULL (auto-start was skipped).
@@ -2893,7 +2904,6 @@ pub fn run() {
             commands::orchestrator_core::kg_check_duplicates,
             commands::orchestrator_core::code_graph_reanalyze_current,
             commands::orchestrator_core::code_graph_prune_stale,
-            commands::orchestrator_core::orchestrator_health_check,
             commands::orchestrator_core::orchestrator_open_logs,
             // v0.2.24.1 (A0bis): "Clone integrity" tab — root-clone-only
             // affordances. Re-detect orchestrator root + Validate clone
@@ -2981,7 +2991,6 @@ pub fn run() {
             // for `runtime.update_endpoint` itself is deferred to v0.2.32 —
             // only the manual apply / seen / mark-seen Tauri entries are
             // wired here. See `commands/module_deprecation.rs`.
-            commands::module_deprecation::apply_deprecation_state,
             commands::module_deprecation::has_module_deprecation_been_seen,
             commands::module_deprecation::mark_module_deprecation_seen,
             // v0.2.31: module-shipped DB migrations. Manual-repair
@@ -2991,7 +3000,6 @@ pub fn run() {
             // installer_engine's run_install / run_upgrade — these
             // commands are for the GUI / dashboard manual paths.
             commands::module_db::apply_module_db_migrations,
-            commands::module_db::issue_module_access_token,
             // Retrieval tuning (v0.2.22 Item #13 — 2026-05-20).
             // Global thresholds for score-driven retrieval verbosity
             // (KG tier cutoffs) + codegraph injection floor. Backed by
@@ -3004,7 +3012,6 @@ pub fn run() {
             // Per-project orchestrator state (agents/skills/hooks/permissions/secrets/KG/codegraph)
             commands::project_state_cmd::list_project_agents,
             commands::project_state_cmd::list_project_skills,
-            commands::project_state_cmd::list_project_hooks,
             commands::project_state_cmd::list_project_permissions,
             commands::project_state_cmd::list_project_secret_refs,
             commands::project_state_cmd::get_project_state_snapshot,
@@ -3050,6 +3057,7 @@ pub fn run() {
             commands::model_gateway::model_gateway_clear_default_model,
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
+            commands::model_gateway::model_gateway_agents_gate,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::gateway_usage::model_gateway_usage_windows,
@@ -3066,7 +3074,6 @@ pub fn run() {
             commands::project_state_cmd::delete_project_codegraph_binding,
             // Per-project MCP servers (migration 010 — Custom MCP tab feed).
             commands::project_state_cmd::list_project_mcp_servers,
-            commands::project_state_cmd::list_user_added_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
             // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
@@ -3095,7 +3102,6 @@ pub fn run() {
             // just diagrams — gets the same surface.
             commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
-            commands::diagrams_cmd::list_project_modules,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no
@@ -3124,6 +3130,8 @@ pub fn run() {
             commands::module_enabled::module_is_global_enabled,
             commands::module_enabled::module_effective_enabled,
             commands::module_enabled::rl_events_count,
+            // v0.2.100 W5R-02: the RL scoring lock every RL scoring control renders.
+            commands::module_enabled::rl_scoring_lock,
             // Phase 1.5.7 wire-up: DiagramsTab calls
             // `is_project_module_active` on mount to decide whether to
             // render the diagrams UI or the "module disabled" overlay.
@@ -3146,7 +3154,6 @@ pub fn run() {
             // alongside the existing text-only one.
             commands::diagrams_cmd::open_diagrams_editor,
             commands::diagrams_cmd::open_diagram_editor_for_path,
-            commands::diagrams_cmd::get_diagrams_token,
             // PR-6 (v0.2.11): per-project .claude/env key reader+writer
             // (backs the HooksTab VCO_LEAN_CTX_DEFAULT toggle).
             commands::claude_env::get_claude_env_value,
@@ -3154,18 +3161,13 @@ pub fn run() {
             // C8 wire-up (2026-05-25): read-only process env lookup, with
             // a credential-name blocklist. DiagramsTab calls this for the
             // Wayland-fallback decision (XDG_SESSION_TYPE).
-            commands::env_cmd::read_env_var,
             // Secrets + settings
             commands::secrets_cmd::set_secret_v2,
             commands::secrets_cmd::clear_secret_v2,
             commands::secrets_cmd::reactivate_secret_v2,
             commands::secrets_cmd::remove_secret_v2,
-            commands::secrets_cmd::is_secret_set,
             commands::secrets_cmd::get_secret_status_v2,
             commands::secrets_cmd::get_secret_preview,
-            commands::secrets_cmd::get_setting_v2,
-            commands::secrets_cmd::set_setting_v2,
-            commands::secrets_cmd::list_module_settings_v2,
             // 0.2.1 grants & per-requester pause API
             commands::secrets_cmd::grant_secret,
             commands::secrets_cmd::revoke_secret_grant_cmd,
@@ -3194,7 +3196,6 @@ pub fn run() {
             commands::projects_v2::update_all_projects,
             // Licensing
             commands::licensing::license_get_tier,
-            commands::licensing::license_is_admin,
             commands::licensing::license_refresh,
             commands::licensing::license_activate,
             commands::licensing::license_deactivate,
@@ -3218,7 +3219,6 @@ pub fn run() {
             // UX flows through the License Manager modal go through
             // these commands.
             commands::licensing::list_license_keys,
-            commands::licensing::get_module_license_key_status,
             commands::licensing::set_module_license_key,
             commands::licensing::clear_module_license_key,
             commands::licensing::validate_module_license,
@@ -3242,8 +3242,6 @@ pub fn run() {
             // single-row UX. KEEP: deliberately post-v1 surface.
             commands::codegraph::codegraph_list_access,
             commands::codegraph::codegraph_grant_access,
-            commands::codegraph::codegraph_check_access,
-            commands::codegraph::codegraph_summary,
             // v0.2.72 (P1/P5): codegraph retrieval floors (machine-global) +
             // per-project .claude-index toggle. Registered by the integrator.
             commands::codegraph_settings::get_codegraph_floors,
@@ -3281,7 +3279,6 @@ pub fn run() {
             commands::installer::get_installed_version,
             commands::installer::check_for_updates,
             commands::installer::install_orchestrator,
-            commands::installer::preview_install,
             commands::installer::detect_existing_install_root,
             // Bug A (v0.2.5): path-agnostic install discovery. FE's
             // `checkStatus()` calls this BEFORE falling back to
@@ -3310,8 +3307,9 @@ pub fn run() {
             // Diagnostics panel. Pull-only: the FE invokes on demand.
             commands::installer::read_install_log,
             // TODO(safety): wire preflight_install_safety_check to the
-            //   OnboardingWizard's confirm-step. Currently `preview_install`
-            //   covers the diff-mode path; preflight returns the richer
+            //   OnboardingWizard's confirm-step (owner-deferred to v0.2.102).
+            //   `install_orchestrator` runs `diff_install` itself and refuses
+            //   with `InstallConflictError`; preflight returns the richer
             //   SafetyReport (volumes, collections, services classification)
             //   and should run before clicking Install on a fresh path.
             commands::installer::preflight_install_safety_check,
@@ -3324,7 +3322,6 @@ pub fn run() {
             // allowlist enforced in storage_ux::is_recognized_legacy_volume.
             commands::storage_ux::get_storage_config,
             commands::storage_ux::set_storage_config,
-            commands::storage_ux::detect_legacy_volumes,
             commands::storage_ux::migrate_to_named_volume,
             commands::storage_ux::migrate_to_bind_path,
             // v0.2.34 (Agent I): read-only resolver for the launcher's
@@ -3332,33 +3329,20 @@ pub fn run() {
             // discoverability surface (renders the resolved path +
             // tooltip explaining VCT_STATE_DIR override).
             commands::storage_ux::get_resolved_vct_root_dir,
-            commands::installer::update_orchestrator,
-            // v0.2.23 (B4 / D19): divergence-recovery commands for
-            // update_orchestrator. When the user's local clone has
-            // diverged from upstream (typical: local edits to
-            // CLAUDE.md, CONTEXT_STATE.md, KG nodes), `git pull
-            // --ff-only` fails. update_orchestrator surfaces a
-            // structured "orchestrator_update_non_ff" error; the
-            // frontend then offers Merge / Rebase / Cancel. These
-            // three commands are the resolvers.
-            commands::installer::merge_orchestrator_with_upstream,
-            commands::installer::rebase_orchestrator_onto_upstream,
+            // v0.2.23 (B4 / D19): when an update hits a diverged clone the
+            // frontend offers Merge / Rebase / Cancel — since v0.2.100 those
+            // are kinds of `run_orchestrator_update`; abort stays its own
+            // command (it touches no install, only the stalled git state).
             commands::installer::abort_orchestrator_merge_or_rebase,
             // v0.2.93 (field incident 2026-09-07): reopen the conflict modal
             // on a STALLED merge/rebase after a launcher restart. Pairs with
             // `UpdateStatus::merge_in_progress`; read-only.
             commands::installer::get_pending_conflict_payload,
-            // v0.2.51 Bug A: resume an orchestrator-update flow that
-            // halted at a merge/rebase conflict. The user resolved the
-            // conflict in their editor (or via CLI) and the launcher
-            // re-enters the post-pull tail (install.py --update + binary
-            // refresh + auto-restart). Without this, the modal's
-            // "Resolve manually" path silently abandoned the update.
-            commands::installer::resume_orchestrator_update,
             // v0.2.52 V52-B: one-click conflict resolution from the
             // OrchestratorUpdateConflictModal. "Keep local" runs
             // `git checkout --ours` on every conflicted file then
-            // commits + delegates to resume_orchestrator_update.
+            // commits + continues through `run_orchestrator_update`'s
+            // `Resume` kind (v0.2.100), handing over its claim.
             // "Accept upstream" is the symmetric `--theirs` variant.
             // Orientation flips between merge and rebase — the helper
             // `resolve_checkout_flag` in installer.rs handles that.
@@ -3368,29 +3352,20 @@ pub fn run() {
             // enriched orchestrator_untracked_collision modal. Deletes
             // byte-identical colliding untracked files, backs up + deletes
             // divergent ones (to .claude/state/update-collision-backups-<ts>/),
-            // then re-enters update_orchestrator. Refuses tracked / out-of-root
-            // paths; per-file soft-fail.
+            // then re-runs the update (`PullFf`, claim handed over). Refuses
+            // tracked / out-of-root paths; per-file soft-fail.
             commands::installer::resolve_untracked_collision_and_retry,
             // v0.2.88 (DEFECT 2 / FIELD DEFECT): "keep updated / keep local"
             // resolver for the orchestrator_autostash_pop_conflict modal. The
             // merge succeeded but the --autostash pop of local WIP conflicted;
             // this resolves each file (checkout --ours/--theirs, backing up the
             // updated version first for keep-local), drops the stash, then
-            // delegates to resume_orchestrator_update to finish install.py.
+            // finishes through the `Resume` kind (install.py etc.).
             commands::installer::resolve_autostash_pop_and_retry,
-            // v0.2.16 (W4 / 0.5): apply_pending_install resolves the
-            // "Pulled-but-not-installed" banner state (source updated
-            // via `git pull` outside the launcher; install-manifest
-            // still records the previous version). Runs install.py
-            // --update WITHOUT a preceding git pull. Distinct from
-            // update_orchestrator (git pull + install) so we don't
-            // waste ~30s pulling an already-current source tree.
-            commands::installer::apply_pending_install,
             commands::installer::get_local_repo_source,
             commands::installer::inspect_orchestrator_at,
             commands::installer::inspect_project_leftovers,
             commands::installer::detect_third_party_project_signals,
-            commands::installer::update_orchestrator_at,
             // GitHub PAT lifecycle. `register_github_pat` is wired in the
             // OnboardingWizard (Bug 22) for first-run capture, AND in the
             // /preferences "GitHub access token" section for ongoing
@@ -3444,8 +3419,6 @@ pub fn run() {
             commands::kg::kg_set_node_access_bulk,
             commands::kg::kg_ensure_node_access_schema,
             // Codegraph — graph viz (v1.1)
-            commands::codegraph::codegraph_load_graph,
-            commands::codegraph::codegraph_set_entity_access_bulk,
             // Codegraph — Gap 2: initial build status + manual rebuild
             commands::codegraph::get_code_graph_build_status,
             commands::codegraph::rebuild_code_graph,
@@ -3573,10 +3546,6 @@ pub fn run() {
             // Dashboard: tier, features, MCP management
             commands::dashboard::get_feature_flags,
             commands::dashboard::get_orchestrator_config,
-            // TODO(v1.x): wire save_orchestrator_config to a Settings UI
-            //   "Save" button. update_orchestrator_setting handles the
-            //   per-key path; this command is the bulk-write counterpart.
-            commands::dashboard::save_orchestrator_config,
             commands::dashboard::update_orchestrator_setting,
             commands::dashboard::get_mcp_servers,
             commands::dashboard::toggle_mcp_server,
@@ -3587,8 +3556,14 @@ pub fn run() {
             commands::audit::list_audit_events,
             // Launcher self-update (git-pull based, daily check)
             commands::self_update::check_for_launcher_update,
-            commands::self_update::apply_launcher_update,
-            commands::self_update::force_resync_launcher,
+            // v0.2.100 (AD-1): THE orchestrator update — every kind
+            // (PullFf, Merge, Rebase, Resume, ApplyOnly, ResetHard), one
+            // pipeline. The per-surface commands it replaced (update_
+            // orchestrator, merge_/rebase_/resume_*, apply_pending_install,
+            // apply_launcher_update, force_resync_launcher, update_
+            // orchestrator_at) were removed in WP-03b once the invoke census
+            // (`update-invoke-census.test.ts`) showed no caller.
+            commands::update_run::run_orchestrator_update,
             // v0.2.92 WP-13: the ONLY path-less `git checkout <branch>` in
             // the launcher. Before it existed there was no in-GUI way out of
             // a detached HEAD at all — every other checkout in this codebase
@@ -3599,10 +3574,6 @@ pub fn run() {
             commands::self_update::reattach_orchestrator_branch,
             commands::self_update::get_user_owned_paths,
             commands::self_update::get_cached_update_status,
-            // v0.2.93: repo-aware cached status for the Updates page only
-            // (async; the sync `get_cached_update_status` stays a pure file
-            // read for the tray).
-            commands::self_update::get_cached_update_status_refreshed,
             commands::self_update::set_auto_check_enabled,
             commands::self_update::get_auto_check_enabled,
             // v0.2.35 (Agent K): running-version display + post-update
@@ -3670,7 +3641,7 @@ pub(crate) use vct_launcher_core::process::pid_is_alive;
 /// v0.2.17 (plan 0.0): sweep stale `<binary>.old-<pid>` and
 /// `<binary>.pending-<pid>` siblings from the launcher dist
 /// directory. These are left behind by the pre-pull-rename path in
-/// `update_orchestrator` (Windows) or a failed-revert path on any
+/// the update pipeline (Windows) or a failed-revert path on any
 /// OS. The PID suffix is parsed; files whose PID is no longer alive
 /// are deleted. Files with malformed names, unparseable PIDs, or
 /// alive PIDs are skipped.

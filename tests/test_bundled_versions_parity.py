@@ -170,9 +170,9 @@ class BundledVersionsParityTests(unittest.TestCase):
 
     def test_self_reference_in_managed_paths(self) -> None:
         """`bundled_mcp_versions.toml` is listed in
-        `orchestrator-managed-paths.txt` so `update_orchestrator_at`
-        propagates new editions of the manifest into every existing
-        install. Without this, a v0.3.0 bump to the pinned versions
+        `orchestrator-managed-paths.txt` so a copy install
+        (`install_orchestrator`) carries new editions of the manifest
+        along. Without this, a v0.3.0 bump to the pinned versions
         would never reach users who installed before v0.3.0."""
         managed_paths_file = REPO_ROOT / "orchestrator-managed-paths.txt"
         self.assertTrue(managed_paths_file.is_file())
@@ -192,8 +192,8 @@ class BundledVersionsParityTests(unittest.TestCase):
         self.assertTrue(
             present,
             "`vco_lib/bundled_mcp_versions.toml` must appear in "
-            "`orchestrator-managed-paths.txt` so `update_orchestrator_at` "
-            "propagates manifest edits to existing installs.",
+            "`orchestrator-managed-paths.txt` so a copy install carries "
+            "manifest edits along.",
         )
 
 

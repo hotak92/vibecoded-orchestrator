@@ -103,7 +103,15 @@ _ANALYZER = REPO_ROOT / "templates" / "scripts" / "analyze_code_graph.py"
 # bare `import weaviate` unused (−1 at merge) → 7223, and the maximum moved
 # down with it, as this ratchet's rule demands. This is the ONE pin:
 # tests/test_v0292_n35_rewire_transform.py::TestTheRatchetHeld imports it.
-_ANALYZER_LINES_MAX = 7223
+# v0.2.100: the --incremental deleted-file prune ADDS a per-root step; it was
+# answered by EXTRACTION — the drain's `_prune_deleted_file_objects` body and
+# the new git-diff pass both live in `vco_lib/codegraph_deleted_files.py`
+# (one deleted-file prune, two thin shims here). Net 7220 -> 7196, re-pinned
+# DOWNWARD to the measured value. The follow-up `--as-extra-path` ownership
+# guard added lines too; answered by moving `_filter_changed_files` into the
+# same module (it shares the diff-range rule with the deleted-file pass) —
+# net 7196 -> 7157.
+_ANALYZER_LINES_MAX = 7157
 
 
 def _measure() -> int:

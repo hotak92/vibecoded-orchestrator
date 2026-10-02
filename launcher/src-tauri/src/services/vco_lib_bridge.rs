@@ -66,10 +66,9 @@
 //!     `adopt` / `use-vco-copy` / `hand-to-vco` verbs — the
 //!     `service_endpoints` rows' one writer).
 
-use std::io::{Read as _, Write as _};
 use std::path::Path;
-use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::process::Command;
+use std::time::Duration;
 
 use vct_launcher_core::db::Db;
 use vct_launcher_core::process::CommandExt as _;
@@ -129,12 +128,19 @@ pub fn reinject_minimal_env(cmd: &mut Command) {
 }
 
 /// Resolve the orchestrator clone root for a `vco_lib` spawn, DB-cache
-/// first. Thin pass-through to the canonical Rust resolver so bridge
-/// callers don't each reach into `commands::installer`.
+/// first. Thin pass-through to the canonical Rust resolver
+/// (`commands::installer::resolve_orchestrator_root` →
+/// `vct_launcher_core::services::install_root`) so bridge callers don't each
+/// reach into `commands::installer`.
 ///
-/// Returns `None` for a standalone binary with no discoverable clone —
-/// callers should then OMIT any `--orchestrator-root` flag (the Python
-/// CLI defaults it to `None`), never pass an empty string.
+/// v0.2.100 WP-02 (L2-F07): inside the `install.py --update` window this
+/// answers from the process-level cache (set at every good launcher.db read)
+/// instead of walking-or-None, so a Python child spawned during the window
+/// gets the SAME `--orchestrator-root` it would get outside it.
+///
+/// Returns `None` only when no clone is discoverable at all — callers should
+/// then OMIT any `--orchestrator-root` flag (the Python CLI defaults it to
+/// `None`), never pass an empty string.
 pub fn resolve_orchestrator_root(db: &Db) -> Option<std::path::PathBuf> {
     crate::commands::installer::resolve_orchestrator_root(db)
 }
@@ -254,6 +260,48 @@ pub fn strip_proven_secret_values(
         .arg("--project-folder")
         .arg(project_folder);
     run_vco_lib_json(cmd, &python, root, project_folder, "", parse_ok_reply)
+}
+
+/// Bound on one `vco_lib.git_bundle_backup create` (two git steps, each
+/// bounded at 600 s on the Python side).
+const BUNDLE_BACKUP_TIMEOUT: Duration = Duration::from_secs(1260);
+
+/// v0.2.100 F-W3-13: save `refs` of `repo` to `<backups_dir>/<name>` and
+/// VERIFY it — `python -m vco_lib.git_bundle_backup create --json`, the ONE
+/// home of the create + verify + partial-cleanup sequence (also called by
+/// `vco_lib.hard_cut`). `refs` are `git bundle create` rev-list arguments
+/// (branch names, `^<excluded>`). `Ok(path)` only for a bundle that exists
+/// and verifies; on `Err` the helper already removed any partial file.
+/// Blocking (bounded): an async caller runs it through `spawn_blocking`.
+pub fn create_verified_bundle(
+    repo: &Path,
+    backups_dir: &Path,
+    name: &str,
+    refs: &[&str],
+) -> Result<std::path::PathBuf, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.git_bundle_backup")
+        .arg("create")
+        .arg("--repo")
+        .arg(repo)
+        .arg("--dir")
+        .arg(backups_dir)
+        .arg("--name")
+        .arg(name)
+        .arg("--json");
+    for r in refs {
+        // `--ref=<value>`: a value starting with `-` (`--all`) must not be
+        // read as an option.
+        cmd.arg(format!("--ref={r}"));
+    }
+    let reply = run_vco_lib_json_with_timeout(cmd, &python, Some(repo), repo, "", BUNDLE_BACKUP_TIMEOUT, parse_ok_reply)?;
+    reply
+        .get("path")
+        .and_then(serde_json::Value::as_str)
+        .map(std::path::PathBuf::from)
+        .ok_or_else(|| "git_bundle_backup reported success without a path".to_string())
 }
 
 /// v0.2.97: the env objects of each folder's JSON env surfaces
@@ -875,55 +923,26 @@ fn run_vco_lib_collect(
         cmd.env("VCT_STATE_DIR", &state);
     }
     cmd.current_dir(vco_lib_cwd(root, project_folder));
-    cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("settings editor: spawn failed (python={}): {}", python.display(), e))?;
-
-    let drain = |pipe: Option<Box<dyn std::io::Read + Send>>| {
-        std::thread::spawn(move || {
-            let mut buf = Vec::new();
-            if let Some(mut p) = pipe {
-                let _ = p.read_to_end(&mut buf);
-            }
-            buf
-        })
-    };
-    let out_reader = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
-    let err_reader = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn std::io::Read + Send>));
-    let stdin_error = child.stdin.take().and_then(|mut sink| sink.write_all(body.as_bytes()).err());
-    // `sink` is dropped above: the child reads stdin to EOF.
-
-    let deadline = Instant::now() + timeout;
-    let mut success = false;
-    let timed_out = loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                success = status.success();
-                break false;
-            }
-            Ok(None) if Instant::now() >= deadline => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break true;
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(20)),
-            Err(e) => {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!("settings editor: wait failed: {}", e));
-            }
+    // The ONE bounded runner (v0.2.100 F-W4-05): stdin written then closed,
+    // both pipes drained while the child runs, killed at the deadline.
+    let done = match vct_launcher_core::process::output_bounded(&mut cmd, Some(body.as_bytes()), timeout) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!("settings editor: spawn failed (python={}): {}", python.display(), e))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "settings editor: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("settings editor: wait failed: {}", e))
         }
     };
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
-    if timed_out {
-        return Err(format!(
-            "settings editor: timed out after {} s. stderr: {}",
-            timeout.as_secs(),
-            String::from_utf8_lossy(&stderr).trim()
-        ));
-    }
+    let (success, stdout, stderr, stdin_error) =
+        (done.status.success(), done.stdout, done.stderr, done.stdin_error);
     Ok(VcoLibRun { success, stdout, stderr, stdin_error })
 }
 
@@ -1167,7 +1186,7 @@ mod tests {
             "import sys; sys.stdin.read(); sys.stderr.write('x' * 400000); \
              sys.stderr.flush(); print('{\"ok\": true, \"written\": [\"A\"]}')",
         );
-        let started = Instant::now();
+        let started = std::time::Instant::now();
         let out = run_env_block_command(cmd, &python, None, &std::env::temp_dir(), "{}", "written");
         assert_eq!(out, Ok(vec!["A".to_string()]));
         assert!(started.elapsed() < Duration::from_secs(20), "must not ride the deadline");

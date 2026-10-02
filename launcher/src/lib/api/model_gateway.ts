@@ -736,7 +736,10 @@ export function describeModeResult(r: PanelModeResult): string {
  * Reuses the generic module toggle rather than adding a command: that one
  * already writes the `project_modules` row AND re-renders the project's
  * CLAUDE.md, which is exactly the gate the template's
- * `{{#if_module_active model_gateway}}` block reads.
+ * `{{#if_module_active model_gateway}}` block reads. v0.2.100: it also runs
+ * the project's bundle update, because the same row is an explicit per-
+ * project choice for the gateway agent definitions (on = delivered, off =
+ * removed), overriding the machine signal.
  */
 export async function setProjectRoutingGuidance(
   projectId: string,
@@ -917,17 +920,103 @@ export function describeWriteResult(r: VSCodeWriteResult): string {
 }
 
 /**
- * True when the gateway is configured enough for the panel actions and the
- * CLAUDE.md routing guidance to make sense.
+ * True when the gateway has been set up enough for the PANEL ACTIONS
+ * ("Point panel at gateway" writes its host token) and the CLAUDE.md routing
+ * guidance to make sense.
  *
- * "Configured" is deliberately not "running": a user who has started it once
+ * "Set up" is deliberately not "running": a user who has started it once
  * (so the token exists) and turned it off for the afternoon has a gateway.
  * A user who has never run it does not, and must not be offered routing
  * advice for models they cannot reach.
+ *
+ * v0.2.100 (AD-7): this is NOT "is the gateway configured on this machine" —
+ * that question (which also needs the panel to point at the gateway, and
+ * decides whether projects receive the gateway agent definitions) has ONE
+ * home, Python `vco_lib.module_gated_delivery`, reached through
+ * {@link gatewayIsConfigured}. This answers only whether the card's buttons
+ * can work, from the status the card already holds.
  */
-export function gatewayIsConfigured(s: ModelGatewayStatus | null): boolean {
+export function gatewayPanelReady(s: ModelGatewayStatus | null): boolean {
   if (!s) return false;
   return s.reachable === true || s.token_present || s.boot === 'enabled';
+}
+
+/** `vco_lib.gateway_ensure.MachineGatewaySignal.to_dict()`. */
+export interface MachineGatewaySignal {
+  /** `null` = could not ask (never read as "no"). */
+  configured: boolean | null;
+  registration: string;
+  panel: 'pointed' | 'not_pointed' | 'unknown' | 'not_checked' | string;
+  reason: string;
+  panel_paths: string[];
+}
+
+/** `vco_lib.module_gated_delivery.GateVerdict.to_dict()`. */
+export interface GatewayAgentsGateVerdict {
+  state: 'deliver' | 'skip' | 'unknown';
+  signal: 'project_row' | 'machine' | 'launcher_db' | string;
+  reason: string;
+  machine_configured: boolean | null;
+}
+
+/** One agent definition naming a gateway model id the router does not know. */
+export interface AgentIdProblem {
+  path: string;
+  model: string;
+  reason: string;
+  suggestions: string[];
+}
+
+/** `python -m vco_lib.module_gated_delivery status --json`, passed through. */
+export interface GatewayAgentsGate {
+  machine_signal: MachineGatewaySignal;
+  gate: GatewayAgentsGateVerdict | null;
+  /** `null` when the gateway package is not importable (nothing to check). */
+  agent_id_problems: AgentIdProblem[] | null;
+}
+
+/**
+ * Is the model gateway configured on this machine — and, with `folder`, does
+ * that project receive the gateway agent definitions on its next bundle
+ * update? Asked of the ONE home (`vco_lib.module_gated_delivery`, via the
+ * `model_gateway_agents_gate` command); nothing here recomputes it.
+ */
+export async function gatewayIsConfigured(
+  folder?: string,
+): Promise<GatewayAgentsGate> {
+  return invoke<GatewayAgentsGate>('model_gateway_agents_gate', {
+    folder: folder ?? null,
+  });
+}
+
+/**
+ * One line for the card: will projects receive the gateway agent
+ * definitions? Keeps the tri-state — "could not tell" is its own label.
+ */
+export function describeAgentDelivery(
+  g: GatewayAgentsGate | null,
+): StatusLine | null {
+  if (!g) return null;
+  const ms = g.machine_signal;
+  if (ms.configured === true) {
+    return {
+      tone: 'up',
+      label: 'agent definitions: delivered on the next bundle update',
+      detail: `${ms.reason}. Every project without an explicit opt-out receives the gateway agent definitions when it is next updated.`,
+    };
+  }
+  if (ms.configured === false) {
+    return {
+      tone: 'warn',
+      label: 'agent definitions: not delivered',
+      detail: `${ms.reason}. Projects switched on below still receive them.`,
+    };
+  }
+  return {
+    tone: 'unknown',
+    label: 'agent definitions: could not tell',
+    detail: `${ms.reason}. Previously delivered definitions are kept until this can be decided.`,
+  };
 }
 
 /**

@@ -45,7 +45,7 @@ behind it) win. This spec describes the same contract in prose.
   "manifest_version": 1,
   "id": "vct-example",                 // required — globally-unique module id
   "name": "Example Module",            // required — display name
-  "version": "0.1.0",                  // required — semver
+  "version": "0.1.0",                  // required — strictly X.Y.Z (see below)
   "category": "paid-independent",      // required — see §2
   "install": { … },                    // required — see §5
   "runtime": { … },                    // required — see §6
@@ -96,6 +96,41 @@ only.
 Everything else has a serde default. `manifest_version` defaults to `0` when
 absent.
 
+**Versions are strictly three numbers** (v0.2.100). `version` and
+`compatibility.min_launcher_version` must be `X.Y.Z` — three non-negative
+integers, optionally written with a leading `v` (`v1.2.0`). Pre-release or
+build suffixes (`1.0.0-beta`, `1.0.0+build.5`), a fourth part (`1.0.0.1`) and
+fewer than three parts (`0.2`) are **refused**: the manifest does not parse,
+with an error naming the field, the value and the module
+(`manifest.version: … — module '<id>'`). VCO compares versions to decide
+upgrades, and a version it cannot order is rejected where it is written, not
+guessed at later (`vct-launcher-core/src/version.rs` is the one parser).
+
+**An already-installed manifest that no longer parses.** A module installed by
+an older launcher (v0.2.99 or earlier) with a suffixed version keeps its files,
+but its extracted `vct-module.json` stops parsing after the update. What that
+does, as of v0.2.100:
+
+- **Install / update of that module**: the launcher treats the module as having
+  no usable on-disk manifest and resolves it from the module catalog (the L0
+  entry, read from the launcher's cached catalog). If the catalog lists the
+  module, the catalog's published version is installed — with the scope the
+  catalog declares, since the unreadable on-disk manifest can no longer supply
+  its own. If the catalog does not list it (a community module, or an empty
+  cache while offline), the install stops with the catalog error ("visit the
+  Modules tab or call refresh_module_catalog first").
+- **Modules tab**: a module still installed but no longer in the catalog shows
+  in the parse-error banner at the top of the tab, naming the module, the file
+  and the parser's message (also logged to `launcher_errors.jsonl`). A module
+  the catalog still lists renders from the catalog entry.
+- **Per-module GUI panels and log paths** read from that manifest are skipped
+  (logged as a parse error) until it parses again.
+
+The fix is the module author's: publish the same release with a plain
+`X.Y.Z` version (for example `1.0.1` instead of `1.0.0-beta`), or, for a
+module you maintain locally, edit `version` in its `vct-module.json` to
+`X.Y.Z` and reinstall it.
+
 The parser is permissive about **unknown top-level fields** (forward
 compatibility) but strict about **required ones** and about **enumerated values**
 (category, install method, install scope) — an unrecognized enum value is
@@ -132,6 +167,8 @@ One of (kebab-case on the wire):
 
 `hosts` gates which project types can install the module. Both fields default
 (empty `hosts`, `null` min version) when the block is omitted.
+`min_launcher_version`, when present, follows the same strict `X.Y.Z` rule as
+`version` (§1).
 
 ---
 
@@ -508,7 +545,8 @@ KV store. How a value reaches the module depends on who starts the module:
   every bundled setting, and a test fails when a new one has neither.
 - **Validation.** Every write goes through one gate,
   `module_settings_schema::write_module_setting` — reached by the launcher's
-  `set_module_setting` command and by `set_setting_v2` alike — which checks
+  `set_module_setting` command (the `set_setting_v2` twin was retired in
+  v0.2.100, so there is one caller) — which checks
   the value against its declaration — `type` (an `integer` is a JSON integer:
   never a numeric string, never `7700.0` or `7.7e3`), `min`/`max`, `options`,
   `validation` (a regex search), `required` (refuses a blank string / empty

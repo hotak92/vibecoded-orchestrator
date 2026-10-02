@@ -53,6 +53,7 @@ module-level binding is both sufficient and cheaper than 29 in-function imports.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 from pathlib import Path
 from typing import Optional
@@ -3047,7 +3048,11 @@ def _resolve_dual_rl_log_enabled() -> bool:
     return True
 
 async def _resolve_dual_rl_log_inputs(
-    query: str, active_slot: str
+    query: str,
+    active_slot: str,
+    *,
+    embed_budget_s: "float | None" = None,
+    task_type: str = "",
 ) -> "dict | None":
     """Resolve the OTHER-slot inputs for the dual-log fan-out (v0.2.71 Sweep-C).
 
@@ -3060,6 +3065,18 @@ async def _resolve_dual_rl_log_inputs(
     slot's (source, model, dim) is derived via the EmbeddingService slot maps.
 
     Soft-fail: any resolver error → None (no dual-log this call), never raises.
+
+    ``embed_budget_s`` (v0.2.100, the hook/CLI path): cap the secondary query
+    embed at this many seconds. The embed then runs on a DAEMON thread rather
+    than the loop's default executor, because ``asyncio.run`` joins the default
+    executor on shutdown — a hung Ollama call would hold a short-lived hook
+    process open past its budget even after ``wait_for`` gave up on it. ``None``
+    (the MCP tools) keeps the unbounded ``asyncio.to_thread`` path.
+
+    Every case where the twin was WANTED (dual-log on, a distinct secondary
+    configured) but cannot be produced is recorded in the RL telemetry loss
+    ledger (``vco_lib.rl_telemetry_loss``), so "fewer twins" is never
+    confused with "twins lost". The gate being off is not a loss.
     """
     if not server._resolve_dual_rl_log_enabled():
         return None
@@ -3084,20 +3101,36 @@ async def _resolve_dual_rl_log_inputs(
     try:
         svc = server._get_embedding_service()
         if svc is None:
+            _record_dual_skip("no_embedding_service", task_type)
             return None
-        # embed_text_all_configured returns {active_slot: vec} PLUS the secondary
-        # slots (only when dual-write is on — already guaranteed by the gate).
-        slots = await asyncio.to_thread(svc.embed_text_all_configured, query)
+        # embed_text_all_configured returns the secondary slots (only when
+        # dual-write is on — already guaranteed by the gate). W5R-07: the
+        # caller already holds the ACTIVE vector, so the active slot is NOT
+        # re-embedded (include_active=False) — on the 1 s hook budget that
+        # second active embed was pure waste.
+        _embed = functools.partial(svc.embed_text_all_configured, include_active=False)
+        if embed_budget_s is None:
+            slots = await asyncio.to_thread(_embed, query)
+        else:
+            slots = await _call_in_daemon_thread(
+                _embed, query, timeout_s=embed_budget_s
+            )
+    except asyncio.TimeoutError:
+        _record_dual_skip("secondary_embed_timeout", task_type, budget_s=embed_budget_s)
+        return None
     except Exception as exc:  # noqa: BLE001
         server.logger.debug("_resolve_dual_rl_log_inputs: embed fan-out raised (%s)", exc)
+        _record_dual_skip("secondary_embed_failed", task_type)
         return None
     if not slots:
+        _record_dual_skip("secondary_embed_empty", task_type)
         return None
     # Pick the OTHER slot: the single non-active text slot with a vector.
     others = [
         (slot, vec) for slot, vec in slots.items() if slot != active_slot and vec
     ]
     if not others:
+        _record_dual_skip("secondary_embed_empty", task_type)
         return None
     # Deterministic pick when multiple secondaries exist (e.g. qwen3 + openai):
     # the first by sorted slot name. Multiple secondaries is an edge case; the
@@ -3129,6 +3162,125 @@ async def _resolve_dual_rl_log_inputs(
         "other_model": other_model,
         "other_query_emb": other_query_emb,
     }
+
+def _dual_rl_log_expected() -> bool:
+    """True iff a dual-log twin is WANTED for this process: the gate is on AND a
+    distinct secondary text slot is configured (the same two checks
+    ``_resolve_dual_rl_log_inputs`` makes before embedding). Callers that skip
+    the twin for their own reason (an oversized hook query) use this to decide
+    whether the skip is a loss worth recording. Probe failure → True (record:
+    an over-count is visible and harmless, a silent under-count is the defect).
+    """
+    if not server._resolve_dual_rl_log_enabled():
+        return False
+    try:
+        from vco_lib.embedding_service import configured_text_models
+
+        return len(configured_text_models()) > 1
+    except Exception:  # noqa: BLE001
+        return True
+
+
+def _record_dual_skip(reason: str, task_type: str = "", **detail) -> None:
+    """Record a wanted-but-not-produced dual-log twin. Never raises."""
+    try:
+        from vco_lib.rl_telemetry_loss import KIND_DUAL_SKIP, record_loss
+
+        record_loss(KIND_DUAL_SKIP, reason, task_type=task_type or None, **detail)
+    except Exception as exc:  # noqa: BLE001
+        server.logger.debug("dual-log skip could not be recorded (%s)", exc)
+
+
+async def _call_in_daemon_thread(fn, *args, timeout_s: float):
+    """Run blocking ``fn(*args)`` on a DAEMON thread, awaiting at most ``timeout_s``.
+
+    Raises ``asyncio.TimeoutError`` past the budget. The thread is abandoned,
+    not joined: unlike ``asyncio.to_thread`` (default executor, joined by
+    ``asyncio.run`` at shutdown) a daemon thread cannot keep a short-lived
+    hook process alive. A late result is dropped on the floor.
+    """
+    import threading
+
+    loop = asyncio.get_running_loop()
+    fut: "asyncio.Future" = loop.create_future()
+
+    def _settle(setter, value):
+        if not fut.done():
+            setter(value)
+
+    def _runner():
+        try:
+            result = fn(*args)
+        except BaseException as exc:  # noqa: BLE001 — relayed to the awaiter
+            try:
+                loop.call_soon_threadsafe(_settle, fut.set_exception, exc)
+            except RuntimeError:
+                pass  # loop already closed — the caller gave up long ago
+            return
+        try:
+            loop.call_soon_threadsafe(_settle, fut.set_result, result)
+        except RuntimeError:
+            pass
+
+    threading.Thread(target=_runner, name="dual-rl-embed", daemon=True).start()
+    return await asyncio.wait_for(fut, timeout=timeout_s)
+
+
+async def resolve_and_enrich_dual(
+    nodes: "list[dict]",
+    *,
+    query: str,
+    query_vector: "list[float] | None",
+    active_slot: str,
+    model_name: str,
+    embed_budget_s: "float | None" = None,
+    backfill_other: bool = True,
+    task_type: str = "",
+) -> "dict | None":
+    """THE one home for "resolve the dual-RL-log inputs, then enrich" (v0.2.100 F1).
+
+    Every KG-search entry point calls this — the MCP ``hybrid_search`` and
+    ``semantic_graph_search`` tools, the hook/CLI ``rl_kg_search.py`` (pre-edit,
+    pre-bash, pre-tool-use, subagent-start) and ``search_knowledge.py``. Before
+    v0.2.100 only the two MCP tools carried this block (twice, inline), so the
+    hook paths — ~99% of retrievals — never produced the other slot's twin.
+
+    Steps: (1) resolve the other slot's inputs through the SAME gate the MCP
+    always used (``_resolve_dual_rl_log_enabled`` — the env projected from the
+    launcher's module_settings → app_state default into the project's
+    ``.claude/settings.json`` env / ``.claude/env``); (2) run the shared
+    ``_rl_enrich_nodes_with_linked_embs`` once, attaching the other slot's
+    per-node vectors from the SAME batched fetch when (1) produced inputs.
+
+    Returns the dual-inputs dict (thread it into ``RerankRequest`` via
+    ``search_pipeline.dual_log_request_fields``) or None for the single-log path.
+
+    Hook/CLI callers pass ``embed_budget_s`` (≈1 s) and ``backfill_other=False``:
+    the lazy other-slot backfill re-embeds whole nodes and must never run on a
+    latency-bounded hook. Enrichment failure is soft (DEBUG) — it never breaks
+    the user-facing search.
+    """
+    dual = await server._resolve_dual_rl_log_inputs(
+        query, active_slot, embed_budget_s=embed_budget_s, task_type=task_type
+    )
+    try:
+        server._rl_enrich_nodes_with_linked_embs(
+            nodes,
+            query_emb=query_vector,
+            active_slot=active_slot,
+            model_name=model_name,
+            other_slot=(dual or {}).get("other_slot", ""),
+            other_query_emb=(dual or {}).get("other_query_emb"),
+            other_model_name=(dual or {}).get("other_model", ""),
+            backfill_other=backfill_other and dual is not None,
+        )
+    except Exception as exc:  # noqa: BLE001 — enrichment is best-effort telemetry
+        server.logger.debug(
+            "resolve_and_enrich_dual: RL enrich failed (%s); proceeding without linked_embs",
+            exc,
+        )
+    return dual
+
 
 def _slot_short_source(slot: str) -> str:
     """Map a named-vector slot to its short RL embedding-source tag.
@@ -3190,6 +3342,7 @@ async def _rl_cache_and_rerank(
     # into this module to reach _rl_node_content_cache et al).
     from claude_mcp_servers.rl_client.search_pipeline import (
         RerankRequest,
+        dual_log_request_fields,
         rerank_and_emit,
     )
 
@@ -3199,8 +3352,6 @@ async def _rl_cache_and_rerank(
     # on a ``:slot``-suffixed task_id. The per-node ``emb_other`` / ``cos_qn_other``
     # were attached upstream by ``_rl_enrich_nodes_with_linked_embs`` on these
     # same dicts. ``dual_log_inputs is None`` → bare single-log path (unchanged).
-    di = dual_log_inputs or {}
-    dual_log = bool(di)
     req = RerankRequest(
         query=query,
         candidates=all_nodes,
@@ -3213,11 +3364,7 @@ async def _rl_cache_and_rerank(
         task_type="mcp_interactive",
         failure_mode=failure_mode,
         failed_collections=failed_collections or [],
-        dual_log=dual_log,
-        other_query_emb=di.get("other_query_emb"),
-        other_embedding_source=di.get("other_source", ""),
-        other_embedding_dim=di.get("other_dim", 0),
-        other_embedding_model=di.get("other_model", ""),
+        **dual_log_request_fields(dual_log_inputs),
     )
     result = await rerank_and_emit(req)
     return result.ranked

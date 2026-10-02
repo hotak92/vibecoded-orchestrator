@@ -13,6 +13,7 @@
 // future tier-gating change has exactly one test surface.
 
 import type { AdminRebindResult } from '$lib/types/launcher';
+import { invoke } from '$lib/tauri';
 
 /**
  * Whether to render the "Rebind to this machine" affordance.
@@ -137,4 +138,26 @@ export function friendlyRebindMessage(result: AdminRebindResult): {
   const friendlyMessage = friendly[code];
   const message = friendlyMessage ?? result.detail ?? `Rebind failed (${code})`;
   return { kind: 'error', message };
+}
+
+/**
+ * v0.2.100: the machine-id hash the launcher sends to `/validate-tier`
+ * (`get_machine_id_hash`: sha256 of the platform-stable host id, 64 lowercase
+ * hex). Shown beside the Rebind button so an admin can compare it with the
+ * hash the server has bound before rebinding. Returns `null` when the command
+ * is unreachable or the value is not a sha256 (never throws: a missing hash
+ * hides the line, it does not break the dialog).
+ */
+export async function fetchMachineIdHash(): Promise<string | null> {
+  try {
+    const h = await invoke<string>('get_machine_id_hash');
+    return /^[0-9a-f]{64}$/.test(h) ? h : null;
+  } catch {
+    return null;
+  }
+}
+
+/** `a1b2c3d4…9f8e7d` - enough to recognise, short enough to fit the row. */
+export function shortMachineHash(hash: string): string {
+  return hash.length <= 20 ? hash : `${hash.slice(0, 8)}\u2026${hash.slice(-6)}`;
 }

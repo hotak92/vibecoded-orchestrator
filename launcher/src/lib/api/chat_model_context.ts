@@ -193,7 +193,7 @@ export function validateDraft(
   if (modelId === '') {
     errors.push({
       field: 'model_id',
-      message: 'Enter the full model id, e.g. glm-5.2 — never a family pattern.',
+      message: 'Enter the full model id, e.g. glm-5.3 — never a family pattern.',
     });
   }
 

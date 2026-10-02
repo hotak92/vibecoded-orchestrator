@@ -29,8 +29,9 @@ from model_router.routing import ONE_M_SUFFIX
 
 
 from tests.common.qwen_catalog import (  # noqa: E402
-    QWEN_CHAT_NINE,
+    QWEN_CHAT_EIGHT,
     QWEN_EXCLUDED_SIX,
+    QWEN_RETIRED,
     QWEN_LIVE_MODELS,
     assert_matches_shipped_row,
 )
@@ -740,7 +741,7 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
         seed = load_seed()
         one_m_ids = {
             model_id for model_id in VENDORS["qwen"].static_ids
-            if (row := seed.lookup(model_id)) is not None and row.window_1m
+            if (row := seed.lookup(model_id, "qwen")) is not None and row.window_1m
         }
         self.assertTrue(one_m_ids, "the seed must flag at least one declared id")
         self.assertEqual(
@@ -757,7 +758,7 @@ class CatalogUrlOverrideTests(unittest.IsolatedAsyncioTestCase):
     def test_the_shipped_static_ids_are_exactly_the_live_chat_set(self) -> None:
         """The declared fallback is curated from the same probe: the fifteen
         live ids minus the six excluded (five non-chat modalities plus the
-        dated deepseek snapshot), with no drift in either direction — a
+        dated deepseek snapshot) and the retired glm-5.2, with no drift in either direction — a
         stale fallback would silently differ from the list the
         endpoint actually serves."""
         assert_matches_shipped_row(self, VENDORS["qwen"])
@@ -807,7 +808,7 @@ class CatalogExcludePrefixTests(unittest.IsolatedAsyncioTestCase):
                     e.id for e in catalog.entries
                     if e.id.startswith("claude-gw/qwen/")
                 }
-                chat = {"claude-gw/qwen/" + m for m in QWEN_CHAT_NINE}
+                chat = {"claude-gw/qwen/" + m for m in QWEN_CHAT_EIGHT}
                 hidden_two = {
                     "claude-gw/qwen/qwen3.7-plus",
                     "claude-gw/qwen/deepseek-v4-pro",
@@ -819,7 +820,7 @@ class CatalogExcludePrefixTests(unittest.IsolatedAsyncioTestCase):
                 for hid in hidden_two:
                     self.assertIn(hid, catalog.hidden)
                 listed = published | set(catalog.hidden)
-                for excluded in QWEN_EXCLUDED_SIX:
+                for excluded in (*QWEN_EXCLUDED_SIX, *QWEN_RETIRED):
                     for spelling in (
                         excluded,
                         f"claude-gw/qwen/{excluded}",
@@ -1076,7 +1077,10 @@ class VerifiedIdsTests(unittest.IsolatedAsyncioTestCase):
                     ids,
                     {"claude-gw/glm-5.3", "claude-gw/glm-5.3-flash"},
                 )
-                self.assertIn("claude-gw/glm-5.2", catalog.hidden)
+                # glm-5.2 is RETIRED (owner 2026-10-01), not merely withheld:
+                # dropped from the live list, so it is in neither list.
+                self.assertNotIn("claude-gw/glm-5.2", catalog.hidden)
+                self.assertNotIn("claude-gw/glm-5.2", ids)
 
 
 class StaticPrecedenceTests(unittest.TestCase):

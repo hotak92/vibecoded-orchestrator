@@ -1,0 +1,24 @@
+{
+  "_doc": "v0.2.100 U17: the ONE machine-readable sidecar-list line of orchestrator_user_modified_preserved. Rendered by launcher/src-tauri/src/commands/git_user_editable_merge.rs::render_sidecar_list_line, read by vco_lib/deferral_probes.py::machine_sidecar_list. Both test suites run these cases (Rust: sidecar_list_line_matches_the_shared_fixture_and_is_never_capped; Python: tests/test_v02100_sidecar_probe_names_match.py).",
+  "marker": "vco-sidecars:",
+  "cases": [
+    {
+      "name": "posix paths",
+      "sidecars": ["knowledge/concepts/gui-tabs.md.from-upstream-4c44eb8", "docs/guide.md.from-upstream-4c44eb8"],
+      "line": "<!-- vco-sidecars: [\"knowledge/concepts/gui-tabs.md.from-upstream-4c44eb8\",\"docs/guide.md.from-upstream-4c44eb8\"] -->",
+      "parsed": ["knowledge/concepts/gui-tabs.md.from-upstream-4c44eb8", "docs/guide.md.from-upstream-4c44eb8"]
+    },
+    {
+      "name": "windows separators are normalised",
+      "sidecars": ["knowledge\\concepts\\x.md.from-upstream-a5b2971"],
+      "line": "<!-- vco-sidecars: [\"knowledge/concepts/x.md.from-upstream-a5b2971\"] -->",
+      "parsed": ["knowledge/concepts/x.md.from-upstream-a5b2971"]
+    },
+    {
+      "name": "no sidecar (auto-merge / rendered-only entry)",
+      "sidecars": [],
+      "line": "<!-- vco-sidecars: [] -->",
+      "parsed": []
+    }
+  ]
+}

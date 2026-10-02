@@ -480,6 +480,24 @@ pub fn zombie_action(row: Option<&ServiceEndpointRow>) -> ZombieAction {
     }
 }
 
+/// [`zombie_action`] once the container's REAL labels are known (v0.2.100
+/// WP-06, AD-5): a `Recreate` row whose live container is not positively
+/// VCO's ([`Ownership::Owned`](super::container_ownership::Ownership)) is at
+/// most started BY NAME — never `rm`, never compose. Executes the
+/// `expect_on_zombie` column of `tests/fixtures/container_ownership_parity.json`
+/// (the `expect_on_foreign_project` rows).
+pub fn zombie_action_given(
+    row: Option<&ServiceEndpointRow>,
+    ownership: &super::container_ownership::Ownership,
+) -> ZombieAction {
+    match zombie_action(row) {
+        ZombieAction::Recreate if *ownership != super::container_ownership::Ownership::Owned => {
+            ZombieAction::Start
+        }
+        other => other,
+    }
+}
+
 /// The container VCO starts BY NAME for an adopted service whose row asks
 /// for it (`adopted_container` + `autostart`); `None` otherwise.
 pub fn adopted_autostart_container(row: Option<&ServiceEndpointRow>) -> Option<&str> {

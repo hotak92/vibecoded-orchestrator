@@ -102,7 +102,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from .model_family import is_older_sibling, parse_model_id
-from .routing import split_namespace
+from .routing import split_namespace, strip_1m
 from .vendors import VENDORS
 
 logger = logging.getLogger(__name__)
@@ -172,6 +172,14 @@ class ModelContext:
     window_1m: bool
     source: str
     source_note: str = ""
+    #: v0.2.100 (F-W1-19): per-VENDOR figures for a model that more than one
+    #: vendor serves at DIFFERENT windows (``vendor_id -> ModelContext``, each
+    #: cited). The row's own figures stay the model's; a vendor that caps it
+    #: lower gets its own cited row here, read by :meth:`ContextTable.lookup`
+    #: when the caller names that vendor. Refines the 2026-09-22 "a window is
+    #: a property of the MODEL" ruling exactly where an endpoint documents a
+    #: smaller one — the case that ruling named as its cost.
+    vendor_overrides: Mapping[str, "ModelContext"] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -217,8 +225,29 @@ class ContextTable:
     #: through to the seed, deleted resolves to nothing at all.
     tombstones: frozenset[str] = frozenset()
 
-    def lookup(self, model_id: str) -> Optional[ModelContext]:
+    def lookup_id(
+        self, model_id: str, vendor_id: Optional[str] = None,
+    ) -> Optional[ModelContext]:
+        """:meth:`lookup` for a possibly NAMESPACED id (``[1m]`` tolerated).
+
+        The vendor is the id's own namespace when it carries one, else
+        ``vendor_id`` — so ``<qwen namespace>glm-5.3`` reads the QwenCloud
+        figures and ``<zai namespace>glm-5.3`` the z.ai ones.
+        """
+        parts = parse_model_id(model_id)
+        vendor, _rest = split_namespace(strip_1m((model_id or "").strip()), VENDORS)
+        return self.lookup(
+            parts.bare_id, vendor.vendor_id if vendor is not None else vendor_id,
+        )
+
+    def lookup(
+        self, model_id: str, vendor_id: Optional[str] = None,
+    ) -> Optional[ModelContext]:
         """EXACT match only. ``glm-5.1-flash-x`` never resolves to ``glm-5.1``.
+
+        ``vendor_id`` (v0.2.100): when the row carries a cited
+        ``vendor_overrides`` entry for that vendor, that entry answers — the
+        endpoint's own documented figures for the model it serves.
 
         Precedence is PER ROW, not per file: an export row wins for the id it
         names, and an id the export does not name falls through to the shipped
@@ -237,7 +266,19 @@ class ContextTable:
             return None
         row = self.rows.get(model_id)
         if row is None:
-            return self.fallback_rows.get(model_id)
+            row = self.fallback_rows.get(model_id)
+        if row is not None and vendor_id:
+            override = row.vendor_overrides.get(vendor_id)
+            if override is None:
+                # The launcher's export cannot carry overrides (its DB has
+                # no column for them), so an exported row for a shared model
+                # would otherwise hide the seed's cited endpoint figure and
+                # re-open the over-budget this field closes.
+                seed_row = self.fallback_rows.get(model_id)
+                if seed_row is not None:
+                    override = seed_row.vendor_overrides.get(vendor_id)
+            if override is not None:
+                return override
         return row
 
     def assume_window(self, model_id: str) -> AssumedWindow:
@@ -277,7 +318,7 @@ class ContextTable:
         table would pool both vendors' rows and take the larger window.
 
         **The shipped table DOES have such a pair, deliberately** (owner
-        ruling, 2026-09-22): ``glm-5.3`` and ``glm-5.2`` are listed by both
+        ruling, 2026-09-22): ``glm-5.3`` is listed by both
         the z.ai row and the QwenCloud row, and the cited z.ai window
         answers for both. The ruling is that a context window is a property
         of the MODEL, not of the endpoint serving it — glm-5.3 is glm-5.3
@@ -302,7 +343,7 @@ class ContextTable:
             # up. The floor is what is left to assume, and it is the
             # conservative answer.
             return AssumedWindow(UNKNOWN_FAMILY_WINDOW, ASSUMED_FLOOR)
-        row = self.lookup(parts.bare_id)
+        row = self.lookup_id(model_id)
         if row is not None and row.context_window > 0:
             return AssumedWindow(row.context_window, ASSUMED_FROM_TABLE)
 
@@ -383,7 +424,7 @@ class ContextTable:
         nothing else, so a settings write can never block on (or be wrong
         because of) a gateway that is not running.
         """
-        row = self.lookup(parse_model_id(model_id).bare_id)
+        row = self.lookup_id(model_id)
         if row is not None:
             return bool(row.window_1m)
         return self.assume_window(model_id).window >= ONE_M_WINDOW
@@ -452,6 +493,20 @@ def _parse(
                 model_id, origin,
             )
             continue
+        overrides: dict[str, ModelContext] = {}
+        raw_overrides = raw.get("vendor_overrides")
+        if isinstance(raw_overrides, dict):
+            for vendor_id, sub in raw_overrides.items():
+                parsed = _parse_override(model_id, vendor_id, sub, origin)
+                if parsed is None:
+                    uncited.append(f"{model_id}@{vendor_id}")
+                else:
+                    overrides[str(vendor_id)] = parsed
+        elif raw_overrides is not None:
+            logger.warning(
+                "model-gateway: 'vendor_overrides' of row %r in %s is not an "
+                "object; ignored", model_id, origin,
+            )
         rows[model_id] = ModelContext(
             model_id=model_id,
             vendor=str(raw.get("vendor") or ""),
@@ -460,8 +515,50 @@ def _parse(
             window_1m=bool(raw.get("window_1m")),
             source=source,
             source_note=str(raw.get("source_note") or ""),
+            vendor_overrides=overrides,
         )
     return rows, tuple(uncited), tombstones
+
+
+def _parse_override(
+    model_id: str, vendor_id: object, raw: object, origin: Path,
+) -> Optional[ModelContext]:
+    """One cited per-vendor override, or ``None`` (logged) when unusable.
+
+    Held to the row rule: no citation, no effect — an uncited override would
+    be a guess the client acts on, in either direction.
+    """
+    if not isinstance(vendor_id, str) or not vendor_id or not isinstance(raw, dict):
+        logger.warning(
+            "model-gateway: a vendor override of row %r in %s is malformed; "
+            "ignored", model_id, origin,
+        )
+        return None
+    source = str(raw.get("source") or "").strip()
+    if not source:
+        logger.warning(
+            "model-gateway: vendor override %r of row %r in %s has no "
+            "'source' citation; ignored", vendor_id, model_id, origin,
+        )
+        return None
+    try:
+        context_window = int(raw.get("context_window") or 0)
+        max_output = int(raw.get("max_output") or 0)
+    except (TypeError, ValueError):
+        logger.warning(
+            "model-gateway: vendor override %r of row %r in %s has "
+            "non-numeric window/output; ignored", vendor_id, model_id, origin,
+        )
+        return None
+    return ModelContext(
+        model_id=model_id,
+        vendor=vendor_id,
+        context_window=context_window,
+        max_output=max_output,
+        window_1m=bool(raw.get("window_1m")),
+        source=source,
+        source_note=str(raw.get("source_note") or ""),
+    )
 
 
 class _UnsupportedSchema(ValueError):

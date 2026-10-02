@@ -3,8 +3,9 @@
 //!
 //! Background
 //! ----------
-//! `update_orchestrator` / `merge_orchestrator_with_upstream` shell out
-//! to `git pull` against `vco_upstream/<branch>`. git refuses the pull
+//! The orchestrator update (`update_run::run_update`; its git operations
+//! live in `update_pipeline`) shells out to `git pull` against
+//! `vco_upstream/<branch>`. git refuses the pull
 //! with "Your local changes to the following files would be overwritten
 //! by merge" whenever a tracked file is BOTH locally-modified AND
 //! changed upstream.
@@ -16,9 +17,9 @@
 //!
 //! What this module does
 //! ---------------------
-//! This module sits between the `update_orchestrator` /
-//! `merge_orchestrator_with_upstream` command bodies and the bare
-//! `git pull` they currently run. It:
+//! This module sits between the update pipeline's git operations
+//! (`update_pipeline::{reconcile_and_pull, merge_upstream}`) and the bare
+//! `git pull` they run. It:
 //!
 //!   1. Walks the diff `<merge-base>..<upstream-tip>`.
 //!   2. For each file ALSO in `git status --porcelain` (locally edited)
@@ -124,7 +125,7 @@ use vct_launcher_core::process::CommandExt as _;
 ///
 /// The set is intentionally narrow. Adding entries here is a deliberate
 /// trust decision — once a path is on the list, divergent edits won't
-/// block `update_orchestrator` (they'll merge or sidecar). Files NOT
+/// block the orchestrator update (they'll merge or sidecar). Files NOT
 /// on the list fall through to git's default behaviour, which is what
 /// we want for protected paths like `vco_lib/*.py`, `launcher/**/*.rs`,
 /// etc. (the user should NOT routinely edit those, so a divergent pull
@@ -689,9 +690,9 @@ pub(crate) async fn classify_untracked_collisions(
 ///
 /// This is the tracked-file sibling of the F2 untracked auto-remove — both gate
 /// the mutation on the SAME byte-identity check (`local_matches_incoming_blob`).
-/// Called by BOTH update surfaces (installer::update_orchestrator +
-/// self_update::apply_launcher_update) right before `resolve_divergence_pull_plan`
-/// so the two can't drift.
+/// Called by the update pipeline's pull sequence
+/// (`update_pipeline::reconcile_and_pull`, v0.2.100: the ONE update surface)
+/// right before `resolve_divergence_pull_plan`.
 ///
 /// DATA-SAFETY: only touches files where working-tree bytes == incoming blob
 /// (nothing is lost — the discarded content is byte-for-byte the merge target).
@@ -2130,14 +2131,31 @@ pub(crate) fn build_deferral_text(
     if actionable.len() > CAP {
         bullets.push(format!("  - ... and {} more", actionable.len() - CAP));
     }
+    // v0.2.100 U17: the COMPLETE sidecar list (never capped), machine-readable,
+    // in the one format the clear probe reads — so the entry and its probe
+    // name the same files.
+    let sidecars: Vec<String> = actionable
+        .iter()
+        .filter_map(|o| match &o.kind {
+            MergeOutcomeKind::PreservedWithUpstreamSidecar { upstream_sidecar_path, .. } => Some(
+                upstream_sidecar_path
+                    .strip_prefix(install_path)
+                    .unwrap_or(upstream_sidecar_path)
+                    .display()
+                    .to_string(),
+            ),
+            _ => None,
+        })
+        .collect();
     let detected = format!(
         "During an orchestrator-root update pulling from `{}/{}`, {} \
          user-editable file(s) had both local and upstream changes. \
-         VCO ran a per-path 3-way merge before `git pull`:\n{}",
+         VCO ran a per-path 3-way merge before `git pull`:\n{}\n{}",
         crate::commands::self_update::VCO_UPSTREAM_REMOTE,
         pull_branch,
         n,
         bullets.join("\n"),
+        render_sidecar_list_line(&sidecars),
     );
     let why_deferred = String::from(
         "Default-to-safety: when a file in the user-editable allowlist \
@@ -2245,6 +2263,23 @@ pub(crate) fn build_deferral_text(
     );
     let command_to_apply = cmd_lines.join("\n");
     (title, detected, why_deferred, command_to_apply)
+}
+
+/// v0.2.100 U17 — marker of the machine-readable sidecar list line. MUST MATCH
+/// `vco_lib/deferral_probes.py::SIDECAR_LIST_MARKER`; the line format is pinned
+/// for both languages by `tests/fixtures/sidecar_list_line.json`.
+pub(crate) const SIDECAR_LIST_MARKER: &str = "vco-sidecars:";
+
+/// `<!-- vco-sidecars: ["a/b.md.from-upstream-x", …] -->` — an HTML comment
+/// (invisible in the rendered ledger), repo-relative POSIX paths (a Windows
+/// `\` is normalised), JSON array. The clear probe reads exactly these.
+pub(crate) fn render_sidecar_list_line(paths: &[String]) -> String {
+    let posix: Vec<String> = paths.iter().map(|p| p.replace('\\', "/")).collect();
+    format!(
+        "<!-- {} {} -->",
+        SIDECAR_LIST_MARKER,
+        serde_json::to_string(&posix).unwrap_or_else(|_| "[]".to_string())
+    )
 }
 
 /// POSIX shell-safe quoting (single-quote escape). Shared with the
@@ -2770,9 +2805,10 @@ async fn pop_probe_all_clean(
 
 /// Which `git pull`/`git rebase` strategy the update flow should use once
 /// the A0 pre-merge step has run. This is the SINGLE source of truth for the
-/// pull-strategy decision shared by BOTH update surfaces:
-///   - `installer::update_orchestrator` (the MenuBar badge), and
-///   - `self_update::apply_launcher_update` (the Preferences → Updates page).
+/// pull-strategy decision of the orchestrator update. Until v0.2.100 two
+/// surfaces shared it (the MenuBar badge's `installer::update_orchestrator`
+/// and the Preferences → Updates page's `self_update::apply_launcher_update`);
+/// both are now the one pipeline (`update_run::run_update`).
 ///
 /// Before v0.2.71 the decision lived inline only in `update_orchestrator`;
 /// the self-update surface did a blind `--ff-only` and routed ANY committed
@@ -3047,8 +3083,8 @@ pub(crate) fn parse_untracked_overwrite_files(err: &str) -> Vec<String> {
 }
 
 /// Decide the pull strategy for a divergence-aware update. This is the SINGLE
-/// source of truth shared by both update surfaces (installer::update_orchestrator
-/// and self_update::apply_launcher_update).
+/// source of truth, read by the update pipeline's pull sequence
+/// (`update_pipeline::reconcile_and_pull`).
 ///
 /// Decision tree (v0.2.79 §A — the pop-probe generalises the v0.2.58 gate):
 ///   - `pre_merge_committed && !generated_reconcile_committed` (the A0 pre-merge
@@ -3242,11 +3278,11 @@ pub(crate) async fn resolve_divergence_pull_plan(
 /// empty sets (the caller then does nothing and the existing modal flow
 /// surfaces — never worse than today).
 ///
-/// v0.2.89: the classify/act/emit family is WIRED into all three live update
-/// surfaces — `resolve_generated_files_to_upstream` runs inside
-/// `installer::update_orchestrator`, `installer::merge_orchestrator_with_upstream`,
-/// and `self_update::apply_launcher_update`, with `emit_generated_reconcile_deferrals`
-/// called by each surface AFTER the pull succeeds (MINOR-1). No `allow(dead_code)`
+/// v0.2.89: the classify/act/emit family is WIRED into the update's git
+/// operations — since v0.2.100 `resolve_generated_files_to_upstream` runs
+/// inside `update_pipeline::reconcile_and_pull` and `update_pipeline::merge_upstream`,
+/// with `emit_generated_reconcile_deferrals` called AFTER the pull succeeds
+/// (MINOR-1). No `allow(dead_code)`
 /// is needed — these are reachable from non-test code.
 pub(crate) struct GeneratedDivergence {
     /// `HEAD:path` differs from `base:path` (the fork COMMITTED changes) AND
@@ -3941,11 +3977,10 @@ pub(crate) fn build_generated_reconcile_deferral_text(
 // Launcher-side update divergence deferral (relocated v0.2.71 Sweep-A#3)
 // ---------------------------------------------------------------------------
 //
-// RELOCATED from installer.rs (was installer.rs-private) so BOTH update
-// surfaces share ONE durable-deferral writer:
-//   - the MenuBar-badge orchestrator-clone update (`installer::update_orchestrator`
-//     and its binary-refresh tail), and
-//   - the launcher SELF-update (`self_update::apply_launcher_update`).
+// RELOCATED from installer.rs (was installer.rs-private) so the two update
+// surfaces of the time shared ONE durable-deferral writer. Since v0.2.100 its
+// callers are the one pipeline: `update_pipeline` (non-FF / pull failures) and
+// `update_run`'s post-install binary check (phase 11).
 //
 // Pre-Sweep-A#3 only the installer surface wrote a durable
 // `UPDATE_DEFERRED.md` trace on a non-FF / git-pull failure; the self-update
@@ -3972,18 +4007,22 @@ pub(crate) enum LauncherUpdateDivergedKind {
         remote_sha: Option<String>,
         detail: String,
     },
-    /// `WaitForBinaryRefresh` timed out but the on-disk dist binary is
-    /// NEWER than the running launcher — we restarted into it anyway
-    /// (v0.2.55 "update in any case"), and record that the update may be
-    /// one step behind the absolute source target.
+    /// The update pipeline's post-install binary check
+    /// (`update_run::decide_binary_refresh`, `BinaryCheck::Partial`) found
+    /// the dist launcher below the source version but NEWER than the running
+    /// launcher — the pipeline relaunches into it anyway (v0.2.55 "update in
+    /// any case"), and records that the update may be one step behind the
+    /// absolute source target.
     PartialBinaryRefresh {
         running: String,
         on_disk: String,
         detail: String,
     },
-    /// `WaitForBinaryRefresh` timed out and there is NO newer binary on
-    /// disk — the restart was (correctly) aborted because re-execing the
-    /// same old binary helps nothing. The durable record makes the stuck
+    /// The update pipeline's post-install binary check
+    /// (`update_run::decide_binary_refresh`, `BinaryCheck::NotPublished`)
+    /// found NO binary newer than the running launcher on disk — the restart
+    /// is (correctly) skipped because re-execing the same old binary helps
+    /// nothing. The durable record makes the stuck
     /// state diagnosable at session start.
     BinaryRefreshTimeout {
         running: String,
@@ -4012,10 +4051,9 @@ pub(crate) enum LauncherUpdateDivergedKind {
 /// the terminal Claude. This closes that asymmetry.
 ///
 /// v0.2.71 Sweep-A#3: relocated from installer.rs to this shared module
-/// (was installer.rs-private) so the launcher SELF-update surface
-/// (`self_update::apply_launcher_update`) can call the SAME writer rather
-/// than growing a second copy. Both surfaces now leave an identical
-/// durable trace on a failed update.
+/// (was installer.rs-private) so the launcher SELF-update surface of the
+/// time could call the SAME writer rather than growing a second copy. Since
+/// v0.2.100 the one update pipeline is its only caller family.
 ///
 /// Standalone Rust writer (does NOT depend on install.py firing) — the
 /// whole point is that install.py / the binary swap did NOT complete.
@@ -4051,7 +4089,7 @@ pub(crate) fn write_launcher_update_diverged_deferral(
         return;
     }
     // v0.2.83 WP-B6: hold the shared UPDATE_DEFERRED lock across the tmp-write +
-    // rename so this standalone full-rewrite serializes with every other writer
+    // rename so this standalone read-merge-write serializes with every other writer
     // (Python `deferral_emit` writers, and the other Rust direct writers) on
     // `<install_path>/.claude/context/.update-deferred.lock`. Standalone by
     // design (install.py did NOT complete → Python cannot be assumed), so we
@@ -4115,12 +4153,12 @@ pub(crate) fn write_launcher_update_diverged_deferral(
             "Orchestrator updated, but the launcher binary may be one step behind target"
                 .to_string(),
             format!(
-                "`WaitForBinaryRefresh` timed out before the on-disk launcher binary reached \
-                 the exact source target, but a NEWER binary than the running one was present \
+                "After install.py finished, the update's binary check found the on-disk \
+                 launcher binary below the source version, but NEWER than the running one \
                  (running v{running}, on-disk v{on_disk}), so the launcher restarted into it \
                  anyway (v0.2.55 \"update in any case\"). The remaining gap is usually the \
                  binary-refresh commit (`chore(binary): refresh … [skip ci]`) not yet pushed \
-                 by the Release workflow, or a transient pull failure. Underlying: `{d}`",
+                 by the Release workflow. Underlying: `{d}`",
                 running = running,
                 on_disk = on_disk,
                 d = detail.trim(),
@@ -4150,12 +4188,12 @@ pub(crate) fn write_launcher_update_diverged_deferral(
             (
                 "Orchestrator update did not deliver a new launcher binary".to_string(),
                 format!(
-                    "`WaitForBinaryRefresh` timed out and NO binary newer than the running \
-                     launcher (v{running}) is on disk (on-disk v{od}). Restarting was aborted \
-                     because re-execing the same old binary would not help. This usually means \
-                     the source pull did not land the binary-refresh commit (a non-FF \
-                     divergence that the re-pull kept failing on, or the Release workflow has \
-                     not pushed the refreshed binaries yet). Underlying: `{d}`",
+                    "After install.py finished, the update's binary check found NO binary \
+                     newer than the running launcher (v{running}) on disk (on-disk v{od}). \
+                     Restarting was skipped because re-execing the same old binary would not \
+                     help. This usually means the pulled source does not yet carry the \
+                     binary-refresh commit (the Release workflow has not pushed the refreshed \
+                     binaries yet). Underlying: `{d}`",
                     running = running,
                     od = od,
                     d = detail.trim(),
@@ -4279,19 +4317,30 @@ python install.py --update\n\
 /// Atomic tmp-write + rename of `UPDATE_DEFERRED.md`. Extracted in v0.2.92
 /// (WP-13) so a SECOND standalone Rust emitter
 /// ([`write_launcher_update_post_pull_unverified_deferral`]) reuses the write
-/// mechanics rather than growing a copy of them.
+/// mechanics rather than growing a copy of them. The THIRD standalone emitter,
+/// `installer::write_update_resume_deferral`, joined in v0.2.100.
+///
+/// v0.2.100 (WP-15, owner rule F-W2-08(c)): the ledger is MERGED into, never
+/// clobbered. `content` is the emitter's single-entry document; when the file
+/// already holds entries, only its `## <condition_id> (` section is taken and
+/// appended to the existing text after removing any older section for the same
+/// condition ([`merge_deferral_section`]). Every caller already holds the
+/// shared deferral lock, so the read and the rename cannot straddle another
+/// writer.
 ///
 /// Best-effort throughout: `condition_id` is used only to keep the log lines
 /// attributable to the emitter that failed. Callers must not depend on the
 /// write having happened.
-fn write_update_deferred_atomically(
+pub(crate) fn write_update_deferred_atomically(
     parent: &Path,
     target: &Path,
     condition_id: &str,
     content: &str,
 ) {
+    let existing = std::fs::read_to_string(target).ok();
+    let merged = merge_deferral_section(existing.as_deref(), condition_id, content);
     let tmp = parent.join(format!("UPDATE_DEFERRED.md.tmp.{}", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, content.as_bytes()) {
+    if let Err(e) = std::fs::write(&tmp, merged.as_bytes()) {
         tracing::error!(
             "[vct] {}: write {} failed: {}",
             condition_id,
@@ -4311,6 +4360,100 @@ fn write_update_deferred_atomically(
         );
         let _ = std::fs::remove_file(&tmp);
     }
+}
+
+/// Merge one emitter's single-entry document into an existing ledger text.
+///
+/// Pure (unit-tested). No existing text, or an existing text with no entry
+/// section (e.g. a pre-v0.2.100 zero-entry stub) → the emitter's document as
+/// is. Otherwise: the existing text minus any section for `condition_id`
+/// (`restart::strip_section`, the one section-stripper), plus the emitter's
+/// section. Every other entry survives byte-for-byte.
+pub(crate) fn merge_deferral_section(
+    existing: Option<&str>,
+    condition_id: &str,
+    fresh_doc: &str,
+) -> String {
+    let header = format!("## {} (", condition_id);
+    let (Some(existing), Some(idx)) = (existing, fresh_doc.find(&header)) else {
+        return fresh_doc.to_string();
+    };
+    let has_entry = existing
+        .lines()
+        .any(|l| l.starts_with("## ") && !l.starts_with("## VCO Update"));
+    if !has_entry {
+        return fresh_doc.to_string();
+    }
+    let kept = crate::commands::restart::strip_section(existing, condition_id);
+    // W5R-11 (v0.2.100): the kept text carries the EXISTING frontmatter, whose
+    // `condition_ids` / `severity_max` predate this merge — re-derive both from
+    // the sections the merged document actually holds.
+    sync_deferral_frontmatter(&format!("{}\n\n{}", kept.trim_end(), &fresh_doc[idx..]))
+}
+
+/// Ledger severities, highest first. MUST MATCH `SEVERITY_ORDER` in
+/// `vco_lib/deferral_report.py` (the Python writer's `severity_max` rule).
+const DEFERRAL_SEVERITY_ORDER: [&str; 3] = ["critical", "warning", "info"];
+
+/// Parse one ledger section header — `## <condition_id> (<severity>)` — into
+/// `(condition_id, severity)`. Any other `## ` line (prose headings) → `None`.
+fn parse_deferral_section_header(line: &str) -> Option<(&str, &str)> {
+    let rest = line.strip_prefix("## ")?;
+    let (cid, tail) = rest.split_once(" (")?;
+    let sev = tail.trim_end().strip_suffix(')')?;
+    let cid_ok = !cid.is_empty()
+        && cid
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.');
+    if cid_ok && DEFERRAL_SEVERITY_ORDER.contains(&sev) {
+        Some((cid, sev))
+    } else {
+        None
+    }
+}
+
+/// Rewrite a ledger's frontmatter `condition_ids: [...]` and `severity_max:`
+/// lines from the entry sections its body holds (W5R-11). The Python reader
+/// keys behaviour off the sections, but `deferral_report.read()` still reports
+/// the frontmatter list as metadata, so a stale list is a false statement in
+/// the file. Pure; a text without a `---` frontmatter block is returned as is,
+/// and only those two lines are touched (everything else byte-for-byte).
+pub(crate) fn sync_deferral_frontmatter(doc: &str) -> String {
+    let Some(after_open) = doc.strip_prefix("---\n") else {
+        return doc.to_string();
+    };
+    let Some(close_rel) = after_open.find("\n---\n") else {
+        return doc.to_string();
+    };
+    let fm = &after_open[..close_rel];
+    let body = &after_open[close_rel..];
+
+    let mut ids: Vec<&str> = Vec::new();
+    let mut sev_rank = DEFERRAL_SEVERITY_ORDER.len() - 1; // "info" when no entries
+    for line in body.lines() {
+        if let Some((cid, sev)) = parse_deferral_section_header(line) {
+            if !ids.contains(&cid) {
+                ids.push(cid);
+            }
+            if let Some(r) = DEFERRAL_SEVERITY_ORDER.iter().position(|s| *s == sev) {
+                sev_rank = sev_rank.min(r);
+            }
+        }
+    }
+
+    let new_fm: Vec<String> = fm
+        .lines()
+        .map(|l| {
+            if l.starts_with("condition_ids:") {
+                format!("condition_ids: [{}]", ids.join(", "))
+            } else if l.starts_with("severity_max:") {
+                format!("severity_max: {}", DEFERRAL_SEVERITY_ORDER[sev_rank])
+            } else {
+                l.to_string()
+            }
+        })
+        .collect();
+    format!("---\n{}{}", new_fm.join("\n"), body)
 }
 
 /// Write a `launcher_update_post_pull_unverified` entry: the post-pull
@@ -4759,6 +4902,49 @@ pub(crate) mod tests {
             "cmd missing sidecar path: {}",
             cmd
         );
+    }
+
+    /// v0.2.100 U17: the machine-readable sidecar line is the SHARED format
+    /// (`tests/fixtures/sidecar_list_line.json`, also read by
+    /// `tests/test_v02100_sidecar_probe_names_match.py`), and the emitted entry
+    /// carries the COMPLETE list — past the 100-bullet display cap too.
+    #[test]
+    fn sidecar_list_line_matches_the_shared_fixture_and_is_never_capped() {
+        #[derive(serde::Deserialize)]
+        struct Case {
+            name: String,
+            sidecars: Vec<String>,
+            line: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            marker: String,
+            cases: Vec<Case>,
+        }
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/sidecar_list_line.json");
+        let fx: Fixture = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(fx.marker, SIDECAR_LIST_MARKER);
+        for c in &fx.cases {
+            assert_eq!(render_sidecar_list_line(&c.sidecars), c.line, "case {}", c.name);
+        }
+
+        let install = Path::new("/tmp/install");
+        let outcomes: Vec<MergeOutcome> = (0..105)
+            .map(|i| MergeOutcome {
+                path: PathBuf::from(format!("knowledge/n{i}.md")),
+                kind: MergeOutcomeKind::PreservedWithUpstreamSidecar {
+                    upstream_sidecar_path: install.join(format!("knowledge/n{i}.md.from-upstream-7b255dd")),
+                    ours_sha: "a".to_string(),
+                    theirs_sha: "7b255dd".to_string(),
+                },
+            })
+            .collect();
+        let actionable: Vec<&MergeOutcome> = outcomes.iter().collect();
+        let (_, detected, _, _) = build_deferral_text(install, &actionable, "main");
+        assert!(detected.contains("... and 5 more"), "display list stays capped");
+        let line = detected.lines().find(|l| l.contains(SIDECAR_LIST_MARKER)).expect("sidecar line");
+        assert!(line.contains("knowledge/n104.md.from-upstream-7b255dd"), "{line}");
     }
 
     /// v0.2.91 WP-B: the THIRD exit. `orchestrator_user_modified_preserved`
@@ -5246,11 +5432,11 @@ pub(crate) mod tests {
         //     vice versa), so `--ff-only` ALWAYS fails post-pre-merge
         //     with a NON-FAST-FORWARD error (a different, expected
         //     failure mode, not the BLOCKER).
-        //   - The non-FF error is handled by `update_orchestrator`'s
-        //     existing B4 modal flow at installer.rs:3423, which
-        //     surfaces a "Merge / Rebase / Cancel" prompt. Choosing
-        //     "Merge" calls `merge_orchestrator_with_upstream` which
-        //     uses `git pull --no-rebase` and lands both edits.
+        //   - The non-FF error is handled by the update's B4 divergence
+        //     modal, which surfaces a "Merge / Rebase / Cancel" prompt.
+        //     Choosing "Merge" runs `run_orchestrator_update({kind:
+        //     Merge})` → `update_pipeline::merge_upstream`, which uses
+        //     `git pull --no-rebase` and lands both edits.
         //
         // This test verifies:
         //   1. The dirty-tree BLOCKER is GONE (pull's stderr no longer
@@ -5379,7 +5565,7 @@ pub(crate) mod tests {
         }
 
         // Follow-up merge pull (the production fallback via the B4
-        // modal → merge_orchestrator_with_upstream) must succeed and
+        // modal → `update_pipeline::merge_upstream`) must succeed and
         // land both edits.
         let merge_pull = StdCommand::new("git").silent()
             .args([
@@ -5476,7 +5662,7 @@ pub(crate) mod tests {
             claude.kind,
         );
 
-        // Non-FF merge pull (matches merge_orchestrator_with_upstream
+        // Non-FF merge pull (matches `update_pipeline::merge_upstream`'s
         // invocation: --no-rebase --no-edit).
         let pull = StdCommand::new("git").silent()
             .args([
@@ -6905,28 +7091,39 @@ pub(crate) mod tests {
             "non-overlapping content edit must pop-probe Clean (the optimisation)"
         );
 
-        // (b) the post-pull backstop is the safety net of record — assert BOTH
-        // update surfaces still detect a conflicted autostash-pop after the fact.
-        // Pinning the source presence makes the A.3 data-safety argument a
-        // regression-tested contract, not just a comment.
+        // (b) the post-pull backstop is the safety net of record — assert the
+        // ONE update pipeline (v0.2.100 WP-03b: `update_pipeline.rs`, which
+        // replaced the per-surface pulls in installer.rs / self_update.rs)
+        // still detects a conflicted autostash-pop after an exit-0 pull and
+        // routes it to the pop deferral. Scanned on CODE ONLY (comments and
+        // string literals blanked by the update_run allowlist scanner), so a
+        // name surviving in a comment cannot satisfy it.
         let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        let installer_src =
-            std::fs::read_to_string(manifest_dir.join("src/commands/installer.rs")).unwrap();
-        let self_update_src =
-            std::fs::read_to_string(manifest_dir.join("src/commands/self_update.rs")).unwrap();
-        assert!(
-            installer_src.contains("--diff-filter=U")
-                || installer_src.contains("collect_conflicted_files")
-                || installer_src.contains("autostash"),
-            "installer.rs must retain the post-pull autostash-pop conflict backstop \
-             (A.3 safety net of record for pop-probe false-CLEANs)"
+        let code_only = crate::commands::update_run::tests::code_only;
+        let pipeline_src = code_only(
+            &std::fs::read_to_string(manifest_dir.join("src/commands/update_pipeline.rs"))
+                .unwrap(),
+        );
+        let installer_src = code_only(
+            &std::fs::read_to_string(manifest_dir.join("src/commands/installer.rs")).unwrap(),
         );
         assert!(
-            self_update_src.contains("--diff-filter=U")
-                || self_update_src.contains("autostash"),
-            "self_update.rs must retain the post-pull autostash-pop conflict backstop \
-             (A.3 safety net of record for pop-probe false-CLEANs)"
+            installer_src.contains("fn collect_conflicted_files("),
+            "installer.rs must keep the unmerged-index reader the backstop uses"
         );
+        for needle in [
+            "let autostash_pop_failed",
+            "collect_conflicted_files(&install_path)",
+            "autostash_pop_failed && merge_succeeded",
+            "write_autostash_pop_conflict_deferral(&install_path",
+        ] {
+            assert!(
+                pipeline_src.contains(needle),
+                "update_pipeline.rs must retain the post-pull autostash-pop conflict \
+                 backstop (A.3 safety net of record for pop-probe false-CLEANs): \
+                 `{needle}` missing from code"
+            );
+        }
     }
 
     /// (vii) A.6 dist-binary allowlist: a dirtied `launcher/dist/**` file is
@@ -7045,6 +7242,91 @@ pub(crate) mod tests {
         assert!(body.contains("python install.py --update"), "CLI recovery");
     }
 
+    /// v0.2.100 (F-W2-08(c)): an existing ledger is MERGED into, never
+    /// clobbered — the other entry survives, an older section for the same
+    /// condition is replaced, and a zero-entry legacy stub is simply replaced.
+    #[test]
+    fn standalone_writer_merges_into_existing_ledger() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let install = dir.path().to_path_buf();
+        let ctx = install.join(".claude/context");
+        std::fs::create_dir_all(&ctx).expect("mkdir");
+        let target = ctx.join("UPDATE_DEFERRED.md");
+        std::fs::write(
+            &target,
+            "---\ncondition_ids: [schema_drift_rebuild_required, launcher_update_diverged]\n---\n\n\
+             # VCO Update Deferred\n\n## schema_drift_rebuild_required (warning)\n\n\
+             **Title**: keep me\n\n---\n\n## launcher_update_diverged (warning)\n\n\
+             **Title**: OLD diverged entry\n\n---\n",
+        )
+        .expect("write");
+        write_launcher_update_diverged_deferral(
+            &install,
+            "main",
+            LauncherUpdateDivergedKind::NonFastForward {
+                local_sha: Some("aaaa111".into()),
+                remote_sha: Some("bbbb222".into()),
+                detail: "fatal: Not possible to fast-forward".into(),
+            },
+        );
+        let body = std::fs::read_to_string(&target).expect("read");
+        assert!(body.contains("## schema_drift_rebuild_required (warning)"), "{body}");
+        assert!(body.contains("keep me"), "{body}");
+        assert!(!body.contains("OLD diverged entry"), "{body}");
+        assert_eq!(body.matches("## launcher_update_diverged (").count(), 1, "{body}");
+        assert!(body.contains("aaaa111"), "{body}");
+    }
+
+    #[test]
+    fn merge_deferral_section_replaces_a_zero_entry_text() {
+        let fresh = "---\ncondition_ids: [x_cid]\n---\n\n# VCO Update Deferred\n\n## x_cid (warning)\n\nbody\n";
+        let stub = "---\nstub: true\n---\n\n# No deferrals\n";
+        assert_eq!(merge_deferral_section(Some(stub), "x_cid", fresh), fresh);
+        assert_eq!(merge_deferral_section(None, "x_cid", fresh), fresh);
+    }
+
+    /// W5R-11: merging a new entry into a ledger that already holds another
+    /// must list BOTH in the frontmatter (and raise `severity_max`), and
+    /// re-merging an existing cid must not duplicate it.
+    #[test]
+    fn merge_deferral_section_keeps_frontmatter_condition_ids_in_sync() {
+        let existing = "---\ntitle: VCO Update Deferred\ngenerated_at: t0\n\
+condition_ids: [old_cid]\nseverity_max: info\n---\n\n# VCO Update Deferred\n\n\
+## old_cid (info)\n\nold body\n";
+        let fresh = "---\ntitle: VCO Update Deferred\ngenerated_at: t1\n\
+condition_ids: [new_cid]\nseverity_max: warning\n---\n\n# VCO Update Deferred\n\n\
+## new_cid (warning)\n\nnew body\n";
+        let merged = merge_deferral_section(Some(existing), "new_cid", fresh);
+        assert!(
+            merged.contains("condition_ids: [old_cid, new_cid]\n"),
+            "{merged}"
+        );
+        assert!(merged.contains("severity_max: warning\n"), "{merged}");
+        assert!(merged.contains("## old_cid (info)\n\nold body"), "{merged}");
+        assert!(merged.contains("## new_cid (warning)\n\nnew body"), "{merged}");
+        // Untouched frontmatter lines survive byte-for-byte.
+        assert!(merged.contains("generated_at: t0\n"), "{merged}");
+
+        // Re-merge the same cid: replaced, not duplicated.
+        let again = merge_deferral_section(Some(&merged), "new_cid", fresh);
+        assert!(
+            again.contains("condition_ids: [old_cid, new_cid]\n"),
+            "{again}"
+        );
+        assert_eq!(again.matches("## new_cid (").count(), 1, "{again}");
+    }
+
+    #[test]
+    fn sync_deferral_frontmatter_ignores_prose_headings_and_no_frontmatter() {
+        let doc = "---\ncondition_ids: []\nseverity_max: info\n---\n\n\
+## Notes on this file\n\n## a_cid (critical)\n\nx\n";
+        let out = sync_deferral_frontmatter(doc);
+        assert!(out.contains("condition_ids: [a_cid]\n"), "{out}");
+        assert!(out.contains("severity_max: critical\n"), "{out}");
+        let plain = "# no frontmatter\n\n## a_cid (info)\n";
+        assert_eq!(sync_deferral_frontmatter(plain), plain);
+    }
+
     /// WP-B6 (v0.2.83): `write_launcher_update_diverged_deferral` must hold the
     /// shared UPDATE_DEFERRED flock across its tmp-write + rename. Observable
     /// proof: hold the SAME folder's flock on a background thread for a fixed
@@ -7159,14 +7441,14 @@ pub(crate) mod tests {
 
     // ─── v0.2.71 Sweep-A#3: self_update surface durable-trace coverage ────
     //
-    // The whole point of relocating the writer is that the launcher
-    // SELF-update path (`self_update::apply_launcher_update`) can now leave
-    // the SAME durable `UPDATE_DEFERRED.md` trace the installer path already
-    // does. `apply_launcher_update` itself is `#[command]` (needs a Tauri
-    // AppHandle + a real git checkout), so we can't unit-test the command
-    // end-to-end here. Instead we pin the contract self_update relies on:
-    // the SHARED writer, called with the EXACT argument shapes the
-    // self_update failure branches pass (a branch name + a NonFastForward
+    // The whole point of relocating the writer was that the launcher
+    // SELF-update path could leave the SAME durable `UPDATE_DEFERRED.md`
+    // trace the installer path did. v0.2.100: both are the one pipeline,
+    // whose non-FF branch (`update_pipeline`, reached from the
+    // `run_orchestrator_update` #[command] — AppHandle + a real checkout) is
+    // not unit-testable end-to-end here. Instead we pin the contract it
+    // relies on: the SHARED writer, called with the EXACT argument shapes the
+    // pipeline's failure branches pass (a branch name + a NonFastForward
     // kind whose detail is the combined git output and whose SHAs come from
     // `current_sha` / `ls_remote_sha`), produces the frontmatter +
     // condition-id + recovery shape a terminal Claude can find. If this ever
@@ -7178,8 +7460,8 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let install = dir.path().to_path_buf();
 
-        // Mirror exactly what `apply_launcher_update`'s non-FF / conflict
-        // return path passes: a NonFastForward kind built from the combined
+        // Mirror exactly what the pipeline's non-FF / conflict return path
+        // passes: a NonFastForward kind built from the combined
         // git output (`e`) + best-effort local/remote SHAs.
         let combined_git_output =
             "Auto-merging launcher/src\nCONFLICT (content): Merge conflict in launcher/src";

@@ -478,6 +478,57 @@ mod tests {
         assert_eq!(arr[0]["embedding_model"], "qwen3-embedding:0.6b");
     }
 
+    /// v0.2.100 W5R-02 / W5R-09: event INGEST is independent of the RL
+    /// scoring lock and of every enable row. With the shipped lock set, an
+    /// explicit per-project `true` row and a host-wide `true` row — i.e.
+    /// scoring forced off while the user's rows say on — a POST through the
+    /// real route still lands. Goes red if the ingest handler ever consults
+    /// the scoring decision (`rl_scoring_enabled_for_project`) or the rows.
+    #[tokio::test]
+    async fn ingest_is_independent_of_the_rl_scoring_lock_and_rows() {
+        let db = Db::open_in_memory().expect("in-memory db");
+        db.insert_project(
+            "p-lock",
+            "P",
+            "/tmp/p-lock",
+            vct_launcher_core::db::models::ProjectHost::Base,
+            "p-lock",
+        )
+        .unwrap();
+        db.module_set_enabled_for_project("p-lock", "vct-rl-reranker", true).unwrap();
+        db.module_set_global_enabled("vct-rl-reranker", true).unwrap();
+        assert!(!db.rl_scoring_enabled_for_project("p-lock").unwrap(), "precondition: locked off");
+
+        let handle = LauncherDbHandle(Arc::new(db));
+        let app: Router = Router::new().nest("/api/v1", router().with_state(handle.clone()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let addr = listener.local_addr().expect("local_addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        let client = reqwest::Client::new();
+        for (task, src) in [("t-locked", "qwen3"), ("t-locked:arctic", "arctic")] {
+            let body = serde_json::json!({
+                "event_type": "retrieval",
+                "schema_version": 3,
+                "ts_ms": 1_700_000_000_000_i64,
+                "project_id": "p-lock",
+                "task_id": task,
+                "task_type": "mcp_interactive",
+                "embedding_source": src,
+                "payload_json": "{}",
+            });
+            let resp = client
+                .post(format!("http://{}/api/v1/rl/events", addr))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), reqwest::StatusCode::OK);
+        }
+        assert_eq!(handle.0.count_rl_events(Some("p-lock"), None, None, None).unwrap(), 2);
+    }
+
     #[tokio::test]
     async fn bad_event_type_returns_400() {
         let base = spawn_test_hub().await;

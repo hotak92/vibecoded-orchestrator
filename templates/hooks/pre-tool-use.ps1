@@ -163,15 +163,41 @@ try {
         Remove-Item -Force -ErrorAction SilentlyContinue
 } catch { }
 
+# v0.2.100 WP-17: read a tool_input field NATIVELY from the payload the
+# ConvertFrom-Json above already decoded. The old Get-Field piped $ToolArgs
+# through a `python -c` child, so with no Python on PATH it returned "" and
+# every branch reading a field -- the Bash shell-injection scan above all --
+# was silently skipped on Windows (and under Windows PowerShell 5.1 the pipe's
+# ASCII $OutputEncoding turned non-ASCII into `?`). No interpreter is needed
+# to read a decoded object. MUST MATCH pre-tool-use.sh's `_get_field` (a
+# missing / null field is "", a value is its string form, trimmed).
 function Get-Field([string]$field) {
-    if (-not $PY) { return "" }
-    if (-not $ToolArgs) { return "" }
+    if (-not $payload -or -not $payload.tool_input) { return "" }
     try {
-        $code = "import sys, json`ntry:`n    d = json.loads(sys.stdin.read())`n    print(d.get('$field', ''))`nexcept Exception:`n    print('')"
-        $result = $ToolArgs | & $PY -c $code 2>$null
-        if ($result) { return $result.Trim() }
+        $value = $payload.tool_input.$field
+        if ($null -eq $value) { return "" }
+        return ([string]$value).Trim()
     } catch { }
     return ""
+}
+
+# v0.2.100 WP-17: the ONE place a branch that genuinely needs Python says so,
+# loudly, instead of skipping itself. Every time it goes to stderr for the
+# human; once per session (a sentinel under .claude/state) it is queued in
+# $script:VcoModelNotice, which the hook emits as its ONE additionalContext
+# envelope where the Bash branch exits (Section 5's tool gate) -- PreToolUse
+# stderr on exit 0 is not shown to the model, and a second envelope on stdout
+# would break the hook's JSON contract.
+# MUST MATCH pre-tool-use.sh's _vco_report_no_python.
+$script:VcoModelNotice = ""
+function Write-VcoNoPythonNotice([string]$what) {
+    $msg = "[VCO broken install] $what did NOT run: no Python interpreter was found (python / py / python3 on PATH). Put Python 3 on PATH or re-run the orchestrator's install / update (``python install.py --update`` in the orchestrator root, or the launcher's Update), then retry."
+    [Console]::Error.WriteLine($msg)
+    $key = if ($SessionIdRaw) { $SessionIdRaw } else { "default" }
+    $sentinel = Join-Path $SessionStateDir "no_python_notice_$key"
+    if (Test-Path -LiteralPath $sentinel) { return }
+    try { Set-Content -LiteralPath $sentinel -Value "" -ErrorAction Stop } catch { }
+    $script:VcoModelNotice = $msg
 }
 
 function Write-SecurityLine([string]$json) {
@@ -180,23 +206,57 @@ function Write-SecurityLine([string]$json) {
 
 # === 1. SSRF GUARD ===
 if ($ToolName -eq "WebFetch") {
-    $url = Get-Field "url"
+    # The URL comes from the payload ConvertFrom-Json already decoded, NOT
+    # from Get-Field: that helper pipes the JSON through a `python -c` child,
+    # which returns nothing when no Python is found (the guard would then be
+    # skipped — the R18F-08 hole) and, under Windows PowerShell 5.1, pipes
+    # with the ASCII $OutputEncoding, turning a non-ASCII host into `?`.
+    $url = ""
+    if ($payload -and $payload.tool_input -and $null -ne $payload.tool_input.url) {
+        $url = ([string]$payload.tool_input.url).Trim()
+    }
     if ($url) {
-        # Whitelisted local services (Weaviate, Ollama, code-embed, Gradio).
-        # SearXNG (:8888) and the mcp__search__fetch_page tool both
+        # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
+        # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
         # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
         # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
         # outbound HTTP doesn't go through this WebFetch SSRF guard.
-        $whitelisted = $url -match '(localhost:(8081|8082|11435|11440|7860)|127\.0\.0\.1:(8081|8082|11435|11440|7860))'
-        if (-not $whitelisted -and $url -match '(localhost|127\.|10\.\d+\.\d+\.\d+|172\.(1[6-9]|2[0-9]|3[01])\.\d+\.|192\.168\.\d+\.|169\.254\.\d+\.|0\.0\.0\.0|::1)') {
+        # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
+        # implementation for every OS; its docstring is the contract), run
+        # once through _lib/ssrf-allowlist.ps1. MUST MATCH the .sh sibling.
+        # The allowed pairs are DERIVED from the projected env, so a moved
+        # service_endpoints port is allowed and nothing asks the user to
+        # hand-edit this hook. FAIL CLOSED: only the exact words `allow` /
+        # `pass` let the call through. The lib missing (partial install), no
+        # interpreter, vco_lib not importable, or any other output blocks,
+        # and says why.
+        $ssrfLib = Join-Path $LibDir "ssrf-allowlist.ps1"
+        $ssrfVerdict = ""
+        $ssrfPairs = ""
+        $ssrfWhy = "hooks/_lib/ssrf-allowlist.ps1 is missing - run the bundle update to restore it"
+        if (Test-Path -LiteralPath $ssrfLib) {
+            . $ssrfLib
+            $ssrfCheck = Invoke-VcoSsrfCheck -Url $url -HooksDir $ScriptDir
+            $ssrfVerdict = [string]$ssrfCheck.Verdict
+            $ssrfPairs = [string]$ssrfCheck.Pairs
+            $ssrfErr = if ($ssrfCheck.Error) { [string]$ssrfCheck.Error } else { "unrecognised answer '$ssrfVerdict'" }
+            $ssrfWhy = "the guard could not run ($ssrfErr) - a broken VCO install: re-run the orchestrator's update (``python install.py --update`` in the orchestrator root, or the launcher's Update), which reinstalls vco_lib into the VCO venv"
+        }
+        if ($ssrfVerdict -cne "allow" -and $ssrfVerdict -cne "pass") {
             # Route the block message to STDERR (matches pre-tool-use.sh).
-            # Claude Code's PreToolUse runner discards plain stdout — an
+            # Claude Code's PreToolUse runner discards plain stdout - an
             # exit-2 hook with only-stdout renders as "hook error: No
             # stderr output". [Console]::Error.WriteLine goes to the true
             # stderr stream (Write-Output / the PS error stream would not).
-            [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address.")
-            [Console]::Error.WriteLine("   Whitelisted localhost services: Weaviate (:8081), Ollama (:11435), code-embed (:11440), Gradio (:7860)")
-            [Console]::Error.WriteLine("   To allow additional services, add to whitelist in .claude/hooks/pre-tool-use.ps1")
+            if ($ssrfVerdict -ceq "block") {
+                if (-not $ssrfPairs) { $ssrfPairs = "none" }
+                [Console]::Error.WriteLine("SSRF guard: '$url' targets a private/internal network address (or one the guard cannot read).")
+                [Console]::Error.WriteLine("   Allowed local services on this machine: $ssrfPairs")
+                [Console]::Error.WriteLine("   They follow WEAVIATE_URL / OLLAMA_URL / CODE_EMBED_SERVICE_URL and the hub port - a moved service is")
+                [Console]::Error.WriteLine("   changed with the launcher's Services page or ``python -m vco_lib.service_endpoints move``, never by editing this hook.")
+            } else {
+                [Console]::Error.WriteLine("SSRF guard: '$url' was blocked because $ssrfWhy.")
+            }
             $urlEsc = $url -replace '\\', '\\\\' -replace '"', '\"'
             Write-SecurityLine "{""timestamp"":""$ts"",""event"":""ssrf_blocked"",""url"":""$urlEsc""}"
             exit 2
@@ -224,8 +284,13 @@ if ($ToolName -eq "Bash") {
         exit 2
     }
 
-    # Extended security scan via bash_security.py if available.
+    # Extended security scan via bash_security.py if available. It is Python,
+    # so with no interpreter it cannot run -- and says so (v0.2.100 WP-17)
+    # instead of being skipped in silence. The regex scan above already ran.
     $SecurityScript = Join-Path $ProjectRoot ".claude/scripts/bash_security.py"
+    if ((Test-Path $SecurityScript) -and -not $PY) {
+        Write-VcoNoPythonNotice "The Bash security scanner (.claude/scripts/bash_security.py)"
+    }
     if ((Test-Path $SecurityScript) -and $PY) {
         try {
             $secOut = $cmd | & $PY $SecurityScript 2>&1
@@ -404,7 +469,14 @@ if ($ToolName -eq "Write" -or $ToolName -eq "Edit") {
 }
 
 # === 5. KG SEARCH SUGGESTION (Edit/Write only) ===
-if ($ToolName -ne "Edit" -and $ToolName -ne "Write") { exit 0 }
+if ($ToolName -ne "Edit" -and $ToolName -ne "Write") {
+    # v0.2.100 WP-17: the Bash branch's queued broken-install notice leaves
+    # in this tool call's one envelope.
+    if ($script:VcoModelNotice -and (Get-Command Emit-AdditionalContext -ErrorAction SilentlyContinue)) {
+        Emit-AdditionalContext $script:VcoModelNotice 'PreToolUse'
+    }
+    exit 0
+}
 
 # WP-E (v0.2.92) REVIVAL: this branch originally gated on a topic-keyword
 # regex scanned out of $UserMessage (populated from the hook payload's
@@ -459,7 +531,21 @@ if ($_kg5File) {
 # USER's project venv (which lacks weaviate-client).
 . (Join-Path $ScriptDir "_lib/resolve-vco-venv.ps1")
 $VenvPy = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-$RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py"
+# v0.2.100 F3: the KG producer ships ONLY in the orchestrator root - locate it
+# there (same roots as the venv), never under the project root. It still runs
+# with THIS project's CLAUDE_PROJECT_DIR/env, so the calling project's KG +
+# shared + granted collections apply. MUST MATCH the .sh sibling.
+$RlScript = Resolve-VcoOrchestratorScript -ScriptDir $ScriptDir -RelPath "claude_mcp_servers/scripts/rl_kg_search.py"
+# Unresolved -> the legacy (absent) project path: every Test-Path below then
+# reads "not installed" without binding an empty -Path.
+if (-not $RlScript) { $RlScript = Join-Path $ProjectRoot "claude_mcp_servers/scripts/rl_kg_search.py" }
+# Pin the CALLING project's identity for the producer (a no-op whenever the
+# harness already set it): the script lives in the orchestrator root, so its
+# own location must never be what names the project.
+$env:CLAUDE_PROJECT_DIR = $ProjectRoot
+# v0.2.100 W5R-14: tag this hook's RL retrieval events with ITS task_type
+# (rl_kg_search.py reads it; MUST MATCH the .sh sibling).
+$env:VCO_RL_TASK_TYPE = "pre_tool_use_kg_search"
 $matchOutput = ""
 if ($VenvPy -and (Test-Path $VenvPy) -and (Test-Path $RlScript)) {
     try {

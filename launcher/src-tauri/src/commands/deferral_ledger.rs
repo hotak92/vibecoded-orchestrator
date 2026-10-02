@@ -558,6 +558,9 @@ pub(crate) fn read_ledger(
 
 /// Resolve a project's folder + display name from the DB.
 fn project_target(db: &Db, project_id: &str) -> Result<(PathBuf, String), String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    let db = db.ensure_live()?;
     let row = db
         .get_project(project_id)?
         .ok_or_else(|| format!("project {project_id} not found"))?;
@@ -566,6 +569,9 @@ fn project_target(db: &Db, project_id: &str) -> Result<(PathBuf, String), String
 
 /// Resolve the orchestrator clone root (DB cache first, then the walk-up).
 fn root_target(db: &Db) -> Result<PathBuf, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    let db = db.ensure_live()?;
     crate::services::vco_lib_bridge::resolve_orchestrator_root(db).ok_or_else(|| {
         "orchestrator root unresolvable (no DB-cached install path and no clone \
          discoverable from the launcher binary) — the global deferral ledger \
@@ -689,12 +695,9 @@ fn run_dismiss_cli(
         .output()
         .map_err(|e| format!("dismiss-deferral failed to spawn: {e}"))?;
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr");
         return Err(format!(
-            "dismiss-deferral exited {}: {}",
-            output.status.code().unwrap_or(-1),
-            first,
+            "dismiss-deferral failed: {}",
+            vct_launcher_core::process::failure_evidence(&output.status, &String::from_utf8_lossy(&output.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
         ));
     }
     serde_json::from_slice::<DismissPayload>(&output.stdout).map_err(|e| {
@@ -1342,5 +1345,72 @@ mod tests {
             summarize_boot_findings(br#"{"ok":true,"findings":[{"probe":"a","status":"ok"}]}"#),
             Some(0)
         );
+    }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn root_and_project_targets_stand_down_in_standby() {
+        let db = standby_db();
+        assert_typed_standby(&root_target(&db).unwrap_err());
+        assert_typed_standby(&project_target(&db, "p1").unwrap_err());
+    }
+
+}
+
+/// v0.2.100 WP-05 (I-06): a failed `dismiss-deferral` spawn names its exit
+/// status — a silent `exit 1` and a signal kill both carry evidence. Pre-fix
+/// the message was `exited 1: no stderr` / `exited -1: no stderr` (the -1 a
+/// signal erased into a made-up code).
+#[cfg(all(test, unix))]
+mod spawn_evidence_tests {
+    use super::*;
+
+    fn fake_python(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("python");
+        std::fs::write(&py, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[test]
+    fn dismiss_cli_failure_carries_the_exit_status() {
+        for (body, want) in [("exit 1", "exit status: 1"), ("kill -9 $$", "signal: 9")] {
+            let py = fake_python(body);
+            let interp = py.path().join("python");
+            let work = tempfile::tempdir().unwrap();
+            let err = {
+                let _env = vct_launcher_core::test_env::env_guard(&[(
+                    "VCT_VENV",
+                    Some(interp.to_str().unwrap()),
+                )]);
+                run_dismiss_cli(work.path(), work.path(), "some_condition")
+                    .expect_err("a failing CLI is an Err")
+            };
+            assert!(err.contains(want), "`{body}` → {err}");
+        }
     }
 }

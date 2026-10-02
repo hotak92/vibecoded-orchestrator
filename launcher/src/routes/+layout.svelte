@@ -3,8 +3,9 @@
   import { isAuthenticated, authLoading } from '$lib/stores/auth';
   import { goto, afterNavigate } from '$app/navigation';
   import { page } from '$app/stores';
-  import { ui } from '$lib/stores/ui';
-  import { orchestrator } from '$lib/stores/orchestrator';
+  import { ui, registerShellListeners } from '$lib/stores/ui';
+  import { orchestrator, startStatusPolling } from '$lib/stores/orchestrator';
+  import { toast } from '$lib/stores/toast';
   import { isOnboardingComplete, clearOnboardingComplete } from '$lib/onboarding';
   import { onMount } from 'svelte';
 
@@ -31,8 +32,8 @@
   // v0.2.43 (contributor branch feat/orchestrator-update-progress-modal): full-
   // screen blocking overlay for the orchestrator self-update flow. Mount +
   // close pattern mirrors `InstallWizard` and the L1 `LicenseManagerModal`
-  // sibling above. Opened by `ui.openOrchestratorUpdateProgress()` from
-  // `UpdateBadge.svelte::handleAction`; the modal self-closes after the
+  // sibling above. Opened by `ui.openOrchestratorUpdateProgress()` inside
+  // `updater.beginOp()` (every update action, from every surface); the modal self-closes after the
   // hold+fade completion lifecycle (1.8 s + 400 ms) or on user-dismiss in
   // the error path. Namespacing reserved by A3 collision audit.
   import OrchestratorUpdateProgressModal from '$lib/components/OrchestratorUpdateProgressModal.svelte';
@@ -74,6 +75,8 @@
   // the MenuBar — see the markup note there. It used to sit above MenuBar,
   // which put it at the window's top edge, glued to the titlebar.
   import ProjectSetupBanner from '$lib/components/ProjectSetupBanner.svelte';
+  // v0.2.100: interrupted-project-move banner (`list_live_project_moves_v2`).
+  import ProjectMoveBanner from '$lib/components/ProjectMoveBanner.svelte';
   // PR-8 (v0.2.11 / 2026-05-15): one-time legacy-collection notice. Auto-
   // shown when (a) Weaviate has at least one ClaudeOrchestrator_<Suffix>
   // class with objects AND (b) at least one user project has a different
@@ -90,7 +93,7 @@
   import GatewayRestartModal from '$lib/components/GatewayRestartModal.svelte';
   import { gatewayFreshness } from '$lib/stores/gateway-freshness';
   import { scheduleStartupCheck } from '$lib/gateway-freshness';
-  import { invoke } from '$lib/tauri';
+  import { invoke, listen } from '$lib/tauri';
   // M-P1-5: per-install-root scoping for localStorage flags. See
   // `install-state-store.ts` for the migration rationale (two clones
   // on the same machine share localStorage; unscoped keys leaked
@@ -177,6 +180,32 @@
   });
 
   onMount(() => {
+    // v0.2.100 (WP-08, L3-F13): the update-status polling is registered
+    // FIRST — before the splash code, the freshness check and the change
+    // poller — so a synchronous throw in any of those can never skip it.
+    // `startStatusPolling` runs the immediate check and arms the hourly one
+    // (which honours the auto-check preference, L3-F09).
+    const stopStatusPolling = startStatusPolling();
+
+    // v0.2.100 (WP-08, L3-F04 / L2-F05): ONE `vct-tray-action` listener plus
+    // the backend notice events that had no listener at all. Routing lives
+    // in `stores/ui.ts` (`routeTrayAction`, `SHELL_NOTICE_EVENTS`).
+    let stopShellListeners: (() => void) | null = null;
+    let unmounted = false;
+    void registerShellListeners(listen, {
+      goto: (path) => goto(path),
+      manualCheck: () => updater.manualCheck(),
+      showAbout: () => {
+        showChangelog = true;
+      },
+      refreshUpdateStatus: () => orchestrator.checkStatus(),
+      notifyInfo: (m) => toast.info(m),
+      notifyError: (m, key) => toast.error(m, { key }),
+    }).then((stop) => {
+      if (unmounted) stop();
+      else stopShellListeners = stop;
+    });
+
     // Hide the boot splash (#vct-splash in app.html) now that the Svelte app
     // has mounted. The splash is plain inline HTML/CSS rendered by the WebView
     // before this code runs, so cold-start reads as "Avvio in corso…" instead
@@ -320,15 +349,13 @@
     // its OWN short-burst retries (30s / 90s / 300s, capped) instead of
     // waiting up to an hour here. So this interval stays a plain hourly
     // refresh; the fast recovery lives in the store, not in this component.
-    void orchestrator.checkStatus();
-    const orchStatusInterval = setInterval(
-      () => void orchestrator.checkStatus(),
-      60 * 60 * 1000,
-    );
+    // v0.2.100: registered at the TOP of this onMount (`startStatusPolling`).
 
     return () => {
+      unmounted = true;
       unsub();
-      clearInterval(orchStatusInterval);
+      stopStatusPolling();
+      stopShellListeners?.();
       cancelFreshnessCheck();
     };
   });
@@ -390,6 +417,7 @@
          Project modal. -->
     <div class="shell-banners">
       <ProjectSetupBanner />
+      <ProjectMoveBanner />
     </div>
     <div class="app-body">
       <Sidebar />
@@ -434,9 +462,9 @@
     <LicenseManagerModal onClose={() => ui.closeLicenseManager()} />
   {/if}
   <!-- v0.2.43 (contributor): full-screen blocking overlay during self-update.
-       Opened by `ui.openOrchestratorUpdateProgress()` from
-       UpdateBadge.handleAction right before invoking any updater action
-       (runUpdate / applyPendingInstall / runRestart). The modal subscribes
+       Opened by `updater.beginOp()` inside every update action
+       (`updater.run(kind)` / `runRestart`, from any surface — v0.2.100).
+       The modal subscribes
        to `$orchestrator.progress` directly (no dup listener) and self-
        closes after the completion hold+fade timer expires. -->
   {#if uiState.showOrchestratorUpdateProgress}

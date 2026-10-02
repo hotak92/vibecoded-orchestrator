@@ -42,8 +42,8 @@
   // All decision logic lives in `$lib/dual-flags` and is unit-tested there
   // (the repo has no jsdom). This file is markup over it.
 
-  import { onMount } from 'svelte';
-  import { invoke } from '$lib/tauri';
+  import { onMount, onDestroy } from 'svelte';
+  import { invoke, listen } from '$lib/tauri';
   import { toast } from '$lib/stores/toast';
   import {
     DUAL_FLAGS,
@@ -52,6 +52,10 @@
     cascadeFootnote,
     effectiveLine,
     globalSaveSummary,
+    MODEL_ENSURE_EVENT,
+    MODEL_ENSURE_RUNNING_TEXT,
+    ensureEventIsFor,
+    modelEnsureOutcomeText,
     mountConfigError,
     panelIntro,
     panelTitle,
@@ -60,6 +64,8 @@
     triChoiceToValue,
     type DualFlagGlobalDefaults,
     type DualFlagKey,
+    type DualFlagProjectWriteResult,
+    type ModelEnsureEvent,
     type DualFlagState,
     type DualFlagsState,
     type DualScope,
@@ -76,7 +82,29 @@
     reprojected: number;
     warnings: number;
     skipped: number;
+    model_ensure_started: boolean;
   }
+
+  // v0.2.100 F-W3-03: the background model ensure a toggle starts is shown
+  // HERE — "running" when the write says it started, then the outcome the
+  // Rust side emits when it finishes (before, only the log saw it).
+  let ensureStatus = $state<{ kind: 'running' | 'ok' | 'failed'; text: string } | null>(null);
+  let unlistenEnsure: (() => void) | null = null;
+
+  function noteEnsureStarted(started: boolean): void {
+    if (started) ensureStatus = { kind: 'running', text: MODEL_ENSURE_RUNNING_TEXT };
+  }
+
+  onMount(() => {
+    void listen<ModelEnsureEvent>(MODEL_ENSURE_EVENT, (e) => {
+      if (!ensureEventIsFor(e.payload, scope, projectId)) return;
+      const r = modelEnsureOutcomeText(e.payload.outcome);
+      ensureStatus = { kind: r.ok ? 'ok' : 'failed', text: r.text };
+    }).then((u) => {
+      unlistenEnsure = u;
+    });
+  });
+  onDestroy(() => unlistenEnsure?.());
 
   let loading = $state(true);
   let loadError = $state<string | null>(null);
@@ -120,11 +148,13 @@
       // cascade may have moved a second flag (turning the log on enables
       // dual-write; turning dual-write off disables the log). Render from
       // that, never from what we optimistically asked for.
-      flags = await invoke<DualFlagsState>('set_dual_flag_for_project', {
+      const result = await invoke<DualFlagProjectWriteResult>('set_dual_flag_for_project', {
         projectId,
         flag: key,
         value: triChoiceToValue(choice),
       });
+      flags = result.state;
+      noteEnsureStarted(result.model_ensure_started);
     } catch (e) {
       toast.error(e);
       await load();
@@ -142,6 +172,7 @@
       });
       globalDefaults = result.defaults;
       toast.success(globalSaveSummary(result.reprojected, result.warnings));
+      noteEnsureStarted(result.model_ensure_started);
     } catch (e) {
       toast.error(e);
       await load();
@@ -280,6 +311,17 @@
       </div>
     {/each}
 
+    {#if ensureStatus}
+      <p
+        class="df-ensure"
+        class:df-ensure-failed={ensureStatus.kind === 'failed'}
+        role="status"
+        aria-live="polite"
+      >
+        {ensureStatus.text}
+      </p>
+    {/if}
+
     <footer class="df-footnote">
       <p><strong>How the cascade works:</strong> {cascadeFootnote(scope)[0]}</p>
       {#each cascadeFootnote(scope).slice(1) as line (line)}
@@ -331,6 +373,14 @@
     text-align: center;
     color: #888;
     font-size: 12px;
+  }
+  .df-ensure {
+    font-size: 11px;
+    color: #9fe6d8;
+    margin: 8px 0 0;
+  }
+  .df-ensure-failed {
+    color: #ffb4b4;
   }
   .df-row {
     display: flex;

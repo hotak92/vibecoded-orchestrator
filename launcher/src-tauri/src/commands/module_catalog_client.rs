@@ -24,7 +24,7 @@
 //     value (if any) survives.
 //
 // Retry / backoff:
-//   - reuses Agent E's v0.2.32 UB1 pattern from `self_update::fetch_with_retry`:
+//   - reuses Agent E's v0.2.32 UB1 pattern from `upstream_fetch::fetch_with_retry`:
 //     first attempt immediate, then delays of 1s / 5s / 30s / 120s (5 attempts
 //     total, ~156s upper bound). Production code interprets the values as ms,
 //     tests interpret as 1/1000 of that to keep CI snappy.
@@ -108,7 +108,7 @@ pub(crate) const APP_STATE_CACHE_LIKE: &str = "module_catalog.cache%";
 // ─── Retry/backoff constants ──────────────────────────────────────────────
 
 /// Backoff schedule for transient L0 fetch failures. Identical to
-/// `self_update::FETCH_RETRY_DELAYS_MS` (v0.2.32 UB1); same rationale — long
+/// `upstream_fetch::FETCH_RETRY_DELAYS_MS` (v0.2.32 UB1); same rationale — long
 /// enough to absorb a Wi-Fi reconnect or VPN handshake, short enough to bail
 /// out before the UI loses patience.
 ///
@@ -414,7 +414,7 @@ pub(crate) fn parse_response_text(text: &str) -> Result<L0CatalogResponse, Strin
 }
 
 /// Inner retry loop, parametrised over the attempt closure so unit tests can
-/// swap in failure-injecting mocks. Mirrors `self_update::fetch_with_retry`'s
+/// swap in failure-injecting mocks. Mirrors `upstream_fetch::fetch_with_retry`'s
 /// shape — first attempt immediate, subsequent attempts wait
 /// `L0_RETRY_DELAYS_MS[i-1]`.
 ///

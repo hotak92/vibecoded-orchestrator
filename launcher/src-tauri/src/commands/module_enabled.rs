@@ -98,6 +98,8 @@ pub async fn module_set_enabled_for_project(
         return Err("module_id must not be empty".to_string());
     }
 
+    // v0.2.100 W5R-02: no "turn on" write while the module's effect is locked.
+    vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(&module_id, enabled)?;
     db.module_set_enabled_for_project(&project_id, &module_id, enabled)?;
 
     db.audit(
@@ -181,6 +183,8 @@ pub async fn module_set_global_enabled(
         return Err("module_id must not be empty".to_string());
     }
 
+    // v0.2.100 W5R-02: no "turn on" write while the module's effect is locked.
+    vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(&module_id, enabled)?;
     db.module_set_global_enabled(&module_id, enabled)?;
 
     db.audit(
@@ -222,6 +226,16 @@ pub async fn module_is_global_enabled(
     db: State<'_, Db>,
 ) -> Result<Option<bool>, String> {
     db.module_global_enabled(&module_id)
+}
+
+/// v0.2.100 W5R-02: the RL scoring lock the GUI must render — `Some(reason)`
+/// while RL scoring is locked off (`vco_lib/rl_scoring_lock.toml`, read by
+/// `vct_launcher_core::rl_scoring_lock`), `None` when unlocked. The GUI has no
+/// copy of this value; every RL scoring control reads it from here (or from
+/// `ModuleEnableState.lock_reason`, the same source).
+#[command]
+pub fn rl_scoring_lock() -> Option<String> {
+    vct_launcher_core::rl_scoring_lock::rl_scoring_lock().map(str::to_string)
 }
 
 /// Read the effective enable flag for a (project, module) pair using
@@ -309,6 +323,9 @@ pub fn set_module_enabled_for_project_v2_with_db(
         return Err("module_id must not be empty".to_string());
     }
 
+    // v0.2.100 W5R-02: refuse an explicit ON while locked. OFF and CLEAR stay
+    // allowed: neither can turn scoring on, and the rows are the user's.
+    vct_launcher_core::rl_scoring_lock::refuse_enable_while_locked(module_id, value == Some(true))?;
     db.module_write_enabled_for_project(project_id, module_id, value)?;
 
     db.audit(
@@ -538,6 +555,16 @@ pub fn probe_rl_auto_enable_at_boot(
         }
     };
 
+    // v0.2.100 W5R-02: never invite "enable RL" while scoring is locked —
+    // the setters would refuse the very action the prompt offers.
+    if !should_emit_rl_auto_enable(
+        count,
+        global,
+        RL_AUTO_ENABLE_EVENT_THRESHOLD,
+        vct_launcher_core::rl_scoring_lock::rl_scoring_lock(),
+    ) {
+        return;
+    }
     match global {
         Some(false) => {
             // Eligible: install.py seeded `false` and the user
@@ -570,6 +597,18 @@ pub fn probe_rl_auto_enable_at_boot(
             // Skip the prompt.
         }
     }
+}
+
+/// The boot probe's decision, pure so every branch is unit-testable: prompt
+/// only at/over the threshold, only while the host-wide row is the seeded
+/// `false`, and never while RL scoring is locked.
+pub fn should_emit_rl_auto_enable(
+    count: i64,
+    global: Option<bool>,
+    threshold: i64,
+    lock: Option<&str>,
+) -> bool {
+    lock.is_none() && count >= threshold && matches!(global, Some(false))
 }
 
 // ─── Seeding helpers (called from project_create / install / uninstall) ──
@@ -828,15 +867,40 @@ mod tests {
     // for the launcher: every other event-emit-on-boot path keeps the
     // decision logic separable.
 
-    /// Compute whether the boot probe SHOULD emit an event given the
-    /// observed event count and current global toggle state. Pure
-    /// function — testable without a Tauri context.
-    fn _should_emit_rl_auto_enable(
-        count: i64,
-        global: Option<bool>,
-        threshold: i64,
-    ) -> bool {
-        count >= threshold && matches!(global, Some(false))
+    /// The real decision fn with the lock lifted (the pre-lock matrix).
+    fn _should_emit_rl_auto_enable(count: i64, global: Option<bool>, threshold: i64) -> bool {
+        should_emit_rl_auto_enable(count, global, threshold, None)
+    }
+
+    /// v0.2.100 W5R-02: while RL scoring is locked the prompt never fires,
+    /// even in the one cell that would otherwise prompt.
+    #[test]
+    fn rl_auto_enable_never_prompts_while_locked() {
+        assert!(should_emit_rl_auto_enable(10_000, Some(false), 500, None));
+        assert!(!should_emit_rl_auto_enable(10_000, Some(false), 500, Some("locked")));
+        assert!(vct_launcher_core::rl_scoring_lock::rl_scoring_lock().is_some(), "ships locked");
+    }
+
+    /// v0.2.100 W5R-02: while locked, the per-project setter refuses an
+    /// explicit ON and writes nothing; OFF and CLEAR are allowed; the
+    /// resolved state carries the lock reason.
+    #[test]
+    fn locked_setter_refuses_on_and_allows_off_and_clear() {
+        let db = mkdb();
+        mkproject(&db, "p1", "p1");
+        let m = "vct-rl-reranker";
+        let err = set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(true)).unwrap_err();
+        assert!(err.contains("locked"), "{err}");
+        assert_eq!(db.resolve_module_enable("p1", m).unwrap().explicit, None, "nothing written");
+
+        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", m, Some(false)).unwrap();
+        assert_eq!(st.explicit, Some(false));
+        assert!(st.lock_reason.is_some());
+        let st = set_module_enabled_for_project_v2_with_db(&db, "p1", m, None).unwrap();
+        assert_eq!(st.explicit, None);
+
+        // Unlocked modules are unaffected.
+        assert!(set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-coordination", Some(true)).is_ok());
     }
 
     /// Boot probe decision matrix.
@@ -914,10 +978,13 @@ mod tests {
         mkproject(&db, "p1", "p1");
         db.module_set_global_enabled("vct-rl-reranker", false).unwrap();
 
-        // Explicit on for this project — beats the host-wide off.
-        let st =
-            set_module_enabled_for_project_v2_with_db(&db, "p1", "vct-rl-reranker", Some(true))
-                .expect("write must succeed");
+        // Explicit on for this project — beats the host-wide off. Written at
+        // the DB layer: an ON row stored before the v0.2.100 RL scoring lock
+        // (the command core refuses a NEW ON while locked — see
+        // `locked_setter_refuses_on_and_allows_off_and_clear`).
+        db.module_write_enabled_for_project("p1", "vct-rl-reranker", Some(true))
+            .expect("write must succeed");
+        let st = db.resolve_module_enable("p1", "vct-rl-reranker").unwrap();
         assert_eq!(st.explicit, Some(true));
         assert_eq!(st.source, ModuleEnableSource::Project);
         assert!(st.effective);
@@ -936,7 +1003,10 @@ mod tests {
         );
         let st = db.resolve_module_enable("p1", "vct-rl-reranker").unwrap();
         assert_eq!(st.source, ModuleEnableSource::SystemDefault);
-        assert!(st.effective, "fail-open when nothing is set anywhere");
+        assert!(
+            !st.effective,
+            "the RL reranker resolves OFF when nothing is set anywhere (v0.2.100)"
+        );
     }
 
     /// The audit trail can tell a CLEAR apart from an explicit off. Without
@@ -1000,13 +1070,17 @@ mod tests {
         assert!(err.contains("module_id"), "unhelpful message: {err}");
         assert!(clear_global_enabled_with_db(&db, "").is_err());
 
-        // Leave-alone half: the real project/module pair still writes.
-        assert!(
+        // Leave-alone half: the real project/module pair still writes. An
+        // explicit OFF, because a NEW explicit ON is refused while the RL
+        // scoring lock is set (v0.2.100 W5R-02 — see
+        // `locked_setter_refuses_on_and_allows_off_and_clear`).
+        assert_eq!(
             set_module_enabled_for_project_v2_with_db(
-                &db, "p1", "vct-rl-reranker", Some(true)
+                &db, "p1", "vct-rl-reranker", Some(false)
             )
             .expect("valid write must succeed")
-            .effective
+            .explicit,
+            Some(false),
         );
     }
 }

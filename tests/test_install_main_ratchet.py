@@ -67,7 +67,10 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 # v0.2.97 SE-2: re-pinned DOWN (1652 → 1645) — step [5b] is one shim call
 # (+ the post-start verify and the --no-containers reconcile, one line each),
 # and --compose-working-dir's help lost the superseded legacy legs.
-_MAIN_SPAN_MAX = 1645
+# v0.2.100 WP-12: re-pinned DOWN (1645 → 1473). The collections/seed block
+# with its Weaviate-down recovery and the migrate-error deferral loop moved to
+# `vco_lib.install_weaviate` (`collections_and_seed`, `migrate_errors_to_entries`).
+_MAIN_SPAN_MAX = 1473
 
 # TOTAL: strict — measured exactly, no headroom. Additions require
 # extraction to vco_lib, not a bump.
@@ -376,7 +379,28 @@ _MAIN_SPAN_MAX = 1645
 # to the call). Same "inseparable thin-shim" precedent as the v0.2.81
 # Step-4c and v0.2.77 Part-5 lines above — measured with `wc -l`, not
 # predicted.
-_TOTAL_LINES_MAX = 23145
+#
+# v0.2.100 WP-04 — re-pinned DOWN 23145 -> 22677 (-468). Step 5's compose
+# tail (runtime pre-flight, GPU overlay pick, compose up + retry + failure
+# surfacing) moved to `vco_lib.install_services_up`, the podman machine
+# helper to `vco_lib.compose_provider`, and the reachability / podman-start
+# helpers became thin calls into `compose_provider`. Measured with `wc -l`.
+#
+# v0.2.100 WP-09 — re-pinned DOWN 22671 -> 22512 (-159). The Ollama wait +
+# pull moved to `vco_lib.ollama_pull` (install.py keeps two thin shims and the
+# testable `_ollama_models_step`), the pull list to `vco_lib.embedding_pull_plan`
+# (`_build_ollama_pull_list`, the profiles' static `embedding_models` and
+# `_OLLAMA_SERVED_EMBEDDING_MODELS` removed). Measured with `wc -l`.
+#
+# v0.2.100 WP-12 — re-pinned DOWN 22512 -> 22153 (-359). The seed phase and
+# the Weaviate write gate moved to `vco_lib.install_weaviate`, the resume/log
+# session parser (three hand copies: resume state, previous choices, state
+# hashes) to `vco_lib.install_resume`, the Ollama step-6/7 flow to
+# `vco_lib.ollama_pull.install_step`, the text-generation tier to one model.
+# Measured with `wc -l`.
+# v0.2.100 WP-15 — re-pinned DOWN 22153 -> 22082: the zero-entry
+# UPDATE_DEFERRED.md stub writer was retired (owner rule F-W2-08(c)).
+_TOTAL_LINES_MAX = 22082
 
 
 def _measure() -> tuple:

@@ -918,6 +918,11 @@ usage() {
 Usage:
   $0 <project_folder> [--field NAME]
   $0 resolve-project <project_folder>
+  $0 hub-port
+
+hub-port prints the port the hub is reached on (VCT_HUB_PORT -> hub.port ->
+7700, the same ladder every request here uses), for a shell caller that
+must know the hub port without making a request.
 
 Exit codes:
   0  success
@@ -939,6 +944,9 @@ main() {
         -h|--help)
             usage
             exit 0
+            ;;
+        hub-port)
+            hub_port
             ;;
         resolve-project)
             if [[ $# -lt 2 ]]; then

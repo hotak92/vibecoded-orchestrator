@@ -6,7 +6,7 @@
 //! later one-click reactivation works without re-entry, but readers are
 //! gated as if the secret were not set).
 //!
-//! Read-time gate is enforced in `commands/secrets_cmd.rs::is_secret_set`
+//! Read-time gate is enforced in `commands/secrets_cmd.rs::get_secret_status_v2`
 //! and `get_secret_preview`. Both consult `is_active(...)` BEFORE
 //! returning data — never trust the keychain alone.
 //!
@@ -84,7 +84,7 @@ impl Db {
 
     /// Mark a secret inactive on its canonical row. The keychain value
     /// is NOT touched — that is the whole point of Lifecycle B (Bug 3
-    /// fix). After this call, the public read API (`is_secret_set`,
+    /// fix). After this call, the public read API (`get_secret_status_v2`,
     /// `get_secret_preview`) MUST refuse to surface the value.
     pub fn mark_secret_inactive(
         &self,

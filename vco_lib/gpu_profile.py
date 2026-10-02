@@ -9,8 +9,10 @@ extract-before-duplicate discipline. Two pure helpers:
   override (case-insensitive, with stderr warning on unknown values).
 - :func:`apply_tier_overrides` — swap an embedding-profile dict's
   ``code_model`` / ``text_model`` for hardware-tier picks while keeping
-  dependent fields (``code_dims``, ``text_dims``, ``active_embedding``,
-  ``embedding_models`` pull list) consistent.
+  dependent fields (``code_dims``, ``text_dims``, ``active_embedding``)
+  consistent. The Ollama pull list is NOT derived here any more — v0.2.100
+  moved it to :mod:`vco_lib.embedding_pull_plan`, which reads the final
+  config (appending here only ever grew the list, never shrank it: L1-F12).
 
 Neither helper references install.py module-level state; install.py's
 constants are passed in as parameters so the same helper is reusable
@@ -53,15 +55,15 @@ def apply_tier_overrides(
     kg_pick: str,
     model_dims: Mapping[str, int],
     text_model_active_embedding: Mapping[str, str],
-    ollama_served_models: set[str],
 ) -> None:
     """Swap the profile's stock models for the hardware-tier picks,
     keeping every dependent field consistent (v0.2.54, gpu-audit C-5).
 
-    Mutates ``config`` in place. The three mapping/set parameters are
-    install.py's module-level constants (``_EMBEDDING_MODEL_DIMS``,
-    ``_TEXT_MODEL_ACTIVE_EMBEDDING``, ``_OLLAMA_SERVED_EMBEDDING_MODELS``)
-    passed by reference so this helper has no coupling to install.py.
+    Mutates ``config`` in place (scalar fields only — safe on a shallow copy
+    of a shared profile). The two mapping parameters are install.py's
+    module-level constants (``_EMBEDDING_MODEL_DIMS``,
+    ``_TEXT_MODEL_ACTIVE_EMBEDDING``) passed by reference so this helper has
+    no coupling to install.py.
 
     See install.py's `_apply_tier_overrides` docstring for the rationale
     on why ``code_backend`` is NOT swapped.
@@ -71,14 +73,6 @@ def apply_tier_overrides(
         dims = model_dims.get(code_pick)
         if dims is not None:
             config["code_dims"] = dims
-        if (code_pick in ollama_served_models
-                and code_pick not in config.get("embedding_models", [])):
-            # Copy-on-write: config is a SHALLOW copy of the module-level
-            # EMBEDDING_CONFIGS profile — appending in place would mutate
-            # the shared profile list across calls.
-            config["embedding_models"] = (
-                list(config.get("embedding_models", [])) + [code_pick]
-            )
     if config.get("text_model") != kg_pick:
         config["text_model"] = kg_pick
         dims = model_dims.get(kg_pick)
@@ -87,8 +81,3 @@ def apply_tier_overrides(
         slot = text_model_active_embedding.get(kg_pick)
         if slot is not None:
             config["active_embedding"] = slot
-        if (kg_pick in ollama_served_models
-                and kg_pick not in config.get("embedding_models", [])):
-            config["embedding_models"] = (
-                list(config.get("embedding_models", [])) + [kg_pick]
-            )

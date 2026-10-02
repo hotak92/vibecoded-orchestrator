@@ -63,6 +63,10 @@ function Invoke-VcoCodegraphQueryBlock {
         [string]$ExcludePath = "",
         [string]$Anchor = "",
         [string]$PromptId = "",
+        # Every caller passes -TranscriptPath (the name the KG helpers use). A
+        # plain function puts an unknown named argument in $args silently, so
+        # without this alias the transcript never reached the CLI on Windows.
+        [Alias("TranscriptPath")]
         [string]$Transcript = ""
     )
     if ([string]::IsNullOrEmpty($Query)) { return "" }

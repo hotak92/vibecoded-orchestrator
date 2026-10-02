@@ -55,7 +55,6 @@ These exist but are **not** in the OSS bundle:
 
 | Component | Description | Where |
 |---|---|---|
-| `orchestrator_tools_mcp` | Pro-tier agent tooling MCP | Pro module, not bundled — see `03-agents-skills-hooks.md` § `orchestrator-tools` MCP |
 | RL reranker | Reinforcement-learning result reranking server | Pro module; MCP falls through cleanly when absent |
 
 ---

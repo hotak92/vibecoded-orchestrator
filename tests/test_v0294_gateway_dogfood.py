@@ -224,6 +224,15 @@ class DogfoodTests(unittest.TestCase):
         self.assertEqual(out["reason"], "dogfood:version")
         self.assertIn("Restart the gateway", out["message"])
 
+    def test_an_unreadable_daemon_version_skips_never_passes(self) -> None:
+        """v0.2.100 W1R-12: freshness UNKNOWN (a non-X.Y.Z version) is
+        ``skipped`` with the reason — never ``ok``, never a refusal."""
+        self.gateway.plan["version"] = "0.2.100-rc1"
+        out = self.run_proof()
+        self.assertEqual(out["status"], "skipped", out)
+        self.assertFalse(out["ok"])
+        self.assertIn("not X.Y.Z", out["message"])
+
     def test_the_accented_body_is_actually_accented_on_the_wire(self) -> None:
         """`ensure_ascii=True` would make it plain ASCII at six times the size.
 

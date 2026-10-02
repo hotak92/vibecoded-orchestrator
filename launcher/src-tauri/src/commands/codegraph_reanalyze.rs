@@ -318,22 +318,19 @@ async fn run_reanalysis_with_stream(
             String::new()
         };
         // Map the analyzer's documented exit codes to actionable text.
-        let code = status.code().unwrap_or(-1);
-        let hint = match code {
-            2 => " (schema case collision — see stderr)",
-            3 => " (no files indexed — check repo path / filters)",
-            4 => " (insert errors — analysis incomplete; see stderr)",
+        let hint = match status.code() {
+            Some(2) => " (schema case collision — see stderr)",
+            Some(3) => " (no files indexed — check repo path / filters)",
+            Some(4) => " (insert errors — analysis incomplete; see stderr)",
             _ => "",
         };
+        // `ExitStatus`'s Display ("exit status: 3" / "signal: 9 (SIGKILL)"):
+        // a signal kill is evidence too, and `code().unwrap_or(-1)` erased it
+        // (v0.2.100 WP-05 / I-06).
         return Err(format!(
-            "analyzer exit {}{}: {}",
-            code,
-            hint,
-            if stderr_text.is_empty() {
-                "no stderr".to_string()
-            } else {
-                stderr_text
-            }
+            "analyzer {}{}",
+            vct_launcher_core::process::failure_evidence(&status, &stderr_text, vct_launcher_core::process::StderrKeep::Whole),
+            hint
         ));
     }
 

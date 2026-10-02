@@ -9,7 +9,7 @@
 //!      module exposes the `was_first_seen` field on the result so the GUI
 //!      decides whether to fire the notification).
 //!   2. Env-var injection into `.claude/settings.json env` (Claude-visible)
-//!      via [`apply_deprecation_state`]. Four keys land in the JSON env
+//!      via [`apply_deprecation_state_impl`]. Four keys land in the JSON env
 //!      block under the same `env` key as the canonical install pairs:
 //!
 //!        * `VCT_RL_MODULE_DEPRECATED=1`
@@ -104,7 +104,7 @@ pub(crate) const DEPRECATION_ENV_KEYS: &[&str] = &[
     "VCT_RL_MODULE_DEPRECATION_URL",
 ];
 
-/// Result of [`apply_deprecation_state`]. Soft-fail per layer: a layer
+/// Result of [`apply_deprecation_state_impl`]. Soft-fail per layer: a layer
 /// failure populates `warnings` rather than failing the whole call.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ApplyDeprecationResult {
@@ -290,6 +290,9 @@ fn write_or_strip_deprecation_env(
     folder: &Path,
     pairs: &[(&str, String)],
 ) -> Result<(), String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    let db = db.ensure_live()?;
     let root = crate::services::vco_lib_bridge::resolve_orchestrator_root(db);
     crate::services::vco_lib_bridge::write_settings_env_block(
         root.as_deref(),
@@ -299,32 +302,6 @@ fn write_or_strip_deprecation_env(
         DEPRECATION_ENV_KEYS,
     )
     .map(|_| ())
-}
-
-/// Tauri command surface for [`apply_deprecation_state_impl`]. Callers
-/// (e.g. the polling task once it lands in v0.2.32) invoke this on every
-/// poll cycle. Re-asserting the same state is cheap — only a transition
-/// touches the audit + env layers.
-#[command]
-pub async fn apply_deprecation_state(
-    project_id: String,
-    module_id: String,
-    deprecated: bool,
-    message: Option<String>,
-    eol_date: Option<String>,
-    migration_url: Option<String>,
-    db: State<'_, Db>,
-) -> Result<ApplyDeprecationResult, String> {
-    let res = apply_deprecation_state_impl(
-        &db,
-        &project_id,
-        &module_id,
-        deprecated,
-        message.as_deref(),
-        eol_date.as_deref(),
-        migration_url.as_deref(),
-    );
-    Ok(res)
 }
 
 /// Has the launcher already fired the one-shot desktop notification for
@@ -432,7 +409,7 @@ pub async fn poll_deprecations_once(app: &AppHandle) {
 
     // v0.2.60: stand down while an orchestrator update is in progress —
     // this opens its OWN launcher.db connection (below), bypassing the
-    // managed-connection close `update_orchestrator` does for the
+    // managed-connection close the update pipeline does for the
     // install.py window. See `update_gate::skip_if_update_in_progress`.
     if crate::commands::update_gate::skip_if_update_in_progress("deprecation_poll") {
         return;
@@ -987,4 +964,36 @@ mod tests {
         // spawn_deprecation_poll directly, this is just a constant check.
         assert_eq!(POLL_INTERVAL_SECS, 0);
     }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn env_write_stands_down_in_standby() {
+        let db = standby_db();
+        let tmp = tempfile::tempdir().unwrap();
+        let err = write_or_strip_deprecation_env(&db, tmp.path(), &[]).unwrap_err();
+        assert_typed_standby(&err);
+    }
+
 }

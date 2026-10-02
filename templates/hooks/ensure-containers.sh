@@ -40,12 +40,13 @@ unset __vct_root_dir __vct_update_lockfile __still_fresh
 # Ensure all required containers are running (background, non-blocking)
 # Called by SessionStart hook — checks and starts any stopped containers.
 #
-# Compose-dir resolution order (PR-2 portability fix 2026-05-06):
-#   1. $VCT_COMPOSE_DIR              — explicit override
-#   2. $VCT_INFRASTRUCTURE_DIR       — orchestrator clone's infrastructure/
-#   3. $VCT_ORCHESTRATOR_ROOT/infrastructure   — env-resolved orch root
-#   4. <project>/infrastructure      — bundled compose copy (per-project)
-#   5. <project>/claude_mcp_servers  — orchestrator clone fallback (legacy)
+# Compose-dir resolution: ONE home, `_lib/compose-dir.sh` (v0.2.100) — the
+# same order as before (VCT_COMPOSE_DIR, VCT_INFRASTRUCTURE_DIR,
+# VCT_ORCHESTRATOR_ROOT/infrastructure, <repo>/infrastructure,
+# <repo>/claude_mcp_servers), but a directory whose parent is not the
+# orchestrator clone (no vct-module.json with id "orchestrator") is REFUSED:
+# a project's copy of the compose files would create containers on EMPTY
+# default volumes. The refusal names VCT_ORCHESTRATOR_ROOT.
 #
 # WHICH containers, and what may be done to each (v0.2.97): ONE call,
 # `python -m vco_lib.service_lifecycle plan --shell`, reads the launcher.db
@@ -68,8 +69,10 @@ unset __vct_root_dir __vct_update_lockfile __still_fresh
 #   "container with given ID already exists: OCI runtime error".
 #   We probe State.Pid against /proc/<pid>; if the PID is dead, run
 #   `runc delete --force` against the user's runc root (or the system
-#   one). A VCO-managed container is then `podman rm --force`d and
-#   re-created by compose; an adopted one only gets `start` (v0.2.97).
+#   one). A VCO-managed container is then removed and re-created by
+#   `python -m vco_lib.service_lifecycle up --recreate` — ONLY after the
+#   data-identity guard proved compose mounts its live data (v0.2.100; a
+#   refusal removes nothing); an adopted one only gets `start` (v0.2.97).
 #   Each recovery attempt is appended to
 #   ~/.local/state/vct/container-recovery.jsonl for audit.
 
@@ -95,26 +98,12 @@ else
     fi
 fi
 
-# Resolve compose dir. The bundled per-project install puts compose files
-# in <project>/infrastructure; the orchestrator's own clone has a sibling
-# claude_mcp_servers/ with a compose.yaml. Prefer the bundled location so
-# the hook works in user projects (the previous default of
-# $REPO_ROOT/claude_mcp_servers only worked in the orchestrator clone).
-COMPOSE_DIR="${VCT_COMPOSE_DIR:-}"
-if [ -z "$COMPOSE_DIR" ]; then
-    if [ -n "${VCT_INFRASTRUCTURE_DIR:-}" ] && [ -d "$VCT_INFRASTRUCTURE_DIR" ]; then
-        COMPOSE_DIR="$VCT_INFRASTRUCTURE_DIR"
-    elif [ -n "${VCT_ORCHESTRATOR_ROOT:-}" ] && [ -d "$VCT_ORCHESTRATOR_ROOT/infrastructure" ]; then
-        COMPOSE_DIR="$VCT_ORCHESTRATOR_ROOT/infrastructure"
-    elif [ -d "$REPO_ROOT/infrastructure" ]; then
-        COMPOSE_DIR="$REPO_ROOT/infrastructure"
-    elif [ -d "$REPO_ROOT/claude_mcp_servers" ]; then
-        # Legacy fallback — only the orchestrator clone has this layout.
-        COMPOSE_DIR="$REPO_ROOT/claude_mcp_servers"
-    else
-        COMPOSE_DIR=""
-    fi
-fi
+# Resolve the compose dir (see the header): _lib/compose-dir.sh sets
+# COMPOSE_DIR, or COMPOSE_DIR_REFUSAL when the only candidate is not the
+# orchestrator's own infrastructure/.
+# shellcheck source=_lib/compose-dir.sh disable=SC1091
+. "$SCRIPT_DIR/_lib/compose-dir.sh"
+vco_resolve_compose_dir "$REPO_ROOT"
 
 # Resolve orchestrator root (used to locate the GPU-safe wrapper script).
 # Falls back to REPO_ROOT for the orchestrator clone case.
@@ -333,61 +322,59 @@ is_gpu_service() {
 }
 
 # ---------------------------------------------------------------------------
-# compose_up_services :: bring up EXACTLY the named compose services
-# (`--no-deps`, never a bare `up -d`). Args: "build"|"" then service names.
-# Prefers the CDI-wait wrapper when a GPU service is among them; the argv
-# comes from `vco_lib.service_lifecycle compose-args` (the one home of the
-# rule), so the hook never spells a compose command itself.
+# compose_up_services :: bring up EXACTLY the named compose services through
+# ONE Python verb, `vco_lib.service_lifecycle up` (v0.2.100 AD-3/AD-4): each
+# service is first cleared by the data-identity guard (a refused one is never
+# removed or composed, and is ledgered), the zombies in `zombie_services` are
+# removed only AFTER their guard passed, and compose runs through the one
+# retry/heal home — this hook never retries `--build` or spells a compose
+# command itself. Args: "build"|"" then service names. For GPU services the
+# CDI-wait wrapper composes, after the verb guarded (`--guard-only`).
+# Sets vco_up_cleared / vco_up_refused / vco_up_removed. Returns 0 composed
+# (or nothing left to compose), 1 failed, 2 no compose/dir, 3 dir refused.
 # ---------------------------------------------------------------------------
 compose_up_services() {
     local build="$1"
     shift
     [ "$#" -gt 0 ] || return 0
-    local wants_gpu=false s
-    for s in "$@"; do is_gpu_service "$s" && wants_gpu=true; done
-    if [ "$wants_gpu" = true ] && [ -n "$WRAPPER_SCRIPT" ] && [ -x "$WRAPPER_SCRIPT" ]; then
-        # The wrapper resolves its compose file from VCT_STACK_WORKING_DIR;
-        # point it at our COMPOSE_DIR unless the caller already did.
-        if VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-$COMPOSE_DIR}" \
-            VCT_STACK_BUILD="$([ "$build" = build ] && echo 1)" \
-            "$WRAPPER_SCRIPT" up "$@"; then
-            echo "Ran launch-claude-mcp-stack.sh wrapper for: $*"
-            return 0
-        fi
-        echo "ensure-containers: wrapper invocation failed for: $*" >&2
-        return 1
+    vco_up_cleared=""
+    vco_up_refused=""
+    vco_up_removed=""
+    if [ -n "$COMPOSE_DIR_REFUSAL" ]; then
+        echo "ensure-containers: $COMPOSE_DIR_REFUSAL"
+        return 3
     fi
     if [ -z "$COMPOSE_CMD" ] || [ -z "$COMPOSE_DIR" ] || [ ! -d "$COMPOSE_DIR" ]; then
         return 2
     fi
-    local services="$*" args
-    local -a up_args=() build_flag=()
-    [ "$build" = build ] && build_flag=(--build)
-    if ! args="$("$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services "$services" \
-            "${build_flag[@]}")"; then
-        echo "ensure-containers: vco_lib.service_lifecycle compose-args failed for: $services" >&2
+    local wants_gpu=false use_wrapper=false s out rc
+    local -a flags=()
+    for s in "$@"; do is_gpu_service "$s" && wants_gpu=true; done
+    if [ "$wants_gpu" = true ] && [ -n "$WRAPPER_SCRIPT" ] && [ -x "$WRAPPER_SCRIPT" ]; then
+        use_wrapper=true
+        flags+=(--guard-only)
+    fi
+    [ "$build" = build ] && flags+=(--build)
+    out="$("$RUN_PY" -m vco_lib.service_lifecycle up --shell --services "$*" \
+        --recreate "${zombie_services[*]}" "${flags[@]}" --compose-dir "$COMPOSE_DIR" \
+        --compose-cmd "$COMPOSE_CMD" --runtime "$RUNTIME")"
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^vco_up_' | grep -v '^$'
+    eval "$(printf '%s\n' "$out" | grep '^vco_up_')"
+    if [ "$use_wrapper" = true ]; then
+        [ -n "$vco_up_cleared" ] || return 0
+        # shellcheck disable=SC2086  # a space-separated service list
+        if VCT_STACK_WORKING_DIR="${VCT_STACK_WORKING_DIR:-$COMPOSE_DIR}" \
+            VCT_STACK_BUILD="$([ "$build" = build ] && echo 1)" \
+            "$WRAPPER_SCRIPT" up $vco_up_cleared; then
+            echo "Ran launch-claude-mcp-stack.sh wrapper for: $vco_up_cleared"
+            return 0
+        fi
+        echo "ensure-containers: wrapper invocation failed for: $vco_up_cleared" >&2
         return 1
     fi
-    [ -n "$args" ] || return 0
-    # `args` is shlex-quoted by the Python side; this only splits it.
-    eval "up_args=($args)"
-    # Don't redirect stderr — surface failures so users can see what went wrong.
-    # shellcheck disable=SC2086  # COMPOSE_CMD is a command + its subcommand
-    if (cd "$COMPOSE_DIR" && $COMPOSE_CMD "${up_args[@]}"); then
-        echo "Ran '$COMPOSE_CMD $args' in $COMPOSE_DIR"
-        return 0
-    fi
-    if [ "$build" = build ]; then
-        # Report which invocation ACTUALLY ran: claiming "--build" after
-        # falling back to a plain up would be a promise the run did not keep.
-        args="$("$RUN_PY" -m vco_lib.service_lifecycle compose-args --shell --services "$services")" || return 1
-        eval "up_args=($args)"
-        # shellcheck disable=SC2086
-        (cd "$COMPOSE_DIR" && $COMPOSE_CMD "${up_args[@]}")
-        echo "Ran '$COMPOSE_CMD $args' in $COMPOSE_DIR ('--build' was rejected, so the code-embedding image was NOT refreshed — run 'python install.py --update' from the orchestrator root)"
-        return 0
-    fi
-    return 1
+    [ "$rc" -eq 1 ] && return 1
+    return 0
 }
 
 # ---------------------------------------------------------------------------
@@ -409,8 +396,9 @@ clear_zombie_state() {
 # ---------------------------------------------------------------------------
 # handle_zombie :: act on a zombie container per its lifecycle policy.
 # Args: container_name, service, on_zombie (recreate|start|ignore).
-# recreate (VCO-managed) → runc cleanup + `rm --force`, and the service is
-#   queued for the ONE compose call below.
+# recreate (VCO-managed) → runc cleanup, and the service is queued for the
+#   ONE guarded `up` below, which removes the container only after the
+#   data-identity guard passed (never here: a refused recreate keeps it).
 # start (adopted / unlisted) → runc cleanup + `start` BY NAME. Never `rm`:
 #   a compose re-create would bring it back on the installer's EMPTY volume.
 # ---------------------------------------------------------------------------
@@ -432,14 +420,10 @@ handle_zombie() {
     case "$action" in
         recreate)
             clear_zombie_state "$name"
-            # podman rm --force cleans the state DB row even if the OCI
-            # bundle is gone — the load-bearing step on rootless podman.
-            if ! $RUNTIME rm --force "$name" >/dev/null 2>&1; then
-                log_recovery "$name" "failed" "podman rm --force failed"
-                echo "ensure-containers: failed to remove zombie '$name' — manual cleanup required" >&2
-                return 1
-            fi
+            # The `rm --force` (which cleans the state DB row even when the
+            # OCI bundle is gone) runs inside the guarded `up` verb.
             compose_list+=("$service")
+            zombie_services+=("$service")
             zombie_recreated+=("$name")
             ;;
         start)
@@ -466,6 +450,7 @@ recovered=0
 # VCO-managed services whose container is missing, and VCO-managed zombies
 # just removed. Adopted containers never land here.
 compose_list=()
+zombie_services=()
 zombie_recreated=()
 # v0.2.92 BLOCKER-1: code_embed is the ONE compose service BUILT from the
 # checkout, and `up -d` builds an image only when it is MISSING — so a stale
@@ -552,13 +537,20 @@ if [ "${#compose_list[@]}" -gt 0 ]; then
         fi
     fi
     for name in "${zombie_recreated[@]}"; do
-        if [ "$__vco_up_rc" -eq 0 ]; then
-            log_recovery "$name" "recovered" "zombie pid; runc+rm+recreate"
-            echo "ensure-containers: recovered zombie container '$name'"
-            recovered=$((recovered + 1))
-        else
-            log_recovery "$name" "failed" "no wrapper or compose available for recreate"
-        fi
+        case " ${vco_up_removed:-} " in
+            *" $name "*)
+                if [ "$__vco_up_rc" -eq 0 ]; then
+                    log_recovery "$name" "recovered" "zombie pid; runc+rm+recreate (data identity proven)"
+                    echo "ensure-containers: recovered zombie container '$name'"
+                    recovered=$((recovered + 1))
+                else
+                    log_recovery "$name" "failed" "removed; compose up failed"
+                fi
+                ;;
+            *)
+                log_recovery "$name" "left_as_is" "zombie pid; recreate refused or not run (data identity not proven)"
+                ;;
+        esac
     done
 fi
 

@@ -168,8 +168,26 @@ pub struct RlDashboardState {
     /// First 8 chars of the active weights file's sha256, "" when no
     /// state row yet.
     pub weights_sha256_prefix: String,
+    /// v0.2.100: events recorded for this project in the last 24 hours,
+    /// counted from the `rl_events` table in launcher.db (the real corpus
+    /// since v0.2.47). Before this it was the length of the last <=10 lines
+    /// of a JSONL file nothing has written since v0.2.47, so it was always 0.
     pub recent_events_count: u32,
+    /// Legacy placeholder, always `0.0`. The JSONL it was averaged from is
+    /// gone and `rl_events` rows carry no latency; kept so the wire shape
+    /// (and saved snapshots) stay readable.
     pub recent_events_avg_latency_ms: f32,
+    /// v0.2.100: every event ever collected for this project (the whole
+    /// `rl_events` corpus for it, pruned rows excluded). This is the number
+    /// that answers "is training data being collected?".
+    #[serde(default)]
+    pub total_events_count: u32,
+    /// v0.2.100 W5R-13: the same corpus split by `embedding_source` (and
+    /// retrieval vs citation), so the dashboard answers "is arctic data being
+    /// saved?" — the dual-log twin lands under the other slot's source. One
+    /// entry per source present; a NULL source is reported as `"unknown"`.
+    #[serde(default)]
+    pub events_by_embedding_source: Vec<RlSourceEventCount>,
     /// v0.2.29: from `GET /state_summary` — count of registry entries
     /// with `idx >= N_ENTITY_TYPES` (i.e. user-trained types beyond the
     /// builtin set). `None` when the probe failed.
@@ -181,6 +199,16 @@ pub struct RlDashboardState {
     /// failed.
     #[serde(default)]
     pub d1_marker_present: Option<bool>,
+}
+
+/// One `embedding_source`'s share of a project's `rl_events` (W5R-13).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RlSourceEventCount {
+    pub embedding_source: String,
+    pub retrieval: u32,
+    pub citation: u32,
+    /// Every event type for this source (retrieval + citation + any other).
+    pub total: u32,
 }
 
 impl RlDashboardState {
@@ -198,6 +226,8 @@ impl RlDashboardState {
             weights_sha256_prefix: String::new(),
             recent_events_count: 0,
             recent_events_avg_latency_ms: 0.0,
+            total_events_count: 0,
+            events_by_embedding_source: Vec::new(),
             dynamic_types_count: None,
             d1_marker_present: None,
         }
@@ -320,6 +350,11 @@ pub(crate) struct PreparedStart {
     container_name: String,
     image: String,
     spawn: vct_launcher_core::services::container_runtime::SpawnArgs,
+    /// v0.2.100 (W4R-01): this launcher's DB records the module install the
+    /// name derives from — what lets an UNLABELLED (pre-0.2.100) container of
+    /// that name be replaced ([`vct_launcher_core::services::container_runtime::pre_start_removal_decision`]),
+    /// with the mounts the install's manifest records (R18F-06 evidence).
+    claimed: vct_launcher_core::services::container_runtime::ModuleClaim,
 }
 
 /// Everything in a per-project start that can refuse it, with no container
@@ -365,7 +400,10 @@ pub(crate) fn prepare_container_start(
     let spawn = vct_launcher_core::services::container_runtime::spawn_args_for_project(
         manifest, ctx, project, rl_port, &container_name, &image, &podman, gpu_mode, db,
     )?;
-    Ok(PreparedStart { podman, container_name, image, spawn })
+    let claimed = vct_launcher_core::services::container_runtime::module_claim_for_start(
+        db, manifest, ctx, project, rl_port,
+    );
+    Ok(PreparedStart { podman, container_name, image, spawn, claimed })
 }
 
 /// The container CLI's fire-and-forget subcommands (`stop`, `rm`) — output
@@ -377,6 +415,33 @@ pub(crate) trait ContainerCli: Sync {
         program: &'a str,
         args: &'a [&'a str],
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>>;
+
+    /// v0.2.100 (W4R-01): clear `name` for a start through
+    /// [`vct_launcher_core::services::container_runtime::clear_module_name_for_start`] (label-gated
+    /// `rm -f`; `Err` refuses the start).
+    fn clear_name_for_start<'a>(
+        &'a self,
+        program: &'a str,
+        name: &'a str,
+        claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(vct_launcher_core::services::container_runtime::clear_module_name_for_start(
+            program, name, claimed,
+        ))
+    }
+
+    /// Check-only twin of [`ContainerCli::clear_name_for_start`]: `Err` when
+    /// the start would be refused; removes nothing.
+    fn check_name_for_start<'a>(
+        &'a self,
+        program: &'a str,
+        name: &'a str,
+        claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+        Box::pin(vct_launcher_core::services::container_runtime::check_module_name_for_start(
+            program, name, claimed,
+        ))
+    }
 }
 
 /// The real [`ContainerCli`]: the runtime binary, output discarded.
@@ -424,8 +489,11 @@ fn build_container_run_command(
     cmd
 }
 
-/// Run a [`PreparedStart`]: pre-pull, `rm -f` any same-named container,
-/// create the volume dirs, `podman run`. Returns the container name.
+/// Run a [`PreparedStart`]: pre-pull, clear the name (v0.2.100 W4R-01: `rm -f`
+/// a same-named container only when its launcher label says it is this
+/// install's, or it is unlabelled and this launcher's DB claims the name —
+/// another install's container refuses the start), create the volume dirs,
+/// `podman run`. Returns the container name.
 async fn launch_prepared_start(
     manifest: &ModuleManifest,
     ctx: &PlaceholderCtx,
@@ -434,7 +502,7 @@ async fn launch_prepared_start(
     prepared: PreparedStart,
     cli: &dyn ContainerCli,
 ) -> Result<String, String> {
-    let PreparedStart { podman, container_name, image, spawn } = prepared;
+    let PreparedStart { podman, container_name, image, spawn, claimed } = prepared;
 
     // v0.2.47: pre-pull the variant-correct image with auth context
     // attached, so a cache-evicted host doesn't fall through to
@@ -463,8 +531,10 @@ async fn launch_prepared_start(
         }
     }
 
-    // Idempotency: force-remove any prior container with the same name.
-    cli.run_quiet(&podman, &["rm", "-f", &container_name]).await;
+    // Idempotency: replace a prior container with the same name — but only
+    // one this install may remove (v0.2.100 W4R-01, the one rule shared with
+    // the hub's supervisor). Another install's container refuses the start.
+    cli.clear_name_for_start(&podman, &container_name, &claimed).await?;
 
     // mkdir -p every volume host path so podman doesn't fail on bind
     // mounts of nonexistent directories.
@@ -1285,6 +1355,9 @@ async fn restart_container_with(
     db: &Db,
 ) -> Result<String, String> {
     let prepared = prepare_container_start(manifest, ctx, project, rl_port, gpu_mode, podman, db)?;
+    // v0.2.100 (W4R-01): a name held by another install refuses BEFORE the
+    // stop, so the refused restart leaves that container running.
+    cli.check_name_for_start(&prepared.podman, &prepared.container_name, &prepared.claimed).await?;
     stop_container_with(cli, &prepared.podman, container_name).await;
     launch_prepared_start(manifest, ctx, project, rl_port, prepared, cli).await
 }
@@ -1319,8 +1392,8 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 
 // ─── Tauri commands (Phase 1E / 3C / 4A / 4B) ───────────────────────────
 //
-// Step 24 commit b: the lifecycle commands (`rl_is_container_running`,
-// `restart_rl_container`) now proxy to the hub's
+// Step 24 commit b: the lifecycle surface (`restart_rl_container`; "is it
+// running" is the hub's `module_health_snapshot`) proxies to the hub's
 // `/api/v1/projects/{project_id}/modules/{module_id}/...` endpoints
 // (filled in by `vct-hub::lifecycle_api`). The supervisor logic lives
 // in `vct-hub::module_supervisor`.
@@ -1331,26 +1404,6 @@ pub fn parse_inspect_running_state(stdout: &str) -> bool {
 // working in the "hub crashed but launcher GUI still up" failure mode
 // and during the v0.2.21 → v0.2.22 cutover where some users may run a
 // stale hub binary.
-
-/// `is_container_running` by project_id. First tries the hub proxy;
-/// falls back to in-process probe if the hub is unreachable.
-#[command]
-pub async fn rl_is_container_running(
-    project_id: String,
-    db: State<'_, Db>,
-) -> Result<bool, String> {
-    // Hub-first path.
-    if let Ok(running) = hub_proxy_module_status(&project_id, RL_RERANKER_MODULE_ID).await {
-        return Ok(running);
-    }
-    // Fallback: in-process probe (used when hub unreachable).
-    let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
-    let name = match install.and_then(|i| i.container_name) {
-        Some(n) if !n.is_empty() => n,
-        _ => return Ok(false),
-    };
-    is_container_running(&name).await
-}
 
 /// Restart the per-project RL container. Hub proxy not yet wired for
 /// restart (the hub-side endpoint is 501 until a catalog resolver
@@ -1452,35 +1505,6 @@ fn hub_token_for_proxy() -> Result<String, String> {
     )
 }
 
-/// Proxy for `GET /projects/{project_id}/modules/{module_id}/status`.
-/// Returns the `running` boolean from the JSON envelope.
-async fn hub_proxy_module_status(project_id: &str, module_id: &str) -> Result<bool, String> {
-    let port = hub_port_for_proxy()?;
-    let token = hub_token_for_proxy()?;
-    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(5))?;
-    let url = format!(
-        "http://127.0.0.1:{}/api/v1/projects/{}/modules/{}/status",
-        port, project_id, module_id
-    );
-    let resp = client
-        .get(&url)
-        .bearer_auth(&token)
-        .send()
-        .await
-        .map_err(|e| format!("hub GET status: {}", e))?;
-    if !resp.status().is_success() {
-        return Err(format!("hub status returned {}", resp.status()));
-    }
-    let body: serde_json::Value = resp
-        .json()
-        .await
-        .map_err(|e| format!("parse hub status: {}", e))?;
-    Ok(body
-        .get("running")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false))
-}
-
 /// Proxy for `POST /projects/{project_id}/modules/{module_id}/stop`.
 /// Used by `commands::modules::uninstall_module_v2` (via the wrapper
 /// `stop_container_for_project_via_hub`). Idempotent on the hub side.
@@ -1528,7 +1552,6 @@ async fn wait_for_hub_ready() -> Result<(), String> {
     // loaded machine without making a genuinely-down hub hang the caller.
     const ATTEMPTS: u32 = 10;
     const DELAY_MS: u64 = 300;
-    let client = vct_launcher_core::services::loopback_http::client(Duration::from_secs(2))?;
     // v0.2.61 (Option H C-PORT): re-read hub.port INSIDE the loop. If the hub
     // is restarting (update flow / crash-restart) it may bind a different port
     // and rewrite hub.port a moment after `ensure_hub_running` returns. Reading
@@ -1546,11 +1569,9 @@ async fn wait_for_hub_ready() -> Result<(), String> {
             Err(_) => continue, // port file not written yet — retry
         };
         last_port = port;
-        let url = format!("http://127.0.0.1:{}/api/v1/health", port);
-        if let Ok(resp) = client.get(&url).send().await {
-            if resp.status().is_success() {
-                return Ok(());
-            }
+        // v0.2.100 (F-W3-12): the ONE liveness probe.
+        if vct_launcher_core::services::hub_health::probe_async(port).await {
+            return Ok(());
         }
     }
     Err(format!(
@@ -2454,18 +2475,35 @@ async fn run_finetune_then_rotate_async(
 
 // ─── Phase 4B: dashboard widget commands ────────────────────────────────
 
-/// Reads `module_install` + `is_container_running` + recent rl_events.jsonl
-/// tail. Returns the struct expected by the dashboard widget. Soft-fail
-/// throughout — never errors out on a partial state.
+/// Reads `module_install` + `is_container_running` + the `rl_events` counts
+/// (launcher.db, via `rl_event_counts`). Returns the struct expected by the
+/// dashboard widget. Soft-fail throughout — never errors out on a partial
+/// state. The event counts are reported even when the RL module is not
+/// installed: collection does not depend on the module.
 #[command]
 pub async fn get_rl_dashboard_state(
     project_id: String,
     db: State<'_, Db>,
 ) -> Result<RlDashboardState, String> {
+    // v0.2.100: the collection counters come from `rl_events` and are
+    // independent of the module install: event collection runs whether or
+    // not the RL module is installed, so the "not installed" state must
+    // still report the real corpus size.
+    let (recent_events_count, total_events_count) =
+        rl_event_counts(&db, &project_id, now_unix_ms());
+    let events_by_embedding_source = rl_event_counts_by_source(&db, &project_id);
+
     let install = db.get_module_install(&project_id, RL_RERANKER_MODULE_ID)?;
     let install = match install {
         Some(i) => i,
-        None => return Ok(RlDashboardState::empty()),
+        None => {
+            return Ok(RlDashboardState {
+                recent_events_count,
+                total_events_count,
+                events_by_embedding_source,
+                ..RlDashboardState::empty()
+            })
+        }
     };
 
     let project = db
@@ -2519,9 +2557,6 @@ pub async fn get_rl_dashboard_state(
         })
         .unwrap_or_default();
 
-    let (recent_events_count, recent_events_avg_latency_ms) =
-        load_recent_event_stats(&project.slug).await;
-
     // v0.2.29: probe `GET /state_summary` (vct-rl-reranker v0.2.3+).
     // Soft-fail to `(None, None)` if the container isn't running, the
     // endpoint 404s (pre-v0.2.3 module), or the body fails to parse.
@@ -2548,7 +2583,9 @@ pub async fn get_rl_dashboard_state(
         last_finetuned_at: 0,
         weights_sha256_prefix: String::new(),
         recent_events_count,
-        recent_events_avg_latency_ms,
+        recent_events_avg_latency_ms: 0.0,
+        total_events_count,
+        events_by_embedding_source,
         dynamic_types_count,
         d1_marker_present,
     })
@@ -2582,74 +2619,75 @@ async fn probe_state_summary(port: u16) -> (Option<u32>, Option<bool>) {
     (dyn_count, marker)
 }
 
-/// Read the last <=10 events from `rl_events_<slug>.jsonl` and return
-/// `(count, avg_latency_ms)`. Hard caps the file-tail read at 16 KB so
-/// the dashboard call is bounded even when the events file is huge.
-async fn load_recent_event_stats(project_slug: &str) -> (u32, f32) {
-    let safe_slug = sanitize_path_component(project_slug);
-    let path = match directories::UserDirs::new() {
-        Some(d) => d
-            .home_dir()
-            .join(".claude")
-            .join("retrieval_rl_data")
-            .join(format!("rl_events_{}.jsonl", safe_slug)),
-        None => return (0, 0.0),
-    };
-    parse_recent_event_stats_from_path(&path).await
+/// Window for [`RlDashboardState::recent_events_count`].
+const RL_RECENT_WINDOW_MS: i64 = 24 * 60 * 60 * 1000;
+
+fn now_unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
-/// Path-driven variant so we can unit-test the parsing logic without
-/// depending on `directories::UserDirs`.
-async fn parse_recent_event_stats_from_path(path: &Path) -> (u32, f32) {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
-
-    let mut file = match tokio::fs::File::open(path).await {
-        Ok(f) => f,
-        Err(_) => return (0, 0.0),
-    };
-    let len = match file.metadata().await {
-        Ok(m) => m.len(),
-        Err(_) => return (0, 0.0),
-    };
-    const TAIL_BYTES: u64 = 16 * 1024;
-    let read_from = len.saturating_sub(TAIL_BYTES);
-    if file.seek(SeekFrom::Start(read_from)).await.is_err() {
-        return (0, 0.0);
-    }
-    let mut buf = Vec::with_capacity(TAIL_BYTES as usize);
-    if file.read_to_end(&mut buf).await.is_err() {
-        return (0, 0.0);
-    }
-    let s = String::from_utf8_lossy(&buf);
-
-    let lines: Vec<&str> = if read_from > 0 {
-        s.lines().skip(1).collect()
-    } else {
-        s.lines().collect()
-    };
-
-    let mut latencies: Vec<f32> = Vec::new();
-    for line in lines.iter().rev().take(10).rev() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+/// `(events in the last 24h, all events)` for one project, counted from the
+/// `rl_events` table in launcher.db via `Db::count_rl_events` (the same
+/// accessor the hub's `GET /api/v1/rl/events/count` uses). The corpus moved
+/// from `~/.claude/retrieval_rl_data/rl_events_<slug>.jsonl` to that table in
+/// v0.2.47; this used to tail the JSONL, which nothing has written since, so
+/// the dashboard figure read 0 while events were being collected.
+///
+/// Soft-fails to `(0, 0)` on a DB error: a dashboard counter must never
+/// error the load. Saturates into `u32`.
+pub(crate) fn rl_event_counts(db: &Db, project_id: &str, now_ms: i64) -> (u32, u32) {
+    let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
+    let total = match db.count_rl_events(Some(project_id), None, None, None) {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!("[rl-dashboard] count rl_events failed: {}", e);
+            return (0, 0);
         }
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(trimmed);
-        if let Ok(v) = parsed {
-            if let Some(lat) = v.get("latency_ms").and_then(|x| x.as_f64()) {
-                latencies.push(lat as f32);
-            } else if let Some(lat) = v.get("latency_ms").and_then(|x| x.as_i64()) {
-                latencies.push(lat as f32);
-            }
-        }
-    }
-    let count = latencies.len() as u32;
-    let avg = if count > 0 {
-        latencies.iter().sum::<f32>() / count as f32
-    } else {
-        0.0
     };
-    (count, avg)
+    let recent = db
+        .count_rl_events(
+            Some(project_id),
+            None,
+            Some(now_ms.saturating_sub(RL_RECENT_WINDOW_MS)),
+            None,
+        )
+        .unwrap_or(0);
+    (clamp(recent), clamp(total))
+}
+
+/// W5R-13: one project's `rl_events` per `embedding_source`, folded from
+/// `Db::count_rl_events_by_source`. Soft-fails to an empty list (a dashboard
+/// counter never errors the load). Sorted by source name.
+pub(crate) fn rl_event_counts_by_source(db: &Db, project_id: &str) -> Vec<RlSourceEventCount> {
+    let clamp = |n: i64| u32::try_from(n.max(0)).unwrap_or(u32::MAX);
+    let rows = match db.count_rl_events_by_source(project_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("[rl-dashboard] count rl_events by source failed: {}", e);
+            return Vec::new();
+        }
+    };
+    let mut by: std::collections::BTreeMap<String, RlSourceEventCount> = Default::default();
+    for (src, event_type, n) in rows {
+        let key = src.filter(|s| !s.trim().is_empty()).unwrap_or_else(|| "unknown".to_string());
+        let e = by.entry(key.clone()).or_insert_with(|| RlSourceEventCount {
+            embedding_source: key,
+            retrieval: 0,
+            citation: 0,
+            total: 0,
+        });
+        let n = clamp(n);
+        match event_type.as_str() {
+            "retrieval" => e.retrieval = e.retrieval.saturating_add(n),
+            "citation" => e.citation = e.citation.saturating_add(n),
+            _ => {}
+        }
+        e.total = e.total.saturating_add(n);
+    }
+    by.into_values().collect()
 }
 
 // ─── Startup hook + daily poller (scaffolding) ──────────────────────────
@@ -2758,9 +2796,7 @@ async fn reap_pathological_containers_for_resume<F>(db: &Db, resolve_manifest: &
 where
     F: Fn(&str) -> Option<ModuleManifest>,
 {
-    use std::collections::HashSet;
-
-    // Build claimed_names: every container_name referenced by any
+    // Every container_name referenced by any
     // module_installs row (whether status='installed' or other).
     // Includes both per-project + global rows.
     let claimed = match db.list_module_installs_with_containers() {
@@ -2774,9 +2810,6 @@ where
             return;
         }
     };
-    let claimed_names: HashSet<String> =
-        claimed.iter().map(|(_pid, _mid, cname)| cname.clone()).collect();
-
     // Build the (container_name → expected image:tag) lookup. For
     // each claimed row, resolve the manifest's
     // `install.container.image:tag` (variant-aware via the same
@@ -2806,25 +2839,10 @@ where
         }
     }
 
-    // Build name_filter: a container name is interesting if it
-    // matches a known module-id prefix. We derive the set of
-    // module-id prefixes from the claimed rows + any module known
-    // to the resolver (the resolve_manifest closure can be queried
-    // for arbitrary ids — but the claimed set already covers every
-    // module the launcher has installed; broken/orphan containers
-    // for those modules ARE the targets). The reaper deliberately
-    // does NOT touch containers whose names don't match any known
-    // module-id prefix — never reap Weaviate / Ollama / user
-    // containers.
-    let prefixes: HashSet<String> = claimed
-        .iter()
-        .map(|(_pid, mid, _cn)| mid.clone())
-        .collect();
-    let name_filter = move |name: &str| -> bool {
-        prefixes.iter().any(|p| name == p.as_str() || name.starts_with(&format!("{}-", p)))
-    };
-
-    // Detect runtime + invoke the core reaper.
+    // Detect runtime + invoke the ONE core reaper pass (v0.2.100 WP-06,
+    // L2-F17): module-name filter AND the DB verdict AND this install's
+    // launcher label — never Weaviate / Ollama / the user's containers, and
+    // never a container this launcher cannot prove it created.
     let runtime = match detect_container_runtime().await {
         Ok(r) => r,
         Err(e) => {
@@ -2836,21 +2854,19 @@ where
         }
     };
 
-    let expected_lookup = move |name: &str| expected_map.get(name).cloned();
-    let (reaped, errors) =
-        vct_launcher_core::services::container_runtime::reap_pathological_containers(
-            &runtime,
-            &claimed_names,
-            expected_lookup,
-            name_filter,
-        )
-        .await;
-    if reaped > 0 || errors > 0 {
+    let report = vct_launcher_core::services::container_runtime::reap_module_containers(
+        &runtime,
+        &claimed,
+        expected_map,
+    )
+    .await;
+    if report.reaped > 0 || report.errors > 0 {
         tracing::info!(
             "[module_service] V52-D.2 reaper: pass complete, reaped={} errors={}",
-            reaped, errors
+            report.reaped, report.errors
         );
     }
+    vct_launcher_core::services::container_runtime::record_unlabelled_modules_off_runtime(report.unlabelled.clone()).await;
 }
 
 /// Test-friendly variant: same logic as `resume_containers_on_startup`
@@ -3107,7 +3123,7 @@ where
 {
     // v0.2.60: stand down while an orchestrator update is in progress —
     // this opens its OWN launcher.db connection (below), bypassing the
-    // managed-connection close `update_orchestrator` does for the
+    // managed-connection close the update pipeline does for the
     // install.py window. See `update_gate::skip_if_update_in_progress`.
     if crate::commands::update_gate::skip_if_update_in_progress("module_service_poll") {
         return;
@@ -3212,7 +3228,9 @@ where
 //   1. License revoked between attempts → `decision="skipped_license"`,
 //      audit-only, row unchanged.
 //   2. Manifest's `min_launcher_version` exceeds current launcher version
-//      → `decision="skipped_version"`, audit-only, row unchanged.
+//      → `decision="skipped_version"`, audit-only, row unchanged. Either
+//      version not X.Y.Z (v0.2.100) → `decision="skipped_version_unreadable"`
+//      with the offending string in `error` — never treated as satisfied.
 //   3. A healthy container with the expected name already exists →
 //      `decision="self_healed"`, row's `status` flipped to `Installed` and
 //      `last_error` cleared. No install re-run; the prior attempt
@@ -3232,13 +3250,14 @@ pub struct RetryReport {
     pub project_id: String,
     pub module_id: String,
     /// One of `retried_success` / `retried_failed` / `skipped_license` /
-    /// `skipped_version` / `skipped_manifest_missing` / `self_healed` /
-    /// `retried_unavailable`.
+    /// `skipped_version` / `skipped_version_unreadable` /
+    /// `skipped_manifest_missing` / `self_healed` / `retried_unavailable`.
     pub decision: String,
     /// Status after the retry decision was applied. `None` when the row
     /// was untouched (every `skipped_*` decision).
     pub new_status: Option<String>,
-    /// Error string when the retry failed (`retried_failed`), else `None`.
+    /// Error string when the retry failed (`retried_failed`) or a version was
+    /// unreadable (`skipped_version_unreadable`), else `None`.
     pub error: Option<String>,
 }
 
@@ -3283,38 +3302,27 @@ pub async fn set_auto_retry_failed_installs_setting(
     set_auto_retry_on_orchestrator_update(&db, enabled)
 }
 
-/// Compare two dotted version strings as semver-ish ordered tuples.
-/// Returns true iff `current >= required` (numeric-component-wise).
-/// Non-numeric suffixes (e.g. `-rc1`) are stripped before parsing; the
-/// resulting "x.y.z" prefix is compared as a Vec<u32>. Missing components
-/// default to 0 so `"0.2"` compares equal to `"0.2.0"`.
+/// Gate 2 of the auto-retry: does this launcher satisfy the manifest's
+/// `min_launcher_version`? `None` = pass; `Some((decision, error))` = skip.
 ///
-/// Conservative semantics: if EITHER side fails to parse, returns true
-/// (treat as compatible) so a malformed `min_launcher_version` doesn't
-/// silently block every retry. The install-time gate is the canonical
-/// version check; this helper is only an EARLY skip for the retry path.
-fn version_at_least(current: &str, required: &str) -> bool {
-    fn parse(v: &str) -> Option<Vec<u32>> {
-        let trimmed = v.split(|c: char| c == '-' || c == '+').next().unwrap_or(v);
-        let parts: Result<Vec<u32>, _> = trimmed.split('.').map(|p| p.parse::<u32>()).collect();
-        parts.ok()
+/// v0.2.100 WP-01: ordering goes through the ONE comparator,
+/// `vct_launcher_core::version` (strict `X.Y.Z`). Superseded: the private
+/// `version_at_least` returned `true` ("compatible") when either side
+/// failed to parse, so a malformed declaration was retried as if satisfied.
+/// Now an unreadable version is a named skip — `skipped_version_unreadable`
+/// with the offending string — never a pass.
+fn min_launcher_retry_decision(
+    launcher_ver: &str,
+    required: &str,
+) -> Option<(&'static str, Option<String>)> {
+    match vct_launcher_core::version::is_older(launcher_ver, required.trim()) {
+        Ok(false) => None,
+        Ok(true) => Some(("skipped_version", None)),
+        Err(e) => Some((
+            "skipped_version_unreadable",
+            Some(format!("min_launcher_version check: {e}")),
+        )),
     }
-    let (cur, req) = match (parse(current), parse(required)) {
-        (Some(a), Some(b)) => (a, b),
-        _ => return true,
-    };
-    let n = cur.len().max(req.len());
-    for i in 0..n {
-        let a = *cur.get(i).unwrap_or(&0);
-        let b = *req.get(i).unwrap_or(&0);
-        if a > b {
-            return true;
-        }
-        if a < b {
-            return false;
-        }
-    }
-    true
 }
 
 /// Core retry helper.
@@ -3461,15 +3469,16 @@ pub async fn retry_failed_module_installs(
 
         // Gate 2: min_launcher_version satisfied?
         if let Some(req) = manifest.compatibility.min_launcher_version.as_deref() {
-            if !version_at_least(launcher_ver, req) {
+            if let Some((decision, gate_error)) = min_launcher_retry_decision(launcher_ver, req) {
                 let detail = serde_json::json!({
                     "project_id": project_id,
                     "module_id": module_id,
                     "prior_status": prior_status,
                     "prior_error": prior_error,
-                    "decision": "skipped_version",
+                    "decision": decision,
                     "launcher_version": launcher_ver,
                     "min_launcher_version": req,
+                    "error": gate_error,
                 });
                 let _ = db.audit(
                     "module_install_auto_retry",
@@ -3480,9 +3489,9 @@ pub async fn retry_failed_module_installs(
                 reports.push(RetryReport {
                     project_id,
                     module_id,
-                    decision: "skipped_version".to_string(),
+                    decision: decision.to_string(),
                     new_status: None,
-                    error: None,
+                    error: gate_error,
                 });
                 continue;
             }
@@ -3866,6 +3875,55 @@ mod tests {
             self.0.lock().unwrap().push(call);
             Box::pin(async {})
         }
+
+        // Never reach a real runtime from a test: record the label-gated
+        // clear/check (W4R-01) as calls too.
+        fn clear_name_for_start<'a>(
+            &'a self,
+            program: &'a str,
+            name: &'a str,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec![program.into(), "clear-name".into(), name.into()]);
+            Box::pin(async { Ok(()) })
+        }
+
+        fn check_name_for_start<'a>(
+            &'a self,
+            program: &'a str,
+            name: &'a str,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec![program.into(), "check-name".into(), name.into()]);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// v0.2.100 (R18F-06): a prepared start carries the module install's
+    /// recorded mounts (the manifest's volumes) when this DB claims the
+    /// install — the evidence an unlabelled ≤0.2.99 container is matched
+    /// against — and nothing when it does not.
+    #[test]
+    fn prepared_start_carries_the_claimed_installs_recorded_mounts() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let manifest = make_manifest(true, true);
+        assert!(!manifest.runtime.volumes.is_empty(), "precondition: the manifest mounts something");
+        let (db, pid) = open_db_with_resume_project();
+        let mut project = make_project();
+        project.id = pid.clone();
+        project.slug = "rs-slug".into();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+
+        let unclaimed = prepare_container_start(&manifest, &ctx, &project, 11533, None, "podman".into(), &db).unwrap();
+        assert!(!unclaimed.claimed.claimed && unclaimed.claimed.recorded_mounts.is_empty());
+
+        db.insert_module_install("install-r18f06", &pid, &manifest.id, "0.1.0", "/tmp/r18f06").unwrap();
+        let prepared = prepare_container_start(&manifest, &ctx, &project, 11533, None, "podman".into(), &db).unwrap();
+        assert!(prepared.claimed.claimed);
+        let dests: Vec<&str> = prepared.claimed.recorded_mounts.iter().map(|m| m.destination.as_str()).collect();
+        let want: Vec<&str> = manifest.runtime.volumes.iter().map(|v| v.container.as_str()).collect();
+        assert_eq!(dests, want);
     }
 
     /// A restart whose start is refused — a REQUIRED listed secret that is
@@ -3902,6 +3960,73 @@ mod tests {
 
         assert!(err.contains("RL_API_TOKEN"), "{err}");
         assert!(cli.0.lock().unwrap().is_empty(), "calls: {:?}", cli.0.lock().unwrap());
+    }
+
+    /// A CLI whose label check refuses the name (another install's
+    /// container); records every call.
+    #[derive(Default)]
+    struct OtherInstallCli(std::sync::Mutex<Vec<Vec<String>>>);
+
+    impl ContainerCli for OtherInstallCli {
+        fn run_quiet<'a>(
+            &'a self,
+            program: &'a str,
+            args: &'a [&'a str],
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+            let mut call = vec![program.to_string()];
+            call.extend(args.iter().map(|a| a.to_string()));
+            self.0.lock().unwrap().push(call);
+            Box::pin(async {})
+        }
+        fn clear_name_for_start<'a>(
+            &'a self,
+            _program: &'a str,
+            name: &'a str,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec!["clear-name".into(), name.into()]);
+            Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })
+        }
+        fn check_name_for_start<'a>(
+            &'a self,
+            _program: &'a str,
+            name: &'a str,
+            _claimed: &'a vct_launcher_core::services::container_runtime::ModuleClaim,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), String>> + Send + 'a>> {
+            self.0.lock().unwrap().push(vec!["check-name".into(), name.into()]);
+            Box::pin(async move { Err(format!("container '{name}' was created by another VCO install")) })
+        }
+    }
+
+    /// v0.2.100 (W4R-01): a restart whose name belongs to another install
+    /// is refused by the label check BEFORE `stop`/`rm` — nothing of the
+    /// other install's container is touched.
+    #[tokio::test]
+    async fn w4r01_restart_refused_by_another_installs_label_stops_nothing() {
+        let _state = vct_launcher_core::test_env::state_dir_guard_with(&[]);
+        let manifest = make_manifest(true, true);
+        let project = make_project();
+        let db = Db::open_in_memory().unwrap();
+        let ctx = PlaceholderCtx::new(&manifest.id);
+        let cli = OtherInstallCli::default();
+
+        let err = restart_container_with(
+            &cli,
+            "podman".into(),
+            &manifest,
+            &ctx,
+            &project,
+            "vct-rl-reranker-acme-corp",
+            11533,
+            None,
+            &db,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(err.contains("another VCO install"), "{err}");
+        let calls = cli.0.lock().unwrap().clone();
+        assert_eq!(calls, vec![vec!["check-name".to_string(), "vct-rl-reranker-acme-corp".into()]]);
     }
 
     // ─── resolve_container_name ──────────────────────────────────────
@@ -4335,36 +4460,87 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    // ─── recent events parsing ─────────────────────────────────────────
+    // ─── rl_event_counts reads the real store ──────────────────────────
 
-    #[tokio::test]
-    async fn recent_events_avg_latency_handles_missing_file() {
-        let nonexistent = PathBuf::from("/tmp/__rl_test_def_not_there.jsonl");
-        let (count, avg) = parse_recent_event_stats_from_path(&nonexistent).await;
-        assert_eq!(count, 0);
-        assert!((avg - 0.0).abs() < f32::EPSILON);
+    fn fixture_project_db() -> (Db, String) {
+        let db = Db::open_in_memory().expect("DB");
+        {
+            let guard = db.lock();
+            guard
+                .execute(
+                    "INSERT INTO projects (id, name, folder_path, host, slug, created_at, updated_at)
+                     VALUES ('proj-rl', 'P', '/tmp/p', 'base', 'p-slug', 1, 1)",
+                    [],
+                )
+                .expect("insert project");
+        }
+        (db, "proj-rl".to_string())
     }
 
-    #[tokio::test]
-    async fn recent_events_avg_latency_averages_last_10_lines() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("rl_test_avg_{}.jsonl", std::process::id()));
-
-        let mut content = String::new();
-        for i in 1..=12u32 {
-            content.push_str(&format!(
-                "{{\"event\":\"rerank\",\"latency_ms\":{}}}\n",
-                i * 10
-            ));
+    /// A project with events in `rl_events` reports them. The old reader
+    /// tailed a JSONL file that nothing writes, so it always said 0.
+    #[test]
+    fn rl_event_counts_reads_the_rl_events_table() {
+        let (db, pid) = fixture_project_db();
+        let now = 10 * RL_RECENT_WINDOW_MS;
+        // 2 recent, 1 older than 24h.
+        for (i, ts) in [now - 1_000, now - 5_000, now - RL_RECENT_WINDOW_MS - 1].iter().enumerate() {
+            db.insert_rl_event(
+                "retrieval", 3, *ts, Some(&pid), None, &format!("t{i}"),
+                None, None, None, None, "{}",
+            )
+            .unwrap();
         }
-        tokio::fs::write(&path, content).await.expect("write");
+        assert_eq!(rl_event_counts(&db, &pid, now), (2, 3));
+    }
 
-        let (count, avg) = parse_recent_event_stats_from_path(&path).await;
-        assert_eq!(count, 10);
-        // Lines 3..=12 → latencies 30, 40, ..., 120. Sum 750, avg 75.0.
-        assert!((avg - 75.0).abs() < 0.01, "got {}", avg);
+    /// Another project's events, and events with no project, never count.
+    #[test]
+    fn rl_event_counts_is_scoped_to_the_project() {
+        let (db, pid) = fixture_project_db();
+        db.insert_rl_event("retrieval", 3, 5, None, None, "free", None, None, None, None, "{}")
+            .unwrap();
+        assert_eq!(rl_event_counts(&db, &pid, 10), (0, 0));
+    }
 
-        let _ = tokio::fs::remove_file(&path).await;
+    /// W5R-13: the corpus split by embedding source (qwen3 primary + arctic
+    /// twin), retrieval vs citation, scoped to the project.
+    #[test]
+    fn rl_event_counts_by_source_splits_qwen3_arctic_and_types() {
+        let (db, pid) = fixture_project_db();
+        let ins = |et: &str, src: Option<&str>, task: &str| {
+            db.insert_rl_event(et, 3, 1, Some(&pid), None, task, None, src, None, None, "{}")
+                .unwrap();
+        };
+        ins("retrieval", Some("qwen3"), "a");
+        ins("retrieval", Some("arctic"), "a:arctic");
+        ins("citation", Some("qwen3"), "a-c");
+        ins("citation", Some("arctic"), "a-c:arctic");
+        ins("retrieval", Some("arctic"), "b:arctic");
+        ins("retrieval", None, "legacy");
+        db.insert_rl_event("retrieval", 3, 1, None, None, "other", None, Some("qwen3"), None, None, "{}")
+            .unwrap();
+        let got = rl_event_counts_by_source(&db, &pid);
+        let row = |src: &str| got.iter().find(|r| r.embedding_source == src).cloned().unwrap();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(row("arctic"), RlSourceEventCount { embedding_source: "arctic".into(), retrieval: 2, citation: 1, total: 3 });
+        assert_eq!(row("qwen3"), RlSourceEventCount { embedding_source: "qwen3".into(), retrieval: 1, citation: 1, total: 2 });
+        assert_eq!(row("unknown").total, 1);
+        let v = serde_json::to_value(RlDashboardState::empty()).unwrap();
+        assert_eq!(v["events_by_embedding_source"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn rl_dashboard_state_reports_total_events_on_the_wire() {
+        let v = serde_json::to_value(RlDashboardState::empty()).unwrap();
+        assert_eq!(v["total_events_count"], 0);
+        // A snapshot saved before the field existed still deserializes.
+        let legacy = r#"{"container_name":"","container_running":false,"port":0,
+            "image_tag":"","current_weights_version":"","last_checked_at":0,
+            "last_finetuned_at":0,"weights_sha256_prefix":"",
+            "recent_events_count":0,"recent_events_avg_latency_ms":0.0}"#;
+        let d: RlDashboardState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(d.total_events_count, 0);
     }
 
     // ─── DB-backed: ensure_project_rl_port ─────────────────────────────
@@ -4953,19 +5129,32 @@ mod tests {
         .expect("flip to error");
     }
 
-    /// Verify `version_at_least` handles the canonical cases.
+    /// v0.2.100 WP-01 (leave-alone): satisfied / unsatisfied, numerically.
     #[test]
-    fn version_at_least_handles_basic_comparisons() {
-        assert!(version_at_least("0.2.44", "0.2.44"));
-        assert!(version_at_least("0.2.44", "0.2.43"));
-        assert!(version_at_least("0.3.0", "0.2.44"));
-        assert!(!version_at_least("0.2.40", "0.2.44"));
-        // Missing patch component defaults to 0.
-        assert!(version_at_least("0.2.0", "0.2"));
-        assert!(version_at_least("0.2", "0.2.0"));
-        // Malformed → conservative true (treat as compatible).
-        assert!(version_at_least("not-a-version", "0.2.0"));
-        assert!(version_at_least("0.2.0", "garbage"));
+    fn min_launcher_retry_decision_orders_numerically() {
+        assert_eq!(min_launcher_retry_decision("0.2.44", "0.2.44"), None);
+        assert_eq!(min_launcher_retry_decision("0.2.100", "0.2.99"), None);
+        assert_eq!(min_launcher_retry_decision("0.3.0", " 0.2.44 "), None);
+        assert_eq!(
+            min_launcher_retry_decision("0.2.99", "0.2.100"),
+            Some(("skipped_version", None))
+        );
+    }
+
+    /// v0.2.100 WP-01 (act): an unreadable version is a named skip. It used
+    /// to be `true` ("compatible") and the retry went ahead.
+    #[test]
+    fn min_launcher_retry_decision_refuses_unreadable_versions() {
+        for (cur, req, bad) in [
+            ("0.2.100", "garbage", "garbage"),
+            ("not-a-version", "0.2.0", "not-a-version"),
+            ("0.2.100", "0.2", "0.2"),
+            ("0.2.100", "0.2.99-rc1", "0.2.99-rc1"),
+        ] {
+            let (decision, err) = min_launcher_retry_decision(cur, req).expect("must skip");
+            assert_eq!(decision, "skipped_version_unreadable", "{cur} vs {req}");
+            assert!(err.unwrap_or_default().contains(bad), "{cur} vs {req}");
+        }
     }
 
     /// T-license: an error-state row whose manifest declares

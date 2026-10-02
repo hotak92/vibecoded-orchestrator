@@ -898,12 +898,10 @@ fn run_gateway_cli(args: &[&str]) -> Result<(i32, String, String), String> {
     run_to_completion(cmd, "vct-model-gateway")
 }
 
-/// Spawn, wait with a deadline, then drain both pipes.
-///
-/// Draining after exit is safe because of the deadline: a child that filled
-/// a pipe buffer never exits, so it is killed here rather than deadlocking
-/// the GUI thread. Every payload this module reads is a single small JSON
-/// object, far below any platform's pipe capacity.
+/// Spawn and wait with a deadline through
+/// [`vct_launcher_core::process::output_bounded`]: both pipes are drained
+/// while the child runs, and a child still running at the deadline is killed
+/// rather than parking the GUI thread.
 fn run_to_completion(cmd: Command, label: &str) -> Result<(i32, String, String), String> {
     run_to_completion_within(cmd, label, PY_TIMEOUT)
 }
@@ -916,44 +914,15 @@ pub(crate) fn run_to_completion_within(
     label: &str,
     limit: Duration,
 ) -> Result<(i32, String, String), String> {
-    let mut child = cmd
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("{}: spawn failed: {}", label, e))?;
-
-    let deadline = Instant::now() + limit;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!(
-                        "{}: timed out after {} s",
-                        label,
-                        limit.as_secs()
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(25));
-            }
-            Err(e) => return Err(format!("{}: wait failed: {}", label, e)),
-        }
-    };
-
-    let mut stdout = String::new();
-    let mut stderr = String::new();
-    if let Some(mut s) = child.stdout.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stdout);
-    }
-    if let Some(mut s) = child.stderr.take() {
-        use std::io::Read;
-        let _ = s.read_to_string(&mut stderr);
-    }
-    Ok((status.code().unwrap_or(-1), stdout, stderr))
+    // The ONE bounded runner (v0.2.100 F-W4-05): pipes drained while the
+    // child runs, killed and reaped at the deadline.
+    let out = vct_launcher_core::process::output_bounded(&mut cmd, None, limit)
+        .map_err(|e| format!("{}: {}", label, e))?;
+    Ok((
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    ))
 }
 
 // ─── vco_lib.vscode_settings bridge ───────────────────────────────────────
@@ -1616,6 +1585,54 @@ pub async fn model_gateway_check() -> Result<String, String> {
     }
 }
 
+// ─── Gateway agent delivery gate (v0.2.100, AD-7) ─────────────────────────
+
+/// The argv tail of the ONE home for "is the gateway configured on this
+/// machine, and does this project get the gateway agent definitions?":
+/// `python -m vco_lib.module_gated_delivery status --json [--folder <f>]`.
+/// Split out so the argv shape is unit-testable without a Python.
+fn agents_gate_args(folder: Option<&str>) -> Vec<String> {
+    let mut args = vec!["status".to_string(), "--json".to_string()];
+    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+        args.push("--folder".to_string());
+        args.push(f.to_string());
+    }
+    args
+}
+
+/// Machine signal + (with `folder`) the project's tri-state gate verdict +
+/// agent definitions naming a gateway id the router does not know.
+///
+/// Rust decides nothing here (rule A): the payload is the Python module's
+/// JSON, passed through. A spawn failure or non-JSON answer is an `Err` the
+/// card renders as "could not ask" — never as "not configured".
+#[command]
+pub async fn model_gateway_agents_gate(
+    folder: Option<String>,
+) -> Result<serde_json::Value, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let python = python_or_err()?;
+        let root = crate::commands::installer::find_local_repo_root().ok();
+        let mut cmd =
+            python_module_command(&python, "vco_lib.module_gated_delivery", root.as_deref());
+        for a in agents_gate_args(folder.as_deref()) {
+            cmd.arg(a);
+        }
+        let (code, stdout, stderr) =
+            run_to_completion(cmd, "vco_lib.module_gated_delivery")?;
+        serde_json::from_str::<serde_json::Value>(stdout.trim()).map_err(|e| {
+            format!(
+                "vco_lib.module_gated_delivery exited {} and did not return JSON ({}): {}",
+                code,
+                e,
+                stderr.trim()
+            )
+        })
+    })
+    .await
+    .map_err(|e| format!("agents-gate task failed: {}", e))?
+}
+
 // ─── VS Code panel wiring ─────────────────────────────────────────────────
 
 #[command]
@@ -1804,6 +1821,16 @@ mod tests {
     /// to prevent.
     fn scratch_root() -> vct_launcher_core::test_env::StateDirGuard {
         state_dir_guard_with(&[(PORT_ENV, None)])
+    }
+
+    #[test]
+    fn agents_gate_asks_the_python_home_with_and_without_a_folder() {
+        assert_eq!(agents_gate_args(None), vec!["status", "--json"]);
+        assert_eq!(agents_gate_args(Some("   ")), vec!["status", "--json"]);
+        assert_eq!(
+            agents_gate_args(Some("/p/x")),
+            vec!["status", "--json", "--folder", "/p/x"]
+        );
     }
 
     #[test]

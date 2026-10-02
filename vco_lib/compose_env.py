@@ -258,11 +258,14 @@ class ServiceKeysResult:
     """What :func:`write_service_keys` did. ``values``: the managed keys now
     in the block. ``superseded``: ``{key: old_value}`` for lines OUTSIDE the
     block that assigned a key the rows now state (the row is the truth; the
-    old value is returned so a caller can report it). ``notes``: why a key
-    was not written. ``action``: ``"set"`` / ``"unchanged"``."""
+    old value is returned so a caller can report it). ``carried``: block
+    keys kept although no row stated them (:func:`write_service_keys`).
+    ``notes``: why a key was not written. ``action``: ``"set"`` /
+    ``"unchanged"``."""
 
     def __init__(self) -> None:
         self.values: dict[str, str] = {}
+        self.carried: dict[str, str] = {}
         self.superseded: dict[str, str] = {}
         self.notes: list[str] = []
         self.action = "unchanged"
@@ -295,14 +298,16 @@ def service_key_values(
     """Pure: the managed keys *rows* state (``""`` = stated ABSENT), plus
     notes for keys it could not decide.
 
-    A service with NO row states nothing — its keys are left alone, because
-    the absence of a row is not a statement. Port keys and data knobs come
-    from ``vco_managed`` rows only; a data knob only when the row carries an
-    observed mount (a vco_managed row without one leaves any existing knob
-    line alone rather than re-pointing the service at the default volume).
-    ``CODE_EMBED_OLLAMA_URL`` is stated when the Ollama row is NOT
-    ``vco_managed``; *runtime* picks the host alias for an adopted Ollama on
-    this machine (``podman``/``docker``)."""
+    A service with NO row states nothing, because the absence of a row is
+    not a statement. Port keys and data knobs come from ``vco_managed`` rows
+    only; a data knob only when the row carries an observed mount. A row
+    without a mount states NO knob — this function never states one absent
+    — and :func:`write_service_keys` then KEEPS the knob the file already
+    carries (in its block or outside it): a missing mount never re-points
+    the service at compose's default (possibly empty) volume (v0.2.100
+    W2R-01; the v0.2.98 knob loss). ``CODE_EMBED_OLLAMA_URL`` is stated
+    when the Ollama row is NOT ``vco_managed``; *runtime* picks the host
+    alias for an adopted Ollama on this machine (``podman``/``docker``)."""
     from vco_lib.service_endpoints import render_grpc_port, render_url  # noqa: PLC0415
 
     values: dict[str, str] = {}
@@ -347,6 +352,24 @@ def service_key_values(
     return values, notes
 
 
+def _carried_keys(rows: "Mapping[str, Any]", stated: Mapping[str, str]) -> list[str]:
+    """The block keys :func:`write_service_keys` keeps although *rows* do
+    not state them (its docstring): the data knobs of every service whose
+    row states neither half of its pair, and every key of a service with no
+    row at all."""
+    keys: list[str] = []
+    for service, pair in DATA_KNOBS.items():
+        if not any(k in stated for k in pair):
+            keys.extend(pair)
+        if rows.get(service) is None:
+            keys.append(SERVICE_PORT_KEYS[service])
+            if service == "weaviate":
+                keys.append(WEAVIATE_GRPC_PORT_KEY)
+    if rows.get("ollama") is None:
+        keys += [CODE_EMBED_OLLAMA_URL_KEY, CODE_EMBED_HOST_GATEWAY_KEY]
+    return [k for k in keys if k not in stated]
+
+
 def write_service_keys(
     infra_dir: Path,
     rows: "Mapping[str, Any]",
@@ -357,11 +380,26 @@ def write_service_keys(
     ``service_endpoints`` *rows* (``{service: EndpointRow}``).
 
     The keys live in ONE marker-delimited block this function owns: every
-    call rewrites the block from the rows, so a key the rows no longer state
-    leaves the block. A line OUTSIDE the block that assigns a key the rows
-    now state (a value, or stated-absent — the other half of a data-knob
-    pair) is removed, and its old value reported in ``superseded``: the row
-    is the source of truth, and compose must never see two assignments. An
+    call rewrites the block from the rows, so a port / URL key a PRESENT row
+    no longer states leaves the block. Two kinds of block line are carried
+    forward instead (``carried`` lists them), because not stating a key is
+    not a statement that it is absent:
+
+    * a DATA KNOB (:data:`DATA_KNOBS`) whose service's row states neither
+      half of the pair — no row, a row without a recorded mount, a row that
+      is not ``vco_managed``. A data knob leaves the block only when the row
+      states the other half (a bind replaces a volume name and vice versa).
+      Dropping it would make the next compose run recreate the service onto
+      its default volume — v0.2.100 W2R-01: a batch that projected service
+      B from a map still holding A's NULL row erased A's just-recorded knob;
+    * every key of a service with NO row (its port keys; for Ollama, the
+      ``CODE_EMBED_OLLAMA_URL`` pair).
+
+    A carried key that a line OUTSIDE the block also assigns is not carried
+    (the outside line stays, and compose never sees two assignments). A line
+    OUTSIDE the block that assigns a key the rows now state (a value, or
+    stated-absent — the other half of a data-knob pair) is removed, and its
+    old value reported in ``superseded``: the row is the source of truth. An
     outside line for a key the rows do NOT state is left exactly as it is.
     Every other byte of the file is kept.
 
@@ -394,6 +432,8 @@ def write_service_keys(
             prior = handle.read()
     eol = "\r\n" if "\r\n" in prior else "\n"
     kept: list[str] = []
+    block_prior: dict[str, str] = {}   # the block's current assignments
+    outside: set[str] = set()          # keys assigned by a line kept outside the block
     block_at: Optional[int] = None  # where an existing block stood: rewritten IN PLACE
     in_block = False
     for line in prior.splitlines():
@@ -403,16 +443,25 @@ def write_service_keys(
             if block_at is None:
                 block_at = len(kept)
             continue
+        pair = parse_env_line(line)
         if in_block:
             if marker == _SERVICE_BLOCK_END:
                 in_block = False
+            elif pair is not None and pair[0] in SERVICE_KEYS:
+                block_prior[pair[0]] = pair[1]
             continue
-        pair = parse_env_line(line)
         if pair is not None and pair[0] in stated:
             if pair[1] != written.get(pair[0], ""):
                 result.superseded[pair[0]] = pair[1]
             continue
+        if pair is not None:
+            outside.add(pair[0])
         kept.append(line)
+    for key in _carried_keys(rows, stated):
+        value = block_prior.get(key, "")
+        if value and key not in outside:
+            written[key] = value
+            result.carried[key] = value
     block: list[str] = []
     if written:
         block = [_SERVICE_BLOCK_BEGIN]

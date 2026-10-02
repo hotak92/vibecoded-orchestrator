@@ -73,10 +73,10 @@
   // in `$lib/module-enable` (pure ⇒ unit-tested; this file is markup).
   import {
     MODULE_TRI_CHOICE_LABELS,
-    dormantNotice,
+    moduleActiveChoice,
     moduleBadgeFor,
     moduleEffectiveLine,
-    moduleTriChoiceFor,
+    moduleLockReason,
     moduleTriChoiceToValue,
     installedTileUsesCascade,
     showsProjectSettingControl,
@@ -602,11 +602,12 @@
     }
   }
 
-  // v0.2.35 (Agent J): `semverLess` + `hasUpdate` extracted into
-  // `$lib/module-status-display` (same comparison logic, re-exported
-  // as part of `resolveTileDisplay`'s `can_update` field). The
-  // refactor lets unit tests cover the full gating matrix without a
-  // Svelte runtime.
+  // v0.2.35 (Agent J): the update gating lives in
+  // `$lib/module-status-display` (`resolveTileDisplay`'s `can_update`), so
+  // unit tests cover the full matrix without a Svelte runtime. v0.2.100:
+  // the ordering there is `resolveCanUpdate` over the ONE strict X.Y.Z
+  // comparator (`$lib/version-compare`); an unreadable version yields
+  // `can_update: false` + `version_unreadable`, rendered in the title row.
 
   // v0.2.35 (Agent J): retry-install handler. Calls the SAME
   // `install_module_for_project` Tauri command as the first-time
@@ -763,19 +764,29 @@
 -->
 {#snippet enableCascadeControl(m: ModuleCatalogEntry, tileLicenseGated: boolean)}
   {@const enableState = enableStates[m.id]}
+  <!-- v0.2.100 W5R-02: while the module's effect is LOCKED (the RL scoring
+       lock, served by the backend as `lock_reason`) no position is
+       highlighted — the stored row is not the live state — every button is
+       disabled, and the line below leads with "Off" and the reason. -->
+  {@const lockReason = enableState === undefined ? null : moduleLockReason(enableState)}
   <div class="mc-enable" data-testid="mc-enable-cascade">
     <div class="mc-enable-seg" role="group" aria-label="{m.name} for this project">
       {#each ['inherit', 'on', 'off'] as const as choice (choice)}
         <button
           class="mc-enable-btn"
           class:mc-enable-active={enableState !== undefined &&
-            moduleTriChoiceFor(enableState) === choice}
+            moduleActiveChoice(enableState) === choice}
           aria-pressed={enableState !== undefined &&
-            moduleTriChoiceFor(enableState) === choice}
-          disabled={tileLicenseGated || enableState === undefined || enableBusy !== null}
-          title={tileLicenseGated
-            ? 'License required to change enable state. Re-activate the license to manage this module.'
-            : undefined}
+            moduleActiveChoice(enableState) === choice}
+          disabled={tileLicenseGated ||
+            enableState === undefined ||
+            lockReason !== null ||
+            enableBusy !== null}
+          title={lockReason !== null
+            ? lockReason
+            : tileLicenseGated
+              ? 'License required to change enable state. Re-activate the license to manage this module.'
+              : undefined}
           onclick={() => chooseEnable(m.id, choice)}
         >
           {MODULE_TRI_CHOICE_LABELS[choice]}
@@ -795,11 +806,6 @@
         >
       {/if}
     </p>
-    {#if dormantNotice(m.id)}
-      <!-- USER rider (#23): say what is TRUE today, so "On" never reads as
-           "actively reranking". -->
-      <p class="mc-enable-dormant">{dormantNotice(m.id)}</p>
-    {/if}
   </div>
 {/snippet}
 
@@ -994,6 +1000,19 @@
                     Update available: v{m.version}
                   </span>
                 {/if}
+                <!-- v0.2.100 (WP-08, F-W1-03): an installed or catalog version
+                     that is not X.Y.Z cannot be ordered, so the tile shows
+                     that instead of a verdict (never "update available",
+                     never silently "current"). -->
+                {#if display.kind === 'installed' && display.version_unreadable}
+                  <span
+                    class="tier-badge tier-catalog-warning"
+                    title="The installed or catalog version is not in X.Y.Z form, so the launcher cannot tell whether an update exists."
+                    data-testid="badge-version-unreadable"
+                  >
+                    {display.version_unreadable}
+                  </span>
+                {/if}
                 <!-- Bug D (v0.2.49): per-project status badge.
                      Resolved at the top of the {#each} (ppBadge const).
                      Always rendered so a project switch reads as
@@ -1026,6 +1045,12 @@
             </div>
           </div>
           <p class="card-desc">{m.description || 'No description provided.'}</p>
+          <!-- v0.2.100 (WP-08, F-W1-03): the backend's catalog warning (module
+               no longer in the catalog, or versions that cannot be ordered) —
+               set by `modules.rs`, never rendered before. -->
+          {#if m.catalog_warning}
+            <p class="card-catalog-warning" data-testid="catalog-warning">{m.catalog_warning}</p>
+          {/if}
           {#if m.compatibility_hosts.length}
             <p class="card-hosts">
               Hosts: {m.compatibility_hosts.join(', ')}
@@ -1531,6 +1556,21 @@
     cursor: help;
   }
 
+  /* v0.2.100 (WP-08): version-unreadable / catalog-warning badges. The same
+     amber as the deprecated badge — "warning, not error": the module keeps
+     working, the launcher just cannot give an update verdict. */
+  .tier-badge.tier-catalog-warning {
+    background: rgba(255, 159, 28, 0.14);
+    color: rgb(255, 159, 28);
+    cursor: help;
+  }
+  .card-catalog-warning {
+    margin: 0 0 8px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: rgb(255, 159, 28);
+  }
+
   /* v0.2.49 Stream D: tier badge for unlicensed paid modules. Subtle
      red-tinted variant to signal "this is gated" without screaming —
      the actual blocking happens in the Install button → Activate
@@ -1817,14 +1857,6 @@
   .mc-enable-badge-auto {
     background: rgba(123, 95, 255, 0.15);
     color: var(--color-purple);
-  }
-  .mc-enable-dormant {
-    margin: 0;
-    font-size: 11px;
-    line-height: 1.45;
-    color: var(--color-mid);
-    border-left: 2px solid var(--color-purple);
-    padding-left: 8px;
   }
 
   .mono {

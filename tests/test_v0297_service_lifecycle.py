@@ -442,6 +442,9 @@ class EmbedWorld:
         argv = list(argv)
         self.all_argv.append(argv)
         rest = argv[1:]
+        if rest[:2] == ["compose", "version"]:
+            # v0.2.100: the compose PROVIDER is detected (the recovery's refine)
+            return _cp(argv, 0, "Docker Compose version v2.30.0\n")
         if "config" in argv and argv[-1] == "config":
             m = self._knob_mount()
             vol = ({"type": "bind", "source": m["Source"], "target": "/cache"}

@@ -117,6 +117,22 @@ def _probe_license() -> Dict[str, Any]:
     }
 
 
+def _probe_scoring_lock() -> Dict[str, Any]:
+    """The shipped RL scoring lock (``vco_lib/rl_scoring_lock.toml``), read
+    through the SAME resolver the MCP's scoring gate uses. While locked, RL
+    scoring is off whatever the licence and toggle say; logging is unaffected.
+    """
+    try:
+        from claude_mcp_servers.rl_client.search_pipeline import _rl_scoring_lock_reason
+
+        reason = _rl_scoring_lock_reason()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "locked": True, "detail": f"lock probe raised: {exc}"}
+    if reason is None:
+        return {"status": "unlocked", "locked": False, "detail": "RL scoring is not locked."}
+    return {"status": "locked", "locked": True, "detail": reason}
+
+
 def _probe_per_project_toggle() -> Dict[str, Any]:
     """Per-project enable toggle (hub-resolved). Soft-fail → unknown."""
     try:
@@ -384,6 +400,7 @@ def _probe_retention() -> Dict[str, Any]:
 
 def run_diagnostics(project_root: str) -> Dict[str, Any]:
     """Run every probe and assemble the report dict. Pure aggregation."""
+    lock = _probe_scoring_lock()
     lic = _probe_license()
     toggle = _probe_per_project_toggle()
     container = _probe_container()
@@ -392,14 +409,19 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
     retention = _probe_retention()
     quarantine = _probe_quarantine()
 
-    rl_enabled = bool(lic.get("enabled")) and toggle.get("enabled") is not False
+    # v0.2.100 W5R-02: the scoring lock wins over the licence and the toggle.
+    rl_enabled = (
+        lock.get("locked") is False
+        and bool(lic.get("enabled"))
+        and toggle.get("enabled") is not False
+    )
 
     # Healthy iff: free-tier (nothing to fix) OR (enabled AND container
     # compatible AND hub up). Version mismatch / container down / hub down on
     # an ENABLED install = unhealthy (fixable).
     healthy: bool
     if not rl_enabled:
-        healthy = True  # free-tier / opted-out → legitimately cosine
+        healthy = True  # locked / free-tier / opted-out → legitimately cosine
     else:
         healthy = bool(container.get("compatible")) and telemetry.get("reachable") is True
 
@@ -407,6 +429,7 @@ def run_diagnostics(project_root: str) -> Dict[str, Any]:
         "rl_enabled": rl_enabled,
         "healthy": healthy,
         "project_root": project_root,
+        "scoring_lock": lock,
         "license": lic,
         "per_project_toggle": toggle,
         "container": container,
@@ -432,6 +455,7 @@ def format_human(report: Dict[str, Any]) -> str:
         lines.append(f"[{title}] {d.get('status', '?')}")
         lines.append(f"    {d.get('detail', '')}")
 
+    _sec("scoring lock", report.get("scoring_lock", {"status": "unknown", "detail": ""}))
     _sec("license gate", report["license"])
     _sec("per-project toggle", report["per_project_toggle"])
     _sec("container / negotiation", report["container"])

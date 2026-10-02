@@ -28,18 +28,25 @@
   //
   // Reactive: re-runs `load()` whenever `projectId` changes.
 
-  import { onMount } from 'svelte';
-  import { invoke } from '$lib/tauri';
+  import { onMount, onDestroy } from 'svelte';
+  import { invoke, listen } from '$lib/tauri';
   import { pickDirectory } from '$lib/dialog';
   import { toast } from '$lib/stores/toast';
   import { projects as projectsStore } from '$lib/stores/projects';
   import ExtrasDisambiguationModal from '$lib/components/ExtrasDisambiguationModal.svelte';
   import ExtrasSyncProgressModal from '$lib/components/ExtrasSyncProgressModal.svelte';
   import type { SyncModalState } from '$lib/components/ExtrasSyncProgressModal.svelte';
-  import type {
-    ExtraPath,
-    ProjectMeta,
-    SyncOutcome,
+  import {
+    EXTRAS_PROGRESS_EVENT,
+    applyExtrasProgress,
+    type ExtrasProgressPayload,
+    type ExtrasSyncProgress,
+  } from '$lib/components/extras-sync-progress';
+  import {
+    extraPathStaleBadge,
+    type ExtraPath,
+    type ProjectMeta,
+    type SyncOutcome,
   } from '$lib/types/codegraph-extras';
   import {
     addExtraPath,
@@ -71,6 +78,10 @@
   let syncBody = $state('');
   let syncState = $state<SyncModalState>('running');
   let syncError = $state<string | null>(null);
+  // v0.2.100 (F-W2-05): the analyzer's progress for the op in flight, fed by
+  // `vct-codegraph-extras-progress` (reset at the start of every run).
+  let syncProgress = $state<ExtrasSyncProgress | null>(null);
+  let unlistenProgress: (() => void) | null = null;
   // Track the operation that's currently in flight so Retry knows what
   // to re-invoke. Reused across all three flows.
   let pendingOp = $state<null | (() => Promise<SyncOutcome>)>(null);
@@ -112,7 +123,13 @@
 
   onMount(() => {
     void load();
+    void listen<ExtrasProgressPayload>(EXTRAS_PROGRESS_EVENT, (e) => {
+      syncProgress = applyExtrasProgress(syncProgress, e.payload, projectId, syncState === 'running');
+    }).then((u) => {
+      unlistenProgress = u;
+    });
   });
+  onDestroy(() => unlistenProgress?.());
   $effect(() => {
     if (projectId) void load();
   });
@@ -182,6 +199,7 @@
     syncBody = opts.body;
     syncState = 'running';
     syncError = null;
+    syncProgress = null;
     pendingOp = opts.op;
     pillPath = opts.pillPath ?? '';
     syncOpen = true;
@@ -220,6 +238,7 @@
     const op = pendingOp;
     syncState = 'running';
     syncError = null;
+    syncProgress = null;
     try {
       const outcome = await op();
       syncState = 'succeeded';
@@ -447,6 +466,7 @@
     <ul class="extras-list" aria-label="Extra codegraph paths">
       {#each rows as row (row.path)}
         {@const busy = !!rowBusy[row.path]}
+        {@const staleBadge = extraPathStaleBadge(row)}
         <li class="extras-row" class:extras-row-disabled={!row.enabled}>
           <div class="extras-row-meta">
             <div class="extras-row-label">
@@ -457,6 +477,15 @@
                   aria-label="This path is currently disabled"
                 >
                   disabled
+                </span>
+              {/if}
+              {#if staleBadge}
+                <span
+                  class="extras-row-badge extras-row-badge-stale"
+                  title={staleBadge.title}
+                  aria-label={staleBadge.title}
+                >
+                  {staleBadge.text}
                 </span>
               {/if}
             </div>
@@ -559,6 +588,7 @@
     bodyText={syncBody}
     phase={syncState}
     errorMessage={syncError}
+    progress={syncProgress}
     onRetry={pendingOp ? retrySync : undefined}
     onClose={closeSyncModal}
   />
@@ -634,6 +664,10 @@
     background: rgba(255, 255, 255, 0.06);
     border-radius: 8px;
     color: #888;
+  }
+  .extras-row-badge-stale {
+    background: rgba(255, 79, 160, 0.14);
+    color: #ff4fa0;
   }
   .extras-row-path {
     font-family: ui-monospace, monospace;

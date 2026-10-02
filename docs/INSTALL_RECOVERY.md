@@ -69,7 +69,7 @@ JSON record, which you should skip rather than abort on).
 - `start → warn` — step partially succeeded (e.g. seed step where the KG
   sync ran but docs upload failed). Non-fatal but worth surfacing.
 - `start` with no terminal phase — the writer crashed mid-step.
-  `read_install_log` reports these in `failed_steps` with detail
+  `read_install_log` reports these (the launcher panel that shows them is deferred by the owner to v0.2.102; until then read `state/logs/install.jsonl` directly) in `failed_steps` with detail
   `"interrupted: ..."` so the wizard offers to re-run them.
 
 **Step IDs you'll see:**
@@ -163,14 +163,25 @@ side effects (venv exists, .env present, Weaviate has the collection
 schema we expect) before declaring a step a no-op. The log is necessary
 but not sufficient.
 
-**Resume behaviour in install.py**:
-On re-run, install.py reads the log and skips steps whose latest phase
-within the most-recent session is `ok` or `skip`. Sessions older than 24
-hours are treated as stale and ignored. The user can disable resume
-entirely with `--no-resume` (forces every step to re-run regardless of
-log state). Even when the log says skip, install.py re-verifies the
-actual side effect (venv-python on disk, schema in Weaviate, etc.)
-before honouring it.
+**Resume behaviour in install.py** (v0.2.100, `vco_lib/install_resume.py`):
+a re-run skips a step only when BOTH hold — the most recent session in
+this log (younger than 24 hours) recorded the step as completed, AND a
+verifier proves its side effect is still there. Each skip prints
+`verified, skipped (<evidence>)`. The steps that resume, and their
+verifiers:
+
+| step | work skipped | verified by |
+|---|---|---|
+| 1/10 | Python wheel probe + prerequisites | same interpreter version as the run that passed |
+| 3/10 | venv creation | the venv interpreter runs and reports a version (checked on every run) |
+| 4/10 | `pip install` + editable installs | dependency fingerprint unchanged (requirements files, both `pyproject.toml`, dev flag), `pip check` clean, `vco_lib` imports from the checkout (no site-packages copy) |
+| 7/10 | Ollama model pulls | `/api/tags` lists every planned model |
+
+Steps 2/10 (system detection — it starts the container runtime), 5/5b
+(services and bundle, reconciled against live state) and 6/10 (the
+Ollama wait, itself a probe) always run; the embedding profile replays
+the recorded choice. So a re-run after a step-5 failure goes straight
+to the work that failed. `--no-resume` turns every skip off.
 
 
 
@@ -437,11 +448,94 @@ above.
 
 ---
 
+## Update from the shell (no launcher GUI)
+
+Use this when the launcher cannot start an update — a v0.2.97/0.2.98
+launcher whose update badge never lights (see
+[TROUBLESHOOTING.md](TROUBLESHOOTING.md#the-update-badge-never-lights-on-v0297v0298-fixed-in-v0299)),
+a launcher that does not start, or a machine without the GUI. It is the
+same work the launcher's update does: move the checkout to the release,
+then apply it with `install.py --update` (which never pulls by itself).
+
+In the install root (the folder holding `install.py`):
+
+```bash
+git fetch --tags --force vco_upstream
+git pull --ff-only vco_upstream main
+python install.py --update
+```
+
+- `vco_upstream` is the remote the launcher maintains for the public
+  repository (it never touches `origin`). If `git remote get-url
+  vco_upstream` fails, add it once:
+  `git remote add vco_upstream https://github.com/hotak92/vibecoded-orchestrator.git`.
+- `--tags --force`: release tags are re-pointed after the binaries are
+  committed; without `--force` the fetch refuses to move a local tag and
+  exits 1.
+- Windows: quit the launcher and run
+  `launcher\dist\windows-x64\vct-hub.exe --stop` before the pull — a
+  running `.exe` cannot be replaced, so the pull would fail on
+  `launcher\dist\`. `install.py --update` restarts the hub.
+- `install.py --update` refuses to start while the launcher is itself
+  running an update (it reads the launcher's `~/.vct/update.lock`); wait
+  for that update to finish.
+- Afterwards quit any running launcher and start the new one:
+  `launcher/dist/linux-x64/vct-launcher`,
+  `launcher/dist/macos-arm64/vct-launcher`, or
+  `launcher\dist\windows-x64\vct-launcher.exe`.
+
+If `install.py --update` stops part-way, fix what it names and run it
+again: completed steps are verified and skipped (see "Resume behaviour"
+above), so the re-run resumes at the failed step.
+
+### When the pull is not a fast-forward
+
+`git pull --ff-only` refuses with "Not possible to fast-forward" when the
+checkout has commits upstream does not, and stops with "Your local
+changes … would be overwritten" when shipped files carry uncommitted
+edits. Look first:
+
+```bash
+git status
+git log --oneline vco_upstream/main..HEAD
+```
+
+- **Only `CLAUDE.md` is listed**: the install renders that file (its
+  AUTO block comes from a template), so it always differs from git, and
+  the pull stops on it only when the release changed it too. Run
+  `git stash`, the pull again, then `git stash pop`; if the pop reports a
+  conflict in `CLAUDE.md`, keep your own lines, delete the conflict
+  markers, run `git stash drop`, and let `python install.py --update`
+  re-render the AUTO block from the new template.
+- **Uncommitted edits you want to keep**: commit them
+  (`git commit -am "local changes"`), then treat them as local commits
+  below. Edits to shipped files are normally not worth keeping — the next
+  update adopts those files anyway, with a backup.
+- **Local commits you want to keep**: `git merge vco_upstream/main`
+  (or `git rebase vco_upstream/main`), resolve any conflicts, commit, then
+  `python install.py --update`.
+- **Nothing local worth keeping**: save it on a branch FIRST, then move
+  the checkout to the release:
+
+  ```bash
+  git branch vco-backup-before-update
+  git reset --hard vco_upstream/main
+  python install.py --update
+  ```
+
+  `reset --hard` discards uncommitted edits to tracked files; the backup
+  branch keeps every commit, and `git stash` beforehand keeps uncommitted
+  edits too. Untracked files (your own notes, `knowledge/`) are not touched.
+
+The launcher's divergence dialog offers the same choices — merge and
+rebase, plus (from v0.2.100) a reset that saves your commits and edits
+first — so the shell route is only needed when the GUI cannot run.
+
 ## Conflict Resolution (re-installing over existing files)
 
 When the install path already contains orchestrator files (`.claude/`,
 `knowledge/`, etc.), the launcher's OnboardingWizard surfaces a 4-option
-modal instead of the legacy "call preview_install + confirm_overwrite=true"
+modal instead of the legacy "preview, then confirm_overwrite=true"
 error. CLI users who run `python install.py` directly get the same options
 via `--conflict-strategy=...`.
 
@@ -592,8 +686,9 @@ Both the launcher (Rust) and `install.py` (Python) emit a
 }
 ```
 
-`read_install_log` (Tauri command) surfaces this event so the launcher
-can show which strategy ran and what it touched.
+`read_install_log` (Tauri command) returns this event; the launcher panel
+that would show which strategy ran and what it touched is deferred by the
+owner to v0.2.102 (read `state/logs/install.jsonl` until then).
 
 ---
 

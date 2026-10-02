@@ -324,6 +324,11 @@ pub async fn bundle_staleness_census(db: State<'_, Db>) -> Result<BundleStalenes
 }
 
 async fn run_census(db: &Db) -> BundleStalenessCensus {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    if let Err(standby) = db.ensure_live() {
+        return BundleStalenessCensus::undetermined(standby.to_string());
+    }
     let Some(python) = vct_launcher_core::python_resolve::resolve_python_for_vco_lib() else {
         return BundleStalenessCensus::undetermined(
             "no vco_lib-capable python interpreter resolved (VCT_VENV / \
@@ -366,19 +371,9 @@ async fn run_census(db: &Db) -> BundleStalenessCensus {
         }
     };
     if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let head = stderr
-            .lines()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("no stderr")
-            .to_string();
         return BundleStalenessCensus::undetermined(format!(
-            "bundle census exited {}: {}",
-            out.status
-                .code()
-                .map(|c| c.to_string())
-                .unwrap_or_else(|| "signal".into()),
-            head
+            "bundle census failed: {}",
+            vct_launcher_core::process::failure_evidence(&out.status, &String::from_utf8_lossy(&out.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
         ));
     }
     census_from_stdout(&String::from_utf8_lossy(&out.stdout))
@@ -651,5 +646,91 @@ mod tests {
             "the GUI census must not opt into the ledger write"
         );
         assert!(src.contains(&json_arg), "the census must run in --json mode");
+    }
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[tokio::test]
+    async fn census_is_undetermined_with_the_typed_reason_in_standby() {
+        let db = standby_db();
+        let c = run_census(&db).await;
+        assert!(!c.determined);
+        assert_typed_standby(c.error.as_deref().unwrap_or(""));
+    }
+
+}
+
+/// v0.2.100 WP-05 (I-06): a failed census spawn names its exit status —
+/// pre-fix a signal kill rendered as the bare word `signal`, number dropped.
+#[cfg(all(test, unix))]
+mod spawn_evidence_tests {
+    use super::*;
+
+    fn fake_python(body: &str) -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let py = dir.path().join("python");
+        std::fs::write(&py, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&py, std::fs::Permissions::from_mode(0o755)).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn census_failure_carries_the_exit_status() {
+        for (body, want) in [("exit 1", "exit status: 1"), ("kill -9 $$", "signal: 9")] {
+            let py = fake_python(body);
+            let interp = py.path().join("python");
+            let _env = vct_launcher_core::test_env::env_guard(&[(
+                "VCT_VENV",
+                Some(interp.to_str().unwrap()),
+            )]);
+            // A minimal orchestrator clone, seeded as the DB's cached root, so
+            // the census reaches its spawn wherever the test binary lives (the
+            // fake interpreter ignores the root).
+            let root = tempfile::tempdir().unwrap();
+            for (f, body) in [
+                ("CLAUDE.md", ""),
+                ("install.py", ""),
+                ("vct-module.json", r#"{"id":"orchestrator"}"#),
+            ] {
+                std::fs::write(root.path().join(f), body).unwrap();
+            }
+            std::fs::create_dir_all(root.path().join("state")).unwrap();
+            std::fs::write(
+                root.path().join("state/install-manifest.json"),
+                r#"{"installed":true}"#,
+            )
+            .unwrap();
+            let db = Db::open_in_memory().unwrap();
+            {
+                use vct_launcher_core::services::install_root::RootStore as _;
+                db.write_cached_root(root.path().to_str().unwrap()).unwrap();
+            }
+            let census = run_census(&db).await;
+            let err = census.error.unwrap_or_default();
+            assert!(!census.determined, "`{body}`");
+            assert!(err.contains(want), "`{body}` → {err}");
+        }
     }
 }

@@ -15,13 +15,18 @@ dependency on the installer's mutable state).
   provably a stale VCO artifact (adopt it, with a backup) or is it the user's
   own work (leave it alone)?
 
-Callers: ``vco_lib.project_init._file_action`` only, at three decision points.
+Callers: ``vco_lib.project_init._file_action`` (three decision points) and,
+since v0.2.100 (WP-15), ``vco_lib.bundle_leftovers`` — the pass that removes a
+file OUTSIDE the manifest only when it is provably a VCO artefact an earlier
+release shipped. Both reach the same core, :func:`match_shipped_history`, so
+"is this VCO's own artefact?" has one answer, not two.
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
 from vco_lib.hashing import sha256_bytes
 
@@ -29,9 +34,98 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from vco_lib.project_init import _BundleFileOp
 
 __all__ = [
+    "ShippedMatch",
     "installed_matches_template_history",
+    "match_shipped_history",
+    "release_containing",
     "stale_shipped_artifact_reason",
 ]
+
+
+@dataclass(frozen=True)
+class ShippedMatch:
+    """Which historical blob the installed bytes equal: the commit and the
+    template path (relative to the orchestrator root, POSIX) it was read at."""
+
+    commit: str
+    template_rel: str
+
+
+def match_shipped_history(
+    orchestrator_root: Path,
+    template_rels: Sequence[str],
+    installed_hash: str,
+    *,
+    render: Optional[Callable[[bytes], bytes]] = None,
+    all_refs: bool = False,
+    oldest: bool = False,
+    max_commits: int = 50,
+) -> Optional[ShippedMatch]:
+    """THE predicate: do ``installed_hash``'s bytes equal a version VCO itself
+    shipped at any of ``template_rels`` (POSIX paths relative to
+    ``orchestrator_root``, which may no longer exist in the working tree)?
+
+    Walks the last ``max_commits`` commits touching any of the paths (``--all``
+    refs when ``all_refs``), ``git show``s each blob raw and compares its
+    sha-256 — and, when ``render`` is given, the sha-256 of the RENDERED blob,
+    because a placeholder-substituted file (an agent, a skill page) was
+    written rendered, never raw. A ``render`` that raises is treated as "no
+    rendered form" for that blob.
+
+    ``oldest=True`` walks the window oldest-first, so the match names the
+    commit that FIRST shipped those bytes (the leftover report's "shipped by"
+    release) rather than a later commit that merely moved them.
+
+    ``None`` on every uncertain path — not a git checkout (tarball install),
+    git absent, no history, nothing matched — so a caller can only ever act on
+    a POSITIVE match. That is the safety property both callers rely on.
+    """
+    from vco_lib import git_meta as _git_meta
+
+    if not template_rels or not orchestrator_root.is_dir():
+        return None
+    if not (orchestrator_root / ".git").exists():
+        return None
+    rels = [str(r).replace("\\", "/") for r in template_rels]
+    log_args = ["log"] + (["--all"] if all_refs else []) + [
+        f"-{max_commits}", "--pretty=format:%H", "--", *rels]
+    rc, out, _err = _git_meta.run_git(orchestrator_root, log_args, timeout=5)
+    if rc != 0:
+        return None
+    commits = [c.strip() for c in out.splitlines() if c.strip()]
+    for sha in (reversed(commits) if oldest else commits):
+        for rel in rels:
+            b_rc, blob, _b_err = _git_meta.run_git_binary(
+                orchestrator_root, ["show", f"{sha}:{rel}"], timeout=2)
+            if b_rc != 0:
+                continue
+            if sha256_bytes(blob) == installed_hash:
+                return ShippedMatch(sha, rel)
+            if render is not None:
+                try:
+                    rendered = render(blob)
+                except Exception:  # noqa: BLE001 — no rendered form for this blob
+                    continue
+                if sha256_bytes(rendered) == installed_hash:
+                    return ShippedMatch(sha, rel)
+    return None
+
+
+def release_containing(orchestrator_root: Path, commit: str) -> str:
+    """The first release tag containing ``commit`` (the release that SHIPPED
+    it), else the short sha. Read-only, bounded; never raises."""
+    from vco_lib import git_meta as _git_meta
+
+    rc, out, _err = _git_meta.run_git(
+        orchestrator_root,
+        ["tag", "--contains", commit, "--sort=version:refname", "--list", "v*"],
+        timeout=5,
+    )
+    if rc == 0:
+        for line in out.splitlines():
+            if line.strip():
+                return line.strip()
+    return commit[:10]
 
 
 def installed_matches_template_history(
@@ -39,6 +133,7 @@ def installed_matches_template_history(
     installed_hash: str,
     orchestrator_root: Path,
     *,
+    also_paths: Sequence[str] = (),
     max_commits: int = 50,
 ) -> bool:
     """v0.2.31 heal: did this file's installed sha match ANY historical
@@ -73,46 +168,22 @@ def installed_matches_template_history(
     bytes are sha-256-hashed raw, and the text runner's
     ``errors="replace"`` decode would silently mangle non-UTF-8 content
     before the hash — an adopt decision made against corrupted bytes.
-    """
-    from vco_lib import git_meta as _git_meta
 
+    v0.2.100 (WP-15): a thin bool over :func:`match_shipped_history`, the one
+    core the leftover pass shares. ``also_paths`` adds further template paths
+    (POSIX, relative to the orchestrator root) whose history counts too — an
+    ``_archive/`` location or a path since deleted.
+    """
     if not orchestrator_root.is_dir():
-        return False
-    git_dir = orchestrator_root / ".git"
-    if not git_dir.exists():
-        # Tarball install or non-git source tree. Can't walk history.
         return False
     try:
         rel = template_source.resolve().relative_to(orchestrator_root.resolve())
     except (OSError, RuntimeError, ValueError):
         return False
-    rel_str = str(rel).replace("\\", "/")
-    # `git log --format=%H` over the path → list of commits touching it.
-    # We then `git show <sha>:<path>` for each and sha-256 the bytes.
-    rc, out, _err = _git_meta.run_git(
-        orchestrator_root,
-        ["log", f"-{max_commits}", "--pretty=format:%H", "--", rel_str],
-        timeout=5,
-    )
-    if rc != 0:
-        return False
-    commits = [c.strip() for c in out.splitlines() if c.strip()]
-    if not commits:
-        # File never had a commit touching it under this path. Could be
-        # legitimately new (uncommitted) or moved/renamed; fall through
-        # to default-preserve.
-        return False
-    for sha in commits:
-        b_rc, blob, _b_err = _git_meta.run_git_binary(
-            orchestrator_root,
-            ["show", f"{sha}:{rel_str}"],
-            timeout=2,
-        )
-        if b_rc != 0:
-            continue
-        if sha256_bytes(blob) == installed_hash:
-            return True
-    return False
+    rels = [str(rel).replace("\\", "/"), *also_paths]
+    return match_shipped_history(
+        orchestrator_root, rels, installed_hash, max_commits=max_commits,
+    ) is not None
 
 
 def stale_shipped_artifact_reason(

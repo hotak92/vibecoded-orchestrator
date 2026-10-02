@@ -170,10 +170,15 @@ into `~/.claude.json` (soft-fail — the install completes even if registration
 fails; opt out with `--skip-mcp-registration`) and deploys/refreshes the
 launcher binary.
 
-**Resume**: on re-run, install.py reads the log and skips steps whose latest
-phase in the most-recent session is `ok`/`skip` — after re-verifying the
-actual side effect (venv on disk, schema in Weaviate). Sessions older than
-24 hours are stale and ignored; `--no-resume` forces every step.
+**Resume** (v0.2.100, `vco_lib/install_resume.py`): on re-run, a step is
+skipped only when the most recent session (younger than 24 hours) recorded
+it as completed AND a verifier proves its side effect — steps 1/10 (same
+interpreter), 3/10 (the venv interpreter runs), 4/10 (dependency
+fingerprint unchanged, `pip check` clean, `vco_lib` imports from the
+checkout) and 7/10 (`/api/tags` lists every planned model). Each prints
+`verified, skipped`. Steps 2, 5/5b and 6 always run (they reconcile live
+state). `--no-resume` forces every step. Detail:
+[`INSTALL_RECOVERY.md`](INSTALL_RECOVERY.md).
 `--lightweight` is the fast path for re-installs on a hot system (path
 rewrite + venv triage + container ensure, no model pulls or seeding) — see
 [`INSTALL_RECOVERY.md`](INSTALL_RECOVERY.md).
@@ -492,6 +497,23 @@ for it).
   caller's run and never appears in `gh run list` for this workflow, and
   the gate reads before the tag is pushed. The remedy the gate prints is a
   `workflow_dispatch` run, which is free on the public repo.
+
+**Launcher GUI wiring (v0.2.100).** The launcher frontend's wiring is guarded
+in-repo by two vitest census tests, which run with the rest of
+`cd launcher && npx vitest run` and need no browser:
+`launcher/src/lib/event-census.test.ts` (every event the Rust side emits has
+a frontend listener and vice versa; every `goto`/`href` target and every
+backend-supplied route resolves to a `+page.svelte`) and
+`launcher/src/lib/invoke-names.test.ts` (every literal `invoke` names a
+command registered in `generate_handler!`; every registered command is
+invoked, manifest-dispatchable, or classified in an allowlist with a reason).
+Runtime-named sites and deliberate exceptions are declared in the tests
+themselves, each with a one-line reason, and a stale declaration fails. A
+real-browser harness (Chromium, Tauri IPC mocked, loading the launcher pages
+and asserting no uncaught error — the class of the v0.2.97 `Illegal
+invocation` mount failure, which unit tests with fake timers cannot see) is
+maintained outside this repository by the maintainers and is not part of CI
+or of the shipped artefacts; the census is the in-repo guard.
 
 ---
 

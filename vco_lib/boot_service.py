@@ -53,7 +53,6 @@ never raises to the caller and never blocks an install.
 
 from __future__ import annotations
 
-import html
 import os
 import platform
 import plistlib
@@ -63,7 +62,7 @@ import shutil
 import subprocess
 import sys
 import xml.etree.ElementTree as ET
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
@@ -145,6 +144,10 @@ class BootServiceSpec:
     #: ``loginctl enable-linger`` so a user unit fires without a login
     #: session. Linux only; ignored elsewhere.
     linger: bool = True
+    #: v0.2.100 WP-18: the managed folder whose UPDATE_DEFERRED ledger records
+    #: a unit render's unrendered placeholder / missing path (owner rules). The
+    #: install root for both shipped services; ``None`` ⇒ warn only.
+    deferral_folder: Optional[Path] = None
 
 
 #: Called as ``on_event(phase, detail, data)``. ``install.py`` binds it to
@@ -185,16 +188,68 @@ def read_template(templates_root: Path, relpath: str) -> Optional[str]:
         return None
 
 
-def render_template(template_text: str, substitutions: Mapping[str, object]) -> str:
-    """Naive ``{{KEY}}`` substitution.
+#: The deferral-row surface of unit renders (``materialize.settle_deferrals``).
+BOOT_UNIT_SURFACE = "boot-unit"
 
-    Deliberately not jinja2 / ``string.Template``: the substitution set is
-    closed, and install.py's early steps stay stdlib-only.
+
+def render_template(
+    template_text: str,
+    substitutions: Mapping[str, object],
+    *,
+    escape: str = "none",
+    label: Optional[str] = None,
+    deferral_folder: Optional[Path] = None,
+) -> str:
+    """THE boot-unit renderer: ``{{KEY}}`` substitution through the ONE
+    materializer (``vco_lib.materialize.render``, v0.2.100 WP-18). Every
+    ``register_*`` function reaches it through :func:`_render_unit`.
+
+    The allowed set is the registry's boot-unit vocabulary
+    (``materialize.BOOT_UNIT_KEYS``); ``substitutions`` supplies the values. A
+    name outside that vocabulary, or one the spec gives no value, stays in
+    place — never a failed registration. With a ``label``, findings are
+    warned about on stderr, and with a ``deferral_folder`` they are also
+    settled as the owner-rule deferral rows there (a clean render clears
+    them). ``escape`` applies to every value except the registry's verbatim
+    keys (``EXEC_ARGV_PLIST``, a pre-escaped fragment).
     """
-    rendered = template_text
-    for key, value in substitutions.items():
-        rendered = rendered.replace("{{" + key + "}}", str(value))
-    return rendered
+    from vco_lib import materialize as _mz
+
+    values = {k: (None if v is None else str(v)) for k, v in substitutions.items()}
+    result = _mz.render(template_text, values, allowed=_mz.BOOT_UNIT_KEYS, escape=escape)
+    if label is not None:
+        if not result.clean:
+            _mz.warn(label, result)
+        if deferral_folder is not None:
+            _mz.settle_deferrals(deferral_folder, {label: result},
+                                 surface=BOOT_UNIT_SURFACE)
+    return result.text
+
+
+def unit_label(spec: "BootServiceSpec", os_name: str) -> str:
+    """The deferral label of ``spec``'s unit on ``os_name`` — ONE home for
+    the render (which records it) and :func:`unregister` (which resolves it)."""
+    if os_name == "Darwin":
+        return f"launchd:{spec.plist_label}"
+    if os_name == "Windows":
+        return f"windows-task:{spec.task_name}"
+    return f"systemd:{spec.unit_name}"
+
+
+def _render_unit(
+    spec: "BootServiceSpec",
+    template_text: str,
+    values: Mapping[str, object],
+    *,
+    escape: str,
+    os_name: str,
+) -> str:
+    """One unit file through :func:`render_template`, labelled for ``os_name``
+    and settling its rows in ``spec.deferral_folder`` (the install root); a
+    spec without one (tests, ad-hoc callers) only warns."""
+    return render_template(template_text, values, escape=escape,
+                           label=unit_label(spec, os_name),
+                           deferral_folder=spec.deferral_folder)
 
 
 def backup_and_write_idempotent(
@@ -274,7 +329,9 @@ def xml_escape_content(value: object) -> str:
     version across; it is not a MUST-MATCH pair and no parity test claims
     otherwise.
     """
-    return html.escape(str(value), quote=False)
+    from vco_lib.materialize import escape_value
+
+    return escape_value(str(value), "xml")
 
 
 def default_templates_root() -> Path:
@@ -412,12 +469,12 @@ def register_linux(
     except OSError:
         pass
 
-    rendered = render_template(template_text, {
+    rendered = _render_unit(spec, template_text, {
         "INSTALLED_AT_PATH": str(unit_path),
         "LOG_FILE": str(log_file),
         "BOOT_LOG_FILE": str(boot_log_file(log_file)),
         **spec.substitutions,
-    })
+    }, escape="none", os_name="Linux")
     try:
         changed, backup = backup_and_write_idempotent(unit_path, rendered)
     except OSError as exc:
@@ -508,13 +565,19 @@ def register_macos(
     except OSError:
         pass
 
-    rendered = render_template(template_text, {
+    # ONE escape point, like the Windows Task XML (v0.2.100 WP-18, survey
+    # gap f): every value lands in plist ELEMENT CONTENT and is escaped here,
+    # exactly once — the container stack's spec used to pass raw paths, so a
+    # clone path containing `&` rendered a plist launchd rejects outright.
+    # `EXEC_ARGV_PLIST` is a pre-escaped <string> fragment (registry
+    # `verbatim` key) and is not escaped again.
+    rendered = _render_unit(spec, template_text, {
         "INSTALLED_AT_PATH": str(plist_path),
         "LABEL": spec.plist_label,
         "LOG_FILE": str(log_file),
         "BOOT_LOG_FILE": str(boot_log_file(log_file)),
         **spec.substitutions,
-    })
+    }, escape="xml", os_name="Darwin")
     try:
         changed, backup = backup_and_write_idempotent(plist_path, rendered)
     except OSError as exc:
@@ -597,17 +660,14 @@ def register_windows(
     # ONE escape point: every value that reaches the Task XML is escaped
     # here, exactly once, so no spec builder can forget one and none can
     # double-escape.
-    rendered = render_template(template_text, {
-        key: xml_escape_content(value)
-        for key, value in {
-            "LABEL": spec.task_name,
-            "CREATED_AT": utc_iso_now(),
-            "USER_ID": windows_user_id(),
-            "LOG_FILE": _windows_forward(log_file),
-            "BOOT_LOG_FILE": _windows_forward(boot_log_file(log_file)),
-            **spec.substitutions,
-        }.items()
-    })
+    rendered = _render_unit(spec, template_text, {
+        "LABEL": spec.task_name,
+        "CREATED_AT": utc_iso_now(),
+        "USER_ID": windows_user_id(),
+        "LOG_FILE": _windows_forward(log_file),
+        "BOOT_LOG_FILE": _windows_forward(boot_log_file(log_file)),
+        **spec.substitutions,
+    }, escape="xml", os_name="Windows")
     try:
         changed, backup = backup_and_write_idempotent(task_xml_path, rendered)
     except OSError as exc:
@@ -833,6 +893,12 @@ def unregister(
         audit.append(
             f"WARN: {spec.service_id} boot-service removal raised {type(e).__name__}: {e}"
         )
+    # Review R18-09: an unregistered unit is no longer rendered, so nothing
+    # would ever clear a row its last render left. Resolve them here.
+    if spec.deferral_folder is not None:
+        from vco_lib import materialize as _mz
+
+        _mz.resolve_labels(spec.deferral_folder, [unit_label(spec, os_name)])
     return audit
 
 
@@ -1122,6 +1188,7 @@ def container_stack_spec(
         # the NEXT boot. Starting it again here would race compose.
         enable_now=False,
         linger=True,
+        deferral_folder=install_path,
     )
 
 
@@ -1537,14 +1604,12 @@ def model_gateway_spec(
                 f"        <string>{xml_escape_content(part)}</string>"
                 for part in argv
             ),
-            # Every value here lands in plist ELEMENT CONTENT, so every value
-            # is escaped — the argv array was, and these were not, which made
-            # a home directory containing `&` render an unparseable plist that
-            # launchd rejects outright (the same class v0.2.92 fixed centrally
-            # for the Windows Task XML).
-            "WORKING_DIR": xml_escape_content(wd),
-            "STATE_DIR": xml_escape_content(root),
-            "SECRET_PROJECT": xml_escape_content(scope),
+            # RAW values: `register_macos` escapes every value centrally
+            # (v0.2.100 WP-18), the way `register_windows` does. Escaping here
+            # too would double-escape `&` into `&amp;amp;`.
+            "WORKING_DIR": str(wd),
+            "STATE_DIR": str(root),
+            "SECRET_PROJECT": scope,
         }
     else:
         substitutions = {
@@ -1907,6 +1972,9 @@ def register_model_gateway(
             env=env, installed=facts.secret_project, install_root=install_root,
         ),
     )
+    if install_root is not None:
+        # v0.2.100 WP-18: the install whose ledger records a render finding.
+        spec = replace(spec, deferral_folder=Path(install_root))
     if update_only:
         accepted = rerender_if_registered(
             spec, templates_root=templates_root, on_event=on_event,
@@ -2192,6 +2260,7 @@ __all__ = [
     "register_windows",
     "remove_gateway_state",
     "render_template",
+    "unit_label",
     "rerender_if_registered",
     "resolve_gateway_exec",
     "resolve_gateway_exec_verified",

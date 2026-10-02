@@ -146,7 +146,9 @@ def _holds_shared_deferral_lock(text: str) -> bool:
 
 _V0290_OWNED_PREFIXES = (
     "bundle_pin_drift_", "deprecated_mcp_", "kg_named_vector_slot_error_",
-    "lowercase_codegraph_residual_", "schema_migration_failed_",
+    "lowercase_codegraph_residual_",
+    # v0.2.100 (WP-12): emitted since HIGH-1, registered now.
+    "migrate_collections_partial_failure_", "schema_migration_failed_",
     "schema_migration_required_", "stale_unit_retired_",
 )
 
@@ -286,6 +288,60 @@ _V0297_OWNED_ADDITIONS = frozenset({
 # record: the pre-v0.2.98 cohort owes the user a visible remedy.
 _V0298_OWNED_ADDITIONS = frozenset({
     "openai_key_env_var_no_longer_read",
+})
+
+
+# v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
+# wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
+# by the plan's ruling (state-keyed re-probe, R26). Two shapes:
+#   * install-run emitters (compose recovery / step 5-7 / bundle engine /
+#     gated delivery): family A proper — emitted INSIDE the install.py run
+#     into that run's report, so the run that no longer detects the state
+#     drops the row;
+#   * (the launcher / hub emitters `watchdog_foreign_container`,
+#     `services_stop_incomplete`, `module_container_unlabelled` LEFT this set
+#     in WP-06 — wave-1 review W1R-15: install ownership expired a row whose
+#     class says it persists while true. They are paired-resolution rows kept
+#     true by their emitters: infra_watchdog::record_foreign,
+#     lifecycle::record_stop_outcome, container_runtime::record_unlabelled_modules.)
+_V02100_OWNED_ADDITIONS = frozenset({
+    "compose_socket_heal_failed",
+    "compose_provider_mismatch",
+    "compose_network_label_mismatch_attached",
+    "container_storage_leftover_unsafe",
+    "service_recreate_refused_data_unknown",
+    "ollama_not_ready_at_update",
+    "ollama_model_pull_failed",
+    "code_embed_backend_unavailable",
+    # W4R-06: the adopted/foreign half of the same outage (action_required).
+    "code_embed_adopted_backend_unavailable",
+    # gated_delivery_skipped / gated_delivery_unknown left this set in WP-10
+    # (F-W1-12): their emitter runs INSIDE an install.py run (the root bundle),
+    # so install ownership would drop the row in that run's own finalize; they
+    # are paired-resolution rows owned by vco_lib.module_gated_delivery.
+    # bundle_leftover_removed / bundle_compose_copies_removed left in WP-15 for
+    # the same reason — see _V02100_BUNDLE_RECONCILED below.
+})
+
+
+# v0.2.100 WP-15 (F-W1-12): the bundle engine's leftover records are cleared
+# by the bundle reconcile, never by install.py ownership — pinned the other way
+# round so a later edit cannot hand them back (the root bundle runs inside an
+# install.py run whose finalize would drop them).
+_V02100_BUNDLE_RECONCILED = frozenset({
+    "bundle_leftover_removed",
+    "bundle_compose_copies_removed",
+})
+
+
+# v0.2.100 WP-06 (W1R-15): the launcher / hub rows are NOT install-owned —
+# pinned the other way round so a later edit cannot quietly hand them back.
+_V02100_EMITTER_KEPT = frozenset({
+    "watchdog_foreign_container",
+    "services_stop_incomplete",
+    "module_container_unlabelled",
+    # W4R-07: kept true by modules::record_invalid_installed_manifests.
+    "module_manifest_invalid",
 })
 
 
@@ -653,6 +709,14 @@ class TestRegistryCompleteness(unittest.TestCase):
             # wrapper's record-boot-refusal included (pinned by
             # tests/test_v0297_runtime_reconcile.py).
             "container_runtime_unusable", "container_runtime_data_under_both",
+            # v0.2.100 WP-18: vco_lib.materialize's entry builders attach file +
+            # placeholders / paths on every emit (pinned by
+            # tests/test_template_materialization_complete.py).
+            "template_placeholder_unrendered_*", "template_path_missing_*",
+            # v0.2.100 review R18-01: vco_lib.project_templates._review_entry
+            # attaches template_sha256 + reason on every emit (pinned by
+            # tests/test_v02100_claude_md_user_section.py).
+            "claude_md_user_section_review",
         }
         for spec in self.dr.all_specs():
             if not spec.dismiss_key:
@@ -691,12 +755,28 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0293_OWNED_ADDITIONS
             | _V0295_OWNED_ADDITIONS
             | _V0297_OWNED_ADDITIONS
-            | _V0298_OWNED_ADDITIONS,
+            | _V0298_OWNED_ADDITIONS
+            | _V02100_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "
             "INSIDE an install.py run. Justify the change and update this pin.",
         )
+
+    def test_launcher_and_hub_rows_are_kept_true_by_their_emitters(self):
+        from vco_lib import deferral_registry as dr  # noqa: PLC0415
+
+        leaked = _V02100_EMITTER_KEPT & self.owned
+        self.assertFalse(leaked, f"install.py would expire these on the next update: {sorted(leaked)}")
+        for cid in _V02100_EMITTER_KEPT:
+            self.assertEqual(dr.clear_probe_for(cid), "paired-resolution", cid)
+
+    def test_bundle_leftover_rows_are_reconciled_by_the_bundle(self):
+        from vco_lib import deferral_registry as dr  # noqa: PLC0415
+
+        self.assertFalse(_V02100_BUNDLE_RECONCILED & self.owned)
+        for cid in _V02100_BUNDLE_RECONCILED:
+            self.assertEqual(dr.clear_probe_for(cid), "bundle-reconciled", cid)
 
     def test_prefix_families_unchanged(self):
         self.assertEqual(self.prefixes, _V0290_OWNED_PREFIXES)

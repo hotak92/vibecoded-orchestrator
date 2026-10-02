@@ -40,6 +40,10 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import install  # type: ignore  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
+from vco_lib.service_endpoints import urls_from_rows  # noqa: E402
+
+# No rows: the compiled defaults (http://localhost:8081 / :11435 / :11440, gRPC 50052).
+_DEFAULT_URLS = urls_from_rows({})
 
 
 _IS_WINDOWS = platform.system().lower().startswith("win")
@@ -244,9 +248,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(
-                root, py, 8081, 11435, 50052, 11440,
-            )
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             names = [n for n, _, _ in entries]
             # Critical: ollama MCP was deprecated in v0.2.11 (see
             # install.py:_check_ollama_mcp_remnants). Must NOT be in the
@@ -268,7 +270,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             by_name = {n: (e, d) for n, e, d in entries}
             entry, dropped = by_name["playwright"]
             self.assertEqual(entry["type"], "stdio")
@@ -292,7 +294,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             by_name = {n: e for n, e, _ in entries}
             expected = os.pathsep.join((str(root), str(root / "claude_mcp_servers")))
             for name in ("mermaid", "excalidraw"):
@@ -313,7 +315,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             name, entry, _ = entries[0]
             self.assertEqual(name, "weaviate-kg")
             self.assertEqual(entry["type"], "stdio")
@@ -351,7 +353,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             name, entry, _ = entries[1]
             self.assertEqual(name, "search")
             self.assertTrue(entry["command"].endswith("wrapper.sh"))
@@ -367,7 +369,7 @@ class BuildEntriesTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             name, entry, _ = entries[1]
             self.assertEqual(name, "search")
             self.assertEqual(entry["command"], str(py))
@@ -386,7 +388,7 @@ class PythonFallbackWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             target = Path(td) / "fake_home" / ".claude.json"
             self.assertFalse(target.exists())
             success, errors = install._python_fallback_write_mcp_entries(target, entries)
@@ -420,7 +422,7 @@ class PythonFallbackWriterTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as td:
             root = _make_pseudo_install_root(Path(td))
             py = install._resolve_venv_python_for_install(root)
-            entries = install._build_python_mcp_entries(root, py, 8081, 11435, 50052, 11440)
+            entries = install._build_python_mcp_entries(root, py, _DEFAULT_URLS)
             target = Path(td) / ".claude.json"
             existing = {
                 "permissions": {"allow": ["Read", "Edit"]},

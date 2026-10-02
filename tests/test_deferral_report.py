@@ -552,33 +552,12 @@ class TestHighFixesIntegration(unittest.TestCase):
             ],
         }
 
-        # Simulate the install.py call site logic exactly: capture migrate
-        # result, walk errors, add per-collection deferral entries.
-        for err in fake_result.get("errors", []):
-            collection = err.get("collection") or "unknown"
-            action = err.get("action") or "unknown"
-            err_msg = err.get("error") or "(no error message)"
-            report.add_entry(DeferralEntry(
-                condition_id=(
-                    f"migrate_collections_partial_failure_{collection}"
-                ),
-                title=f"Schema migration failed for `{collection}`",
-                detected=f"Action `{action}` raised: {err_msg}",
-                why_deferred=(
-                    "Migration partial failure leaves the collection in an "
-                    "inconsistent state; manual recovery required."
-                ),
-                command_to_apply=(
-                    "python install.py --update --rebuild-collections "
-                    "--force-rebuild (last-resort drop+re-embed) OR see "
-                    "logs at state/logs/install.jsonl stage 7b.<action>"
-                ),
-                severity="critical",
-                kg_node_refs=[
-                    ".claude/context/"
-                    "weaviate-schema-port-research-2026-05-01.md",
-                ],
-            ))
+        # v0.2.100: the call-site logic has ONE home —
+        # vco_lib.install_weaviate.migrate_errors_to_entries (install.main
+        # calls it); exercised directly instead of a copy of it in this test.
+        from vco_lib.install_weaviate import migrate_errors_to_entries
+
+        self.assertFalse(migrate_errors_to_entries(fake_result, report))  # no rebuild in the plan
 
         # Both collection failures produce DISTINCT deferral entries
         # (no deduplication — collection name is part of condition_id).
@@ -617,33 +596,8 @@ class TestHighFixesIntegration(unittest.TestCase):
         self.assertTrue(hasattr(install, "_project_init"))
         self.assertTrue(hasattr(install._project_init, "migrate_collections"))
 
-        # Replicate the install.py call-site walk so we exercise the same
-        # condition_id template + severity choice the production code uses.
-        for err in fake_result.get("errors", []) or []:
-            report.add_entry(DeferralEntry(
-                condition_id=(
-                    f"migrate_collections_partial_failure_"
-                    f"{err.get('collection') or 'unknown'}"
-                ),
-                title=(
-                    f"Schema migration failed for "
-                    f"`{err.get('collection') or 'unknown'}`"
-                ),
-                detected=(
-                    f"Action `{err.get('action') or 'unknown'}` raised: "
-                    f"{err.get('error') or '(no error message)'}"
-                ),
-                why_deferred=(
-                    "Migration partial failure leaves the collection in an "
-                    "inconsistent state; manual recovery required."
-                ),
-                command_to_apply="python install.py --update --rebuild-collections --force-rebuild",
-                severity="critical",
-                kg_node_refs=[
-                    ".claude/context/"
-                    "weaviate-schema-port-research-2026-05-01.md",
-                ],
-            ))
+        # The production walk itself (v0.2.100: vco_lib.install_weaviate).
+        install._install_weaviate.migrate_errors_to_entries(fake_result, report)
         self.assertTrue(report.has_condition(
             "migrate_collections_partial_failure_X_KnowledgeGraph"
         ))
@@ -836,31 +790,28 @@ class TestHighFixesIntegration(unittest.TestCase):
             shutil.rmtree(folder, ignore_errors=True)
 
     def test_high4_install_py_wiring_covers_seed_too(self) -> None:
-        """MEDIUM-9: the try/except now wraps both _ensure_collections and
-        _seed_weaviate. Assert via source inspection (the cheapest way to
-        verify the code structure without spinning up Weaviate)."""
-        import install
-        import inspect
-        import re
-        src = inspect.getsource(install.main)
-        # Locate the try-block that catches Weaviate errors during update.
-        # The `except Exception as _weaviate_err:` line is unique enough.
-        self.assertIn("except Exception as _weaviate_err", src)
-        # The fixed code calls _seed_weaviate inside the same try (and on
-        # the restart-retry branch). Two _seed_weaviate calls inside main
-        # — one in the try, one in the restart retry.
-        #
-        # v0.2.95 WP-4: matched on the CALL, not on a fixed argument list.
-        # The seed gained a `deferral_report=` keyword (so an incomplete
-        # embedding-model change can record owed work), which a literal
-        # `_seed_weaviate(args)` scan reported as ZERO calls — a stale
-        # pattern claiming the wiring was gone while it was intact.
-        seed_calls = len(re.findall(r"_seed_weaviate\(\s*args\b", src))
-        self.assertGreaterEqual(
-            seed_calls, 2,
-            f"expected >=2 _seed_weaviate(args, ...) calls in install.main "
-            f"(one in try, one in restart retry); got {seed_calls}",
-        )
+        """MEDIUM-9: the Weaviate-down recovery covers the SEED as well as
+        _ensure_collections. v0.2.100: the block moved out of ``install.main``
+        into ``vco_lib.install_weaviate.collections_and_seed`` (main calls it
+        with both steps), so this is now asserted by BEHAVIOUR instead of a
+        source scan: a seed that raises gets the one restart and a retry."""
+        from unittest import mock as _mock
+
+        from vco_lib import install_weaviate as iw
+
+        seeds = []
+
+        def seed():
+            seeds.append(1)
+            if len(seeds) == 1:
+                raise TimeoutError("weaviate not ready")
+
+        with _mock.patch("vco_lib.containers.find_existing_container", return_value="vco_weaviate"):
+            status = iw.collections_and_seed(
+                lambda: None, seed, report=DeferralReport(), rebuild_performed=False,
+                runtime=lambda: "podman", run=lambda *a, **k: None, sleep=lambda _s: None)
+        self.assertEqual(status, iw.SEEDED)
+        self.assertEqual(len(seeds), 2, "the seed runs in the try AND in the restart retry")
 
     def test_high4_rebuild_snapshot_logged_before_delete(self) -> None:
         """HIGH-4: rebuild action snapshots object count + UUIDs BEFORE

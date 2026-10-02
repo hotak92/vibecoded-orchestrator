@@ -313,6 +313,132 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.93: `compose up` failed on --update while every required service already answered; the update continued, the compose change did not apply."
 
+# v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12): registered in wave 1 (WP-04) ahead of
+# their emitters — the completeness test requires every EMITTED id to be here,
+# not the reverse. Each clears by re-detection (owned-drop-when-absent, R26).
+
+[conditions.compose_socket_heal_failed]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3): compose could not reach the podman API socket and the non-destructive heal (`systemctl --user restart|start podman.socket`, or `podman machine start`) did not bring it back. Emitted by `vco_lib.compose_recovery` / `vco_lib.install_services_up` inside install.py step 5 and re-detected every run."
+
+[conditions.compose_provider_mismatch]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F05): a VCO container name is held by a container another compose tool created (its labels name podman-compose vs docker-compose). Never recreated automatically; consent + data check needed. Emitted by `vco_lib.compose_recovery.deferral_entries` inside install.py step 5."
+
+[conditions.compose_network_label_mismatch_attached]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, unreadable, or the project is unknown). The id keeps its v0.2.100 wave-1 name; the row's title/recipe cover both reasons. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+
+[conditions.container_storage_leftover_unsafe]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-3, L1-F06; wave-1 review W1R-02): a storage-only leftover owns a VCO container name and could not be PROVEN safe to clear (still mounted in either mountinfo view, non-empty merged/, not a canonical VCO name, or a probe failed) — or the verified removal `podman rm --storage --force <id>` itself failed (fail-closed; the row carries the exact recipe). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+
+[conditions.service_recreate_refused_data_unknown]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-4): a service recreate was refused because the data location of the running container could not be positively matched to the effective compose config. Registered ahead of its emitter (WP-07, `vco_lib.data_identity`), which runs inside install.py step 5."
+
+[conditions.ollama_not_ready_at_update]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-6): Ollama did not answer within the step-6 wait during an update; the owed model work resolves once it answers. Registered ahead of its emitter (install.py step 6)."
+retry_action = "retry:py:ollama_models"
+
+[conditions.ollama_model_pull_failed]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-6, L1-F09): a model the configuration uses could not be pulled; the run records it instead of a traceback. Registered ahead of its emitter (install.py step 7)."
+retry_action = "retry:py:ollama_models"
+
+[conditions.code_embed_backend_unavailable]
+class = "auto_retryable"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (W3R-04 (c), W4R-06): VCO's OWN code_embed container (vco_managed row, VCO's compose labels) was DOWN at install step 7 — exited/absent and not answering, or running longer than a model load takes (ollama_pull.CODE_EMBED_WARMING_MAX_S) without answering /health. The session-start ensure hook starts it; `retry:py:code_embed_backend` resolves the row once the code backend answers (gate 4's positive evidence); the next install run that finds it up drops it. An adopted or foreign code_embed is `code_embed_adopted_backend_unavailable` instead. Emitter: embedding_pull_plan.code_embed_unavailable_entry via ollama_pull.ensure_plan_step."
+retry_action = "retry:py:code_embed_backend"
+
+[conditions.code_embed_adopted_backend_unavailable]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (W3R-04 (c), W4R-06): the configured code_embed is NOT VCO's to start — the row is adopted, or the container's compose labels name another project — and it was DOWN at install step 7. VCO starts nothing it does not run, so a human must; the next install run that finds it up drops the row. Emitter: embedding_pull_plan.code_embed_unavailable_entry(vco_managed=False) via ollama_pull.ensure_plan_step."
+
+[conditions.gated_delivery_skipped]
+class = "informational_record"
+owner = "vco_lib.module_gated_delivery"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-7, L5-F04; F-W1-12): the gateway agent definitions were skipped for a project that explicitly switched the model_gateway module OFF while this machine's gateway IS configured — a by-design skip, recorded so it is visible. Emitted into the TARGET folder's own ledger by `module_gated_delivery.record_gate_outcomes`, which runs inside EVERY bundle run (project `install-bundle` and the root bundle inside install.py alike) and resolves the row in the same call whenever the verdict no longer produces it. NOT install.py-owned: owned-drop-when-absent would drop a root row in that run's own finalize and never clear a project row."
+
+[conditions.gated_delivery_unknown]
+class = "auto_retryable"
+owner = "vco_lib.module_gated_delivery"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-7, L5-F02; F-W1-12): the gateway agent gate could not be evaluated (launcher.db unreadable/locked, or the machine signal could not be read); previously delivered definitions were carried forward untouched. Retried by the next bundle update (no retry handler: the bundle run IS the retry), whose `module_gated_delivery.record_gate_outcomes` resolves the row once the gate decides. Same ownership reasoning as gated_delivery_skipped."
+
+[conditions.watchdog_foreign_container]
+class = "environmental"
+owner = "vct-hub (infra_watchdog.rs)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-5, WP-06): the hub watchdog found a stopped service container whose own compose labels name another project and left it alone (no up, no rm, no start). A true description of the machine, kept true by its emitter: `infra_watchdog::record_foreign` rewrites the row when the set of foreign services changes and resolves it (`deferral_bridge::resolve_deferral_conditions`) on the first tick that finds none — including the hub's first tick after a restart. NOT install.py-owned (W1R-15): owned-drop-when-absent would expire the row on the next update while the condition still holds."
+
+[conditions.services_stop_incomplete]
+class = "action_required"
+owner = "vct-launcher (commands/lifecycle.rs)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-5, L2-F09, WP-06): quit-and-stop could not verify every VCO container stopped; the row names them and a non-destructive command (stop + list, never rm). Resolved by `lifecycle::record_stop_outcome` when a later quit-and-stop verifies every stop, or when `services_start_all` starts the services again. NOT install.py-owned (W1R-15): an update must not drop an unverified stop the user has not dealt with."
+
+[conditions.bundle_leftover_removed]
+class = "informational_record"
+owner = "vco_lib.bundle_leftovers"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, L5-F06, WP-15): a file outside the bundle manifest whose bytes match a version VCO shipped at a template path that no longer ships (deleted, or `_archive/`) was backed up and removed. A completed action. Emitted by `bundle_leftovers.remove_vco_leftovers` inside the bundle engine; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12): the root bundle runs INSIDE an install.py run, whose finalize would drop an install-owned row it did not itself emit."
+
+[conditions.bundle_compose_copies_removed]
+class = "informational_record"
+owner = "vco_lib.bundle_leftovers"
+clear_probe = "bundle-reconciled"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, owner Q3, WP-15): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Emitted by `bundle_leftovers.retire_compose_copies`; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12), same reason as `bundle_leftover_removed`."
+
+[conditions.module_container_unlabelled]
+class = "informational_record"
+owner = "vct-launcher-core (container_runtime.rs reaper)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (AD-12, L2-F17, WP-06): a module container the database calls a leftover carries no launcher ownership label (created before v0.2.100, by another launcher, or by a launcher whose install root did not resolve from its executable — W4R-09: such a launcher logs once at create that it omits the label), so the reaper left it alone. Kept true by `container_runtime::record_unlabelled_modules`, called after every reaper pass by BOTH surfaces (launcher `module_service`, hub `module_supervisor`): rewritten while unlabelled containers remain, resolved by the first pass that finds none. NOT install.py-owned (W1R-15)."
+
+[conditions.module_manifest_invalid]
+class = "action_required"
+owner = "launcher (modules.rs resolve_manifest_for_install)"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.100 (W4R-07): an INSTALLED module manifest (`~/.vct/modules/<id>/vct-module.json`) no longer parses — typically a version a <=0.2.99 launcher accepted (`1.0.0-beta`, `min_launcher_version = \"0.2\"`) and the strict X.Y.Z rule (F-W1-02) now refuses. The resolver falls back to the catalog (offline / unlisted: nothing); the row names each module, file and offending value. Kept true by `modules::record_invalid_installed_manifests`, called on every `resolve_manifest_for_install`: rewritten while any installed manifest fails to parse, resolved once none does (updated, reinstalled or uninstalled). NOT install.py-owned (a launcher-side state, same reason as W1R-15)."
+
 [conditions.update_install_phase_failed]
 class = "action_required"
 owner = "install.py"
@@ -717,7 +843,10 @@ owner = "vco_lib.doctor"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = """v0.2.95 WP-2 — the detector the half-executed install states lacked. \
-`state/install-manifest.json` has TWO writers: install.py, and \
+v0.2.100: the three launcher paths and the Rust writer below are RETIRED (the \
+one update pipeline always runs install.py), so no current launcher produces \
+this state; the row stays for installs a launcher <= 0.2.99 left in it. \
+`state/install-manifest.json` had TWO writers: install.py, and \
 `manifest.rs::refresh_install_manifest`, which the launcher's \
 `apply_launcher_update`, `force_resync_launcher` and `update_orchestrator_at` \
 each call. Those three advance the whole source tree, rebuild only the \
@@ -1011,6 +1140,21 @@ entry — the user picks the state (re-disable, or Enable on the Disabled row, \
 which clears the stale parked row). Emitted by the bundle update; cleared by the \
 probe once no hook is both parked and running (None — keep — when launcher.db \
 or settings.json cannot be read)."""
+
+[conditions.project_hooks_relative_paths]
+class = "action_required"
+owner = "vco_lib.hook_relative_paths"
+clear_probe = "probe:py:project_hooks_relative_paths_still_present"
+emit_surfaces = ["ledger"]
+notes = """v0.2.100 WP-17 (F-W1-16). A project's OWN hook command invokes a \
+`.claude/hooks/` script by a relative path, so it fails ("No such file or \
+directory", exit 127) whenever the session's cwd moves — on every call, each \
+failure written into the transcript. VCO's shipped hooks are anchored by the \
+bundle merge; the project's own are the user's configuration, so the bundle \
+update OFFERS the anchored rewrite (`python -m vco_lib.hook_relative_paths \
+anchor`) instead of applying it. Emitted by the bundle update; cleared by the \
+probe once no relative hook command remains in .claude/settings.json or \
+.claude/settings.local.json (None — keep — when either cannot be read)."""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Paired-resolution conditions (family C)
@@ -1961,3 +2105,71 @@ mechanism: the remedy is a full code-graph analysis, which is the user's \
 decision because it costs compute, and a probe that cleared the entry when \
 the count happened to reach zero could not distinguish "analyzed" from \
 "someone deleted the rows"."""
+
+[conditions."migrate_collections_partial_failure_*"]
+match = "glob"
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.100 (WP-12): one row per collection whose smart schema migration (`project_init.migrate_collections`) raised during `install.py --update`, emitted inside the run by `vco_lib.install_weaviate.migrate_errors_to_entries`. Emitted since HIGH-1 but never registered; install-owned so a later completed run that no longer fails drops it."""
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Template materializer (v0.2.100 WP-18) — owner rules 2026-09-30
+# ═══════════════════════════════════════════════════════════════════════════
+
+[conditions."template_placeholder_unrendered_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.materialize"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["file", "placeholders"]
+notes = """One row per materialized FILE (suffix = slug of its destination path) \
+that was written with a `{{NAME}}` token left in place: a name the file class \
+may not use / the registry does not know, or one with no value on this \
+machine. Owner rule: a placeholder never fails an install or update — the \
+file is written, a stderr warning names file, placeholder and line, and this \
+row records it. PAIRED SITE: `vco_lib.materialize.settle_deferrals`, called \
+at the end of every bundle install/update (`project_init.install_project_bundle`), \
+by `rendered_root_files.render_entry` (install.py step 4c) and by every \
+boot-unit render (`boot_service._render_unit`): a CLEAN render of the same \
+file resolves the row. Not install-owned, so a mid-run clear is honoured by \
+the flow's vanished-seed reconcile and a mid-run emit by its late merge."""
+
+[conditions."template_path_missing_*"]
+match = "glob"
+class = "action_required"
+owner = "vco_lib.materialize"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["file", "paths"]
+notes = """Sibling of `template_placeholder_unrendered_*`: a path-valued \
+placeholder (the registry's `must_exist` keys — roots, the venv interpreter, \
+a boot unit's working dir / wrapper script) rendered to a value that does not \
+exist on this machine. The file is written with the correct path for this \
+install; the row says what will fail until the path exists. Same paired site: \
+`vco_lib.materialize.settle_deferrals` resolves it on the next render that \
+finds every path present."""
+
+[conditions.claude_md_user_section_review]
+class = "action_required"
+owner = "vco_lib.project_templates"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+dismiss_key = ["template_sha256", "reason"]
+notes = """v0.2.100 (review R18-01, owner decision): a project CLAUDE.md is split \
+into VCO's managed region (between the VCO_MANAGED markers, re-rendered on \
+every update) and the USER SECTION outside them (introduction, overview, tech \
+stack, key paths — written only when the file is created, never rewritten). \
+One row, emitted by `vco_lib.project_templates.reconcile_claude_md` (bundle \
+update AND the launcher's module toggle) when the user-section TEMPLATE differs \
+from the one recorded in `.claude/context/templates/CLAUDE.md.user-section.json` \
+(reason `template_changed`; the new text is written to \
+`CLAUDE.md.user-section.reference.md` beside it), or once after a pre-split file \
+whose edited text was moved above the markers (reason `migrated`). No row when \
+that template did not change. ACKNOWLEDGEMENT = dismissing the row \
+(`dismiss-deferral`): the dismissal is keyed on the template hash, so the next \
+run records that hash as acknowledged and the row stays away until a release \
+changes the template again. PAIRED SITE: the same function resolves the row on \
+the run that finds recorded == shipped."""

@@ -91,9 +91,10 @@ pub struct UpdateSummary {
     /// hash (= user untouched), now overwritten with the new shipped
     /// version.
     pub overwritten: u32,
-    /// Files where the installed content diverged from the prior-shipped
-    /// hash (= user-modified). Preserved on disk; surfaced via the
-    /// `bundle_user_modified_preserved` deferral entry.
+    /// Code files whose adoption BACKUP could not be written, so the user's
+    /// copy was left in place; surfaced via the `bundle_user_modified_preserved`
+    /// deferral entry. v0.2.100 F-W2-08(a): excludes `knowledge/**` nodes, which
+    /// are kept by design and reported as an informational engine note.
     pub preserved: u32,
     /// Files whose installed content already matches what we'd write
     /// (no-op).
@@ -159,10 +160,19 @@ impl UpdateSummary {
                 .map(|a| a.len() as u32)
                 .unwrap_or(0)
         };
+        // v0.2.100 F-W2-08(a): `preserve` also lists divergent `knowledge/**`
+        // nodes, which are the user's data and kept BY DESIGN — not "your edits
+        // kept (backup failed)". The engine names them in `knowledge_kept` (the
+        // knowledge/code split has one home, Python's `_is_knowledge_dest`).
+        let knowledge_kept = v
+            .get("knowledge_kept")
+            .and_then(|x| x.as_array())
+            .map(|a| a.len() as u32)
+            .unwrap_or(0);
         UpdateSummary {
             created: count_for("create"),
             overwritten: count_for("overwrite"),
-            preserved: count_for("preserve"),
+            preserved: count_for("preserve").saturating_sub(knowledge_kept),
             noop: count_for("noop"),
             always_overwritten: count_for("always-overwrite"),
             skipped_existing: count_for("skip-existing"),
@@ -337,6 +347,9 @@ pub async fn create_project_v2(
     db: State<'_, Db>,
     app: AppHandle,
 ) -> Result<CreateProjectResult, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let folder = Path::new(&req.folder_path);
     let mut warnings: Vec<String> = Vec::new();
 
@@ -865,6 +878,11 @@ pub(crate) async fn apply_post_bundle_steps(
     is_initial_create: bool,
     kg_or_docs_content_changed: bool,
 ) -> Vec<String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    if let Err(standby) = db.ensure_live() {
+        return vec![format!("post-bundle steps skipped: {}", standby)];
+    }
     let mut warnings: Vec<String> = Vec::new();
     let folder_path_str = folder.to_string_lossy().to_string();
 
@@ -1442,9 +1460,9 @@ pub(crate) async fn run_bootstrap_collections(folder: &Path, project_name: &str)
             if v.get("deferred").and_then(|x| x.as_bool()).unwrap_or(false) {
                 warnings.push(format!(
                     "Weaviate collection bootstrap deferred — Weaviate was \
-                     unreachable during project creation. The launcher attempted \
-                     `podman start weaviate_claude` but it did not become \
-                     healthy in time. The deferral is recorded at \
+                     unreachable during project creation. VCO tried to start \
+                     the Weaviate container but it did not become healthy in \
+                     time. The deferral is recorded at \
                      {}/.claude/context/UPDATE_DEFERRED.md; collections will \
                      be created when Weaviate is up and you re-run \
                      `python -m vco_lib.project_init bootstrap-collections \
@@ -1804,6 +1822,9 @@ async fn run_install_bundle_core(
     orchestrator_root_override: Option<&Path>,
     mode: BundleMode,
 ) -> (Vec<String>, Option<UpdateSummary>) {
+    // v0.2.100 W3R-06: one engine per project folder — the per-project update,
+    // "Update all" and the module toggle all arrive here and take turns.
+    let _engine_turn = crate::commands::single_flight::bundle_engine_turn(folder).await;
     let mut warnings: Vec<String> = Vec::new();
     // Only Update mode carries a summary. v0.2.71 Piece 5b: start CONSERVATIVE
     // — every soft-fail early-return below and the JSON-parse-failure arm leave
@@ -1925,27 +1946,20 @@ async fn run_install_bundle_core(
                     warnings.push(format!("{} file error on {}: {}", prefix, p, msg));
                 }
             }
-            if let Some(ws) = v.get("warnings").and_then(|x| x.as_array()) {
-                for w in ws {
-                    if let Some(s) = w.as_str() {
-                        warnings.push(format!("{}: {}", prefix, s));
+            // v0.2.100 F-W2-08(a): the engine's informational `notes` (knowledge
+            // kept, compose copies / retired files removed) ride the same
+            // channel; `classify_warning` renders them as info. The launcher no
+            // longer writes its own "N user-modified file(s) preserved … see
+            // UPDATE_DEFERRED.md … --force" line: it counted knowledge nodes
+            // (no such entry, `--force` does not apply to them) and the engine
+            // already reports each real backup failure with its own warning.
+            for key in ["notes", "warnings"] {
+                if let Some(ws) = v.get(key).and_then(|x| x.as_array()) {
+                    for w in ws {
+                        if let Some(s) = w.as_str() {
+                            warnings.push(format!("{}: {}", prefix, s));
+                        }
                     }
-                }
-            }
-
-            // Update mode: if preserve > 0, surface a friendly pointer so the
-            // user knows the deferral .md exists with manual-merge instructions.
-            // (Create mode never preserves — first install is skip-existing.)
-            if let Some(s) = summary.as_ref() {
-                if s.preserved > 0 {
-                    warnings.push(format!(
-                        "{} user-modified file(s) preserved during update. \
-                         See {}/.claude/context/UPDATE_DEFERRED.md for the \
-                         `bundle_user_modified_preserved` entry (lists each \
-                         preserved file + the explicit `--force` command to \
-                         accept the orchestrator's shipped versions).",
-                        s.preserved, folder_str
-                    ));
                 }
             }
 
@@ -2336,12 +2350,10 @@ fn spawn_root_identity_sweep(
                 }
             }
             Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
                 tracing::warn!(
-                    "[vct] warning: root identity sweep for {} exited {}: {}",
+                    "[vct] warning: root identity sweep for {} failed: {}",
                     project_id,
-                    out.status.code().unwrap_or(-1),
-                    stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no stderr")
+                    vct_launcher_core::process::failure_evidence(&out.status, &String::from_utf8_lossy(&out.stderr), vct_launcher_core::process::StderrKeep::FirstLine)
                 );
             }
             Err(e) => {
@@ -3468,6 +3480,16 @@ pub async fn update_all_projects(
         }
     }
 
+    // v0.2.100 F-W2-08(b): one line in the launcher log per run (each project's
+    // own result is in its `.claude/logs/bundle-install.log`, written by the
+    // engine itself).
+    tracing::info!(
+        "[vct] update all projects: {} succeeded, {} failed, {} skipped (of {})",
+        total_succeeded,
+        total_failed,
+        total_skipped,
+        total
+    );
     Ok(UpdateAllReport {
         updated: entries,
         total_succeeded,
@@ -3546,6 +3568,9 @@ fn apply_project_env_via_python(
     folder: &Path,
     db: &Db,
 ) -> Result<(), String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let python = resolve_python_for_vco_lib_local().ok_or_else(|| {
         "no python interpreter found for vco_lib.config_projection apply \
          (checked: $VCT_VENV, <VCT_INSTALL_ROOT>/.venv, \
@@ -3601,64 +3626,32 @@ fn apply_project_env_via_python(
     // (v0.2.97 review F13, same fix as the env-block verbs).
     cmd.current_dir(crate::services::vco_lib_bridge::vco_lib_cwd(Some(folder), folder));
 
-    // Spawn with stdout/stderr captured. 30 s wall-clock cap — the
-    // happy path is ~150 ms; a hang past 30 s indicates a stuck DB
-    // open or a runaway Python process and is better surfaced than
-    // letting the user click sit indefinitely.
-    let mut child = cmd
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .map_err(|e| {
-            format!(
-                "config_projection apply: spawn failed (python={}): {}",
-                python.display(),
-                e
-            )
-        })?;
+    // 30 s wall-clock cap through the ONE bounded runner (v0.2.100
+    // F-W4-05) — the happy path is ~150 ms; a hang past 30 s indicates a
+    // stuck DB open or a runaway Python process and is better surfaced than
+    // letting the user click sit indefinitely. Pipes are drained while the
+    // child runs, so a chatty child cannot deadlock on a full pipe.
+    let out = vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        std::time::Duration::from_secs(30),
+    )
+    .map_err(|e| {
+        format!(
+            "config_projection apply (python={}): {}",
+            python.display(),
+            e
+        )
+    })?;
 
-    // Polled wait with 30 s deadline. std::process::Child::wait()
-    // doesn't take a timeout, so we sleep-poll. 50 ms granularity is
-    // cheap and gives the subprocess every chance to exit fast.
-    let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(30);
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break s,
-            Ok(None) => {
-                if std::time::Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(
-                        "config_projection apply: timed out after 30 s"
-                            .to_string(),
-                    );
-                }
-                std::thread::sleep(std::time::Duration::from_millis(50));
-            }
-            Err(e) => {
-                return Err(format!(
-                    "config_projection apply: wait failed: {}",
-                    e
-                ));
-            }
-        }
-    };
-
-    if !status.success() {
-        // Capture stderr for the error message — Python prints a
-        // JSON-shaped diagnostic on the CLI's error paths
+    if !out.status.success() {
+        // Python prints a JSON-shaped diagnostic on the CLI's error paths
         // (project_not_found, db_unreachable, apply_failed).
-        let mut stderr_text = String::new();
-        if let Some(mut s) = child.stderr.take() {
-            use std::io::Read;
-            let mut buf = Vec::new();
-            let _ = s.read_to_end(&mut buf);
-            stderr_text = String::from_utf8_lossy(&buf).into_owned();
-        }
         return Err(format!(
             "config_projection apply exited with {} (project_id={}): {}",
-            status, project_id, stderr_text.trim()
+            out.status,
+            project_id,
+            String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
 
@@ -3834,6 +3827,9 @@ pub async fn rename_project_v2(
     new_name: String,
     db: State<'_, Db>,
 ) -> Result<RenameProjectResult, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     // v0.2.46 KG-AUTO-HEAL adversarial-review H3 follow-up: reject
     // rename when host='orchestrator_root'. The orchestrator-root
     // project's slug ('orchestrator-root') is canonical and used by
@@ -4223,29 +4219,6 @@ pub async fn set_shared_kg_read_disabled(
     })
 }
 
-/// Deprecated alias of `set_shared_kg_write_disabled`. Logs a deprecation
-/// notice to stderr and delegates. Slated for removal once the legacy env
-/// var + DB key are fully retired (target: 2026-08, ~3 releases).
-///
-/// The Svelte client ships a matching `setSharedKgOptOut` deprecated
-/// alias — both go away together.
-#[command]
-pub async fn set_shared_kg_opt_out(
-    project_id: String,
-    opt_out: bool,
-    db: State<'_, Db>,
-) -> Result<RenameProjectResult, String> {
-    tracing::warn!(
-        "[vct] DEPRECATED: Tauri command `set_shared_kg_opt_out` was called \
-         (project_id={}, opt_out={}). The toggle now gates WRITES only — \
-         reads of the shared KG are always on. Use \
-         `set_shared_kg_write_disabled` instead. The legacy command will be \
-         removed in ~3 releases (target: 2026-08).",
-        project_id, opt_out,
-    );
-    set_shared_kg_write_disabled(project_id, opt_out, db).await
-}
-
 /// P1-D (2026-05-08): re-run the env projection for a registered
 /// project so the launcher's current view of the access matrix lands in
 /// `.claude/env` and `.claude/settings.json env`. (PR-27 / v0.2.12 /
@@ -4261,12 +4234,26 @@ pub async fn set_shared_kg_opt_out(
 /// list of warnings produced by the projection, plus the
 /// access lists this run resolved (so the FE can show "now exporting
 /// VCT_KG_ACCESS_LIST=Foo,Bar" feedback).
+///
+/// The per-project "Re-render this project's env" button on the project's
+/// Settings tab calls this. There is deliberately NO all-projects button
+/// (owner ruling, v0.2.100: re-rendering every project at once is too risky
+/// to hand to users); `refresh_all_projects_env_with_db` stays as the
+/// internal core for the boot hook and the gate paths.
+///
+/// The projection runs a Python subprocess (30 s cap), so it goes through
+/// the blocking pool, not a tokio worker (F3).
 #[command]
 pub async fn refresh_project_env(
     project_id: String,
-    db: State<'_, Db>,
+    app: tauri::AppHandle,
 ) -> Result<RefreshProjectEnvResult, String> {
-    refresh_project_env_with_db(&db, &project_id)
+    crate::commands::blocking::run_with_db_on_blocking_pool(
+        app,
+        "refresh_project_env",
+        move |db| refresh_project_env_with_db(db, &project_id),
+    )
+    .await?
 }
 
 /// Free-function variant of `refresh_project_env` that takes `&Db` so
@@ -4368,9 +4355,13 @@ pub fn reproject_env_soft(db: &Db, project_id: &str) -> RefreshProjectEnvResult 
 ///   * The launcher's first-boot setup hook (post seed consumption)
 ///     — re-renders env for every project so the user-project-style
 ///     "missing exports" state is healed automatically.
-///   * The launcher GUI's "Refresh all projects" admin action, if a
-///     user wants to force a manual refresh after a manual edit to
-///     the launcher DB.
+///   * The `app_state` write trigger (`app_state_cmd.rs`), which carries the
+///     RL logging / online-training global switches into every project.
+///
+/// Deliberately NOT a Tauri command: a manual "re-render every project"
+/// button was retired in v0.2.100 (owner: doing it for all projects is a
+/// risky operation users should not be offered). The per-project repair is
+/// `refresh_project_env`.
 ///
 /// Soft-fail per project: one project's hiccup MUST NOT prevent the
 /// others from refreshing. Returns a per-project status map (the
@@ -4427,27 +4418,6 @@ pub struct RefreshAllProjectsEnvResult {
     /// Errors outside the per-project loop (e.g. `list_projects`
     /// itself failed).
     pub global_warnings: Vec<String>,
-}
-
-/// v0.2.37 (Agent V37-E): Tauri command surface for the bulk refresh.
-/// Lets the launcher GUI's admin / dev-tools tab trigger a manual
-/// "re-render env for every project" without the user having to walk
-/// project-by-project. The boot hook in lib.rs calls
-/// `refresh_all_projects_env_with_db` directly (no Tauri layer).
-///
-/// F3 (v0.2.72): the refresh runs N serial Python subprocesses (30 s cap
-/// each) — route it through spawn_blocking so it doesn't park a tokio
-/// worker for the duration.
-#[command]
-pub async fn refresh_all_projects_env(
-    app: tauri::AppHandle,
-) -> Result<RefreshAllProjectsEnvResult, String> {
-    crate::commands::blocking::run_with_db_on_blocking_pool(
-        app,
-        "refresh_all_projects_env",
-        refresh_all_projects_env_with_db,
-    )
-    .await
 }
 
 #[command]
@@ -5283,6 +5253,9 @@ pub async fn delete_project_v2(
     options: Option<UnregisterOptions>,
     db: State<'_, Db>,
 ) -> Result<UnregisterReport, String> {
+    // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
+    // launcher.db, instead of `no such table` from the stand-in connection.
+    db.ensure_live()?;
     let opts = options.unwrap_or_default();
 
     // Read the row first so we have the project name for collection
@@ -5539,7 +5512,7 @@ pub(crate) use editor_launch::*;
 // `perform_hard_cut` is INERT in v0.2.60: it exists + is registered but is
 // reachable ONLY when the (Piece-5) version-floor check returns below-floor,
 // which never happens with the inert `min_upgradable_from = "0.0.0"`. The
-// normal update path (`update_orchestrator`) does NOT call it — proven by
+// normal update path (`update_run::run_update`) does NOT call it — proven by
 // `test_perform_hard_cut_not_wired_into_update_orchestrator`.
 // ===========================================================================
 
@@ -5847,7 +5820,7 @@ pub async fn apply_stale_derived_choice(
 /// INERT (v0.2.60): the §7 hard-cut driver. EXISTS + is registered, but is
 /// reachable ONLY when the Piece-5 version-floor check returns below-floor —
 /// which NEVER happens while `min_upgradable_from` is the inert `"0.0.0"`. The
-/// normal update path (`update_orchestrator`) does NOT call this. v0.3.0 raises
+/// normal update path (`update_run::run_update`) does NOT call this. v0.3.0 raises
 /// the floor to activate it.
 ///
 /// Subprocess-calls the Python primitive `vco_lib.hard_cut` (built + tested in
@@ -6220,13 +6193,21 @@ mod tests {
     }
 
     /// Source-level proof that the normal update path does NOT invoke the
-    /// hard cut. `update_orchestrator` (the launcher "Update orchestrator"
-    /// button) lives in installer.rs; it must contain no `perform_hard_cut` /
+    /// hard cut. The launcher's orchestrator update (v0.2.100: the one
+    /// pipeline, `update_run.rs` + `update_pipeline.rs`, whose recovery
+    /// commands live in installer.rs) must contain no `perform_hard_cut` /
     /// `hard_cut(` call. This is the INERT guarantee at the wiring layer
     /// (mirrors the Python test_hard_cut_not_invoked_by_normal_update).
     #[test]
     fn test_perform_hard_cut_not_wired_into_update_orchestrator() {
-        let installer_src = include_str!("installer.rs");
+        // v0.2.100 WP-03b: the update flow moved out of installer.rs into the
+        // one pipeline; all three files are scanned as ONE source.
+        let installer_src = [
+            include_str!("installer.rs"),
+            include_str!("update_run.rs"),
+            include_str!("update_pipeline.rs"),
+        ]
+        .join("\n");
         // The hard cut must not be WIRED (called) from the update flow. We
         // check for a CALL, not a bare mention: Piece 5's `update_orchestrator`
         // floor-gate carries a prose comment naming `perform_hard_cut` (the
@@ -6236,7 +6217,7 @@ mod tests {
         // the comment, a false positive).
         assert!(
             !installer_src.contains("perform_hard_cut("),
-            "installer.rs (home of update_orchestrator) must NOT CALL \
+            "the update flow (installer.rs / update_run.rs / update_pipeline.rs) must NOT CALL \
              perform_hard_cut(...) in v0.2.60 — the hard cut is INERT"
         );
         // And no direct call into the §7 Python primitive `hard_cut(...)`
@@ -6869,14 +6850,14 @@ mod tests {
         assert_eq!(get_shared_kg_write_disabled(&db, &pid).unwrap(), true);
     }
 
-    /// Tauri command level: legacy `set_shared_kg_opt_out` delegates to
-    /// `set_shared_kg_write_disabled`. Both write under the canonical DB
-    /// key and refresh env surfaces. We exercise the underlying logic
+    /// `set_shared_kg_write_disabled` writes under the canonical DB key and
+    /// refreshes env surfaces (the legacy `set_shared_kg_opt_out` command
+    /// was retired in v0.2.100; the legacy key constants remain for the
+    /// migration that relocates old rows). We exercise the underlying logic
     /// (skipping the actual #[command] async wrapping, which needs the
-    /// Tauri runtime) by setting the row and confirming env files reflect
-    /// it — same code path the deprecated command takes.
+    /// Tauri runtime) by setting the row and confirming env files reflect it.
     #[test]
-    fn deprecated_set_shared_kg_opt_out_writes_canonical_key() {
+    fn set_shared_kg_write_disabled_writes_canonical_key() {
         let db = Db::open_in_memory().unwrap();
         let pid = uuid::Uuid::new_v4().to_string();
         let tmp = std::env::temp_dir().join(format!(
@@ -6886,7 +6867,7 @@ mod tests {
         std::fs::create_dir_all(&tmp).unwrap();
         db.insert_project(&pid, "Acme", tmp.to_str().unwrap(), ProjectHost::Base, "acme").unwrap();
 
-        // Simulate the legacy command: same DB write the new command does.
+        // Same DB write the command does.
         db.set_setting(
             &pid,
             KG_GATE_MODULE_ID,
@@ -7366,8 +7347,8 @@ mod tests {
         // Skill recursively copied.
         assert!(proj.join(".claude").join("skills").join("architect").join("SKILL.md").exists());
 
-        // Infrastructure compose file copied.
-        assert!(proj.join("infrastructure").join("docker-compose.yml").exists());
+        // v0.2.100 (owner Q3, WP-15): compose files no longer ship into a project.
+        assert!(!proj.join("infrastructure").join("docker-compose.yml").exists());
 
         // Settings template smart-merged.
         let settings: serde_json::Value = serde_json::from_str(
@@ -7560,6 +7541,35 @@ mod tests {
     /// Soft-fail discipline: even if `bootstrap-collections` would defer
     /// (no Weaviate in test env), `run_install_bundle_update` itself only
     /// calls install-bundle, which is independent of Weaviate.
+    /// v0.2.100 W3R-06: the bundle engine waits for the per-folder turn, so a
+    /// module toggle can never run a second engine beside "Update all" (or a
+    /// per-project update) on the same manifest.
+    #[test]
+    fn bundle_engine_waits_for_the_folder_turn() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let held = crate::commands::single_flight::bundle_engine_turn(&proj).await;
+            let p = proj.clone();
+            let engine = tokio::spawn(async move {
+                run_install_bundle_update_with_root(&p, Some(&p)).await
+            });
+            tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+            assert!(!engine.is_finished(), "engine ran while another held the folder's turn");
+            drop(held);
+            tokio::time::timeout(std::time::Duration::from_secs(120), engine)
+                .await
+                .expect("engine must run once the turn is released")
+                .expect("join");
+        });
+    }
+
     #[test]
     fn update_project_v2_success() {
         let Some(py) = pick_python() else {
@@ -7733,6 +7743,27 @@ mod tests {
         assert_eq!(summary.errors_count, 0);
         // total_ops() now includes adopted (2 adopt + 1 create == 3).
         assert_eq!(summary.total_ops(), 3);
+    }
+
+    /// v0.2.100 F-W2-08(a): knowledge nodes the engine KEPT (the user's data,
+    /// by design) are not "your edits kept (backup failed)" — the tally
+    /// subtracts the engine's `knowledge_kept` list from `preserve`.
+    #[test]
+    fn knowledge_kept_is_not_counted_as_a_preserved_edit() {
+        let envelope = serde_json::json!({
+            "actions": {
+                "preserve": ["knowledge/TAG_HIERARCHY.md", "knowledge/VOCABULARY.md",
+                             ".claude/hooks/foo.sh"],
+            },
+            "knowledge_kept": ["knowledge/TAG_HIERARCHY.md", "knowledge/VOCABULARY.md"],
+            "errors": [],
+        });
+        assert_eq!(UpdateSummary::from_bundle_envelope(&envelope).preserved, 1);
+        let only_knowledge = serde_json::json!({
+            "actions": { "preserve": ["knowledge/VOCABULARY.md"] },
+            "knowledge_kept": ["knowledge/VOCABULARY.md"],
+        });
+        assert_eq!(UpdateSummary::from_bundle_envelope(&only_knowledge).preserved, 0);
     }
 
     /// D9: adopt lives under `knowledge/**` NEVER (D3 carve-out), so the
@@ -10021,6 +10052,7 @@ SHARED_KG_OPT_OUT=false\n"),
         ));
         std::fs::create_dir_all(tmp.join("state")).unwrap();
         std::fs::write(tmp.join("install.py"), "# stub\n").unwrap();
+        std::fs::write(tmp.join("vct-module.json"), r#"{"id": "orchestrator"}"#).unwrap(); // W1R-06
         std::fs::write(tmp.join("CLAUDE.md"), "# stub\n").unwrap();
         std::fs::write(
             tmp.join("state/install-manifest.json"),
@@ -11023,4 +11055,35 @@ pub async fn rename_collections_v2(
         preview: rename_preview_from_json(&value),
         summary: if dry_run { None } else { Some(value.clone()) },
     })
+}
+
+/// v0.2.100 (F-W1-07): while install.py --update holds launcher.db the
+/// managed connection is a schema-less stand-in; this file's DB callers
+/// answer with the typed stand-down, never `no such table`.
+#[cfg(test)]
+mod standby_tests {
+    use super::*;
+
+    fn standby_db() -> Db {
+        let db = Db::open_in_memory().unwrap();
+        db.close_for_update().unwrap();
+        assert!(db.is_update_standby());
+        db
+    }
+
+    fn assert_typed_standby(msg: &str) {
+        assert!(
+            msg.contains("launcher.db is closed while install.py --update runs"),
+            "expected the typed stand-down, got: {msg}"
+        );
+        assert!(!msg.contains("no such table"), "{msg}");
+    }
+
+    #[test]
+    fn env_projection_stands_down_in_standby() {
+        let db = standby_db();
+        let tmp = tempfile::tempdir().unwrap();
+        assert_typed_standby(&apply_project_env_via_python("p1", tmp.path(), &db).unwrap_err());
+    }
+
 }

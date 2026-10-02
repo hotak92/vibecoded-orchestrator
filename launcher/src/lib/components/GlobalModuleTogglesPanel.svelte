@@ -54,8 +54,9 @@
   // the per-project tile control cannot word the same cascade differently.
   import {
     GLOBAL_TRI_CHOICE_LABELS,
-    dormantNotice,
     globalDefaultLine,
+    globalLockedLine,
+    moduleSystemDefault,
     globalTriChoiceFor,
     globalTriChoiceToValue,
     type GlobalTriChoice,
@@ -76,14 +77,15 @@
       label: 'RL Reranker',
       description:
         'Reinforcement-learning-based reranking of KG retrieval results. ' +
-        'Disabled by default on fresh installs until enough training data ' +
-        'accumulates. Per-project overrides take precedence.',
+        'Off by default. Per-project overrides take precedence. Training-event ' +
+        'collection is separate and always runs.',
       autoEnableEventThreshold: 500,
     },
   ];
 
   type ModuleState = {
-    /** null = no global row written (system default true applies). */
+    /** null = no global row written (the module's system default applies:
+     *  on, except the RL reranker, which is off). */
     globalEnabled: boolean | null;
     /** Current rl_events row count (only meaningful for vct-rl-reranker). */
     rlEventsCount: number | null;
@@ -91,6 +93,10 @@
     pending: boolean;
     /** Last error message; clears on successful read. */
     error: string | null;
+    /** v0.2.100 W5R-02: the served lock (`rl_scoring_lock`) — a reason while
+     *  the module's effect is locked off, null when not, undefined until read
+     *  (the controls stay disabled until it is known). */
+    lockReason: string | null | undefined;
   };
 
   let states = $state<Record<string, ModuleState>>({});
@@ -103,7 +109,16 @@
       rlEventsCount: null,
       pending: false,
       error: null,
+      lockReason: undefined,
     };
+  }
+
+  /** Only the RL reranker carries a lock today; every other module reads
+   *  as unlocked without an IPC. */
+  function readLock(moduleId: string): Promise<string | null> {
+    return moduleId === 'vct-rl-reranker'
+      ? invoke<string | null>('rl_scoring_lock')
+      : Promise.resolve(null);
   }
 
   async function loadOne(moduleId: string) {
@@ -116,15 +131,17 @@
     s.error = null;
     states[moduleId] = s;
     try {
-      const [globalEnabled, rlCount] = await Promise.all([
+      const [globalEnabled, rlCount, lockReason] = await Promise.all([
         invoke<boolean | null>('module_is_global_enabled', { moduleId }),
         // rl_events_count is currently global (not per-module). Surface
         // the same count for every module; future per-module event
         // counters can refine this.
         invoke<number>('rl_events_count').catch(() => null),
+        readLock(moduleId),
       ]);
       s.globalEnabled = globalEnabled;
       s.rlEventsCount = rlCount;
+      s.lockReason = lockReason;
     } catch (e) {
       s.error = e instanceof Error ? e.message : String(e);
       console.warn(`[GlobalModuleTogglesPanel] load(${moduleId}) failed:`, s.error);
@@ -197,10 +214,11 @@
    * and read-failure are separate branches above it. Wording comes from
    * `$lib/module-enable` so this panel and the per-project tile agree.
    */
-  function describeGlobal(s: ModuleState): string {
+  function describeGlobal(moduleId: string, s: ModuleState): string {
     if (s.pending) return 'loading…';
     if (s.error) return 'status unavailable';
-    return globalDefaultLine(s.globalEnabled);
+    if (s.lockReason) return globalLockedLine(s.globalEnabled, s.lockReason);
+    return globalDefaultLine(s.globalEnabled, moduleSystemDefault(moduleId));
   }
 
   /**
@@ -278,7 +296,7 @@
               <div class="row-label">{m.label}</div>
               <div class="row-desc">{m.description}</div>
               <div class="row-status">
-                Current global default: <strong>{describeGlobal(s)}</strong>
+                Current global default: <strong>{describeGlobal(m.id, s)}</strong>
               </div>
               {#if autoEnableProgress(m.id, s)}
                 <div class="row-progress">
@@ -292,12 +310,16 @@
                    module starts in) is unreachable after the first click,
                    and while in it NEITHER button carried `.active`, so a
                    real named state rendered as "nothing selected". -->
+              <!-- v0.2.100 W5R-02: while locked (or before the lock is
+                   known) every position is disabled and none is
+                   highlighted — the stored row is not the live state. -->
               {#each ['default', 'on', 'off'] as const as choice (choice)}
                 <button
                   class="toggle"
-                  class:active={globalTriChoiceFor(s.globalEnabled) === choice}
-                  aria-pressed={globalTriChoiceFor(s.globalEnabled) === choice}
-                  disabled={s.pending}
+                  class:active={s.lockReason === null && globalTriChoiceFor(s.globalEnabled) === choice}
+                  aria-pressed={s.lockReason === null && globalTriChoiceFor(s.globalEnabled) === choice}
+                  disabled={s.pending || s.lockReason !== null}
+                  title={s.lockReason ?? undefined}
                   onclick={() => setGlobal(m.id, choice)}
                 >
                   {GLOBAL_TRI_CHOICE_LABELS[choice]}
@@ -305,11 +327,6 @@
               {/each}
             </div>
           </div>
-          {#if dormantNotice(m.id)}
-            <!-- USER rider (#23): the switch is real, its EFFECT is pending.
-                 Say so, so "Enabled" never reads as "actively reranking". -->
-            <div class="row-dormant">{dormantNotice(m.id)}</div>
-          {/if}
           {#if s.error}
             <div class="row-error">{s.error}</div>
           {/if}
@@ -324,7 +341,9 @@
       the hub for module state, the resolver checks the project's own row
       first; if none exists, it falls back to the host-wide default
       above; if that's also unset, modules are treated as enabled
-      (fail-open).
+      (fail-open), except the RL reranker, which defaults off. While RL
+      scoring is locked (until its model is trained) it stays off whatever
+      is stored here; stored choices are kept and apply once unlocked.
     </p>
     <p>
       <strong>What these gate:</strong> whether a module is consulted for
@@ -437,16 +456,6 @@
     margin-top: 0.5rem;
     color: var(--error, #ff6b6b);
     font-size: 0.8rem;
-  }
-  /* v0.2.91 (#23 USER rider): the module's switch is real but its effect is
-     pending. Rendered as a quiet note, not a warning — nothing is broken. */
-  .row-dormant {
-    margin-top: 0.6rem;
-    padding-left: 0.6rem;
-    border-left: 2px solid var(--color-purple, #7b5fff);
-    color: var(--text-muted, #999);
-    font-size: 0.8rem;
-    line-height: 1.45;
   }
   footer.footnote {
     margin-top: 2rem;

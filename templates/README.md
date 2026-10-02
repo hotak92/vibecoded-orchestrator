@@ -69,15 +69,45 @@ The VCT Launcher is the gate: it validates the license, fetches the module from 
 
 ## Path placeholders
 
-Template files may contain these placeholders. `install.py` substitutes them at copy time:
+Template files may contain these placeholders. Every one of them is rendered by
+ONE materializer (`vco_lib/materialize.py`) at install and on every update, with
+this machine's values; the file class decides which names it may use. A name the
+materializer cannot fill never fails the install: the file is written with the
+token left in place, a warning is printed, and `UPDATE_DEFERRED.md` records it
+until a clean render clears it.
 
-| Placeholder | Expands to |
-|---|---|
-| `{{ORCHESTRATOR_ROOT}}` | Where you installed the orchestrator (e.g., `/home/you/vibecoded-orchestrator`) |
-| `{{PROJECTS_ROOT}}` | Parent of the orchestrator dir |
-| `{{HOME}}` | Your `$HOME` |
+<!-- BEGIN: placeholder-table (generated from vco_lib/materialize.py REGISTRY) -->
+| Placeholder | Expands to | Where it may appear |
+|---|---|---|
+| `{{ORCHESTRATOR_ROOT}}` | The orchestrator clone this install runs from | `VCO-REWIRE` regions, agents, skills, project templates |
+| `{{PROJECT_ROOT}}` | The project folder being installed into (the orchestrator root on a self-install) | `VCO-REWIRE` regions, agents, skills, project templates |
+| `{{PROJECTS_ROOT}}` | Parent of the orchestrator dir | `VCO-REWIRE` regions, agents, skills, project templates |
+| `{{HOME}}` | Your home directory | `VCO-REWIRE` regions, agents, skills, project templates |
+| `{{VCT_ORCHESTRATOR_ROOT}}` | The literal `${VCT_ORCHESTRATOR_ROOT}`, expanded by the consumer at run time | `VCO-REWIRE` regions, agents, skills, project templates |
+| `{{PROJECT_NAME}}` | The project's registered name (launcher.db), else the name given at install, else the folder basename | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{VENV_PYTHON}}` | The install venv's interpreter (`.venv/bin/python`, `.venv\Scripts\python.exe` on Windows) | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{WEAVIATE_URL}}` | Weaviate HTTP URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{WEAVIATE_GRPC_PORT}}` | Weaviate gRPC port from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{OLLAMA_URL}}` | Ollama URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{CODE_EMBED_URL}}` | Code-embedding service URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{HUB_PORT}}` | The vct-hub port at render time (`$VCT_HUB_PORT` → `hub.port` → 7700); a snapshot — clients re-resolve that ladder at run time | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{INSTALLED_AT_PATH}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{WORKING_DIR}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{WRAPPER_SCRIPT}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{LOG_FILE}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{BOOT_LOG_FILE}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{LABEL}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{CREATED_AT}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{USER_ID}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{EXEC_START}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{EXEC_ARGV_PLIST}}` | boot unit (value from the unit spec, vco_lib/boot_service.py); a pre-escaped `<string>` fragment | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{EXEC_COMMAND}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{EXEC_ARGUMENTS}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{STATE_DIR}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+| `{{SECRET_PROJECT}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
+<!-- END: placeholder-table -->
 
-Keep placeholders in templates — do NOT hard-code paths.
+Keep placeholders in templates — do NOT hard-code paths, ports or URLs.
 
 ## Install flags
 

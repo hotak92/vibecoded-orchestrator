@@ -91,67 +91,53 @@ _kg_emit_gate_skipped_metric() {
         >> "$jsonl" 2>/dev/null || true
 }
 
-# v0.2.49 SB1: write an UPDATE_DEFERRED.md entry directing the user to
-# resolve the empty-VCT_PROJECT_ID condition (re-run install.py
-# --update OR re-register via Launcher GUI). Per the user's 2026-06-08
-# Q1 directive, this is the user-facing surface — silent-allow remains
-# the default at the gate, no stderr WARNING is emitted.
+# v0.2.49 SB1: record an UPDATE_DEFERRED.md entry directing the user to
+# resolve the empty-VCT_PROJECT_ID condition (re-run install.py --update OR
+# re-register via Launcher GUI). Silent-allow remains the default at the gate;
+# this entry is the user-facing surface.
+#
+# v0.2.100 WP-17: the entry is written by the ONE locked writer,
+# `python -m vco_lib.gate_skipped_deferral` (shared with the weaviate-kg MCP
+# server), never by an append from here. The old bare `>>` took no lock: it
+# raced install.py's finalize (which reads, merges and rewrites the ledger
+# under `.claude/context/.update-deferred.lock`) and could lose the entry or
+# another writer's. Writers append/merge, never clobber.
 #
 # Idempotency: deduped per (session, project) via a sentinel file in
-# .claude/state/ so a kg-sync burst doesn't accumulate duplicate
-# blocks. The condition_id token matches the Python sibling so even
-# cross-process duplicates upsert under the
-# vco_lib.deferral_report contract when --apply-deferred eventually
-# runs.
+# .claude/state/ so a kg-sync burst spawns the writer once. The sentinel is
+# removed again when the write fails, so the next write retries. No VCO venv
+# (a broken install) is said on stderr — never an unlocked fallback write.
+# MUST MATCH route-touched-path.ps1's Emit-KgGateSkippedDeferral.
 _kg_emit_gate_skipped_deferral() {
     local coll="${1:-}"
-    local deferred="$_VCO_ROUTE_PROJECT_ROOT/.claude/context/UPDATE_DEFERRED.md"
     local state_dir="$_VCO_ROUTE_PROJECT_ROOT/.claude/state"
     local session_id="${VCT_SESSION_ID:-${CLAUDE_SESSION_ID:-$$}}"
     local sentinel="$state_dir/gate_skipped_deferral_${session_id}"
 
+    [ -n "$_VCO_ROUTE_PROJECT_ROOT" ] || return 0
     # Per-session dedup. The first call writes; subsequent calls within
     # the same session are no-ops.
     [ -f "$sentinel" ] && return 0
     mkdir -p "$state_dir" 2>/dev/null || return 0
     : > "$sentinel" 2>/dev/null || true
 
-    mkdir -p "$(dirname "$deferred")" 2>/dev/null || return 0
-
-    # Idempotent body marker — if a prior session already wrote a row
-    # for this condition_id, leave it in place rather than duplicating
-    # the section header.
-    local marker="## gate_skipped_no_project_id"
-    if [ -f "$deferred" ] && grep -q "^$marker" "$deferred" 2>/dev/null; then
+    VCO_VENV_PYTHON=""
+    if [ -f "$_VCO_ROUTE_HOOKS_DIR/_lib/resolve-vco-venv.sh" ]; then
+        # shellcheck source=resolve-vco-venv.sh disable=SC1091
+        . "$_VCO_ROUTE_HOOKS_DIR/_lib/resolve-vco-venv.sh"
+        resolve_vco_venv_python "$_VCO_ROUTE_HOOKS_DIR" 2>/dev/null || true
+    fi
+    if [ -z "${VCO_VENV_PYTHON:-}" ]; then
+        echo "[VCO] gate_skipped_no_project_id: the deferral entry was NOT recorded -- the VCO venv is not resolvable (broken install; re-run the orchestrator's install / update)." >&2
+        rm -f "$sentinel" 2>/dev/null || true
         return 0
     fi
-
-    local ts
-    ts=$(date -u +"%Y-%m-%dT%H:%M:%SZ" 2>/dev/null) || ts="unknown"
-
-    # Append-mode write. If the file doesn't exist, this creates a
-    # naked entry with no frontmatter — vco_lib.deferral_report.read()
-    # treats absent frontmatter as an empty header (the section parser
-    # still picks up the entry via `^## <cid> (sev)`). The next
-    # install.py --update pass calls DeferralReport.read() then write()
-    # which canonicalises the file with frontmatter.
-    {
-        printf '\n%s (warning)\n\n' "$marker"
-        printf '**Title**: Phase-8 access-matrix gate skipped (VCT_PROJECT_ID missing from hook env)\n\n'
-        printf '**Detected**: A VCO write hook reached the Phase-8 WRITE gate with no VCT_PROJECT_ID. The gate cannot identify this project against the hub access matrix, so the write was permitted via the silent-allow path. Target collection: %s\n\n' "$coll"
-        printf '**Why deferred**: Seeding VCT_PROJECT_ID requires an orchestrator install pass (queries launcher.db for the project UUID) or a Launcher GUI re-registration. The hook cannot self-heal.\n\n'
-        printf '**To apply**:\n'
-        printf '```bash\n'
-        printf '# Option A — orchestrator-root install / update:\n'
-        printf 'python install.py --update\n\n'
-        printf '# Option B — per-project (pre-v0.2.49 install): re-register the\n'
-        printf '# project via Launcher GUI -> Projects -> Identity tab. The\n'
-        printf "# launcher's apply_project_env pass seeds VCT_PROJECT_ID into\n"
-        printf '# the project-local .claude/env from launcher.db.\n'
-        printf '```\n\n'
-        printf '**Detected at**: %s\n\n' "$ts"
-        printf -- '---\n'
-    } >> "$deferred" 2>/dev/null || true
+    if ! "$VCO_VENV_PYTHON" -m vco_lib.gate_skipped_deferral \
+            --folder "$_VCO_ROUTE_PROJECT_ROOT" --collection "$coll" --surface hook \
+            </dev/null >/dev/null; then
+        rm -f "$sentinel" 2>/dev/null || true
+    fi
+    return 0
 }
 
 # v0.2.92 FIX (silent-KG-sync-drop): this synchronous function is RETAINED

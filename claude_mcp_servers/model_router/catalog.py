@@ -393,8 +393,14 @@ def resolve_window(
     *,
     table: ContextTable,
     family_floor: Optional[FamilyFloor],
+    vendor_id: Optional[str] = None,
 ) -> WindowResolution:
     """Decide one row's window. Table, then upstream, then the family floor.
+
+    ``vendor_id`` names the upstream serving ``entry`` (``None`` for the
+    first-party route); an id that carries its own namespace names it
+    itself. It selects a cited per-vendor table override (v0.2.100, F-W1-19:
+    one model, two endpoints, two documented windows).
 
     The order encodes who is entitled to be believed about a window:
 
@@ -428,7 +434,7 @@ def resolve_window(
     if bare_id in table.tombstones:
         return WindowResolution(None, None, WINDOW_DELETED)
 
-    row = table.lookup(bare_id)
+    row = table.lookup_id(entry.id, vendor_id)
     if row is not None:
         return WindowResolution(
             _positive(row.context_window), _positive(row.max_output), WINDOW_TABLE,
@@ -510,6 +516,7 @@ def resolve_family_windows(
     *,
     table: ContextTable,
     parts: Mapping[str, ModelIdParts],
+    vendor_id: Optional[str] = None,
 ) -> dict[str, WindowResolution]:
     """Resolve every row of ONE upstream, floors included.
 
@@ -520,7 +527,9 @@ def resolve_family_windows(
     its models in.
     """
     resolved = {
-        entry.id: resolve_window(entry, table=table, family_floor=None)
+        entry.id: resolve_window(
+            entry, table=table, family_floor=None, vendor_id=vendor_id,
+        )
         for entry in entries
     }
     for entry in entries:
@@ -532,7 +541,7 @@ def resolve_family_windows(
         if floor is None:
             continue
         resolved[entry.id] = resolve_window(
-            entry, table=table, family_floor=floor,
+            entry, table=table, family_floor=floor, vendor_id=vendor_id,
         )
     return resolved
 
@@ -617,6 +626,7 @@ def describe_row(
 
 def _warn_on_table_disagreement(
     bare_id: str, *, table: ContextTable, window: Optional[int],
+    vendor_id: Optional[str] = None,
 ) -> None:
     """A table row whose ``window_1m`` flag contradicts its own window.
 
@@ -627,7 +637,7 @@ def _warn_on_table_disagreement(
     said so. The advert now follows the WINDOW — the number that is cited —
     and the contradiction is reported rather than resolved silently.
     """
-    row = table.lookup(bare_id)
+    row = table.lookup(bare_id, vendor_id)
     if row is None:
         return
     derived = (window or 0) >= ONE_M_WINDOW
@@ -782,7 +792,10 @@ def _publish_family(
         entries = kept_entries
 
     parts = {entry.id: parse_model_id(entry.id) for entry in entries}
-    resolved = resolve_family_windows(entries, table=table, parts=parts)
+    resolved = resolve_family_windows(
+        entries, table=table, parts=parts,
+        vendor_id=vendor.vendor_id if vendor is not None else None,
+    )
     # Owner curation (2026-09-22, final advertised list): ids a row
     # defers to a later discussion are HIDDEN under BOTH catalog filters
     # — reported in ``_vct_catalog_hidden``, still routable by name, never
@@ -804,6 +817,7 @@ def _publish_family(
             continue
         _warn_on_table_disagreement(
             parts[entry.id].bare_id, table=table, window=answer.window,
+            vendor_id=vendor.vendor_id if vendor is not None else None,
         )
         if vendor is None:
             published_id = entry.id
@@ -1053,6 +1067,24 @@ class CatalogService:
             for family_id in known
         }
 
+    def known_vendor_ids(self) -> dict[str, frozenset[str]]:
+        """Per vendor, the bare ids its last-read model list carried. Never fetches.
+
+        The routing guard's evidence (:func:`model_router.routing.route`'s
+        ``known_ids``): an id the picker published came from this cache, so
+        it can never be refused as unknown. Empty for a family never read —
+        the router then judges on the row's declared lists and family alone.
+        """
+        out: dict[str, frozenset[str]] = {}
+        for vendor_id in self._vendors:
+            entry = self._cache.get(vendor_id)
+            if entry is None:
+                continue
+            out[vendor_id] = frozenset(
+                parse_model_id(e.id, self._vendors).bare_id for e in entry.entries
+            )
+        return out
+
     def hidden_count(self) -> int:
         """How many rows the last :meth:`union` withheld. Never fetches.
 
@@ -1209,6 +1241,13 @@ class CatalogService:
         if entries and vendor.catalog_exclude_prefixes:
             entries = _exclude_by_prefix(
                 entries, vendor.catalog_exclude_prefixes,
+            )
+        if entries and vendor.retired_ids:
+            retired = {i.lower() for i in vendor.retired_ids}
+            entries = tuple(
+                e for e in entries
+                if parse_model_id(e.id, self._vendors).bare_id.lower()
+                not in retired
             )
         result = (
             _FamilyCache(entries, SOURCE_LIVE, self._clock())

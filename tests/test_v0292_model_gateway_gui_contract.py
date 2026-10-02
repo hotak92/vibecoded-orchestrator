@@ -709,17 +709,32 @@ def test_claude_md_template_is_enumerated_as_a_project_level_template():
     assert "CLAUDE.md.template" in names
 
 
-def test_render_claude_md_is_the_path_the_gui_toggle_uses():
+def test_render_claude_md_is_the_path_the_gui_toggle_uses(tmp_path):
     """The module toggle's re-render is what actually lands the section.
 
-    `install-bundle` never rewrites an existing project's CLAUDE.md, so if
-    this function stopped merging the managed region the GUI toggle would
-    become a row in a table with no visible effect.
+    If this function stopped merging the managed region the GUI toggle would
+    become a row in a table with no visible effect. (v0.2.100 WP-18 retarget:
+    the old check read the docstring, which moved with the body to
+    ``vco_lib.project_templates``; the claim is now proven by BEHAVIOUR — the
+    managed body is replaced and user content outside the markers survives.
+    ``install-bundle --update`` re-renders the same region since v0.2.100.)
     """
-    from vco_lib.project_init import render_claude_md
+    from vco_lib.project_init import MANAGED_REGION_CLOSE, render_claude_md
 
-    doc = render_claude_md.__doc__ or ""
-    assert "preserving any user content outside" in doc
+    orch = tmp_path / "orch"
+    (orch / "templates").mkdir(parents=True)
+    (orch / "templates" / "CLAUDE.md.template").write_text(
+        "# {{PROJECT_NAME}}\nNEW BODY\n", encoding="utf-8")
+    project = tmp_path / "proj"
+    project.mkdir()
+    render_claude_md(project, orchestrator_root=orch, project_name="proj")
+    live = project / "CLAUDE.md"
+    live.write_text(live.read_text(encoding="utf-8").replace("NEW BODY", "OLD BODY")
+                    + "\nuser tail\n", encoding="utf-8")
+    render_claude_md(project, orchestrator_root=orch, project_name="proj")
+    text = live.read_text(encoding="utf-8")
+    assert "NEW BODY" in text and "OLD BODY" not in text
+    assert text.split(MANAGED_REGION_CLOSE, 1)[1].strip() == "user tail"
 
 
 # ---------------------------------------------------------------------------

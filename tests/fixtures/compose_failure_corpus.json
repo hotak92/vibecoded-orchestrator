@@ -1,0 +1,147 @@
+{
+  "_comment": "Recorded compose stderr (docker-compose v2, docker compose, podman-compose, podman) and the typed cause vco_lib.compose_recovery.classify must return. The three `field_2026_09_29_*` rows are the three real failures of the 2026-09-29 update (socket file vanished, network labelled by another tool, storage-only leftover). `negative_*` rows contain the bare words the pre-v0.2.100 classifier matched (`daemon`, `bind`) and must NOT be read as those causes. Consumed by tests/test_v02100_compose_recovery.py.",
+  "cases": [
+    {
+      "id": "field_2026_09_29_socket_file_missing",
+      "source": "podman compose -> docker-compose v2",
+      "runtime": "podman",
+      "stderr": ">>>> Executing external compose provider \"/usr/local/bin/docker-compose\". Please see podman-compose(1) for how to disable this message. <<<<\n\nCannot connect to the Docker daemon at unix:///run/user/1000/podman/podman.sock. Is the docker daemon running?\nError: executing /usr/local/bin/docker-compose -f docker-compose.yml up -d --no-deps weaviate: exit status 1\n",
+      "cause": "socket_missing",
+      "subject": "/run/user/1000/podman/podman.sock"
+    },
+    {
+      "id": "field_2026_09_29_network_label",
+      "source": "podman compose -> docker-compose v2",
+      "runtime": "podman",
+      "stderr": ">>>> Executing external compose provider \"/usr/local/bin/docker-compose\". Please see podman-compose(1) for how to disable this message. <<<<\n\nnetwork infrastructure_default was found but has incorrect label com.docker.compose.network set to \"\" (expected: \"default\")\nError: executing /usr/local/bin/docker-compose -f docker-compose.yml up -d: exit status 1\n",
+      "cause": "network_label_mismatch",
+      "subject": "infrastructure_default"
+    },
+    {
+      "id": "field_2026_09_29_storage_leftover",
+      "source": "podman compose -> docker-compose v2 over the podman API",
+      "runtime": "podman",
+      "stderr": " Container vco_code_embed  Creating\nError response from daemon: creating container storage: the container name \"vco_code_embed\" is already in use by 5d1c0e8b7a2f9c3e4b6a1d0f8e7c6b5a4d3c2b1a0f9e8d7c6b5a4f3e2d1c0b9a. You have to remove that container to be able to reuse that name: that name is already in use by an external entity, or use --replace to instruct Podman to do so.\n",
+      "cause": "name_conflict_storage_leftover",
+      "subject": "vco_code_embed"
+    },
+    {
+      "id": "podman_compose_storage_leftover",
+      "source": "podman-compose (podman CLI)",
+      "runtime": "podman",
+      "stderr": "Error: creating container storage: the container name \"vco_ollama\" is already in use by 0a1b2c3d4e5f60718293a4b5c6d7e8f9. You have to remove that container to be able to reuse that name: that name is already in use by an external entity, or use --replace to instruct Podman to do so\nexit code: 125\n",
+      "cause": "name_conflict_storage_leftover",
+      "subject": "vco_ollama"
+    },
+    {
+      "id": "dial_unix_socket_missing",
+      "source": "docker-compose v2 over podman",
+      "runtime": "podman",
+      "stderr": "error during connect: Get \"http://%2Frun%2Fuser%2F1000%2Fpodman%2Fpodman.sock/v1.41/containers/json\": dial unix /run/user/1000/podman/podman.sock: connect: no such file or directory\n",
+      "cause": "socket_missing",
+      "subject": "/run/user/1000/podman/podman.sock"
+    },
+    {
+      "id": "docker_daemon_down_linux",
+      "source": "docker compose",
+      "runtime": "docker",
+      "stderr": "Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?\n",
+      "cause": "daemon_down"
+    },
+    {
+      "id": "docker_daemon_down_windows",
+      "source": "docker compose (Windows)",
+      "runtime": "docker",
+      "stderr": "error during connect: this error may indicate that the docker daemon is not running: Get \"http://%2F%2F.%2Fpipe%2Fdocker_engine/v1.24/containers/json\": open //./pipe/docker_engine: The system cannot find the file specified.\n",
+      "cause": "daemon_down"
+    },
+    {
+      "id": "podman_machine_down",
+      "source": "podman compose (macOS)",
+      "runtime": "podman",
+      "stderr": "Cannot connect to Podman. Please verify your connection to the Linux system using `podman system connection list`, or try `podman machine init` and `podman machine start` to manage a new Linux VM\nError: unable to connect to Podman socket: failed to connect: dial tcp 127.0.0.1:52341: connect: connection refused\n",
+      "cause": "daemon_down"
+    },
+    {
+      "id": "docker_port_allocated",
+      "source": "docker compose",
+      "runtime": "docker",
+      "stderr": "Error response from daemon: driver failed programming external connectivity on endpoint vco_weaviate (3f2a): Bind for 0.0.0.0:8081 failed: port is already allocated\n",
+      "cause": "port_taken",
+      "subject": "8081"
+    },
+    {
+      "id": "podman_rootlessport_in_use",
+      "source": "podman-compose",
+      "runtime": "podman",
+      "stderr": "Error: rootlessport listen tcp 0.0.0.0:11435: bind: address already in use\nexit code: 126\n",
+      "cause": "port_taken",
+      "subject": "11435"
+    },
+    {
+      "id": "docker_name_conflict",
+      "source": "docker compose",
+      "runtime": "docker",
+      "stderr": "Error response from daemon: Conflict. The container name \"/vco_weaviate\" is already in use by container \"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\". You have to remove (or rename) that container to be able to reuse that name.\n",
+      "cause": "name_conflict_other_provider",
+      "subject": "vco_weaviate"
+    },
+    {
+      "id": "podman_name_conflict_known_container",
+      "source": "docker-compose v2 over podman",
+      "runtime": "podman",
+      "stderr": "Error response from daemon: creating container storage: the container name \"vco_weaviate\" is already in use by 9f8e7d6c5b4a. You have to remove that container to be able to reuse that name: that name is already in use\n",
+      "cause": "name_conflict_other_provider",
+      "subject": "vco_weaviate"
+    },
+    {
+      "id": "podman_compose_rejects_build",
+      "source": "podman-compose (old)",
+      "runtime": "podman",
+      "stderr": "usage: podman-compose up [-h] [-d] [--no-deps] [--force-recreate] [services ...]\npodman-compose up: error: unrecognized arguments: --build\n",
+      "cause": "build_flag_unsupported"
+    },
+    {
+      "id": "cobra_unknown_build_flag",
+      "source": "compose plugin without --build",
+      "runtime": "docker",
+      "stderr": "unknown flag: --build\nSee 'docker compose up --help'.\n",
+      "cause": "build_flag_unsupported"
+    },
+    {
+      "id": "buildkit_failed_to_solve",
+      "source": "docker-compose v2",
+      "runtime": "podman",
+      "stderr": " => ERROR [code_embed 5/7] RUN pip install -r requirements.txt\n------\nfailed to solve: process \"/bin/sh -c pip install -r requirements.txt\" did not complete successfully: exit code: 1\n",
+      "cause": "build_failed"
+    },
+    {
+      "id": "podman_build_step_failed",
+      "source": "podman-compose",
+      "runtime": "podman",
+      "stderr": "Error: building at STEP \"RUN pip install -r requirements.txt\": while running runtime: exit status 1\nexit code: 1\n",
+      "cause": "build_failed"
+    },
+    {
+      "id": "negative_daemon_word_pull_denied",
+      "source": "docker compose",
+      "runtime": "docker",
+      "stderr": "Error response from daemon: pull access denied for vco/code-embed, repository does not exist or may require 'docker login'\n",
+      "cause": "unknown"
+    },
+    {
+      "id": "negative_bind_word_mount_source",
+      "source": "docker compose",
+      "runtime": "docker",
+      "stderr": "Error response from daemon: invalid mount config for type \"bind\": bind source path does not exist: /home/u/weaviate-data\n",
+      "cause": "unknown"
+    },
+    {
+      "id": "negative_podman_bind_mount",
+      "source": "podman-compose",
+      "runtime": "podman",
+      "stderr": "Error: statfs /srv/data: no such file or directory (bind mount source path does not exist)\n",
+      "cause": "unknown"
+    }
+  ]
+}

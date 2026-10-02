@@ -12,7 +12,7 @@
 //     started from the divergence modal must keep `nonFf`).
 //   - endOp() ⇒ updating=false, error=null, op RETAINED (overlay title stays).
 //   - endOp(err) ⇒ error is the error's text (Error instance or string).
-//   - runUpdate() rejecting with `orchestrator_update_conflict` — including
+//   - run('PullFf') rejecting with `orchestrator_update_conflict` — including
 //     the whitespace-prefixed shape from the incident — routes to `conflict`.
 //   - setConflict clears nonFf; dismissConflict clears conflict.
 //   - openPendingConflict: parses `get_pending_conflict_payload`, routes a
@@ -98,7 +98,7 @@ vi.mock('./orchestrator', () => ({
   orchestrator: {
     subscribe: orchStore.subscribe,
     checkStatus: checkStatusMock,
-    update_orchestrator: updateOrchestratorMock,
+    runUpdate: updateOrchestratorMock,
     resetProgress: resetProgressMock,
   },
   cancelScheduledRetry: () => {},
@@ -178,7 +178,7 @@ describe('beginOp / endOp (v0.2.93)', () => {
       diverged_files: ['CLAUDE.md'],
       git_stderr: 'fatal: Not possible to fast-forward',
     });
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).nonFf).not.toBeNull();
     expect(get(updater).updating).toBe(false);
     // The divergence modal now starts a merge FROM that state.
@@ -214,8 +214,8 @@ describe('beginOp / endOp (v0.2.93)', () => {
     expect(get(updater).updating).toBe(false);
   });
 
-  it('runUpdate brackets itself with beginOp/endOp (op=update, overlay opened)', async () => {
-    await updater.runUpdate();
+  it('run(PullFf) brackets itself with beginOp/endOp (op=update, overlay opened)', async () => {
+    await updater.run('PullFf');
     const s = get(updater);
     expect(s.op).toBe('update');
     expect(s.updating).toBe(false);
@@ -225,9 +225,9 @@ describe('beginOp / endOp (v0.2.93)', () => {
     expect(checkStatusMock).toHaveBeenCalledTimes(1);
   });
 
-  it('runUpdate is a no-op outside Tauri (no overlay, no op)', async () => {
+  it('run(PullFf) is a no-op outside Tauri (no overlay, no op)', async () => {
     tauriIsAvailable = false;
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).op).toBeNull();
     expect(get(ui).showOrchestratorUpdateProgress).toBe(false);
     expect(resetProgressMock).not.toHaveBeenCalled();
@@ -235,9 +235,9 @@ describe('beginOp / endOp (v0.2.93)', () => {
 });
 
 describe('conflict routing (hoisted `conflict` field)', () => {
-  it('runUpdate rejecting with the conflict payload routes to store.conflict, error null', async () => {
+  it('run(PullFf) rejecting with the conflict payload routes to store.conflict, error null', async () => {
     updateOrchestratorReject = JSON.stringify(CONFLICT);
-    await updater.runUpdate();
+    await updater.run('PullFf');
     const s = get(updater);
     expect(s.conflict?.operation).toBe('merge');
     expect(s.conflict?.conflicted_files).toEqual(['CLAUDE.md']);
@@ -248,14 +248,14 @@ describe('conflict routing (hoisted `conflict` field)', () => {
 
   it('routes the WHITESPACE-PREFIXED conflict payload too (the incident shape, end-to-end through the store)', async () => {
     updateOrchestratorReject = `\n  ${JSON.stringify(CONFLICT)}`;
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).conflict).not.toBeNull();
     expect(get(updater).error).toBeNull();
   });
 
   it('a plain error still lands in store.error with every payload field null', async () => {
     updateOrchestratorReject = 'git: command not found';
-    await updater.runUpdate();
+    await updater.run('PullFf');
     const s = get(updater);
     expect(s.error).toBe('git: command not found');
     expect(s.conflict).toBeNull();
@@ -273,7 +273,7 @@ describe('conflict routing (hoisted `conflict` field)', () => {
       diverged_files: [],
       git_stderr: '',
     });
-    await updater.runUpdate();
+    await updater.run('PullFf');
     expect(get(updater).nonFf).not.toBeNull();
     updater.setConflict(CONFLICT as never);
     expect(get(updater).nonFf).toBeNull();
@@ -335,9 +335,14 @@ describe('pickKind priority (v0.2.93)', () => {
     expect(mod.pickKind(all)).toBe('merge_resolved_incomplete');
   });
 
-  it('keeps binary > install > remote below the two merge kinds', () => {
+  it('keeps remote > binary > install below the two merge kinds', () => {
+    // v0.2.100 (WP-08): a pending REMOTE update is never hidden by a stale
+    // binary — the run relaunches into the new binary anyway.
     expect(
       mod.pickKind({ remote_ahead: true, install_stale: true, binary_stale: true }),
+    ).toBe('remote_ahead');
+    expect(
+      mod.pickKind({ remote_ahead: false, install_stale: true, binary_stale: true }),
     ).toBe('binary_stale');
     // v0.2.93 (field 2026-09-08): a half-finished install must NOT mask the
     // only action that pulls — the update flow includes the install.

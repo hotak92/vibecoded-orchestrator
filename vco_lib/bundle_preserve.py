@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:  # pragma: no cover — typing only, never imported at runtime
     from vco_lib.project_init import _BundleFileOp
 
-__all__ = ["record_preserve", "emit_user_modified_deferral"]
+__all__ = ["record_preserve", "record_knowledge_kept", "emit_user_modified_deferral"]
 
 
 def record_preserve(
@@ -87,6 +87,25 @@ def record_preserve(
         "shipped_source": op.source_rel,
         "reason": reason,
     }
+
+
+def record_knowledge_kept(result: dict, knowledge_preserved_paths: list) -> None:
+    """v0.2.100 F-W2-08(a): say — as INFORMATION, never as a warning — that
+    divergent ``knowledge/**`` nodes were kept. They are the user's data and
+    are kept by design (``--force`` included), so there is no deferral entry to
+    point at and no command to run; the launcher used to print both.
+
+    Adds the additive envelope key ``knowledge_kept`` (the paths; present only
+    when non-empty) — the launcher subtracts them from its "your edits kept
+    (backup failed)" tally, which is about code files only — and one
+    ``notes`` line.
+    """
+    if not knowledge_preserved_paths:
+        return
+    result["knowledge_kept"] = sorted(knowledge_preserved_paths)
+    result.setdefault("notes", []).append(
+        f"{len(knowledge_preserved_paths)} knowledge file(s) kept as you have "
+        "them — knowledge/ is your data; an update never overwrites it")
 
 
 def emit_user_modified_deferral(

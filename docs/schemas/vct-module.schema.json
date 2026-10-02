@@ -24,7 +24,9 @@
       "type": "string"
     },
     "version": {
-      "type": "string"
+      "description": "Module version: strictly `X.Y.Z` (optional leading `v`, no suffix).",
+      "type": "string",
+      "pattern": "^v?\\d+\\.\\d+\\.\\d+$"
     },
     "description": {
       "default": "",
@@ -247,11 +249,13 @@
           }
         },
         "min_launcher_version": {
+          "description": "Oldest launcher version this module supports: strictly `X.Y.Z`.",
           "default": null,
           "type": [
             "string",
             "null"
-          ]
+          ],
+          "pattern": "^v?\\d+\\.\\d+\\.\\d+$"
         }
       }
     },

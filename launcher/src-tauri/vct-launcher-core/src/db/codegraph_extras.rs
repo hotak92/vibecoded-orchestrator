@@ -275,6 +275,134 @@ impl Db {
     }
 }
 
+// ─── One home: "sync ONE extra path" (v0.2.100 W5R-04) ────────────────────
+
+/// Analyzer argv (everything AFTER `analyze_code_graph.py`) for syncing ONE
+/// extra path into the project's own code-graph collections.
+///
+/// The single source of the shape used by BOTH triggers: the panel's manual
+/// Sync button (`commands::project_codegraph_extras::sync_project_codegraph_
+/// extra_path`) and the automatic Stop-drain refresh
+/// (`vco_lib/codegraph_extras_refresh.py::build_extra_sync_argv`, which MUST
+/// MATCH this fn — both sides assert the committed table
+/// `tests/fixtures/codegraph_extra_sync_argv.json`).
+///
+/// `--since-commit` is emitted only for an incremental run that knows the
+/// last indexed commit; without one an incremental run would diff only
+/// `HEAD~1`, so callers without a commit should run a full pass.
+pub fn extra_path_sync_args(
+    path: &str,
+    prefix: &str,
+    incremental: bool,
+    since_commit: Option<&str>,
+) -> Vec<String> {
+    let mut args = vec![
+        path.to_string(),
+        "--project".to_string(),
+        prefix.to_string(),
+        "--json-progress".to_string(),
+        // v0.2.100: `path` is analyzed AS the repo root here, so the
+        // analyzer must never delete a row it cannot prove is this path's
+        // (a legacy row with an empty `project_source` is the primary's).
+        "--as-extra-path".to_string(),
+    ];
+    if incremental {
+        args.push("--incremental".to_string());
+        if let Some(sha) = since_commit.map(str::trim).filter(|s| !s.is_empty()) {
+            args.push("--since-commit".to_string());
+            args.push(sha.to_string());
+        }
+    }
+    args
+}
+
+/// Does an extra path need a re-index? True iff its repo HEAD is known and
+/// differs from `last_indexed_commit` (a never-indexed git path is stale; a
+/// non-git path — no HEAD — never is). The ONE rule behind both the panel's
+/// "stale" badge and the automatic Stop-drain refresh; MUST MATCH
+/// `vco_lib/codegraph_extras_refresh.py::extra_path_is_stale` (both assert
+/// `stale_cases` in `tests/fixtures/codegraph_extra_sync_argv.json`).
+pub fn extra_path_is_stale(head: Option<&str>, last_indexed_commit: Option<&str>) -> bool {
+    match head.map(str::trim).filter(|h| !h.is_empty()) {
+        None => false,
+        Some(h) => last_indexed_commit.map(str::trim) != Some(h),
+    }
+}
+
+/// Outcome of one successful single-extra-path analyzer run, as recorded by
+/// [`Db::record_codegraph_extra_indexed`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtraPathIndexedRun<'a> {
+    /// Repo HEAD the run indexed (`None` for a non-git extra path).
+    pub commit: Option<&'a str>,
+    pub files_analyzed: u64,
+    pub entities_indexed: u64,
+    pub duration_ms: u64,
+    /// Which trigger ran it: `"manual_sync"` (panel button) or
+    /// `"stop_drain"` (automatic, via the hub route).
+    pub trigger: &'a str,
+}
+
+impl Db {
+    /// Record a successful sync of ONE extra path — the single writer path
+    /// shared by the panel's Sync button and the hub route
+    /// `POST /api/v1/projects/{id}/codegraph/extras/indexed` (v0.2.100
+    /// W5R-04). Three effects, in order:
+    ///   1. `last_indexed_at` / `last_indexed_commit` on the row (Err when no
+    ///      row matches — the row was removed mid-run; nothing is resurrected);
+    ///   2. the `code_graph_builds` upsert (V52-Z — so "last successful build"
+    ///      reflects extra-path activity; best-effort, warned on failure);
+    ///   3. the `codegraph_extra_path_synced` audit row (best-effort).
+    pub fn record_codegraph_extra_indexed(
+        &self,
+        project_id: &str,
+        path: &str,
+        run: &ExtraPathIndexedRun<'_>,
+    ) -> Result<(), String> {
+        let now = Utc::now().timestamp_millis();
+        let n = self.update_codegraph_extra_last_indexed(project_id, path, now, run.commit)?;
+        if n == 0 {
+            return Err(format!(
+                "no extra-path row at '{}' for project {}",
+                path, project_id
+            ));
+        }
+        let duration_ms = run.duration_ms as i64;
+        if let Err(e) = self.upsert_code_graph_build(
+            project_id,
+            "success",
+            Some(now - duration_ms),
+            Some(now),
+            Some(duration_ms),
+            u32::try_from(run.files_analyzed).unwrap_or(u32::MAX),
+            None,
+            false,
+            None,
+            None,
+        ) {
+            tracing::warn!(
+                "[vct] warning: V52-Z code_graph_builds upsert failed for project {}: {}",
+                project_id, e
+            );
+        }
+        let _ = self.audit(
+            "codegraph_extra_path_synced",
+            Some(project_id),
+            None,
+            &serde_json::json!({
+                "path": path,
+                "commit": run.commit,
+                "files_scanned": run.files_analyzed,
+                "entities_indexed": run.entities_indexed,
+                "duration_ms": run.duration_ms,
+                "prune_stale": false,
+                "trigger": run.trigger,
+            }),
+        );
+        Ok(())
+    }
+}
+
 // ─── Row mapping ──────────────────────────────────────────────────────────
 
 fn row_to_extra(r: &rusqlite::Row) -> rusqlite::Result<CodegraphExtraPathRow> {
@@ -310,6 +438,104 @@ mod tests {
         db.insert_project(project_id, name, &folder, ProjectHost::Base, &slug)
             .unwrap();
         db
+    }
+
+    // ─── v0.2.100 W5R-04: argv one-home + record writer ─────────────────
+
+    /// Both argv builders (this fn and the Python Stop-drain refresh) assert
+    /// the same committed table, so the two triggers cannot drift.
+    #[test]
+    fn extra_path_sync_args_matches_shared_fixture() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/fixtures/codegraph_extra_sync_argv.json"
+        ))
+        .expect("shared argv fixture");
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let cases = v["cases"].as_array().unwrap();
+        assert!(cases.len() >= 4);
+        for c in cases {
+            let got = extra_path_sync_args(
+                c["path"].as_str().unwrap(),
+                c["prefix"].as_str().unwrap(),
+                c["incremental"].as_bool().unwrap(),
+                c["since_commit"].as_str(),
+            );
+            let want: Vec<String> = c["argv"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|x| x.as_str().unwrap().to_string())
+                .collect();
+            assert_eq!(got, want, "case {}", c["name"]);
+        }
+    }
+
+    #[test]
+    fn extra_path_is_stale_matches_shared_fixture() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../../tests/fixtures/codegraph_extra_sync_argv.json"
+        ))
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        for c in v["stale_cases"].as_array().unwrap() {
+            assert_eq!(
+                extra_path_is_stale(c["head"].as_str(), c["last"].as_str()),
+                c["stale"].as_bool().unwrap(),
+                "{c}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_codegraph_extra_indexed_updates_row_build_and_audit() {
+        let db = make_db_with_project("p1", "Acme");
+        db.add_codegraph_extra("p1", "/opt/clone", None).unwrap();
+        db.record_codegraph_extra_indexed(
+            "p1",
+            "/opt/clone",
+            &ExtraPathIndexedRun {
+                commit: Some("deadbeef"),
+                files_analyzed: 3,
+                entities_indexed: 9,
+                duration_ms: 50,
+                trigger: "stop_drain",
+            },
+        )
+        .unwrap();
+        let row = db.get_codegraph_extra("p1", "/opt/clone").unwrap().unwrap();
+        assert_eq!(row.last_indexed_commit.as_deref(), Some("deadbeef"));
+        assert!(row.last_indexed_at.is_some());
+        let trig: String = db
+            .lock()
+            .query_row(
+                "SELECT detail FROM audit_log WHERE operation = 'codegraph_extra_path_synced'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(trig.contains("stop_drain"), "{trig}");
+    }
+
+    #[test]
+    fn record_codegraph_extra_indexed_refuses_missing_row() {
+        let db = make_db_with_project("p1", "Acme");
+        let err = db
+            .record_codegraph_extra_indexed(
+                "p1",
+                "/opt/never-added",
+                &ExtraPathIndexedRun {
+                    commit: Some("x"),
+                    files_analyzed: 0,
+                    entities_indexed: 0,
+                    duration_ms: 0,
+                    trigger: "stop_drain",
+                },
+            )
+            .unwrap_err();
+        assert!(err.contains("no extra-path row"), "{err}");
+        assert!(db.list_codegraph_extras("p1").unwrap().is_empty());
     }
 
     // ─── Add / list ─────────────────────────────────────────────────────

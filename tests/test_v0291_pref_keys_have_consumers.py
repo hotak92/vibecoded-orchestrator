@@ -36,6 +36,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 PREFS_PAGE = REPO_ROOT / "launcher" / "src" / "routes" / "preferences" / "+page.svelte"
+PREFS_LOADERS = REPO_ROOT / "launcher" / "src" / "lib" / "preferences" / "loaders.ts"
 QUIT_DIALOG = REPO_ROOT / "launcher" / "src-tauri" / "src" / "quit_dialog.rs"
 LIB_RS = REPO_ROOT / "launcher" / "src-tauri" / "src" / "lib.rs"
 # v0.2.91 WP-L — the log-level pref's consumer chain.
@@ -154,12 +155,15 @@ class WindowPrefsHaveBackendConsumers(unittest.TestCase):
         nothing on this page may write settings generically again."""
         src = PREFS_PAGE.read_text(encoding="utf-8")
         code = src.split("</script>")[0]
-        self.assertNotIn(
-            "'set_setting_v2'",
-            code,
-            "the Preferences page must not persist settings through the generic "
-            "per-project setting writer",
-        )
+        # `set_setting_v2` was the generic per-project writer until v0.2.100
+        # retired it; `set_module_setting` is the one that remains.
+        for writer in ("'set_setting_v2'", "'set_module_setting'"):
+            self.assertNotIn(
+                writer,
+                code,
+                "the Preferences page must not persist settings through the generic "
+                "per-project setting writer",
+            )
 
 
 class LoggingLevelPrefHasBackendConsumers(unittest.TestCase):
@@ -249,11 +253,17 @@ class LoggingLevelPrefHasBackendConsumers(unittest.TestCase):
             )
 
     def test_the_page_invokes_that_command_pair(self):
-        for cmd in ("'get_logging_level'", "'set_logging_level'"):
+        # v0.2.100 (WP-16): the page's READS live in its loader registry
+        # (`launcher/src/lib/preferences/loaders.ts`); the write stays here.
+        loaders = PREFS_LOADERS.read_text(encoding="utf-8")
+        for cmd, src, where in (
+            ("'get_logging_level'", loaders, "the Preferences loader registry"),
+            ("'set_logging_level'", self.script, "the Preferences page"),
+        ):
             self.assertIn(
                 cmd,
-                self.script,
-                f"the page must go through {cmd}; the generic app_state "
+                src,
+                f"{where} must go through {cmd}; the generic app_state "
                 "writer would skip validation AND the env re-projection",
             )
 

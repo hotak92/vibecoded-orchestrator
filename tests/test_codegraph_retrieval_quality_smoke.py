@@ -259,6 +259,13 @@ def test_live_known_noise_query_returns_only_relevant_or_empty() -> None:
     env = dict(os.environ)
     env.pop("VCT_VENV", None)  # discipline: don't let ambient VCT_VENV hijack
     env["WEAVIATE_URL"] = url
+    # v0.2.100 WP-18B: the CLI now honours GRPC_PORT (it used to dial 50052
+    # whatever the env said). conftest pins GRPC_PORT to the discard port for
+    # hermeticity; this LIVE smoke targets the live HTTP URL above, so drop
+    # the pin and let the CLI pair it with its default gRPC port — exactly
+    # the leg it always used here.
+    env.pop("GRPC_PORT", None)
+    env.pop("WEAVIATE_GRPC_PORT", None)
     # Hermeticity (see the module-level snapshot comment above): pin project
     # resolution to what this process saw before any sibling test could have
     # stripped it, so this subprocess call behaves the same regardless of

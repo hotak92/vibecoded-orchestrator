@@ -412,7 +412,20 @@ def test_sh_hook_passes_hook_format_to_rl_kg_search() -> None:
     Dropping this flag is exactly the regression we're guarding against.
     """
     body = HOOK_SRC.read_text(encoding="utf-8")
-    invocations = _producer_invocation_lines(body, "rl_kg_search.py")
+    # v0.2.100 F3: the producer path is resolved ONCE from the orchestrator
+    # root into $RL_SCRIPT (resolve_vco_orchestrator_script) and every call
+    # site passes "$RL_SCRIPT". The resolution line must name the producer;
+    # the invocations are the lines that pass "$RL_SCRIPT" (not its
+    # assignment, not an existence test).
+    assert any(
+        "resolve_vco_orchestrator_script" in ln and "rl_kg_search.py" in ln
+        for _i, ln in _producer_invocation_lines(body, "rl_kg_search.py")
+    ), "the hook must locate rl_kg_search.py through resolve_vco_orchestrator_script"
+    invocations = [
+        (i, ln)
+        for i, ln in _producer_invocation_lines(body, '"$RL_SCRIPT"')
+        if not ln.lstrip().startswith("RL_SCRIPT=") and '-f "$RL_SCRIPT"' not in ln
+    ]
     assert invocations, (
         "rl_kg_search.py invocation missing entirely (no executable line "
         "mentions the producer — only comments)."

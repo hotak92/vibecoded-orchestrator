@@ -58,6 +58,85 @@ $queue = Join-Path $stateDir ("codegraph_drain_{0}.txt" -f $SessionId)
 # orphan code-graph-queue.jsonl) so the NEXT eligible Stop drain (any session)
 # processes them, decoupled from the subagent's session id.
 $sharedQueue = Join-Path $stateDir "codegraph_drain_shared.txt"
+# --- RUNTIME: analyzer script + interpreter (one home for this hook) ---
+# Used by BOTH the extra-path refresh below and the queue drain. Sets
+# $script:analyzer / $script:python and returns (cached, resolved at most
+# once per run): 0 usable, 1 no analyzer script, 2 bare-PATH interpreter
+# cannot import the analyzer's dependencies (or no interpreter at all).
+# MUST MATCH stop-codegraph-drain.sh::_drain_resolve_runtime.
+$script:runtimeRc = $null
+$script:analyzer = $null
+$script:python = $null
+function Resolve-DrainRuntime {
+    if ($null -ne $script:runtimeRc) { return $script:runtimeRc }
+    $defaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
+    $script:analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $defaultRepoRoot ".claude/scripts/analyze_code_graph.py" }
+    if (-not (Test-Path -LiteralPath $script:analyzer)) { $script:runtimeRc = 1; return 1 }
+    # Resolve python (venv preferred via the shared resolver, else system).
+    $py = $env:VCT_PYTHON
+    if (-not $py -and (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue)) {
+        $py = Resolve-VcoVenvPython -ScriptDir $ScriptDir
+    }
+    $fellBack = $false
+    if (-not $py) {
+        foreach ($c in @('python','py','python3')) {
+            $cmd = Get-Command $c -ErrorAction SilentlyContinue
+            if ($cmd) { $py = $cmd.Source; $fellBack = $true; break }
+        }
+    }
+    $script:python = $py
+    if (-not $py) { $script:runtimeRc = 1; return 1 }
+    # v0.2.96 (WP-5 S2) -- MUST MATCH the .sh probe. When the venv resolver
+    # missed, the bare-PATH interpreter in a user project routinely has
+    # neither `weaviate` nor `vco_lib`; the detached analyzer would die into a
+    # redirected stream after the queue was consumed. Probed only on fallback.
+    if ($fellBack) {
+        & $py -c 'import weaviate, vco_lib' 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { $script:runtimeRc = 2; return 2 }
+    }
+    $script:runtimeRc = 0
+    return 0
+}
+
+# --- EXTRA CODE-GRAPH PATHS: automatic re-index (v0.2.100 W5R-04) ---
+# MUST MATCH the .sh block of the same name: at most once per
+# VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS (default 600) per project, spawn
+# `python -m vco_lib.codegraph_extras_refresh` DETACHED. It compares each
+# enabled extra path's HEAD with its last indexed commit, runs the SAME
+# single-path analyzer argv as the panel's Sync button (throttled per path,
+# bounded), and records the new commit through the hub route -- never by
+# opening launcher.db. Runs whether or not this turn queued any file (the
+# extra path's repo moves on its own). Log: .claude/logs/codegraph_extras_refresh.log.
+$extrasInterval = 600
+if ($env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS -match '^\d+$') {
+    $extrasInterval = [int]$env:VCO_CODEGRAPH_EXTRAS_CHECK_INTERVAL_SECONDS
+}
+if (Test-Path -LiteralPath $stateDir -PathType Container) {
+    $extrasTsFile = Join-Path $stateDir "codegraph_extras_check.ts"
+    $extrasNow = [int][double]::Parse((Get-Date -UFormat %s))
+    $extrasLast = 0
+    if (Test-Path -LiteralPath $extrasTsFile) {
+        try {
+            $rawTs = (Get-Content -LiteralPath $extrasTsFile -Raw -ErrorAction Stop).Trim()
+            if ($rawTs -match '^\d+$') { $extrasLast = [int]$rawTs }
+        } catch { }
+    }
+    if ($extrasLast -eq 0 -or (($extrasNow - $extrasLast) -ge $extrasInterval)) {
+        Set-Content -LiteralPath $extrasTsFile -Value "$extrasNow" -NoNewline -ErrorAction SilentlyContinue
+        if ((Resolve-DrainRuntime) -eq 0) {
+            $extrasLogDir = Join-Path (Join-Path $ProjectRoot ".claude") "logs"
+            try { New-Item -ItemType Directory -Path $extrasLogDir -Force -ErrorAction Stop | Out-Null } catch { }
+            $extrasLog = Join-Path $extrasLogDir "codegraph_extras_refresh.log"
+            $q = { param($v) "'" + ($v -replace "'","''") + "'" }
+            # The child's own output/errors land in the same log the module
+            # writes, so a broken refresh is never silent.
+            $extrasInner = "& " + (& $q $script:python) + " -m vco_lib.codegraph_extras_refresh --project-root " + (& $q $ProjectRoot) +
+                " --analyzer " + (& $q $script:analyzer) + " --state-dir " + (& $q $stateDir) + " *>> " + (& $q $extrasLog)
+            Start-VcoDetachedPwsh -Command $extrasInner -PowerShellExe $PsExe
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $queue) -and -not (Test-Path -LiteralPath $sharedQueue)) { exit 0 }
 
 # --- RATE LIMIT ---
@@ -96,47 +175,16 @@ if (Test-Path -LiteralPath $sharedQueue) {
     } catch { }
 }
 
-$defaultRepoRoot = (Resolve-Path (Join-Path $ScriptDir "..\..")).Path
-$analyzer = if ($env:VCT_ANALYZER_SCRIPT) { $env:VCT_ANALYZER_SCRIPT } else { Join-Path $defaultRepoRoot ".claude/scripts/analyze_code_graph.py" }
-if (-not (Test-Path -LiteralPath $analyzer)) {
+# Resolve analyzer + interpreter through the ONE home above. Unusable -> put
+# the queue back + no-op; the bare-PATH interpreter case also says one line.
+$runtimeRc = Resolve-DrainRuntime
+if ($runtimeRc -ne 0) {
     try { Get-Content -LiteralPath $consumed | Add-Content -LiteralPath $queue } catch { }
     Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
-    exit 0
-}
-
-# Resolve python (venv preferred via the shared resolver, else system).
-$python = $env:VCT_PYTHON
-if (-not $python -and (Get-Command Resolve-VcoVenvPython -ErrorAction SilentlyContinue)) {
-    $python = Resolve-VcoVenvPython -ScriptDir $ScriptDir
-}
-$fellBackToPathPython = $false
-if (-not $python) {
-    foreach ($c in @('python','py','python3')) {
-        $cmd = Get-Command $c -ErrorAction SilentlyContinue
-        if ($cmd) { $python = $cmd.Source; $fellBackToPathPython = $true; break }
+    if ($runtimeRc -eq 2) {
+        [Console]::Error.WriteLine("i  code-graph drain: no interpreter with weaviate+vco_lib (tried '$($script:python)'); queue kept for a later turn.")
     }
-}
-if (-not $python) {
-    try { Get-Content -LiteralPath $consumed | Add-Content -LiteralPath $queue } catch { }
-    Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
     exit 0
-}
-
-# v0.2.96 (WP-5 S2) -- MUST MATCH stop-codegraph-drain.sh's probe block.
-# When the venv resolver missed, $python came from the bare-PATH loop above
-# and in a user project routinely has neither `weaviate` nor `vco_lib`. The
-# detached analyzer then dies into a redirected stream while $consumed has
-# already been taken off $queue -- the batch is lost silently. Same remedy
-# the "no analyzer" / "no python" branches above already use: put the queue
-# back, say one line, exit 0. Probed only when we fell back.
-if ($fellBackToPathPython) {
-    & $python -c 'import weaviate, vco_lib' 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        try { Get-Content -LiteralPath $consumed | Add-Content -LiteralPath $queue } catch { }
-        Remove-Item -LiteralPath $consumed -ErrorAction SilentlyContinue
-        [Console]::Error.WriteLine("i  code-graph drain: no interpreter with weaviate+vco_lib (tried '$python'); queue kept for a later turn.")
-        exit 0
-    }
 }
 
 $codeRe ='\.(py|js|mjs|jsx|ts|tsx|go|rs|lua|cpp|cc|cxx|c|h|hpp|java|rb|cs|proto|sh|bash)$'
@@ -254,12 +302,12 @@ foreach ($h in @($byRoot.Keys)) {
 
     # Detached background run holding the per-root lock for the whole analyzer
     # run, then releasing it + the list file.
-    $argList = @($analyzer, $canon, '--project', $project, '--only-files-from', $listFile, '--canonical-source', $canon, $dotFlag)
+    $argList = @($script:analyzer, $canon, '--project', $project, '--only-files-from', $listFile, '--canonical-source', $canon, $dotFlag)
     $cleanup = "try { Remove-Item -LiteralPath '$listFile' -ErrorAction SilentlyContinue } catch {}; try { Remove-Item -LiteralPath '$lock' -Recurse -Force -ErrorAction SilentlyContinue } catch {}"
     # Write the detached run's own PID into the lock dir FIRST so the PID-based
     # stale-lock breaker can tell a live long run from a dead holder (SEV-2 #3).
     $pidStamp = "try { Set-Content -LiteralPath '$lock/pid' -Value `$PID -ErrorAction SilentlyContinue } catch {}; "
-    $inner = $pidStamp + "& '$python' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
+    $inner = $pidStamp + "& '$($script:python)' " + (($argList | ForEach-Object { "'" + ($_ -replace "'","''") + "'" }) -join ' ') + " *> `$null; $cleanup"
     # Through the ONE guarded spawn home: an unguarded `-WindowStyle Hidden`
     # is REJECTED on non-Windows PowerShell, which kills the drain outright
     # AND leaves the per-root lock dir behind (the cleanup runs in the child).

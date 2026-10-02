@@ -28,6 +28,12 @@
 # Soft-fail throughout: a CDI-wait timeout MUST NOT block the unit, just
 # degrade to CPU-only with a log warning.
 #
+# Exit codes (v0.2.100): 0 composed; 2 bad working dir; 3 no usable runtime;
+# 4 unknown runtime token; 5 a vco_lib step (plan / provider / guard /
+# compose-args) could not run — nothing composed; 6 the data-identity guard
+# refused a service (nothing removed; cleared ones were composed); any other
+# value is compose's own exit status, passed through unchanged (125 included).
+#
 # Tests: a thin Python wrapper at tests/test_launch_claude_mcp_stack_pick.py
 # sources this script and exercises `pick_compose_invocation` against a
 # matrix of (runtime, gpu_mode) inputs.
@@ -177,7 +183,9 @@ resolve_runtime_file() {
 
     local seen_path=""
     local cand
-    for cand in "${candidates[@]}"; do
+    # bash 3.2 (macOS /bin/bash) + `set -u`: an empty array expansion is an
+    # "unbound variable" error there — expand only when set.
+    for cand in ${candidates[@]+"${candidates[@]}"}; do
         # De-dup adjacent identical candidates (common when env vars
         # collapse to the same path on default installs).
         [ "$cand" = "$seen_path" ] && continue
@@ -598,15 +606,25 @@ pick_compose_invocation() {
     local runtime="$1"
     local gpu_mode="$2"
     local working_dir="${3:-$PWD}"
+    local family="${4:-}"
 
-    # Pick the right overlay filename per runtime. podman-compose and the
-    # podman compose subcommand both use the podman overlay; docker compose
-    # uses the docker overlay.
+    # The overlay FILE follows the label family of the compose engine that
+    # will PARSE it (v0.2.100 F-W1-14, `vco_lib.compose_provider`): a
+    # `podman compose` that delegates to docker-compose cannot read the podman
+    # overlay's CDI devices. main() passes the family it detected
+    # (detect_label_family); with no 4th argument the runtime name decides
+    # (the pure helper's historical contract, pinned by its tests).
     local overlay=""
-    case "$runtime" in
-        docker)              overlay="$VCT_STACK_GPU_OVERLAY_DOCKER" ;;
-        podman-compose)      overlay="$VCT_STACK_GPU_OVERLAY" ;;
-        "podman compose")    overlay="$VCT_STACK_GPU_OVERLAY" ;;
+    case "$family" in
+        podman) overlay="$VCT_STACK_GPU_OVERLAY" ;;
+        docker) overlay="$VCT_STACK_GPU_OVERLAY_DOCKER" ;;
+        *)
+            case "$runtime" in
+                docker)              overlay="$VCT_STACK_GPU_OVERLAY_DOCKER" ;;
+                podman-compose)      overlay="$VCT_STACK_GPU_OVERLAY" ;;
+                "podman compose")    overlay="$VCT_STACK_GPU_OVERLAY" ;;
+            esac
+            ;;
     esac
 
     # Resolve overlay path against working_dir for existence-check, but
@@ -809,6 +827,68 @@ select_services() {
 }
 
 # ---------------------------------------------------------------------------
+# runtime_parts :: the runtime binary and the compose command for a
+# detect_runtime token ("docker" | "podman-compose" | "podman compose").
+# Prints two lines: <runtime binary>, <compose command>.
+# ---------------------------------------------------------------------------
+runtime_parts() {
+    case "$1" in
+        docker)           printf 'docker\ndocker compose\n' ;;
+        podman-compose)   printf 'podman\npodman-compose\n' ;;
+        "podman compose") printf 'podman\npodman compose\n' ;;
+        *) return 1 ;;
+    esac
+}
+
+# ---------------------------------------------------------------------------
+# detect_label_family :: the label family (podman | docker) of the compose
+# engine that will run — the ONE rule, vco_lib.compose_provider.detect (a
+# `podman compose` delegating to docker-compose is docker). Args: runtime
+# binary, compose command. Prints the family; non-zero when Python cannot say.
+# ---------------------------------------------------------------------------
+detect_label_family() {
+    local root="${_VCT_SCRIPT_DIR:+$_VCT_SCRIPT_DIR/..}"
+    PYTHONPATH="${root}${PYTHONPATH:+:$PYTHONPATH}" "$STACK_PY" -c '
+import sys
+from vco_lib import compose_provider as cp
+p = cp.detect(sys.argv[1], argv=sys.argv[2].split())
+# The overlay rule itself decides the family (an engine it cannot name
+# falls back inside overlay_candidates) — no second copy of that rule here.
+print("" if p is None else
+      "podman" if cp.overlay_candidates(p, None)[0].startswith("podman-compose") else "docker")
+' "$1" "$2"
+}
+
+# ---------------------------------------------------------------------------
+# guard_services :: clear SELECTED_SERVICES through the ONE guarded verb
+# (`python -m vco_lib.service_lifecycle up --guard-only`, v0.2.100 F-W2-14):
+# the data-identity guard runs for each service BEFORE this wrapper composes
+# it; a refused service is never composed (and nothing is removed). Sets
+# SELECTED_SERVICES to the cleared ones and GUARD_REFUSED to the refused.
+# Args: runtime binary, compose command. Returns non-zero when the verb
+# could not run at all (the caller then composes nothing).
+# ---------------------------------------------------------------------------
+guard_services() {
+    local rt_bin="$1" compose_cmd="$2" out rc
+    out="$(stack_py vco_lib.service_lifecycle up --shell --guard-only \
+        --services "$SELECTED_SERVICES" --compose-dir "$VCT_STACK_WORKING_DIR" \
+        --compose-cmd "$compose_cmd" --runtime "$rt_bin")"
+    rc=$?
+    printf '%s\n' "$out" | grep -v '^vco_up_' | grep -v '^$' | while IFS= read -r line; do log "guard: $line"; done
+    vco_up_cleared=""
+    vco_up_refused=""
+    vco_up_removed=""
+    eval "$(printf '%s\n' "$out" | grep '^vco_up_')"
+    case "$rc" in
+        0|3) ;;
+        *) return 1 ;;
+    esac
+    SELECTED_SERVICES="$vco_up_cleared"
+    GUARD_REFUSED="$vco_up_refused"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # main :: orchestrate the boot-safe compose-up.
 # ---------------------------------------------------------------------------
 main() {
@@ -909,9 +989,22 @@ main() {
     # OVERLAY_MISSING_WARNED is set by pick_compose_invocation when
     # gpu_mode=gpu but the configured overlay file doesn't exist. Reset
     # it here so a previous invocation's state can't leak in.
+    local rt_bin compose_cmd family parts
+    if ! parts="$(runtime_parts "$runtime")"; then
+        log "FATAL: unknown runtime token '$runtime' — nothing composed"
+        exit 4
+    fi
+    rt_bin="$(printf '%s\n' "$parts" | sed -n 1p)"
+    compose_cmd="$(printf '%s\n' "$parts" | sed -n 2p)"
+    if ! family="$(detect_label_family "$rt_bin" "$compose_cmd")" || [ -z "$family" ]; then
+        log "FATAL: vco_lib.compose_provider could not name the compose engine for '$compose_cmd' — nothing composed"
+        exit 5
+    fi
+    log "compose engine label family: $family"
+
     OVERLAY_MISSING_WARNED=0
     local argv
-    if ! argv="$(pick_compose_invocation "$runtime" "$gpu_mode" "$VCT_STACK_WORKING_DIR")"; then
+    if ! argv="$(pick_compose_invocation "$runtime" "$gpu_mode" "$VCT_STACK_WORKING_DIR" "$family")"; then
         log "FATAL: pick_compose_invocation rejected runtime=$runtime gpu_mode=$gpu_mode"
         exit 4
     fi
@@ -930,8 +1023,6 @@ main() {
     # for those services and nothing else.
     local name
     if [ "$FROM_PLAN" = "1" ]; then
-        local rt_bin="podman"
-        [ "$runtime" = "docker" ] && rt_bin="docker"
         for name in ${VCO_ADOPTED_CONTAINERS:-}; do
             if "$rt_bin" start "$name" >/dev/null 2>&1; then
                 log "started adopted container $name (by name — never re-created)"
@@ -941,15 +1032,36 @@ main() {
         done
     fi
 
+    # The data-identity guard FIRST (v0.2.100 F-W2-14): every selected
+    # service is cleared by the guarded verb before this wrapper composes it;
+    # a refused one is never composed and nothing is removed. The wrapper
+    # composes itself (not the verb) because only it knows the GPU overlay
+    # and the CDI wait — the verb's documented `--guard-only` contract.
+    GUARD_REFUSED=""
+    if [ -n "$SELECTED_SERVICES" ]; then
+        if ! guard_services "$rt_bin" "$compose_cmd"; then
+            log "FATAL: vco_lib.service_lifecycle up --guard-only could not run for '$SELECTED_SERVICES' — nothing composed"
+            exit 5
+        fi
+        if [ -n "$GUARD_REFUSED" ]; then
+            log "the data-identity guard refused: $GUARD_REFUSED (left exactly as it is; see UPDATE_DEFERRED.md)"
+        fi
+        if [ -z "$SELECTED_SERVICES" ]; then
+            log "nothing cleared to compose"
+            exit 6
+        fi
+    fi
+
     # The `up` argv for EXACTLY the selected services — from the one home of
     # the rule (`--no-deps`; code_embed only with the gpu profile, and not at
     # all in CPU mode). An empty list is NO compose call, never a bare up.
     local up_line
     local -a up_args=() build_flag=()
     [ "${VCT_STACK_BUILD:-}" = "1" ] && build_flag=(--build)
+    # bash 3.2 + `set -u`: expand the (possibly empty) array only when set.
     if ! up_line="$(stack_py vco_lib.service_lifecycle compose-args --shell \
             --services "$SELECTED_SERVICES" --gpu-mode "$gpu_mode" \
-            "${build_flag[@]}")"; then
+            ${build_flag[@]+"${build_flag[@]}"})"; then
         log "FATAL: vco_lib.service_lifecycle compose-args failed for '$SELECTED_SERVICES' — nothing composed"
         exit 5
     fi
@@ -967,13 +1079,15 @@ main() {
     $argv "${up_args[@]}"
     local rc=$?
     log "compose exited rc=$rc"
-    # Exit 125 from podman-compose means "one or more containers failed
-    # to start" — we tolerate that at the unit level (other containers'
-    # restart policy recovers them).
-    case "$rc" in
-        0|125) exit 0 ;;
-        *)     exit "$rc" ;;
-    esac
+    # v0.2.100 (L2-F08): the exit status is passed through as it is. Exit
+    # 125 from podman-compose means "one or more containers failed to start"
+    # (and, detached, a failed create can hide behind it) — mapping it to 0
+    # let callers book a failed heal as success. The systemd unit tolerates
+    # it through `SuccessExitStatus`, not through this script.
+    if [ "$rc" -eq 0 ] && [ -n "${GUARD_REFUSED:-}" ]; then
+        exit 6
+    fi
+    exit "$rc"
 }
 
 # Only run main when executed directly, NOT when sourced for tests.

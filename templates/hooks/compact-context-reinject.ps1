@@ -28,6 +28,17 @@ $HookStdin = ""
 try { $HookStdin = [Console]::In.ReadToEnd() } catch { }
 $SessionId = Get-VcoHookSessionId -Stdin $HookStdin
 
+# v0.2.100 WP-17: the WHOLE output goes through the shared injection cap
+# (_lib/emit-context.ps1 Limit-VcoHookContext): Claude Code shows the model
+# only a file path + a 2 000-character preview past 10 000 characters, and
+# this hook exceeded that on 223 of 235 measured runs. The cut keeps the
+# START (CONTEXT_STATE) and ends with a marker naming the files to Read.
+# A missing helper (broken install) re-injects uncapped rather than nothing.
+# MUST MATCH compact-context-reinject.sh.
+$EmitLib = Join-Path $PSScriptRoot "_lib/emit-context.ps1"
+if (Test-Path -LiteralPath $EmitLib) { . $EmitLib }
+
+$Reinjected = & {
 # 1. CONTEXT_STATE.md (uncapped)
 $CtxState = Join-Path $ProjectDir ".claude/CONTEXT_STATE.md"
 if (Test-Path $CtxState) {
@@ -87,4 +98,10 @@ if ((Test-Path $Pruned) -and ((Get-Item $Pruned).Length -gt 0)) {
     # compact's summary as stale state.
     Set-Content -Path $Pruned -Value "" -NoNewline
 }
+}
+$ReinjectText = (@($Reinjected) | ForEach-Object { [string]$_ }) -join "`n"
+if (Get-Command Limit-VcoHookContext -ErrorAction SilentlyContinue) {
+    $ReinjectText = Limit-VcoHookContext -Text $ReinjectText -Pointer "The rest is on disk: Read .claude/CONTEXT_STATE.md (and .claude/context/CONTEXT_STATE_<session>.md, the active plan under .claude/context/plans/, .claude/context/pre-compact-snapshot.md)."
+}
+if ($ReinjectText) { Write-Output $ReinjectText }
 exit 0

@@ -290,6 +290,17 @@ export const AUTO_RETRY_BACKED_CONDITIONS: ReadonlySet<string> = new Set([
   // silently). `retry:py:kg_seed` re-runs `sync_knowledge_graph.py --all`,
   // whose `--all` tail is exactly that refresh — the retry is real.
   'kg_node_formats_refresh_failed',
+  // v0.2.100 WP-12: Ollama unreachable at update, or a planned model pull
+  // failed. `retry:py:ollama_models` (vco_lib.deferral_retry →
+  // ollama_pull.retry_owed_model_work) completes the pulls and the KG seed
+  // once Ollama answers, so the retry claim is true for both rows.
+  'ollama_not_ready_at_update',
+  'ollama_model_pull_failed',
+  // v0.2.100 W4R-06: VCO's own code_embed was down at an update. The
+  // session-start ensure hook starts the container and
+  // `retry:py:code_embed_backend` resolves the row once the code backend
+  // answers, so the retry claim is true.
+  'code_embed_backend_unavailable',
   // DOCUMENTED EXCEPTION — no `retry_action` ON PURPOSE. The work is already
   // scheduled: the flip transaction inserted a `code_graph_builds` pending row
   // and the launcher's own build runner consumes it. A WP-H handler here would
