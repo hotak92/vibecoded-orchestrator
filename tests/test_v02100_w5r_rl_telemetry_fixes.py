@@ -250,7 +250,11 @@ def test_hand_off_detaches_and_the_child_sends_both_events(tmp_path, monkeypatch
     class _Hub(http.server.BaseHTTPRequestHandler):
         def do_POST(self):  # noqa: N802
             n = int(self.headers.get("Content-Length") or 0)
-            got.append(json.loads(self.rfile.read(n)))
+            body = json.loads(self.rfile.read(n) or b"null")
+            # Record only the RL event route: the child may also reach other
+            # hub routes (seen on CI), which are not what this test measures.
+            if self.path.rstrip("/").endswith("/api/v1/rl/events"):
+                got.append(body)
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b"{}")

@@ -107,8 +107,14 @@ export function listenAliases(files: SourceFile[]): Set<string> {
   return out;
 }
 
+/** Escape every RegExp metacharacter (not only `$`) before splicing an
+ *  identifier into a pattern. */
+function escapeRegExp(text: string): string {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 export function frontendListenSites(files: SourceFile[]): Site[] {
-  const aliases = [...listenAliases(files)].map((a) => a.replace(/\$/g, '\\$')).join('|');
+  const aliases = [...listenAliases(files)].map(escapeRegExp).join('|');
   const re = new RegExp(
     `(?<![\\w$.])(${aliases})\\s*(?:<(?:[^<>()]|<(?:[^<>()]|<[^<>()]*>)*>)*>)?\\s*\\(\\s*`,
     'g',
