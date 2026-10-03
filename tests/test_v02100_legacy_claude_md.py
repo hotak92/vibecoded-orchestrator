@@ -225,8 +225,12 @@ class TestEditedMigrationDoesNotDuplicateVcoSections:
             assert mine in user, mine
         assert text.endswith("\n## Added below\nmine\n")
         # The unedited VCO sections exist once — in the managed region.
-        for vco in ("## KG-First Search Policy", "## VCO-Managed Files",
-                    "## KG / Context / Memory / Plans are LOAD-BEARING"):
+        # (Heading names follow the current template: the search-policy and
+        # persistence sections were renamed in the 2026-10 instruction-file
+        # pass — same rules, de-duplicated homes.)
+        for vco in ("## Search before you answer project questions",
+                    "## VCO-Managed Files",
+                    "## Persistence layers: KG, context, memory, plans"):
             assert vco not in user, vco
             assert text.count(vco) == 1 and vco in managed
         assert "## SESSION START (always)" in user, "the EDITED VCO section is kept"

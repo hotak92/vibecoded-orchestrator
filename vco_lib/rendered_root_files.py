@@ -40,6 +40,8 @@ import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from vco_lib import setup_sections
+
 #: The format version this loader understands. Bumped in lockstep with the
 #: table and the Rust loader's ``SUPPORTED_FORMAT_VERSION``.
 SUPPORTED_FORMAT_VERSION = 1
@@ -385,6 +387,21 @@ def render_entry(install_root: Path, entry: RenderedRootFile, *,
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
     rendered = result.text
+    # SETUP-ONLY blocks (v0.2.101): a block the user has acted on (its content
+    # hash is acknowledged, see vco_lib.setup_sections) is OMITTED from the
+    # render so the removal survives the re-render; an unacknowledged block
+    # renders as before and is reported as pending, which re-arms the
+    # `first_run_setup_pending` deferral row. `pending` is None only when the
+    # markers are malformed or the ack is unreadable — then the template is
+    # left exactly as it is and the row is left alone.
+    setup_pending: tuple[setup_sections.SetupBlock, ...] | None = None
+    try:
+        _acked = setup_sections.acknowledged_hashes(install_root)
+        rendered, _stripped = setup_sections.strip_blocks(
+            rendered, lambda b: b.sha256 in _acked)
+        setup_pending = setup_sections.find_blocks(rendered)
+    except (OSError, ValueError):
+        setup_pending = None
     findings = dict(
         unrendered=tuple(f"{u.name}@{u.line}" for u in result.unresolved),
         missing_paths=tuple(f"{m.name}={m.value}" for m in result.missing_paths),
@@ -430,6 +447,8 @@ def render_entry(install_root: Path, entry: RenderedRootFile, *,
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
     _mz.settle_deferrals(install_root, {entry.path: result}, surface=ROOT_FILE_SURFACE)
+    if setup_pending is not None:
+        setup_sections.emit_pending_deferral(install_root, setup_pending)
     return outcome
 
 

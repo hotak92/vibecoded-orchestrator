@@ -40,7 +40,13 @@ _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 **Before answering any non-trivial question:**
 
 1. Read `.claude/CONTEXT_STATE.md` — current task, recent progress, blockers.
-2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. **Read each entry's `**Disposition**:` line first and triage by it**, not by severity: `action_required` (someone must act) and `auto_retryable` (transient; VCO retries it) are real work; `environmental` (a true description of this machine) and `informational_record` (already done, or a by-design skip) are context, not tasks — do not spend the user's attention on them. The CLAUDE.md reminder block gives you the split ("N actionable, M informational/records") before you open the file. Two entries to surface proactively when present: `update_resume_required` (an update halted at a conflict and needs a manual nudge — click **Continue Update** in the launcher or run `python install.py --update`) and `launcher_update_diverged` (a GUI update could not fast-forward / pull / fully refresh the binary — inspect `git status`, resolve the divergence, then re-run the update). Each entry's **For your Claude assistant** block has the specific recovery. Do not assume an entry clears itself: every condition declares its class and the mechanism that clears it in the orchestrator's `vco_lib/deferral_conditions.toml`, and an `action_required` entry stays until the named thing is done. An `environmental` entry the user is happy with can be silenced with `python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id <id>` (run from the orchestrator root); that dismissal holds until the underlying state actually changes.
+2. Check `.claude/context/UPDATE_DEFERRED.md` if present — the last orchestrator update may have queued conditions you need to know about. Triage each entry by its `Disposition:` line (its class), not by how alarming it reads, and do not assume an entry clears itself: every condition declares its class and the mechanism that clears it in the orchestrator's `vco_lib/deferral_conditions.toml`, and the entry's **For your Claude assistant** block carries the specific recovery. The CLAUDE.md reminder block gives you the split ("N actionable, M informational/records") before you open the file.
+   - `action_required` — a human must do the named thing; it will not resolve on its own. Surface it.
+   - `auto_retryable` — owed work (a KG seed, a code-graph walk) skipped because a backend was down; the session-start hook hands it to a detached retry driver. Don't ask the user to do anything.
+   - `environmental` — a true description of this machine (e.g. two Ollama daemons). It persists while it is true; that is not a bug. If the user is happy with it, silence it: `python -m vco_lib.project_init dismiss-deferral --folder <project> --condition-id <id>` (run from the orchestrator root; the dismissal holds until the underlying state actually changes).
+   - `informational_record` — already done, or a by-design skip. Nothing is pending; do not surface it as a problem.
+
+   Two entries to surface proactively when present: `update_resume_required` (an update halted at a conflict and needs a manual nudge — click **Continue Update** in the launcher or run `python install.py --update`) and `launcher_update_diverged` (a GUI update could not fast-forward / pull / fully refresh the binary — inspect `git status`, resolve the divergence, then re-run the update).
 3. For architecture / system questions → search the KG **before** generating a response.
 4. For any other project question → search KG / code graph **before** answering.
 
@@ -50,11 +56,11 @@ _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 
 ---
 
-## KG / Context / Memory / Plans are LOAD-BEARING
+## Persistence layers: KG, context, memory, plans
 
-These four persistence layers exist for a reason — future-you, future-agents, and the user rely on them. Treat them like commits to a codebase, not optional notes:
+Four layers carry state across sessions — future-you, future agents, and the user rely on them. Treat writes to them like commits to a codebase, not optional notes:
 
-- **Knowledge Graph**: cross-project patterns, concepts, decisions. Write a node BEFORE moving on after learning a non-obvious fact (architecture, gotcha, decision rationale, post-incident insight). The `kg-update-nudge` hook fires after ~175k work units accumulated without a KG write (then every 50k after, escalating) — treat that nudge as a hard prompt. **Three legitimate ways to silence it**: (a) **write a real KG node** — `Write`/`Edit` to `knowledge/**/*.md` or call `store_knowledge_node` (this is the default and what the nudge wants); (b) **transcript escape marker** `[No KG update needed: <one-line reason naming what you searched for>]` as top-level reply text (NOT inside a tool call) — only after running `hybrid_search` for 2-5 candidate lessons and finding nothing; the reason must name the topic(s) you searched (bare reasons like "nothing new" are rejected); (c) **env var `KG_NUDGE_OFF=1`** — disables the hook for that shell, use only during releases or orthogonal work where injection would be noise.
+- **Knowledge Graph**: cross-project patterns, concepts, decisions. Write a node BEFORE moving on after learning a non-obvious fact (architecture, gotcha, decision rationale, post-incident insight). The `kg-update-nudge` hook fires after ~175k work units accumulated without a KG write, then every 50k work units after (a constant interval — a second nudge means you skipped the first, not that the gap is growing); treat that nudge as a hard prompt. **Three legitimate ways to silence it**: (a) **write a real KG node** — `Write`/`Edit` to `knowledge/**/*.md` or call `store_knowledge_node` (this is the default and what the nudge wants); (b) **transcript escape marker** `[No KG update needed: <one-line reason naming what you searched for>]` as top-level reply text (NOT inside a tool call) — only after running `hybrid_search` for 2-5 candidate lessons and finding nothing; the reason must name the topic(s) you searched (bare reasons like "nothing new" are rejected); (c) **env var `KG_NUDGE_OFF=1`** — disables the hook for that shell, use only during releases or orthogonal work where injection would be noise.
 - **CONTEXT_STATE.md**: current task, recent progress, blockers. Update DURING work, not at end. Stale state = future-you starts confused.
 - **MEMORY.md** (`~/.claude/projects/.../memory/MEMORY.md`): user preferences, recurring fixes, stable facts. NOT in git. Loaded into the system prompt every session, **hard-truncated to the first 200 lines / ~25 KB (everything after is silently dropped)** — so keep it a one-line-per-entry index and put detail in topic files (loaded on demand, not capped).
 - **Plans** (`.claude/context/plans/`): non-trivial work breakdowns with rationale. Active plans here; archived plans in `archive/`. Update when scope changes.
@@ -63,20 +69,20 @@ These four persistence layers exist for a reason — future-you, future-agents, 
 
 ---
 
-## KG-First Search Policy
+## Search before you answer project questions
 
-Before searching OR reasoning about project topics, choose the right tool:
+For questions about this project's state, decisions, patterns, or architecture, look it up before answering — never explain from memory what the codebase does, what patterns exist, or what was previously decided. For general coding questions, syntax, or files already in context, answer directly; searching first there costs tokens and finds nothing.
 
-1. Conceptual question → `hybrid_search` (Weaviate MCP) — searches KG + docs together.
+One decision tree for picking the tool:
+
+1. Conceptual question, patterns, "how does X work?" → `hybrid_search` (Weaviate MCP) — searches KG + docs together; the default.
 2. Relational ("what links to what") → `semantic_graph_search`.
-3. Code by purpose → `search_code_graph`.
-4. Architecture / callers / deps → `query_code_structure`.
+3. Code by purpose → `search_code_graph` (before opening files).
+4. Architecture / callers / deps → `query_code_structure` (before grep).
 5. Known exact term/tag/title → `kg-search` CLI (~100 ms).
-6. Quick analysis or rewrite → use Claude directly.
-
-**This applies to reasoning too** — do NOT explain what the codebase does, what patterns exist, or what was previously decided from memory alone.
-
-Only use `Grep` / `Read` when the user provides an exact file path, you're hunting literal strings, the file is already in context, or you need line-by-line detail.
+6. Literal strings (variable names, error messages), an exact file path the user gave, or line-by-line detail → Grep / Read.
+7. Quick analysis or rewrite of content already in context → use Claude directly.
+8. Still unsure → `hybrid_search` (most comprehensive).
 
 ---
 
@@ -85,44 +91,18 @@ Only use `Grep` / `Read` when the user provides an exact file path, you're hunti
 
 This section is here because a **model gateway is configured for this machine** (Services → Model gateway in the launcher). It would be absent otherwise — a project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise. Turn it off per-project from the same card.
 
-**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (v0.2.92: the ONE permitted edit is appending the `[1m]` context-window hint to the SAME model id, which is disclosed in the done message — the model a slot names is never changed). A subagent that declares no model runs on the session's model unless `CLAUDE_CODE_SUBAGENT_MODEL` is set in the environment — check with `echo $CLAUDE_CODE_SUBAGENT_MODEL` (empty = inherits) rather than assuming. Choose models visibly, in `/model` or in the agent's own frontmatter. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers ten definitions across two lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none). The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
+**The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (the one permitted edit is appending the `[1m]` context-window hint to the SAME model id, disclosed in the done message — the model a slot names is never changed).
+
+**Name the model on every subagent dispatch** — via the Agent-tool `model` parameter or `model:` in the agent definition's frontmatter; never rely on a subagent inheriting the session's model. When several sources name a model, the resolution order is: Agent-tool parameter > definition frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` env var > session model; `/tasks` shows the model each subagent actually ran on. When you need to wait for something to finish (a test suite, a build, a background agent), start it with `run_in_background` and continue or end your turn — its completion notification wakes you when it is done. To spawn a gateway subagent, dispatch it by definition name and pass no model override: the Agent tool's own model enum cannot carry `claude-gw/*` ids, but a definition's frontmatter can. This module delivers ten definitions across two lanes — on the next bundle update, whenever the model gateway is configured on this machine (a project switched off in Services → Model gateway receives none). The z.ai lane — `@glm-implementer`, `@glm-reviewer`, `@glm-planner`, `@glm-flash-researcher` — covers implementation, review, planning and investigation on `claude-gw/glm-5.3[1m]`, with the flash variant kept for research. The qwen-vendor lane covers execution and research on `claude-gw/qwen/*[1m]`: `@deepseek-implementer` and `@qwen-implementer` for implementation that needs several files in view at once, `@qwen-flash-implementer` for cheap, fully-specified mechanical edits, `@deepseek-researcher` and `@qwen-flash-researcher` for read-only research that returns a lead rather than a verdict, and `@qwen-flash-sweeper` for applying one mechanical rule across many items. There is deliberately **no reviewer and no planner on the qwen vendor** — those two roles stay on the z.ai lane and on the Anthropic tiers.
+
+{{MODEL_SELECTION_GRID}}
 
 **When you route to GLM, route to `claude-gw/glm-5.3[1m]`** — not the flash variant, and not a pre-5.3 version, unless the user explicitly asks for one. Version matters beyond quality: context windows are version-keyed (glm-5.3 is 1M on both the z.ai and the qwen route, glm-5.1 is 200K); `glm-5.2` is not provided at all — the gateway refuses it and suggests glm-5.3, so "the GLM one" is not a specification.
 
-⚠️ **Everything below is conditional on YOU having supplied the vendor's API
-key.** VCO ships no third-party key and never writes one. Without a key and a
-gateway, the `claude-gw/*` ids are unreachable and only the Anthropic rows apply.
-
-**The capability ladder, and it is one ordering, not five opinions**:
-**Fable 5.1 > Opus 5 > `glm-5.3` > `glm-5.3-flash` > Sonnet 5.** That is the
-Artificial Analysis Intelligence Index v4.1.1 composite read in order — 66, 63,
-60, 57, 55 — and it matches hands-on use on a large repository. Two consequences
-worth stating because they surprise people: **both GLM tiers rank above Sonnet
-5**, and `glm-5.3` sits nearer Opus than Sonnet. So **Sonnet should be a rare
-choice** — reach for it when the models above it are unavailable, not as the
-default middle rung.
-
-| Task class | Route to | Why |
-|---|---|---|
-| Final plans, adversarial review, hardest architecture | Fable 5.1 | Highest independent composite (Artificial Analysis Intelligence Index v4.1.1: 66, top of the five compared) |
-| Agentic coding on real repos, multi-file refactors | Opus 5 | 97.0% SWE-bench Verified, first of 86 models on that leaderboard (Vals AI) |
-| Bulk code generation, debugging, mid-tier implementation | `claude-gw/glm-5.3[1m]` | Sits between Sonnet 5 and Opus 5 and **nearer Opus** — slightly below it. Roughly 60% of Sonnet's price |
-| High-volume mechanical sweeps, first-pass triage | `claude-gw/glm-5.3-flash[1m]`, **behind a verifier** | **Slightly above Sonnet 5**, at ~1/15 the price |
-| Anything with an image, screenshot or diagram as input | a Claude model | GLM-5.3 (non-flash) is text-only |
-| Unsupervised edits to a green test suite | **not flash** | It broke an already-passing baseline test in 6.9% of agent rollouts (vs 4.4% for GLM-5.3) |
-
-**Where those placements come from, and which evidence wins.** The two GLM rows
-reflect hands-on use on a large real codebase, not a leaderboard: `glm-5.3` reads
-as an Opus-class model a little short of Opus, and flash as a little better than
-Sonnet 5. A published composite (Artificial Analysis Intelligence Index v4.1.1)
-scores them 60 and 57 against Sonnet 5's 55 — same ordering, but it compresses a
-gap that is wider in practice. Where the two disagree, **prefer the hands-on
-placement**: no public index measures agentic work on a repository of this size,
-and the index figures have no in-repo citation, while the placement above does.
-
-Two guardrails on flash, both from the same measurement: retries rescue it, more effort does not (longer runs helped it only 46% of the time — below chance), so cascade rather than escalate, and always verify its output against tests or a stronger second pass.
-
-**Do not propagate the circulating "GLM-5.3-Flash = 92% SWE-bench Verified" figure.** It is not on the leaderboard it cites and contradicts every other measurement of that model.
+⚠️ **The gateway rows of the grid are conditional on YOU having supplied the
+vendor's API key.** VCO ships no third-party key and never writes one. Without a
+key and a gateway, the `claude-gw/*` ids are unreachable and only the Anthropic
+rows apply.
 
 **Window size is known. Competence across it is not. Keep the two apart.**
 
@@ -141,8 +121,8 @@ would only introduce drift.
 Code sizes a session from the id string it was given, and the gateway publishes
 the 1M variant of a row as `<id>[1m]` — the suffix is the whole signal. A bare
 gateway id is budgeted at **200 000** tokens even when the model's own row says
-1M (measured 2026-09-28: `claude-gw/glm-5.3` → 200 000, `claude-gw/glm-5.3[1m]`
-→ 1 000 000, the same pair for `claude-gw/qwen/qwen3.8-max`), so an unsuffixed
+1M (`claude-gw/glm-5.3` → 200 000, `claude-gw/glm-5.3[1m]` → 1 000 000, and
+the same pair for `claude-gw/qwen/qwen3.8-max`), so an unsuffixed
 spelling costs the session 800 000 tokens of window and triggers an early
 auto-compact while the picker advertises the larger figure. Every shipped
 gateway id — the picker's, and the `model:` of each `module-gateway` agent — is
@@ -252,15 +232,12 @@ anything.
    contradicting `weaviate-kg` block (backing the file up first), but check
    it yourself when adopting an unfamiliar checkout. Restart Claude Code
    afterwards so the MCP re-reads the corrected env.
-9. **After the move, re-read the deferral ledger with suspicion.** Before
-   v0.2.92, some VCO checks re-derived the project's identity from the FOLDER
-   BASENAME rather than the registered name, so a move could make a project's
-   own live collections look like foreign "legacy" data — complete with drop
-   commands. Identity now resolves from the registered row and the live
-   bindings, and an emitted drop command re-validates against those bindings
-   before it runs. A ledger entry written by an OLDER version can still carry
-   a command built on the old, wrong identity. So before running ANY
-   collection migration or drop command from
+9. **After the move, re-read the deferral ledger with suspicion.** Project
+   identity resolves from the registered launcher row and the live bindings,
+   never from the folder basename, and an emitted drop command re-validates
+   against those bindings before it runs. A ledger entry written by an OLDER
+   VCO version can still carry a command built on the old, wrong identity. So
+   before running ANY collection migration or drop command from
    `UPDATE_DEFERRED.md`, verify against the live bindings: the launcher's
    Identity tab, the hub's `/config` response, and the collections that
    actually hold your objects. If the "legacy" class is the one your

@@ -91,6 +91,7 @@ until a clean render clears it.
 | `{{OLLAMA_URL}}` | Ollama URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{CODE_EMBED_URL}}` | Code-embedding service URL from this machine's endpoint row | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{HUB_PORT}}` | The vct-hub port at render time (`$VCT_HUB_PORT` → `hub.port` → 7700); a snapshot — clients re-resolve that ladder at run time | agents, skills, project templates, `rendered_root_files.toml` entries |
+| `{{MODEL_SELECTION_GRID}}` | The per-task model-selection table, rendered with only the rows for the model providers reachable on this machine at render time (a snapshot; no monitoring afterwards) | agents, skills, project templates, `rendered_root_files.toml` entries |
 | `{{INSTALLED_AT_PATH}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
 | `{{WORKING_DIR}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |
 | `{{WRAPPER_SCRIPT}}` | boot unit (value from the unit spec, vco_lib/boot_service.py) | boot-unit templates (`templates/systemd`, `launchd`, `windows`) |

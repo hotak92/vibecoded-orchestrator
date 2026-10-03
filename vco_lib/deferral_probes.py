@@ -1105,8 +1105,36 @@ def chunker_resync_still_owed(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def first_run_setup_sections_still_pending(ctx: ProbeContext) -> Optional[bool]:
+    """``first_run_setup_pending`` — is a rendered SETUP-ONLY block unacknowledged?
+
+    One thin wrapper over :func:`vco_lib.setup_sections.pending_rendered_blocks`,
+    which owns the whole rule (the marker scan and the hash acknowledgement).
+    The renderer asks the same module the same question about the text it is
+    about to write, so "the row is emitted" and "the probe says it still
+    applies" cannot disagree.
+
+    Returns:
+        True  — the rendered CLAUDE.md still carries a block the user has not
+                acted on, so the reminder stands.
+        False — no unacknowledged block remains (the cleanup script has run, or
+                the file has no blocks): the condition is provably over.
+        None  — could not look (unreadable file or a malformed marker pair).
+    """
+    from vco_lib import setup_sections
+
+    try:
+        pending = setup_sections.pending_rendered_blocks(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — could not look is not a verdict
+        return None
+    if pending is None:
+        return None
+    return bool(pending)
+
+
 PROBES: dict[str, ProbeFn] = {
     "bash_env_cleanup_still_owed": bash_env_cleanup_still_owed,
+    "first_run_setup_sections_still_pending": first_run_setup_sections_still_pending,
     "chunker_resync_still_owed": chunker_resync_still_owed,
     "gateway_exec_still_unrunnable": gateway_exec_still_unrunnable,
     "hub_back_after_restart_failure": hub_back_after_restart_failure,

@@ -1507,6 +1507,23 @@ does not re-detect it and `InstallDeferralFlow.finalize()` drops it (the \
 `owned-drop-when-absent` one-shot-expiry shape, same as the Rust-emitted \
 `stale_unit_retired_` precedent)."""
 
+[conditions.first_run_setup_pending]
+class = "action_required"
+owner = "vco_lib.rendered_root_files"
+clear_probe = "probe:py:first_run_setup_sections_still_pending"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101: the orchestrator-root CLAUDE.md still carries one or more \
+`<!-- BEGIN: SETUP-ONLY -->` blocks that the user has not acted on. Those blocks \
+live INSIDE the AUTO-rendered region of `templates/ORCHESTRATOR-CLAUDE.md.template`, \
+so the renderer (`vco_lib/rendered_root_files.render_entry`, install.py step 4c) \
+re-emits the row on every install/update while an un-acknowledged block is \
+rendered. Acting on the blocks and running \
+`python .claude/scripts/cleanup-setup-sections.py` records each block's content \
+hash in `.claude/state/setup-sections-ack.json` (atomic write); the renderer then \
+omits the acknowledged blocks, so the removal survives every future update, and \
+the row clears. A block whose content CHANGES in a later release has a new hash, \
+renders again, and re-arms the row."""
+
 [conditions.launcher_binary_stale]
 class = "action_required"
 owner = "launcher/src-tauri/src/services/binary_freshness.rs"

@@ -101,5 +101,5 @@ begin_marker = "<!-- BEGIN: AUTO"
 end_marker = "<!-- END: AUTO -->"
 substitutions = [
   "ORCHESTRATOR_ROOT", "VENV_PYTHON", "WEAVIATE_URL", "WEAVIATE_GRPC_PORT",
-  "OLLAMA_URL", "CODE_EMBED_URL", "HUB_PORT",
+  "OLLAMA_URL", "CODE_EMBED_URL", "HUB_PORT", "MODEL_SELECTION_GRID",
 ]
