@@ -601,7 +601,11 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
 
 
 # ── count_tokens: never worse than native ────────────────────────────────
-def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]:
+def count_tokens_estimate(
+    payload: Optional[Mapping[str, Any]] = None,
+    *,
+    raw: Optional[bytes] = None,
+) -> Optional[int]:
     """A bytes/4 floor for the countable content of a request, or ``None``.
 
     ``None`` means "there is nothing to count" — no ``messages`` and no
@@ -610,10 +614,19 @@ def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]
     cannot cost zero tokens, and an endpoint that says so is telling the
     client something the client's own fallback would have contradicted.
 
-    Only ``messages`` and ``system`` are measured. Tools, metadata and
-    sampling parameters do consume tokens upstream, but including them would
-    move this from "a floor the client already trusts" to "a competing
-    estimate", and the point is to be no worse than the client's own guess.
+    Two ways to measure the SAME floor, and the caller picks the cheap one.
+    ``raw`` is the request body EXACTLY as the client sent it, which the
+    request path already holds: ``len(raw) / ESTIMATE_BYTES_PER_TOKEN`` is
+    the floor without re-serialising the parsed conversation, so a streamed
+    multi-MB transcript is never ``json.dumps``-ed on the event loop for it.
+    It measures the WHOLE body — tools, model id, sampling params included —
+    and so is a slightly HIGHER floor than the ``messages`` + ``system``
+    serialisation below; that is the correct direction for a floor, and the
+    client's own fallback counts the whole request too. Without ``raw`` (the
+    unit-test and count-body path) only ``messages`` and ``system`` are
+    serialised explicitly, and tools, metadata and sampling parameters stay
+    out of it so this remains "a floor the client already trusts" rather than
+    a competing estimate.
     """
     if not isinstance(payload, Mapping):
         return None
@@ -624,11 +637,14 @@ def count_tokens_estimate(payload: Optional[Mapping[str, Any]]) -> Optional[int]
             countable[key] = value
     if not countable:
         return None
-    size = len(
-        json.dumps(countable, ensure_ascii=False, separators=(",", ":")).encode(
-            "utf-8",
+    if raw is not None:
+        size = len(raw)
+    else:
+        size = len(
+            json.dumps(countable, ensure_ascii=False, separators=(",", ":")).encode(
+                "utf-8",
+            )
         )
-    )
     return max(1, math.ceil(size / ESTIMATE_BYTES_PER_TOKEN))
 
 
@@ -773,6 +789,15 @@ class UsageLedger:
         self._dropped = 0
         self._rotation_warned = False
         self._last_by_session: "OrderedDict[str, UsageRecord]" = OrderedDict()
+        #: Last row per ``(session, agent)`` identity, for
+        #: :meth:`context_floor`. A SECOND index rather than a second scan:
+        #: the floor must match BOTH halves exactly, and the per-chat map
+        #: holds one row per chat (last submit wins, any agent), so it cannot
+        #: answer "this agent's row" once a sibling has written. LRU-capped
+        #: like the per-chat map, by the same count.
+        self._last_by_identity: (
+            "OrderedDict[tuple[str, Optional[str]], UsageRecord]"
+        ) = OrderedDict()
         self._pending: set = set()
 
     # ── paths ────────────────────────────────────────────────────────────
@@ -841,6 +866,11 @@ class UsageLedger:
             self._last_by_session[record.session] = record
             while len(self._last_by_session) > self._max_sessions:
                 self._last_by_session.popitem(last=False)
+            identity = (record.session, record.agent)
+            self._last_by_identity.pop(identity, None)
+            self._last_by_identity[identity] = record
+            while len(self._last_by_identity) > self._max_sessions:
+                self._last_by_identity.popitem(last=False)
 
     def _append(self, record: UsageRecord) -> None:
         target = self.path
@@ -941,6 +971,40 @@ class UsageLedger:
             for key, record in items
             if only is None or key == only
         }
+
+    def context_floor(
+        self, *, session: Optional[str], agent: Optional[str],
+    ) -> Optional[int]:
+        """The ledger floor for exactly this identity, or ``None``.
+
+        A FLOOR, not a prediction: the matching record's ``context_after`` is
+        what the next turn carries at MINIMUM (last turn's input plus its
+        output), which is exactly the property the ``message_start`` usage
+        fill needs — a positive figure that is never an overestimate of the
+        conversation the request is continuing.
+
+        The match is EXACT on BOTH halves of the identity: the session AND
+        the agent, where ``None`` is a value like any other — a main-chat
+        request (``agent is None``) matches only a row that also carried no
+        agent. There is deliberately NO fallback: the per-chat map holds one
+        row per chat (last submit wins, whatever agent wrote it), so a
+        sibling subagent's newer turn would otherwise stand in for this one —
+        and a forked conversation's size is not a floor for the main chat. A
+        request with NO session has no conversation to key on, so it gets no
+        ledger floor at all and the caller's own estimate applies.
+
+        Cheap by construction: one ``(session, agent)`` lookup in the
+        LRU-bounded index — no scan of the map and no file read. ``None``
+        when nothing matches or the match is non-positive; the caller then
+        falls back to its own estimate rather than inventing a number here.
+        """
+        if session is None:
+            return None
+        with self._lock:
+            record = self._last_by_identity.get((session, agent))
+        if record is None or record.context_after <= 0:
+            return None
+        return record.context_after
 
     def health(self) -> "dict[str, Any]":
         """The ``/health`` block. Cached state only — never touches the disk."""

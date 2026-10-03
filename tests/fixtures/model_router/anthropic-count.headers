@@ -1,0 +1,14 @@
+HTTP 200 OK
+Date: Sat, 03 Oct 2026 19:51:00 GMT
+Content-Type: application/json
+request-id: req_011CfftKcE1wt3ABNU47mJjG
+anthropic-organization-id: 00000000-0000-0000-0000-000000000000
+anthropic-workspace-id: wrkspc_0000000000000000000000
+Vary: Accept-Encoding
+Content-Security-Policy: default-src 'none'; frame-ancestors 'none'
+Server: cloudflare
+server-timing: x-originResponse;dur=60
+cf-cache-status: DYNAMIC
+X-Robots-Tag: none
+CF-RAY: a44e7aa2ea3cee7d-MXP
+Transfer-Encoding: chunked

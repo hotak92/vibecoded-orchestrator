@@ -1,0 +1,13 @@
+HTTP 200 OK
+Content-Type: text/event-stream; charset=utf-8
+grpc-encoding: identity
+grpc-accept-encoding: gzip
+x-envoy-upstream-service-time: 806
+Cache-Control: no-cache
+Date: Sat, 03 Oct 2026 19:51:13 GMT
+Server: istio-envoy
+x-request-id: fd8058f6-7ebf-4466-bcc3-e4d01571eb19
+req-cost-time: 806
+req-arrive-time: 1791057072715
+resp-start-time: 1791057073522
+Transfer-Encoding: chunked

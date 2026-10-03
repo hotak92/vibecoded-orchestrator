@@ -1,0 +1,11 @@
+HTTP 200 OK
+Date: Sat, 03 Oct 2026 19:51:08 GMT
+Content-Type: application/json
+Alt-Svc: h3=":443"; ma=3600
+ga-traceid: be997806a020f042406c7bfa23f12593
+Vary: Origin
+X-LOG-ID: 202610040351041083f30b66f4479c
+x-process-time: 4.104999
+X-Request-ID: bb00d864-e8c3-41ab-a763-3c7ef1fc897b
+Content-Length: 328
+Server: Python/3.12 aiohttp/3.13.5

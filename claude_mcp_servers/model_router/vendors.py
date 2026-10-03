@@ -167,6 +167,35 @@ class Vendor:
         short_name: the compact label the usage status line and the
             launcher's usage card print for this vendor (``GLM``, ``Qwen``).
             Falls back to :func:`vendor_display_name` when empty.
+        partial_message_start_usage: True when this vendor's STREAMING
+            ``message_start`` was MEASURED to lack the real input/cache
+            figures, which arrive only in the final ``message_delta``. Two
+            shapes were captured live 2026-10-03 (parity audit gap 3,
+            fixtures in ``tests/fixtures/model_router/``): z.ai reports
+            ``{"input_tokens": 0, "output_tokens": 0}`` and no cache fields;
+            the qwen endpoint reports a small non-zero ``input_tokens`` that
+            under-reads the final figure (4 where the delta says 36) and no
+            cache fields. Claude Code stamps each content block's transcript
+            entry with the usage it knows at that moment, so an all-zero
+            ``message_start`` writes an all-zero transcript entry and the
+            VS Code agent row keeps "resetting"; a partial one under-reads
+            the session. For a flagged row the SSE rewriter lifts
+            ``message_start``'s ``input_tokens`` to a positive FLOOR estimate
+            (never lowers it, never touches the cache fields — see
+            :class:`model_router.tool_ids.SseIdRewriter` and
+            ``server.py::_message_start_usage_estimate``); the final
+            ``message_delta`` carries the vendor's real figures, and because
+            the accumulator's merge rule is last-positive-wins those real
+            POSITIVES replace the estimate, so the ledger records the
+            vendor's own numbers. The one case where it does not: a delta
+            that repeats a ZERO for ``input_tokens`` never overwrites the
+            positive the splice planted in ``message_start``, so that row
+            keeps the estimate. Today's two measured vendors both send
+            positives in the delta (the captured fixtures show it), so this
+            is a boundary of the claim, not a live case. A row that does not declare the flag is
+            relayed byte-identically, and a flagged row whose event already
+            reports at least the floor is too — the splice fires on the
+            measured deficiency, not on the flag alone.
     """
 
     vendor_id: str
@@ -199,6 +228,7 @@ class Vendor:
     verified_ids: tuple[str, ...] = ()
     quota_url: Optional[str] = None
     short_name: str = ""
+    partial_message_start_usage: bool = False
 
 
 ANTHROPIC_FAMILY = AnthropicFamily(
@@ -262,6 +292,14 @@ VENDORS: Mapping[str, Vendor] = {
         # model_router.usage_windows.parse_zai_quota for how both read.
         quota_url="https://api.z.ai/api/monitor/usage/quota/limit",
         short_name="GLM",
+        # Measured on this machine's transcripts 2026-10-03: 110 of 598 GLM
+        # assistant entries carried ALL-ZERO usage, because the endpoint's
+        # streamed message_start reports input_tokens 0 / output_tokens 0 and
+        # the real figures arrive only in message_delta (live capture:
+        # tests/fixtures/model_router/zai-stream.body). usage.py's merge rule
+        # already keeps the LEDGER correct for this shape; the flag fixes what
+        # the CLIENT's transcript sees.
+        partial_message_start_usage=True,
     ),
     "qwen": Vendor(
         vendor_id="qwen",
@@ -322,6 +360,15 @@ VENDORS: Mapping[str, Vendor] = {
         # and no quota headers (probed 2026-09-23), so usage shows the
         # gateway ledger's tokens for the month instead of a percentage.
         short_name="Qwen",
+        # Live capture 2026-10-03 (parity audit gap 3; fixtures
+        # tests/fixtures/model_router/qwen-deepseek-stream.body,
+        # qwen-max-stream.body): message_start reports a small non-zero
+        # input_tokens that under-reads the final figure (4 at the start,
+        # 36 in the delta on the same turn) and NO cache fields — the same
+        # deficiency as z.ai's zeros, one degree milder. The floor splice
+        # only ever LIFTS the figure, so a turn whose real input already
+        # exceeds the floor is relayed byte-identically.
+        partial_message_start_usage=True,
     ),
 }
 

@@ -1,0 +1,14 @@
+HTTP 200 OK
+Date: Sat, 03 Oct 2026 19:51:16 GMT
+Content-Type: text/event-stream; charset=utf-8
+Alt-Svc: h3=":443"; ma=3600
+ga-traceid: e26251197895cc36045e9cc1a5df8da3
+Vary: Origin
+X-LOG-ID: 20261004035114c52a2af9a7e74f81
+Cache-Control: no-cache
+Access-Control-Allow-Origin: *
+Access-Control-Allow-Headers: *
+x-process-time: 1.105945
+X-Request-ID: b2bb4987-5149-441c-879b-faee4c6fcafd
+Transfer-Encoding: chunked
+Server: Python/3.12 aiohttp/3.13.5

@@ -1,0 +1,1 @@
+{"id":"msg_202610040351041083f30b66f4479c","type":"message","role":"assistant","model":"glm-5.3","content":[{"type":"text","text":"Hi"}],"stop_reason":"end_turn","stop_sequence":null,"usage":{"input_tokens":145,"output_tokens":3,"cache_read_input_tokens":0,"server_tool_use":{"web_search_requests":0},"service_tier":"standard"}}

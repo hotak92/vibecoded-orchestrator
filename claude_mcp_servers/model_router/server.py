@@ -1086,9 +1086,13 @@ class RequestFacts:
     parent_agent: Optional[str]
     #: This request is :data:`COUNT_TOKENS_PATH`.
     count_tokens: bool
-    #: The gateway's own bytes/4 floor over the client's ``messages`` +
-    #: ``system``, for the vendor zero-guard. ``None`` when there is nothing
-    #: to count, or when the body was never parsed (the over-buffer path).
+    #: The gateway's own bytes/4 floor over the request's body bytes.
+    #: Two readers, one value: the vendor ``count_tokens`` zero-guard, and the
+    #: ``message_start`` ``input_tokens`` floor for a vendor flagged
+    #: ``partial_message_start_usage`` (streamed requests only — a
+    #: non-streamed body carries its real usage natively). ``None`` when there
+    #: is nothing to count, when the body was never parsed (the over-buffer
+    #: path), or when this request has no reader for it.
     count_estimate: Optional[int]
 
 
@@ -1165,6 +1169,42 @@ def _submit_usage(
     except RuntimeError:  # pragma: no cover — handlers always have a loop
         loop = None
     gateway.usage.submit(record, loop=loop)
+
+
+def _message_start_usage_estimate(
+    gateway: "Gateway", facts: Optional[RequestFacts],
+) -> Optional[int]:
+    """A positive ``input_tokens`` floor for a vendor that under-reports it.
+
+    Read by the SSE rewriter's ``message_start`` splice on a vendor flagged
+    ``partial_message_start_usage`` (data, ``vendors.py``). Two sources, both
+    FLOORS rather than guesses, and the larger one wins:
+
+    * the ledger's last real input+cache total for this request's own
+      identity (:meth:`model_router.usage.UsageLedger.context_floor` —
+      the row matching BOTH the request's session and its agent, so a
+      sibling subagent's turn never stands in for the main chat). Its
+      ``context_after`` is what this turn carries at minimum;
+    * the request's own bytes/4 floor (``count_estimate``), which covers the
+      growth since that row — the new user turn and tool results — and a
+      chat whose first turn has no ledger row yet.
+
+    ``None`` when neither has anything to say, and then the rewriter leaves
+    the vendor's event untouched: the splice must lift to a measured floor or
+    not at all, never to an invented number, and "not at all" is today's
+    behaviour — so a failure here can never be worse than the status quo.
+    """
+    if facts is None:
+        return None
+    candidates: list[int] = []
+    floor = gateway.usage.context_floor(
+        session=facts.session, agent=facts.agent,
+    )
+    if floor is not None and floor > 0:
+        candidates.append(floor)
+    if facts.count_estimate is not None and facts.count_estimate > 0:
+        candidates.append(facts.count_estimate)
+    return max(candidates) if candidates else None
 
 
 def _log_safe(value: object) -> str:
@@ -1774,11 +1814,24 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         agent=agent,
         parent_agent=parent_agent,
         count_tokens=is_count_tokens,
-        # Only a VENDOR count_tokens can need it, and computing it otherwise
-        # would serialise a whole conversation for an answer nobody reads.
+        # Only two vendor-routed shapes can need it — a count_tokens call
+        # (the zero-guard) and a STREAMED request to a vendor measured to
+        # under-report its message_start usage (the floor splice) — and
+        # computing it otherwise would run for an answer nobody reads. The
+        # floor is read off the request's OWN body bytes (``raw``, already in
+        # hand), not a fresh ``json.dumps`` of the parsed conversation: one
+        # computation per request, nothing per streamed event.
         count_estimate=(
-            count_tokens_estimate(payload)
-            if is_count_tokens and not decision.is_anthropic
+            count_tokens_estimate(payload, raw=raw)
+            if not decision.is_anthropic
+            and (
+                is_count_tokens
+                or (
+                    stream_requested
+                    and decision.vendor is not None
+                    and decision.vendor.partial_message_start_usage
+                )
+            )
             else None
         ),
     )
@@ -2244,11 +2297,25 @@ async def _proxy(
                     accumulator=accumulator,
                 )
 
-            rewriter = (
-                SseIdRewriter(id_map=gateway.id_map(vendor))
-                if vendor is not None and is_stream
-                else None
-            )
+            rewriter = None
+            if vendor is not None and is_stream:
+                # A vendor flagged ``partial_message_start_usage`` (data,
+                # ``vendors.py``) gets a positive floor estimate for its
+                # ``message_start`` ``input_tokens``. Guarded like every
+                # optional pass: a failure to estimate relays the vendor's
+                # event untouched, which is today's behaviour — the splice
+                # can degrade to the status quo and never below it.
+                fill: Optional[int] = None
+                if vendor.partial_message_start_usage:
+                    guarded_fill = _guarded(
+                        _message_start_usage_estimate, gateway, facts,
+                        what="message_start usage estimate",
+                    )
+                    fill = None if guarded_fill is _ABANDON else guarded_fill
+                rewriter = SseIdRewriter(
+                    id_map=gateway.id_map(vendor),
+                    message_start_usage=fill,
+                )
 
             response = web.StreamResponse(status=upstream.status, headers=relay)
             # The relayed Content-Type header carries the type; we only choose
