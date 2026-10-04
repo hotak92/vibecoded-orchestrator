@@ -50,10 +50,20 @@ class _SpyService:
     def __init__(self, slots):
         self._slots = slots
         self.fanout_calls = 0
+        self.query_tasks: list = []
 
     def embed_text_all_configured(self, query, *, include_active=True):
         self.fanout_calls += 1
         self.include_active = include_active
+        return self._slots
+
+    def embed_text_query_all_configured(
+        self, query, *, task=None, include_active=True
+    ):
+        # v0.2.101: the dual-RL-log twin now uses the QUERY-side fan-out.
+        self.fanout_calls += 1
+        self.include_active = include_active
+        self.query_tasks.append(task)
         return self._slots
 
 

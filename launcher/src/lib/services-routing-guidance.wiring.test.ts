@@ -69,16 +69,18 @@ function calls(root: unknown, name: string): Node[] {
 }
 
 describe('Services page — routing guidance is seeded from the render gate', () => {
-  it('loads each project’s state with routingGuidance(p.folder_path)', () => {
-    const loads = calls(PAGE, 'routingGuidance');
-    expect(loads.length).toBeGreaterThan(0);
-    // The seed loop asks per project, keyed by the FOLDER (the argument the
-    // Python gate resolves); the post-toggle re-read passes the same value
-    // through a local, which is why "at least one" is the assertion.
-    const byFolder = loads.filter((c) =>
+  it('loads EVERY project with ONE batched call — routingGuidanceAll, not per-project spawns (S2)', () => {
+    // Review S2: seeding the list with `await routingGuidance(p.folder_path)`
+    // inside the loop spawned one sequential Python subprocess per project
+    // on every page open. The batched command answers for all folders in
+    // one interpreter start.
+    const batched = calls(PAGE, 'routingGuidanceAll');
+    expect(batched.length).toBe(1);
+    // ...and no per-project single ask keyed on the loop variable remains.
+    const perProject = calls(PAGE, 'routingGuidance').filter((c) =>
       isMember((c.arguments as Node[])[0], 'p', 'folder_path'),
     );
-    expect(byFolder.length).toBeGreaterThan(0);
+    expect(perProject).toHaveLength(0);
   });
 
   it('no longer reads the row-only projectHasRoutingGuidance (the G1 defect)', () => {

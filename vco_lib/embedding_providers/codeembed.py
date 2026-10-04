@@ -8,9 +8,11 @@ sentence-transformers, running in ``claude_mcp_servers/code_embedding_service``
 
   * ``GET /health`` →
     ``{"status": "ok", "backend": "...", "model": "...", "dim": N, ...}``
-  * ``POST /embed`` with ``{"texts": [...], "is_query": false}`` →
+  * ``POST /embed`` with ``{"texts": [...], "is_query": false, "task": null}`` →
     ``{"embeddings": [[...]], "dim": N, "count": N, "backend": "...", "model": "..."}``
-    Max 256 texts per call (server-side limit).
+    Max 256 texts per call (server-side limit). ``task`` (v0.2.101) names the
+    retrieval task so the service picks the right query instruction wording for
+    its loaded model (``is_query`` must be true for it to matter).
   * ``POST /api/embeddings`` (Ollama-compatible single-item shim) with
     ``{"model": "", "prompt": "..."}`` → ``{"embedding": [...]}``
 
@@ -134,7 +136,9 @@ class CodeEmbedAdapter:
 
     # ---- embed --------------------------------------------------------------
 
-    def embed(self, text: str, is_query: bool = False) -> list[float]:
+    def embed(
+        self, text: str, is_query: bool = False, task: str | None = None
+    ) -> list[float]:
         """Embed a single text.
 
         Always goes through the batched ``/embed`` endpoint (one-item
@@ -143,16 +147,22 @@ class CodeEmbedAdapter:
         prefix for query vs document at inference time, so callers
         should set ``is_query=True`` when embedding a search query.
 
+        ``task`` (v0.2.101) names the retrieval task (``chunking.QUERY_TASKS``
+        key) so the SERVICE can pick the right instruction wording for its
+        loaded model; ignored for models whose prefix is literal or empty.
+        Callers embedding a document leave it ``None``.
+
         Raises:
             RuntimeError: On non-2xx response or malformed payload.
         """
-        results = self.embed_batch([text], is_query=is_query)
+        results = self.embed_batch([text], is_query=is_query, task=task)
         return results[0]
 
     def embed_batch(
         self,
         texts: list[str],
         is_query: bool = False,
+        task: str | None = None,
     ) -> list[list[float]]:
         """Embed a batch of texts (auto-chunks at MAX_BATCH_SIZE).
 
@@ -165,19 +175,20 @@ class CodeEmbedAdapter:
             return []
 
         if len(texts) <= MAX_BATCH_SIZE:
-            return self._embed_chunk(texts, is_query=is_query)
+            return self._embed_chunk(texts, is_query=is_query, task=task)
 
         # Split into MAX_BATCH_SIZE-sized chunks; preserve order.
         out: list[list[float]] = []
         for i in range(0, len(texts), MAX_BATCH_SIZE):
             chunk = texts[i : i + MAX_BATCH_SIZE]
-            out.extend(self._embed_chunk(chunk, is_query=is_query))
+            out.extend(self._embed_chunk(chunk, is_query=is_query, task=task))
         return out
 
     def _embed_chunk(
         self,
         texts: list[str],
         is_query: bool,
+        task: str | None = None,
     ) -> list[list[float]]:
         """One HTTP call to ``/embed`` for a chunk ≤ MAX_BATCH_SIZE."""
         # v0.2.70 FIX A: bounded total deadline per embed request (= one batch).
@@ -185,7 +196,7 @@ class CodeEmbedAdapter:
             response = bounded_post(
                 self.session,
                 f"{self.base_url}/embed",
-                json={"texts": texts, "is_query": is_query},
+                json={"texts": texts, "is_query": is_query, "task": task},
                 timeout=self.timeout,
             )
         except requests.RequestException as exc:

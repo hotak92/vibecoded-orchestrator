@@ -13,11 +13,15 @@ nothing said so for days.
 This module is the ONE post-start verifier (pure decision + ONE thin
 probe, every dependency injectable):
 
-* :func:`probe` asks the runtime which devices the container actually
-  holds — ``<runtime> inspect --format '{{json .HostConfig.Devices}}'`` —
-  positive evidence from the container itself, not from the spec. A
-  GPU-less container answers with an empty (or non-matching) device list;
-  that is the incident's exact shape.
+* :func:`probe` asks the runtime what the container actually holds —
+  ``<runtime> inspect`` over ``HostConfig.Devices`` (the device-node list,
+  where podman's CDI spec lands) and, on docker only,
+  ``HostConfig.DeviceRequests`` (where the compose GPU overlay's
+  ``deploy.resources.reservations.devices`` block maps — the documented
+  Docker Engine API shape; see :func:`probe`). Positive evidence from the
+  container itself, not from the spec. A GPU-less container answers with
+  empty/non-matching lists on BOTH fields; that is the incident's exact
+  shape.
 * :func:`decide` is the pure truth table: GPU not expected → ``skip`` (no
   check, no row); expected + device present → ``ok``; expected + the
   container answers with NO matching device → ``missing``; the probe could
@@ -48,7 +52,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable, Optional, Sequence
+from typing import Any, Callable, Mapping, Optional, Sequence
 
 from vco_lib import tool_search_dirs as _tsd
 from vco_lib.deferral_report import DeferralEntry
@@ -135,6 +139,71 @@ def _matching_device(paths: Sequence[str], raw: str, vendor: str) -> Optional[st
     return None
 
 
+def _request_vendor(req: Mapping) -> Optional[str]:
+    """The vendor ONE DeviceRequest names, when it names one: the ``Driver``
+    (``nvidia`` / ``amd``-family per the Docker Engine API's documented
+    driver strings) or a CDI-style vendor tag in ``DeviceIDs``
+    (``nvidia.com/gpu=…`` / ``amd.com/gpu=…``). ``None`` = the request
+    carries NO vendor evidence (empty driver, no vendor ids) — a bare
+    capability request docker satisfies with whatever GPU the host has.
+
+    Only THIS request's fields are read — never the whole inspect payload —
+    so one request's tag cannot satisfy another's vendor question."""
+    driver = str(req.get("Driver") or "").lower()
+    if driver == "nvidia":
+        return "nvidia"
+    if driver in ("amd", "rocm", "amdgpu"):
+        return "amd"
+    ids = req.get("DeviceIDs")
+    id_str = " ".join(str(i) for i in ids) if isinstance(ids, list) else ""
+    if "nvidia.com/gpu" in id_str:
+        return "nvidia"
+    if "amd.com/gpu" in id_str:
+        return "amd"
+    return None
+
+
+def _request_matches(req: Mapping, vendor: str) -> Optional[bool]:
+    """Does ONE docker DeviceRequest (Engine API ``HostConfig.
+    DeviceRequests``: ``Driver`` / ``Count`` / ``DeviceIDs`` /
+    ``Capabilities`` / ``Options``) ask for THIS vendor's GPU?
+
+    Tri-state, and vendor-discriminating by design (SF-2):
+
+    * ``True`` — the request names THIS vendor's GPU: ``Driver: nvidia`` /
+      an ``nvidia.com/gpu`` device id for nvidia, the amd driver family or
+      an ``amd.com/gpu`` id for amd (:func:`_request_vendor`).
+    * ``False`` — the request names a DIFFERENT vendor, or names none and
+      asks for no GPU capability at all: it cannot be this vendor's device,
+      so it never satisfies the expectation (the false-ok SF-2 named).
+    * ``None`` — the request asks for a bare ``gpu`` capability but carries
+      NO vendor evidence (empty ``Driver``, no vendor ``DeviceIDs``).
+      Docker allocates whichever GPU the host has, so the probe cannot tell
+      whose device this is: the CALLER answers ``unknown`` (no ledger row)
+      — never a false ``ok``, never a false ``missing``."""
+    named = _request_vendor(req)
+    if named is not None:
+        return named == vendor
+    caps = req.get("Capabilities")
+    flat_caps = {str(c).lower() for row in caps if isinstance(row, list)
+                 for c in row} if isinstance(caps, list) else set()
+    return None if "gpu" in flat_caps else False
+
+
+def _request_evidence(req: Mapping) -> str:
+    driver = str(req.get("Driver") or "")
+    caps = req.get("Capabilities")
+    flat_caps = [str(c) for row in caps if isinstance(row, list)
+                 for c in row] if isinstance(caps, list) else []
+    count = req.get("Count")
+    parts = [f"driver={driver or '?'}"]
+    if flat_caps:
+        parts.append(f"capabilities={','.join(flat_caps)}")
+    if count is not None:
+        parts.append(f"count={count}")
+    return " ".join(parts)
+
+
 def probe(
     runtime: str,
     container: str = OLLAMA_CONTAINER,
@@ -146,38 +215,116 @@ def probe(
 ) -> GPUVerdict:
     """ONE thin probe: what does ``<runtime> inspect`` say the container
     holds? ``ok`` / ``missing`` (positive answers) / ``unknown`` (the probe
-    could not tell — never a verdict on uncertainty)."""
+    could not tell — never a verdict on uncertainty).
+
+    TWO inspect fields, because the runtimes attach GPUs differently:
+
+    * ``HostConfig.Devices`` — the device-node list. This is where PODMAN's
+      CDI spec lands (resolved into ``/dev/nvidia*`` entries; the CDI tag
+      itself may appear verbatim). Podman's inspect HAS no
+      ``DeviceRequests`` field (verified live: the template errors with
+      "can't evaluate field DeviceRequests"), so podman never asks.
+    * ``HostConfig.DeviceRequests`` — docker's DeviceRequest objects
+      (``Driver`` / ``Count`` / ``DeviceIDs`` / ``Capabilities`` /
+      ``Options``), the documented Docker Engine API shape exposed by
+      ``docker inspect`` (https://docs.docker.com/engine/api/ —
+      ContainerInspect's ``HostConfig.DeviceRequests``). The docker compose
+      GPU overlay's ``deploy.resources.reservations.devices`` block maps
+      HERE, not into ``Devices``
+      (https://docs.docker.com/compose/how-ts/gpu/) — so a correct
+      docker+NVIDIA container answers ``[]`` for devices and holds its GPU
+      in a request with ``Driver: "nvidia"`` (or an ``nvidia.com/gpu`` id);
+      a request that asks for a bare ``gpu`` capability with no vendor
+      evidence is ambiguous and answers ``unknown`` (never a false ``ok``).
+      Only docker asks, and only when the device list alone did not answer.
+    """
     vendor = _vendor(gpu_vendor)
     _run = run or _tsd.run
     exe = (which or _tsd.which)(runtime) or runtime
-    try:
-        res = _run([exe, "inspect", "--format", "{{json .HostConfig.Devices}}", container],
-                   capture_output=True, text=True, timeout=timeout_s)
-    except (subprocess.TimeoutExpired, OSError) as exc:
-        return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` could not run ({exc})")
-    if res.returncode != 0:
-        err = (res.stderr or "").strip().splitlines()
-        tail = err[-1] if err else f"exit {res.returncode}"
-        return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` failed: {tail}")
-    raw = (res.stdout or "").strip()
-    if not raw:
-        # rc 0 but no output is an anomalous answer, not evidence of a
-        # GPU-less container — never a verdict on it.
-        return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` printed nothing")
-    try:
-        devices = json.loads(raw)
-    except json.JSONDecodeError:
+
+    def _inspect(field_fmt: str) -> "GPUVerdict | str":
+        """One inspect call: the raw answer, or an ``unknown`` verdict."""
+        try:
+            res = _run([exe, "inspect", "--format", field_fmt, container],
+                       capture_output=True, text=True, timeout=timeout_s)
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` could not run ({exc})")
+        if res.returncode != 0:
+            err = (res.stderr or "").strip().splitlines()
+            tail = err[-1] if err else f"exit {res.returncode}"
+            return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` failed: {tail}")
+        raw = (res.stdout or "").strip()
+        if not raw:
+            # rc 0 but no output is an anomalous answer, not evidence of a
+            # GPU-less container — never a verdict on it.
+            return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` printed nothing")
+        return raw
+
+    def _parse(raw: str) -> "list | None":
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, list) else None
+
+    got = _inspect("{{json .HostConfig.Devices}}")
+    if isinstance(got, GPUVerdict):
+        return got
+    devices = _parse(got)
+    if devices is None:
         return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` printed unparseable JSON")
-    if not isinstance(devices, list):
-        return GPUVerdict(GPU_UNKNOWN, f"`{runtime} inspect {container}` printed no device list")
-    hit = _matching_device(_device_paths(devices), raw, vendor)
+    hit = _matching_device(_device_paths(devices), got, vendor)
     if hit is not None:
         return GPUVerdict(GPU_OK, f"{container} holds the {vendor} device {hit}", evidence=hit)
+
+    requests: list = []
+    raw_requests = ""
+    if runtime == "docker":
+        got_req = _inspect("{{json .HostConfig.DeviceRequests}}")
+        if isinstance(got_req, GPUVerdict):
+            return got_req
+        parsed_req = _parse(got_req)
+        if parsed_req is None:
+            return GPUVerdict(GPU_UNKNOWN,
+                              f"`{runtime} inspect {container}` printed unparseable device requests")
+        requests, raw_requests = parsed_req, got_req
+        ambiguous: Optional[Mapping] = None
+        for req in requests:
+            if not isinstance(req, dict):
+                continue
+            matched = _request_matches(req, vendor)
+            if matched is True:
+                return GPUVerdict(GPU_OK,
+                                  f"{container} asks for the {vendor} GPU via a device request "
+                                  f"({_request_evidence(req)})",
+                                  evidence=raw_requests[:400])
+            if matched is None:
+                ambiguous = req
+        if ambiguous is not None:
+            # A bare `gpu` capability with no vendor evidence: the request
+            # cannot be another vendor's (docker allocates whatever GPU the
+            # host has), but it also cannot be positively confirmed as THIS
+            # vendor's — so answer unknown and record NOTHING (SF-2).
+            return GPUVerdict(
+                GPU_UNKNOWN,
+                f"{container} asks for a GPU via a device request with no vendor "
+                f"evidence ({_request_evidence(ambiguous)}) — cannot tell whether it is "
+                f"the expected {vendor} device",
+                evidence=raw_requests[:400])
+
     named = ", ".join(_device_paths(devices)) or "(none)"
+    if runtime == "docker":
+        req_named = ", ".join(_request_evidence(r) for r in requests if isinstance(r, dict)) or "(none)"
+        return GPUVerdict(
+            GPU_MISSING,
+            f"{container} exposes no {vendor} GPU device — devices: {named}; "
+            f"device requests: {req_named}",
+            evidence=(got + " | " + raw_requests)[:400],
+        )
     return GPUVerdict(
         GPU_MISSING,
         f"{container} exposes no {vendor} GPU device — inspect lists: {named}",
-        evidence=raw[:400],
+        evidence=got[:400],
     )
 
 

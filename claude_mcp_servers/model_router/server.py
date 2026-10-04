@@ -195,7 +195,6 @@ from .tool_ids import (
     BoundedIdMap,
     RepairStats,
     SseIdRewriter,
-    is_server_tool_type,
     normalise_vendor_response,
     restore_vendor_ids,
     sanitise_for_anthropic,
@@ -1360,91 +1359,23 @@ def _strip_images_for_text_only(payload: Any, model_id: str) -> tuple[Any, int]:
 
 
 def _apply_text_only_images(
-    payload: Any, gateway: "Gateway", vendor_id: str, model_id: str,
+    payload: Any, gateway: "Gateway", model_id: str,
 ) -> tuple[Any, int]:
-    """Replace image blocks IFF the catalog flags ``model_id`` text-only.
+    """Replace image blocks IFF ``model_id`` is a text-only model.
 
-    One guarded call covers both the catalog lookup and the rewrite, so a
+    One guarded call covers both the capability lookup and the rewrite, so a
     defect in either abandons the whole step and the client's own bytes go on
-    unchanged (:func:`_guarded`). The flag is a property of the MODEL, read
-    from the per-model catalog row (``chat_model_context.seed.json``'s
-    ``text_only``), so the one ``glm-5.3`` row answers for both the z.ai and
-    the qwen route that serve it. Returns ``(payload, replaced_count)``.
+    unchanged (:func:`_guarded`). ``text_only`` is a property of the MODEL,
+    resolved from the shipped seed via
+    :meth:`model_router.context_table.ContextTable.is_text_only` — so the one
+    ``glm-5.3`` row answers for both the z.ai and the qwen route that serve it,
+    and neither a launcher export that predates the field nor a per-vendor
+    window override can silently reset it (review S3). Returns
+    ``(payload, replaced_count)``.
     """
-    row = gateway.context.current().lookup(model_id, vendor_id)
-    if row is None or not row.text_only:
+    if not gateway.context.current().is_text_only(model_id):
         return payload, 0
     return _strip_images_for_text_only(payload, model_id)
-
-
-# ── item (e): Anthropic server tools a vendor route cannot serve ─────────────
-def _partition_server_tools(payload: Any) -> "Optional[tuple[list, list]]":
-    """Split ``payload['tools']`` into ``(server_tools, ordinary_tools)``.
-
-    ``None`` when the request declares no tools at all (nothing to decide). A
-    tool is a SERVER tool when its ``type`` names one
-    (:func:`vco_lib.transcript_repair.is_server_tool_type`) — the shape of
-    Claude Code's WebSearch sub-request, ``tools:[{"type":"web_search_20250305",
-    …}]``. A vendor route cannot serve these (parity gap 6, live: z.ai HTTP
-    500, qwen a silent no-op that answers from its weights), so the handler
-    needs the split to decide between refusing (only server tools) and
-    stripping (mixed).
-    """
-    if not isinstance(payload, dict):
-        return None
-    tools = payload.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return None
-    server: list[Any] = []
-    ordinary: list[Any] = []
-    for tool in tools:
-        if isinstance(tool, dict) and is_server_tool_type(tool.get("type")):
-            server.append(tool)
-        else:
-            ordinary.append(tool)
-    return server, ordinary
-
-
-def _strip_server_tools(payload: Any) -> tuple[Any, int]:
-    """Drop the server tools from ``payload['tools']``, keeping the rest.
-
-    Returns ``(payload, stripped_count)``; ``payload`` is the same object when
-    nothing was stripped. The mixed case of item (e): an ordinary tool the
-    request also declared still works, so the request is forwarded rather than
-    failed — only the tools the vendor cannot serve are removed.
-    """
-    if not isinstance(payload, dict):
-        return payload, 0
-    tools = payload.get("tools")
-    if not isinstance(tools, list) or not tools:
-        return payload, 0
-    kept = [
-        tool for tool in tools
-        if not (isinstance(tool, dict) and is_server_tool_type(tool.get("type")))
-    ]
-    stripped = len(tools) - len(kept)
-    if not stripped:
-        return payload, 0
-    patched = dict(payload)
-    patched["tools"] = kept
-    return patched, stripped
-
-
-def _server_tools_refusal(vendor_name: str) -> str:
-    """The gateway-authored 400 text for a server-tools-only vendor request.
-
-    Names the vendor and says what still works, because the alternative is the
-    vendor's own opaque answer (z.ai's HTTP 500 ``"Internal Network Failure"``,
-    qwen's silent no-op) which tells the user nothing they can act on.
-    """
-    return (
-        f"Anthropic server tools (web_search, web_fetch, code_execution) are "
-        f"not available on the {vendor_name} route: {vendor_name} answers them "
-        f"with an error or silently ignores them, so Claude Code's WebSearch "
-        f"would return nothing useful. Route this request to a first-party "
-        f"Claude model to use WebSearch. WebFetch and `curl` (via Bash) still "
-        f"work on {vendor_name}."
-    )
 
 
 def _access_line(
@@ -2000,12 +1931,11 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: line in ``note`` rather than being logged separately, so one request
     #: still means one line.
     rewrite_failed = False
-    #: Per-transform access-line counters (items a/e/f). Each rides in ``note``
+    #: Per-transform access-line counters (items a/f). Each rides in ``note``
     #: so an operator can see WHICH request-shaping fired without the gateway
     #: logging any body. Zero/False on the first-party route and on the
     #: over-buffer path, where the vendor transforms do not run.
     effort_translated = False
-    server_tools_stripped = 0
     text_only_images_omitted = 0
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
@@ -2054,40 +1984,14 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
 
-        # item (e): Anthropic server tools a vendor route cannot serve (z.ai
-        # 500s, qwen silently ignores them). Decided BEFORE the key so a
-        # server-tools-only request — the shape of Claude Code's WebSearch
-        # sub-request — gets the clear gateway-authored 400 even with no key
-        # configured. count_tokens is exempt: it executes nothing, so counting
-        # a server tool is harmless and refusing a count would be wrong.
-        if forward_payload is not None and not is_count_tokens:
-            partition = _guarded(
-                _partition_server_tools, forward_payload,
-                what="server-tool scan",
-            )
-            if partition is not _ABANDON and partition is not None:
-                server_tools, ordinary_tools = partition
-                if server_tools and not ordinary_tools:
-                    log_local(400, "server_tools_unsupported_on_vendor")
-                    return _json_error(
-                        400, "invalid_request_error",
-                        _server_tools_refusal(vendor_display_name(vendor)),
-                    )
-                if server_tools and ordinary_tools:
-                    # Mixed: strip what the vendor cannot serve, forward the
-                    # rest — NEVER fail a request that has an ordinary tool
-                    # that still works.
-                    stripped_pair = _guarded(
-                        _strip_server_tools, forward_payload,
-                        what="server-tool strip",
-                    )
-                    if stripped_pair is _ABANDON:
-                        rewrite_failed = True
-                    else:
-                        forward_payload, stripped = stripped_pair
-                        if stripped:
-                            mutated = True
-                            server_tools_stripped = stripped
+        # Anthropic server tools (``web_search_*`` and friends) are forwarded
+        # to the vendor UNCHANGED, and the vendor's own answer — including any
+        # error — is relayed verbatim. Live evidence 2026-10-04 overturns the
+        # parity audit's hand-built probe: Claude Code's WebSearch sub-request,
+        # sent by real agents on the z.ai and qwen routes, is answered 200 with
+        # genuine search-result blocks by the agent's own vendor model. A
+        # gateway refusal or strip here would break a working feature, so the
+        # gateway stays out of the request's ``tools`` entirely.
 
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
@@ -2150,7 +2054,6 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 _apply_text_only_images,
                 forward_payload,
                 gateway,
-                vendor.vendor_id,
                 decision.forward_model,
                 what="text-only image replacement",
             )
@@ -2167,15 +2070,11 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
 
     body: "bytes | AsyncIterator[bytes]"
     note = "note=rewrite_failed" if rewrite_failed else ""
-    # Per-transform notes (items a/e/f). Each says a request-shaping fired,
+    # Per-transform notes (items a/f). Each says a request-shaping fired,
     # with the count where one is meaningful, and none of them logs a body
     # byte. Assembled here so they ride EVERY access line this request writes.
     if effort_translated:
         note = f"{note} note=effort_translated".strip()
-    if server_tools_stripped:
-        note = (
-            f"{note} note=server_tools_stripped={server_tools_stripped}".strip()
-        )
     if text_only_images_omitted:
         note = (
             f"{note} "

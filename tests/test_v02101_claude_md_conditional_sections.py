@@ -55,8 +55,11 @@ USER_TEMPLATE = REPO_ROOT / "templates" / "CLAUDE.md.template"
 UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 
 # Strings unique to each conditional section of the SHIPPED root template.
-LEAN_CTX_SECTION = "**Lean-ctx Bash compression**"
-LEAN_CTX_TABLE = "**Three-tier bypass hierarchy**"
+# (lean-ctx sentinels updated with the v0.2.101 allow-list + tee/pointer
+# rewrite of that section: the "Three-tier bypass hierarchy" table heading
+# is gone; the pointer line is the section's load-bearing promise.)
+LEAN_CTX_SECTION = "**Lean-ctx Bash compression — allow-listed, lossless**"
+LEAN_CTX_POINTER = "[lean-ctx-tee]"
 RL_SECTION = "**RL retrieval reranking is active for this project**"
 DIAGRAMS_BULLET = "- **mermaid** / **excalidraw**"
 
@@ -125,7 +128,7 @@ class TestRootRenderConditionalSections:
         assert text is not None
         assert "{{#" not in text and "{{/if_" not in text
         assert LEAN_CTX_SECTION not in text
-        assert LEAN_CTX_TABLE not in text
+        assert LEAN_CTX_POINTER not in text
         assert RL_SECTION not in text
         assert DIAGRAMS_BULLET not in text
         # The document around the dropped sections still renders.
@@ -139,7 +142,7 @@ class TestRootRenderConditionalSections:
         assert outcome.status in ("created", "auto_block_updated", "full_rewrite")
         assert text is not None
         assert "{{#" not in text and "{{/if_" not in text
-        assert LEAN_CTX_SECTION in text and LEAN_CTX_TABLE in text
+        assert LEAN_CTX_SECTION in text and LEAN_CTX_POINTER in text
         assert RL_SECTION in text
         assert DIAGRAMS_BULLET in text
 
@@ -379,7 +382,7 @@ class TestGatewaySectionRendersPayload:
         folder.mkdir()
         for configured, expected in ((True, True), (False, False)):
             _pin_machine_signal(monkeypatch, configured)
-            payload = mgd.status_payload(folder)
+            payload = mgd.status_payload([folder])
             assert payload["gate"]["state"] == (
                 "deliver" if configured else "skip")
             assert payload["claude_md_section"] == {"renders": expected}, (
@@ -392,6 +395,77 @@ class TestGatewaySectionRendersPayload:
         payload = mgd.status_payload(None)
         assert "claude_md_section" not in payload, (
             "no folder → no gate verdict → no render answer to give")
+        assert "folders" not in payload
+
+    def test_status_payload_batches_every_folder_in_one_call(self, tmp_path,
+                                                             monkeypatch):
+        """S2 (v0.2.101 review): the Services page asks for ALL projects in
+        ONE interpreter start — one ``status`` invocation carrying every
+        ``--folder``, one machine signal, a verdict per folder."""
+        folders = []
+        for name in ("proj-a", "proj-b", "proj-c"):
+            f = tmp_path / name
+            f.mkdir()
+            folders.append(f)
+        calls = {"n": 0}
+
+        def counting_signal(*a, **k):
+            calls["n"] += 1
+            return gateway_ensure.MachineGatewaySignal(
+                configured=True, registration="test", panel="test",
+                reason="test signal")
+
+        monkeypatch.setattr(gateway_ensure, "machine_gateway_signal",
+                            counting_signal)
+        payload = mgd.status_payload(folders)
+        assert calls["n"] == 1, "the machine signal is probed ONCE per call"
+        by_folder = payload["folders"]
+        assert set(by_folder) == {str(f) for f in folders}
+        for entry in by_folder.values():
+            assert entry["gate"]["state"] == "deliver"
+            assert entry["claude_md_section"] == {"renders": True}
+        # Single-folder back-compat: the top-level verdict stays for the
+        # one-folder shape the launcher's agents-gate command reads.
+        single = mgd.status_payload(folders[:1])
+        assert single["gate"]["state"] == "deliver"
+        assert single["claude_md_section"] == {"renders": True}
+        assert set(single["folders"]) == {str(folders[0])}
+
+    def test_batched_scan_reads_each_directory_once(self, tmp_path,
+                                                    monkeypatch):
+        """N-2 (v0.2.101 review): the per-folder dirs include the USER
+        agents dir every time, so an N-folder call would report each
+        ``~/.claude/agents`` problem N times. The scan list is deduped —
+        each directory is read exactly once."""
+        seen = []
+
+        def recording_scan(dirs):
+            seen.extend(str(d) for d in dirs)
+            return []
+
+        monkeypatch.setattr(mgd, "check_agent_model_ids", recording_scan)
+        folders = [tmp_path / "a", tmp_path / "b", tmp_path / "c"]
+        for f in folders:
+            f.mkdir()
+        mgd.status_payload(folders)
+        duplicates = {d for d in seen if seen.count(d) > 1}
+        assert duplicates == set(), (
+            f"every directory must be scanned exactly once; duplicates: "
+            f"{duplicates}")
+
+    def test_batched_keys_echo_the_callers_exact_folder_strings(
+            self, tmp_path, monkeypatch):
+        """N-3 (v0.2.101 review): the answer is keyed by the EXACT folder
+        string the caller sent. ``str(Path(...))`` normalises (drops a
+        trailing slash, resolves ``.``), so a launcher.db ``folder_path``
+        in non-canonical form would miss its own verdict and sit at
+        "could not ask" forever."""
+        _pin_machine_signal(monkeypatch, True)
+        raw = [str(tmp_path) + "/", "./" + tmp_path.name]
+        payload = mgd.status_payload(raw)
+        assert set(payload["folders"]) == set(raw), (
+            "the keys must echo the caller's strings verbatim, not the "
+            f"normalised {set(payload['folders'])}")
 
 
 class TestModulesVerdictSource:

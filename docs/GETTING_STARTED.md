@@ -384,13 +384,21 @@ Tools the installer detects and integrates with when present, but doesn't requir
 
 ### lean-ctx — CLI output compression
 
-[lean-ctx](https://github.com/yvgude/lean-ctx) (MIT license, zero telemetry) wraps common CLI commands (`git`, `npm`, `pip`, `grep`, `ls`, etc.) and compresses their output by 90–97% by stripping boilerplate, progress bars, and redundant lines. This translates directly to:
+[lean-ctx](https://github.com/yvgude/lean-ctx) (MIT license, zero telemetry) compresses noisy CLI output by 90–97% by stripping boilerplate, progress bars, and redundant lines. This translates directly to:
 
 - shorter Claude context windows
 - lower token costs per session
 - faster response time on commands that produce verbose output
 
-The orchestrator's installer detects lean-ctx automatically. The wiring is a PreToolUse hook (`.claude/hooks/lean-ctx-rewrite.{sh,ps1}`) that rewrites each `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. The hook is a no-op if lean-ctx isn't on `PATH`.
+The orchestrator's installer detects lean-ctx automatically. The wiring is a PreToolUse hook (`.claude/hooks/lean-ctx-rewrite.{sh,ps1}`) that compresses ONLY the commands on one committed allow-list (`.claude/hooks/_lib/lean-ctx-allowlist.txt`): package installs, image pulls, downloads, and test/build runners. Everything else runs raw — loops, pipes, chains, redirects, `git`, unknown commands, and anything carrying a credential. The hook is a no-op if lean-ctx isn't on `PATH`.
+
+Compression is lossless: an allow-listed command is rewritten to a small tee wrapper that saves the FULL raw output to `<project>/.claude/state/lean-ctx-tee/<timestamp>.log` (auto-cleaned after 7 days by default; `VCO_LEAN_CTX_TEE_TTL_HOURS` in `.claude/env` tunes it, `0` keeps forever; dir 0700 / files 0600 on POSIX — raw output can carry credentials) and ends the compressed output with a pointer line:
+
+```
+[lean-ctx-tee] 204 raw lines -> 26 shown; full output: /abs/path/.claude/state/lean-ctx-tee/<ts>.log (kept 168h)
+```
+
+Need a line the compression dropped? Read the file the pointer names — never re-run the command.
 
 Bypass / override matrix:
 
@@ -401,7 +409,7 @@ Bypass / override matrix:
 | Per-project default = off | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` |
 | Disable all VCO hooks (debug only) | `export VCT_DISABLE_HOOKS=1` |
 
-Footgun note: lean-ctx in default mode can swallow stderr from failing commands. The rewrite hook **auto-bypasses `git commit` and `git push`** (they run raw, uncompressed — a pre-commit hook failure is never silenced). For any *other* command that exits non-zero with no message, retry under `lean-ctx bypass "..."`.
+Footgun note: lean-ctx in default mode can swallow stderr from failing commands. Under the allow-list rule the historical victims (`git commit`/`git push`, read-only `git` inspection, loops, pipes) are never wrapped at all, and a wrapped command's full output — stderr included — is always on disk behind the pointer line. For the rare case a pointer is missing, retry under `lean-ctx bypass "..."`.
 
 Install:
 ```bash

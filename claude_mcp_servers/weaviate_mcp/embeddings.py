@@ -565,7 +565,9 @@ def _primary_named_vector(scheme: str) -> str:
     return next(iter(server.VECTOR_SCHEMES[scheme]))
 
 
-async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float] | None, str]:
+async def _get_search_vector(
+    text: str, scheme: str = "kg", task: str | None = None
+) -> tuple[list[float] | None, str]:
     """Get embedding for search, returns (vector, target_vector_name).
 
     v0.2.18: routes through EmbeddingService which resolves BOTH the
@@ -574,22 +576,30 @@ async def _get_search_vector(text: str, scheme: str = "kg") -> tuple[list[float]
     the slot-resolution logic already living in the Wave-A
     EmbeddingService TEXT_SLOT_MAP / CODE_SLOT_MAP.
 
+    v0.2.101: this is a SEARCH path, so it embeds through the QUERY-side
+    methods (``embed_text_query`` / ``embed_code_query``) which apply the
+    active model's query-prefix — documents still go through ``embed_text`` /
+    ``embed_code`` unprefixed. ``task`` selects the per-use instruction
+    sentence (see ``chunking.QUERY_TASKS``); ``None`` uses the scheme default.
+
     Falls through to the legacy ACTIVE_EMBEDDING-branching path when
-    the service is unavailable.
+    the service is unavailable (that path is UNPREFIXED — a half-migrated
+    install's degraded fallback; the prefix table needs the resolved model).
 
     Args:
         text: Text to embed.
         scheme: 'kg' or 'code' — determines text vs code backend.
+        task: QUERY_TASKS key (KG search / hook injection / code-nl / code-sim).
     """
     from . import server
     svc = server._get_embedding_service()
     if svc is not None:
         try:
             if scheme == "code":
-                vec = await asyncio.to_thread(svc.embed_code, text)
+                vec = await asyncio.to_thread(svc.embed_code_query, text, task)
                 target = svc.code_vector_slot
             else:
-                vec = await asyncio.to_thread(svc.embed_text, text)
+                vec = await asyncio.to_thread(svc.embed_text_query, text, task)
                 target = svc.text_vector_slot
             return vec, target
         except Exception as e:
@@ -664,7 +674,7 @@ async def get_code_embedding(text: str) -> list[float] | None:
 
     ⚠️  Do NOT use this to embed a SEARCH QUERY. For query embedding use
     ``get_code_query_embedding`` (v0.2.73 C-5) which routes through
-    ``svc.embed_code`` for ALL slots — mirroring the CLI
+    ``svc.embed_code_query`` for ALL slots — mirroring the CLI
     (``query_code_graph.py::generate_code_embedding``). Using this
     codesage-biased helper for queries broke the CLI≡MCP invariant on
     every non-CodeSage slot (qwen3 / jina): the CLI embedded via the
@@ -711,17 +721,22 @@ async def _inline_code_embed_http(text: str) -> list[float] | None:
         return None
 
 
-async def get_code_query_embedding(text: str) -> list[float] | None:
+async def get_code_query_embedding(text: str, task: str | None = None) -> list[float] | None:
     """Embed a SEARCH QUERY into the active code-vector space.
 
     v0.2.73 C-5: the CLI≡MCP invariant requires the MCP to embed queries
     exactly as the CLI does. The CLI's
     ``query_code_graph.py::generate_code_embedding`` routes ALL slots
-    through ``svc.embed_code`` (which resolves the slot's backend —
+    through ``svc.embed_code_query`` (which resolves the slot's backend —
     CodeSage :11440, qwen3 → Ollama :11435, jina → Ollama, openai) and
     only falls back to raw CodeEmbed HTTP when EmbeddingService is
     unavailable. This function MIRRORS that contract so
     ``search_code_graph`` produces the same query vector the CLI would.
+
+    v0.2.101: ``embed_code_query`` applies the active code model's query
+    prefix (client-side on the OpenAI/Ollama legs; the SERVICE applies it for
+    the CodeSage/jina legs — see ``EmbeddingService.embed_code_query``).
+    Documents still embed through ``embed_code`` (unprefixed).
 
     MUST MATCH ``templates/scripts/query_code_graph.py::generate_code_embedding``.
     """
@@ -729,10 +744,10 @@ async def get_code_query_embedding(text: str) -> list[float] | None:
     svc = server._get_embedding_service()
     if svc is not None:
         try:
-            return await asyncio.to_thread(svc.embed_code, text)
+            return await asyncio.to_thread(svc.embed_code_query, text, task)
         except Exception as e:
             server.logger.warning(
-                "EmbeddingService.embed_code failed (%s); falling back to inline CodeEmbed call",
+                "EmbeddingService.embed_code_query failed (%s); falling back to inline CodeEmbed call",
                 e,
             )
     # Legacy fallback (svc unavailable): direct CodeEmbed HTTP call.

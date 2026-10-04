@@ -44,6 +44,7 @@ import {
   clearProjectRoutingGuidance,
   describeRoutingGuidance,
   routingGuidance,
+  routingGuidanceAll,
   setModelGatewayBoot,
   setProjectRoutingGuidance,
   startModelGateway,
@@ -194,21 +195,34 @@ describe('wire shape', () => {
     expect(cleared).toBe(true);
   });
 
-  it('routing-guidance STATE asks the Python gate by folder (v0.2.101 G1)', async () => {
+  it('routing-guidance STATE asks the Python gate for ALL folders at once (S2)', async () => {
     // The list must seed from the same gate the render follows — the
     // row-only lookup above was the defect (no row read as "off" while the
-    // render drew the section on a gateway-configured machine).
-    mockInvoke.mockResolvedValue({
+    // render drew the section on a gateway-configured machine) — and one
+    // interpreter start must answer for every project, not one spawn per
+    // project (review S2).
+    const follows: RoutingGuidanceState = {
       mode: 'follows_machine',
       renders: true,
       machine_decides: 'renders',
       reason: 'test',
-    });
-    const state = await routingGuidance('/p/proj-a');
+    };
+    mockInvoke.mockResolvedValue({ '/p/a': follows, '/p/b': follows });
+    const map = await routingGuidanceAll(['/p/a', '/p/b']);
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
     expect(mockInvoke).toHaveBeenCalledWith('model_gateway_routing_guidance', {
-      folder: '/p/proj-a',
+      folders: ['/p/a', '/p/b'],
     });
-    expect(state.mode).toBe('follows_machine');
+    expect(map['/p/a'].mode).toBe('follows_machine');
+
+    // The single re-read after a toggle/clear rides the SAME batched
+    // command with one folder — never a second command shape to drift.
+    mockInvoke.mockClear();
+    mockInvoke.mockResolvedValue({ '/p/a': follows });
+    await routingGuidance('/p/a');
+    expect(mockInvoke).toHaveBeenCalledWith('model_gateway_routing_guidance', {
+      folders: ['/p/a'],
+    });
   });
 });
 

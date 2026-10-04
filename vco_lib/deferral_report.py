@@ -1251,6 +1251,60 @@ def _entry_from_dict(d: dict) -> Optional[DeferralEntry]:
     )
 
 
+#: The volatile TOP-LEVEL ledger timestamp only. Two renders of the SAME
+#: entries may legitimately differ in it, so :func:`_ledger_matches_disk`
+#: normalises it away — but ONLY there. An entry's free text may itself contain
+#: the literal ``generated_at:`` (a log line, a command, a quoted field), and a
+#: blanket regex would blank that too, letting a REAL body change slip through
+#: as "unchanged" (v0.2.101 NF-3). Each format therefore anchors to the one
+#: field it owns: the JSON sidecar's top-level key line, and the Markdown
+#: frontmatter block (the first ``---``-delimited region).
+#:
+#: The JSON pattern is anchored BY INDENT, not by data: ``json.dumps(indent=2)``
+#: renders a top-level key with EXACTLY two leading spaces, and every nested
+#: key deeper (4+). Requiring `` {2}`` therefore cannot match a nested
+#: ``generated_at`` (e.g. a future per-entry field) — a structural guarantee,
+#: not a reliance on ``_entry_to_dict`` happening to omit the key (NF-3 nit).
+_JSON_GENERATED_AT_RE = re.compile(r'(?m)^( {2}"generated_at":\s*)"[^"\n]*"(,?)$')
+_MD_FRONTMATTER_RE = re.compile(r"\A---\n(?P<body>.*?)\n---\n", re.DOTALL)
+_MD_GENERATED_AT_RE = re.compile(r"(?m)^generated_at:\s*[^\n]*$")
+
+
+def _normalize_json_generated_at(text: str) -> str:
+    """Blank the TOP-LEVEL ``generated_at`` value; leave every other byte.
+
+    Anchored to a whole line whose key sits at the TOP level (``  "generated_at":
+    "..."``). ``json.dumps(..., indent=2)`` renders a top-level key with
+    exactly two leading spaces and every NESTED key deeper, so a nested
+    ``generated_at`` (a per-entry field, a value line) can never match: the
+    `` {2}`` indent is the structural anchor (NF-3 nit).
+    """
+    return _JSON_GENERATED_AT_RE.sub(r'\1"X"\2', text)
+
+
+def _normalize_markdown_generated_at(text: str) -> str:
+    """Blank the ``generated_at`` line ONLY inside the frontmatter block."""
+    match = _MD_FRONTMATTER_RE.match(text)
+    if match is None:
+        return text
+    body = _MD_GENERATED_AT_RE.sub("generated_at: X", match.group("body"))
+    return text[:match.start("body")] + body + text[match.end("body"):]
+
+
+def _ledger_matches_disk(path: Path, rendered: str) -> bool:
+    """True when ``path`` already holds ``rendered``, ignoring ONLY the
+    volatile top-level ``generated_at`` of that file's format."""
+    try:
+        existing = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    if path.suffix == ".json":
+        return (_normalize_json_generated_at(existing)
+                == _normalize_json_generated_at(rendered))
+    return (_normalize_markdown_generated_at(existing)
+            == _normalize_markdown_generated_at(rendered))
+
+
 def _render_json_sidecar(entries: List[DeferralEntry]) -> str:
     """Render the authoritative JSON sidecar for ``entries``."""
     payload = {
@@ -1448,16 +1502,30 @@ class DeferralReport:
 
         target.parent.mkdir(parents=True, exist_ok=True)
 
-        # A-3: JSON sidecar is the SOURCE OF TRUTH — write it first so a
-        # crash between the two writes leaves the authoritative copy intact
-        # (the Markdown is a re-derivable render).
-        atomic_write_text(json_target, _render_json_sidecar(self._entries))
-
+        json_content = _render_json_sidecar(self._entries)
         content = (
             _render_frontmatter(self._entries)
             + _render_header()
             + "".join(_render_entry(e) for e in self._entries)
         )
+
+        # Idempotence (one home for the rule): a write whose rendered pair is
+        # byte-identical to what is already on disk — ignoring the volatile
+        # top-level ``generated_at`` — keeps the existing files untouched, so a
+        # no-op re-write never churns the ledger's timestamp (v0.2.101 flake:
+        # a per-project re-emit rewrote an unchanged ledger, and byte-identity
+        # across runs is the update contract). A tampered/stale human render
+        # still differs, so the authoritative JSON + re-derived Markdown are
+        # written as before.
+        if (_ledger_matches_disk(json_target, json_content)
+                and _ledger_matches_disk(target, content)):
+            _ensure_claude_md_reminder(folder, self._entries)
+            return True
+
+        # A-3: JSON sidecar is the SOURCE OF TRUTH — write it first so a
+        # crash between the two writes leaves the authoritative copy intact
+        # (the Markdown is a re-derivable render).
+        atomic_write_text(json_target, json_content)
 
         # Atomic write via the shared vco_lib.atomic helper (temp file
         # in the same directory, fsync, then os.replace()). Markdown is the

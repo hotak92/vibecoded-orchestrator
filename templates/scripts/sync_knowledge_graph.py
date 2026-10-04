@@ -5690,6 +5690,13 @@ def main():
                 # run resolved a REAL collection — is the helper's; see it.)
                 if _METADATA_REPAIR_FAILED_COUNT == 0:
                     _record_metadata_repair_pass(PROJECT_ROOT)
+                # v0.2.101 (caller-audit Gap 4/5/6): the run that walked the
+                # whole tree records WHAT it walked it against. ONE rule in ONE
+                # place, so every seeding entry point converges — install's
+                # foreground seed, the detached driver (install-spawned OR
+                # session-start), the launcher's Sync button, migrate-collections
+                # and a hand-run `kg-sync --all` all run THIS script.
+                _record_context_triple(total_fail)
             else:
                 # v0.2.92 D17: record the per-node failures as owed,
                 # auto-retryable work — pre-fix, failed nodes were counted
@@ -5933,6 +5940,46 @@ def _clear_sync_failures_deferral(install_root: Path) -> None:
         resolve_conditions(install_root, (_SYNC_FAILURES_CID,))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _record_context_triple(failures: int) -> None:
+    """Record the context this whole-tree run embedded against (v0.2.101).
+
+    Called from the ``--all`` success path, and *failures* is the run's REAL
+    per-node failure count — passed in rather than assumed zero, so the RULE in
+    ``vco_lib.kg_context_triple.certified_from_run`` refuses a failing run by
+    itself. (Placement inside the ``total_fail == 0`` branch is a second guard,
+    not the only one: a call moved out of the branch must not record.) The rest
+    of the rule: whole-tree, a POSITIVELY RESOLVED collection (a run that fell
+    back to the literal ``"KnowledgeGraph"`` proved a pass over a class nobody
+    reads), the tree being the ORCHESTRATOR ROOT's, and no shared-target marker.
+
+    The profile comes from this process's own env / launcher.db tier
+    (``active_embedding_profile``), so a child spawned by the launcher or by hand
+    records the same value an install-spawned one does.
+
+    Soft-fail: bookkeeping must never change a sync's exit code.
+    """
+    try:
+        import os as _os
+
+        from vco_lib.kg_context_triple import SHARED_SEED_ENV, record_from_run
+        from vco_lib.orchestrator_identity import is_orchestrator_clone
+
+        record_from_run(
+            whole_tree=True,
+            failures=failures,
+            kg_collection_resolved=_KG_COLLECTION_RESOLVED,
+            # SF-1: the row is machine-global and install.py compares it for the
+            # ROOT's seed — a registered project's own `--all` must leave it be.
+            orchestrator_root=is_orchestrator_clone(PROJECT_ROOT),
+            # A shared-targeted pass says nothing about the per-project context.
+            shared_targeted=_os.environ.get(SHARED_SEED_ENV) == "1",
+            kg_collection=COLLECTION_NAME,
+            shared_kg_collection=SHARED_COLLECTION_NAME,
+        )
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (context-triple record failed: {inner})", file=sys.stderr)
 
 
 def _targets_shared_collection() -> bool:

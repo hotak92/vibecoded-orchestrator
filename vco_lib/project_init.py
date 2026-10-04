@@ -3722,7 +3722,7 @@ def _enumerate_bundle_files(
 
     Layout:
       .claude/hooks/<name>.{sh,ps1}        from templates/hooks/  (skip _lib)
-      .claude/hooks/_lib/<name>.{sh,ps1}   from templates/hooks/_lib/  (always overwrite)
+      .claude/hooks/_lib/<name>.{sh,ps1,txt} from templates/hooks/_lib/ (always overwrite)
       .claude/scripts/<rel>                from templates/scripts/<rel>  (recursive, all flavours)
       .claude/agents/<name>.md             from templates/agents/free/  (with substitutions)
       .claude/agents/<name>.md             from templates/agents/module-gateway/
@@ -3755,10 +3755,10 @@ def _enumerate_bundle_files(
                     always_overwrite=False,
                 ))
 
-    # Hooks _lib (always overwrite — not user-customisable). Both flavours.
-    lib_src = hooks_src / "_lib"
+    from vco_lib.bundle_globs import hook_lib_data_globs as _lib_data_globs
+    lib_src = hooks_src / "_lib"  # _lib: always overwrite (not user-customisable); both script flavours PLUS shared data files (v0.2.101: the lean-ctx allow-list .txt both rewrite siblings parse)
     if lib_src.exists():
-        for glob in hook_globs:
+        for glob in tuple(hook_globs) + _lib_data_globs():
             for lib_file in sorted(lib_src.glob(glob)):
                 ops.append(_BundleFileOp(
                     dest_rel=str(Path(".claude") / "hooks" / "_lib" / lib_file.name),

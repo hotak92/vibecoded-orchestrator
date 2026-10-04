@@ -221,12 +221,57 @@ def _compute_on_disk_content_hashes(knowledge_root: Path) -> "dict[str, str]":
     return result
 
 
-def content_hash_diff(
+def archived_stored_removals(
     on_disk: "Mapping[str, str]",
     stored_hashes: "Mapping[str, str]",
     project_root: Path,
 ) -> "list[str]":
-    """The ``knowledge/`` files whose on-disk hash differs from Weaviate's.
+    """Stored rows whose file became ARCHIVED since its last sync (v0.2.101 S2).
+
+    Skipping archived files in the walk (item 3) removed them from the
+    changelist entirely, and ``_prune_stale_kg_rows`` cannot help — the file
+    still EXISTS on disk, it is only marked archived. Before item 3 the (buggy)
+    always-changed listing routed such a file into the per-file sync, where
+    ``sync_node``'s archived leg skipped the node AND deleted its prior row.
+
+    This restores exactly that routing, cheaply: the only files worth checking
+    are STORED paths the walk did not keep — a stored path present in *on_disk*
+    was walked and is therefore not archived, so it needs no second read, and a
+    stored path whose file is gone is the prune's business, not this one's.
+    The caller appends the result to the changelist; the sync's own archived
+    leg does the deleting (one home for "archived ⇒ no row").
+
+    PURE apart from the reads of the handful of files it must judge.
+    """
+    from vco_lib.kg_node_status import is_archived_content
+
+    kept = set(on_disk)
+    out: "list[str]" = []
+    for stored_path in stored_hashes:
+        candidate = Path(stored_path)
+        if str(candidate) in kept or stored_path in kept:
+            continue
+        if not candidate.is_absolute():
+            candidate = Path(project_root) / candidate
+        if candidate.suffix != ".md" or not candidate.is_file():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        if is_archived_content(candidate, content)[0]:
+            out.append(str(candidate))
+    return sorted(out)
+
+
+def content_hash_diff(
+    on_disk: "Mapping[str, str]",
+    stored_hashes: "Mapping[str, str]",
+    project_root: Path,
+    *,
+    knowledge_root: "Optional[Path]" = None,
+) -> "list[str]":
+    """The ``knowledge/`` files the per-file sync must visit.
 
     PURE. v0.2.95 moved this loop out of ``install.py``'s leg (c) so it sits
     with the two helpers that produce its inputs —
@@ -236,6 +281,11 @@ def content_hash_diff(
     first, then by the project-relative form (``sync_knowledge_graph.py``
     writes ``file_path`` either way depending on ``KG_BASE_DIR``), and treat a
     missing or empty stored hash as changed.
+
+    *knowledge_root* is leg (c)'s input, not a fact about the comparison: when
+    given, newly-ARCHIVED files that still hold a stored row are appended (see
+    :func:`archived_stored_removals`) so the row is deleted. The comparison
+    itself stays exactly as it was.
     """
     diff_files: "list[str]" = []
     for file_path_str, disk_hash in on_disk.items():
@@ -248,6 +298,14 @@ def content_hash_diff(
                 pass
         if disk_hash != stored_hash:
             diff_files.append(file_path_str)
+    if knowledge_root is not None:
+        # v0.2.101 S2: archived-but-still-stored rows are REMOVALS. They cannot
+        # be in `on_disk` (the walk skips archived files) and the prune cannot
+        # see them (their file exists), so without this the row stays live.
+        diff_files.extend(
+            p for p in archived_stored_removals(on_disk, stored_hashes, project_root)
+            if p not in diff_files
+        )
     return diff_files
 
 
@@ -1877,6 +1935,18 @@ SEED_OWED_WORK_CONDITION_ID = "kg_sync_failures_pending"
 #: (``sync_knowledge_graph.py::_clear_shared_seed_deferral``).
 SHARED_SEED_OWED_CONDITION_ID = "kg_sync_shared_pending"
 
+#: The ONLY environment keys a detached seed driver inherits from the caller
+#: (v0.2.101 S1). ``SEED_CTX_*`` is the context the handler stamps after a
+#: proven seed; ``ACTIVE_EMBEDDING``/``EMBEDDING_MODEL`` are the embedding
+#: pair the child must embed with. Everything else — notably
+#: ``KG_COLLECTION``, which the shared seed legitimately sets for its own
+#: child — stays with the caller's process: the driver dispatches EVERY owed
+#: row, so a leaked target would silently misroute a per-project seed.
+_DRIVER_ENV_ALLOW: frozenset = frozenset({
+    "ACTIVE_EMBEDDING",
+    "EMBEDDING_MODEL",
+})
+
 
 @dataclass
 class SeedStepOutcome:
@@ -1909,7 +1979,6 @@ def kg_seed_step(
     label: str = "KG seed",
     error_prefix: str = "",
     hint: str = "",
-    deferral_report: object = None,
     make_deferral: Optional[Callable] = None,
     run_child_logged: Optional[Callable] = None,
 ) -> SeedStepOutcome:
@@ -1934,6 +2003,20 @@ def kg_seed_step(
       shared_kg_collection)`` triple the per-project driver stamps after a
       proven seed.
 
+    Two orderings matter and are both enforced here (v0.2.101 B1/S1):
+
+    * the owed row is written to the ON-DISK ledger BEFORE the spawn (see
+      :func:`_write_enqueued_entry`) — the driver reads that ledger once and
+      exits, so a row that waited for install.py's finalize was usually
+      invisible to the driver it was written for;
+    * the DRIVER gets a WHITELISTED environment (the ``SEED_CTX_*`` context
+      plus the embedding pair), never the whole ``seed_env``. The shared seed's
+      ``seed_env`` carries ``KG_COLLECTION=<shared>``, and the driver dispatches
+      EVERY owed row — handing it that var made a per-project owed seed target
+      the shared collection (`retry_kg_seed` pins only the project root; its
+      child inherits the driver's env). The caller's mapping is never mutated
+      either, so the FOREGROUND fallback sees exactly what the caller passed.
+
     A driver that cannot be launched falls back to the foreground run — a
     failed spawn must NEVER leave the seed silently unwritten. The fallback is
     the v0.2.96 one-drain ``run_child_logged``, so that path keeps the
@@ -1945,23 +2028,35 @@ def kg_seed_step(
 
     out = SeedStepOutcome()
     shared = bool(shared_target)
+    child_env = dict(seed_env)  # N4: never mutate the caller's mapping
+    if shared:
+        # The marker the CHILD reads to refuse recording the per-project context
+        # triple (kg_context_triple.SHARED_SEED_ENV): a shared-targeted pass is
+        # not a statement about the project's context, and the collection NAME
+        # cannot tell the two apart on the orchestrator root (kg == shared).
+        from vco_lib.kg_context_triple import SHARED_SEED_ENV  # noqa: PLC0415
+
+        child_env[SHARED_SEED_ENV] = "1"
     if enqueue:
+        # S1: whitelist what travels to the DRIVER — `seed_env` may legitimately
+        # carry KG_COLLECTION (the shared seed's target), and the driver's child
+        # would inherit it for a PER-PROJECT owed row too.
+        driver_env = {k: v for k, v in child_env.items() if k in _DRIVER_ENV_ALLOW}
         if shared:
-            seed_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION] = shared_target
+            driver_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION] = shared_target
         elif len(context) == 3:
-            (seed_env[_dr.SEED_CTX_ENV_ACTIVE_EMBEDDING],
-             seed_env[_dr.SEED_CTX_ENV_KG_COLLECTION],
-             seed_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION]) = (
-                context[0], context[1], context[2])
+            driver_env[_dr.SEED_CTX_ENV_ACTIVE_EMBEDDING] = context[0]
+            driver_env[_dr.SEED_CTX_ENV_KG_COLLECTION] = context[1]
+            driver_env[_dr.SEED_CTX_ENV_SHARED_KG_COLLECTION] = context[2]
         out.log_glob = _dr.detached_log_glob() or ""
-        if deferral_report is not None and make_deferral is not None:
+        if make_deferral is not None:
             emit = (emit_shared_seed_enqueued_deferral if shared
                     else emit_seed_enqueued_deferral)
-            emit(deferral_report, log_path=out.log_glob or None,
+            emit(folder, log_path=out.log_glob or None,
                  collection=shared_target or (context[1] if len(context) == 3 else "")
                  or "(unresolved)",
                  make_deferral=make_deferral)
-        out.detached = _dr.spawn_detached(folder, extra_env=seed_env)
+        out.detached = _dr.spawn_detached(folder, extra_env=driver_env)
         if out.detached:
             print(f"  \u21b3 {label} continues in the background.")
             if out.log_glob:
@@ -1973,7 +2068,7 @@ def kg_seed_step(
     try:
         assert run_child_logged is not None
         run_child_logged([str(venv_py), str(sync_kg), *[str(a) for a in cmd_args]],
-                         log_stem=log_stem, check=True, cwd=str(folder), env=seed_env)
+                         log_stem=log_stem, check=True, cwd=str(folder), env=child_env)
         out.ran = True
         out.exit_zero = True
     except subprocess.CalledProcessError as exc:
@@ -1987,13 +2082,39 @@ def kg_seed_step(
     return out
 
 
+def _write_enqueued_entry(folder: Path, condition_id: str, entry) -> bool:
+    """Persist an enqueued-seed row to the ON-DISK ledger, NOW (v0.2.101 B1).
+
+    The in-memory ``DeferralReport`` only reaches disk at install.py's
+    end-of-``main`` finalize, while the spawned driver reads the ledger from
+    disk ONCE and exits — so a row that waited for finalize was usually
+    invisible to the driver it was written for (the seed did not start until
+    the next session, and the "continues in the background" message was
+    false). ``deferral_emit.emit`` is the immediate, LOCKED writer the rest of
+    VCO already uses for out-of-band rows, so the driver sees the row on its
+    first read.
+
+    Disk-only is also what makes the row un-resurrectable: this run's finalize
+    MERGES foreign entries from disk (both ids are owned by the sync script,
+    not install.py), so a row the seed already cleared is not there to bring
+    back. Soft-fail: ledger I/O never changes a seed's outcome.
+    """
+    try:
+        from vco_lib.deferral_emit import emit  # noqa: PLC0415
+
+        return emit(Path(folder), entry)
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
+
+
 def emit_shared_seed_enqueued_deferral(
-    deferral_report,
+    folder: Path,
     *,
     log_path: "str | None",
     collection: str,
     make_deferral: Callable,
-) -> None:
+) -> bool:
     """Record that the install ENQUEUED the SHARED-collection seed (item 4).
 
     The sibling of :func:`emit_seed_enqueued_deferral` for the shared seed,
@@ -2003,13 +2124,11 @@ def emit_shared_seed_enqueued_deferral(
     shared class finishes with zero failures.
 
     Soft-fail by contract: ledger bookkeeping must never change the outcome of
-    a seed.
+    a seed. Written to disk immediately, exactly like its sibling.
     """
-    if deferral_report is None:
-        return
     log_hint = f"\n                tail -f {log_path}" if log_path else ""
     try:
-        deferral_report.add_entry(make_deferral(
+        return _write_enqueued_entry(folder, SHARED_SEED_OWED_CONDITION_ID, make_deferral(
             SHARED_SEED_OWED_CONDITION_ID,
             title=(
                 f"Shared-KG seed ({collection}) continues in the background — "
@@ -2039,6 +2158,7 @@ def emit_shared_seed_enqueued_deferral(
         ))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
 
 
 def emit_context_change_incomplete_deferral(
@@ -2117,12 +2237,12 @@ def emit_context_change_incomplete_deferral(
 
 
 def emit_seed_enqueued_deferral(
-    deferral_report,
+    folder: Path,
     *,
     log_path: "str | None",
     collection: str,
     make_deferral: Callable,
-) -> None:
+) -> bool:
     """Record that the install ENQUEUED the KG seed to the background (item 4).
 
     v0.2.101: install.py no longer blocks on the per-project seed — it emits
@@ -2137,12 +2257,12 @@ def emit_seed_enqueued_deferral(
     Soft-fail by contract, like its sibling above: a ledger that cannot be
     written must never change the outcome of a seed. *log_path* (the detached
     driver's log) is named in ``command_to_apply`` so the user can watch it.
+    Written to disk immediately (see :func:`_write_enqueued_entry`) so the
+    driver the caller is about to spawn can actually see it.
     """
-    if deferral_report is None:
-        return
     log_hint = f"\n                tail -f {log_path}" if log_path else ""
     try:
-        deferral_report.add_entry(make_deferral(
+        return _write_enqueued_entry(folder, SEED_OWED_WORK_CONDITION_ID, make_deferral(
             SEED_OWED_WORK_CONDITION_ID,
             title=(
                 "KG seed continues in the background — retry pending until it "
@@ -2172,6 +2292,7 @@ def emit_seed_enqueued_deferral(
         ))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"  ! (deferral emit failed: {inner})", flush=True)
+        return False
 
 
 # ---------------------------------------------------------------------------

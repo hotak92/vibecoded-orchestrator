@@ -97,7 +97,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Mapping, Optional
 
@@ -188,6 +188,14 @@ class ModelContext:
     #: is never stripped. Set ONLY on positive doc evidence (see the seed's
     #: per-row ``source``); a vision-capable model wrongly flagged would drop
     #: images it could have used.
+    #:
+    #: This is a MODEL capability, so the SHIPPED SEED row is its only
+    #: authority and :meth:`ContextTable.is_text_only` is its only reader. A
+    #: launcher EXPORT row cannot carry it (the DB has no column) and a
+    #: per-vendor ``vendor_overrides`` entry states an endpoint's WINDOW, not
+    #: the model's capabilities — so neither may reset it. :meth:`ContextTable.lookup`
+    #: therefore carries the seed's value onto whatever row it returns (review
+    #: S3); read the flag through ``is_text_only``, never off a raw row.
     text_only: bool = False
     #: v0.2.100 (F-W1-19): per-VENDOR figures for a model that more than one
     #: vendor serves at DIFFERENT windows (``vendor_id -> ModelContext``, each
@@ -284,6 +292,7 @@ class ContextTable:
         row = self.rows.get(model_id)
         if row is None:
             row = self.fallback_rows.get(model_id)
+        resolved = row
         if row is not None and vendor_id:
             override = row.vendor_overrides.get(vendor_id)
             if override is None:
@@ -295,8 +304,57 @@ class ContextTable:
                 if seed_row is not None:
                     override = seed_row.vendor_overrides.get(vendor_id)
             if override is not None:
-                return override
-        return row
+                resolved = override
+        if resolved is None:
+            return None
+        # ``text_only`` is a MODEL capability curated in the seed; the row that
+        # answers here may be a launcher EXPORT (no text_only column → False) or
+        # a per-vendor WINDOW override (says nothing about capabilities), and
+        # either would silently reset the flag (review S3). Carry the seed's
+        # value onto whatever row answers, so ``lookup(...).text_only`` — and
+        # therefore :meth:`is_text_only` — is always the model property. In the
+        # common no-export case ``resolved`` IS the seed row, so this is a
+        # no-op and costs no copy.
+        seed_row = self._seed_row(model_id)
+        seed_text_only = bool(seed_row.text_only) if seed_row is not None else False
+        if resolved.text_only != seed_text_only:
+            resolved = replace(resolved, text_only=seed_text_only)
+        return resolved
+
+    def _seed_row(self, model_id: str) -> Optional[ModelContext]:
+        """The shipped-seed row for ``model_id``, or ``None``.
+
+        The seed is the curated, doc-cited authority for model CAPABILITIES
+        (``text_only``). When a launcher export is active ``fallback_rows``
+        holds the seed and ``rows`` holds the export; with no export ``rows``
+        IS the seed and ``fallback_rows`` is empty.
+        """
+        seed = self.fallback_rows.get(model_id)
+        if seed is not None:
+            return seed
+        if not self.fallback_rows:
+            return self.rows.get(model_id)
+        return None
+
+    def is_text_only(self, model_id: str) -> bool:
+        """Whether ``model_id`` takes TEXT-ONLY input — a MODEL capability.
+
+        The one reader of :attr:`ModelContext.text_only`, and the entry point
+        the gateway's image replacement uses. Resolved from the seed via
+        :meth:`lookup` (which carries the seed's flag onto an export or override
+        row), so neither a launcher export that predates the field nor a
+        per-vendor window override can silently reset it — the
+        correct-but-undelivered trap review S3 named. Tombstone-aware: a model
+        the user deleted resolves to nothing. ``[1m]`` and a vendor namespace
+        are tolerated so either spelling of an id answers.
+        """
+        if not isinstance(model_id, str):
+            return False
+        # ``parse_model_id(...).bare_id`` is the same reduction ``lookup_id``
+        # uses: it tolerates a vendor namespace and the ``[1m]`` suffix, so
+        # either spelling of an id answers.
+        row = self.lookup(parse_model_id(model_id.strip()).bare_id)
+        return bool(row.text_only) if row is not None else False
 
     def assume_window(self, model_id: str) -> AssumedWindow:
         """The window to ASSUME for ``model_id``. Always answers.

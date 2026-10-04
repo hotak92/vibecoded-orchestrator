@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""v0.2.101 gateway vendor-parity — REQUEST shaping (items 13a, 13c, 13e, 13f).
+"""v0.2.101 gateway vendor-parity — REQUEST shaping (items 13a, 13c, 13f; 13e reversed).
 
-Four request-side gaps from the 2026-10-03 parity audit
-(``.claude/context/reviews/GATEWAY-VENDOR-PARITY-2026-10-03.md``), each closed
-here and each pinned by a test. Live captures are replayed verbatim from
+Request-side gaps from the 2026-10-03 parity audit
+(``.claude/context/reviews/GATEWAY-VENDOR-PARITY-2026-10-03.md``), each pinned by
+a test. Live captures are replayed verbatim from
 ``tests/fixtures/model_router/`` (auth-stripped at capture); vendor shapes are
 never invented.
 
@@ -19,10 +19,14 @@ never invented.
   (``anthropic-vendor-thinking.body``). Vendor signatures are marked on the way
   out (``vct_`` prefix) and stripped from history bound for Anthropic; the
   vendor route gets its own signature back.
-* **(e) Anthropic server tools on vendor routes** — z.ai 500s
-  (``zai-websearch.body``), qwen silently ignores them (``qwen-websearch.body``).
-  A server-tools-only request is refused with guidance; a mixed request has the
-  server tools stripped and still succeeds.
+* **(e) Anthropic server tools — REVERSED, now a passthrough.** The audit read a
+  hand-built probe (``zai-websearch.body`` 500, ``qwen-websearch.body`` a
+  from-weights answer) and concluded vendors cannot serve WebSearch. Live
+  evidence 2026-10-04 overturns that: Claude Code's REAL WebSearch sub-request,
+  sent by agents on the z.ai and qwen routes, is answered 200 with genuine
+  search results by the agent's own vendor model. The gateway therefore leaves
+  the request's ``tools`` untouched and relays the vendor's own answer; the
+  captures are kept as the evidence trail of the probe that misled the audit.
 * **(f) Text-only models** — glm-5.3 cannot see an image and says so
   (``zai-image.body``: "I cannot see images from URLs"). A per-model
   ``text_only`` catalog flag replaces each image block with a short text note.
@@ -44,14 +48,11 @@ from unittest import mock
 import vco_lib.transcript_repair as tr
 from model_router import effort as E
 from model_router import tool_ids as ti
-from model_router.context_table import load_seed
+from model_router.context_table import ContextTable, ModelContext, load_seed
 from model_router.server import (
     TEXT_ONLY_IMAGE_NOTE,
-    _partition_server_tools,
     _replace_image_blocks,
-    _server_tools_refusal,
     _strip_images_for_text_only,
-    _strip_server_tools,
 )
 from model_router.vendors import VENDORS
 
@@ -217,6 +218,28 @@ class TranslateEffortUnitTests(unittest.TestCase):
         out, changed = E.translate_effort(payload, "qwen", "glm-5.3")
         self.assertFalse(changed)
         self.assertIs(out, payload)
+
+    def test_the_captured_zai_budget_pair_proves_budget_is_ignored(self) -> None:
+        """The evidence for leaving ``thinking.budget_tokens`` untranslated.
+
+        ``zai-budget-{512,8192}.body``: the same prompt at budget 512 and 8192
+        produced IDENTICAL substance (73 output tokens, 208 thinking chars),
+        differing only in the message id and the vendor's own fake signature.
+        z.ai ignores the budget, so there is no rejection to prevent and no
+        honest integer mapping to apply — the gateway forwards it untouched.
+        """
+        def substance(name: str) -> tuple[int, int]:
+            body = json.loads(_fixture(name))
+            thinking = "".join(
+                b.get("thinking", "") for b in body["content"]
+                if b.get("type") == "thinking"
+            )
+            return body["usage"]["output_tokens"], len(thinking)
+
+        self.assertEqual(substance("zai-budget-512"), (73, 208))
+        self.assertEqual(
+            substance("zai-budget-512"), substance("zai-budget-8192"),
+        )
 
     def test_a_non_dict_or_missing_output_config_is_untouched(self) -> None:
         self.assertEqual(E.translate_effort(None, "qwen", "glm-5.3"), (None, False))
@@ -689,8 +712,22 @@ class ThinkingRouteIntegrationTests(GatewayTestBase):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# item (e) — Anthropic server tools on vendor routes
+# item (e) — REVERSED: Anthropic server tools pass through on vendor routes
 # ══════════════════════════════════════════════════════════════════════════
+# The parity audit (gap 6) read a hand-built probe — z.ai answered HTTP 500
+# (``zai-websearch.body``), qwen answered 200 from its weights
+# (``qwen-websearch.body``) — and concluded vendors cannot serve WebSearch, so
+# the gateway should refuse/strip. LIVE EVIDENCE 2026-10-04 overturns that:
+# Claude Code's real WebSearch sub-request, sent by agents on claude-gw/glm-5.3
+# and glm-5.3-flash (vendor:zai) and claude-gw/qwen/deepseek-v4.1-flash and
+# qwen3.8-flash (vendor:qwen), was answered 200 by the agent's OWN vendor model
+# with a structured link list (only producible from real search-result blocks).
+# The probe's request shape differed from the client's. A gateway refusal would
+# therefore BREAK a working feature on every vendor route, so the gateway stays
+# out of the request's ``tools`` entirely: server tools are forwarded
+# byte-identical and the vendor's own answer — including any error — is relayed
+# verbatim. These tests pin that passthrough; re-introducing a refusal or a
+# strip turns them red.
 WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search"}
 ORDINARY_TOOL = {
     "name": "get_weather",
@@ -699,55 +736,10 @@ ORDINARY_TOOL = {
 }
 
 
-class ServerToolTypeUnitTests(unittest.TestCase):
-    def test_server_tool_types_are_recognised(self) -> None:
-        for tool_type in (
-            "web_search_20250305", "web_fetch_20250910", "code_execution_20250522",
-            "bash_code_execution_20250124", "text_editor_code_execution_20250124",
-            "tool_search_tool_regex_20251119",
-        ):
-            self.assertTrue(tr.is_server_tool_type(tool_type), tool_type)
+class ServerToolPassthroughTests(GatewayTestBase):
+    """A server-tool request on a vendor route is forwarded UNCHANGED."""
 
-    def test_ordinary_and_absent_types_are_not_server_tools(self) -> None:
-        self.assertFalse(tr.is_server_tool_type("custom"))
-        self.assertFalse(tr.is_server_tool_type(None))
-        self.assertFalse(tr.is_server_tool_type("get_weather"))
-        # bash_code_execution must not be caught by the code_execution prefix.
-        self.assertTrue(tr.is_server_tool_type("bash_code_execution_20250124"))
-
-
-class ServerToolPartitionUnitTests(unittest.TestCase):
-    def test_only_server_tools(self) -> None:
-        server, ordinary = _partition_server_tools({"tools": [WEB_SEARCH_TOOL]})
-        self.assertEqual(len(server), 1)
-        self.assertEqual(ordinary, [])
-
-    def test_mixed_tools(self) -> None:
-        server, ordinary = _partition_server_tools(
-            {"tools": [WEB_SEARCH_TOOL, ORDINARY_TOOL]},
-        )
-        self.assertEqual(len(server), 1)
-        self.assertEqual(ordinary, [ORDINARY_TOOL])
-
-    def test_no_tools_is_none(self) -> None:
-        self.assertIsNone(_partition_server_tools({"messages": []}))
-        self.assertIsNone(_partition_server_tools({"tools": []}))
-
-    def test_strip_removes_only_server_tools(self) -> None:
-        payload = {"tools": [WEB_SEARCH_TOOL, ORDINARY_TOOL]}
-        out, count = _strip_server_tools(payload)
-        self.assertEqual(count, 1)
-        self.assertEqual(out["tools"], [ORDINARY_TOOL])
-
-    def test_strip_is_a_noop_without_server_tools(self) -> None:
-        payload = {"tools": [ORDINARY_TOOL]}
-        out, count = _strip_server_tools(payload)
-        self.assertEqual(count, 0)
-        self.assertIs(out, payload)
-
-
-class ServerToolRouteIntegrationTests(GatewayTestBase):
-    async def test_only_server_tools_is_refused_naming_the_vendor(self) -> None:
+    async def test_only_server_tools_is_forwarded_unchanged(self) -> None:
         resp = await self.client.post(
             "/v1/messages",
             headers=self.auth(),
@@ -757,38 +749,12 @@ class ServerToolRouteIntegrationTests(GatewayTestBase):
                 "tools": [WEB_SEARCH_TOOL],
             },
         )
-        self.assertEqual(resp.status, 400)
-        body = await resp.json()
-        self.assertEqual(body["error"]["type"], "invalid_request_error")
-        self.assertIn("Z.ai", body["error"]["message"])
-        self.assertIn("WebSearch", body["error"]["message"])
-        # Refused before proxying: the vendor never sees it.
-        self.assertEqual(self.vendor_up.message_requests, [])
-
-    async def test_the_refusal_names_webfetch_and_curl_as_still_working(self) -> None:
-        text = _server_tools_refusal("Z.ai")
-        self.assertIn("WebFetch", text)
-        self.assertIn("curl", text)
-
-    async def test_mixed_tools_strips_the_server_tool_and_forwards(self) -> None:
-        with self.assertLogs(LOGGER, level="INFO") as captured:
-            resp = await self.client.post(
-                "/v1/messages",
-                headers=self.auth(),
-                json={
-                    "model": "claude-gw/glm-5.3",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "tools": [WEB_SEARCH_TOOL, ORDINARY_TOOL],
-                },
-            )
+        # NOT refused: the vendor answers, and its answer is relayed.
         self.assertEqual(resp.status, 200)
         forwarded = json.loads(self.vendor_up.requests[0]["body"])
-        self.assertEqual(forwarded["tools"], [ORDINARY_TOOL])
-        line = next(m for m in captured.output if "requested=" in m)
-        self.assertIn("note=server_tools_stripped=1", line)
+        self.assertEqual(forwarded["tools"], [WEB_SEARCH_TOOL])
 
-    async def test_a_mixed_request_is_never_failed(self) -> None:
-        # The ordinary tool still works, so the request must succeed.
+    async def test_mixed_tools_are_forwarded_unchanged(self) -> None:
         resp = await self.client.post(
             "/v1/messages",
             headers=self.auth(),
@@ -799,6 +765,23 @@ class ServerToolRouteIntegrationTests(GatewayTestBase):
             },
         )
         self.assertEqual(resp.status, 200)
+        forwarded = json.loads(self.vendor_up.requests[0]["body"])
+        # Nothing stripped: both tools reach the vendor exactly as sent.
+        self.assertEqual(forwarded["tools"], [WEB_SEARCH_TOOL, ORDINARY_TOOL])
+
+    async def test_no_server_tool_note_is_added_to_the_access_line(self) -> None:
+        with self.assertLogs(LOGGER, level="INFO") as captured:
+            await self.client.post(
+                "/v1/messages",
+                headers=self.auth(),
+                json={
+                    "model": "claude-gw/glm-5.3",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [WEB_SEARCH_TOOL],
+                },
+            )
+        line = next(m for m in captured.output if "requested=" in m)
+        self.assertNotIn("server_tools_stripped", line)
 
     async def test_first_party_server_tools_are_forwarded_untouched(self) -> None:
         await self.client.post(
@@ -813,13 +796,22 @@ class ServerToolRouteIntegrationTests(GatewayTestBase):
         forwarded = json.loads(self.anthropic_up.requests[0]["body"])
         self.assertEqual(forwarded["tools"], [WEB_SEARCH_TOOL])
 
-    async def test_the_captured_vendor_websearch_answers_are_the_evidence(self) -> None:
-        # z.ai 500s; qwen answers 200 but with no search (model says so).
-        zai = json.loads(_fixture("zai-websearch"))
-        self.assertEqual(zai["type"], "error")
-        qwen = json.loads(_fixture("qwen-websearch"))
-        thinking = qwen["content"][0]["thinking"]
-        self.assertIn("don't have internet", thinking)
+    async def test_qwen_route_server_tools_are_forwarded_unchanged(self) -> None:
+        stub_url = self.vendor.upstream
+        self.vendor = replace(VENDORS["qwen"], upstream=stub_url)
+        self.client = await self.make_client()
+        resp = await self.client.post(
+            "/v1/messages",
+            headers=self.auth(),
+            json={
+                "model": "claude-gw/qwen/deepseek-v4.1-flash",
+                "messages": [{"role": "user", "content": "search Rome"}],
+                "tools": [WEB_SEARCH_TOOL],
+            },
+        )
+        self.assertEqual(resp.status, 200)
+        forwarded = json.loads(self.vendor_up.requests[0]["body"])
+        self.assertEqual(forwarded["tools"], [WEB_SEARCH_TOOL])
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -865,6 +857,100 @@ class TextOnlyCatalogDataTests(unittest.TestCase):
             )
         }["text_only"]
         self.assertIs(field.default, False)
+
+
+def _ctx(
+    model_id: str, *, text_only: bool = False, vendor: str = "zai",
+    overrides: "dict[str, ModelContext] | None" = None,
+) -> ModelContext:
+    """A cited row, so nothing is dropped for want of a ``source``."""
+    return ModelContext(
+        model_id=model_id, vendor=vendor, context_window=1_000_000,
+        max_output=128_000, window_1m=True,
+        source=f"https://docs.example/{model_id}", text_only=text_only,
+        vendor_overrides=overrides or {},
+    )
+
+
+class TextOnlyIsAModelPropertyTests(unittest.TestCase):
+    """Review S3: no override or export row may silently reset ``text_only``.
+
+    ``text_only`` is a MODEL capability curated in the shipped seed. A
+    per-vendor ``vendor_overrides`` entry states an endpoint's WINDOW, and a
+    launcher export row cannot carry the flag at all (its DB has no column, so
+    it parses False) — either would mask the capability and silently stop the
+    gateway replacing images for a text-only model. ``is_text_only`` resolves
+    from the seed so neither can.
+    """
+
+    def test_a_vendor_override_does_not_reset_text_only(self) -> None:
+        override = _ctx("glm-5.3", text_only=False, vendor="qwen")
+        table = ContextTable(
+            rows={"glm-5.3": _ctx(
+                "glm-5.3", text_only=True, overrides={"qwen": override},
+            )},
+            source="seed(no-export)", path=None,
+        )
+        self.assertTrue(table.is_text_only("glm-5.3"))
+        # lookup(...).text_only carries the seed value onto the override too,
+        # so a reader of the row (not only is_text_only) is not misled.
+        resolved = table.lookup("glm-5.3", "qwen")
+        assert resolved is not None
+        self.assertTrue(resolved.text_only)
+
+    def test_a_launcher_export_row_does_not_mask_the_seed_flag(self) -> None:
+        # rows = the export (no text_only column -> False); fallback_rows = the
+        # seed (the capability authority -> True).
+        table = ContextTable(
+            rows={"glm-5.3": _ctx("glm-5.3", text_only=False)},
+            fallback_rows={"glm-5.3": _ctx("glm-5.3", text_only=True)},
+            source="export", path=None,
+        )
+        self.assertTrue(table.is_text_only("glm-5.3"))
+        resolved = table.lookup("glm-5.3")
+        assert resolved is not None
+        self.assertTrue(resolved.text_only)
+
+    def test_a_tombstoned_model_resolves_to_nothing(self) -> None:
+        table = ContextTable(
+            rows={"glm-5.3": _ctx("glm-5.3", text_only=True)},
+            source="seed(no-export)", path=None,
+            tombstones=frozenset({"glm-5.3"}),
+        )
+        self.assertFalse(table.is_text_only("glm-5.3"))
+
+    def test_a_vision_or_unknown_model_is_not_text_only(self) -> None:
+        table = ContextTable(
+            rows={"glm-5.3-flash": _ctx("glm-5.3-flash", text_only=False)},
+            source="seed(no-export)", path=None,
+        )
+        self.assertFalse(table.is_text_only("glm-5.3-flash"))
+        self.assertFalse(table.is_text_only("no-such-model"))
+        self.assertFalse(table.is_text_only(""))
+
+    def test_a_namespaced_or_1m_id_resolves(self) -> None:
+        table = ContextTable(
+            rows={"glm-5.3": _ctx("glm-5.3", text_only=True)},
+            source="seed(no-export)", path=None,
+        )
+        self.assertTrue(table.is_text_only("claude-gw/qwen/glm-5.3"))
+        self.assertTrue(table.is_text_only("glm-5.3[1m]"))
+
+    def test_the_seed_only_lookup_does_not_copy_the_row(self) -> None:
+        # The common case (no export, no override) must stay a no-op: lookup
+        # returns the very seed row, so text_only preservation costs nothing.
+        seed_row = _ctx("glm-5.3", text_only=True)
+        table = ContextTable(
+            rows={"glm-5.3": seed_row}, source="seed(no-export)", path=None,
+        )
+        self.assertIs(table.lookup("glm-5.3"), seed_row)
+
+    def test_the_shipped_seed_resolves_through_the_gateway_reader(self) -> None:
+        seed = load_seed()
+        self.assertTrue(seed.is_text_only("glm-5.3"))
+        self.assertTrue(seed.is_text_only("deepseek-v4-pro"))
+        self.assertFalse(seed.is_text_only("glm-5.3-flash"))
+        self.assertFalse(seed.is_text_only("deepseek-v4.1-flash"))
 
 
 class TextOnlyImageUnitTests(unittest.TestCase):

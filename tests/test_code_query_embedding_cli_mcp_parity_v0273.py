@@ -8,7 +8,7 @@ for the same query.
 
 Regression guarded here:
   * C-5 — the MCP used the codesage-biased ``get_code_embedding`` for
-    queries, which bypassed ``svc.embed_code`` on non-CodeSage slots
+    queries, which bypassed ``svc.embed_code_query`` on non-CodeSage slots
     (qwen3 / jina), so the MCP query vector came from raw HTTP :11440
     while the CLI's came from the resolved slot backend.
   * C-6 — the MCP's svc-None ``target_vector`` fallback branched on
@@ -46,17 +46,28 @@ _LADDER_SLOTS = ["codesage_embed", "qwen3_embed", "jina_embed", "openai_code_emb
 
 
 class _FakeService:
-    """Minimal EmbeddingService stub: records embed_code calls per slot."""
+    """Minimal EmbeddingService stub: records query-embed calls per slot."""
 
     def __init__(self, code_slot: str):
         self.code_vector_slot = code_slot
         self.text_vector_slot = "qwen3_embed"
         self.embed_code_calls: list[str] = []
 
-    def embed_code(self, text: str) -> list:
+    def _vec(self) -> list:
         # A slot-tagged vector so a raw-HTTP bypass would be detectable.
-        self.embed_code_calls.append(text)
         return [len(self.code_vector_slot), 0.1, 0.2]
+
+    def embed_code(self, text: str) -> list:
+        self.embed_code_calls.append(text)
+        return self._vec()
+
+    def embed_code_query(self, text: str, task=None) -> list:
+        # v0.2.101: a SEARCH QUERY routes through the query-side method (which
+        # applies the active model's query prefix). The record is the SAME
+        # list so the C-5 assertions still prove the query reached the
+        # service on every ladder slot.
+        self.embed_code_calls.append(text)
+        return self._vec()
 
 
 class CodeQueryEmbeddingParityTests(unittest.TestCase):
@@ -73,7 +84,7 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
     def _run(self, coro):
         return asyncio.run(coro)
 
-    # ----- C-5: query embedding routes through svc.embed_code for ALL slots -----
+    # ----- C-5: query embedding routes through svc.embed_code_query for ALL slots -----
 
     def test_mcp_query_embedding_uses_service_for_all_slots(self):
         for slot in _LADDER_SLOTS:
@@ -86,7 +97,7 @@ class CodeQueryEmbeddingParityTests(unittest.TestCase):
             self.assertEqual(
                 fake.embed_code_calls,
                 ["auth middleware"],
-                f"MCP must route slot {slot!r} through svc.embed_code (C-5)",
+                f"MCP must route slot {slot!r} through svc.embed_code_query (C-5)",
             )
             self.assertEqual(vec, [len(slot), 0.1, 0.2])
 

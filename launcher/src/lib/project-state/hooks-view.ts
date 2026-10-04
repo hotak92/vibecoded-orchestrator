@@ -211,3 +211,71 @@ export function newHookCommandPlaceholder(os: HintOs): string {
     ? 'powershell -NoProfile -ExecutionPolicy Bypass -File "${CLAUDE_PROJECT_DIR}/.claude/hooks/my-hook.ps1"'
     : 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"';
 }
+
+// ─── lean-ctx per-project toggle (PR-6 v0.2.11; copy fixed + control wired
+// in v0.2.101 alongside the allow-list inversion) ─────────────────────────
+//
+// Three logical states map to two on-disk states for
+// `<project>/.claude/env::VCO_LEAN_CTX_DEFAULT`:
+//   * 'default' → key absent (the hook treats absence as "on")
+//   * 'on'      → key present, value 'on'
+//   * 'off'     → key present, value 'off'
+// The logic lives here (not in the .svelte) so the mapping and the copy the
+// user reads are unit-testable — the v0.2.101 GUI audit found the toggle's
+// state + handlers had shipped in HooksTab.svelte with NO markup ever
+// rendering them (a delivered-nowhere control); the description below must
+// match the allow-list rule the hooks actually enforce.
+
+/** The `VCO_LEAN_CTX_DEFAULT` key this toggle owns. */
+export const LEAN_CTX_KEY = 'VCO_LEAN_CTX_DEFAULT';
+
+/** The toggle's three logical states. */
+export type LeanCtxChoice = 'default' | 'on' | 'off';
+
+export const LEAN_CTX_OPTIONS: Array<{ value: LeanCtxChoice; label: string }> = [
+  { value: 'default', label: 'Default (on)' },
+  { value: 'on', label: 'Per-project: on' },
+  { value: 'off', label: 'Per-project: off' },
+];
+
+/**
+ * What the user reads under the toggle. MUST describe the v0.2.101
+ * allow-list rule (compress only known-noisy commands; everything else
+ * raw; every compression lossless via the tee pointer) — not the retired
+ * "compress everything except exemptions" rule.
+ */
+export const LEAN_CTX_HINT =
+  'When on, the PreToolUse hook compresses ONLY allow-listed noisy commands ' +
+  '(package installs, image pulls, downloads, test/build runs); loops, pipes, git, ' +
+  'unknown and credential-bearing commands run raw. Every compressed run saves its ' +
+  'full raw output under .claude/state/lean-ctx-tee/ and prints a pointer to it, so ' +
+  'nothing is lost. Needs the lean-ctx binary — without one the hook does nothing.';
+
+/**
+ * Map the on-disk env value to a toggle state. Both hook siblings read the
+ * key case-insensitively (the .sh via a POSIX `[oO][fF][fF]` case-glob, the
+ * .ps1 via ToLowerInvariant — SF-3, v0.2.101 review), so this mapping is
+ * case-insensitive too. Any value other than the two the hooks read
+ * (including a manual edit or a missing key) renders as 'default': the user
+ * keeps the on-disk override until they actively move the toggle, which
+ * then writes cleanly.
+ */
+export function leanCtxChoiceFromEnvValue(v: string | null | undefined): LeanCtxChoice {
+  if (v === null || v === undefined) return 'default';
+  const lower = v.toLowerCase();
+  if (lower === 'off') return 'off';
+  if (lower === 'on') return 'on';
+  return 'default';
+}
+
+/** The env value to persist for a chosen state ('default' removes the key). */
+export function leanCtxEnvValueForChoice(c: LeanCtxChoice): string | null {
+  return c === 'default' ? null : c;
+}
+
+/** Confirmation copy after a successful toggle write. */
+export function leanCtxToastText(c: LeanCtxChoice): string {
+  return c === 'default'
+    ? 'Reverted to default (allow-listed compression on)'
+    : `Per-project compression set to ${c}`;
+}

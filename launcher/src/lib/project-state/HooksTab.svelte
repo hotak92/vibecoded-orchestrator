@@ -7,6 +7,12 @@
     detectHintOs,
     gitVisibilityNote,
     isChecked,
+    leanCtxChoiceFromEnvValue,
+    leanCtxEnvValueForChoice,
+    leanCtxToastText,
+    LEAN_CTX_HINT,
+    LEAN_CTX_KEY,
+    LEAN_CTX_OPTIONS,
     newHookCommandPlaceholder,
     parseTimeoutSeconds,
     registerBlockedReason,
@@ -17,6 +23,7 @@
     unregisterConfirmText,
     type EffectiveHook,
     type EffectiveHooksView,
+    type LeanCtxChoice,
   } from './hooks-view';
 
   let { projectId }: { projectId: string } = $props();
@@ -56,18 +63,11 @@
   ];
   const EVENT_OPTIONS = COMMON_EVENTS.map((e) => ({ value: e, label: e }));
 
-  // PR-6 (v0.2.11): per-project lean-ctx toggle. Three logical states map
-  // to two on-disk states for `<project>/.claude/env::VCO_LEAN_CTX_DEFAULT`:
-  //   * 'default' → key absent (the PR-1 hook treats absence as "on")
-  //   * 'on'      → key present, value 'on'
-  //   * 'off'     → key present, value 'off'
-  type LeanCtxChoice = 'default' | 'on' | 'off';
-  const LEAN_CTX_KEY = 'VCO_LEAN_CTX_DEFAULT';
-  const LEAN_CTX_OPTIONS: Array<{ value: LeanCtxChoice; label: string }> = [
-    { value: 'default', label: 'Default (on)' },
-    { value: 'on', label: 'Per-project: on' },
-    { value: 'off', label: 'Per-project: off' },
-  ];
+  // PR-6 (v0.2.11): per-project lean-ctx toggle. v0.2.101: the state mapping
+  // + user-facing copy moved to ./hooks-view (unit-tested there), and the
+  // control is actually RENDERED below — until then the state and handlers
+  // had shipped without any markup ever calling them (delivered-nowhere).
+  // The copy describes the v0.2.101 allow-list rule the hooks enforce.
   let leanCtxChoice = $state<LeanCtxChoice>('default');
   let leanCtxLoading = $state(true);
   let leanCtxSaving = $state(false);
@@ -131,13 +131,10 @@
         projectId,
         key: LEAN_CTX_KEY,
       });
-      if (v === null || v === undefined) leanCtxChoice = 'default';
-      else if (v === 'off') leanCtxChoice = 'off';
-      else if (v === 'on') leanCtxChoice = 'on';
-      // Any other value (manual edit) is rendered as "default" in the UI;
-      // the user keeps the on-disk override until they actively change the
-      // toggle, at which point we overwrite cleanly.
-      else leanCtxChoice = 'default';
+      // Any value the hook does not read (a manual edit, an absent key)
+      // renders as 'default'; the on-disk override survives until the user
+      // actively moves the toggle (mapping unit-tested in hooks-view).
+      leanCtxChoice = leanCtxChoiceFromEnvValue(v);
     } catch (e) {
       toast.error(e);
     } finally {
@@ -151,17 +148,12 @@
     const previous = leanCtxChoice;
     leanCtxChoice = next; // optimistic
     try {
-      const value = next === 'default' ? null : next;
       await invoke('set_claude_env_value', {
         projectId,
         key: LEAN_CTX_KEY,
-        value,
+        value: leanCtxEnvValueForChoice(next),
       });
-      toast.success(
-        next === 'default'
-          ? 'Reverted to default (compression on)'
-          : `Per-project compression set to ${next}`,
-      );
+      toast.success(leanCtxToastText(next));
     } catch (e) {
       leanCtxChoice = previous;
       toast.error(e);
@@ -254,7 +246,12 @@
 
   // Re-load on project switch. `$effect` fires on mount too, so there is no
   // separate `onMount` — a second load would only double the first render.
-  $effect(() => { if (projectId) void load(); });
+  $effect(() => {
+    if (projectId) {
+      void load();
+      void loadLeanCtx();
+    }
+  });
 </script>
 
 <section class="ps-tab">
@@ -265,6 +262,24 @@
   </header>
 
   <p class="ps-git-note">{gitVisibilityNote(settingsPath)}</p>
+
+  <div class="ps-lean-card" data-testid="lean-ctx-toggle">
+    <div class="ps-lean-row">
+      <span class="ps-lean-title">Bash output compression (lean-ctx)</span>
+      <!-- One-way `value`, NOT bind:value: Dropdown assigns the bindable
+           BEFORE firing onChange, so a two-way bind would update
+           leanCtxChoice first and setLeanCtx's equality guard would skip
+           the persist — a control that moves but writes nothing. -->
+      <Dropdown
+        options={LEAN_CTX_OPTIONS}
+        value={leanCtxChoice}
+        disabled={leanCtxLoading || leanCtxSaving}
+        ariaLabel="Per-project lean-ctx compression"
+        onChange={(v) => void setLeanCtx(v)} />
+      {#if leanCtxSaving}<span class="ps-lean-saving">Saving…</span>{/if}
+    </div>
+    <p class="ps-lean-hint">{LEAN_CTX_HINT}</p>
+  </div>
 
   {#if view && !readable}
     <div class="ps-banner" role="alert">
@@ -364,6 +379,15 @@
   }
   /* settings.json is usually VCS-tracked — say so before the user clicks. */
   .ps-git-note { color: #aaa; font-size: 11px; line-height: 1.5; margin: 0 0 12px; }
+  /* lean-ctx per-project compression toggle (v0.2.101: wired + accurate copy). */
+  .ps-lean-card {
+    background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 6px; padding: 10px 12px; margin: 0 0 14px;
+  }
+  .ps-lean-row { display: flex; align-items: center; gap: 10px; }
+  .ps-lean-title { font-size: 12px; font-weight: 600; color: inherit; }
+  .ps-lean-saving { font-size: 11px; color: #888; }
+  .ps-lean-hint { color: #aaa; font-size: 11px; line-height: 1.5; margin: 8px 0 0; }
   .ps-banner {
     display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
     background: rgba(255,120,120,0.10); border: 1px solid rgba(255,120,120,0.35);

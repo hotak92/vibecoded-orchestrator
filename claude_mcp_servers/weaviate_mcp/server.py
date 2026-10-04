@@ -5101,69 +5101,6 @@ _CODE_STRUCTURE_TELEMETRY_MAX_NODES = _rl_state._CODE_STRUCTURE_TELEMETRY_MAX_NO
 DUAL_RL_LOG_ENABLED_ENV = _rl_state.DUAL_RL_LOG_ENABLED_ENV
 
 
-async def search_single_collection(collection_name: str, query: str, limit: int, filters=None) -> list:
-    """
-    Search a collection and return formatted results.
-
-    For chunked nodes (content prefixed with '[chunk N/total]'), also fetches
-    the immediately preceding and following chunks so callers receive full
-    context without needing a second query.  Dedup is by (title, chunk_number).
-    """
-    try:
-        client = get_weaviate_client()
-        coll = client.collections.get(collection_name)
-
-        # Search with near_vector (Ollama embeddings) or near_text (Weaviate vectorizer)
-        if EMBEDDING_SOURCE == "weaviate":
-            nv_kwargs = dict(query=query, limit=limit, return_metadata=["distance"])
-            if filters:
-                nv_kwargs["filters"] = filters
-            response = coll.query.near_text(**nv_kwargs)
-        else:
-            vector, target_name = await _get_search_vector(query)
-            nv_kwargs = dict(near_vector=vector, limit=limit, return_metadata=["distance"])
-            if filters:
-                nv_kwargs["filters"] = filters
-            if target_name:
-                nv_kwargs["target_vector"] = target_name
-            response = coll.query.near_vector(**nv_kwargs)
-
-        # Primary hits
-        results: list[dict] = []
-        # W7: per-NODE chunk identity (see `_node_chunk_key`) — a
-        # (title, chunk_number) key drops a colliding node's whole result.
-        seen: set = set()
-
-        for obj in response.objects:
-            formatted = _format_obj(obj, collection_name, obj.metadata.distance)
-            key = _node_chunk_key(formatted)
-            if key not in seen:
-                seen.add(key)
-                results.append(formatted)
-
-        # Neighbour chunks for any chunked primary hits
-        neighbour_candidates: list[dict] = []
-        for r in list(results):
-            if r["chunk_number"] is not None:
-                neighbours = _fetch_adjacent_chunks(
-                    coll, r["title"], r["chunk_number"], r["total_chunks"],
-                    collection_name,
-                    file_path=r.get("file_path") or "",
-                )
-                neighbour_candidates.extend(neighbours)
-
-        for nb in neighbour_candidates:
-            key = _node_chunk_key(nb)
-            if key not in seen:
-                seen.add(key)
-                results.append(nb)
-
-        return results
-    except Exception as e:
-        logger.warning(f"Failed to search collection {collection_name}: {e}")
-        return []
-
-
 # V52-I Fix A (2026-06-09): per-collection cache of whether `valid_until`
 # property exists. The MCP fans hybrid_search / semantic_graph_search across
 # {project KG, shared KG, peer KGs, _Development, _Diagrams} but only the
@@ -7697,7 +7634,7 @@ async def search_code_graph(
 
     try:
         # v0.2.73 C-5: embed the query via the CLI-mirrored path
-        # (svc.embed_code for ALL slots) so the MCP and CLI produce the
+        # (svc.embed_code_query for ALL slots) so the MCP and CLI produce the
         # SAME query vector on every ladder tier. Using the codesage-biased
         # get_code_embedding here broke CLI≡MCP on qwen3/jina slots.
         query_embedding = await get_code_query_embedding(query)

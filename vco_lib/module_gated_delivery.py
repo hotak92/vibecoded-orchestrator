@@ -622,44 +622,82 @@ def agent_definition_dirs(folder: Optional[Path]) -> list[Path]:
 # ---------------------------------------------------------------------------
 
 
-def status_payload(folder: Optional[Path]) -> dict[str, Any]:
-    """``{"machine_signal", "gate", "agent_id_problems"}``. Reads only.
+def status_payload(
+    folders: Optional[Sequence[Path | str]] = None,
+) -> dict[str, Any]:
+    """``{"machine_signal", "gate", "agent_id_problems", "folders"?}``. Reads
+    only.
 
-    ``agent_id_problems`` lists definitions (the project's and the user's)
+    ``agent_id_problems`` lists definitions (the projects' and the user's)
     naming a gateway model id the router does not know — ``None`` when the
-    gateway package is not importable (no registry to check against). With
-    ``folder``, ``claude_md_section.renders`` says whether the project's
-    CLAUDE.md model-routing section renders — the render's own mapping
+    gateway package is not importable (no registry to check against).
+
+    ``folders`` (any number; ONE interpreter start answers for all of them —
+    the machine signal is per-machine, only the per-project row varies, so
+    the Services page asks once, not once per project): the ``folders`` map
+    carries, per folder, the gate verdict plus ``claude_md_section.renders``
+    — whether that project's CLAUDE.md model-routing section renders,
+    computed by the render's own mapping
     (``vco_lib.claude_md_sections.gateway_section_renders``), so a GUI
-    consumer never re-derives it.
+    consumer never re-derives it. The map is keyed by the EXACT string the
+    caller passed (a ``Path`` element is keyed by ``str(path)``):
+    ``str(Path(...))`` normalises — drops a trailing slash, resolves ``.`` —
+    and a launcher lookup keyed by the raw ``folder_path`` would otherwise
+    miss its own verdict. With exactly ONE folder the same verdict also
+    appears at the top level (``gate`` / ``claude_md_section``), the shape
+    the launcher's agents-gate card reads.
     """
+    from vco_lib.claude_md_sections import gateway_section_renders
     from vco_lib.gateway_ensure import machine_gateway_signal
 
     signal = machine_gateway_signal()
-    gate = None
-    gate_verdict = None
-    if folder is not None:
-        gate_verdict = gateway_agents_gate(folder, machine_signal=lambda: signal)
-        gate = gate_verdict.to_dict()
+    # (exact key, folder) pairs: the key echoes the caller's string, the
+    # Path is what the gate and the definition scan resolve.
+    entries: list[tuple[str, Path]] = [
+        (folder if isinstance(folder, str) else str(folder), Path(folder))
+        for folder in (folders if folders is not None else [])
+    ]
+
+    def verdict(folder: Path) -> dict[str, Any]:
+        gate_verdict = gateway_agents_gate(
+            folder, machine_signal=lambda: signal)
+        return {
+            "gate": gate_verdict.to_dict(),
+            # What the CLAUDE.md render does with the same verdict — the
+            # render's own mapping, so the Services page shows what the
+            # file actually does instead of re-deriving it in Rust/TS.
+            "claude_md_section": {
+                "renders": gateway_section_renders(gate_verdict),
+            },
+        }
+
+    dirs: list[Path] = []
+    for _key, folder in entries:
+        dirs.extend(agent_definition_dirs(folder))
+    if not dirs:
+        dirs = agent_definition_dirs(None)
+    # N-2: every folder's dirs include the USER agents dir, so an N-folder
+    # call would scan it N times and report each of its problems N times.
+    # Path equality is by parsed parts, so this also folds non-canonical
+    # duplicates of the same directory.
+    dirs = list(dict.fromkeys(dirs))
     try:
-        problems: Optional[list[dict[str, Any]]] = check_agent_model_ids(
-            agent_definition_dirs(folder))
+        problems: Optional[list[dict[str, Any]]] = check_agent_model_ids(dirs)
     except ImportError:
         problems = None
+
+    by_folder = {key: verdict(folder) for key, folder in entries}
     payload: dict[str, Any] = {
         "machine_signal": signal.to_dict(),
-        "gate": gate,
+        "gate": None,
         "agent_id_problems": problems,
     }
-    if gate_verdict is not None:
-        # What the CLAUDE.md render does with the same verdict — computed by
-        # the render's own mapping (vco_lib.claude_md_sections), so the
-        # launcher's Services-page toggle shows what the file actually does
-        # instead of re-deriving it in Rust/TS.
-        from vco_lib.claude_md_sections import gateway_section_renders
-        payload["claude_md_section"] = {
-            "renders": gateway_section_renders(gate_verdict),
-        }
+    if len(entries) == 1:
+        only = by_folder[entries[0][0]]
+        payload["gate"] = only["gate"]
+        payload["claude_md_section"] = only["claude_md_section"]
+    if by_folder:
+        payload["folders"] = by_folder
     return payload
 
 
@@ -673,8 +711,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     )
     sub = p.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("status", help="Print the machine signal and, with "
-                       "--folder, that project's gate verdict.")
-    s.add_argument("--folder", default=None, metavar="DIR")
+                       "--folder (repeatable), those projects' gate "
+                       "verdicts — one call answers for every folder.")
+    s.add_argument("--folder", action="append", default=None, metavar="DIR",
+                   help="Project folder to answer for; repeat for several.")
     s.add_argument("--json", action="store_true",
                    help="Print one JSON object on stdout.")
     c = sub.add_parser("check-agent-ids", help="List agent definitions whose "
@@ -684,8 +724,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    help="Project whose .claude/agents is checked too.")
     c.add_argument("--json", action="store_true")
     args = p.parse_args(argv)
-    folder = Path(args.folder) if args.folder else None
+    # `status` takes a REPEATABLE --folder (one call answers for every
+    # project); `check-agent-ids` keeps its single optional --folder.
     if args.cmd == "check-agent-ids":
+        folder = Path(args.folder) if args.folder else None
         problems = check_agent_model_ids(agent_definition_dirs(folder))
         if args.json:
             print(json.dumps({"agent_id_problems": problems}, sort_keys=True))
@@ -695,7 +737,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[vct] {pr['path']}: model {pr['model']!r} is not a gateway "
                   f"id{hint}", file=sys.stderr if args.json else sys.stdout)
         return 3 if problems else 0
-    payload = status_payload(folder)
+    # Raw strings, not Paths: the payload must echo the caller's exact
+    # folder strings back as keys (N-3).
+    folders = list(args.folder) if args.folder else None
+    payload = status_payload(folders)
     if args.json:
         print(json.dumps(payload, sort_keys=True))
     else:
@@ -704,6 +749,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         if payload["gate"] is not None:
             g = payload["gate"]
             print(f"gate: {g['state']} ({g['signal']}) — {g['reason']}")
+        # Single folder: its verdict already printed above as "gate:".
+        if payload["gate"] is None:
+            for path, entry in (payload.get("folders") or {}).items():
+                g = entry["gate"]
+                print(f"gate [{path}]: {g['state']} ({g['signal']}) — {g['reason']}")
     return 0
 
 

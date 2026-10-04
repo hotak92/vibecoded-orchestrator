@@ -10076,27 +10076,24 @@ def _read_active_embedding_from_app_state() -> "str | None":
 def _resolve_active_embedding_for_install() -> "str | None":
     """v0.2.52 V52-AJ: resolve the install-time active embedding profile.
 
-    Resolution chain (matches ``EmbeddingService._resolve_active_embedding``):
+    v0.2.101: this is a THIN CALL over the ONE home,
+    :func:`vco_lib.kg_context_triple.active_embedding_profile_or_none` — the
+    chain is ``ACTIVE_EMBEDDING`` env → ``app_state[embedding.active_profile]``
+    → ``app_state[default_text_embedding]`` mapped to its profile (the
+    hardware-pick derive) → ``None``. ``EmbeddingService._resolve_active_embedding``
+    delegates to the same chain and appends the ``"qwen3"`` default.
 
-      1. ``os.environ[ACTIVE_EMBEDDING]`` — explicit user override.
-      2. ``launcher.db app_state[embedding.active_profile]`` — what the
-         launcher's GUI / install.py preset chooser wrote.
-      3. ``None`` — caller falls back to ``"qwen3"`` default (no
-         destructive resolution here; the None sentinel lets callers
-         distinguish "use default" from "explicit qwen3").
-
-    Returned value (when not None) is lowercased + stripped.
-
-    The chain intentionally mirrors the EmbeddingService side so both
-    code paths arrive at the same answer for any given (env, db) pair.
+    The ``None`` sentinel is install.py's, deliberately: callers distinguish
+    "nothing is configured, use the qwen3 default" from "qwen3 was explicitly
+    chosen" (``current_active_embedding = ... or "qwen3"`` attests it). What
+    the copy this replaced got WRONG was the chain itself: it stopped at
+    ``embedding.active_profile``, so on a hardware-pick-only box install.py
+    resolved ``None`` → qwen3 while the embedder resolved (say) arctic — the
+    recorded context and the work disagreed.
     """
-    env_value = os.environ.get("ACTIVE_EMBEDDING", "").strip().lower()
-    if env_value:
-        return env_value
-    db_value = _read_active_embedding_from_app_state()
-    if db_value:
-        return db_value.lower()
-    return None
+    from vco_lib.kg_context_triple import active_embedding_profile_or_none
+
+    return active_embedding_profile_or_none(db_path=_discover_app_state_db_path())
 
 
 # v0.2.61 (stale-embedding reconcile): the active_embedding profile slot
@@ -13544,11 +13541,10 @@ def _seed_weaviate_shared_kg_only(
         shared_target=current_shared_kg,
         label=f"shared seed ({current_shared_kg})", error_prefix="shared-kg",
         hint=f"KG_COLLECTION={current_shared_kg} kg-sync --all",
-        deferral_report=deferral_report, make_deferral=_make_deferral,
+        make_deferral=_make_deferral,
         run_child_logged=run_child_logged,
     )
     seed_errors.extend(_shared.errors)
-    return seed_errors
     return seed_errors
 
 
@@ -14033,11 +14029,11 @@ def _seed_weaviate_impl(
             )
 
             diff_files = _install_weaviate.content_hash_diff(
-                on_disk, stored_hashes, PROJECT_ROOT,
+                on_disk, stored_hashes, PROJECT_ROOT, knowledge_root=knowledge_root,
             )
 
             total_files = len(on_disk)
-            _nodes_skipped = total_files - len(diff_files)
+            _nodes_skipped = max(total_files - len(diff_files), 0)
 
             if not diff_files:
                 # All hashes match → skip sync entirely.
@@ -14163,15 +14159,14 @@ def _seed_weaviate_impl(
         # NEW non-leaking channel, which outranks any inherited KG_BASE_DIR.
         seed_env = _subprocess_env_with_embedding()
         seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
-        # v0.2.101 item 4: the whole-tree seed is enqueued (see
-        # `vco_lib.install_weaviate.kg_seed_step` for the decision + fallback).
+        # v0.2.101: enqueued (see `install_weaviate.kg_seed_step`) — decision + fallback there.
         _seed = _install_weaviate.kg_seed_step(
             folder=PROJECT_ROOT, venv_py=venv_py, sync_kg=sync_kg, cmd_args=cmd_args,
             log_stem="kg-sync", seed_env=seed_env, enqueue=_sync_all,
             context=(current_active_embedding, current_kg_collection, current_shared_kg),
             label="full seed (knowledge/ + docs/)",
             error_prefix="kg-sync", hint="kg-sync --all",
-            deferral_report=deferral_report, make_deferral=_make_deferral,
+            make_deferral=_make_deferral,
             run_child_logged=run_child_logged,
         )
         seed_detached, sync_subprocess_ran, sync_exit_zero = (
@@ -14236,7 +14231,9 @@ def _seed_weaviate_impl(
     # carve-out: they record "an attempt happened at T, embedding N/K" — true of
     # an incomplete run too — withholding them would hide the attempt itself.
     _context_change_incomplete = _context_change_run and not sync_exit_zero
-    if sync_subprocess_ran and not _context_change_incomplete:
+    # Whole-tree (`--all`) shapes belong to the child (vco_lib.kg_context_triple);
+    # this is SEG-1's PARTIAL-run rule — see that module's docstring.
+    if sync_subprocess_ran and not _context_change_incomplete and not _sync_all:
         _write_app_state_key(_APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, current_active_embedding)
         _write_app_state_key(_APP_STATE_KEY_LAST_KG_COLLECTION, current_kg_collection)
         _write_app_state_key(_APP_STATE_KEY_LAST_SHARED_KG_COLLECTION, current_shared_kg)

@@ -460,13 +460,17 @@ def generate_code_embedding(text: str) -> Optional[List[float]]:
     v0.2.18: routes through EmbeddingService.embed_code (which picks
     CodeEmbed / Ollama / OpenAI from env). Falls back to direct
     CodeEmbed-service HTTP call when the service isn't available.
+
+    v0.2.101: this embeds a SEARCH QUERY, so it routes through
+    ``embed_code_query`` (the MCP's ``get_code_query_embedding`` does the
+    same — CLI≡MCP invariant). Documents/backfill still use ``embed_code``.
     """
     svc = _get_or_create_embedding_service()
     if svc is not None:
         try:
-            return svc.embed_code(text)
+            return svc.embed_code_query(text)
         except Exception as e:
-            print(f"⚠️  EmbeddingService.embed_code failed: {e}", file=sys.stderr)
+            print(f"⚠️  EmbeddingService.embed_code_query failed: {e}", file=sys.stderr)
     # Legacy fallback: direct CodeEmbed HTTP call.
     try:
         response = requests.post(
@@ -481,6 +485,27 @@ def generate_code_embedding(text: str) -> Optional[List[float]]:
     except Exception as e:
         print(f"❌ Embedding error: {e}")
         return None
+
+
+def _reference_code_text(props: dict) -> str:
+    """The code/text body of a code-graph entity, for embedding as a QUERY.
+
+    Property names per collection (the code-graph schema): CodeFunction →
+    ``function_body``, CodeClass → ``class_body``, CodeModule →
+    ``module_summary``, CodeAPI → ``api_description``. Falls back to ``doc`` —
+    an entity with no body still has a description worth embedding.
+    """
+    for key in (
+        "function_body",
+        "class_body",
+        "module_summary",
+        "api_description",
+        "doc",
+    ):
+        val = props.get(key)
+        if val:
+            return str(val)
+    return ""
 
 
 class CodeGraphQuery:
@@ -1317,27 +1342,68 @@ class CodeGraphQuery:
 
             ref_obj = ref_query.objects[0]
 
-            # Find similar
-            similar_query = coll.query.near_object(
-                near_object=ref_obj.uuid,
-                limit=limit + 1
-            )
+            # Find similar.
+            #
+            # v0.2.101: this is a code→code similarity search, so embed the
+            # reference entity's CODE as a QUERY in the code space with the
+            # code_similarity task wording, then search by vector. Falls back
+            # to Weaviate's ``near_object`` (the object's own stored vector, no
+            # query embed) whenever no embedding backend is available, the
+            # entity carries no body, or the vector search cannot run — so the
+            # command keeps working on a half-migrated install.
+            #
+            # ``_run`` is the ONE place the project filter + execution happen,
+            # shared by BOTH legs. It is called INSIDE the try for the vector
+            # leg: ``near_vector`` can fail at EXECUTION time (a dimension/slot
+            # mismatch against the collection's named vector), not only while
+            # the query is built, and that must fall back to ``near_object``
+            # rather than fail a call that used to succeed (v0.2.101 SF-2 nit).
+            def _run(query):
+                if self.project:
+                    query = query.where(
+                        Filter.by_property("project").equal(self.project)
+                    )
+                return query.do()
 
-            if self.project:
-                similar_query = similar_query.where(
-                    Filter.by_property("project").equal(self.project)
-                )
+            similar_query = None
+            response = None
+            svc = _get_or_create_embedding_service()
+            if svc is not None:
+                ref_text = _reference_code_text(dict(ref_obj.properties or {}))
+                if ref_text:
+                    try:
+                        from weaviate_mcp.chunking import QUERY_TASK_CODE_SIMILARITY
 
-            response = similar_query.do()
+                        vec = svc.embed_code_query(
+                            ref_text, task=QUERY_TASK_CODE_SIMILARITY
+                        )
+                        if vec:
+                            nv_kwargs: dict = dict(near_vector=vec, limit=limit + 1)
+                            slot = _active_code_vector_slot()
+                            if slot:
+                                nv_kwargs["target_vector"] = slot
+                            similar_query = coll.query.near_vector(**nv_kwargs)
+                            response = _run(similar_query)
+                    except Exception as e:
+                        print(
+                            f"⚠️  query-vector similarity unavailable ({e}); "
+                            f"falling back to near_object",
+                            file=sys.stderr,
+                        )
+                        similar_query = None
+                        response = None
+            if similar_query is None:
+                response = _run(coll.query.near_object(
+                    near_object=ref_obj.uuid,
+                    limit=limit + 1
+                ))
 
-            # Format and print results
+            # Format and print results (the reference itself is excluded).
+            others = [o for o in response.objects if o.uuid != ref_obj.uuid]
             print(f"\n🔍 Finding code similar to: '{reference_name}'")
-            print(f"   Found {len(response.objects) - 1} similar items:\n")  # -1 for reference itself
+            print(f"   Found {len(others)} similar items:\n")
 
-            for i, obj in enumerate(response.objects, 1):
-                if obj.uuid == ref_obj.uuid:
-                    continue  # Skip reference itself
-
+            for i, obj in enumerate(others, 1):
                 props = obj.properties
                 distance = obj.metadata.distance if obj.metadata.distance is not None else -1.0
                 similarity = 1.0 - distance if distance >= 0 else 0.0

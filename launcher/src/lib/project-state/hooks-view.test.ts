@@ -8,12 +8,19 @@
 // the cases where the honest answer is "this control does nothing, so it is
 // off" rather than a checkbox that silently lies.
 
+import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import {
   canToggle,
   detectHintOs,
   gitVisibilityNote,
   isChecked,
+  leanCtxChoiceFromEnvValue,
+  leanCtxEnvValueForChoice,
+  leanCtxToastText,
+  LEAN_CTX_HINT,
+  LEAN_CTX_KEY,
+  LEAN_CTX_OPTIONS,
   newHookCommandPlaceholder,
   parseTimeoutSeconds,
   registerBlockedReason,
@@ -236,5 +243,98 @@ describe('newHookCommandPlaceholder — the hint must fit the OS that reads it',
 
   it('never shows the bash form on Windows (a copied bash hint is a broken hook)', () => {
     expect(newHookCommandPlaceholder('windows')).not.toContain('bash');
+  });
+});
+
+
+// ─── lean-ctx per-project toggle (v0.2.101: wired + accurate copy) ───────
+//
+// The v0.2.101 GUI audit found the PR-6 (v0.2.11) toggle had shipped its
+// state + handlers in HooksTab.svelte with NO markup ever rendering them —
+// a delivered-nowhere control. The mapping/copy now live in hooks-view and
+// are pinned here; the wiring itself (markup + onChange) is asserted
+// structurally below against the .svelte source.
+
+describe('lean-ctx toggle — state mapping', () => {
+  it('maps the two on-disk values the hook reads, and nothing else', () => {
+    expect(leanCtxChoiceFromEnvValue('on')).toBe('on');
+    expect(leanCtxChoiceFromEnvValue('off')).toBe('off');
+    // absent key = the hook's own default ("on"), rendered as 'default'
+    expect(leanCtxChoiceFromEnvValue(null)).toBe('default');
+    expect(leanCtxChoiceFromEnvValue(undefined)).toBe('default');
+    // a manual edit the hook would ignore keeps rendering as 'default' —
+    // the on-disk value survives until the user actively moves the toggle
+    expect(leanCtxChoiceFromEnvValue('OFF!')).toBe('default');
+    expect(leanCtxChoiceFromEnvValue('')).toBe('default');
+    // case-insensitive: BOTH hook siblings compare case-insensitively
+    // (.sh via a POSIX case-glob, .ps1 via ToLowerInvariant — SF-3)
+    expect(leanCtxChoiceFromEnvValue('Off')).toBe('off');
+    expect(leanCtxChoiceFromEnvValue('ON')).toBe('on');
+  });
+
+  it('persists on/off and REMOVES the key for default (null)', () => {
+    expect(leanCtxEnvValueForChoice('on')).toBe('on');
+    expect(leanCtxEnvValueForChoice('off')).toBe('off');
+    expect(leanCtxEnvValueForChoice('default')).toBeNull();
+  });
+
+  it('owns the VCO_LEAN_CTX_DEFAULT key the hooks read', () => {
+    expect(LEAN_CTX_KEY).toBe('VCO_LEAN_CTX_DEFAULT');
+  });
+
+  it('offers exactly the three logical states', () => {
+    expect(LEAN_CTX_OPTIONS.map((o) => o.value)).toEqual(['default', 'on', 'off']);
+  });
+});
+
+describe('lean-ctx toggle — copy must match the allow-list rule the hooks enforce', () => {
+  it('describes the v0.2.101 rule positively: allow-list, raw-by-default, lossless pointer', () => {
+    expect(LEAN_CTX_HINT).toMatch(/allow-listed/i);
+    expect(LEAN_CTX_HINT).toMatch(/run raw|runs raw|raw/i);
+    expect(LEAN_CTX_HINT).toMatch(/pointer/i);
+    expect(LEAN_CTX_HINT).toContain('.claude/state/lean-ctx-tee/');
+  });
+
+  it('never re-describes the retired compress-everything rule', () => {
+    expect(LEAN_CTX_HINT).not.toMatch(/every Bash|all commands|compresses everything/i);
+  });
+
+  it('names the lean-ctx binary prerequisite (without it the hook no-ops)', () => {
+    expect(LEAN_CTX_HINT).toMatch(/lean-ctx binary/i);
+  });
+
+  it('confirms after a write in the state the user picked', () => {
+    expect(leanCtxToastText('default')).toMatch(/default/i);
+    expect(leanCtxToastText('off')).toMatch(/off/);
+    expect(leanCtxToastText('on')).toMatch(/\bon\b/);
+  });
+});
+
+describe('lean-ctx toggle — HooksTab wiring (structural)', () => {
+  // The control was delivered-nowhere once already (logic shipped, markup
+  // never rendered, loader never called). These pins read the .svelte
+  // source: a future refactor that drops the render or the load goes red
+  // here instead of shipping a second placebo.
+  const svelte = readFileSync(
+    new URL('./HooksTab.svelte', import.meta.url),
+    'utf-8',
+  );
+
+  it('renders the Dropdown with the shared options', () => {
+    expect(svelte).toContain('LEAN_CTX_OPTIONS');
+    expect(svelte).toMatch(/<Dropdown[^>]*options=\{LEAN_CTX_OPTIONS\}/s);
+  });
+
+  it('calls loadLeanCtx from the project effect (not dead state)', () => {
+    expect(svelte).toMatch(/void loadLeanCtx\(\)/);
+  });
+
+  it('persists through setLeanCtx on change', () => {
+    expect(svelte).toMatch(/onChange=\{\(v\) => void setLeanCtx\(v\)\}/);
+    expect(svelte).toContain('set_claude_env_value');
+  });
+
+  it('shows the accurate hint text', () => {
+    expect(svelte).toContain('LEAN_CTX_HINT');
   });
 });

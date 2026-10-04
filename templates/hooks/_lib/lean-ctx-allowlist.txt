@@ -1,0 +1,76 @@
+# lean-ctx compression allow-list (v0.2.101) — the ONE committed rule table
+# both lean-ctx-rewrite siblings PARSE (shared config, A>B>C tier B).
+# Read by templates/hooks/lean-ctx-rewrite.sh (embedded python) and
+# templates/hooks/lean-ctx-rewrite.ps1 (native PowerShell). Do not fork
+# per-language copies of this list; edit it here once.
+#
+# RULE: a Bash tool call is compressed ONLY when it is a single simple
+# command whose leading tokens match one entry below. Everything else runs
+# RAW: loops, pipes, chains (&& ; |), redirects, command substitution,
+# git (never allow-listed — owner rule), unknown commands, and anything
+# matching a SEC-RAW credential pattern in the hooks.
+#
+# MATCHING: the command is whitespace-tokenized; leading VAR=value env
+# assignments are skipped; the program token is reduced to its basename
+# (so `.venv/bin/python -m pytest` matches `python -m pytest`); an entry
+# matches when it equals the command's first len(entry) tokens (whole
+# tokens, prefix-anchored: `npm install` matches `npm install foo` but
+# not `npm` alone and not `npm uninstall`).
+#
+# Test runners and builds are safe to list ONLY because every compressed
+# run is lossless: the lean-ctx-tee wrapper saves the full raw output
+# under <project>/.claude/state/lean-ctx-tee/ and the compressed output
+# ends with a pointer line naming that file.
+
+# --- package installs (pure progress noise) ---
+npm install
+npm ci
+npm i
+pnpm install
+pnpm i
+pnpm add
+yarn install
+yarn add
+pip install
+pip3 install
+python -m pip install
+python3 -m pip install
+uv pip install
+uv sync
+cargo install
+
+# --- image pulls and image builds ---
+docker pull
+podman pull
+docker compose pull
+docker-compose pull
+podman-compose pull
+docker build
+podman build
+docker compose build
+docker-compose build
+podman-compose build
+
+# --- downloads ---
+wget
+curl
+
+# --- test runners and builds ---
+pytest
+python -m pytest
+python3 -m pytest
+cargo build
+cargo test
+cargo clippy
+tsc
+vitest
+npx vitest
+npm test
+npm run test
+npm run build
+pnpm test
+pnpm run test
+pnpm build
+pnpm run build
+yarn test
+yarn build

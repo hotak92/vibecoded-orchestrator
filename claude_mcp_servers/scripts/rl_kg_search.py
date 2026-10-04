@@ -79,6 +79,24 @@ def resolve_task_type(arg: "str | None") -> str:
     return DEFAULT_TASK_TYPE
 
 
+async def embed_hook_query(text: str):
+    """Embed the hook's retrieval query through the MCP QUERY-side method.
+
+    v0.2.101: every search path must embed its QUERY through
+    ``weaviate_mcp.server._get_search_vector`` (which applies the active
+    model's query prefix) — never the document-side ``embed_text``. The
+    hook-injection context query is a distinct use, so it carries its own
+    ``task`` wording (``hook_injection``).
+
+    Kept as a named helper so the hook↔query-method wiring is asserted
+    BEHAVIOURALLY (mutate this task or the wiring and the test goes red),
+    rather than by a source scan.
+    """
+    from weaviate_mcp.server import _get_search_vector
+
+    return await _get_search_vector(text, task="hook_injection")
+
+
 async def main():
     parser = argparse.ArgumentParser(description="KG search with RL reranking")
     parser.add_argument("query", help="Search query")
@@ -122,7 +140,6 @@ async def main():
     # strategy.
     from weaviate_mcp.server import (
         get_weaviate_client,
-        _get_search_vector,
         _format_obj,
         _enrich_with_adjacent_chunks,
         _get_result_verbosity_by_score,
@@ -183,7 +200,7 @@ async def main():
             vector = None
             target_name = None
         else:
-            vector, target_name = await _get_search_vector(effective_query)
+            vector, target_name = await embed_hook_query(effective_query)
         # F-G (v0.2.70): the active named-vector slot (e.g. "qwen3_embed"). The
         # hook path historically attached NO node vector at all, so EVERY
         # hook-driven retrieval (≈72% of all events) carried no n_emb → cosine
@@ -260,7 +277,7 @@ async def main():
             pooled_per_chunk: list[list[dict]] = []
             query_chunk_embs: list[list[float]] = []
             for qc_text in query_chunks:
-                qc_vec, _qc_target = await _get_search_vector(qc_text)
+                qc_vec, _qc_target = await embed_hook_query(qc_text)
                 if qc_vec:
                     query_chunk_embs.append(qc_vec)
                 pooled_per_chunk.append(
@@ -343,6 +360,11 @@ async def main():
                         embed_budget_s=dual_embed_budget_s(task_type),
                         backfill_other=False,
                         task_type=task_type,
+                        # v0.2.101: the twin query must be embedded with the
+                        # SAME task wording the retrieval vector used here
+                        # (embed_hook_query → _get_search_vector(task=hook_injection)),
+                        # so the logged twin equals a real retrieval vector.
+                        query_task="hook_injection",
                     )
                 else:
                     from weaviate_mcp.server import _rl_enrich_nodes_with_linked_embs

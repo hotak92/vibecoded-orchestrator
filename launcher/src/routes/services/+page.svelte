@@ -60,6 +60,7 @@
     resetPanelToNative,
     clearProjectRoutingGuidance,
     routingGuidance,
+    routingGuidanceAll,
     setModelGatewayBoot,
     setProjectRoutingGuidance,
     startModelGateway,
@@ -264,20 +265,28 @@
   }
 
   async function loadGuidanceFlags() {
+    // ONE batched ask for every project (review S2): the machine signal is
+    // per-machine, only the per-project row varies, so a single Python
+    // spawn answers the whole list — the per-project loop this replaced
+    // cost one sequential interpreter startup per project on every open.
+    // The gate is the SAME one the CLAUDE.md render follows (one home,
+    // Python); reading the `project_modules` row alone was the v0.2.101 G1
+    // defect: no row is a tri-state ("follow the machine"), not "off".
     const next: Record<string, RoutingGuidanceState | null> = {};
-    for (const p of $projects.projects) {
-      try {
-        // The SAME gate the CLAUDE.md render follows (one home, Python —
-        // `model_gateway_routing_guidance` passes it through). Reading the
-        // `project_modules` row alone was the v0.2.101 G1 defect: no row is
-        // a tri-state ("follow the machine"), not "off".
-        next[p.id] = await routingGuidance(p.folder_path);
-      } catch {
-        // Could not ask → `null`: the row renders its own "could not ask"
-        // line and the checkbox is disabled, rather than guessing a state
-        // the render may contradict.
-        next[p.id] = null;
+    for (const p of $projects.projects) next[p.id] = null;
+    try {
+      const folders = [...new Set($projects.projects.map((p) => p.folder_path))];
+      if (folders.length > 0) {
+        const verdicts = await routingGuidanceAll(folders);
+        for (const p of $projects.projects) {
+          // Missing from the answer → stays null = "could not ask", per row.
+          next[p.id] = verdicts[p.folder_path] ?? null;
+        }
       }
+    } catch {
+      // The whole ask failed → every row keeps its "could not ask" line
+      // and a disabled checkbox, rather than guessing a state the render
+      // may contradict.
     }
     guidance = next;
   }

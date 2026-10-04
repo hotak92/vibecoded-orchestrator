@@ -1,22 +1,33 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""D-11 + TRIM-b (v0.2.75): lean-ctx hook candidate probe + git step-aside.
+"""D-11 lean-ctx candidate probe + SEC-RAW credential step-aside.
 
-Two fixes land in ONE commit (landing D-11 alone would re-arm the
-git-commit stderr-swallow footgun):
+v0.2.101 ALLOW-LIST INVERSION changed what this file pins:
 
-  * D-11: ``templates/hooks/lean-ctx-rewrite.sh`` (+ ``.ps1``) now probe
+  * D-11 (KEPT): ``templates/hooks/lean-ctx-rewrite.sh`` (+ ``.ps1``) probe
     the same candidate list ``install.py::_find_lean_ctx_binary`` uses
-    (``~/.cargo/bin`` → ``~/.local/bin`` → ``/usr/local/bin`` →
-    ``/usr/bin`` → homebrew) before giving up. A ``cargo install``ed
-    binary off the hook shell's PATH now still activates compression.
-  * TRIM-b: the hook auto-bypasses ``git commit`` / ``git push`` — it
-    emits nothing (raw command) so a hook-failed commit's stderr is never
-    swallowed. Keyed on the FINAL ``&&``-segment so ``git log && git
-    commit`` passes through while ``echo git commit`` is still rewritten.
+    (``~/.cargo/bin`` → ``~/.local/bin`` → ``/usr/local/bin`` → ``/usr/bin``
+    → homebrew) before giving up. A ``cargo install``ed binary off the hook
+    shell's PATH still activates compression. The extraction-based parity
+    lock over all three lists lives in
+    ``tests/test_v0295_wp7_bootstrap_cascade_parity.py``.
+  * SEC-RAW (KEPT through the inversion): allow-listed commands CAN carry
+    credentials (``pip install --index-url https://user:pass@host/simple``,
+    ``curl -u``/auth headers, ``wget --password``, npm ``_authToken``
+    args, secret-shaped env prefixes), so the credential scan still runs
+    BEFORE the allow-list and any hit forces the raw path. The pattern
+    list stays a C-mirror between the siblings, parity-pinned below by
+    extraction (not a source scan).
+  * TRIM-b / TRIM-r (RETIRED): the ``git commit``/``git push`` step-aside
+    and the seven read-only git verbs are subsumed by the allow-list — no
+    git form is allow-listed, so ALL git runs raw and the verb tables are
+    gone from both hooks. The behavioural allow-list cases (wrap/raw
+    tables, wrapper tee/pointer, TTL sweep, .sh/.ps1 parity) live in
+    ``tests/test_v02101_lean_ctx_allowlist_tee.py``; the git-is-never-
+    wrapped representative arms remain here.
 
-Both fixes are mirrored .sh/.ps1 (must-match). The .ps1 behavioural cases
-are pwsh-gated; structural parity is covered by the hook-OS-parity gate.
+The .ps1 behavioural cases are pwsh-gated; structural parity is covered
+by the hook-OS-parity gate.
 """
 from __future__ import annotations
 
@@ -39,12 +50,21 @@ pytestmark = pytest.mark.skipif(
     reason="bash hook; .ps1 behavioural cases are pwsh-gated below.",
 )
 
-# lean-ctx's canned rewrite response (matches 3.4.5 serialization).
+# The pre-v0.2.101 hook delegated the wrap decision to the lean-ctx binary
+# and filtered ITS response. Since the allow-list inversion the hook
+# constructs the response itself and never invokes the binary at rewrite
+# time — the fake's canned stdout is deliberately IGNORED by the hook; it
+# only needs to EXIST for the candidate probe. (The retirement is pinned
+# behaviourally by test_hook_never_invokes_the_binary_* in
+# tests/test_v02101_lean_ctx_allowlist_tee.py.)
 ALLOW_RESPONSE = (
     '{"hookSpecificOutput":{"hookEventName":"PreToolUse",'
     '"permissionDecision":"allow",'
     '"updatedInput":{"command":"lean-ctx -c \'ls\'"}}}'
 )
+
+#: An allow-listed command (see templates/hooks/_lib/lean-ctx-allowlist.txt).
+WRAPPED_CMD = "npm install"
 
 
 def _payload(cmd: str) -> str:
@@ -80,6 +100,9 @@ def _run_sh(cmd: str, *, cargo_bin: Path | None, strip_path: bool,
     D-11 candidate probe (keyed on $HOME) can find it."""
     env = dict(os.environ)
     env.pop("VCT_DISABLE_HOOKS", None)
+    # tests/conftest.py pins CLAUDE_PROJECT_DIR to a suite-wide scratch
+    # project; these tests stage their own project cwd.
+    env.pop("CLAUDE_PROJECT_DIR", None)
     env["HOME"] = str(fake_home)
     if strip_path:
         # A minimal PATH that still has bash/python but NOT the fake bindir.
@@ -100,16 +123,22 @@ class TestD11CandidateProbe:
         home = tmp_path / "home"
         cargo_bin = home / ".cargo" / "bin"
         _make_fake_lean_ctx(cargo_bin)
-        res = _run_sh("ls -la", cargo_bin=cargo_bin, strip_path=True,
+        res = _run_sh(WRAPPED_CMD, cargo_bin=cargo_bin, strip_path=True,
                       fake_home=home)
         assert res.returncode == 0, res.stderr
         out = res.stdout.strip()
         assert out, "candidate-probe should have found ~/.cargo/bin binary"
         data = json.loads(out)
-        assert data["hookSpecificOutput"]["updatedInput"]["command"] == (
-            "lean-ctx -c 'ls'"
+        wrapped = data["hookSpecificOutput"]["updatedInput"]["command"]
+        assert "lean-ctx-tee.sh" in wrapped, (
+            f"rewrite must route through the tee wrapper: {wrapped}"
         )
-        # D-3 invariant still holds: permissionDecision stripped.
+        assert str(cargo_bin / "lean-ctx") in wrapped, (
+            f"the probed binary path must be threaded into the wrapper "
+            f"call: {wrapped}"
+        )
+        # D-3 invariant, now structural: the hook builds the response
+        # itself, so no auto-approval field can appear.
         assert "permissionDecision" not in data["hookSpecificOutput"]
 
     def test_binary_absent_everywhere_clean_noop(self, tmp_path):
@@ -117,146 +146,83 @@ class TestD11CandidateProbe:
         (leave-alone)."""
         home = tmp_path / "home"
         (home / "proj").mkdir(parents=True)
-        res = _run_sh("ls -la", cargo_bin=None, strip_path=True,
+        res = _run_sh(WRAPPED_CMD, cargo_bin=None, strip_path=True,
                       fake_home=home)
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() == "", "absent binary must be a no-op"
 
 
-class TestTrimBGitBypass:
-    def _run_with_binary(self, cmd: str, tmp_path: Path):
-        home = tmp_path / "home"
-        _make_fake_lean_ctx(home / ".cargo" / "bin")
-        return _run_sh(cmd, cargo_bin=home / ".cargo" / "bin",
-                       strip_path=True, fake_home=home)
-
-    def test_git_commit_passthrough(self, tmp_path):
-        res = self._run_with_binary('git commit -m "x"', tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() == "", "git commit must pass through raw"
-
-    def test_git_push_passthrough(self, tmp_path):
-        res = self._run_with_binary("git push origin main", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() == "", "git push must pass through raw"
-
-    def test_final_segment_governs_git_commit(self, tmp_path):
-        # `git log && git commit` → the FINAL segment (commit) governs → raw.
-        res = self._run_with_binary("git log && git commit -m y", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() == "", "final && segment (commit) must govern"
-
-    def test_echo_git_commit_still_rewritten(self, tmp_path):
-        # `echo git commit` is NOT a real commit → still compressed (act).
-        res = self._run_with_binary("echo git commit", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", "echo git commit must still be rewritten"
-
-    def test_commit_as_first_segment_not_bypassed(self, tmp_path):
-        # `git commit && echo done` → final segment is `echo done`, NOT a
-        # commit → compressed. (The commit's own stderr is a separate call.)
-        res = self._run_with_binary("git commit -m z && echo done", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            "when commit is not the final segment, normal path applies"
-        )
-
-    def test_ordinary_command_still_rewritten(self, tmp_path):
-        res = self._run_with_binary("ls -la", tmp_path)
-        assert res.stdout.strip() != "", "non-git command must still rewrite"
-
-
-GIT_READONLY_VERBS = [
-    "show", "diff", "grep", "log", "blame", "cat-file", "ls-tree",
-]
-
-
-class TestTrimRReadonlyBypass:
-    """TRIM-r: read-only git INSPECTION commands run raw. lean-ctx compressed
-    `git ls-tree -r --name-only` by -94% (286/300 paths silently dropped) and
-    `git log --oneline -500` by -93% (OLDEST commits dropped, no signal) —
-    a reviewer lane lost evidence. Same FINAL-`&&`-segment segmentation as
-    TRIM-b; command-specific, NOT a blanket `git` gate."""
-
-    VERBS = GIT_READONLY_VERBS
+class TestGitNeverWrapped:
+    """RETIRED MACHINERY, SAME OUTCOME: TRIM-b (git commit/push) and
+    TRIM-r (the seven read-only inspection verbs) were command-specific
+    step-asides inside a compress-everything rule. Under the v0.2.101
+    allow-list NO git form is a candidate at all — every git command runs
+    raw by omission, and the verb tables no longer exist in the hooks."""
 
     def _run_with_binary(self, cmd: str, tmp_path: Path):
         home = tmp_path / "home"
         _make_fake_lean_ctx(home / ".cargo" / "bin")
         return _run_sh(cmd, cargo_bin=home / ".cargo" / "bin",
                        strip_path=True, fake_home=home)
-
-    @pytest.mark.parametrize("verb", VERBS)
-    def test_git_inspection_verb_passthrough(self, verb, tmp_path):
-        res = self._run_with_binary(f"git {verb} HEAD", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() == "", (
-            f"git {verb} (read-only inspection) must pass through raw"
-        )
 
     @pytest.mark.parametrize("cmd", [
+        'git commit -m "x"',
+        "git push origin main",
+        "git show HEAD",
+        "git diff HEAD~1",
+        "git log --oneline -500",
+        "git ls-tree -r HEAD --name-only",
         "git status",
         "git branch",
         "git fetch origin",
-        "git remote -v",
-        "git add file.txt",
-        "git checkout main",
+        "git log && git commit -m y",
+        "echo git commit",
     ])
-    def test_non_inspection_git_still_rewritten(self, cmd, tmp_path):
-        # Command-specific gate: only the seven inspection verbs step aside.
+    def test_git_form_runs_raw(self, cmd, tmp_path):
         res = self._run_with_binary(cmd, tmp_path)
         assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            f"non-inspection git command must stay compressed: {cmd}"
+        assert res.stdout.strip() == "", (
+            f"no git form may be wrapped (allow-list omits git): {cmd}"
         )
 
-    def test_echo_git_show_still_rewritten(self, tmp_path):
-        # `echo git show` is NOT a real inspection → still compressed.
-        res = self._run_with_binary("echo git show", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", "echo git show must still be rewritten"
+    def test_allow_listed_command_still_wrapped(self, tmp_path):
+        res = self._run_with_binary(WRAPPED_CMD, tmp_path)
+        assert res.stdout.strip() != "", "allow-listed command must wrap"
 
-    def test_final_segment_governs_git_show(self, tmp_path):
-        # `git show X && echo done` → final segment is `echo done`, NOT an
-        # inspection verb → compressed (mirrors TRIM-b segmentation).
-        res = self._run_with_binary("git show X && echo done", tmp_path)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            "final && segment (echo done) must govern → rewritten"
-        )
-
-    def test_ordinary_command_still_rewritten(self, tmp_path):
-        res = self._run_with_binary("ls -la", tmp_path)
-        assert res.stdout.strip() != "", "non-git command must still rewrite"
+    def test_verb_table_retired_from_both_hooks(self):
+        for hook in (SH_HOOK, PS1_HOOK):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "GIT-READONLY-VERBS" not in src, (
+                f"{hook.name}: the TRIM-r verb table must stay retired"
+            )
 
 
 def test_sh_source_mentions_must_match_ps1():
     """Marker pin only — NOT the candidate-order parity guarantee.
 
-    This asserts that the D-11 / TRIM-b *markers* survive an edit of either
-    hook. It is a source scan, so a name inside a comment satisfies it: it
-    stayed green under a deliberate ``/usr/bin/lean-ctx`` drift during the
-    v0.2.95 WP-7 red-proof. The real, extraction-based parity assertion over
-    install.py / lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1 lives in
+    This asserts that the D-11 / allow-list *markers* survive an edit of
+    either hook. It is a source scan, so a name inside a comment satisfies
+    it. The real, extraction-based parity assertion over install.py /
+    lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1 lives in
     ``tests/test_v0295_wp7_bootstrap_cascade_parity.py``
-    (``test_lean_ctx_cascade_agrees_across_install_py_and_both_hooks``) —
-    that one went red under the same mutation. Keep both; they check
-    different things.
+    (``test_lean_ctx_cascade_agrees_across_install_py_and_both_hooks``).
+    Keep both; they check different things.
     """
     sh = SH_HOOK.read_text(encoding="utf-8")
-    ps1 = PS1_HOOK.read_text(encoding="utf-8")
+    ps1 = PS1_HOOK.read_text(encoding="utf-8-sig")
     for src in (sh, ps1):
         assert ".cargo/bin/lean-ctx" in src, "candidate probe missing"
-        assert "commit" in src and "push" in src, "git step-aside missing"
+        assert "lean-ctx-allowlist.txt" in src, "shared allow-list missing"
         assert "MUST MATCH" in src
 
 
 # ─── SEC-RAW: credential-bearing commands step aside (2026-07-21) ────────
-# lean-ctx's own wrap heuristic is not credential-aware; wrapped inline
-# commands carrying auth material have 401'd with valid tokens and a
-# multi-line wrap corruption once leaked a secret into error output. The
-# hook now scans the WHOLE command against a credential pattern list and
-# emits nothing (raw) on any hit — before lean-ctx is ever invoked.
+# KEPT through the v0.2.101 allow-list inversion because allow-listed
+# commands CAN carry credentials: pip install --index-url
+# https://user:pass@host/simple, curl -u / auth headers, wget --password,
+# npm registry _authToken args, secret-shaped env prefixes. The hook scans
+# the WHOLE command against the pattern list and emits nothing (raw) on
+# any hit — before the allow-list is ever consulted.
 
 
 class TestSecRawSecretsStepAside:
@@ -278,6 +244,10 @@ class TestSecRawSecretsStepAside:
         'wget --password hunter2 https://x.test/',
         # credential in a NON-final && segment still disqualifies the wrap
         'curl -u a@b.test:tok123 https://x.test/ && echo done',
+        # v0.2.101 additions: allow-listed commands carrying credentials
+        "pip install --index-url https://user:secret123@pypi.test/simple pkg",
+        "npm install --//registry.npmjs.org/:_authToken=abc12345",
+        "MY_TOKEN=x npm install",
     ])
     def test_credential_command_passes_through_raw(self, cmd, tmp_path):
         res = self._run_with_binary(cmd, tmp_path)
@@ -287,16 +257,19 @@ class TestSecRawSecretsStepAside:
         )
 
     @pytest.mark.parametrize("cmd", [
-        "ls -la",
-        "grep -rn pattern src/",
+        # benign AND allow-listed — a benign non-allow-listed command runs
+        # raw too, but by the allow-list gate, not SEC-RAW (that table is
+        # in tests/test_v02101_lean_ctx_allowlist_tee.py).
+        "npm install",
+        "pip install requests",
         "curl -s https://example.test/health",
         "python3 -m pytest tests/ -q",
     ])
-    def test_benign_command_still_rewritten(self, cmd, tmp_path):
+    def test_benign_allow_listed_command_still_wrapped(self, cmd, tmp_path):
         res = self._run_with_binary(cmd, tmp_path)
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() != "", (
-            f"benign command must still be rewritten: {cmd}"
+            f"benign allow-listed command must still be wrapped: {cmd}"
         )
 
 
@@ -321,7 +294,7 @@ def test_sec_raw_pattern_list_parity_sh_ps1():
     """The credential pattern lists in the two siblings are byte-identical
     (C-mirror discipline: same data, thin per-language wrapper)."""
     sh_patterns = _extract_patterns(SH_HOOK.read_text(encoding="utf-8"), '"')
-    ps1_patterns = _extract_patterns(PS1_HOOK.read_text(encoding="utf-8"), "'")
+    ps1_patterns = _extract_patterns(PS1_HOOK.read_text(encoding="utf-8-sig"), "'")
     assert sh_patterns, "sh SEC-RAW pattern block missing or unparsed"
     assert sh_patterns == ps1_patterns, (
         "SEC-RAW pattern lists diverged between .sh and .ps1"
@@ -334,43 +307,6 @@ def test_sec_raw_patterns_are_valid_in_python_re():
     import re as _re
     for p in _extract_patterns(SH_HOOK.read_text(encoding="utf-8"), '"'):
         _re.compile(p)
-
-
-def _extract_git_verbs(src: str, quote: str) -> list[str]:
-    """Pull the read-only git verb literals between the GIT-READONLY-VERBS
-    markers. `quote` is the string delimiter used by that language ('"' for
-    the sh-embedded python, "'" for PowerShell). Comment lines never start
-    with the delimiter, so a verb named only in a comment is not counted —
-    same discipline as _extract_patterns. BEGIN is taken as the LAST
-    occurrence and END as the first one after it, so prose comments that
-    mention the marker names (e.g. 'GIT-READONLY-VERBS-BEGIN/END' in the
-    TRIM-r comment block) cannot widen the extracted block."""
-    begin = src.rindex("GIT-READONLY-VERBS-BEGIN")
-    end = src.index("GIT-READONLY-VERBS-END", begin)
-    block = src[begin:end]
-    out = []
-    for line in block.splitlines():
-        line = line.strip().rstrip(",")
-        if len(line) >= 2 and line.startswith(quote) and line.endswith(quote):
-            out.append(line[1:-1])
-    return out
-
-
-def test_git_readonly_verb_list_parity_sh_ps1():
-    """The read-only git verb lists in the two siblings are identical AND
-    equal the canonical seven verbs (C-mirror discipline, same shape as
-    test_sec_raw_pattern_list_parity_sh_ps1 — extraction, not a source
-    scan, so a verb in a comment cannot satisfy it)."""
-    sh_verbs = _extract_git_verbs(SH_HOOK.read_text(encoding="utf-8"), '"')
-    ps1_verbs = _extract_git_verbs(PS1_HOOK.read_text(encoding="utf-8"), "'")
-    assert sh_verbs, "sh GIT-READONLY-VERBS block missing or unparsed"
-    assert sh_verbs == ps1_verbs, (
-        "git read-only verb lists diverged between .sh and .ps1"
-    )
-    assert sh_verbs == GIT_READONLY_VERBS, (
-        f"git read-only verb list must be exactly the canonical seven, "
-        f"got {sh_verbs!r}"
-    )
 
 
 # ─── pwsh-gated .ps1 behavioural parity ──────────────────────────────────
@@ -394,6 +330,7 @@ class TestPs1Parity:
         _make_fake_lean_ctx_ps(bin_dir)
         env = dict(os.environ)
         env.pop("VCT_DISABLE_HOOKS", None)
+        env.pop("CLAUDE_PROJECT_DIR", None)
         if on_path:
             env["PATH"] = f"{bin_dir}{os.pathsep}{env.get('PATH', '')}"
         cwd = tmp_path / "proj"
@@ -409,10 +346,20 @@ class TestPs1Parity:
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() == "", "ps1 git commit must pass through"
 
-    def test_ps1_ordinary_command_rewritten(self, tmp_path):
-        res = self._run_ps1("ls -la", tmp_path, on_path=True)
+    def test_ps1_git_inspection_verb_passthrough(self, tmp_path):
+        res = self._run_ps1("git show HEAD", tmp_path, on_path=True)
         assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", "ps1 non-git command must rewrite"
+        assert res.stdout.strip() == "", (
+            "ps1 git inspection form must pass through raw"
+        )
+
+    def test_ps1_allow_listed_command_rewritten(self, tmp_path):
+        res = self._run_ps1(WRAPPED_CMD, tmp_path, on_path=True)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", "ps1 allow-listed command must wrap"
+        data = json.loads(res.stdout.strip())
+        wrapped = data["hookSpecificOutput"]["updatedInput"]["command"]
+        assert "lean-ctx-tee.ps1" in wrapped, wrapped
 
     def test_ps1_credential_command_passes_through_raw(self, tmp_path):
         res = self._run_ps1(
@@ -423,35 +370,11 @@ class TestPs1Parity:
             "ps1 credential-bearing command must run raw"
         )
 
-    @pytest.mark.parametrize("verb", GIT_READONLY_VERBS)
-    def test_ps1_git_inspection_verb_passthrough(self, verb, tmp_path):
-        res = self._run_ps1(f"git {verb} HEAD", tmp_path, on_path=True)
+    def test_ps1_unknown_command_passthrough(self, tmp_path):
+        res = self._run_ps1("ls -la", tmp_path, on_path=True)
         assert res.returncode == 0, res.stderr
         assert res.stdout.strip() == "", (
-            f"ps1 git {verb} (read-only inspection) must pass through raw"
-        )
-
-    def test_ps1_echo_git_show_still_rewritten(self, tmp_path):
-        res = self._run_ps1("echo git show", tmp_path, on_path=True)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            "ps1 echo git show must still be rewritten"
-        )
-
-    def test_ps1_final_segment_governs_git_show(self, tmp_path):
-        # `git show X && echo done` → final segment is `echo done` →
-        # compressed (TRIM-r uses TRIM-b's final-segment segmentation).
-        res = self._run_ps1("git show X && echo done", tmp_path, on_path=True)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            "ps1 final && segment (echo done) must govern → rewritten"
-        )
-
-    def test_ps1_non_inspection_git_still_rewritten(self, tmp_path):
-        res = self._run_ps1("git status", tmp_path, on_path=True)
-        assert res.returncode == 0, res.stderr
-        assert res.stdout.strip() != "", (
-            "ps1 non-inspection git command must stay compressed"
+            "ps1 non-allow-listed command must run raw"
         )
 
 

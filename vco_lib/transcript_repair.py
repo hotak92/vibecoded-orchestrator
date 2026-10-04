@@ -365,35 +365,6 @@ def is_server_tool_result_type(block_type: object) -> bool:
     )
 
 
-def is_server_tool_type(tool_type: object) -> bool:
-    """True when a REQUEST tool's ``type`` names an Anthropic SERVER tool.
-
-    The request-side counterpart of :data:`PORTABLE_SERVER_TOOL_NAMES`. On the
-    wire a server tool is declared in the request's ``tools`` array with a
-    ``type`` of ``<name>_<date>`` — Claude Code's WebSearch sub-request sends
-    ``tools:[{"type":"web_search_20250305", …}]`` — where ``<name>`` is one of
-    the portable server-tool names. A vendor route cannot serve these (parity
-    gap 6, live: z.ai answers HTTP 500 ``"Internal Network Failure"``, qwen
-    answers 200 but the model replies from its weights with no search), so the
-    gateway must recognise them on the REQUEST, where they are a ``type``
-    field, not the ``server_tool_use`` NAME this module's response-side half
-    keys on.
-
-    Matched by name-prefix rather than by an enumerated ``_<date>`` list
-    because the date is a version the vendor bumps and this must not go stale:
-    ``web_search_20250305`` and a future ``web_search_2026xxxx`` are both the
-    ``web_search`` server tool. ``code_execution`` never false-matches
-    ``bash_code_execution`` (the latter does not START with the former), and
-    each family is named explicitly in :data:`PORTABLE_SERVER_TOOL_NAMES`.
-    """
-    if not isinstance(tool_type, str):
-        return False
-    for name in PORTABLE_SERVER_TOOL_NAMES:
-        if tool_type == name or tool_type.startswith(name + "_"):
-            return True
-    return False
-
-
 def thinking_signature_is_vendor_origin(signature: object) -> bool:
     """True when a ``thinking`` block's signature is NOT Anthropic's own.
 
@@ -1290,7 +1261,6 @@ __all__ = [
     "final_assistant_turn_needs_thinking",
     "id_conforms",
     "is_server_tool_result_type",
-    "is_server_tool_type",
     "mark_thinking_signature",
     "minted_by_anthropic",
     "normalise_id",

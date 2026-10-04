@@ -29,11 +29,12 @@ Consumers
   call-sites and tests; the skip/delete behaviour around it is unchanged).
 * :mod:`vco_lib.install_weaviate` — :func:`is_archived_content` on the seed's
   on-disk walk.
-* :mod:`vco_lib.kg_sync_drift` keeps its OWN C-leg mirror of this rule
-  (``is_archived_node(rel_parts, content)``) because it cannot import the
-  sync script — that module resolves the hub and imports ``weaviate`` at
-  module scope. The mirror is parity-pinned against this home by
-  ``tests/test_v02101_seed_and_data_keys.py``; it is unchanged by v0.2.101.
+* :mod:`vco_lib.kg_sync_drift` — its own mirror was RETIRED in v0.2.101:
+  ``is_archived_node(rel_parts, content)`` / ``is_archived_path(rel_parts)``
+  now CALL this module and the two frozensets are re-exported from here, so
+  all four consumers sit on one implementation (pinned by
+  ``tests/test_v0292_kg_sync_drift.py`` and
+  ``tests/test_v02101_seed_and_data_keys.py``).
 
 Not touched: an archived node is still kept on disk (grep/read history) and
 the sync still deletes any prior Weaviate row for it — this module only

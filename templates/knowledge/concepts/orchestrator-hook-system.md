@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-04T07:45:00Z
 status: active
 ---
 
@@ -152,7 +152,7 @@ Context nearing limit
 - Blocks Bash commands that would echo or leak a Vercel deploy token.
 
 **lean-ctx-rewrite.sh / lean-ctx-rewrite.ps1** (matcher: `Bash`)
-- Rewrites Bash commands for token compression via `lean-ctx`. Scrubs sensitive environment variables before delegating to the lean-ctx subprocess; graceful no-op when lean-ctx is not installed; symmetric `bypass` support for raw output per call.
+- Compresses ONLY the single simple commands on the shared allow-list `_lib/lean-ctx-allowlist.txt` (package installs, image pulls, downloads, test/build runners) — everything else runs raw: loops, pipes, chains, redirects, `git`, unknown commands, and credential-bearing commands (SEC-RAW). An allow-listed command is rewritten to the `_lib/lean-ctx-tee.{sh,ps1}` wrapper, which tees the FULL raw output to `.claude/state/lean-ctx-tee/<ts>.log` (TTL-swept, default 168 h) and ends the compressed output with a pointer line naming that file — compression is lossless (v0.2.101). Scrubs sensitive environment variables before any subprocess; graceful no-op when lean-ctx is not installed; commands starting with `lean-ctx` step aside (per-call `bypass`, no double-wrap).
 
 **pre-bash-context-inject.sh** (matcher: `Bash`)
 - Injects relevant KG context ahead of a Bash command when the command's intent maps to known patterns.

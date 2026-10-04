@@ -793,16 +793,39 @@ export interface RoutingGuidanceState {
 }
 
 /**
- * The per-project verdict, asked of the Python gate through the
- * `model_gateway_routing_guidance` command (same one home,
- * `vco_lib.module_gated_delivery`, as every other gate question).
+ * The per-project verdicts for a WHOLE list, asked of the Python gate in
+ * ONE spawn through the `model_gateway_routing_guidance` command (same one
+ * home, `vco_lib.module_gated_delivery`, as every other gate question).
+ * Review S2: the machine signal is per-machine — only the per-project row
+ * varies — so one interpreter start answers for every project instead of
+ * one sequential spawn per project on every Services-page open. Keyed by
+ * the folder string exactly as it was passed in.
+ */
+export async function routingGuidanceAll(
+  folders: string[],
+): Promise<Record<string, RoutingGuidanceState>> {
+  return invoke<Record<string, RoutingGuidanceState>>(
+    'model_gateway_routing_guidance',
+    { folders },
+  );
+}
+
+/**
+ * One project's verdict — the single re-read after a toggle or a clear.
+ * Rides the SAME batched command with one folder rather than a second
+ * command shape that could drift from it.
  */
 export async function routingGuidance(
   folder: string,
 ): Promise<RoutingGuidanceState> {
-  return invoke<RoutingGuidanceState>('model_gateway_routing_guidance', {
-    folder,
-  });
+  const map = await routingGuidanceAll([folder]);
+  const state = map[folder];
+  if (!state) {
+    throw new Error(
+      `the gate returned no verdict for ${folder} — the row stays "could not ask"`,
+    );
+  }
+  return state;
 }
 
 /**

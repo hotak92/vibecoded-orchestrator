@@ -1591,9 +1591,12 @@ pub async fn model_gateway_check() -> Result<String, String> {
 /// machine, and does this project get the gateway agent definitions?":
 /// `python -m vco_lib.module_gated_delivery status --json [--folder <f>]`.
 /// Split out so the argv shape is unit-testable without a Python.
+/// Folder strings go on the argv VERBATIM (nit 6, same rule as
+/// [`routing_guidance_args`]): only a folder empty after trimming is skipped;
+/// the bytes that remain are never altered.
 fn agents_gate_args(folder: Option<&str>) -> Vec<String> {
     let mut args = vec!["status".to_string(), "--json".to_string()];
-    if let Some(f) = folder.map(str::trim).filter(|f| !f.is_empty()) {
+    if let Some(f) = folder.filter(|f| !f.trim().is_empty()) {
         args.push("--folder".to_string());
         args.push(f.to_string());
     }
@@ -1719,19 +1722,86 @@ pub(crate) fn map_routing_guidance(
     })
 }
 
-/// The per-project verdict for the Services page's routing-guidance list.
-/// Same python bridge as [`model_gateway_agents_gate`]; `folder` is
-/// required (without it Python returns no gate verdict).
+/// The folders that name anything, WITHOUT altering them: entries that are
+/// empty after trimming are dropped, but every string that remains is sent
+/// — and keyed in the answer — VERBATIM. NF-2 (re-review of N-3): trimming
+/// here would echo a trimmed key back while the GUI looks up by the raw
+/// `folder_path`, so a whitespace-padded DB row would sit at "could not
+/// ask" forever — the same class N-3 fixed for slashes and `.` segments.
+pub(crate) fn keep_named_folders(folders: &[String]) -> Vec<String> {
+    folders
+        .iter()
+        .filter(|f| !f.trim().is_empty())
+        .cloned()
+        .collect()
+}
+
+/// The argv tail for the BATCHED ask: `status --json --folder a --folder b
+/// …` — ONE interpreter start answers for every project (review S2: one
+/// Python spawn per project on every Services-page open was a serial
+/// startup cost the DB read it replaced never had). Split out so the argv
+/// shape is unit-testable without a Python, like [`agents_gate_args`].
+/// Folder strings go on the argv VERBATIM (see [`keep_named_folders`]):
+/// only entries that are empty after trimming are skipped.
+pub(crate) fn routing_guidance_args(folders: &[String]) -> Vec<String> {
+    let mut args = vec!["status".to_string(), "--json".to_string()];
+    for f in keep_named_folders(folders) {
+        args.push("--folder".to_string());
+        args.push(f);
+    }
+    args
+}
+
+/// Map the batched status payload (`folders` → per-folder `{gate,
+/// claude_md_section}`) to one GUI tri-state per folder. Reuses
+/// [`map_routing_guidance`] per entry; a missing or non-object `folders`
+/// key is an error naming it (pins the Python pairing, same as the single
+/// mapping).
+pub(crate) fn map_routing_guidance_batch(
+    payload: &serde_json::Value,
+) -> Result<std::collections::BTreeMap<String, RoutingGuidanceState>, String> {
+    let folders = payload
+        .get("folders")
+        .and_then(|v| v.as_object())
+        .ok_or_else(|| {
+            "the status payload carries no `folders` map — update \
+             vco_lib.module_gated_delivery's status payload"
+                .to_string()
+        })?;
+    let mut out = std::collections::BTreeMap::new();
+    for (folder, entry) in folders {
+        let mini = serde_json::json!({
+            "gate": entry.get("gate").cloned().unwrap_or(serde_json::Value::Null),
+            "claude_md_section": entry
+                .get("claude_md_section")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null),
+        });
+        out.insert(folder.clone(), map_routing_guidance(&mini)?);
+    }
+    Ok(out)
+}
+
+/// The per-project verdicts for the Services page's routing-guidance list,
+/// for EVERY project in one Python spawn. Same bridge as
+/// [`model_gateway_agents_gate`]; the machine signal is per-machine, only
+/// the per-project row varies, so one call answers for the whole list.
 #[command]
 pub async fn model_gateway_routing_guidance(
-    folder: String,
-) -> Result<RoutingGuidanceState, String> {
+    folders: Vec<String>,
+) -> Result<std::collections::BTreeMap<String, RoutingGuidanceState>, String> {
     tauri::async_runtime::spawn_blocking(move || {
+        // Originals, not trimmed copies (NF-2): the answer is keyed by the
+        // exact strings sent, and the GUI looks up by the raw `folder_path`.
+        let folders = keep_named_folders(&folders);
+        if folders.is_empty() {
+            return Err("at least one project folder is required".to_string());
+        }
         let python = python_or_err()?;
         let root = crate::commands::installer::find_local_repo_root().ok();
         let mut cmd =
             python_module_command(&python, "vco_lib.module_gated_delivery", root.as_deref());
-        for a in agents_gate_args(Some(folder.as_str())) {
+        for a in routing_guidance_args(&folders) {
             cmd.arg(a);
         }
         let (code, stdout, stderr) =
@@ -1746,7 +1816,7 @@ pub async fn model_gateway_routing_guidance(
                     stderr.trim()
                 )
             })?;
-        map_routing_guidance(&payload)
+        map_routing_guidance_batch(&payload)
     })
     .await
     .map_err(|e| format!("routing-guidance task failed: {}", e))?
@@ -1950,6 +2020,13 @@ mod tests {
             agents_gate_args(Some("/p/x")),
             vec!["status", "--json", "--folder", "/p/x"]
         );
+        // Nit 6 (NF-2 latent residual): a folder non-empty after trimming is
+        // sent VERBATIM, exactly like [`routing_guidance_args`] — only a
+        // whitespace-only folder is dropped, never the surrounding bytes.
+        assert_eq!(
+            agents_gate_args(Some(" /p/x ")),
+            vec!["status", "--json", "--folder", " /p/x "]
+        );
     }
 
     // ─── G1 (v0.2.101): the routing-guidance tri-state the Services page
@@ -2058,6 +2135,89 @@ mod tests {
         let no_gate = serde_json::json!({"machine_signal": {"configured": true}});
         let err = map_routing_guidance(&no_gate).expect_err("must refuse");
         assert!(err.contains("gate"), "the error must name the gate; got: {err}");
+    }
+
+    // ─── S2 (v0.2.101 review): one spawn answers for EVERY project ──────
+
+    #[test]
+    fn routing_guidance_args_carry_every_folder_in_one_invocation() {
+        assert_eq!(
+            routing_guidance_args(&["/p/a".into(), "/p/b".into()]),
+            vec!["status", "--json", "--folder", "/p/a", "--folder", "/p/b"]
+        );
+        // Whitespace-only entries are dropped, not passed as empty folders.
+        assert_eq!(
+            routing_guidance_args(&["  ".into(), "/p/a".into(), "".into()]),
+            vec!["status", "--json", "--folder", "/p/a"]
+        );
+        assert_eq!(routing_guidance_args(&[]), vec!["status", "--json"]);
+    }
+
+    #[test]
+    fn routing_guidance_sends_folder_strings_verbatim_not_trimmed() {
+        // NF-2 (re-review of N-3): a folder the DB stores with surrounding
+        // whitespace must reach Python — and be echoed back as a map key —
+        // EXACTLY as stored. Trimming here would defeat the N-3 echo one
+        // layer up: the GUI looks up by the raw `folder_path` and a trimmed
+        // key would miss every time ("could not ask" forever).
+        assert_eq!(
+            routing_guidance_args(&[" /p/a ".into(), "\t/p/b\n".into()]),
+            vec!["status", "--json", "--folder", " /p/a ", "--folder", "\t/p/b\n"],
+        );
+        // The filter the command itself applies keeps the same rule:
+        // drop only what is empty after trimming, keep the original bytes.
+        assert_eq!(
+            keep_named_folders(&[" /p/a ".into(), "  ".into(), "".into(), "/p/b".into()]),
+            vec![" /p/a ", "/p/b"]
+        );
+    }
+
+    #[test]
+    fn batch_mapping_returns_one_state_per_folder() {
+        let explicit = status_payload_fixture("skip", "project_row", false);
+        let follows = status_payload_fixture("deliver", "machine", true);
+        let payload = serde_json::json!({
+            "machine_signal": {"configured": true, "reason": "fixture"},
+            "gate": null,
+            "folders": {
+                "/p/a": {
+                    "gate": explicit["gate"],
+                    "claude_md_section": explicit["claude_md_section"],
+                },
+                "/p/b": {
+                    "gate": follows["gate"],
+                    "claude_md_section": follows["claude_md_section"],
+                },
+            }
+        });
+        let map = map_routing_guidance_batch(&payload).expect("batch maps");
+        assert_eq!(map.len(), 2);
+        assert_eq!(map["/p/a"].mode, "off");
+        assert!(!map["/p/a"].renders);
+        assert_eq!(map["/p/b"].mode, "follows_machine");
+        assert_eq!(map["/p/b"].machine_decides.as_deref(), Some("renders"));
+    }
+
+    #[test]
+    fn batch_mapping_refuses_a_payload_without_the_folders_map() {
+        let err = map_routing_guidance_batch(&serde_json::json!({
+            "machine_signal": {"configured": true}
+        }))
+        .expect_err("must refuse");
+        assert!(
+            err.contains("folders"),
+            "the error must name the folders map; got: {err}"
+        );
+        // An entry missing its render answer is refused per folder, exactly
+        // like the single mapping — never silently defaulted.
+        let err = map_routing_guidance_batch(&serde_json::json!({
+            "folders": {"/p/a": {"gate": null}}
+        }))
+        .expect_err("must refuse");
+        assert!(
+            err.contains("claude_md_section") || err.contains("renders") || err.contains("gate"),
+            "the error must name what the entry is missing; got: {err}"
+        );
     }
 
     #[test]

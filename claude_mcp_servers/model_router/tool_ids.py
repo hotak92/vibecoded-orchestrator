@@ -51,7 +51,6 @@ from vco_lib.transcript_repair import (
     RepairStats,
     TranscriptRepairer,
     final_assistant_turn_needs_thinking,
-    is_server_tool_type,
     mark_thinking_signature,
     restore_ids,
     thinking_enabled,
@@ -659,9 +658,6 @@ __all__ = [
     "split_sse_frames",
     # Re-exported from the SSOT so server.py imports every request/response
     # rewrite seam from this one adapter: the vendor branch strips the
-    # gateway's thinking-signature marker before forwarding (item c), and the
-    # request handler recognises Anthropic server tools a vendor cannot serve
-    # (item e).
-    "is_server_tool_type",
+    # gateway's thinking-signature marker before forwarding (item c).
     "unmark_thinking_signatures",
 ]

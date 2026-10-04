@@ -262,15 +262,15 @@ class TestConfiguredTextModels:
         """R2-3: a custom ``EMBEDDING_MODEL`` install (profile qwen3, dual OFF)
         must size chunks to the CUSTOM model's ctx, not qwen3's. Before the fix
         ``configured_text_models`` derived the active slot from the PROFILE only,
-        so ``embeddinggemma:300m-bf16`` (num_ctx 2 048) got qwen3's xlarge budget
-        → silent truncation of the active slot.
+        so ``snowflake-arctic-embed2:latest`` (num_ctx 4 096) got qwen3's xlarge
+        budget → silent truncation of the active slot.
 
         Red-proof: the single-model preset returned here must equal
         ``chunking_preset_for_model(env value)`` — reverting
         ``resolve_active_text_model_id`` to derive from the profile makes this
         return the qwen3 (large/xlarge) preset instead → FAIL."""
         from vco_lib.embedding_service import configured_text_models
-        custom = "embeddinggemma:300m-bf16"  # num_ctx 2 048, in MODEL_TOKEN_LIMITS
+        custom = "snowflake-arctic-embed2:latest"  # num_ctx 4 096, in MODEL_TOKEN_LIMITS
         monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "false")
         monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
         monkeypatch.setenv("EMBEDDING_MODEL", custom)
@@ -281,11 +281,11 @@ class TestConfiguredTextModels:
             "the active slot must be the EMBEDDING_MODEL env value, not the "
             "profile-derived qwen3 model"
         )
-        # The single-model preset must be the custom model's (2 048-ctx) tier,
+        # The single-model preset must be the custom model's (4 096-ctx) tier,
         # NOT qwen3's larger budget — this is the truncation-hazard guard.
         assert chunking_preset_for_models(models) == chunking_preset_for_model(custom)
         assert chunking_preset_for_models(models) != chunking_preset_for_model(_QWEN), (
-            "embeddinggemma (2 048 ctx) and qwen3 must resolve to DIFFERENT presets; "
+            "arctic (4 096 ctx) and qwen3 must resolve to DIFFERENT presets; "
             "if equal, the truncation hazard is not exercised"
         )
 
@@ -293,7 +293,7 @@ class TestConfiguredTextModels:
         """R2-3 + dual: custom active EMBEDDING_MODEL + write-all ON adds qwen3 as
         the secondary; the min-across-slots budget is the TIGHTER of the two."""
         from vco_lib.embedding_service import configured_text_models
-        custom = "embeddinggemma:300m-bf16"  # 2 048 ctx (tighter than qwen3)
+        custom = "snowflake-arctic-embed2:latest"  # 4 096 ctx (tighter than qwen3)
         monkeypatch.setenv("DUAL_EMBEDDING_WRITE_ALL_SLOTS", "true")
         monkeypatch.setenv("ACTIVE_EMBEDDING", "qwen3")
         monkeypatch.setenv("EMBEDDING_MODEL", custom)
@@ -303,7 +303,7 @@ class TestConfiguredTextModels:
         # active = custom (env), secondary = qwen3 (DEFAULT_TEXT_MODEL, != active).
         assert models[0] == custom
         assert _QWEN in models
-        # min-across-slots = embeddinggemma's tighter 2 048-ctx tier.
+        # min-across-slots = arctic's tighter 4 096-ctx tier.
         assert chunking_preset_for_models(models) == chunking_preset_for_model(custom)
 
 

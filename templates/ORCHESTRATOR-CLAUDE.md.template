@@ -562,32 +562,25 @@ Output: Where to save
 **File Operations**: check before reading (Grep first), use `offset`/`limit` for large files, trust writes (no re-reads), spawn agents for multi-file ops (cap at 3 parallel editors per shared tree).
 
 {{#if_module_active lean_ctx}}
-**Lean-ctx Bash compression**: when the per-project PreToolUse hook `.claude/hooks/lean-ctx-rewrite.sh` (Windows: `lean-ctx-rewrite.ps1`) finds a `lean-ctx` binary — on PATH, or in the candidate paths it probes (`~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, the Homebrew prefixes) — it rewrites every `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. Result: Claude sees output compressed ~90–97% (boilerplate, progress bars, redundant lines stripped) without losing behaviour. When no binary is found, the hook is a graceful no-op and Bash output is raw.
+**Lean-ctx Bash compression — allow-listed, lossless**: the per-project PreToolUse hook `.claude/hooks/lean-ctx-rewrite.sh` (Windows: `lean-ctx-rewrite.ps1`) compresses ONLY the commands on the one committed allow-list `.claude/hooks/_lib/lean-ctx-allowlist.txt` — package installs, image pulls, downloads, and test/build runners. Everything else runs RAW: loops, pipes, chains, redirects, command substitution, `git`, unknown commands, and anything carrying a credential. When no `lean-ctx` binary is found (PATH, or the probed candidates `~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, the Homebrew prefixes), the hook is a graceful no-op and all output is raw.
 
-**Three-tier bypass hierarchy** — pick the right one for what you want:
+**Compressed output is never lossy — read the pointer, don't re-run.** Every compressed run tees its FULL raw output to `<project>/.claude/state/lean-ctx-tee/<timestamp>.log` and the compressed output ends with one pointer line. Raw output can carry credentials even when the command text doesn't, so the tee dir is mode 0700 and its files 0600 on POSIX (on Windows the user-profile ACLs are the equivalent); the whole `.claude/` tree is git-excluded at bundle add/update, and `.claude/state/` is transient to the code graph:
+
+```
+[lean-ctx-tee] 204 raw lines -> 26 shown; full output: /abs/path/.claude/state/lean-ctx-tee/<ts>.log (kept 168h)
+```
+
+When you need a line the compression dropped, **read that file** (it holds every warning, error body and progress line verbatim) — never re-run the command. The tee files self-clean after a TTL (default 168 h; set `VCO_LEAN_CTX_TEE_TTL_HOURS` in `.claude/env`, `0` = keep forever).
+
+**Bypass** (rare — the pointer already gives you the full output; use these only when you want raw *inline*):
 
 | Scope | Mechanism | When to use |
 |---|---|---|
-| Per-call (granular) | `lean-ctx bypass "<cmd>"` or `lean-ctx -c --raw "<cmd>"` | See raw output for ONE command without disabling other VCO hooks. The hook auto-detects commands starting with `lean-ctx` and steps aside — no double-wrap, no recursion. |
-| Per-call inverse | `lean-ctx -c "<cmd>"` | Force-compress a single command when the per-project default is `off`. |
-| Per-project (default) | Add `VCO_LEAN_CTX_DEFAULT=off` to `.claude/env` | Switch the project's default to raw output. Default `on` (compression active) when the line is missing or `.claude/env` doesn't exist. |
-| Global (sledgehammer) | `export VCT_DISABLE_HOOKS=1` | Disables ALL `.claude/hooks/*.sh` for the current shell, not just lean-ctx. Use only when debugging hook interactions. |
+| Per-call | `lean-ctx bypass "<cmd>"` or `lean-ctx -c --raw "<cmd>"` | See raw output inline for ONE command. The hook steps aside for any command starting with `lean-ctx` — no double-wrap. |
+| Per-project | `VCO_LEAN_CTX_DEFAULT=off` in `.claude/env` | Turn compression off for this project (default `on`). Launcher: project → Hooks tab → "Bash output compression". |
+| Global | `export VCT_DISABLE_HOOKS=1` | Disables ALL VCO hooks for the shell, not just lean-ctx — for debugging hook interactions only. |
 
-Override symmetry is intentional: with project default `on`, `lean-ctx bypass "<cmd>"` still produces raw output. With default `off`, prefixing `lean-ctx -c "<cmd>"` still produces compressed output.
-
-**The rewrite hook auto-bypasses `git commit` and `git push`** — they run RAW (uncompressed) so their stderr is always visible. This matters because compression can otherwise swallow stderr from a hook-failed `git commit`, leaving it to return exit code 1 with zero output (the file stays staged but uncommitted, with no visible reason). The step-aside keys on the FINAL `&&`-segment, so `git log && git commit` also runs the commit raw, while `echo git commit` (not a real commit) is still compressed.
-
-**Seven read-only `git` verbs step aside for the same reason** — `git show`, `git diff`, `git grep`, `git log`, `git blame`, `git cat-file` and `git ls-tree` run RAW. Their output *is* evidence: a lane reviewing a branch it has not checked out reads exactly these, and compressed output loses lines invisibly (`git ls-tree -r` measured -94% with 286 of 300 paths silently dropped; `git log` keeps the newest commits while the oldest disappear). The list is deliberately command-specific: `git status`, `git branch`, `git fetch` and every mutating verb still compress, and an ordinary command is still rewritten.
-
-For any OTHER command that returns silent non-zero (rare — e.g. a bespoke tool with a failing hook), use the manual bypass so its stderr surfaces: `lean-ctx bypass "some-tool --that-fails-quietly"`.
-
-**Recovery after heavy compression is limited, so bypass the pipeline instead of fighting it.** With no `lean-ctx.toml` present, tee mode is `failures`: only commands that FAILED write a verbatim copy under `~/.lean-ctx/tee/`, so a heavy-but-successful compression leaves nothing on disk to recover dropped lines from. When you need verbatim output, write it to a file rather than printing it — bytes written to a file are never compressed:
-
-```bash
-git show origin/main:path/to/file > /tmp/x.txt && wc -l /tmp/x.txt   # then read /tmp/x.txt
-```
-
-lean-ctx >= 3.8.18 adds `tee_mode="highcompression"` upstream as a remedy; recommend the upgrade where it matters, but do not depend on it — the hooks must stay correct on the older binaries that ship today.
+Two conservative arms keep output lossless either way: when the state dir can't be created the command runs raw and uncompressed inline (no tee, no pointer — nothing was dropped); when the raw output exceeds 32 MiB only the pointer is printed and the full output is read from the tee file.
 {{/if_module_active}}
 
 ---

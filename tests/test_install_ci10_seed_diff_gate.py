@@ -39,6 +39,8 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
 )
 from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
 from vco_lib import deferral_retry  # noqa: E402
+from vco_lib import kg_context_triple  # noqa: E402
+from vco_lib.deferral_report import DeferralReport  # noqa: E402
 import install  # noqa: E402
 
 
@@ -719,13 +721,16 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             deferral_report=report,
         )
         self.assertEqual(len(self.spawns), 1, "the seed must be enqueued")
+        # v0.2.101 B1: the owed row is written to the ON-DISK ledger BEFORE the
+        # spawn (the driver reads that ledger once), so this reads disk.
+        entries = DeferralReport.read(Path(self.tmp)).entries
         self.assertIn(
             "deferral-retry-*.log",
-            "".join(e.command_to_apply for e in report.entries),
+            "".join(e.command_to_apply for e in entries),
             "the user must be told where the background seed's log is",
         )
 
-        cids = [e.condition_id for e in report.entries]
+        cids = [e.condition_id for e in entries]
         self.assertIn(
             install._SEED_OWED_WORK_CONDITION_ID, cids,
             "an incomplete context change left no ledger entry — the owed "
@@ -752,14 +757,15 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             "embedding work is still owed",
         )
 
-    def test_leg_b_a_proven_seed_advances_the_triple_through_the_handler(self):
+    def test_leg_b_a_proven_seed_advances_the_triple_through_the_child(self):
         """The positive case: the context change IS recorded once it finished.
 
-        v0.2.101 item 4: install.py no longer writes the triple — the detached
-        handler does, after the child's own paired clear. This pins the leg-(b)
-        half of that contract next to the negative one above: `stamp_seed_context`
-        (fed the context the spawn carried) is what makes the next --update take
-        the cheap diff path.
+        v0.2.101 (caller-audit Gap 4/5/6): the CHILD records the triple on its
+        own clean `--all` success path — one home for every seeding entry point,
+        including the ones install.py never sees (the session-start driver, the
+        launcher's Sync, migrate-collections). install.py writes nothing on this
+        path; this test drives the child's own recorder, exactly as the script
+        does, and asserts the next update's comparison comes out cheap.
         """
         report = self._new_report()
         self._run_seed(
@@ -770,15 +776,12 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         # install.py itself must NOT have stamped it (see the test above)...
         self.assertIsNone(
             self._read_triple().get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING))
-        # ...but the context the handler will stamp travelled with the spawn.
-        carried = self.spawns[0]["env"]
-        deferral_retry.stamp_seed_context(
-            {
-                "active_embedding": carried[deferral_retry.SEED_CTX_ENV_ACTIVE_EMBEDDING],
-                "kg_collection": carried[deferral_retry.SEED_CTX_ENV_KG_COLLECTION],
-                "shared_kg_collection": carried[
-                    deferral_retry.SEED_CTX_ENV_SHARED_KG_COLLECTION],
-            },
+        # ...the CHILD does, from its own env, on a clean whole-tree run.
+        kg_context_triple.record_from_run(
+            whole_tree=True, failures=0, kg_collection_resolved=True,
+            orchestrator_root=True, shared_targeted=False,
+            kg_collection=os.environ["KG_COLLECTION"],
+            shared_kg_collection=os.environ["SHARED_KG_COLLECTION"],
             write_key=install._write_app_state_key,
         )
 
@@ -790,13 +793,15 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION),
             os.environ["KG_COLLECTION"],
         )
-        # The owed row exists from the ENQUEUE (install.py cannot know yet
-        # whether the background seed will succeed); the seed's own paired
-        # clear is what retires it — the registry half of that is pinned by
-        # test_leg_b_enqueue_records_owed_work_that_can_clear.
+        # The owed row is ON DISK from the enqueue — install.py cannot know yet
+        # whether the background seed will succeed, and the driver that is
+        # about to be spawned reads the DISK ledger (v0.2.101 B1). The seed's
+        # own paired clear is what retires it. The row carries no context now:
+        # the child records the triple itself. The registry half of that is
+        # pinned by test_leg_b_enqueue_records_owed_work_that_can_clear.
         self.assertIn(
             install._SEED_OWED_WORK_CONDITION_ID,
-            [e.condition_id for e in report.entries],
+            [e.condition_id for e in DeferralReport.read(Path(self.tmp)).entries],
         )
 
     def _new_report(self):
@@ -916,24 +921,22 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             "run 2 must re-enter the full-seed branch — the retry",
         )
 
-        # The detached handler finishes the seed and stamps the context. A
-        # successful whole-tree run also records the one-time metadata-repair
-        # pass (the sync script writes its own file stamp; install.py's
-        # app_state record is a projection of it) — without that, run 2 would
-        # legitimately re-enter the FULL branch via leg (d) instead of the
-        # diff path this test is about.
+        # The detached driver's CHILD finishes the seed and records what it
+        # walked against (v0.2.101: one home, the child). A successful
+        # whole-tree run also records the one-time metadata-repair pass (the
+        # sync script writes its own file stamp; install.py's app_state record
+        # is a projection of it) — without that, run 2 would legitimately
+        # re-enter the FULL branch via leg (d) instead of the diff path this
+        # test is about.
         install._write_app_state_key(
             _install_weaviate.KG_METADATA_REPAIR_STATE_KEY,
             _install_weaviate.KG_METADATA_REPAIR_STAMP,
         )
-        carried = self.spawns[0]["env"]
-        deferral_retry.stamp_seed_context(
-            {
-                "active_embedding": carried[deferral_retry.SEED_CTX_ENV_ACTIVE_EMBEDDING],
-                "kg_collection": carried[deferral_retry.SEED_CTX_ENV_KG_COLLECTION],
-                "shared_kg_collection": carried[
-                    deferral_retry.SEED_CTX_ENV_SHARED_KG_COLLECTION],
-            },
+        kg_context_triple.record_from_run(
+            whole_tree=True, failures=0, kg_collection_resolved=True,
+            orchestrator_root=True, shared_targeted=False,
+            kg_collection=os.environ["KG_COLLECTION"],
+            shared_kg_collection=os.environ["SHARED_KG_COLLECTION"],
             write_key=install._write_app_state_key,
         )
 

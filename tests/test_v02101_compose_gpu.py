@@ -42,6 +42,19 @@ DEVICES_OK = json.dumps([
 ])
 DEVICES_EMPTY = "[]"
 DEVICES_KFD = json.dumps([{"PathOnHost": "/dev/kfd", "PathInContainer": "/dev/kfd"}])
+# docker's documented inspect shape (Engine API: HostConfig.DeviceRequests —
+# DeviceRequest{Driver, Count, DeviceIDs, Capabilities, Options}); the
+# compose GPU overlay's `deploy.resources.reservations.devices` block maps
+# HERE, so a correct docker+NVIDIA container answers `[]` for Devices.
+# Fixtures follow the documented JSON (no docker on the CI machines).
+REQUESTS_NVIDIA_DRIVER = json.dumps([
+    {"Driver": "nvidia", "Count": -1, "DeviceIDs": None,
+     "Capabilities": [["gpu", "compute"]], "Options": {}}])
+REQUESTS_GPU_CAPABILITY = json.dumps([
+    {"Driver": "", "Count": "all", "DeviceIDs": None, "Capabilities": [["gpu"]]}])
+REQUESTS_AMD = json.dumps([
+    {"Driver": "amd", "Count": 1, "DeviceIDs": None, "Capabilities": [["gpu"]]}])
+REQUESTS_EMPTY = "[]"
 
 
 def _cp(argv, rc=0, out="", err=""):
@@ -120,6 +133,78 @@ def test_probe_unknown_when_it_cannot_tell():
     def boom(argv, **_kw):
         raise subprocess.TimeoutExpired(argv, 1)
     assert gv.probe("podman", run=boom).kind == gv.GPU_UNKNOWN
+
+
+def _docker_probe_run(devices: str, requests: str, *, req_rc: int = 0):
+    """A fake ``run`` that answers by the ``--format`` argument — docker's
+    two inspect fields are separate calls."""
+    def run(argv, **_kw):
+        fmt = argv[argv.index("--format") + 1]
+        if "DeviceRequests" in fmt:
+            return _cp(argv, req_rc, requests if req_rc == 0 else "", "")
+        return _cp(argv, 0, devices, "")
+    return run
+
+
+def test_probe_docker_gpu_via_device_requests_driver_nvidia():
+    """The B2 blocker's exact shape: a correct docker+NVIDIA container (the
+    compose overlay's reservations.devices block) answers EMPTY Devices and
+    holds its GPU in a DeviceRequest."""
+    v = gv.probe("docker", run=_docker_probe_run(DEVICES_EMPTY, REQUESTS_NVIDIA_DRIVER))
+    assert v.kind == gv.GPU_OK, v.detail
+    assert "device request" in v.detail and "driver=nvidia" in v.detail
+
+
+def test_probe_docker_gpu_via_amd_driver_request():
+    """A driver-tagged AMD request satisfies an AMD expectation."""
+    assert gv.probe("docker", gpu_vendor="amd", run=_docker_probe_run(
+        DEVICES_EMPTY, REQUESTS_AMD)).kind == gv.GPU_OK
+
+
+def test_probe_docker_foreign_vendor_request_is_missing():
+    """SF-2: the request path must be vendor-discriminating like the device
+    list — an AMD request while NVIDIA is expected (and vice versa) is the
+    expected-GPU-not-in-container shape, never a false ok. Empty device list
+    + no matching request → MISSING (the existing rule)."""
+    v = gv.probe("docker", run=_docker_probe_run(DEVICES_EMPTY, REQUESTS_AMD))
+    assert v.kind == gv.GPU_MISSING, v.detail
+    v = gv.probe("docker", gpu_vendor="amd",
+                 run=_docker_probe_run(DEVICES_EMPTY, REQUESTS_NVIDIA_DRIVER))
+    assert v.kind == gv.GPU_MISSING, v.detail
+
+
+def test_probe_docker_bare_gpu_capability_is_unknown():
+    """SF-2: a driverless, id-less ``["gpu"]`` request carries no vendor
+    evidence — docker allocates whichever GPU the host has, so the probe
+    cannot confirm it is the expected vendor and answers UNKNOWN (no row):
+    never a false ok, never a false missing."""
+    for vendor in (None, "amd"):
+        v = gv.probe("docker", gpu_vendor=vendor, run=_docker_probe_run(
+            DEVICES_EMPTY, REQUESTS_GPU_CAPABILITY))
+        assert v.kind == gv.GPU_UNKNOWN, v.detail
+
+
+def test_probe_docker_empty_devices_and_empty_requests_is_missing():
+    v = gv.probe("docker", run=_docker_probe_run(DEVICES_EMPTY, REQUESTS_EMPTY))
+    assert v.kind == gv.GPU_MISSING, v.detail
+    assert "device requests: (none)" in v.detail
+
+
+def test_probe_docker_requests_probe_failure_is_unknown():
+    """The second field unreadable ⇒ could-not-tell, never a false row."""
+    v = gv.probe("docker", run=_docker_probe_run(DEVICES_EMPTY, "", req_rc=125))
+    assert v.kind == gv.GPU_UNKNOWN, v.detail
+
+
+def test_probe_podman_never_asks_for_device_requests():
+    """Podman's inspect has NO DeviceRequests field (verified live — the
+    template errors), so a podman answer comes from Devices alone and the
+    requests query is never made."""
+    def run(argv, **_kw):
+        fmt = argv[argv.index("--format") + 1]
+        assert "DeviceRequests" not in fmt, "podman cannot evaluate that field"
+        return _cp(argv, 0, DEVICES_OK, "")
+    assert gv.probe("podman", run=run).kind == gv.GPU_OK
 
 
 def test_decide_truth_table():
