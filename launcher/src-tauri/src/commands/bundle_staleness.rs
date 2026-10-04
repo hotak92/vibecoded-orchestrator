@@ -310,6 +310,55 @@ pub(crate) fn census_from_stdout(stdout: &str) -> BundleStalenessCensus {
     }
 }
 
+// ─── Filtered census for the Update-all root gate (v0.2.101, 12b) ───────
+
+/// Build the census CLI argv — everything after `-m vco_lib.bundle_staleness`.
+///
+/// Pure (mirrors `build_config_projection_apply_args` in `projects_v2`) so
+/// the read-only contract stays unit-testable at the argv level:
+/// `--refresh-ledger` is deliberately absent (see the module docs) — a GUI
+/// surface must never mutate the ledger it is displaying.
+///
+/// `project: Some(path)` restricts the census to ONE project via the Python
+/// CLI's id-or-folder-path filter, which is report-only by design
+/// (`vco_lib/bundle_staleness.py`: `--project` never writes the census
+/// state or the ledger).
+pub(crate) fn build_census_args(
+    orchestrator_root: &std::path::Path,
+    project: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "--json".to_string(),
+        "--orchestrator-root".to_string(),
+        orchestrator_root.to_string_lossy().to_string(),
+    ];
+    if let Some(p) = project {
+        args.push("--project".to_string());
+        args.push(p.to_string_lossy().to_string());
+    }
+    args
+}
+
+/// Does this census positively report `folder`'s bundle as CURRENT?
+///
+/// The only combination that yields `true`: the census ran
+/// (`determined`), returned a row for exactly this folder, and that row's
+/// verdict is `current`. An undetermined probe (spawn failure, timeout,
+/// unparseable stdout), a row for a different folder, or ANY other verdict
+/// (`stale`, `unknown`, unrecognised) yields `false` — the conservative
+/// direction for a skip gate: a caller that could not prove currentness
+/// must update exactly as it did before the gate existed.
+pub(crate) fn census_reports_folder_current(
+    census: &BundleStalenessCensus,
+    folder: &str,
+) -> bool {
+    census.determined
+        && census
+            .projects
+            .iter()
+            .any(|p| p.folder == folder && p.verdict == "current")
+}
+
 // ─── Command ────────────────────────────────────────────────────────────
 
 /// Run the READ-ONLY bundle-staleness census over every registered project.
@@ -320,10 +369,16 @@ pub(crate) fn census_from_stdout(stdout: &str) -> BundleStalenessCensus {
 /// this feature must never do.
 #[command]
 pub async fn bundle_staleness_census(db: State<'_, Db>) -> Result<BundleStalenessCensus, String> {
-    Ok(run_census(&db).await)
+    Ok(run_census(&db, None).await)
 }
 
-async fn run_census(db: &Db) -> BundleStalenessCensus {
+/// Run the READ-ONLY census. `project: Some(path)` restricts it to one
+/// project (v0.2.101 12b: the Update-all root gate probes ONLY the root
+/// row instead of paying for — and coupling to — the full population).
+pub(crate) async fn run_census(
+    db: &Db,
+    project: Option<&std::path::Path>,
+) -> BundleStalenessCensus {
     // v0.2.100 (F-W1-07): a typed stand-down while install.py --update holds
     // launcher.db, instead of `no such table` from the stand-in connection.
     if let Err(standby) = db.ensure_live() {
@@ -345,15 +400,16 @@ async fn run_census(db: &Db) -> BundleStalenessCensus {
     let mut cmd = tokio::process::Command::new(&python).silent();
     cmd.arg("-m")
         .arg("vco_lib.bundle_staleness")
-        // READ-ONLY. `--refresh-ledger` is deliberately absent: see the
-        // module docs. Adding it here would make every Projects-page mount
-        // rewrite the census state and flap the deferral badge.
-        .arg("--json")
-        .arg("--orchestrator-root")
-        .arg(&root)
         .current_dir(&root)
         .env("VCT_INSTALL_ROOT", &root)
         .stdin(std::process::Stdio::null());
+    // READ-ONLY argv, built by the pure helper above: `--refresh-ledger`
+    // is deliberately absent (see the module docs and the argv guard
+    // test). Adding it here would make every Projects-page mount rewrite
+    // the census state and flap the deferral badge.
+    for a in build_census_args(&root, project) {
+        cmd.arg(a);
+    }
 
     let out = match timeout(Duration::from_secs(CENSUS_TIMEOUT_SECS), cmd.output()).await {
         Ok(Ok(out)) => out,
@@ -633,6 +689,11 @@ mod tests {
     /// Guard the read-only contract at the argv level: the census command
     /// must never grow `--refresh-ledger`. A GUI poll that writes the ledger
     /// would flap the user's deferral badge on every page mount.
+    ///
+    /// v0.2.101 (12b): the spawn argv moved to the pure `build_census_args`
+    /// helper, so the guard now pins the builder's OUTPUT (plus the same
+    /// assembled-literal source scan, which still catches a hand-written
+    /// `.arg(...)` even if the builder were bypassed).
     #[test]
     fn census_argv_is_read_only() {
         let src = include_str!("bundle_staleness.rs");
@@ -640,12 +701,92 @@ mod tests {
         // spell the forbidden call out verbatim: a literal occurrence anywhere
         // in the source would match itself and make the guard self-defeating.
         let ledger_arg = format!(".arg(\"--{}\")", "refresh-ledger");
-        let json_arg = format!(".arg(\"--{}\")", "json");
         assert!(
             !src.contains(&ledger_arg),
             "the GUI census must not opt into the ledger write"
         );
-        assert!(src.contains(&json_arg), "the census must run in --json mode");
+        let args = build_census_args(std::path::Path::new("/opt/vco"), None);
+        assert!(
+            !args.contains(&format!("--{}", "refresh-ledger")),
+            "the census argv must not opt into the ledger write: {:?}",
+            args
+        );
+        assert!(
+            args.contains(&"--json".to_string()),
+            "the census must run in --json mode: {:?}",
+            args
+        );
+    }
+
+    // ─── v0.2.101 (12b): filtered census for the Update-all root gate ────
+
+    /// One `--project`-shaped payload: a single row, the given verdict.
+    fn single_project_json(verdict: &str, folder: &str) -> String {
+        let (c, s, u) = match verdict {
+            "current" => (1, 0, 0),
+            "stale" => (0, 1, 0),
+            _ => (0, 0, 1),
+        };
+        serde_json::json!({
+            "schema": 1,
+            "running": {"version": "0.2.101"},
+            "registry": "launcher.db",
+            "projects": [
+                {"id": "root-1", "name": "Root", "folder": folder,
+                 "verdict": verdict, "reason": "noop", "changed_files": [],
+                 "user_modified": 0}
+            ],
+            "summary": {"current": c, "stale": s, "unknown": u},
+            "remedy": {"gui": "g", "cli": "c"}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn census_args_carry_the_project_filter_only_when_given() {
+        let root = std::path::Path::new("/opt/vco");
+        let with = build_census_args(root, Some(std::path::Path::new("/p/root")));
+        assert!(
+            with.contains(&"--project".to_string()),
+            "the filtered spawn must pass the project filter: {:?}",
+            with
+        );
+        assert_eq!(with.last().map(String::as_str), Some("/p/root"));
+        let without = build_census_args(root, None);
+        assert!(
+            !without.iter().any(|a| a == "--project"),
+            "the unfiltered census must not carry a project filter: {:?}",
+            without
+        );
+    }
+
+    #[test]
+    fn only_a_determined_current_row_for_the_folder_means_current() {
+        for (verdict, expect) in [("current", true), ("stale", false), ("unknown", false)] {
+            let census = census_from_stdout(&single_project_json(verdict, "/p/root"));
+            assert!(census.determined, "{}", verdict);
+            assert_eq!(
+                census_reports_folder_current(&census, "/p/root"),
+                expect,
+                "verdict {} must map to current=={}",
+                verdict,
+                expect
+            );
+        }
+        // A current row for a DIFFERENT folder proves nothing about this one
+        // (a loosely-matching `--project` filter must not leak a skip).
+        let census = census_from_stdout(&single_project_json("current", "/p/other"));
+        assert!(!census_reports_folder_current(&census, "/p/root"));
+    }
+
+    #[test]
+    fn unparsable_or_undetermined_output_is_never_current() {
+        // Unparsable stdout → undetermined → NOT current (update as today).
+        let census = census_from_stdout("{ this is not json");
+        assert!(!census_reports_folder_current(&census, "/p/root"));
+        // Failed/timed-out probe shape.
+        let census = BundleStalenessCensus::undetermined("bundle census timed out");
+        assert!(!census_reports_folder_current(&census, "/p/root"));
     }
 }
 
@@ -674,7 +815,7 @@ mod standby_tests {
     #[tokio::test]
     async fn census_is_undetermined_with_the_typed_reason_in_standby() {
         let db = standby_db();
-        let c = run_census(&db).await;
+        let c = run_census(&db, None).await;
         assert!(!c.determined);
         assert_typed_standby(c.error.as_deref().unwrap_or(""));
     }
@@ -727,7 +868,7 @@ mod spawn_evidence_tests {
                 use vct_launcher_core::services::install_root::RootStore as _;
                 db.write_cached_root(root.path().to_str().unwrap()).unwrap();
             }
-            let census = run_census(&db).await;
+            let census = run_census(&db, None).await;
             let err = census.error.unwrap_or_default();
             assert!(!census.determined, "`{body}`");
             assert!(err.contains(want), "`{body}` → {err}");

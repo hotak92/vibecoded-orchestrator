@@ -417,7 +417,11 @@ class ComposeArgvTests(unittest.TestCase):
         recorded = {}
 
         def fake_run(cmd, **kwargs):
-            recorded["cmd"] = list(cmd)
+            # v0.2.101: the post-start GPU check's `inspect` probe also runs
+            # through this mock AFTER compose up — these tests pin the COMPOSE
+            # argv, so only that call is recorded.
+            if "compose" in cmd or "-f" in cmd:
+                recorded["cmd"] = list(cmd)
             return subprocess.CompletedProcess(cmd, 0, "", "")
 
         state = code_embed_image.ImageState(verdict, f"summary({verdict})")

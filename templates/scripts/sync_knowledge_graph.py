@@ -344,6 +344,11 @@ from vco_lib import progress_event as _progress_event  # noqa: E402 — same imp
 # for `connect_v4`.
 from vco_lib.weaviate_helpers import weaviate_url_default  # noqa: E402 — same import-order constraint as the group above
 from vco_lib.containers import runtime_command_hint as _runtime_command_hint  # noqa: E402 — same import-order constraint as the group above
+# v0.2.101 (item 3): the archived-node predicate has ONE home. The seed's
+# change check (vco_lib.install_weaviate) must skip exactly what this script
+# skips — otherwise archived nodes (which never get a stored content_hash) are
+# re-listed as "changed" on every update. Import, not a second copy.
+from vco_lib.kg_node_status import is_archived_node as _is_archived_node_shared  # noqa: E402 — same import-order constraint as the group above
 
 # Try to import query logger.
 #
@@ -3795,18 +3800,11 @@ def _is_archived_node(file_path: Path, frontmatter: dict | None = None) -> tuple
     upstream skipping is the cleaner default: it keeps the index lean and
     avoids paying embedding cost for content that won't surface.
     """
-    parts = file_path.parts
-    # Exact segment match for `archive`, `.archive`, `_archive` — NOT a
-    # substring match (would catch `architecture/`, `archived-notes/`).
-    _ARCHIVE_DIR_SEGMENTS = {"archive", ".archive", "_archive"}
-    archive_hit = next((p for p in parts if p in _ARCHIVE_DIR_SEGMENTS), None)
-    if archive_hit is not None:
-        return True, f"path contains {archive_hit!r} segment ({file_path})"
-    if frontmatter is not None:
-        status = (frontmatter.get("status") or "").strip().lower()
-        if status in ("archived", "deprecated", "superseded"):
-            return True, f"frontmatter status={status!r}"
-    return False, ""
+    # v0.2.101 (item 3): ONE predicate, shared with the seed's change check.
+    # The rule (path segments / frontmatter status) lives in
+    # `vco_lib.kg_node_status`; this name stays so the skip/delete call-sites
+    # and their tests are untouched.
+    return _is_archived_node_shared(file_path, frontmatter)
 
 
 # NEW-11 (2026-05-28): normalize typed_links to list-of-objects before any
@@ -5612,6 +5610,14 @@ def main():
                 # only a FULLY successful --all proves the failed nodes
                 # from an earlier run actually landed.
                 _clear_sync_failures_deferral(PROJECT_ROOT)
+                # v0.2.101 item 4: and, when THIS run targeted the shared
+                # collection, it retires the shared-seed entry install.py
+                # enqueued. Narrow by construction — a normal project run has
+                # COLLECTION_NAME != SHARED_COLLECTION_NAME and clears nothing;
+                # the orchestrator root (where the two names ARE equal) never
+                # enqueues this row at all.
+                if _targets_shared_collection():
+                    _clear_shared_seed_deferral(PROJECT_ROOT)
                 # v0.2.94: and it retires the DRIFT entry `--check-drift` wrote.
                 #
                 # The launcher's bundle-update gate now runs `--check-drift`
@@ -5801,6 +5807,14 @@ _SYNC_NO_BACKEND_CID = "kg_sync_no_embedding_backend"
 #: project once the backend answers. Named once, same discipline.
 _SYNC_FAILURES_CID = "kg_sync_failures_pending"
 
+#: v0.2.101 item 4: owed-work condition for the SHARED-collection seed that
+#: install.py enqueues (it used to block on it). Registered in
+#: ``vco_lib/deferral_conditions.toml`` as ``auto_retryable`` with
+#: ``retry_action = "retry:py:kg_seed_shared"``. The paired clear is HERE —
+#: the run that targets the shared class is the only thing that proves the
+#: shared seed landed, so the clear lives with that run. Named once.
+_SYNC_SHARED_CID = "kg_sync_shared_pending"
+
 
 def _clear_sync_deferral_no_backend(install_root: Path) -> None:
     """Resolve ``kg_sync_no_embedding_backend`` after a SUCCESSFUL tree sync.
@@ -5917,6 +5931,39 @@ def _clear_sync_failures_deferral(install_root: Path) -> None:
         from vco_lib.deferral_emit import resolve_conditions
 
         resolve_conditions(install_root, (_SYNC_FAILURES_CID,))
+    except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
+        print(f"   (deferral clear failed: {inner})", file=sys.stderr)
+
+
+def _targets_shared_collection() -> bool:
+    """Did THIS run seed the SHARED class rather than the project's own?
+
+    v0.2.101 item 4 — the gate on ``_clear_shared_seed_deferral``. True only
+    when a shared class is configured AND the run's effective target IS that
+    class (which is what ``KG_COLLECTION=<shared>`` in the child env produces).
+    A normal project run targets its own class and must clear nothing.
+    """
+    return bool(SHARED_COLLECTION_NAME) and COLLECTION_NAME == SHARED_COLLECTION_NAME
+
+
+def _clear_shared_seed_deferral(install_root: Path) -> None:
+    """Resolve ``kg_sync_shared_pending`` after a successful SHARED-collection
+    tree sync (v0.2.101 item 4).
+
+    install.py enqueues the shared seed instead of blocking on it, so the owed
+    work needs a paired resolution — and THIS run is the only thing that proves
+    it: the entry says "the project's knowledge/ has not been pushed into the
+    shared class yet", and only an ``--all`` run that TARGETED that class with
+    ZERO failures retires it. A normal project run does not target the shared
+    class, so it deliberately does not clear (the same narrow-clear shape as
+    ``_clear_sync_failures_deferral``).
+
+    Soft-fail: the sync's exit code must never depend on ledger bookkeeping.
+    """
+    try:
+        from vco_lib.deferral_emit import resolve_conditions
+
+        resolve_conditions(install_root, (_SYNC_SHARED_CID,))
     except Exception as inner:  # noqa: BLE001 — bookkeeping is best-effort
         print(f"   (deferral clear failed: {inner})", file=sys.stderr)
 

@@ -47,10 +47,15 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from vco_lib import boot_service, materialize, project_init  # noqa: E402
+from vco_lib import claude_md_sections  # noqa: E402
 from vco_lib import rendered_root_files as rrf  # noqa: E402
 from vco_lib.deferral_report import DeferralReport  # noqa: E402
 from vco_lib.project_templates import render_project_template  # noqa: E402
 from tests._materialize_fixtures import mirror_repo_tree  # noqa: E402
+
+#: The two feature-set extremes every conditionally-rendered document is
+#: gated under (v0.2.101 T4): nothing on, and everything the resolver knows.
+_SECTION_SETS = (frozenset(), claude_md_sections.ALL_FEATURES)
 
 #: Path-vocabulary keys that NO shipped template uses today. They are part of
 #: the documented contract (templates/README.md) and of the moved-clone heal's
@@ -169,7 +174,10 @@ def _render_bundle(syn: Synthetic, monkeypatch) -> Rendered:
 def _render_project_templates(syn: Synthetic) -> Rendered:
     out: Rendered = {}
     templates = REPO_ROOT / "templates"
-    for active in (set(), set(project_init._DEFAULT_ACTIVE_MODULES) | {"diagrams"}):
+    # v0.2.101 (T4): the "on" extreme is the resolver's FULL vocabulary, so
+    # every conditional section (the gateway block included) is rendered — and
+    # therefore placeholder-checked — at least once by this gate.
+    for active in (set(), set(claude_md_sections.ALL_FEATURES)):
         for template_name, live_rel, _ref in project_init._PROJECT_LEVEL_TEMPLATES:
             sink = materialize.FindingsSink()
             text = render_project_template(
@@ -184,13 +192,20 @@ def _render_project_templates(syn: Synthetic) -> Rendered:
 
 def _render_root_table(syn: Synthetic) -> Rendered:
     out: Rendered = {}
-    for entry in rrf.entries():
-        result = rrf._render_template_text(
-            syn.root, entry, (REPO_ROOT / entry.template).read_text(encoding="utf-8"),
-            context=materialize.MaterializeContext(
-                syn.root, syn.root, os_name=syn.os_name, home=syn.home),
-        )
-        out[entry.path] = (result.text, result)
+    # v0.2.101 (T4): the root table renders through the SAME path
+    # `render_entry` uses — conditional pass included — under BOTH feature
+    # extremes, mirroring `_render_project_templates`. The explicit `active`
+    # sets keep the gate off the machine-state resolver.
+    for active in _SECTION_SETS:
+        for entry in rrf.entries():
+            result = rrf._render_template_text(
+                syn.root, entry,
+                (REPO_ROOT / entry.template).read_text(encoding="utf-8"),
+                context=materialize.MaterializeContext(
+                    syn.root, syn.root, os_name=syn.os_name, home=syn.home),
+                active=active,
+            )
+            out[f"{entry.path} (sections={sorted(active)})"] = (result.text, result)
     return out
 
 
@@ -254,6 +269,13 @@ def _render_everything(syn: Synthetic, monkeypatch) -> Rendered:
     return out
 
 
+#: Conditional-tag fragments that must never survive into a rendered document
+#: (v0.2.101 T4): a tag the renderer did not consume is an un-wired or
+#: malformed conditional — silent leakage into a shipped file, which is the
+#: exact defect the root path's fail-the-entry decision (plan risk 4) backstops.
+_CONDITIONAL_TAG_FRAGMENTS = ("{{#if_", "{{/if_")
+
+
 def _violations(rendered: Rendered) -> List[str]:
     """The gate's one verdict function (the mutation proof feeds it too)."""
     bad: List[str] = []
@@ -262,6 +284,9 @@ def _violations(rendered: Rendered) -> List[str]:
             bad.append(f"{label}: {{{{{u.name}}}}} line {u.line} ({u.reason})")
         for m in result.missing_paths:
             bad.append(f"{label}: {{{{{m.name}}}}} -> missing path {m.value!r}")
+        for fragment in _CONDITIONAL_TAG_FRAGMENTS:
+            if fragment in text:
+                bad.append(f"{label}: surviving conditional tag {fragment!r}")
         region_only = label.startswith(".claude/scripts/")
         scanned = _region_text(text) if region_only else text
         for tok in _tokens(scanned):
@@ -312,13 +337,18 @@ class TestEveryShippedTemplateRenders:
 
     def test_rendered_values_are_this_installs(self, synthetic, monkeypatch):
         rendered = _render_root_table(synthetic)
-        (text, _r), = rendered.values()
-        assert str(synthetic.root) in text
+        # v0.2.101 (T4): TWO feature-set extremes per entry, so every render
+        # — sections dropped and sections kept — must carry this install's
+        # values (the conditional sections hold no path placeholders, and a
+        # dropped section can never take one of these assertions with it).
+        assert len(rendered) == 2 * len(rrf.entries())
         py = materialize.venv_python_path(synthetic.root, os_name=synthetic.os_name)
-        assert str(py) in text and py.exists()
-        if synthetic.os_name == "Windows":
-            assert py.parts[-2:] == ("Scripts", "python.exe")
-        assert str(synthetic.root / "claude_mcp_servers" / ".venv") not in text
+        for (text, _r) in rendered.values():
+            assert str(synthetic.root) in text
+            assert str(py) in text and py.exists()
+            if synthetic.os_name == "Windows":
+                assert py.parts[-2:] == ("Scripts", "python.exe")
+            assert str(synthetic.root / "claude_mcp_servers" / ".venv") not in text
 
     def test_every_registry_key_is_used(self, tmp_path, monkeypatch):
         used: set = set()
@@ -356,6 +386,19 @@ class TestMutationProof:
         violations = _violations({op.dest_rel: (data.decode("utf-8"), result)})
         assert any("BOGUS" in v for v in violations), violations
         assert b"{{BOGUS}}" in data, "owner rule: the token is left in place"
+
+    def test_a_surviving_conditional_tag_turns_the_gate_red(self):
+        """RED proof of the T4 tag check: a rendered document still carrying a
+        conditional tag — the shape an un-wired renderer pass or a malformed
+        tag produces — is a violation, whatever the rest of the render says."""
+        clean = materialize.render("no tags here\n", {}, allowed=set(), escape="none")
+        assert _violations({"CLAUDE.md": ("no tags here\n", clean)}) == []
+        for leaked in ("{{#if_module_active x}}\nbody\n{{/if_module_active}}\n",
+                       "{{#if_bogus x}}\n",
+                       "prose {{/if_module_active}} prose\n"):
+            result = materialize.render(leaked, {}, allowed=set(), escape="none")
+            violations = _violations({"CLAUDE.md": (leaked, result)})
+            assert any("conditional tag" in v for v in violations), leaked
 
 
 # ---------------------------------------------------------------------------

@@ -330,6 +330,12 @@ _AMBIENT_WEAVIATE_URL = os.environ.get("WEAVIATE_URL")
 
 if not _ALLOW_REAL_STATE:
     os.environ["WEAVIATE_URL"] = _fixture_guard.UNROUTABLE_SENTINEL_URL
+    # No test reaches the licensing backend either (v0.2.101): rendering the
+    # root CLAUDE.md probes `feature_enabled("rl_retrieval")`, which validates a
+    # licence key ONLINE whenever one exists on the machine and rewrites the
+    # user's licence cache. The free-tier override short-circuits before any key
+    # is read; the licence tests clear it themselves.
+    os.environ["VIBECODED_TIER"] = "free"
 os.environ[_fixture_guard.ALLOW_FIXTURE_WRITES_ENV] = "1"
 
 

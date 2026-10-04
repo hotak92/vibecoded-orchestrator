@@ -261,6 +261,25 @@ def _as_count(value: Any) -> Optional[int]:
     return value if value >= 0 else None
 
 
+class UsageTotals(dict):
+    """The merged counts, plus WHICH of them the response actually reported.
+
+    A plain ``dict[str, int]`` to every existing consumer — :func:`build_record`
+    reads it with ``.get(name, 0)`` and the merged-view tests index it
+    directly, so an unseen field is still a real zero here and nothing that
+    reads this changes. ``reported`` is the one extra the access line needs:
+    :func:`access_extra` reads it to print ``-`` for the fields the response
+    never sent, because a vendor's default ``cache_c=0`` and a genuine
+    cache-creation of zero must not read as the same six characters (the
+    logging policy in :mod:`model_router.server`). The accumulator's ``_seen``
+    set is the only thing that observed the bytes, so it is carried here.
+    """
+
+    def __init__(self, values: "dict[str, int]", reported: "frozenset[str]") -> None:
+        super().__init__(values)
+        self.reported = reported
+
+
 class UsageAccumulator:
     """Merges the usage a response reports, whatever shape it reports it in.
 
@@ -427,9 +446,19 @@ class UsageAccumulator:
             field_name in self._seen for field_name in USAGE_FIELDS
         )
 
-    def totals(self) -> "dict[str, int]":
-        """The merged counts, with unseen fields at zero."""
-        return {name: self._values.get(name, 0) for name in USAGE_FIELDS}
+    def totals(self) -> "UsageTotals":
+        """The merged counts, with unseen fields at zero.
+
+        Returned as a :class:`UsageTotals`: still the plain
+        ``dict[str, int]`` every consumer has always read (unseen fields are
+        zero here), but carrying ``reported`` — the fields the response
+        actually stated — so :func:`access_extra` can dash the ones it never
+        sent instead of printing a default zero as if it were an observation.
+        """
+        return UsageTotals(
+            {name: self._values.get(name, 0) for name in USAGE_FIELDS},
+            frozenset(self._seen),
+        )
 
     @property
     def saw_anything(self) -> bool:
@@ -572,24 +601,40 @@ def access_extra(totals: Mapping[str, int], *, seen: bool) -> str:
 
     ``-`` for a field the response never reported, because a zero and a
     silence are different observations and the log is the place that has to
-    keep telling them apart. The whole group is dashes when the response
-    reported no usage at all (an error status relayed verbatim, a stream that
-    died before ``message_start``).
+    keep telling them apart. :meth:`UsageAccumulator.totals` says which fields
+    those are: the :class:`UsageTotals` it returns carries ``reported``, the
+    set of fields the response actually stated — INCLUDING an explicit zero,
+    which is a reading and is printed as ``0``. ``ctx`` is the sum of the
+    reported context fields only, and ``-`` when none of them was reported.
+
+    A plain mapping from a caller that has only numbers carries no per-field
+    provenance, so it falls back to the historical rule: a field counts as
+    reported when it is present and non-null, and an empty/``seen=False``
+    mapping dashes the whole group.
     """
+    reported = getattr(totals, "reported", None)
+    if reported is None:
+        reported = (
+            {name for name in USAGE_FIELDS if totals.get(name) is not None}
+            if seen
+            else frozenset()
+        )
+
     def show(name: str) -> str:
-        if not seen:
+        if name not in reported:
             return "-"
         value = totals.get(name)
         return "-" if value is None else str(value)
 
+    context_fields = (
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+    )
     context = (
-        "-"
-        if not seen
-        else str(
-            totals.get("input_tokens", 0)
-            + totals.get("cache_creation_input_tokens", 0)
-            + totals.get("cache_read_input_tokens", 0)
-        )
+        str(sum(totals.get(name, 0) for name in context_fields))
+        if any(name in reported for name in context_fields)
+        else "-"
     )
     return (
         f"in={show('input_tokens')} "

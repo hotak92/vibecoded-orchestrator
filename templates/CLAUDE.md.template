@@ -24,6 +24,26 @@ _(List the primary languages, frameworks, and infrastructure. Examples: "Python 
 _(Edit this list to match {{PROJECT_NAME}}'s actual layout.)_
 
 <!-- >>>VCO_MANAGED>>> -->
+<!-- BEGIN: SETUP-ONLY (project-scoping nudge — remove after the user has either declined or completed the scoping pass) -->
+## First session: offer to scope agents and skills
+
+Do this once, after the user has described what this project is (intent, stack, goals) — not before, since they may
+have opened this session for something else.
+
+1. Offer the choice (AskUserQuestion if available): VCO registered its whole catalogue of agents, skills and hooks
+   here, and much of it is likely off-topic for this project. Scoping disables what does not apply, for a cleaner
+   catalogue and less listing noise; anything disabled can be re-enabled with one click later. "Keep all" is a valid
+   answer.
+2. If they agree, choose from their description, `.claude/CONTEXT_STATE.md` and each item's `description:`
+   frontmatter. Keep a small core (planner, coder, tester, kg-navigator) plus whatever fits the stack; keep
+   borderline items enabled.
+3. Disable through the launcher's per-project Agents / Skills / Hooks tabs. They move agents and skills to
+   `.claude/agents.disabled/` / `.claude/skills.disabled/` and park hook entries in the launcher DB, which bundle
+   updates respect; a deleted file would simply come back on the next update.
+4. When done, or if they decline, run `python .claude/scripts/cleanup-setup-sections.py`. It removes every SETUP-ONLY
+   block and records an acknowledgement, so the removal survives future bundle updates.
+<!-- END: SETUP-ONLY -->
+
 ---
 
 ## VCO Paths
@@ -89,7 +109,7 @@ One decision tree for picking the tool:
 {{#if_module_active model_gateway}}
 ## Model routing
 
-This section is here because a **model gateway is configured for this machine** (Services → Model gateway in the launcher). It would be absent otherwise — a project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise. Turn it off per-project from the same card.
+This section is here because **model-gateway routing is usable for this project**: the gateway is configured on this machine and this project has not opted out (Services → Model gateway in the launcher; the per-project switch there removes both this section and the gateway agent definitions on the next bundle update). A project with no gateway reaches only Anthropic models, and routing advice for models you cannot call is noise.
 
 **The rule that outranks the table: a model name must name the model that answers.** Never point a Claude tier slot (`ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU,FABLE}_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`) or the subagent slot (`CLAUDE_CODE_SUBAGENT_MODEL`) at a vendor model. Dispatching under one name and answering with another makes every later "which model wrote this?" unanswerable, and it is why the gateway namespaces vendor ids as `claude-gw/<id>` instead of relabelling them. VCO never writes any of those slots — not even when it points the VS Code panel at the gateway; an override already present in your settings is preserved and reported, never silently honoured (the one permitted edit is appending the `[1m]` context-window hint to the SAME model id, disclosed in the done message — the model a slot names is never changed).
 
@@ -160,7 +180,7 @@ To disable diagrams for this project, toggle it off in the launcher's DiagramsTa
 {{/if_module_active}}
 ## VCO-Managed Files
 
-This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, use the launcher (this project's Settings page → **Update bundle**, or the Projects page → **⟳ Update all** for every project) or run from the orchestrator root:
+This project's `.claude/hooks/`, `.claude/scripts/`, `.claude/agents/`, `.claude/skills/`, and `.claude/settings.json` are shipped by VCO (the orchestrator). To update them, use the launcher (this project's Settings page → **Update bundle**, or the Projects page → **⟳ Update all** for every project — Update all skips the orchestrator root when its bundle is already current, while this project's own Update bundle always runs) or run from the orchestrator root:
 
 ```bash
 python -m vco_lib.project_init install-bundle \

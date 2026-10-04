@@ -4,27 +4,24 @@
      tests/test_v0292_deferral_reminder_single_owner.py). -->
 
 <!-- BEGIN: SETUP-ONLY (project-scoping nudge — remove after the user has either declined or completed the scoping pass) -->
-## FIRST SESSION — wait for the user to define the project, then offer to scope agents/skills
+## First session: offer to scope agents and skills
 
-This block appears on every new project until you remove it. It's NOT for you to act on alone — it's a reminder to do ONE thing the first time the user starts a substantive conversation:
+Do this once, after the user has described what they use this orchestrator for — not before, since they may have
+opened this session for something else.
 
-1. **Wait until the user has explained what this project is about** (one or two paragraphs of intent, stack, goals). Do NOT ask before they've spoken — they may open Claude for an unrelated reason on this session.
-
-2. **Once you understand the project**, offer the scoping choice. Use AskUserQuestion (or plain prose if AskUserQuestion isn't available). Suggested phrasing:
-
-   > VCO pre-registered its full catalog of agents, skills and hooks for this project (the launcher's per-project Agents / Skills / Hooks tabs list them). Most of them are off-topic for what you've described. Want me to scope this project — disable the agents/skills that don't apply to your stack, leaving just the relevant ones? Pros: cleaner Agents/Skills tabs, less noise in `@agent-*` autocomplete, faster mental model of what's available. Cons: if the project's scope expands later, you'll have to re-enable items manually (one click each from the launcher's per-project Agents/Skills tabs). If you'd rather keep everything visible and triage on demand, that's also a valid choice — just say "keep all" and I'll skip this.
-
-3. **If the user says yes**, disable through the launcher's per-project Agents / Skills / Hooks tabs (NOT by deleting files). The toggle is what the harness reads: an agent or skill is MOVED to `.claude/agents.disabled/` (or `.claude/skills.disabled/`), a hook's entry is removed from `.claude/settings.json` and parked in the launcher DB. A bundle update skips any agent or skill found at a disabled location, and keeps out any hook the launcher on THIS machine has parked, so the choice survives updates; a deleted file is simply re-added by the next bundle update. A hook's disabled state lives in that machine's launcher DB, so it does not travel with a copied or cloned project. (Details under "Good behaviour", rule 2.)
-
-4. **Decide which to disable** by reading: the user's project description, `.claude/CONTEXT_STATE.md` (if present), the agent/skill `description:` frontmatter (one-line summary of what each does), and your judgement. Bias toward keeping a small core (planner, coder, tester, doc-extractor, kg-navigator) + everything that maps to the user's stack/goal. When unsure about a borderline item, default to ENABLED — the user can always disable later from the launcher.
-
-5. **After the scoping pass (or if the user declines), remove this block** so it doesn't nag every future session:
-   ```bash
-   python .claude/scripts/cleanup-setup-sections.py
-   ```
-   The script strips ALL `BEGIN: SETUP-ONLY` blocks at once (this one plus the "First-Run Setup" and "Verifying Installation" blocks), which have all served their purpose by the time the scoping pass is done.
-
-A project's actual domain rarely needs the full agent/skill catalog. Scoping off-topic items at project-start is a one-time cleanup that keeps every future session's mental model focused; the nudge makes it a deliberate first-session choice rather than housekeeping that never happens.
+1. Offer the choice (AskUserQuestion if available): VCO registered its whole catalogue of agents, skills and hooks
+   here, and much of it is likely off-topic for this user's work. Scoping disables what does not apply, for a cleaner
+   catalogue and less listing noise; anything disabled can be re-enabled with one click later. "Keep all" is a valid
+   answer.
+2. If they agree, choose from their description, `.claude/CONTEXT_STATE.md` and each item's `description:`
+   frontmatter. Keep a small core (planner, coder, tester, kg-navigator) plus whatever fits their stack; keep
+   borderline items enabled.
+3. Disable through the launcher's per-project Agents / Skills / Hooks tabs. They move agents and skills to
+   `.claude/agents.disabled/` / `.claude/skills.disabled/` and park hook entries in the launcher DB, which updates
+   respect; a deleted file would simply come back on the next update.
+4. When done, or if they decline, run `python .claude/scripts/cleanup-setup-sections.py`. It removes every SETUP-ONLY
+   block (this one and the "First-Run Setup" and "Verifying Installation" blocks) and records an acknowledgement, so
+   the removal survives future updates.
 <!-- END: SETUP-ONLY -->
 
 # VibeCoded Orchestrator — Project Instructions
@@ -208,29 +205,7 @@ For questions about this project's state, decisions, patterns, or architecture, 
 - Quick analysis or rewrite of content already in context → Claude directly
 - Still unsure → `hybrid_search` (most comprehensive)
 
-**Tool signatures and options:**
-- `hybrid_search(query, limit, node_type, tags, days, detail)` — keyword+semantic, auto-scoped (~1–2 s).
-  - `detail` (default `"auto"`) — score-driven verbosity. Five tiers (calibrated against a canonical eval set; see `knowledge/concepts/score-driven-retrieval-tiers.md`):
-    - `score < 0.42` → discarded (noise)
-    - `0.42..0.55` → `summary` (LLM description from sidecar, ~6 lines)
-    - `0.55..0.65` → `single_chunk` (matched chunk, ~2000 chars)
-    - `0.65..0.75` → `three_chunks` (matched + neighbours, 3 chunks)
-    - `>= 0.75` → `full` (whole node, up to 7 nearest chunks)
-    Auto-mode varies tier per result based on score → most relevant nodes get richer detail, marginal nodes only get a summary. Token savings ~50% vs uniform `full`.
-    Explicit overrides (`titles`, `summary`, `single_chunk`, `three_chunks`, `full`) apply uniformly to every result. Tier thresholds are tunable via `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` env vars.
-  - Each result carries `score` (0..1) and `tier` (the verbosity actually applied).
-- `semantic_graph_search(query, depth, detail)` — GraphRAG with WikiLink traversal (~1–2 s). Same `detail="auto"` tiering on primary results; connected nodes always render at `summary` tier (graph topology, not score, drove their selection).
-- `store_knowledge_node(..., scope)` — write a node; `scope="project"` (default) or `scope="shared"` (writes into the shared `VibeCodedOrchestrator_KnowledgeGraph` collection — visible to every other project).
-- `search_code_graph(query, scope, limit, expand_hops, detail)` — find code by purpose/concept (~200–500 ms).
-  - `scope`: `"all"` (default), `"code"` (functions/classes/modules), `"interaction"` (APIs/cross-service calls).
-  - `expand_hops`: 0 (default) | 1 | 2 — follow call/interaction edges after seed retrieval.
-  - `detail` (default `"auto"`): `auto` gives top-4 full details + rest as metadata refs; `titles` returns metadata refs for all; `full` returns full details for all.
-- `query_code_structure(query_type, target, project)` — structural queries (~50–100 ms).
-  - Types: `dependencies` | `imports` | `callers` | `methods` | `extends` | `interactions` | `path` | `composes` | `composed_by` | `type_users`.
-  - `path`: target format `"source.func->dest.func"` (BFS up to depth 6).
-  - `composes` / `composed_by`: composition relationships between classes.
-  - `type_users`: functions using a given type in annotations.
-- CLI equivalents: `.claude/scripts/kg-search search "term" [--type TYPE] [--tags TAGS]`, `.claude/scripts/kg-info info|connections "Node Title"`, `.claude/scripts/code-graph-query search "auth middleware"`.
+**Retrieval verbosity**: the KG and code-graph search tools expose a score-driven `detail` parameter (five tiers, `auto` by default). The tier thresholds are tunables: `KG_TIER_MIN` / `KG_TIER_SINGLE_CHUNK` / `KG_TIER_THREE_CHUNKS` / `KG_TIER_FULL` for KG, `CODE_TIER_*` for the code graph. Calibration notes: `knowledge/concepts/score-driven-retrieval-tiers.md`. Tool signatures, parameters and defaults arrive with the tools themselves — the MCP tool schemas are the source of truth, not this file.
 
 **If you retrieve knowledge that's clearly outdated, bring it up to date immediately** — don't act on stale information and don't defer the fix. Memory entries, KG nodes, reference docs, and instruction files (CLAUDE.md, MEMORY.md, etc.) are point-in-time snapshots; they drift as the codebase evolves. When you spot drift (a memory cites a guard hook that doesn't exist, a KG node names a project that's been renamed, a CLAUDE.md instruction references a subsystem that's been replaced), fix the source-of-truth document in the same turn you discovered the drift, before continuing the original task. The cost of a 60-second fix is far less than the cost of every future agent re-deriving the same outdated conclusion.
 
@@ -392,11 +367,16 @@ The installer registers the bundled MCP servers in `~/.claude.json`; `claude mcp
   - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API).
   - Tools: `search_papers` only.
 - **playwright** — browser automation. **Enabled by default**, invoked via `npx -y @playwright/mcp@latest`; install.py pre-caches the browsers (opt out with `VCT_SKIP_PLAYWRIGHT=1`). Being registered as the bare command `npx`, it can only spawn where `npx` actually resolves — with no Node.js installed, Claude Code reports just "Failed to connect". The doctor phase at the end of every install/update probes for it and defers `npx_missing_mcp_unspawnable`; run `vco doctor` (or `python -m vco_lib.npx_resolver --json`) to check.
+
+{{#if_module_active diagrams}}
 - **mermaid** / **excalidraw** — diagram describe/extract. **Registered but default-disabled per project**; `claude mcp list` shows them Connected, but their tools are not callable until you opt in via the launcher's Diagrams tab.
+{{/if_module_active}}
 
 The code-embedding FastAPI service is backend infrastructure, not an MCP.
 
-**Free-tier RL gate** — retrieval reranking skips RL when `feature_enabled("rl_retrieval") == False`. Pro/MAO licenses unlock RL; free-tier users get plain Weaviate cosine ordering. Nothing breaks when the gate is closed — retrieval just falls back to base scores.
+{{#if_module_active rl_retrieval}}
+**RL retrieval reranking is active for this project** (license-gated: `feature_enabled("rl_retrieval")`). Retrieval results are reranked by the trained model before they reach you, and its training logs are collected even when you do not use the feature. If retrieval ever falls back to plain cosine ordering, the license gate closed — say so rather than working around it.
+{{/if_module_active}}
 
 ### Hook System
 Located in `.claude/hooks/` — automated workflow actions. On Windows the bash hooks need WSL2 to fire automatically (the `.ps1` siblings are the native-Windows code path). The list below is a representative subset by event; `ls .claude/hooks/*.sh` enumerates the full set and `.claude/settings.json` shows the event and matcher each hook is registered with. Two ship **unregistered and uninvoked**, kept for users who want to wire them themselves: `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh` (which mirrors its resolution logic and calls the analyzer itself rather than calling the hook). Neither is dead code; both run standalone.
@@ -581,6 +561,7 @@ Output: Where to save
 
 **File Operations**: check before reading (Grep first), use `offset`/`limit` for large files, trust writes (no re-reads), spawn agents for multi-file ops (cap at 3 parallel editors per shared tree).
 
+{{#if_module_active lean_ctx}}
 **Lean-ctx Bash compression**: when the per-project PreToolUse hook `.claude/hooks/lean-ctx-rewrite.sh` (Windows: `lean-ctx-rewrite.ps1`) finds a `lean-ctx` binary — on PATH, or in the candidate paths it probes (`~/.cargo/bin`, `~/.local/bin`, `/usr/local/bin`, `/usr/bin`, the Homebrew prefixes) — it rewrites every `Bash(<cmd>)` tool call to `lean-ctx -c '<cmd>'`. Result: Claude sees output compressed ~90–97% (boilerplate, progress bars, redundant lines stripped) without losing behaviour. When no binary is found, the hook is a graceful no-op and Bash output is raw.
 
 **Three-tier bypass hierarchy** — pick the right one for what you want:
@@ -607,6 +588,7 @@ git show origin/main:path/to/file > /tmp/x.txt && wc -l /tmp/x.txt   # then read
 ```
 
 lean-ctx >= 3.8.18 adds `tee_mode="highcompression"` upstream as a remedy; recommend the upgrade where it matters, but do not depend on it — the hooks must stay correct on the older binaries that ship today.
+{{/if_module_active}}
 
 ---
 
@@ -615,7 +597,7 @@ lean-ctx >= 3.8.18 adds `tee_mode="highcompression"` upstream as a remedy; recom
 Two distinct "update" actions live in the launcher:
 
 - **Update orchestrator** (Settings → Updates) — refreshes the orchestrator clone itself (the global venv, bundled hooks/MCP servers, the templates folder, the launcher and hub binaries). Stops the detached `vct-hub` before the update so the binary swap isn't blocked on Windows, then restarts it and the launcher.
-- **Update bundle** (per-project Settings page → "Update bundle" button; the Projects page's "⟳ Update all" button runs it on every registered project) — propagates newly-shipped orchestrator files to an existing user project. CLI equivalent: `'{{VENV_PYTHON}}' -m vco_lib.project_init install-bundle --folder <project> --orchestrator-root '{{ORCHESTRATOR_ROOT}}' --update`.
+- **Update bundle** (per-project Settings page → "Update bundle" button; the Projects page's "⟳ Update all" button runs it on every registered project) — propagates newly-shipped orchestrator files to an existing user project. The orchestrator root is skipped by ⟳ Update all when its bundle is already current — the per-project Settings page's Update bundle always runs. CLI equivalent: `'{{VENV_PYTHON}}' -m vco_lib.project_init install-bundle --folder <project> --orchestrator-root '{{ORCHESTRATOR_ROOT}}' --update`.
 
 The "Update bundle" path is manifest-driven via `<project>/.claude/.vco-manifest.json`:
 - New shipped file → created in the project.

@@ -949,23 +949,44 @@ def compose_command(
 ) -> Optional[tuple[list[str], str]]:
     """The compose invocation for ``runtime``: ``(argv_prefix, form)``.
 
-    ONE order (this is the only home — the Rust surfaces get the form from
-    the decide verdict's ``compose_form``; the Rust probe was retired in
-    v0.2.97 R12):
-      1. subcommand — ``<runtime> compose version`` exits 0
-         (Podman 4.x+ / Docker 20.10+; Podman delegates to an external
-         provider, which is fine — it is what the user has).
-      2. standalone — ``<runtime>-compose`` on PATH, or in ``~/.local/bin``
-         (pip-installed ``podman-compose`` lives there and a graphical
-         launcher's PATH may not include it).
+    ONE order per runtime (this is the only home — the Rust surfaces get
+    the form from the decide verdict's ``compose_form``; the Rust probe
+    was retired in v0.2.97 R12). v0.2.101 (plan item 1) split the order by
+    runtime: a delegating ``podman compose`` picks its provider at RUN time
+    (``docker-compose`` before ``podman-compose`` on ``$PATH``) and an
+    external docker-compose silently DROPS the CDI ``devices:`` spec the
+    GPU overlay needs — the 2026-09-29 incident — so on podman the
+    deterministic standalone tool wins:
+
+      * podman — 1. standalone ``podman-compose`` on PATH, or in
+        ``~/.local/bin`` (pip installs land there and a graphical
+        launcher's PATH may not include it); 2. subcommand ``podman
+        compose`` (whatever provider podman delegates to — install step 5
+        then verifies the GPU actually reached the container and defers
+        loudly when it did not, :mod:`vco_lib.gpu_verify`).
+      * docker — 1. subcommand ``docker compose`` (the plugin IS the
+        implementation); 2. standalone ``docker-compose``.
+
     ``None`` when neither exists — the caller decides whether that is
     fatal (the stack cannot come up) or a skip (a probe-only hook).
     """
     _which = which or _tsd.which
     _run = run or _tsd.run
+    standalone = f"{runtime}-compose"
+    if runtime == "podman":
+        # Standalone FIRST: one deterministic, CDI-capable tool per podman
+        # host (the wrapper's detect_runtime already prefers it — this
+        # aligns every surface on the same tool).
+        if _which(standalone):
+            return [standalone], "standalone"
+        user_local = (home or Path.home()) / ".local" / "bin" / standalone
+        if user_local.is_file():
+            return [str(user_local)], "standalone"
+        if _probe([runtime, "compose", "version"], COMPOSE_PROBE_TIMEOUT_S, _run):
+            return [runtime, "compose"], "subcommand"
+        return None
     if _probe([runtime, "compose", "version"], COMPOSE_PROBE_TIMEOUT_S, _run):
         return [runtime, "compose"], "subcommand"
-    standalone = f"{runtime}-compose"
     if _which(standalone):
         return [standalone], "standalone"
     user_local = (home or Path.home()) / ".local" / "bin" / standalone

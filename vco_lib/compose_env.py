@@ -299,26 +299,33 @@ def service_key_values(
     notes for keys it could not decide.
 
     A service with NO row states nothing, because the absence of a row is
-    not a statement. Port keys and data knobs come from ``vco_managed`` rows
-    only; a data knob only when the row carries an observed mount. A row
-    without a mount states NO knob — this function never states one absent
-    — and :func:`write_service_keys` then KEEPS the knob the file already
-    carries (in its block or outside it): a missing mount never re-points
-    the service at compose's default (possibly empty) volume (v0.2.100
-    W2R-01; the v0.2.98 knob loss). ``CODE_EMBED_OLLAMA_URL`` is stated
-    when the Ollama row is NOT ``vco_managed``; *runtime* picks the host
-    alias for an adopted Ollama on this machine (``podman``/``docker``)."""
+    not a statement. PORT keys come from ``vco_managed`` rows only. A DATA
+    knob comes from ANY row that carries an observed mount, whatever its
+    mode: the mount is a fact about the data location, not about who owns
+    the container, and compose substitutes ``${VCT_*_DATA_SOURCE:-<empty
+    volume>}`` for ANY recreate — install step 5 and the deferral's printed
+    command both. On a real machine Ollama is often ``adopted_container``
+    (item 2: gating the knob on ``vco_managed`` pointed such a recreate at
+    the empty named volume). A row without a mount states NO knob — this
+    function never states one absent — and :func:`write_service_keys` then
+    KEEPS the knob the file already carries (in its block or outside it): a
+    missing mount never re-points the service at compose's default
+    (possibly empty) volume (v0.2.100 W2R-01; the v0.2.98 knob loss).
+    ``CODE_EMBED_OLLAMA_URL`` is stated when the Ollama row is NOT
+    ``vco_managed``; *runtime* picks the host alias for an adopted Ollama
+    on this machine (``podman``/``docker``)."""
     from vco_lib.service_endpoints import render_grpc_port, render_url  # noqa: PLC0415
 
     values: dict[str, str] = {}
     notes: list[str] = []
     for service, port_key in SERVICE_PORT_KEYS.items():
         row = rows.get(service)
-        if row is None or row.mode != "vco_managed":
+        if row is None:
             continue
-        values[port_key] = str(int(row.port))
-        if service == "weaviate":
-            values[WEAVIATE_GRPC_PORT_KEY] = str(render_grpc_port(row))
+        if row.mode == "vco_managed":
+            values[port_key] = str(int(row.port))
+            if service == "weaviate":
+                values[WEAVIATE_GRPC_PORT_KEY] = str(render_grpc_port(row))
         mount = row.data_mount
         if mount:
             source_key, volume_key = DATA_KNOBS[service]
@@ -386,9 +393,9 @@ def write_service_keys(
     not a statement that it is absent:
 
     * a DATA KNOB (:data:`DATA_KNOBS`) whose service's row states neither
-      half of the pair — no row, a row without a recorded mount, a row that
-      is not ``vco_managed``. A data knob leaves the block only when the row
-      states the other half (a bind replaces a volume name and vice versa).
+      half of the pair — no row, or a row (of any mode) that records no
+      mount. A data knob leaves the block only when the row states the other
+      half (a bind replaces a volume name and vice versa).
       Dropping it would make the next compose run recreate the service onto
       its default volume — v0.2.100 W2R-01: a batch that projected service
       B from a map still holding A's NULL row erased A's just-recorded knob;

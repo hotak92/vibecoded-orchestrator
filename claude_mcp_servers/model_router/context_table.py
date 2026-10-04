@@ -172,6 +172,23 @@ class ModelContext:
     window_1m: bool
     source: str
     source_note: str = ""
+    #: v0.2.101 (parity gap 7): True when the vendor's docs say this model
+    #: takes TEXT-ONLY input — it cannot see an image block. A request routed
+    #: to a flagged model that carries ``type == "image"`` blocks has each one
+    #: replaced by a short text note (guarded, with an access-line record) so
+    #: the model is told an image was omitted instead of silently ignoring it
+    #: and answering as though nothing were attached — the silent degrade the
+    #: live ``zai-image.body`` capture shows (glm-5.3: "I cannot see images
+    #: from URLs"). It is a property of the MODEL, not the endpoint, so the
+    #: one ``glm-5.3`` row answers for both the z.ai and the qwen route that
+    #: serve it (the same vendor-blind ruling ``lookup`` already makes for the
+    #: shared window). Defaults False — the conservative direction: an
+    #: unflagged model keeps its image blocks exactly as the client sent them,
+    #: which is today's behaviour, so a model nobody has verified as text-only
+    #: is never stripped. Set ONLY on positive doc evidence (see the seed's
+    #: per-row ``source``); a vision-capable model wrongly flagged would drop
+    #: images it could have used.
+    text_only: bool = False
     #: v0.2.100 (F-W1-19): per-VENDOR figures for a model that more than one
     #: vendor serves at DIFFERENT windows (``vendor_id -> ModelContext``, each
     #: cited). The row's own figures stay the model's; a vendor that caps it
@@ -515,6 +532,7 @@ def _parse(
             window_1m=bool(raw.get("window_1m")),
             source=source,
             source_note=str(raw.get("source_note") or ""),
+            text_only=bool(raw.get("text_only")),
             vendor_overrides=overrides,
         )
     return rows, tuple(uncited), tombstones
@@ -558,6 +576,7 @@ def _parse_override(
         window_1m=bool(raw.get("window_1m")),
         source=source,
         source_note=str(raw.get("source_note") or ""),
+        text_only=bool(raw.get("text_only")),
     )
 
 

@@ -64,7 +64,15 @@ pub(crate) fn installer_step_to_user_label(step: &str, detail: &str) -> String {
         ("6", "") => "Waiting for Ollama to be ready…".to_string(),
         ("7", "") => "Pulling embedding models from Ollama…".to_string(),
         ("7", "b") => "Configuring Ollama (this can take a minute)…".to_string(),
-        ("7", "c") => "Seeding Weaviate KG (this can take a few minutes)…".to_string(),
+        // v0.2.101: the KG seed is DETACHED — install.py only enqueues it
+        // and returns within seconds, and the owed work surfaces through
+        // the deferral ledger rows this step emits (kg_sync_*_pending),
+        // whose remedy names the background seed log. The label says the
+        // seed continues in the background; a duration promise would
+        // describe the pre-detach block this step no longer performs.
+        ("7", "c") => {
+            "Seeding Weaviate KG (continues in the background)…".to_string()
+        }
         ("7", "d") => "Running schema migrations…".to_string(),
         ("7", "e") => "Self-healing KG bindings…".to_string(),
         ("8", "") => "Deploying vct-hub binary…".to_string(),

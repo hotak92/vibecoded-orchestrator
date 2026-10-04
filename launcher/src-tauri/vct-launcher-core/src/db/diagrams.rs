@@ -547,6 +547,35 @@ impl Db {
         Ok(())
     }
 
+    /// Delete a project's EXPLICIT module-flag row (v0.2.101, G1 follow-up).
+    ///
+    /// The inverse of [`set_project_module_enabled`]: with no row, the
+    /// module falls back to its default resolution — for `model_gateway`
+    /// the machine gateway signal
+    /// (`vco_lib.module_gated_delivery.gateway_agents_gate`), the same
+    /// "follows the machine" state the CLAUDE.md render already gives a
+    /// row-less project. Until this existed, a project the user had ever
+    /// toggled could never return to that state.
+    ///
+    /// `Ok(false)` when no row existed — an absent row is not an error
+    /// (same rule as `delete_chat_model_context`), and a double-click on
+    /// "Follow this machine" must not look like a failure.
+    pub fn clear_project_module(
+        &self,
+        project_id: &str,
+        module_name: &str,
+    ) -> Result<bool, String> {
+        let guard = self.lock();
+        let affected = guard
+            .execute(
+                "DELETE FROM project_modules
+                 WHERE project_id = ?1 AND module_name = ?2",
+                params![project_id, module_name],
+            )
+            .map_err(|e| format!("clear_project_module: {}", e))?;
+        Ok(affected > 0)
+    }
+
     /// List every module-flag row for a project. Used by the launcher's
     /// per-project "Modules" tab and by the CLAUDE.md conditional-block
     /// renderer when it needs all flags in one round trip.
@@ -920,6 +949,31 @@ mod tests {
         // Re-enable it (UPSERT path).
         db.set_project_module_enabled("p1", "diagrams", true).unwrap();
         assert!(db.is_module_active("p1", "diagrams").unwrap());
+    }
+
+    // ─── clear_project_module (v0.2.101, G1 follow-up) ──────────────────
+
+    #[test]
+    fn clear_project_module_deletes_only_the_named_row_and_reports_absence() {
+        let db = make_db_with_project("p1", "Acme");
+        db.set_project_module_enabled("p1", "model_gateway", false).unwrap();
+        db.set_project_module_enabled("p1", "diagrams", true).unwrap();
+
+        // ACT: the explicit choice goes away — the module's default
+        // resolution takes over again ("follows the machine").
+        assert!(db.clear_project_module("p1", "model_gateway").unwrap());
+        let modules = db.list_project_modules("p1").unwrap();
+        assert_eq!(
+            modules.iter().map(|m| m.module_name.as_str()).collect::<Vec<_>>(),
+            vec!["diagrams"],
+            "only the named (project, module) row is deleted"
+        );
+
+        // LEAVE-ALONE: clearing a row that is not there is Ok(false), not
+        // an error — and it still touches nothing else.
+        assert!(!db.clear_project_module("p1", "model_gateway").unwrap());
+        assert!(!db.clear_project_module("p-other", "diagrams").unwrap());
+        assert_eq!(db.list_project_modules("p1").unwrap().len(), 1);
     }
 
     #[test]

@@ -71,6 +71,15 @@ CLEANUP_SCRIPT_REL = Path(".claude") / "scripts" / "cleanup-setup-sections.py"
 BEGIN_RE = re.compile(r"<!--\s*BEGIN:\s*SETUP-ONLY[^>]*-->")
 END_RE = re.compile(r"<!--\s*END:\s*SETUP-ONLY[^>]*-->")
 
+#: The template/label pairs :func:`build_entry` names in the reminder, one per
+#: render path (v0.2.101 12a: the lifecycle serves BOTH the orchestrator root
+#: and user projects; the defaults are the root's, the project render path in
+#: ``vco_lib.project_templates`` passes the ``PROJECT_*`` pair).
+ROOT_TEMPLATE_NAME = "templates/ORCHESTRATOR-CLAUDE.md.template"
+ROOT_LABEL = "the orchestrator root"
+PROJECT_TEMPLATE_NAME = "templates/CLAUDE.md.template"
+PROJECT_ROOT_LABEL = "this project's root"
+
 
 @dataclass(frozen=True)
 class SetupBlock:
@@ -263,6 +272,36 @@ def pending_blocks(
     return tuple(b for b in find_blocks(text) if b.sha256 not in acknowledged)
 
 
+def apply_to_render(
+    folder: Path, rendered_text: str
+) -> tuple[str, Optional[tuple[SetupBlock, ...]]]:
+    """The renderer-side lifecycle step — ONE home for BOTH render paths.
+
+    Strips every block whose content hash is acknowledged (so a removal the
+    cleanup script recorded survives the re-render) and reports the blocks
+    that remain (the caller feeds them to :func:`emit_pending_deferral` after
+    the write). ``vco_lib.rendered_root_files.render_entry`` (the orchestrator
+    root) and ``vco_lib.project_templates`` (a project's CLAUDE.md, v0.2.101
+    12a) both call this instead of inlining the sequence, so the two paths can
+    never drift in how an acknowledgement is honoured.
+
+    Returns ``(text, pending)``. ``pending`` is ``None`` ONLY when the markers
+    are malformed (the text is then returned exactly as it came in and the
+    caller must leave the ledger alone — a partial strip of a malformed
+    document is the silent-data-loss shape this module exists to prevent);
+    ``()`` means the render carries no unacknowledged block, which is what
+    clears the deferral row.
+    """
+    try:
+        acknowledged = acknowledged_hashes(folder)
+        text, _stripped = strip_blocks(
+            rendered_text, lambda b: b.sha256 in acknowledged
+        )
+        return text, find_blocks(text)
+    except (OSError, ValueError):
+        return rendered_text, None
+
+
 def pending_rendered_blocks(folder: Path) -> Optional[tuple[SetupBlock, ...]]:
     """The clear-probe predicate: unacknowledged SETUP-ONLY blocks in the
     folder's rendered ``CLAUDE.md``.
@@ -289,13 +328,26 @@ def pending_rendered_blocks(folder: Path) -> Optional[tuple[SetupBlock, ...]]:
 # The deferral row
 # ---------------------------------------------------------------------------
 
-def build_entry(folder: Path, blocks: tuple[SetupBlock, ...]) -> "DeferralEntry":
+def build_entry(
+    folder: Path,
+    blocks: tuple[SetupBlock, ...],
+    *,
+    template_name: str = ROOT_TEMPLATE_NAME,
+    root_label: str = ROOT_LABEL,
+) -> "DeferralEntry":
     """Build the ``first_run_setup_pending`` :class:`DeferralEntry`.
 
     The prose is addressed to the reading agent ("For your Claude assistant"),
     which is the surface the ledger's human render reaches: act on each block,
     then run the cleanup script, which records the acknowledgement and clears
     this row.
+
+    ``template_name`` / ``root_label`` parametrise the two render paths the
+    lifecycle serves (v0.2.101 12a): the defaults describe the orchestrator
+    root; a project's CLAUDE.md render passes :data:`PROJECT_TEMPLATE_NAME`
+    and :data:`PROJECT_ROOT_LABEL`. The remedy command is the same at both —
+    the cleanup script resolves its target relative to its own location, so
+    ``cd <folder>`` + the relative script path works at either root.
     """
     from vco_lib.deferral_report import DeferralEntry
 
@@ -304,19 +356,19 @@ def build_entry(folder: Path, blocks: tuple[SetupBlock, ...]) -> "DeferralEntry"
     hashes = ", ".join(b.sha256[:12] for b in blocks)
     detected = (
         f"CLAUDE.md still contains {count} un-acknowledged SETUP-ONLY "
-        f"{plural} rendered from templates/ORCHESTRATOR-CLAUDE.md.template "
+        f"{plural} rendered from {template_name} "
         f"(content hash(es): {hashes})."
     )
     why = (
         "For your Claude assistant (read this before continuing the user's "
-        "task): these are first-run help sections — the project-scoping nudge, "
-        "the first-run setup steps, and the installation-verification "
-        f"checklist. Act on each {plural} (finish or decline it) and then run "
-        "the cleanup command below from the orchestrator root. That records an "
-        "acknowledgement keyed by each block's content hash, so the removed "
-        "blocks STAY removed across future updates, and this entry clears. A "
-        "block whose content changes in a later release renders again with a "
-        "new hash and re-arms this reminder."
+        "task): these are first-run help sections (the project-scoping nudge "
+        "and, on the orchestrator root, the first-run setup steps and the "
+        f"installation-verification checklist). Act on each {plural} (finish "
+        "or decline it) and then run the cleanup command below from "
+        f"{root_label}. That records an acknowledgement keyed by each block's "
+        "content hash, so the removed blocks STAY removed across future "
+        "updates, and this entry clears. A block whose content changes in a "
+        "later release renders again with a new hash and re-arms this reminder."
     )
     command = (
         f"cd {Path(folder)}\n"
@@ -332,7 +384,13 @@ def build_entry(folder: Path, blocks: tuple[SetupBlock, ...]) -> "DeferralEntry"
     )
 
 
-def emit_pending_deferral(folder: Path, blocks: tuple[SetupBlock, ...]) -> None:
+def emit_pending_deferral(
+    folder: Path,
+    blocks: tuple[SetupBlock, ...],
+    *,
+    template_name: str = ROOT_TEMPLATE_NAME,
+    root_label: str = ROOT_LABEL,
+) -> None:
     """Emit (or clear) ``first_run_setup_pending`` for ``folder``.
 
     ``blocks`` non-empty ⇒ the row is written (re-emission keeps the first
@@ -343,7 +401,14 @@ def emit_pending_deferral(folder: Path, blocks: tuple[SetupBlock, ...]) -> None:
     A no-op outside a MANAGED install root (see
     :func:`is_managed_install_root`): a tree that has not had the bundle
     installed has no cleanup script to run, so raising a "pending action"
-    there would name a command the user cannot run.
+    there would name a command the user cannot run. The gate holds for a user
+    project exactly as for the root — ``templates/scripts/**`` ships into
+    ``<project>/.claude/scripts/``, so a bundled project IS a managed install
+    root by the time its CLAUDE.md renders.
+
+    ``template_name`` / ``root_label`` name the render path in the row's
+    prose (see :func:`build_entry`); a project's CLAUDE.md render passes the
+    ``PROJECT_*`` pair.
     """
     from vco_lib.deferral_emit import emit_entries, resolve_conditions
     from vco_lib.deferral_report import DeferralReport
@@ -354,7 +419,12 @@ def emit_pending_deferral(folder: Path, blocks: tuple[SetupBlock, ...]) -> None:
         # bundle, no remedy to run, so no claim (and nothing to clear).
         return
     if blocks:
-        emit_entries(folder, (build_entry(folder, blocks),), keep_first_detected=True)
+        emit_entries(
+            folder,
+            (build_entry(folder, blocks, template_name=template_name,
+                         root_label=root_label),),
+            keep_first_detected=True,
+        )
         return
     try:
         present = DeferralReport.read(folder).has_condition(CONDITION_ID)

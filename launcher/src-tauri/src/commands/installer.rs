@@ -8857,18 +8857,28 @@ mod tests {
     // frozen 50% bar instead of the current sub-step).
 
     #[test]
-    fn test_step_label_seeding_weaviate_is_long_running_phase() {
-        // 7c/10 is the Weaviate KG seed step — the longest one in
-        // --update by far (minutes). User must see this label or
-        // they'll think the install hung at 50%.
+    fn test_step_label_seeding_weaviate_names_the_background_seed() {
+        // 7c/10 is the Weaviate KG seed step. Since v0.2.101 the seed is
+        // DETACHED: install.py only enqueues it and returns within seconds
+        // (vco_lib/install_weaviate.kg_seed_step), and the owed work is
+        // surfaced through the deferral ledger rows this step emits, whose
+        // remedy names the background seed log. The label must say the seed
+        // continues in the background — the pre-v0.2.101 "can take a few
+        // minutes" described a block this step no longer performs.
         let label = installer_step_to_user_label("7c/10", "all seed sub-steps completed");
         assert!(
             label.contains("Seeding Weaviate") || label.contains("KG"),
             "7c/10 must surface a Weaviate-seed-related label; got: {label}"
         );
         assert!(
-            label.contains("few minutes") || label.contains("minute"),
-            "long-running phases should warn the user about duration; got: {label}"
+            label.contains("background"),
+            "the seed is detached since v0.2.101; the label must say it \
+             continues in the background; got: {label}"
+        );
+        assert!(
+            !label.contains("minute"),
+            "the enqueue completes in seconds; a duration promise is stale; \
+             got: {label}"
         );
     }
 

@@ -49,6 +49,7 @@
     describeSupervision,
     describeUsageLedger,
     describeAgentDelivery,
+    describeRoutingGuidance,
     gatewayIsConfigured,
     gatewayPanelReady,
     getModelGatewayStatus,
@@ -56,8 +57,9 @@
     listVSCodeTargets,
     pointPanelAtGateway,
     pointPanelWarnings,
-    projectHasRoutingGuidance,
     resetPanelToNative,
+    clearProjectRoutingGuidance,
+    routingGuidance,
     setModelGatewayBoot,
     setProjectRoutingGuidance,
     startModelGateway,
@@ -70,7 +72,10 @@
     VSCodeTarget,
     VSCodeWriteResult,
   } from '$lib/types/model-gateway';
-  import type { GatewayAgentsGate } from '$lib/api/model_gateway';
+  import type {
+    GatewayAgentsGate,
+    RoutingGuidanceState,
+  } from '$lib/api/model_gateway';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
@@ -141,8 +146,10 @@
   let removeSlots = $state(false);
   const modelError = $derived(setDefaultModel ? defaultModelError(modelChoice) : '');
 
-  // Per-project CLAUDE.md routing-guidance flags, keyed by project id.
-  let guidance = $state<Record<string, boolean>>({});
+  // Per-project CLAUDE.md routing-guidance state, keyed by project id —
+  // the TRI-STATE the render follows (v0.2.101 G1): `null` = the Python
+  // gate could not be asked for that project.
+  let guidance = $state<Record<string, RoutingGuidanceState | null>>({});
 
   const gwLine = $derived(describeStatus(gw));
   // Two facts the status line deliberately does not fold in: who (if anyone)
@@ -257,24 +264,56 @@
   }
 
   async function loadGuidanceFlags() {
-    const next: Record<string, boolean> = {};
+    const next: Record<string, RoutingGuidanceState | null> = {};
     for (const p of $projects.projects) {
       try {
-        next[p.id] = await projectHasRoutingGuidance(p.id);
+        // The SAME gate the CLAUDE.md render follows (one home, Python —
+        // `model_gateway_routing_guidance` passes it through). Reading the
+        // `project_modules` row alone was the v0.2.101 G1 defect: no row is
+        // a tri-state ("follow the machine"), not "off".
+        next[p.id] = await routingGuidance(p.folder_path);
       } catch {
-        // A project whose row cannot be read is shown as off rather than
-        // guessed as on — the section it gates is advice about models, and
-        // showing it where it may not apply is the failure mode to avoid.
-        next[p.id] = false;
+        // Could not ask → `null`: the row renders its own "could not ask"
+        // line and the checkbox is disabled, rather than guessing a state
+        // the render may contradict.
+        next[p.id] = null;
       }
     }
     guidance = next;
   }
 
   async function toggleGuidance(projectId: string, enabled: boolean) {
+    const folder = $projects.projects.find((p) => p.id === projectId)?.folder_path;
     await gwAction(async () => {
       await setProjectRoutingGuidance(projectId, enabled);
-      guidance = { ...guidance, [projectId]: enabled };
+      if (folder) {
+        // Re-read the real verdict rather than synthesising one: the write
+        // re-rendered this project's CLAUDE.md, and the state below must
+        // say what that render actually did.
+        try {
+          guidance = { ...guidance, [projectId]: await routingGuidance(folder) };
+        } catch {
+          guidance = { ...guidance, [projectId]: null };
+        }
+      }
+      await refreshAgentsGate();
+    });
+  }
+
+  async function clearGuidance(projectId: string) {
+    // The way BACK to "follows the machine": delete the explicit row (the
+    // generic module clear), then re-read the verdict the same way a
+    // toggle does — the clear re-rendered the project's CLAUDE.md too.
+    const folder = $projects.projects.find((p) => p.id === projectId)?.folder_path;
+    await gwAction(async () => {
+      await clearProjectRoutingGuidance(projectId);
+      if (folder) {
+        try {
+          guidance = { ...guidance, [projectId]: await routingGuidance(folder) };
+        } catch {
+          guidance = { ...guidance, [projectId]: null };
+        }
+      }
       await refreshAgentsGate();
     });
   }
@@ -1026,10 +1065,13 @@
       <p class="muted small">
         Adds a model-routing section to a project's <code>CLAUDE.md</code> —
         which task classes to route to which model, and the rule that a model
-        name must never be silently re-pointed. Off by default and offered only
-        here, because a project on a machine with no gateway must not read
-        advice about models it cannot reach. Toggling re-renders only the
-        VCO-managed region of that file; anything you wrote around it is
+        name must never be silently re-pointed. A project with no explicit
+        choice here <strong>follows this machine</strong>: the section renders
+        whenever the gateway is set up here, and stays hidden when it is not —
+        a project on a machine with no gateway never reads advice about models
+        it cannot reach. Switching a project on or off writes that project's
+        explicit choice, which wins over the machine. Toggling re-renders only
+        the VCO-managed region of that file; anything you wrote around it is
         untouched.
       </p>
       <p class="muted small">
@@ -1043,16 +1085,32 @@
       </p>
       <ul class="gw-projects">
         {#each $projects.projects as p}
+          {@const g = guidance[p.id]}
           <li>
             <label class="gw-toggle">
               <input
                 type="checkbox"
-                checked={guidance[p.id] ?? false}
-                disabled={gwBusy}
+                checked={g?.mode === 'on'}
+                indeterminate={g?.mode === 'follows_machine'}
+                disabled={gwBusy || !g}
                 onchange={(e) => toggleGuidance(p.id, e.currentTarget.checked)}
               />
               {p.name}
             </label>
+            {#if g?.mode === 'follows_machine'}
+              <span class="muted small" data-testid="gw-guidance-follows">
+                {describeRoutingGuidance(g)}
+              </span>
+            {:else if g}
+              <button
+                class="secondary gw-follow-btn"
+                onclick={() => clearGuidance(p.id)}
+                disabled={gwBusy}
+                title="Delete this project's explicit choice — the machine decides again"
+              >Follow this machine</button>
+            {:else if !g}
+              <span class="muted small">Could not ask the gate for this project.</span>
+            {/if}
           </li>
         {/each}
       </ul>
@@ -1378,6 +1436,16 @@
     display: flex;
     flex-direction: column;
     gap: 0.25rem;
+  }
+  .gw-projects li {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  .gw-follow-btn {
+    font-size: 0.8rem;
+    padding: 0.15rem 0.6rem;
   }
   .tag {
     margin-left: 0.4rem;

@@ -35,7 +35,7 @@ from unittest import mock
 REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
-from vco_lib import code_embed_image, containers, data_identity, install_services_guard  # noqa: E402
+from vco_lib import code_embed_image, compose_provider, containers, data_identity, install_services_guard  # noqa: E402
 
 
 def _install_module():
@@ -217,7 +217,11 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
         recorded = {}
 
         def fake_run(cmd, **kwargs):
-            recorded["cmd"] = list(cmd)
+            # v0.2.101: the post-start GPU check's `inspect` probe also runs
+            # through this mock AFTER compose up — these tests pin the COMPOSE
+            # argv, so only that call is recorded.
+            if "compose" in cmd or "-f" in cmd:
+                recorded["cmd"] = list(cmd)
             return subprocess.CompletedProcess(cmd, rc, "", stderr)
 
         state = code_embed_image.ImageState(code_embed_image.STALE, "summary(stale)")
@@ -252,6 +256,16 @@ class StartServicesIdentityGuardTests(unittest.TestCase):
                                side_effect=lambda svc, runtime="podman": f"vco_{svc}"), \
              mock.patch.object(install._containers, "compose_identity_of", return_value=identity), \
              mock.patch.object(code_embed_image, "image_state", return_value=state), \
+             mock.patch.object(
+                 # v0.2.101: with no banner in the canned run output, step 5's
+                 # provider detection falls back to the REAL $PATH /
+                 # containers.conf — machine-dependent (a host with
+                 # docker-compose would emit the no-CDI-tool row here). Pin a
+                 # deterministic podman-compose provider instead.
+                 compose_provider, "detect",
+                 return_value=compose_provider.ComposeProvider(
+                     "standalone", compose_provider.ENGINE_PODMAN_COMPOSE,
+                     ("podman-compose",), "podman", "podman", "test pin")), \
              mock.patch.object(subprocess, "run", side_effect=fake_run):
             buf = io.StringIO()
             with contextlib.redirect_stdout(buf):

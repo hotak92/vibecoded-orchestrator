@@ -614,6 +614,44 @@ pub async fn set_project_module_enabled(
     Ok(())
 }
 
+/// Clear a project's EXPLICIT module choice — the way back to "follows the
+/// machine" (v0.2.101, G1 follow-up).
+///
+/// The inverse of [`set_project_module_enabled`], same shape: the row is
+/// deleted (nothing is remembered of the previous choice), then the same
+/// two side effects a flip triggers run, because a cleared row changes
+/// what the bundle DELIVERS exactly like a flip — with no row, the module
+/// falls back to its default resolution (for `model_gateway`, the machine
+/// gateway signal). `Ok(false)` when no row existed: the state is already
+/// the default one, so neither the re-render nor the bundle update has
+/// anything to do, and a double-click must not look like a failure.
+#[command]
+pub async fn clear_project_module(
+    project_id: String,
+    module_name: String,
+    db: State<'_, Db>,
+) -> Result<bool, String> {
+    let cleared = db.clear_project_module(&project_id, &module_name)?;
+    if !cleared {
+        return Ok(false);
+    }
+    db.audit(
+        "project_module_cleared",
+        Some(&project_id),
+        None,
+        &serde_json::json!({
+            "module": module_name,
+            "cleared": true,
+        }),
+    )?;
+    // Same reasoning as `set_project_module_enabled`: the CLAUDE.md
+    // conditional block and the bundle delivery both read the row (or its
+    // absence), so both must re-run. Soft-fail throughout.
+    spawn_re_render_claude_md(&db, &project_id);
+    schedule_bundle_update_for_project(&db, &project_id, spawn_bundle_update);
+    Ok(true)
+}
+
 /// Resolve `project_id`'s folder and hand it to `run`. Split from the spawn
 /// so the "a toggle triggers delivery" wiring is testable without a Tauri
 /// runtime. Soft-fail: an unknown project or a missing folder is logged and

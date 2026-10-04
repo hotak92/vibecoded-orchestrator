@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 import tomllib
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -342,15 +343,50 @@ class RenderOutcome:
 
 
 def _render_template_text(install_root: Path, entry: RenderedRootFile, text: str,
-                          context=None, *, db_path: Path | None = None):
-    """The registry pass for one entry (``vco_lib.materialize``). The table's
-    ``substitutions`` is the entry's ALLOWED set; a name it lists that the
-    registry does not know, or one the body uses that the table does not list,
-    is left in place and reported — never a silent pass, never a failed run.
-    ``context`` overrides the install's own (the completeness gate renders
-    under synthetic POSIX and Windows installs)."""
-    from vco_lib import materialize as _mz
+                          context=None, *, db_path: Path | None = None,
+                          active: frozenset[str] | None = None):
+    """The conditional pass + the registry pass for one entry.
 
+    v0.2.101 (12c): conditional sections FIRST (``project_init
+    .render_conditional_blocks``, the SAME primitive the project pipeline
+    uses — regions/conditionals before the registry pass is the layering both
+    pipelines share), then the registry pass (``vco_lib.materialize``). The
+    table's ``substitutions`` is the entry's ALLOWED set; a name it lists that
+    the registry does not know, or one the body uses that the table does not
+    list, is left in place and reported — never a silent pass, never a failed
+    run. ``context`` overrides the install's own (the completeness gate
+    renders under synthetic POSIX and Windows installs).
+
+    ``active`` is the conditional-pass feature set; ``None`` resolves it from
+    the install's real state via ``claude_md_sections.active_sections`` (one
+    home, shared with the project render paths). The completeness gate passes
+    explicit sets so it renders every template under both feature extremes.
+
+    Raises ``project_init.TemplateError`` on a malformed conditional tag —
+    see :func:`render_entry` for why the root path never swallows it."""
+    from vco_lib import materialize as _mz
+    from vco_lib import project_init as _pi
+
+    if active is None:
+        from vco_lib import claude_md_sections
+
+        try:
+            active = claude_md_sections.active_sections(
+                install_root, db_path=db_path,
+                needed=claude_md_sections.tagged_features(text))
+        except Exception as exc:  # noqa: BLE001 — this render must never crash
+            # The resolver guards every probe individually, so reaching this
+            # line is a defect; the conservative direction is the SAME one the
+            # probes take (a detection failure RENDERS the section): fall back
+            # to the full feature set with one stderr line.
+            try:
+                print(f"[vco] rendered-root-files: section resolver failed "
+                      f"({exc}); rendering every conditional section",
+                      file=sys.stderr, flush=True)
+            except Exception:  # noqa: BLE001 — a warning must never raise
+                pass
+            active = claude_md_sections.ALL_FEATURES
+    text = _pi.render_conditional_blocks(text, active_modules=set(active))
     ctx = _mz.LazyContext(context if context is not None
                           else _mz.MaterializeContext(install_root, install_root,
                                                       db_path=db_path))
@@ -371,6 +407,7 @@ def render_entry(install_root: Path, entry: RenderedRootFile, *,
     settled as deferral rows in ``install_root`` (a clean render clears them).
     """
     from vco_lib import materialize as _mz
+    from vco_lib.project_init import TemplateError
 
     template_path = install_root / Path(entry.template)
     target_path = install_root / Path(entry.path)
@@ -386,22 +423,28 @@ def render_entry(install_root: Path, entry: RenderedRootFile, *,
             db_path=db_path)
     except OSError as exc:
         return RenderOutcome(entry.path, "failed", f"FAILED ({exc})")
+    except TemplateError as exc:
+        # v0.2.101 (plan risk 4, decided): the ROOT path never ships raw
+        # conditional tags. The project bundle path historically swallows a
+        # malformed tag and ships it (its reference sidecar surfaces it); a
+        # malformed SHIPPED template on the root path is a release defect the
+        # completeness gate catches first, so here it fails the entry LOUDLY
+        # (the existing `failed` outcome: nothing is written, the installer
+        # warns) rather than silently leaking `{{#if_…}}` into the rendered
+        # CLAUDE.md every agent on this install reads.
+        return RenderOutcome(
+            entry.path, "failed",
+            f"FAILED (malformed conditional block in {entry.template}: {exc})")
     rendered = result.text
     # SETUP-ONLY blocks (v0.2.101): a block the user has acted on (its content
     # hash is acknowledged, see vco_lib.setup_sections) is OMITTED from the
     # render so the removal survives the re-render; an unacknowledged block
     # renders as before and is reported as pending, which re-arms the
     # `first_run_setup_pending` deferral row. `pending` is None only when the
-    # markers are malformed or the ack is unreadable — then the template is
-    # left exactly as it is and the row is left alone.
-    setup_pending: tuple[setup_sections.SetupBlock, ...] | None = None
-    try:
-        _acked = setup_sections.acknowledged_hashes(install_root)
-        rendered, _stripped = setup_sections.strip_blocks(
-            rendered, lambda b: b.sha256 in _acked)
-        setup_pending = setup_sections.find_blocks(rendered)
-    except (OSError, ValueError):
-        setup_pending = None
+    # markers are malformed — then the template is left exactly as it is and
+    # the row is left alone. ONE home for the sequence (shared with the
+    # project render path): vco_lib.setup_sections.apply_to_render.
+    rendered, setup_pending = setup_sections.apply_to_render(install_root, rendered)
     findings = dict(
         unrendered=tuple(f"{u.name}@{u.line}" for u in result.unresolved),
         missing_paths=tuple(f"{m.name}={m.value}" for m in result.missing_paths),

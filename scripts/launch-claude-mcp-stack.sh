@@ -860,6 +860,32 @@ print("" if p is None else
 }
 
 # ---------------------------------------------------------------------------
+# gpu_verify_after_up :: the POST-START GPU check (v0.2.101 plan items 1+5).
+# The GPU decision was made up here (gpu_mode, CDI wait); whether the device
+# actually reached the RUNNING container is verified by the ONE Python home,
+# vco_lib.gpu_verify — no shell mirror. A `missing` verdict writes the
+# compose_gpu_device_missing deferral row into the orchestrator root's
+# UPDATE_DEFERRED.md; `unknown` records nothing. Args: runtime binary,
+# reason ("overlay" = the GPU overlay was applied | "degraded" = the host
+# has an NVIDIA GPU but this wrapper composed CPU-only). MUST MATCH
+# Invoke-GpuVerify in launch-claude-mcp-stack.ps1. Never fails the boot.
+# ---------------------------------------------------------------------------
+gpu_verify_after_up() {
+    local rt="$1" reason="${2:-overlay}" out rc=0
+    [ -n "$STACK_PY" ] || return 0
+    local -a gv_args=(vco_lib.gpu_verify --runtime "$rt" --reason "$reason")
+    [ -n "${_VCT_OWN_ROOT:-}" ] && gv_args+=(--install-root "$_VCT_OWN_ROOT")
+    [ -n "${VCT_STACK_WORKING_DIR:-}" ] && gv_args+=(--infra-dir "$VCT_STACK_WORKING_DIR")
+    out="$(stack_py ${gv_args[@]+"${gv_args[@]}"} 2>&1)" || rc=$?
+    if [ -n "$out" ]; then
+        local line
+        while IFS= read -r line; do [ -n "$line" ] && log "$line"; done <<< "$out"
+    fi
+    [ "$rc" -eq 0 ] || log "WARNING: post-start GPU check exited rc=$rc (ignored)"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
 # guard_services :: clear SELECTED_SERVICES through the ONE guarded verb
 # (`python -m vco_lib.service_lifecycle up --guard-only`, v0.2.100 F-W2-14):
 # the data-identity guard runs for each service BEFORE this wrapper composes
@@ -954,10 +980,16 @@ main() {
     log "runtime=$runtime"
 
     local gpu_mode="cpu"
+    # gpu_expected: the HOST has an NVIDIA GPU, so a GPU in the container is
+    # owed even when the CDI wait degraded this boot to CPU-only compose —
+    # the post-start check (gpu_verify_after_up) turns that degrade into a
+    # deferral row instead of a bare log line (v0.2.101 plan item 1).
+    local gpu_expected=0 gpu_reason="overlay"
     case "$(uname -s)" in
         Linux)
             if has_nvidia; then
                 log "nvidia detected; checking CDI readiness"
+                gpu_expected=1
                 # Docker uses its own runtime hook for GPU — no CDI yaml
                 # required. Only podman blocks on /var/run/cdi/nvidia.yaml.
                 if [ "$runtime" = "docker" ]; then
@@ -970,6 +1002,7 @@ main() {
                     else
                         log "WARNING: CDI yaml not ready after ${VCT_STACK_CDI_TIMEOUT}s — degrading to CPU-only compose"
                         gpu_mode="cpu"
+                        gpu_reason="degraded"
                     fi
                 fi
             else
@@ -1079,6 +1112,13 @@ main() {
     $argv "${up_args[@]}"
     local rc=$?
     log "compose exited rc=$rc"
+    # v0.2.101 (plan items 1+5): on success, verify the GPU actually reached
+    # the running container (deferral row when it did not; nothing on
+    # uncertainty). The wrapper's CDI-timeout CPU degrade routes through the
+    # SAME verdict via gpu_reason=degraded.
+    if [ "$rc" -eq 0 ] && [ "$gpu_expected" = "1" ]; then
+        gpu_verify_after_up "$rt_bin" "$gpu_reason"
+    fi
     # v0.2.100 (L2-F08): the exit status is passed through as it is. Exit
     # 125 from podman-compose means "one or more containers failed to start"
     # (and, detached, a failed create can hide behind it) — mapping it to 0

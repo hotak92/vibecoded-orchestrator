@@ -42,6 +42,7 @@ from vco_lib import code_embed_image as _cei
 from vco_lib import compose_provider as _cp
 from vco_lib import compose_recovery as _cr
 from vco_lib import containers as _containers
+from vco_lib import gpu_verify as _gv
 from vco_lib import install_services_guard as _svc_guard
 from vco_lib.deferral_report import DeferralEntry
 
@@ -240,6 +241,49 @@ def _gpu_overlay_args(plan: Step5Plan, hooks: Step5Hooks,
     return ["-f", str(plan.infra_dir / name), "--profile", "gpu"]
 
 
+def _warn_no_cdi_compose_tool(plan: Step5Plan, provider: Optional[_cp.ComposeProvider],
+                              gpu_args: list[str]) -> None:
+    """Podman + GPU overlay + a docker-compose delegate: the overlay's CDI
+    ``devices:`` spec cannot reach the container (v0.2.101 plan item 1) — say
+    so with a ledger row instead of starting silently on CPU. The post-start
+    check below re-states it with container evidence once compose answered."""
+    if not gpu_args or plan.runtime != "podman":
+        return
+    if provider is None or provider.engine != _cp.ENGINE_DOCKER_COMPOSE:
+        return
+    print(f"  WARNING: the only compose tool here is {provider.engine} ({provider.evidence}); "
+          "it drops the GPU overlay's CDI device spec — the stack will start CPU-only.")
+    entry = _gv.deferral_entry(
+        _gv.GPUVerdict(
+            _gv.GPU_MISSING,
+            f"no CDI-capable compose tool: this podman host has only {provider.engine} "
+            f"({provider.evidence})"),
+        reason=_gv.REASON_NO_CDI_TOOL, runtime=plan.runtime, gpu_vendor=plan.gpu_vendor,
+        infra_dir=plan.infra_dir, rerun_cmd=_rerun_cmd(plan))
+    if entry is not None and plan.deferral_report is not None:
+        plan.deferral_report.add_entry(entry)
+
+
+def _gpu_post_start_check(plan: Step5Plan, hooks: Step5Hooks, gpu_args: list[str]) -> None:
+    """v0.2.101 (plan items 1 + 5): the GPU overlay was in the compose argv —
+    did the GPU reach the RUNNING container? Positive evidence only
+    (:mod:`vco_lib.gpu_verify`); ``unknown`` (probe could not tell) does
+    NOTHING — no row on uncertainty."""
+    if not gpu_args:
+        return
+    verdict = _gv.decide(True, _gv.probe(
+        plan.runtime, gpu_vendor=plan.gpu_vendor, run=hooks.run))
+    if verdict.kind != _gv.GPU_MISSING:
+        return
+    print(f"  WARNING: {verdict.detail}")
+    entry = _gv.deferral_entry(verdict, runtime=plan.runtime, gpu_vendor=plan.gpu_vendor,
+                               infra_dir=plan.infra_dir, rerun_cmd=_rerun_cmd(plan))
+    if entry is not None and plan.deferral_report is not None:
+        plan.deferral_report.add_entry(entry)
+        print("      A deferral entry has been written to UPDATE_DEFERRED.md with the "
+              "recovery recipe (recreate with a CDI-capable compose tool).")
+
+
 # ---------------------------------------------------------------------------
 # 3. compose up
 # ---------------------------------------------------------------------------
@@ -296,7 +340,9 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
     # (v0.2.96 WP-4): append the present override files.
     cmd.extend(_svc_guard.override_f_chain(plan.infra_dir))
     _ambiguity_check(plan, hooks, provider)
-    cmd.extend(_gpu_overlay_args(plan, hooks, provider))
+    gpu_args = _gpu_overlay_args(plan, hooks, provider)
+    cmd.extend(gpu_args)
+    _warn_no_cdi_compose_tool(plan, provider, gpu_args)
     if project:
         cmd.extend(["-p", project])
 
@@ -352,6 +398,7 @@ def compose_up_step(plan: Step5Plan, hooks: Step5Hooks) -> str:
             hooks.log_event("5/10", "heal", h.reason, data={"actions": h.actions})
         print("  OK")
         hooks.log_event("5/10", "ok", "compose up completed")
+        _gpu_post_start_check(plan, hooks, gpu_args)
         return OK
 
     # W1R-10: "Try starting manually" names the LAST argv (after a rejected

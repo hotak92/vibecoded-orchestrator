@@ -49,6 +49,7 @@ function makeRow(over: Partial<ChatModelContextRow> = {}): ChatModelContextRow {
     context_window: 1_000_000,
     max_output: 128_000,
     window_1m: true,
+    text_only: false,
     source: 'https://docs.z.ai/guides/llm/glm-5.2',
     source_note: '',
     user_edited: false,
@@ -86,6 +87,7 @@ function goodDraft(over: Partial<ChatModelContextDraft> = {}): ChatModelContextD
     context_window: '1000000',
     max_output: '128000',
     window_1m: true,
+    text_only: false,
     source: 'https://docs.z.ai/guides/llm/glm-5.2',
     source_note: '',
     ...over,
@@ -125,6 +127,7 @@ describe('command wire shapes', () => {
         context_window: 1_000_000,
         max_output: 128_000,
         window_1m: true,
+        text_only: false,
         source: 'https://docs.z.ai/guides/llm/glm-5.2',
         source_note: '',
       },
@@ -311,6 +314,7 @@ describe('draft helpers', () => {
       context_window: row.context_window,
       max_output: row.max_output,
       window_1m: row.window_1m,
+      text_only: row.text_only,
       source: row.source,
       source_note: row.source_note,
     });
@@ -356,5 +360,25 @@ describe('summaries', () => {
     // claim to have deleted the row twice.
     expect(describeDelete('glm-5.2', true)).toBe('Removed glm-5.2.');
     expect(describeDelete('glm-5.2', false)).toBe('glm-5.2 was already gone.');
+  });
+});
+
+describe('text_only — the image-capability flag (v0.2.101)', () => {
+  it('draftFromRow carries the flag, so an EDIT cannot silently drop it', () => {
+    const flagged = makeRow({ model_id: 'glm-5.3', text_only: true });
+    const draft = draftFromRow(flagged);
+    expect(draft.text_only).toBe(true);
+    // A draft that lost the flag would re-save the row as image-capable —
+    // the exact silent drop the pre-fix mirror performed on reseed.
+    const result = validateDraft(draft);
+    expect(result.ok).toBe(true);
+    if (!result.ok) return;
+    expect(result.input.text_only).toBe(true);
+  });
+
+  it('a fresh draft defaults to false (the gateway reader’s own default)', () => {
+    expect(emptyDraft().text_only).toBe(false);
+    const result = validateDraft(goodDraft());
+    expect(result.ok && result.input.text_only).toBe(false);
   });
 });

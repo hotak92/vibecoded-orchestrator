@@ -562,6 +562,7 @@ mod tests {
             context_window: 200_000,
             max_output: 128_000,
             window_1m: false,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/glm-5.1".into(),
             source_note: String::new(),
         }
@@ -1196,6 +1197,7 @@ mod tests {
                 context_window: 200_000,
                 max_output: 0,
                 window_1m: false,
+                text_only: false,
                 source: "https://docs.qwencloud.com/".into(),
                 source_note: String::new(),
             },

@@ -40,7 +40,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable, List, Optional, Tuple
 
+from vco_lib import claude_md_sections
 from vco_lib import project_init as _pi
+from vco_lib import setup_sections
 from vco_lib.template_divergence import (
     meaningfully_differs,
     normalise_for_diff,
@@ -108,6 +110,22 @@ def render_project_template(
     elif not result.clean:
         _mz.warn(label, result)
     return result.text
+
+
+def _emit_setup_deferral(
+    folder: Path, pending: Tuple[setup_sections.SetupBlock, ...],
+) -> None:
+    """Emit/clear ``first_run_setup_pending`` for a PROJECT render (v0.2.101
+    12a) — the project pair of the root path's default call in
+    ``rendered_root_files.render_entry``. Self-gates on
+    ``setup_sections.is_managed_install_root`` (a project the bundle has
+    installed into always is — ``templates/scripts/**`` ships the cleanup
+    script the row's remedy names). Best-effort: soft-fails internally."""
+    setup_sections.emit_pending_deferral(
+        folder, pending,
+        template_name=setup_sections.PROJECT_TEMPLATE_NAME,
+        root_label=setup_sections.PROJECT_ROOT_LABEL,
+    )
 
 
 def install_project_level_templates(
@@ -198,18 +216,20 @@ def install_project_level_templates(
             raw = src.read_bytes()
         except OSError:
             continue
+        raw_text = raw.decode("utf-8", errors="replace")
         # Phase 1.5.B: conditional sections, then the registry pass — both in
-        # `_render_project_template`, the ONE pipeline `render_claude_md` also
-        # uses. The project folder is the module resolver's project_id (Phase
-        # 1.1's launcher DB keys on the sanitised folder path).
-        try:
-            active = _pi.resolve_active_modules(str(folder))
-        except Exception:
-            # Defensive: any unexpected resolver failure falls back to
-            # defaults so install never breaks.
-            active = set(_pi._DEFAULT_ACTIVE_MODULES)
+        # `render_project_template`, the ONE pipeline `render_claude_md` also
+        # uses. v0.2.101 (plan D4): the active set comes from
+        # `claude_md_sections.active_sections` (the ONE resolver both render
+        # paths share), which resolves the folder to its launcher.db UUID
+        # internally — the call this replaced passed `str(folder)` to a
+        # resolver keyed on the UUID, so explicit `project_modules` rows
+        # never reached the bundle-path render. It never raises (every probe
+        # soft-fails to RENDER), so no defensive fallback is needed.
+        active = claude_md_sections.active_sections(
+            folder, needed=claude_md_sections.tagged_features(raw_text))
         substituted = render_project_template(
-            raw.decode("utf-8", errors="replace"),
+            raw_text,
             label=str(live_rel),
             folder=folder,
             orchestrator_root=orchestrator_root,
@@ -219,8 +239,21 @@ def install_project_level_templates(
             swallow_template_error=True,
         ).encode("utf-8")
 
+        # SETUP-ONLY blocks (v0.2.101 12a): the project CLAUDE.md carries the
+        # scoping nudge inside its managed region, so the project render path
+        # honours the SAME acknowledgement lifecycle as the root (one home:
+        # `setup_sections.apply_to_render`). The strip feeds the live write,
+        # the reference sidecar AND the reconcile comparison below, so an
+        # acknowledged removal survives the update byte-identically and is
+        # never mistaken for a user edit. Only the CLAUDE.md arm — the other
+        # two templates carry no SETUP-ONLY blocks.
+        setup_pending: Optional[Tuple[setup_sections.SetupBlock, ...]] = None
+        if live_rel == Path("CLAUDE.md"):
+            _text, setup_pending = setup_sections.apply_to_render(
+                folder, substituted.decode("utf-8", errors="replace"))
+            substituted = _text.encode("utf-8")
+
         live_target = folder / live_rel
-        raw_text = raw.decode("utf-8", errors="replace")
         if not live_target.exists():
             # Missing project-level file → install the stub.
             # For CLAUDE.md specifically: the template carries the
@@ -242,6 +275,8 @@ def install_project_level_templates(
                     continue
                 if is_claude_md:
                     record_user_section_created(folder, raw_text, parts[1])
+                    if setup_pending is not None:
+                        _emit_setup_deferral(folder, setup_pending)
             out["live_created"].append(str(live_rel))
             # Don't write the reference sidecar in this case — the live
             # file IS the reference at this moment, so a sidecar is
@@ -262,6 +297,12 @@ def install_project_level_templates(
                 dry_run=dry_run, out=out, orchestrator_root=orchestrator_root,
                 project_name=project_name,
             )
+            # The deferral row follows the FILE: it is emitted only when the
+            # live managed body IS this render (an unmarked user-owned file or
+            # a failed backup leaves the row to the clear probe, which reads
+            # the live CLAUDE.md generically) and never on a dry run.
+            if managed_current and not dry_run and setup_pending is not None:
+                _emit_setup_deferral(folder, setup_pending)
         if not dry_run:
             try:
                 _redirect = _pi._write_file_atomic(ref_target, substituted)
@@ -784,10 +825,11 @@ def render_claude_md(
         orchestrator_root: Orchestrator clone root (source of the
             ``templates/CLAUDE.md.template`` file).
         project_name: Display name used to resolve ``{{PROJECT_NAME}}``.
-        project_id: Project id/slug used to look up
-            ``project_modules`` rows. Defaults to ``str(folder)`` so the
-            stub resolver (no DB) returns default-on modules — matches
-            the install-time behaviour.
+        project_id: launcher.db ``projects``-table UUID to read
+            ``project_modules`` rows for, when the caller already holds it
+            (the launcher passes the id it toggled). ``None`` resolves the
+            UUID from ``folder`` (v0.2.101, plan D4 — the old
+            ``str(folder)`` default could never match a UUID-keyed table).
         db_path: Override the default ``~/.vct/launcher.db`` resolution
             (used by tests).
 
@@ -796,7 +838,8 @@ def render_claude_md(
 
             {
               "wrote_path": "<abs path>",
-              "active_modules": [<sorted module names>],
+              "active_modules": [<sorted feature-section names the resolver
+                                 probed for this template>],
               "managed_region_present_before": bool,
               "rendered_bytes": <int>,
               "managed_backups": [<rel backup path>...],  # edited region
@@ -823,11 +866,16 @@ def render_claude_md(
     raw_bytes = template_path.read_bytes()
     raw_text = raw_bytes.decode("utf-8", errors="replace")
 
-    # Resolve active modules. Default project_id to the folder path so
-    # the stub resolver (no DB) returns the default-on set — matches
-    # install-time behaviour.
-    effective_project_id = project_id if project_id is not None else str(folder)
-    active = _pi.resolve_active_modules(effective_project_id, db_path=db_path)
+    # Resolve the active sections through the ONE resolver (v0.2.101, plan
+    # D2/D4): `project_id` stays an override for the launcher, which passes
+    # the id it already holds; `None` resolves the folder to its launcher.db
+    # UUID internally (the old `str(folder)` default could never match a
+    # UUID-keyed table). `needed` keeps the probes to what this template can
+    # use — the user template has no RL section, so the license validator is
+    # never consulted on this path.
+    active = claude_md_sections.active_sections(
+        folder, db_path=db_path, project_id=project_id,
+        needed=claude_md_sections.tagged_features(raw_text))
 
     # Pipeline: conditional → registry pass (the SAME function the bundle
     # update uses, so both callers agree on every value incl. PROJECT_NAME).
@@ -840,6 +888,11 @@ def render_claude_md(
         active_modules=active,
         db_path=db_path,
     )
+
+    # SETUP-ONLY lifecycle (v0.2.101 12a): the same acknowledgement strip the
+    # bundle path and the root renderer apply (one home:
+    # `setup_sections.apply_to_render`), before any write below.
+    rendered_body, setup_pending = setup_sections.apply_to_render(folder, rendered_body)
 
     # ONE set of rules with the bundle update (review R18-01 (d)): an existing
     # marked file goes through `reconcile_claude_md` — the user section is
@@ -889,6 +942,12 @@ def render_claude_md(
         _pi._write_file_atomic(ref_target, rendered_body.encode("utf-8"))
     except OSError as exc:
         _pi._log_auto(f"CLAUDE.md reference sidecar not refreshed: {exc}")
+
+    # The row follows the write (every branch above has written the live file
+    # by here — a failure raises instead of reaching this point). `pending`
+    # is None only on malformed markers: leave the ledger alone then.
+    if setup_pending is not None:
+        _emit_setup_deferral(folder, setup_pending)
 
     merged_bytes = target.read_bytes()
     return {

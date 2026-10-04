@@ -11944,11 +11944,14 @@ def _get_compose_command(container_cmd: str) -> list[str]:
     """Return the compose command as a list of args.
 
     v0.2.92 (§3.5): thin call into :func:`vco_lib.containers.
-    compose_command`, which holds the ONE preference order — the
-    launcher's: `<runtime> compose` (subcommand) first, then the standalone
-    `<runtime>-compose` (PATH or ~/.local/bin). Pre-merge this function
-    preferred standalone `podman-compose` while `ensure-containers.sh`
-    and the launcher preferred the subcommand — the split-brain R13 closes.
+    compose_command`, which holds the ONE preference order. v0.2.101
+    (plan item 1) split that order by runtime: podman prefers the
+    standalone `podman-compose` (PATH or ~/.local/bin — the deterministic
+    tool that keeps the GPU overlay's CDI `devices:` spec; a delegating
+    `podman compose` can flip to an external docker-compose that drops
+    it), docker keeps the subcommand first. Pre-merge this function and
+    the wrapper disagreed — the split-brain R13 stays closed because the
+    wrapper's detect_runtime already preferred standalone podman-compose.
     Last-resort fallback is unchanged: `[<runtime>, "compose"]`, so the
     user sees compose's own error rather than "no runtime".
     """
@@ -13362,6 +13365,7 @@ def _seed_weaviate_shared_kg_only(
     orphan_candidate_kg: "Optional[str]" = None,
     rebind_deferred: bool = False,
     rebind_deferred_rationale: str = "",
+    deferral_report: "DeferralReport | None" = None,
 ) -> "list[str]":
     """Run the shared-KG seed step only (no per-project KG sync).
 
@@ -13531,19 +13535,20 @@ def _seed_weaviate_shared_kg_only(
     # per-embed-REQUEST timeout, which now lives inside EmbeddingService's
     # adapters (VCT_EMBED_REQUEST_TIMEOUT_SECS) — a genuinely-wedged embedder
     # fails fast per chunk; a slow-but-progressing one runs to completion.
-    try:
-        run_child_logged(
-            [str(venv_py), str(sync_kg), "--all"],
-            log_stem="shared-kg-seed", check=True,
-            cwd=str(PROJECT_ROOT), env=seed_env,
-        )
-    except subprocess.CalledProcessError as e:
-        print(f"    ! shared KG seed exited {e.returncode} — re-run later with "
-              f"`KG_COLLECTION={current_shared_kg} kg-sync --all`")
-        seed_errors.append(f"shared-kg exit {e.returncode}")
-    except FileNotFoundError as e:
-        print(f"    ! shared KG seed failed: {e}")
-        seed_errors.append(f"shared-kg FileNotFound: {e}")
+    #
+    # v0.2.101 item 4: the second whole-tree seed is enqueued too, under its
+    # own condition (a different target class + retry handler).
+    _shared = _install_weaviate.kg_seed_step(
+        folder=PROJECT_ROOT, venv_py=venv_py, sync_kg=sync_kg, cmd_args=["--all"],
+        log_stem="shared-kg-seed", seed_env=seed_env, enqueue=True,
+        shared_target=current_shared_kg,
+        label=f"shared seed ({current_shared_kg})", error_prefix="shared-kg",
+        hint=f"KG_COLLECTION={current_shared_kg} kg-sync --all",
+        deferral_report=deferral_report, make_deferral=_make_deferral,
+        run_child_logged=run_child_logged,
+    )
+    seed_errors.extend(_shared.errors)
+    return seed_errors
     return seed_errors
 
 
@@ -14070,6 +14075,7 @@ def _seed_weaviate_impl(
                     orphan_candidate_kg=_pre_resolution_kg,
                     rebind_deferred=_rebind_deferred,
                     rebind_deferred_rationale=_rebind_deferred_rationale,
+                    deferral_report=deferral_report,
                 )
                 _log_install_event("7c/10", "ok", "CI-10: diff-gate skip complete")
                 return
@@ -14125,6 +14131,7 @@ def _seed_weaviate_impl(
     # different and what had to land first for the amendment to be safe.
     sync_subprocess_ran = False
     sync_exit_zero = False
+    seed_detached = False  # handed to the driver (v0.2.101 item 4)
     if sync_kg.exists():
         if _sync_all:
             cmd_args = ["--all"]
@@ -14156,33 +14163,20 @@ def _seed_weaviate_impl(
         # NEW non-leaking channel, which outranks any inherited KG_BASE_DIR.
         seed_env = _subprocess_env_with_embedding()
         seed_env["KG_SYNC_PROJECT_ROOT"] = str(PROJECT_ROOT)
-        try:
-            run_child_logged(
-                [str(venv_py), str(sync_kg)] + cmd_args,
-                log_stem="kg-sync", check=True, cwd=str(PROJECT_ROOT), env=seed_env,
-            )
-            # Subprocess executed AND exited 0 — clean sync.
-            sync_subprocess_ran = True
-            sync_exit_zero = True
-        except subprocess.CalledProcessError as e:
-            # Subprocess EXECUTED but exited non-zero — e.g. 1/2590 nodes failed
-            # (oversize chunk, transient embed error). The other 2589 WERE
-            # embedded against current_active_embedding, so the collection now
-            # reflects the current context. We record seed_errors (so the KG
-            # PRUNE below stays conservatively skipped) but STILL mark the
-            # subprocess as having run — the context-persist keys off this, not
-            # off seed_errors. The next --update's content-hash diff re-picks-up
-            # only the failed node(s) (their Weaviate content_hash won't match
-            # on-disk), re-embedding them alone in seconds. (SEG-1 fix.)
-            print(f"    ! kg/docs sync exited {e.returncode} — re-run later with `kg-sync --all`")
-            seed_errors.append(f"kg-sync exit {e.returncode}")
-            sync_subprocess_ran = True
-        except FileNotFoundError as e:
-            # Subprocess FAILED TO LAUNCH (venv python / script path bad) —
-            # nothing was embedded. Leave sync_subprocess_ran False so we do
-            # NOT record a false "collection embedded against current context".
-            print(f"    ! kg/docs sync failed: {e}")
-            seed_errors.append(f"kg-sync FileNotFound: {e}")
+        # v0.2.101 item 4: the whole-tree seed is enqueued (see
+        # `vco_lib.install_weaviate.kg_seed_step` for the decision + fallback).
+        _seed = _install_weaviate.kg_seed_step(
+            folder=PROJECT_ROOT, venv_py=venv_py, sync_kg=sync_kg, cmd_args=cmd_args,
+            log_stem="kg-sync", seed_env=seed_env, enqueue=_sync_all,
+            context=(current_active_embedding, current_kg_collection, current_shared_kg),
+            label="full seed (knowledge/ + docs/)",
+            error_prefix="kg-sync", hint="kg-sync --all",
+            deferral_report=deferral_report, make_deferral=_make_deferral,
+            run_child_logged=run_child_logged,
+        )
+        seed_detached, sync_subprocess_ran, sync_exit_zero = (
+            _seed.detached, _seed.ran, _seed.exit_zero)
+        seed_errors.extend(_seed.errors)
     else:
         # Sync script missing — the subprocess never ran, nothing embedded.
         # sync_subprocess_ran stays False → context triple is NOT persisted.
@@ -14260,7 +14254,9 @@ def _seed_weaviate_impl(
     # collection may retire the metadata-repair pass — and `project_root` makes
     # this record a PROJECTION of the file stamp that run wrote, not a 2nd one.
     _install_weaviate.stamp_kg_metadata_repair(_sync_all and bool(current_kg_collection), sync_exit_zero, _write_app_state_key, project_root=PROJECT_ROOT)
-    if _context_change_incomplete:
+    # v0.2.101 item 4: nothing ran here when the seed was enqueued — the
+    # owed-work entry above already covers it.
+    if _context_change_incomplete and not seed_detached:
         _install_weaviate.emit_context_change_incomplete_deferral(
             deferral_report, _context_change_reason,
             make_deferral=_make_deferral,
@@ -14274,6 +14270,9 @@ def _seed_weaviate_impl(
     # on disk at all are always safe to remove regardless of the partial-sync
     # changelist. The _sync_all gate caused the 192 orphan accumulation on
     # the maintainer install's KG (v0.2.43 post-update audit).
+    #
+    # v0.2.101 item 4: an ENQUEUED (not completed) seed does not weaken this —
+    # see `_prune_stale_kg_rows`'s own note. It stays on.
     if not seed_errors and current_kg_collection:
         _prune_stale_kg_rows(current_kg_collection, weaviate_url)
 
@@ -14306,6 +14305,7 @@ def _seed_weaviate_impl(
         orphan_candidate_kg=_pre_resolution_kg,
         rebind_deferred=_rebind_deferred,
         rebind_deferred_rationale=_rebind_deferred_rationale,
+        deferral_report=deferral_report,
     )
     seed_errors.extend(shared_errors)
 

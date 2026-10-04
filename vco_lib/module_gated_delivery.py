@@ -627,24 +627,40 @@ def status_payload(folder: Optional[Path]) -> dict[str, Any]:
 
     ``agent_id_problems`` lists definitions (the project's and the user's)
     naming a gateway model id the router does not know — ``None`` when the
-    gateway package is not importable (no registry to check against).
+    gateway package is not importable (no registry to check against). With
+    ``folder``, ``claude_md_section.renders`` says whether the project's
+    CLAUDE.md model-routing section renders — the render's own mapping
+    (``vco_lib.claude_md_sections.gateway_section_renders``), so a GUI
+    consumer never re-derives it.
     """
     from vco_lib.gateway_ensure import machine_gateway_signal
 
     signal = machine_gateway_signal()
     gate = None
+    gate_verdict = None
     if folder is not None:
-        gate = gateway_agents_gate(folder, machine_signal=lambda: signal).to_dict()
+        gate_verdict = gateway_agents_gate(folder, machine_signal=lambda: signal)
+        gate = gate_verdict.to_dict()
     try:
         problems: Optional[list[dict[str, Any]]] = check_agent_model_ids(
             agent_definition_dirs(folder))
     except ImportError:
         problems = None
-    return {
+    payload: dict[str, Any] = {
         "machine_signal": signal.to_dict(),
         "gate": gate,
         "agent_id_problems": problems,
     }
+    if gate_verdict is not None:
+        # What the CLAUDE.md render does with the same verdict — computed by
+        # the render's own mapping (vco_lib.claude_md_sections), so the
+        # launcher's Services-page toggle shows what the file actually does
+        # instead of re-deriving it in Rust/TS.
+        from vco_lib.claude_md_sections import gateway_section_renders
+        payload["claude_md_section"] = {
+            "renders": gateway_section_renders(gate_verdict),
+        }
+    return payload
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

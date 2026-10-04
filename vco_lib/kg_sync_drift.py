@@ -82,15 +82,16 @@ One-home reuse (this module invents nothing new):
   :func:`surface_drift` for why an unregistered condition must never claim
   ``auto_retryable`` it cannot back up with a real dispatcher handler.
 
-Exclusions this module MUST mirror (parity-tested against the source file —
-see ``tests/test_v0292_kg_sync_drift.py``):
+Exclusions this module MUST mirror (parity-tested — see
+``tests/test_v0292_kg_sync_drift.py``):
 
 * ``TAG_HIERARCHY.md`` / ``VOCABULARY.md`` are never synced at all (schema/
   reference docs, not searchable content) — MUST MATCH
   ``sync_knowledge_graph.py::sync_all_nodes``'s ``EXCLUDED_FILES``.
 * Archived nodes (path segment ``archive`` / ``.archive`` / ``_archive``, or
   frontmatter ``status: archived|deprecated|superseded``) are deliberately
-  absent from Weaviate — MUST MATCH ``sync_knowledge_graph.py::_is_archived_node``.
+  absent from Weaviate. v0.2.101 item 3: this rule has ONE home,
+  :mod:`vco_lib.kg_node_status` — CALLED from here, no longer mirrored.
 """
 from __future__ import annotations
 
@@ -104,19 +105,27 @@ from vco_lib.knowledge_residue import (
     content_signature_excluding_updated,
     weaviate_reachable,
 )
+from vco_lib.kg_node_status import (
+    ARCHIVE_DIR_SEGMENTS,
+    ARCHIVED_STATUS_VALUES,
+    is_archived_content,
+    is_archived_path as _shared_is_archived_path,
+)
 from vco_lib.kg_sync import batch_query_content_hashes
 
 #: MUST MATCH sync_knowledge_graph.py::sync_all_nodes's EXCLUDED_FILES —
 #: schema/reference docs that are never synced, checked by basename only.
 EXCLUDED_SYNC_BASENAMES: frozenset = frozenset({"TAG_HIERARCHY.md", "VOCABULARY.md"})
 
-#: MUST MATCH sync_knowledge_graph.py::_is_archived_node's
-#: _ARCHIVE_DIR_SEGMENTS — exact path-segment match, never substring (so
-#: `architecture/` and `archived-notes/` are NOT caught).
-ARCHIVE_DIR_SEGMENTS: frozenset = frozenset({"archive", ".archive", "_archive"})
-
-#: MUST MATCH sync_knowledge_graph.py::_is_archived_node's status check.
-ARCHIVED_STATUS_VALUES: frozenset = frozenset({"archived", "deprecated", "superseded"})
+#: v0.2.101 item 3: the archived predicate has ONE home —
+#: :mod:`vco_lib.kg_node_status`, which ``sync_knowledge_graph.py``'s
+#: ``_is_archived_node`` and the seed's on-disk change check
+#: (``vco_lib.install_weaviate``) both use. This module used to carry its own
+#: C-leg mirror (importing the sync script is not viable here — module-level
+#: hub resolution + a ``weaviate`` import); the mirror is RETIRED so the
+#: consumers cannot drift. Both names are RE-EXPORTED for existing importers.
+ARCHIVE_DIR_SEGMENTS: frozenset = ARCHIVE_DIR_SEGMENTS
+ARCHIVED_STATUS_VALUES: frozenset = ARCHIVED_STATUS_VALUES
 
 #: Deferral condition ids this module owns.
 CID_DRIFT = "kg_sync_drift_detected"
@@ -133,12 +142,16 @@ CID_UNBOUND = "kg_binding_missing"
 # sync_knowledge_graph.py directly is not viable here — that module resolves
 # the hub, filters warnings, and imports `weaviate` as module-level side
 # effects, none of which a read-only drift scan should trigger. The mirrored
-# logic is intentionally tiny and pinned by a source-scan parity test.)
+# logic is intentionally tiny and pinned by a parity test.)
+#
+# v0.2.101 item 3: the ARCHIVED predicate is no longer mirrored — it moved to
+# ``vco_lib.kg_node_status`` and is CALLED from here. What remains mirrored is
+# ``node_scope`` (pinned by ``tests/test_v0292_kg_sync_drift.py``).
 # ---------------------------------------------------------------------------
 
 def is_archived_path(rel_parts: tuple) -> bool:
-    """Path-segment leg of the archived check. Exact segment match only."""
-    return any(p in ARCHIVE_DIR_SEGMENTS for p in rel_parts)
+    """Path-segment leg of the archived check — the SHARED home's rule."""
+    return _shared_is_archived_path(Path(*rel_parts))[0]
 
 
 def _frontmatter_field(content: str, key: str) -> Optional[str]:
@@ -146,9 +159,8 @@ def _frontmatter_field(content: str, key: str) -> Optional[str]:
 
     Returns None on missing frontmatter, a missing key, unparseable YAML, or
     a non-string value — every case defaults to "cannot tell", which is the
-    safe direction for both callers (``status`` absent ⇒ not archived by
-    status; ``scope`` absent ⇒ "project", matching ``_node_scope``'s own
-    default).
+    safe direction for its one remaining caller (``scope`` absent ⇒
+    "project", matching ``_node_scope``'s own default).
     """
     if not content.strip().startswith("---"):
         return None
@@ -166,14 +178,10 @@ def _frontmatter_field(content: str, key: str) -> Optional[str]:
 
 
 def is_archived_node(rel_parts: tuple, content: str) -> bool:
-    """Full archived check (path OR frontmatter status) — mirrors
-    ``_is_archived_node`` (reason string dropped; callers only need bool)."""
-    if is_archived_path(rel_parts):
-        return True
-    status = _frontmatter_field(content, "status")
-    if status is not None and status.strip().lower() in ARCHIVED_STATUS_VALUES:
-        return True
-    return False
+    """Full archived check (path OR frontmatter status) — delegates to
+    :func:`vco_lib.kg_node_status.is_archived_content` (reason string dropped;
+    callers only need bool)."""
+    return is_archived_content(Path(*rel_parts), content)[0]
 
 
 def node_scope(content: str) -> str:

@@ -212,6 +212,14 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: the DB schema is at the level this code expects (refuse to start if
 #: launcher.db is somehow ahead — user downgraded orchestrator while running
 #: on newer DB).
+#: 48 = migration 048_chat_model_context_text_only.sql (v0.2.101 — the
+#: image-capability flag: 1 = the vendor page states the model takes
+#: TEXT-ONLY input, so the gateway replaces image blocks routed to it with a
+#: text note instead of silently degrading; 0 = images pass through, the
+#: conservative default the gateway reader gives an absent key. The
+#: launcher's seed mirror used to drop the field on the floor. Plain
+#: ALTER TABLE ADD COLUMN, existing rows backfill to 0). Bumped ATOMICALLY
+#: with mig 048's Rust registration.
 #: 47 = migration 047_service_endpoints.sql (v0.2.97 — one row per core
 #: service: mode, scheme/host/port, grpc_port, container + data-mount
 #: identity. The launcher DB becomes the one source of truth for where
@@ -280,7 +288,7 @@ RL_EVENTS_PAYLOAD_SHAPE_VERSION = 3
 #: 37 = migration 037_code_graph_build_pid.sql (code_graph_builds.pid, R-4 —
 #: registers the detached install-spawned resync walk so the GUI shows it and
 #: the boot sweep can death-detect it).
-LAUNCHER_DB_TABLE_SET_VERSION = 47
+LAUNCHER_DB_TABLE_SET_VERSION = 48
 
 
 # ===========================================================================

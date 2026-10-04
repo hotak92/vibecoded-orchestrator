@@ -142,6 +142,20 @@ CLIENT_TOOL_RESULT_TYPE = "tool_result"
 #: that its result reads as an orphan and is stripped on every request.
 MCP_TOOL_USE_TYPE = "mcp_tool_use"
 
+#: Extended-thinking block types. Anthropic SIGNS every ``thinking`` block it
+#: emits; a vendor route mints its own signature instead (z.ai: a short
+#: 24-char lowercase-hex string; qwen: an empty ``""``). Replayed to the
+#: first-party route a vendor signature is HTTP 400 ``"Invalid `signature` in
+#: `thinking` block"`` (live capture
+#: ``tests/fixtures/model_router/anthropic-vendor-thinking.body``), and since a
+#: transcript is append-only a model switch after a vendor turn wedges the
+#: whole session — the thinking-block analogue of the tool-id poison this
+#: module was written for. ``redacted_thinking`` carries an opaque ``data``
+#: blob instead of a signature and is always Anthropic's, so it is never
+#: touched here.
+THINKING_BLOCK_TYPE = "thinking"
+REDACTED_THINKING_BLOCK_TYPE = "redacted_thinking"
+
 #: What a caller wants done with a message the repair emptied.
 #: ``EMPTY_DROP`` — remove the message (in-flight request: nothing downstream
 #: references it, and consecutive same-role turns are accepted).
@@ -242,6 +256,31 @@ _GATEWAY_MINTED_RE = re.compile(
     rf"^(?:srvtoolu|mcptoolu|toolu)_{re.escape(GATEWAY_ID_MARKER)}"
 )
 
+#: Marker this module prepends to a VENDOR thinking signature on the way OUT
+#: (the response-side rewrite seam — :class:`model_router.tool_ids.SseIdRewriter`
+#: for a stream, :func:`model_router.tool_ids.normalise_vendor_response` for a
+#: buffered body), so a LATER first-party request can identify the block as
+#: vendor-origin DEFINITIVELY rather than by guessing from its shape. The
+#: vendor branch strips it again before forwarding
+#: (:func:`unmark_thinking_signatures`), so the vendor is handed back its own
+#: bytes and never sees the marker. Same VALUE as :data:`GATEWAY_ID_MARKER` —
+#: one "did the gateway write this?" concept — kept under its own name because
+#: it lives in a different field (an opaque signature, not an id) and is
+#: reversed by a prefix strip rather than by an id map.
+THINKING_SIGNATURE_MARKER = GATEWAY_ID_MARKER
+
+#: A vendor thinking-signature shape seen in the field BEFORE the marker
+#: shipped, so history written by an older gateway has no marker to key on.
+#: z.ai mints a short lowercase-hex string (24 chars in every capture:
+#: ``d43125f46f424ef1b880535c``, ``f177146cea1e4cfaa6137e3a``, …); qwen emits
+#: ``""`` (handled separately, below). Anthropic's own signature is a LONG
+#: mixed-case base64 blob — never pure lowercase hex — so this pattern only
+#: ever matches a vendor's. Bounded at 64 chars to stay well clear of any
+#: plausible Anthropic signature length: a genuine block must NEVER be
+#: stripped, because that would break a working first-party session, the exact
+#: failure this module exists to prevent.
+_VENDOR_HEX_SIGNATURE_RE = re.compile(r"^[0-9a-f]{1,64}$")
+
 
 def sanitise_id_body(raw: str) -> str:
     """Every character outside ``[A-Za-z0-9_]`` becomes ``_``.
@@ -326,6 +365,189 @@ def is_server_tool_result_type(block_type: object) -> bool:
     )
 
 
+def is_server_tool_type(tool_type: object) -> bool:
+    """True when a REQUEST tool's ``type`` names an Anthropic SERVER tool.
+
+    The request-side counterpart of :data:`PORTABLE_SERVER_TOOL_NAMES`. On the
+    wire a server tool is declared in the request's ``tools`` array with a
+    ``type`` of ``<name>_<date>`` — Claude Code's WebSearch sub-request sends
+    ``tools:[{"type":"web_search_20250305", …}]`` — where ``<name>`` is one of
+    the portable server-tool names. A vendor route cannot serve these (parity
+    gap 6, live: z.ai answers HTTP 500 ``"Internal Network Failure"``, qwen
+    answers 200 but the model replies from its weights with no search), so the
+    gateway must recognise them on the REQUEST, where they are a ``type``
+    field, not the ``server_tool_use`` NAME this module's response-side half
+    keys on.
+
+    Matched by name-prefix rather than by an enumerated ``_<date>`` list
+    because the date is a version the vendor bumps and this must not go stale:
+    ``web_search_20250305`` and a future ``web_search_2026xxxx`` are both the
+    ``web_search`` server tool. ``code_execution`` never false-matches
+    ``bash_code_execution`` (the latter does not START with the former), and
+    each family is named explicitly in :data:`PORTABLE_SERVER_TOOL_NAMES`.
+    """
+    if not isinstance(tool_type, str):
+        return False
+    for name in PORTABLE_SERVER_TOOL_NAMES:
+        if tool_type == name or tool_type.startswith(name + "_"):
+            return True
+    return False
+
+
+def thinking_signature_is_vendor_origin(signature: object) -> bool:
+    """True when a ``thinking`` block's signature is NOT Anthropic's own.
+
+    Recognised three ways, strongest first:
+
+    1. the gateway marker (:data:`THINKING_SIGNATURE_MARKER`) this module
+       prepends on the vendor RESPONSE path — definitive for any turn served
+       since the marker shipped, and the reason the go-forward path does not
+       depend on a shape guess;
+    2. an EMPTY signature — qwen's shape (``signature:""``, capture
+       ``qwen-image.body``); Anthropic never emits an empty one;
+    3. a short pure-lowercase-hex signature — z.ai's pre-marker shape
+       (``_VENDOR_HEX_SIGNATURE_RE``).
+
+    A non-string signature (absent or malformed) also reads as vendor-origin:
+    Anthropic always signs a ``thinking`` block with a string, so a block
+    without one is not Anthropic's and the first-party validator would reject
+    it regardless. Anything else — a long mixed-case base64 blob — is treated
+    as a genuine Anthropic signature and KEPT byte-identical: stripping a real
+    one would break a working first-party session, which is the failure this
+    module exists to prevent, so the doubt always resolves toward keeping.
+    """
+    if not isinstance(signature, str):
+        return True
+    if signature.startswith(THINKING_SIGNATURE_MARKER):
+        return True
+    if signature == "":
+        return True
+    return bool(_VENDOR_HEX_SIGNATURE_RE.match(signature))
+
+
+def mark_thinking_signature(signature: object) -> object:
+    """Prepend :data:`THINKING_SIGNATURE_MARKER` to a vendor signature.
+
+    Run on the vendor RESPONSE path so the signature the CLIENT stores — and
+    therefore replays on every later turn — is unambiguously vendor-origin.
+    Idempotent: a signature that already carries the marker is returned as-is,
+    so a second pass cannot produce ``vct_vct_…``. A non-string passes through
+    unchanged (nothing to mark). The reverse is :func:`unmark_thinking_signature`.
+    """
+    if not isinstance(signature, str):
+        return signature
+    if signature.startswith(THINKING_SIGNATURE_MARKER):
+        return signature
+    return THINKING_SIGNATURE_MARKER + signature
+
+
+def unmark_thinking_signature(signature: object) -> object:
+    """Strip :data:`THINKING_SIGNATURE_MARKER`, restoring the vendor's own."""
+    if isinstance(signature, str) and signature.startswith(THINKING_SIGNATURE_MARKER):
+        return signature[len(THINKING_SIGNATURE_MARKER):]
+    return signature
+
+
+def _has_marked_thinking(node: Any) -> bool:
+    """Read-only probe: does any ``thinking`` block carry the gateway marker?"""
+    if isinstance(node, list):
+        return any(_has_marked_thinking(item) for item in node)
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == THINKING_BLOCK_TYPE:
+        signature = node.get("signature")
+        if isinstance(signature, str) and signature.startswith(
+            THINKING_SIGNATURE_MARKER,
+        ):
+            return True
+    return any(_has_marked_thinking(value) for value in node.values())
+
+
+def unmark_thinking_signatures(payload: Any) -> tuple[Any, int]:
+    """Strip the gateway marker from every ``thinking`` signature in ``payload``.
+
+    The inverse of the response-side marking, for the request leg back to a
+    vendor: the vendor must be handed its OWN signature, not our marker (the
+    brief's "a gateway prefix the vendor branch strips again before
+    forwarding, so vendors still get their own bytes back"). Walks the whole
+    document rather than assuming a message shape, because a thinking block
+    can sit anywhere in the history. A read-only probe runs FIRST so the
+    common case — a request with no marked thinking block — costs a walk and
+    not a full copy of a transcript that can be megabytes.
+
+    Returns ``(payload, unmarked_count)``; the input is not copied when
+    nothing matched.
+    """
+    if not _has_marked_thinking(payload):
+        return payload, 0
+
+    unmarked = 0
+
+    def walk(node: Any) -> Any:
+        nonlocal unmarked
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+        out = {key: walk(value) for key, value in node.items()}
+        if out.get("type") == THINKING_BLOCK_TYPE:
+            signature = out.get("signature")
+            if isinstance(signature, str) and signature.startswith(
+                THINKING_SIGNATURE_MARKER,
+            ):
+                out["signature"] = signature[len(THINKING_SIGNATURE_MARKER):]
+                unmarked += 1
+        return out
+
+    return walk(payload), unmarked
+
+
+def thinking_enabled(payload: Any) -> bool:
+    """True when a request turns extended thinking ON (``thinking.type``)."""
+    if not isinstance(payload, dict):
+        return False
+    thinking = payload.get("thinking")
+    return isinstance(thinking, dict) and thinking.get("type") == "enabled"
+
+
+def final_assistant_turn_needs_thinking(messages: Any) -> bool:
+    """True when the LAST assistant turn has ``tool_use`` but no leading thinking.
+
+    Anthropic rejects that shape while thinking is enabled: a tool-use turn
+    must BEGIN with its thinking block (``"Expected `thinking` or
+    `redacted_thinking`, but found `tool_use`"``). Called AFTER a repair
+    stripped a vendor thinking block, to decide whether the least-invasive
+    VALID request is this one sent WITHOUT ``thinking`` — one turn answers
+    without extended thinking rather than the whole chat wedging on a 400 the
+    user cannot act on (the append-only transcript would replay the bad shape
+    forever).
+
+    Only the FINAL assistant turn is checked, because that is the turn the
+    request continues from and the only one the validator holds to the rule;
+    an earlier turn's stripped thinking is not a 400.
+    """
+    if not isinstance(messages, list):
+        return False
+    for message in reversed(messages):
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, list) or not content:
+            return False
+        has_tool_use = any(
+            isinstance(block, dict) and block.get("type") == "tool_use"
+            for block in content
+        )
+        if not has_tool_use:
+            return False
+        first = content[0]
+        leading_thinking = isinstance(first, dict) and first.get("type") in (
+            THINKING_BLOCK_TYPE, REDACTED_THINKING_BLOCK_TYPE,
+        )
+        return not leading_thinking
+    return False
+
+
 @dataclass
 class RepairStats:
     """What a repair pass actually did. Every field is a count of a REAL edit."""
@@ -339,6 +561,24 @@ class RepairStats:
     results_stripped: int = 0
     #: Messages removed because the repair left them with no content at all.
     messages_dropped: int = 0
+    #: ``thinking`` blocks removed because their signature was not
+    #: Anthropic's own (:func:`thinking_signature_is_vendor_origin`) — a
+    #: vendor block that would 400 on the first-party route. Item (c).
+    thinking_blocks_stripped: int = 0
+    #: ``thinking`` signatures prefixed with the gateway marker on the vendor
+    #: RESPONSE path (:attr:`TranscriptRepairer` ``mark_thinking``). A real
+    #: edit, so it counts toward :attr:`changed` — without it a mark-only pass
+    #: would report "unchanged" and the caller would discard the patch.
+    thinking_signatures_marked: int = 0
+    #: True when the request's top-level ``thinking`` parameter was dropped
+    #: because stripping a vendor thinking block left the FINAL assistant turn
+    #: of a tool loop without its required leading thinking block while
+    #: thinking was enabled (:func:`final_assistant_turn_needs_thinking`). The
+    #: least invasive VALID request: one turn answers without extended
+    #: thinking rather than the chat wedging on a 400. Set by
+    #: :func:`model_router.tool_ids.sanitise_for_anthropic`, not by the
+    #: per-message repair.
+    thinking_param_dropped: bool = False
     #: Distinct non-portable tool NAMES met, plus the block TYPES stripped
     #: for being outside :data:`PORTABLE_SERVER_TOOL_RESULT_TYPES`. Both are
     #: "the thing that could not be represented", which is what the log line
@@ -356,6 +596,8 @@ class RepairStats:
             or self.blocks_stripped
             or self.results_stripped
             or self.messages_dropped
+            or self.thinking_blocks_stripped
+            or self.thinking_signatures_marked
         )
 
     def merge(self, other: "RepairStats") -> None:
@@ -363,17 +605,25 @@ class RepairStats:
         self.blocks_stripped += other.blocks_stripped
         self.results_stripped += other.results_stripped
         self.messages_dropped += other.messages_dropped
+        self.thinking_blocks_stripped += other.thinking_blocks_stripped
+        self.thinking_signatures_marked += other.thinking_signatures_marked
+        self.thinking_param_dropped = (
+            self.thinking_param_dropped or other.thinking_param_dropped
+        )
         self.stripped_names |= other.stripped_names
         self.touched_indexes.extend(other.touched_indexes)
 
     def summary(self) -> str:
         names = ", ".join(sorted(self.stripped_names)) or "-"
+        dropped = " thinking_param_dropped" if self.thinking_param_dropped else ""
         return (
             f"ids_rewritten={self.ids_rewritten} "
             f"blocks_stripped={self.blocks_stripped} "
             f"results_stripped={self.results_stripped} "
             f"messages_dropped={self.messages_dropped} "
-            f"stripped_names={names}"
+            f"thinking_stripped={self.thinking_blocks_stripped} "
+            f"thinking_marked={self.thinking_signatures_marked} "
+            f"stripped_names={names}{dropped}"
         )
 
 
@@ -410,6 +660,24 @@ class TranscriptRepairer:
             take the tool context out of a conversation that was working. The
             destination decides, which is why this is a separate knob rather
             than more behaviour hung on ``strip_nonportable``.
+
+            ALSO governs ``thinking`` blocks (item c): when True, a
+            ``thinking`` block whose signature is not Anthropic's own
+            (:func:`thinking_signature_is_vendor_origin`) is STRIPPED, because
+            replayed to the first-party route it is HTTP 400 ``"Invalid
+            `signature` in `thinking` block"``. A genuine Anthropic thinking
+            block is kept byte-identical.
+        mark_thinking: prepend :data:`THINKING_SIGNATURE_MARKER` to a
+            ``thinking`` block's signature. True ONLY on the vendor RESPONSE
+            path (:func:`model_router.tool_ids.normalise_vendor_response`), so
+            the signature the client stores — and replays on every later turn
+            — is unambiguously vendor-origin and a subsequent first-party
+            request can strip the block by its marker rather than by a shape
+            guess. The vendor branch reverses it with
+            :func:`unmark_thinking_signatures` before forwarding, so the
+            vendor never sees the marker. Mutually exclusive in practice with
+            ``strip_vendor_origin`` (one is the response leg, the other the
+            first-party request leg).
     """
 
     def __init__(
@@ -418,10 +686,12 @@ class TranscriptRepairer:
         id_map: Optional[MutableMapping[str, str]] = None,
         strip_nonportable: bool = True,
         strip_vendor_origin: bool = False,
+        mark_thinking: bool = False,
     ) -> None:
         self._id_map = id_map
         self._strip_nonportable = strip_nonportable
         self._strip_vendor_origin = strip_vendor_origin
+        self._mark_thinking = mark_thinking
         #: original -> new, for results that reference an earlier block.
         self._forward: dict[str, str] = {}
         #: ids whose producing block was stripped; their results go too.
@@ -452,6 +722,11 @@ class TranscriptRepairer:
                 out.append(block)
                 continue
             kind = block.get("type")
+            if kind == THINKING_BLOCK_TYPE:
+                kept = self._thinking_block(block, stats)
+                if kept is not None:
+                    out.append(kept)
+                continue
             if kind == "server_tool_use":
                 kept = self._server_tool_use(block, stats)
                 if kept is not None:
@@ -551,6 +826,40 @@ class TranscriptRepairer:
         """
         if isinstance(block_id, str) and block_id:
             self._producers.add(block_id)
+
+    def _thinking_block(self, block: dict, stats: RepairStats) -> Optional[dict]:
+        """Strip, mark, or keep a ``thinking`` block. Returns ``None`` to strip.
+
+        Two mutually-exclusive modes decide, and the destination is what
+        selects them (the same discipline as ``strip_vendor_origin``):
+
+        * first-party REQUEST (``strip_vendor_origin``): a block whose
+          signature is not Anthropic's own is STRIPPED — replayed to
+          ``api.anthropic.com`` it is HTTP 400 ``"Invalid `signature` in
+          `thinking` block"``. A genuine Anthropic block (long base64
+          signature) is kept byte-identical.
+        * vendor RESPONSE (``mark_thinking``): the signature is prefixed with
+          the gateway marker so a LATER first-party request recognises it
+          definitively. The vendor branch strips the marker again before
+          forwarding, so the vendor still gets its own bytes.
+
+        ``redacted_thinking`` never reaches here (it is not
+        :data:`THINKING_BLOCK_TYPE`) and is always Anthropic's, so it is kept.
+        """
+        signature = block.get("signature")
+        if self._strip_vendor_origin and thinking_signature_is_vendor_origin(
+            signature,
+        ):
+            stats.thinking_blocks_stripped += 1
+            return None
+        if self._mark_thinking:
+            marked = mark_thinking_signature(signature)
+            if marked != signature:
+                stats.thinking_signatures_marked += 1
+                patched = dict(block)
+                patched["signature"] = marked
+                return patched
+        return block
 
     def _server_tool_use(
         self, block: dict, stats: RepairStats,
@@ -967,16 +1276,22 @@ __all__ = [
     "MCP_TOOL_USE_TYPE",
     "PORTABLE_SERVER_TOOL_NAMES",
     "PORTABLE_SERVER_TOOL_RESULT_TYPES",
+    "REDACTED_THINKING_BLOCK_TYPE",
     "SERVER_TOOL_RESULT_TYPE_BY_NAME",
     "REPAIRABLE_ENTRY_TYPES",
     "SERVER_TOOL_ID_PREFIX",
     "SERVER_TOOL_RESULT_SUFFIX",
+    "THINKING_BLOCK_TYPE",
+    "THINKING_SIGNATURE_MARKER",
     "FileRepairResult",
     "LineOutcome",
     "RepairStats",
     "TranscriptRepairer",
+    "final_assistant_turn_needs_thinking",
     "id_conforms",
     "is_server_tool_result_type",
+    "is_server_tool_type",
+    "mark_thinking_signature",
     "minted_by_anthropic",
     "normalise_id",
     "repair_entry",
@@ -984,4 +1299,8 @@ __all__ = [
     "repair_lines",
     "restore_ids",
     "sanitise_id_body",
+    "thinking_enabled",
+    "thinking_signature_is_vendor_origin",
+    "unmark_thinking_signature",
+    "unmark_thinking_signatures",
 ]

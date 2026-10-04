@@ -1182,6 +1182,35 @@ class TestSubprocessCLIs(_CensusFixture):
             "a filtered census must not touch the root ledger",
         )
 
+    def test_project_filter_accepts_a_folder_path(self) -> None:
+        """v0.2.101 (12b): the launcher's Update-all root skip passes the
+        ROOT FOLDER PATH, not the id — `_ref_matches`' path form (resolved,
+        so a relative or differently-spelled path matches too) must select
+        exactly the one project, with the same report-only contract."""
+        proc = subprocess.run(
+            [
+                sys.executable, "-m", "vco_lib.bundle_staleness",
+                "--json", "--orchestrator-root", str(self.orch),
+                "--project", str(self.p_stale),
+            ],
+            capture_output=True, text=True, timeout=60,
+            env=child_env(VCT_LAUNCHER_DB_PATH=str(self.db)),
+            cwd=str(self.tmp),
+        )
+        self.assertEqual(proc.returncode, 0, proc.stderr[-1000:])
+        payload = json.loads(proc.stdout)
+        self.assertEqual(len(payload["projects"]), 1)
+        self.assertEqual(payload["projects"][0]["id"], "id-stale")
+        self.assertEqual(payload["projects"][0]["verdict"], "stale")
+        self.assertFalse(
+            bundle_staleness.census_state_path(self.orch).exists(),
+            "a path-filtered census is report-only like the id form",
+        )
+        self.assertFalse(
+            (self.orch / ".claude" / "context" / "UPDATE_DEFERRED.md").exists(),
+            "a path-filtered census must not touch the root ledger",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

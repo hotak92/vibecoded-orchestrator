@@ -918,6 +918,34 @@ function Get-RuntimeParts {
 }
 
 # ---------------------------------------------------------------------------
+# Invoke-GpuVerify :: the POST-START GPU check (v0.2.101 plan items 1+5).
+# Whether the GPU actually reached the RUNNING container is verified by the
+# ONE Python home, vco_lib.gpu_verify — no PowerShell mirror. A 'missing'
+# verdict writes the compose_gpu_device_missing deferral row into the
+# orchestrator root's UPDATE_DEFERRED.md; 'unknown' records nothing.
+# $Reason: 'overlay' (the GPU overlay was applied) | 'degraded' (the host
+# has an NVIDIA GPU but this wrapper composed CPU-only). Mirrors bash
+# gpu_verify_after_up. Never fails the boot.
+# ---------------------------------------------------------------------------
+function Invoke-GpuVerify {
+    param(
+        [Parameter(Mandatory=$true)][string] $Python,
+        [Parameter(Mandatory=$true)][string] $RuntimeBin,
+        [string] $Reason = 'overlay'
+    )
+    $gvArgs = @('vco_lib.gpu_verify', '--runtime', $RuntimeBin, '--reason', $Reason)
+    if ($script:VctOwnRoot) { $gvArgs += @('--install-root', $script:VctOwnRoot) }
+    if ($script:VctStackWorkingDir) { $gvArgs += @('--infra-dir', $script:VctStackWorkingDir) }
+    $run = Invoke-StackPy -Python $Python -Arguments $gvArgs
+    foreach ($line in ($run.Stdout -split "`n")) {
+        if ($line.Trim()) { Write-StackLog $line.TrimEnd() }
+    }
+    if ($run.Rc -ne 0) {
+        Write-StackLog "WARNING: post-start GPU check exited rc=$($run.Rc) (ignored)"
+    }
+}
+
+# ---------------------------------------------------------------------------
 # Get-LabelFamily :: podman | docker — the label family of the compose engine
 # that will run, from the ONE rule (vco_lib.compose_provider: detect +
 # overlay_candidates). Mirrors bash detect_label_family. '' when Python
@@ -1055,6 +1083,13 @@ function Invoke-Main {
         Write-StackLog "runtime=$runtime"
 
         $gpuMode = 'cpu'
+        # gpuExpected: the HOST has an NVIDIA GPU, so a GPU in the container
+        # is owed even when this wrapper degraded the boot to CPU-only
+        # compose — the post-start check (Invoke-GpuVerify) turns that
+        # degrade into a deferral row instead of a bare log line (v0.2.101
+        # plan item 1). Mirrors bash gpu_expected / gpu_reason.
+        $gpuExpected = $false
+        $gpuReason = 'overlay'
         # Mirrors bash `case "$(uname -s)" in Linux) ... esac`. PowerShell
         # is primarily a Windows-host story here; on Windows we delegate
         # GPU readiness to the container runtime (Docker Desktop /
@@ -1067,6 +1102,7 @@ function Invoke-Main {
         if ($onWindowsHost) {
             if (Test-HasNvidia) {
                 Write-StackLog "nvidia detected on Windows host; relying on $runtime's WSL2/GPU runtime hook (no Windows-host CDI poll)"
+                $gpuExpected = $true
                 $gpuMode = 'gpu'
             } else {
                 Write-StackLog "no NVIDIA GPU detected (nvidia-smi absent on Windows host) — CPU-only compose"
@@ -1077,6 +1113,7 @@ function Invoke-Main {
             # behavior as closely as we can without re-implementing
             # /var/run/cdi/nvidia.yaml parsing in PowerShell.
             if (Test-HasNvidia) {
+                $gpuExpected = $true
                 if ($runtime -eq 'docker') {
                     Write-StackLog "docker runtime: skipping CDI wait (docker uses runtime hook)"
                     $gpuMode = 'gpu'
@@ -1086,6 +1123,7 @@ function Invoke-Main {
                     # conservative: log + CPU-only.
                     Write-StackLog "WARNING: NVIDIA detected on non-Windows host but PowerShell wrapper does not poll /var/run/cdi/nvidia.yaml — degrading to CPU-only. Use the .sh wrapper on Linux for full CDI handling."
                     $gpuMode = 'cpu'
+                    $gpuReason = 'degraded'
                 }
             } else {
                 Write-StackLog "no NVIDIA GPU detected — CPU-only compose"
@@ -1221,6 +1259,13 @@ function Invoke-Main {
         }
 
         Write-StackLog "compose exited rc=$rc"
+        # v0.2.101 (plan items 1+5): on success, verify the GPU actually
+        # reached the running container (deferral row when it did not;
+        # nothing on uncertainty). The CDI/poller CPU degrade routes through
+        # the SAME verdict via gpuReason='degraded'. Mirrors bash.
+        if ($rc -eq 0 -and $gpuExpected) {
+            Invoke-GpuVerify -Python $stackPy -RuntimeBin $parts.Bin -Reason $gpuReason
+        }
         # v0.2.100 (L2-F08): passed through as it is — 125 ("one or more
         # containers failed to start") included. Mirrors the bash wrapper.
         if ($rc -eq 0 -and $guardRefused.Count -gt 0) { return 6 }

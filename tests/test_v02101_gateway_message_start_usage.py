@@ -86,6 +86,22 @@ def _fixture(name: str) -> bytes:
     return (FIXTURES / f"{name}.body").read_bytes()
 
 
+def _unmark_thinking(body: bytes) -> bytes:
+    """Strip the gateway thinking-signature marker item (c) adds on the way out.
+
+    v0.2.101 item (c) marks a vendor ``thinking`` signature with a ``vct_``
+    prefix in the relayed response, so a captured vendor body that carries a
+    thinking block is no longer byte-identical to what the gateway now relays —
+    it differs by exactly that marker. This test is about the ``message_start``
+    usage splice, so the orthogonal mark is removed before the verbatim
+    comparison (the marking itself is asserted in
+    ``tests/test_v02101_gateway_parity_request.py``). The captures are compact
+    JSON, which is also how the gateway re-serialises a body it edited, so the
+    marker is the only difference.
+    """
+    return body.replace(b'"signature":"vct_', b'"signature":"')
+
+
 def _request_body_bytes(payload: dict) -> bytes:
     """Exactly the bytes aiohttp's ``json=`` sends for ``payload``.
 
@@ -461,7 +477,12 @@ class FixtureStreamTests(FlaggedVendorTestBase):
             fixture,
         )
 
-        # Every event that is not the spliced message_start is byte-identical.
+        # Every event that is not the spliced message_start is byte-identical,
+        # EXCEPT a signature_delta: v0.2.101 item (c) marks a vendor thinking
+        # signature on the way out (a "vct_" prefix), which re-serialises that
+        # one event. The mark is orthogonal to the message_start splice under
+        # test here and is asserted in
+        # tests/test_v02101_gateway_parity_request.py.
         original_events = _events(original)
         relayed_events = _events(relayed)
         self.assertEqual(len(original_events), len(relayed_events), fixture)
@@ -473,6 +494,9 @@ class FixtureStreamTests(FlaggedVendorTestBase):
                 and payload_o.get("type") == "message_start"
             ):
                 touched += 1
+                continue
+            delta = payload_o.get("delta") if payload_o is not None else None
+            if isinstance(delta, dict) and delta.get("type") == "signature_delta":
                 continue
             self.assertEqual(orig, got, f"{fixture}: non-message_start event")
         self.assertEqual(touched, 1, fixture)
@@ -523,7 +547,9 @@ class FixtureNonStreamTests(FlaggedVendorTestBase):
                   "messages": [{"role": "user", "content": "hi"}]},
         )
         self.assertEqual(resp.status, 200, fixture)
-        self.assertEqual(await resp.read(), original, fixture)
+        # A buffered thinking block's signature carries the item-(c) marker on
+        # the way out; un-mark it so this compares the splice-free relay.
+        self.assertEqual(_unmark_thinking(await resp.read()), original, fixture)
 
     async def test_zai_captured_non_streamed_bodies(self) -> None:
         for fixture in ("zai-nonstream", "zai-tool"):

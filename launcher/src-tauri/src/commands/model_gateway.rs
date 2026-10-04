@@ -1633,6 +1633,125 @@ pub async fn model_gateway_agents_gate(
     .map_err(|e| format!("agents-gate task failed: {}", e))?
 }
 
+/// What the Services page's "Model-routing guidance" toggle must SHOW for
+/// one project (v0.2.101, GUI gap G1): the tri-state the render actually
+/// follows, not the two-state `project_modules` row it was previously read
+/// from. Pre-fix, a gateway-configured machine rendered the section in
+/// every project without an explicit row while the toggle showed — and the
+/// copy said — "off by default".
+///
+/// The DECISION is Python's (rule A): every field except the mode wording
+/// is passed through from `python -m vco_lib.module_gated_delivery status
+/// --json --folder <f>`, including `claude_md_section.renders`, which the
+/// render's own mapping (`vco_lib.claude_md_sections.gateway_section_renders`)
+/// computes. [`map_routing_guidance`] only restates that payload as the
+/// three states the GUI draws.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct RoutingGuidanceState {
+    /// `on` / `off` = this project carries an EXPLICIT `project_modules`
+    /// row; `follows_machine` = no explicit row, so the machine signal
+    /// decides (the resolver's own default).
+    pub mode: String,
+    /// Does the section render in this project's CLAUDE.md right now?
+    /// Python's answer, verbatim.
+    pub renders: bool,
+    /// Which way the machine decides, when `mode == follows_machine`:
+    /// `renders` / `hidden` / `unknown`. `null` for explicit rows.
+    pub machine_decides: Option<String>,
+    /// The gate's own one-line reason, passed through.
+    pub reason: String,
+}
+
+/// Pure mapping from the Python status payload to the GUI tri-state.
+///
+/// Unit-tested with fixture payloads (no Python needed): explicit on,
+/// explicit off, no row with the machine configured, no row with it not
+/// configured, and the could-not-ask cases.
+pub(crate) fn map_routing_guidance(
+    payload: &serde_json::Value,
+) -> Result<RoutingGuidanceState, String> {
+    let gate = payload
+        .get("gate")
+        .filter(|g| !g.is_null())
+        .ok_or("no gate verdict in the status payload — was --folder passed?")?;
+    let renders = payload
+        .pointer("/claude_md_section/renders")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| {
+            // Pins the Python pairing: the payload must carry the render's
+            // own answer, so this side can never re-derive it.
+            "the status payload does not say whether the CLAUDE.md section \
+             renders — update vco_lib.module_gated_delivery's status payload"
+                .to_string()
+        })?;
+    let state = gate.get("state").and_then(|v| v.as_str()).unwrap_or("");
+    let signal = gate.get("signal").and_then(|v| v.as_str()).unwrap_or("");
+    let reason = gate
+        .get("reason")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+
+    if signal == "project_row" {
+        // An explicit row exists; its state is the user's own choice. Only
+        // DELIVER and SKIP are produced for `project_row` by the gate.
+        let mode = if state == "deliver" { "on" } else { "off" };
+        return Ok(RoutingGuidanceState {
+            mode: mode.to_string(),
+            renders,
+            machine_decides: None,
+            reason,
+        });
+    }
+    // No explicit row (or the row could not be read): the machine decides.
+    // `renders` still comes from Python, so `unknown` here only labels the
+    // machine line — the render answer stays exact.
+    let machine_decides = match state {
+        "deliver" => "renders",
+        "skip" => "hidden",
+        _ => "unknown",
+    };
+    Ok(RoutingGuidanceState {
+        mode: "follows_machine".to_string(),
+        renders,
+        machine_decides: Some(machine_decides.to_string()),
+        reason,
+    })
+}
+
+/// The per-project verdict for the Services page's routing-guidance list.
+/// Same python bridge as [`model_gateway_agents_gate`]; `folder` is
+/// required (without it Python returns no gate verdict).
+#[command]
+pub async fn model_gateway_routing_guidance(
+    folder: String,
+) -> Result<RoutingGuidanceState, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let python = python_or_err()?;
+        let root = crate::commands::installer::find_local_repo_root().ok();
+        let mut cmd =
+            python_module_command(&python, "vco_lib.module_gated_delivery", root.as_deref());
+        for a in agents_gate_args(Some(folder.as_str())) {
+            cmd.arg(a);
+        }
+        let (code, stdout, stderr) =
+            run_to_completion(cmd, "vco_lib.module_gated_delivery")?;
+        let payload: serde_json::Value = serde_json::from_str(stdout.trim())
+            .map_err(|e| {
+                format!(
+                    "vco_lib.module_gated_delivery exited {} and did not \
+                     return JSON ({}): {}",
+                    code,
+                    e,
+                    stderr.trim()
+                )
+            })?;
+        map_routing_guidance(&payload)
+    })
+    .await
+    .map_err(|e| format!("routing-guidance task failed: {}", e))?
+}
+
 // ─── VS Code panel wiring ─────────────────────────────────────────────────
 
 #[command]
@@ -1831,6 +1950,114 @@ mod tests {
             agents_gate_args(Some("/p/x")),
             vec!["status", "--json", "--folder", "/p/x"]
         );
+    }
+
+    // ─── G1 (v0.2.101): the routing-guidance tri-state the Services page
+    // shows. Fixtures mirror `python -m vco_lib.module_gated_delivery
+    // status --json --folder <f>`'s payload shape.
+
+    fn status_payload_fixture(
+        state: &str,
+        signal: &str,
+        renders: bool,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "machine_signal": {"configured": null, "reason": "fixture"},
+            "gate": {"state": state, "signal": signal,
+                     "reason": "fixture reason",
+                     "machine_configured": null},
+            "claude_md_section": {"renders": renders},
+            "agent_id_problems": []
+        })
+    }
+
+    #[test]
+    fn routing_guidance_maps_an_explicit_on_row() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "deliver", "project_row", true,
+        ))
+        .expect("explicit on maps");
+        assert_eq!(s.mode, "on");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides, None, "an explicit row is not the machine's call");
+        assert_eq!(s.reason, "fixture reason");
+    }
+
+    #[test]
+    fn routing_guidance_maps_an_explicit_off_row() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "skip", "project_row", false,
+        ))
+        .expect("explicit off maps");
+        assert_eq!(s.mode, "off");
+        assert!(!s.renders);
+        assert_eq!(s.machine_decides, None);
+    }
+
+    #[test]
+    fn routing_guidance_maps_no_row_with_the_machine_configured() {
+        // The exact case the pre-fix toggle got WRONG: no explicit row on a
+        // gateway-configured machine → the section RENDERS while the
+        // checkbox showed (and the copy said) off.
+        let s = map_routing_guidance(&status_payload_fixture(
+            "deliver", "machine", true,
+        ))
+        .expect("no-row/configured maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("renders"));
+    }
+
+    #[test]
+    fn routing_guidance_maps_no_row_with_no_gateway_on_the_machine() {
+        let s = map_routing_guidance(&status_payload_fixture(
+            "skip", "machine", false,
+        ))
+        .expect("no-row/not-configured maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(!s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("hidden"));
+    }
+
+    #[test]
+    fn routing_guidance_keeps_the_could_not_ask_states_honest() {
+        // UNKNOWN renders (the render never hides text on a could-not-ask),
+        // and the machine line says "unknown" — the render answer itself
+        // still comes from Python, never re-derived here.
+        let s = map_routing_guidance(&status_payload_fixture(
+            "unknown", "launcher_db", true,
+        ))
+        .expect("unknown maps");
+        assert_eq!(s.mode, "follows_machine");
+        assert!(s.renders);
+        assert_eq!(s.machine_decides.as_deref(), Some("unknown"));
+
+        let s = map_routing_guidance(&status_payload_fixture(
+            "unknown", "machine", true,
+        ))
+        .expect("machine-unknown maps");
+        assert_eq!(s.machine_decides.as_deref(), Some("unknown"));
+    }
+
+    #[test]
+    fn routing_guidance_refuses_payloads_without_the_render_answer() {
+        // Pins the Python pairing: if `claude_md_section.renders` ever
+        // disappears from the status payload, this side errors loudly
+        // rather than re-deriving the mapping from `gate.state`.
+        let mut payload = status_payload_fixture("deliver", "machine", true);
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_md_section");
+        let err = map_routing_guidance(&payload).expect_err("must refuse");
+        assert!(
+            err.contains("claude_md_section") || err.contains("renders"),
+            "the error must name what is missing; got: {err}"
+        );
+
+        let no_gate = serde_json::json!({"machine_signal": {"configured": true}});
+        let err = map_routing_guidance(&no_gate).expect_err("must refuse");
+        assert!(err.contains("gate"), "the error must name the gate; got: {err}");
     }
 
     #[test]

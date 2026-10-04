@@ -40,8 +40,10 @@ import {
   pointPanelAtGateway,
   pointPanelPort,
   pointPanelWarnings,
-  projectHasRoutingGuidance,
   resetPanelToNative,
+  clearProjectRoutingGuidance,
+  describeRoutingGuidance,
+  routingGuidance,
   setModelGatewayBoot,
   setProjectRoutingGuidance,
   startModelGateway,
@@ -53,6 +55,7 @@ import type {
   VSCodeInspection,
   VSCodeWriteResult,
 } from '$lib/types/model-gateway';
+import type { RoutingGuidanceState } from './model_gateway';
 
 const mockInvoke = invoke as unknown as ReturnType<typeof vi.fn>;
 
@@ -179,13 +182,62 @@ describe('wire shape', () => {
       moduleName: 'model_gateway',
       enabled: true,
     });
+  });
 
-    mockInvoke.mockResolvedValue(false);
-    await projectHasRoutingGuidance('proj-1');
-    expect(mockInvoke).toHaveBeenCalledWith('is_project_module_active', {
+  it('routing-guidance CLEAR deletes the row — the way back to follows-machine', async () => {
+    mockInvoke.mockResolvedValue(true);
+    const cleared = await clearProjectRoutingGuidance('proj-1');
+    expect(mockInvoke).toHaveBeenCalledWith('clear_project_module', {
       projectId: 'proj-1',
       moduleName: ROUTING_GUIDANCE_MODULE,
     });
+    expect(cleared).toBe(true);
+  });
+
+  it('routing-guidance STATE asks the Python gate by folder (v0.2.101 G1)', async () => {
+    // The list must seed from the same gate the render follows — the
+    // row-only lookup above was the defect (no row read as "off" while the
+    // render drew the section on a gateway-configured machine).
+    mockInvoke.mockResolvedValue({
+      mode: 'follows_machine',
+      renders: true,
+      machine_decides: 'renders',
+      reason: 'test',
+    });
+    const state = await routingGuidance('/p/proj-a');
+    expect(mockInvoke).toHaveBeenCalledWith('model_gateway_routing_guidance', {
+      folder: '/p/proj-a',
+    });
+    expect(state.mode).toBe('follows_machine');
+  });
+});
+
+describe('routing guidance — the tri-state caption (v0.2.101 G1)', () => {
+  const follows = (
+    machine_decides: 'renders' | 'hidden' | 'unknown',
+  ): RoutingGuidanceState => ({
+    mode: 'follows_machine',
+    renders: machine_decides !== 'hidden',
+    machine_decides,
+    reason: 'test',
+  });
+
+  it('says WHICH WAY the machine decides for a following project', () => {
+    expect(describeRoutingGuidance(follows('renders'))).toContain(
+      'the section currently renders',
+    );
+    expect(describeRoutingGuidance(follows('hidden'))).toContain('currently hidden');
+    expect(describeRoutingGuidance(follows('unknown'))).toContain('could not tell');
+  });
+
+  it('stays silent for explicit rows and for a failed ask', () => {
+    expect(describeRoutingGuidance({
+      mode: 'on', renders: true, machine_decides: null, reason: 'r',
+    })).toBeNull();
+    expect(describeRoutingGuidance({
+      mode: 'off', renders: false, machine_decides: null, reason: 'r',
+    })).toBeNull();
+    expect(describeRoutingGuidance(null)).toBeNull();
   });
 });
 

@@ -3,24 +3,30 @@
 # Copyright (c) 2026 VibeCoded Tools
 """Remove SETUP-ONLY blocks from CLAUDE.md and record the acknowledgement.
 
-CLAUDE.md ships with first-run-setup help wrapped in HTML-comment markers:
+Serves BOTH install shapes the script ships into: the orchestrator root and
+every user project (the bundle installs it under ``<root>/.claude/scripts/``
+in each). Their CLAUDE.md files carry first-run help and a project-scoping
+nudge wrapped in HTML-comment markers:
 
-    <!-- BEGIN: SETUP-ONLY (remove after first successful session) -->
+    <!-- BEGIN: SETUP-ONLY (...) -->
     ... content ...
     <!-- END: SETUP-ONLY -->
 
-Once the user has the orchestrator working, that content becomes noise that
-wastes context every session. This script strips those blocks.
+Once setup is done, that content becomes noise that wastes context every
+session. This script strips those blocks.
 
-Those markers live INSIDE the AUTO-rendered region of
-``templates/ORCHESTRATOR-CLAUDE.md.template``, so ``install.py`` re-renders the
-whole region on every update and a removal on its own would be undone. This
-script therefore ALSO records an acknowledgement — the content hash of every
-block it removes — in ``.claude/state/setup-sections-ack.json`` (written
-atomically). The renderer (``vco_lib/rendered_root_files.py``) omits any block
-whose hash is acknowledged, so the removal SURVIVES future updates, and a block
-whose content changes in a later release (new hash) renders again and re-arms
-the ``first_run_setup_pending`` deferral row this script clears.
+Those markers live INSIDE the re-rendered managed region of the shipped
+templates — the root's AUTO region (``templates/ORCHESTRATOR-CLAUDE.md.template``,
+re-rendered by ``install.py`` on every update) and a project's VCO_MANAGED
+region (``templates/CLAUDE.md.template``, re-rendered on every bundle update) —
+so a removal on its own would be undone. This script therefore ALSO records an
+acknowledgement — the content hash of every block it removes — in
+``.claude/state/setup-sections-ack.json`` (written atomically). The render
+paths (``vco_lib/rendered_root_files.py`` for the root,
+``vco_lib/project_templates.py`` for user projects) omit any block whose hash
+is acknowledged, so the removal SURVIVES future updates, and a block whose
+content changes in a later release (new hash) renders again and re-arms the
+``first_run_setup_pending`` deferral row this script clears.
 
 The script is idempotent: running it twice is safe — the second run is a
 no-op.
@@ -30,7 +36,8 @@ Usage:
 
 The script:
   - Resolves the install root relative to this script's location
-    (../../ = the orchestrator root); ``--root`` overrides it.
+    (../../ = the root this copy ships under — the orchestrator root or a
+    user project's root); ``--root`` overrides it.
   - Removes everything between matching BEGIN/END markers (inclusive)
   - Records each removed block's content hash in the acknowledgement file
   - Writes the result back, preserving the rest verbatim

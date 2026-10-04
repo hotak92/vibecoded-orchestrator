@@ -3058,6 +3058,7 @@ pub fn run() {
             commands::model_gateway::model_gateway_mode_get,
             commands::model_gateway::model_gateway_mode_set,
             commands::model_gateway::model_gateway_agents_gate,
+            commands::model_gateway::model_gateway_routing_guidance,
             commands::gateway_freshness::model_gateway_freshness,
             commands::gateway_freshness::model_gateway_restart_stale,
             commands::gateway_usage::model_gateway_usage_windows,
@@ -3102,6 +3103,7 @@ pub fn run() {
             // just diagrams — gets the same surface.
             commands::diagrams_cmd::seed_project_mcp_tool_grants,
             commands::diagrams_cmd::set_project_module_enabled,
+            commands::diagrams_cmd::clear_project_module,
             // v0.2.49 Stream B: per-project enable toggle for global-
             // scope modules. Bare-bool surface, kept because it is
             // shipped IPC — but it cannot express PROVENANCE and has no

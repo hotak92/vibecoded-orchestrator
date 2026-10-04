@@ -253,6 +253,11 @@ const MIGRATIONS: &[Migration] = &[
         description: "service_endpoints (v0.2.97 — the launcher DB becomes the one source of truth for where Weaviate, Ollama and code-embed are reached). One row per core service: mode (vco_managed | adopted_container | adopted_external), scheme/host/port (+ grpc_port for Weaviate, required by CHECK), the container identity (container_name, compose_project) and the observed data mount (data_mount_json), plus enabled/autostart, provenance (source, confirmed_by_user) and verified_at/updated_at. Replaces services.toml adoption rows, the never-written app_state *.port_override keys, vct-config.toml weaviate_url and the endpoint env vars as RESOLVER INPUTS: the Rust readers (db::service_endpoints + services::service_endpoints) and the Python mirror (vco_lib.service_endpoints) answer row -> compiled default and nothing else. NO SEED ROWS: an absent row means not-yet-reconciled and resolves to the compiled default (8081/50052, 11435, 11440); a seeded default would be indistinguishable from a verified endpoint. The only writer is vco_lib.service_endpoints (Python), which enforces these CHECKs before writing and whose tests load this .sql. Plain CREATE TABLE IF NOT EXISTS — idempotent by construction AND by the runner's version check, not self-transactional. LAUNCHER_DB_TABLE_SET_VERSION bumps 46->47 atomically with this migration (B-2).",
         sql: include_str!("migrations/047_service_endpoints.sql"),
     },
+    Migration {
+        version: 48,
+        description: "chat_model_context.text_only (v0.2.101 — the image-capability flag the model gateway reads from the exported table: 1 = the vendor page states this model takes TEXT-ONLY input, so a request routed to it has each image block replaced by a short text note instead of silently degrading; 0 = images pass through untouched, the conservative default the gateway reader itself gives an absent key). The launcher's seed mirror was silently DROPPING the field, so the pane could not show it and a reseed could not carry it. Plain ALTER TABLE ADD COLUMN (the migration-030 shape — no CHECK to widen, no rebuild): existing rows backfill to 0, the IN (0,1) domain CHECK matches window_1m/user_edited. LAUNCHER_DB_TABLE_SET_VERSION bumps 47->48 atomically with this migration (B-2), with scripts/regen_schema_versions_json.py refreshing the committed snapshot in the same merge.",
+        sql: include_str!("migrations/048_chat_model_context_text_only.sql"),
+    },
 ];
 
 /// Migrations whose .sql manages its OWN `BEGIN`/`COMMIT` boundary.
@@ -2562,6 +2567,9 @@ mod tests {
 
         let cols = chat_model_context_columns(&conn);
         let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
+        // `text_only` joins the column set with migration 048 (v0.2.101) —
+        // listed here because this test asserts the LIVE post-apply schema,
+        // not 043's intermediate state.
         assert_eq!(
             names,
             vec![
@@ -2574,6 +2582,7 @@ mod tests {
                 "source_note",
                 "user_edited",
                 "updated_at",
+                "text_only",
             ],
             "column set (and order) of chat_model_context"
         );
@@ -2592,6 +2601,12 @@ mod tests {
         assert_eq!(by_name("window_1m").3.as_deref(), Some("0"));
         assert_eq!(by_name("user_edited").3.as_deref(), Some("0"));
         assert_eq!(by_name("source_note").3.as_deref(), Some("''"));
+        assert_eq!(
+            by_name("text_only").3.as_deref(),
+            Some("0"),
+            "text_only backfills to 0 = false (migration 048's conservative \
+                 default, the gateway reader's own direction for an absent key)"
+        );
         // `source` is NOT NULL and has no default: an INSERT that forgets it
         // fails loudly rather than defaulting to an uncited empty string.
         assert_eq!(by_name("source").2, 1, "source must be NOT NULL");
@@ -2952,7 +2967,10 @@ mod tests {
 
         // The full nine-column set is intact on the rebuilt table (pins the
         // "carry EVERY column" requirement — a future edit that drops one
-        // from the _new table reds here).
+        // from the _new table reds here). `text_only` joins the live
+        // column list with migration 048 — listed here because this test
+        // asserts the POST-apply schema (a full `apply()`), not 046's
+        // intermediate state.
         let cols = chat_model_context_columns(&conn);
         let names: Vec<&str> = cols.iter().map(|c| c.0.as_str()).collect();
         assert_eq!(
@@ -2967,8 +2985,9 @@ mod tests {
                 "source_note",
                 "user_edited",
                 "updated_at",
+                "text_only",
             ],
-            "the 046 rebuild must carry every 043 column"
+            "the 046 rebuild must carry every 043 column (048 appends text_only)"
         );
         // The rebuilt table kept the PRIMARY KEY too (export order depends
         // on it; 043 created no other index to recreate).
@@ -3046,6 +3065,98 @@ mod tests {
             (1, 0),
             "the unstated row survives a verbatim replay byte-identically"
         );
+    }
+
+    // ─── Migration 048 — chat_model_context.text_only (v0.2.101) ─────────
+    //
+    // The image-capability flag the model gateway's reader
+    // (model_router/context_table.py) reads: `true` = the vendor's docs say
+    // this model takes TEXT-ONLY input, so the gateway replaces image blocks
+    // with a text note instead of silently degrading. The launcher's seed
+    // parser used to drop the field on the floor (the table mirrored the
+    // seed field by field and `text_only` was simply absent), so the pane
+    // could not show it and a reseed could not carry it. Plain
+    // `ALTER TABLE ... ADD COLUMN` (the migration-030 shape — no CHECK to
+    // widen, no rebuild), defaulting existing rows to 0 = false, the
+    // gateway reader's own conservative direction: an unflagged model keeps
+    // its image blocks exactly as the client sent them.
+
+    /// UPGRADE BRANCH — a database stopped at v47 (no `text_only` column,
+    /// user rows present) converges: every row survives with its data
+    /// intact, the new column exists and backfills to 0 (false), and the
+    /// `IN (0, 1)` domain CHECK holds.
+    #[test]
+    fn migration_048_adds_text_only_and_preserves_every_row() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "foreign_keys", "ON").unwrap();
+        apply_up_to(&conn, 47).expect("apply up to v47");
+
+        // Pre-existing data: one shipped-shaped row, one user edit — the
+        // same pair the 046 upgrade test carries, so a regression in either
+        // migration's copy path is visible against identical inputs.
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('glm-5.2', 'zai', 1000000, 128000, 1, \
+                     'https://docs.z.ai/guides/llm/glm-5.2', '', 0, \
+                     '2026-09-02T00:00:00Z')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chat_model_context \
+             (model_id, vendor, context_window, max_output, window_1m, \
+              source, source_note, user_edited, updated_at) \
+             VALUES ('my-local-model', 'zai', 42000, 8000, 0, \
+                     'internal wiki', 'hand added', 1, '2026-09-02T01:00:00Z')",
+            [],
+        )
+        .unwrap();
+
+        apply(&conn).expect("apply remaining migrations (048)");
+
+        // The column exists, both rows survived, every pre-048 field is
+        // intact and text_only backfilled to 0 = false on both.
+        let rows: Vec<(String, i64, i64)> = conn
+            .prepare("SELECT model_id, user_edited, text_only FROM chat_model_context \
+                      ORDER BY model_id")
+            .expect("prepare post-048 select")
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .expect("query post-048 select")
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                ("glm-5.2".to_string(), 0, 0),
+                ("my-local-model".to_string(), 1, 0),
+            ],
+            "every pre-048 field survives and text_only backfills to 0 = false"
+        );
+
+        // The domain CHECK: a non-0/1 value is refused even by a hand UPDATE.
+        let err = conn
+            .execute(
+                "UPDATE chat_model_context SET text_only = 2 WHERE model_id = 'glm-5.2'",
+                [],
+            )
+            .expect_err("text_only IN (0,1) must be enforced");
+        assert!(
+            err.to_string().to_uppercase().contains("CHECK"),
+            "expected a CHECK-constraint failure, got: {}",
+            err
+        );
+
+        // 048 recorded exactly once (the runner is version-gated).
+        let recorded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _schema_migrations WHERE version = 48",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(recorded, 1, "048 recorded exactly once");
     }
 
     // ─── Migration 044 — project_moves (v0.2.92 WP-17 / W3) ──────────────

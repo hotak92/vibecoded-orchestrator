@@ -84,7 +84,7 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 from vco_lib.intfile import read_int_line
 
@@ -97,6 +97,29 @@ from vco_lib.code_embed_image import STALE as _IMAGE_STALE
 #: Per (folder, condition) attempt ceiling. Beyond it the entry stays for the
 #: user — a retry that failed three times is not transient.
 MAX_ATTEMPTS = 3
+
+#: v0.2.101 (item 4): install.py no longer BLOCKS on the per-project KG seed.
+#: It enqueues the owed work as ``kg_sync_failures_pending`` (whose registry
+#: row declares ``retry_action = "retry:py:kg_seed"``) and spawns this driver
+#: detached, so the embed runs in the background. The seed therefore runs
+#: OUT of process and install.py can no longer observe its exit — so the
+#: "context triple" install.py used to persist itself (what context the
+#: collection was embedded against) travels to the driver in this env channel
+#: and is stamped by :func:`retry_kg_seed` ONLY after the child's own paired
+#: clear proves the seed ran against it. Set by install.py via
+#: :func:`spawn_detached`'s ``extra_env``; a driver spawned any other way
+#: (the session-start hook) carries none of these and stamps nothing.
+SEED_CTX_ENV_ACTIVE_EMBEDDING = "VCT_KG_SEED_CTX_ACTIVE_EMBEDDING"
+SEED_CTX_ENV_KG_COLLECTION = "VCT_KG_SEED_CTX_KG_COLLECTION"
+SEED_CTX_ENV_SHARED_KG_COLLECTION = "VCT_KG_SEED_CTX_SHARED_KG_COLLECTION"
+
+#: The ``app_state`` keys the context triple lands in. MUST MATCH install.py's
+#: ``_APP_STATE_KEY_LAST_*`` (the CF-10 diff gate reads them): after v0.2.101
+#: item 4 this handler is the writer on the detached path, install.py on the
+#: foreground path.
+APP_STATE_KEY_LAST_ACTIVE_EMBEDDING = "last_installed_active_embedding"
+APP_STATE_KEY_LAST_KG_COLLECTION = "last_installed_kg_collection"
+APP_STATE_KEY_LAST_SHARED_KG_COLLECTION = "last_installed_shared_kg_collection"
 
 #: Attempt trail. Sits beside auto-resolutions.jsonl in the user-owned,
 #: git-ignored logs dir.
@@ -423,6 +446,110 @@ def _analyzer_script(folder: Path) -> Optional[Path]:
     return None
 
 
+def seed_context_from_env(env: Optional[Mapping[str, str]] = None) -> Optional[dict]:
+    """The install-resolved context triple carried in a spawned driver's env.
+
+    ``None`` when no ACTIVE_EMBEDDING was carried — a driver spawned by the
+    session-start hook (not by an install) must never stamp the triple, and an
+    install that never resolved one must not stamp an empty context over a real
+    one. See :data:`SEED_CTX_ENV_ACTIVE_EMBEDDING`.
+    """
+    source = os.environ if env is None else env
+    active = (source.get(SEED_CTX_ENV_ACTIVE_EMBEDDING) or "").strip()
+    if not active:
+        return None
+    return {
+        "active_embedding": active,
+        "kg_collection": (source.get(SEED_CTX_ENV_KG_COLLECTION) or "").strip(),
+        "shared_kg_collection": (
+            source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or ""
+        ).strip(),
+    }
+
+
+def stamp_seed_context(
+    context: Optional[dict], *, write_key: Optional[Callable[[str, str], None]] = None
+) -> bool:
+    """Persist the context triple after a PROVEN-successful seed (item 4).
+
+    Called by :func:`retry_kg_seed` only once the child's own paired clear has
+    removed its condition — the same proof :func:`dispatch` uses, because a
+    zero exit is not proof (the sync's ``--all`` no-backend path exits 0 after
+    re-emitting its entry). Writing it optimistically at enqueue time would
+    silence the next ``--update``'s retry and leave previous-model vectors in
+    place permanently — the v0.2.95 WP-4 defect this stamp's timing avoids.
+
+    *write_key* is injectable for tests; the default writes ``launcher.db``'s
+    ``app_state`` through the ONE writer. Soft-fail: bookkeeping never fails a
+    retry (matches install.py's own ``_write_app_state_key``).
+
+    Returns True when a stamp was attempted (``context`` was non-empty).
+    """
+    if not context:
+        return False
+    if write_key is None:
+        def _default_write(key: str, value: str) -> None:
+            from vco_lib.launcher_db_writer import write_app_state_key
+            from vco_lib.paths import launcher_db_path
+
+            write_app_state_key(launcher_db_path(), key, value)
+
+        write_key = _default_write
+    try:
+        write_key(APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, context.get("active_embedding", ""))
+        write_key(APP_STATE_KEY_LAST_KG_COLLECTION, context.get("kg_collection", ""))
+        write_key(
+            APP_STATE_KEY_LAST_SHARED_KG_COLLECTION,
+            context.get("shared_kg_collection", ""),
+        )
+    except Exception as exc:  # noqa: BLE001 — bookkeeping is best-effort
+        trail(f"seed context stamp failed (non-fatal): {exc}")
+    return True
+
+
+def stamp_metadata_repair_from_child(folder: Path) -> bool:
+    """Project install.py's ``app_state`` metadata-repair row (v0.2.101 item 4).
+
+    The whole-tree pass is ENQUEUED now, so install.py never observes its exit
+    and cannot project the row itself. This is the same move the context triple
+    made: the handler records it, on the same proof (the child's own paired
+    clear), through the SAME writer install.py uses —
+    :func:`vco_lib.install_weaviate.stamp_kg_metadata_repair` — so the two
+    paths cannot disagree about what the row means.
+
+    Two preconditions ride along, both install.py's own:
+
+    * a CARRIED context naming a collection — install.py's third precondition
+      (``_sync_all and bool(current_kg_collection)``): the whole-tree run must
+      have targeted the project's CONFIGURED collection, not the script's
+      literal ``KnowledgeGraph`` fallback. No carried context ⇒ no proof.
+    * ``repair_owed(folder) is False`` — inside the writer. This is what makes
+      the row a PROJECTION rather than a second opinion: a repair that aborts
+      part-way is COUNTED, not FAILED, so the run still exits 0 and the child
+      withholds its file stamp. The exit code (and the paired clear with it)
+      cannot see that; the file stamp can.
+
+    Returns True when the row was written. Soft-fail: bookkeeping never fails
+    the retry (mirrors install.py's own ``_write_app_state_key``).
+    """
+    context = seed_context_from_env()
+    if not context or not context.get("kg_collection"):
+        return False
+    try:
+        from vco_lib.install_weaviate import stamp_kg_metadata_repair
+        from vco_lib.launcher_db_writer import write_app_state_key
+        from vco_lib.paths import launcher_db_path
+
+        return stamp_kg_metadata_repair(
+            True, True,
+            lambda key, value: write_app_state_key(launcher_db_path(), key, value),
+            project_root=folder,
+        )
+    except Exception as exc:  # noqa: BLE001 — bookkeeping is best-effort
+        trail(f"metadata-repair stamp failed (non-fatal): {exc}")
+        return False
+
+
 def retry_kg_seed(ctx: RetryContext) -> RetryResult:
     """Re-run the owed KG seed for ``folder``.
 
@@ -434,6 +561,11 @@ def retry_kg_seed(ctx: RetryContext) -> RetryResult:
     :data:`RETRIED` here means only "the child exited 0" — the script's SKIP
     path exits 0 as well. :func:`dispatch` downgrades it to
     :data:`INCONCLUSIVE` unless the child's own clear removed the condition.
+
+    v0.2.101 (item 4): when an INSTALL spawned this driver (the session-start
+    hook does not), the context triple install.py could no longer persist
+    itself travels in the env; it is stamped here, and ONLY here, after the
+    child's own paired clear proves the seed ran against that context.
     """
     script = _sync_script(ctx.folder)
     if script is None:
@@ -449,8 +581,83 @@ def retry_kg_seed(ctx: RetryContext) -> RetryResult:
         else:
             os.environ["KG_SYNC_PROJECT_ROOT"] = prev
     if rc == 0:
+        if condition_cleared(ctx.folder, ctx.condition_id) is True:
+            stamp_seed_context(seed_context_from_env())
+            # v0.2.101 item 4: the ONE-TIME metadata-repair row install.py used
+            # to project from the exit code travels the same way now.
+            stamp_metadata_repair_from_child(ctx.folder)
         return RetryResult(ctx.condition_id, RETRIED, "kg sync --all completed")
     return RetryResult(ctx.condition_id, FAILED, f"kg sync --all exited {rc}")
+
+
+def _shared_collection_for(folder: Path, env: Optional[Mapping[str, str]] = None) -> str:
+    """The shared KG collection ``folder`` should be seeded into, or ``""``.
+
+    Precedence: the context an install spawn CARRIED
+    (:data:`SEED_CTX_ENV_SHARED_KG_COLLECTION`) — it is what the install
+    resolved and what the owed row was queued for — then the project's OWN
+    declared ``SHARED_KG_COLLECTION`` in ``.claude/settings.json`` ``env`` (the
+    canonical per-project channel), so a driver started by the session-start
+    hook retries the same work with no install env to inherit.
+    """
+    source = os.environ if env is None else env
+    carried = (source.get(SEED_CTX_ENV_SHARED_KG_COLLECTION) or "").strip()
+    if carried:
+        return carried
+    try:
+        data = json.loads((folder / ".claude" / "settings.json").read_text(encoding="utf-8"))
+        value = (data.get("env") or {}).get("SHARED_KG_COLLECTION") or ""
+        return str(value).strip()
+    except Exception:  # noqa: BLE001 — unreadable config ⇒ nothing to target
+        return ""
+
+
+def retry_kg_seed_shared(ctx: RetryContext) -> RetryResult:
+    """Re-run the owed SHARED-collection seed for ``folder``.
+
+    v0.2.101 item 4: install.py used to BLOCK on this seed (the same
+    ``sync_knowledge_graph.py --all``, pointed at the shared class with
+    ``KG_COLLECTION=<shared>`` in the child env). It is now enqueued instead,
+    so the owed work needs this handler.
+
+    It stamps NOTHING: the context triple install.py persists — including
+    ``last_installed_shared_kg_collection`` — describes the PER-PROJECT seed,
+    and ``retry_kg_seed`` is its stamping home. The paired clear is the
+    script's own narrow one (``_clear_shared_seed_deferral``): only a fully
+    successful ``--all`` that TARGETED the shared class retires the row, which
+    is exactly what :func:`condition_cleared` re-reads.
+
+    Returns :data:`SKIPPED` when this folder has no shared collection
+    configured — there is genuinely nothing to seed, and the row is then the
+    user's to dismiss (matching the pre-v0.2.91 disposition for a condition
+    that cannot resolve itself).
+    """
+    script = _sync_script(ctx.folder)
+    if script is None:
+        return RetryResult(ctx.condition_id, SKIPPED, "no sync_knowledge_graph.py found")
+    target = _shared_collection_for(ctx.folder)
+    if not target:
+        return RetryResult(
+            ctx.condition_id, SKIPPED,
+            "no SHARED_KG_COLLECTION is configured for this folder — nothing "
+            "to seed into",
+        )
+    keys = ("KG_COLLECTION", "KG_BASE_DIR", "KG_SYNC_PROJECT_ROOT")
+    prev = {k: os.environ.get(k) for k in keys}
+    os.environ["KG_COLLECTION"] = target
+    os.environ["KG_BASE_DIR"] = str(ctx.folder)
+    os.environ["KG_SYNC_PROJECT_ROOT"] = str(ctx.folder)
+    try:
+        rc = ctx.run([ctx.interpreter(), str(script), "--all"])
+    finally:
+        for key, value in prev.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+    if rc == 0:
+        return RetryResult(ctx.condition_id, RETRIED, "shared kg sync --all completed")
+    return RetryResult(ctx.condition_id, FAILED, f"shared kg sync --all exited {rc}")
 
 
 def retry_code_graph_walk(ctx: RetryContext) -> RetryResult:
@@ -622,6 +829,11 @@ class Handler:
 #: here fails ``tests/test_v0291_retry_dispatch.py``.
 HANDLERS: dict[str, Handler] = {
     "kg_seed": Handler(retry_kg_seed, TEXT_BACKEND),
+    # v0.2.101 item 4: install.py enqueues the SHARED-collection seed too
+    # (it used to block on it). Same shipped child, different target
+    # collection — a distinct handler keeps each retry unambiguous about
+    # which class it is filling.
+    "kg_seed_shared": Handler(retry_kg_seed_shared, TEXT_BACKEND),
     # WP-3 review MAJOR-1: `code_graph_walk`'s handler does a BARE analyzer
     # walk that never enters the resync driver, so the driver-side verdict
     # gate cannot see it — without this flag, a stale-but-UP service passes
@@ -1225,6 +1437,19 @@ def _log_path_for_stamp(stamp: str) -> Optional[Path]:
         return None
 
 
+def detached_log_glob() -> Optional[str]:
+    """The glob a freshly-spawned driver's log matches, for install output.
+
+    v0.2.101 item 4: the install tells the user the seed continues in the
+    background and where to watch it. The exact filename carries a timestamp
+    chosen inside :func:`spawn_detached`, so the caller names the glob
+    (``<vct_root_dir>/logs/deferral-retry-*.log``). ``None`` when the logs dir
+    cannot be resolved.
+    """
+    path = _log_path_for_stamp("*")
+    return str(path) if path is not None else None
+
+
 def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
     """Record the auto-resolution the CHILD performed. Soft-fail.
 
@@ -1253,12 +1478,20 @@ def _record_resolution(folder: Path, condition_id: str, detail: str) -> None:
 _DETACHED_CHILDREN: list = []
 
 
-def spawn_detached(folder: Path, *, python: str = "") -> bool:
+def spawn_detached(
+    folder: Path, *, python: str = "", extra_env: Optional[Mapping[str, str]] = None
+) -> bool:
     """Spawn ``python -m vco_lib.deferral_retry --folder <folder>`` detached.
 
     Used by the session-start hook: the hook must return in milliseconds, and
     a KG seed can take minutes. Returns True when the child was launched (NOT
     when the retry succeeded — nobody waits for that).
+
+    *extra_env* overlays the child's environment (v0.2.101 item 4): install.py
+    passes the ACTIVE_EMBEDDING / EMBEDDING_MODEL pair the seed must embed with
+    plus the context triple this driver stamps after a proven seed. Overlaid
+    AFTER :func:`vco_lib.install_companions.detached_child_env`, so the caller's
+    values win over anything the scrub left behind.
 
     Child stdout/stderr go to ``<vct_root_dir>/logs/deferral-retry-*.log`` so a
     driver that dies mid-run leaves a record (the R-5 lesson: DEVNULL is how a
@@ -1300,6 +1533,8 @@ def spawn_detached(folder: Path, *, python: str = "") -> bool:
         "stdin": subprocess.DEVNULL,
         "env": detached_child_env(),  # outlives the caller: no relaunch record
     }
+    if extra_env:
+        kwargs["env"] = {**kwargs["env"], **{k: str(v) for k, v in extra_env.items()}}
     if os.name == "posix":
         kwargs["start_new_session"] = True
     try:

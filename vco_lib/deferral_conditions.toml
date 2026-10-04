@@ -352,6 +352,27 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-4): a service recreate was refused because the data location of the running container could not be positively matched to the effective compose config. Registered ahead of its emitter (WP-07, `vco_lib.data_identity`), which runs inside install.py step 5."
 
+[conditions.compose_gpu_device_missing]
+class = "action_required"
+owner = "vco_lib.gpu_verify"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 (plan items 1+5): a GPU was expected in the running \
+container (the GPU compose overlay was applied, or the host has an NVIDIA GPU \
+while the stack composed CPU-only), and `<runtime> inspect` shows the \
+container holds NO GPU device — the 2026-09-29 incident shape (an external \
+docker-compose provider silently dropped the podman CDI `devices:` spec; \
+Ollama then served every embedding on CPU for days with a green install). \
+The row's recipe recreates the stack with a CDI-capable compose tool \
+(podman-compose), regenerates the nvidia-ctk CDI spec and re-runs the \
+update. Emitted by `vco_lib.gpu_verify` from install.py step 5 \
+(`vco_lib.install_services_up`, after a successful compose-up and up front \
+when the only compose tool is a docker-compose delegate) and from the \
+GPU-safe wrappers' success path (`scripts/launch-claude-mcp-stack.{sh,ps1}` \
+via `python -m vco_lib.gpu_verify`); a probe that could not tell emits \
+NOTHING. Re-detected every install run and every wrapper boot on a GPU \
+host."""
+
 [conditions.ollama_not_ready_at_update]
 class = "auto_retryable"
 owner = "install.py"
@@ -1215,6 +1236,27 @@ content-hash gated so the retry re-embeds only what never landed). The \
 paired clear is NARROW by design (decision #12 shape): only the end of a \
 FULLY successful `--all` tree sync resolves it — a clean file-list or \
 docs-only run proves nothing about the nodes an earlier run failed on."""
+
+[conditions.kg_sync_shared_pending]
+class = "auto_retryable"
+owner = "templates/scripts/sync_knowledge_graph.py"
+clear_probe = "paired-resolution"
+retry_action = "retry:py:kg_seed_shared"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 item 4: the install used to BLOCK on the SHARED-collection \
+seed (`sync_knowledge_graph.py --all` with `KG_COLLECTION=<shared>` in the \
+child env). It is now enqueued to the detached retry driver, so the owed work \
+needs its own row — the per-project seed's `kg_sync_failures_pending` is a \
+different target and a different handler. `retry:py:kg_seed_shared` re-runs the \
+same shipped script against the shared class (content-hash gated, so a retry \
+over an already-seeded collection re-embeds only what never landed). The \
+paired clear is NARROW and lives with the run that proves it: \
+`sync_knowledge_graph.py::_clear_shared_seed_deferral`, called only at the end \
+of a FULLY successful `--all` whose COLLECTION_NAME was the SHARED collection \
+— a normal project run targets its own class and deliberately clears nothing. \
+install.py is a second emitter of this id (the same shape as \
+`kg_sync_failures_pending`); the row's class, retry and clear are correct as \
+they stand."""
 
 [conditions.codegraph_embed_resync_pending]
 class = "auto_retryable"

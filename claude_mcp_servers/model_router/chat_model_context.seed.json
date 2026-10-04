@@ -9,15 +9,18 @@
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.z.ai/guides/llm/glm-5.3"
+      "text_only": true,
+      "source": "https://docs.z.ai/guides/llm/glm-5.3",
+      "source_note": "text_only=true: the vendor page states verbatim 'GLM-5.3 currently supports text-only inputs'. Live confirmation (parity gap 7): an image block routed here returns 200 with the model replying 'I cannot see images from URLs' (fixture zai-image.body) — a silent degrade the flag lets the gateway pre-empt by replacing the image with a text note. The SAME id is also served by the qwen route; text-only is a property of the MODEL, so this one row answers for both (the vendor-blind ruling lookup() already makes for the shared window)."
     },
     "glm-5.3-flash": {
       "vendor": "zai",
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
+      "text_only": false,
       "source": "https://docs.z.ai/guides/vlm/glm-5.3-flash",
-      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there)."
+      "source_note": "Documented under /guides/vlm/ (the /guides/llm/ path 308-redirects there). text_only=false: the VLM page states 'Native multimodal input supporting images, videos, and files' — GLM-5.3-Flash SEES images, so image blocks are forwarded untouched (unlike glm-5.3)."
     },
     "glm-5.1": {
       "vendor": "zai",
@@ -74,16 +77,18 @@
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
+      "text_only": false,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "Window and output are the vendor's PER-MODEL figures on the cited page. The 200000 this row carried until v0.2.98 came from the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; that citation is gone. The vendor writes output as '128k'/'64k' without expanding it — its DeepSeek '384k' expands to 393,216 (= 384*1024) — so the decimal readings are the non-overstating choice. The same vendor's Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384) with no stated rationale, but VCO writes no such knob (docs/CONFIGURATION.md, 'Panel mode'), so the 1M here is the documented model window. (Qwen3.8 table.)"
+      "source_note": "Window and output are the vendor's PER-MODEL figures on the cited page. The 200000 this row carried until v0.2.98 came from the Claude Code integration page's sentence about the CLIENT's default window, which is not a per-model spec; that citation is gone. The vendor writes output as '128k'/'64k' without expanding it — its DeepSeek '384k' expands to 393,216 (= 384*1024) — so the decimal readings are the non-overstating choice. The same vendor's Claude Code config for this endpoint sets CLAUDE_CODE_MAX_CONTEXT_TOKENS=983616 (1,000,000 - 16,384) with no stated rationale, but VCO writes no such knob (docs/CONFIGURATION.md, 'Panel mode'), so the 1M here is the documented model window. (Qwen3.8 table.) text_only=false: QwenCloud's Vision page (developer-guides/multimodal/vision) uses qwen3.8-max throughout its image_url / video / MultiModalConversation examples, so it accepts image input; image blocks are forwarded untouched."
     },
     "qwen3.8-flash": {
       "vendor": "qwen",
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
+      "text_only": false,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "See qwen3.8-max; same page, Qwen3.8 table."
+      "source_note": "See qwen3.8-max; same page, Qwen3.8 table. text_only=false (conservative): the Qwen3.8 series is multimodal (qwen3.8-max is confirmed vision-capable on the Vision page); no flash-specific image example was found, so the flag stays false — a false 'text_only' would strip images a vision model could use, while leaving it false only preserves today's passthrough."
     },
     "qwen3.7-max": {
       "vendor": "qwen",
@@ -114,24 +119,27 @@
       "context_window": 1000000,
       "max_output": 393216,
       "window_1m": true,
+      "text_only": true,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024."
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. text_only=true: the QwenCloud DeepSeek page (developer-guides/third-party-models/deepseek) states 'All other DeepSeek models accept text input only' — only deepseek-v4.1-flash takes images."
     },
     "deepseek-v4-flash-0731": {
       "vendor": "qwen",
       "context_window": 1000000,
       "max_output": 393216,
       "window_1m": true,
+      "text_only": true,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-mode model list (probe 2026-09-22)."
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-mode model list (probe 2026-09-22). text_only=true: per the DeepSeek page, 'All other DeepSeek models accept text input only' (deepseek-v4.1-flash is the sole vision-capable DeepSeek model)."
     },
     "deepseek-v4.1-flash": {
       "vendor": "qwen",
       "context_window": 1000000,
       "max_output": 393216,
       "window_1m": true,
+      "text_only": false,
       "source": "https://docs.qwencloud.com/developer-guides/getting-started/text-generation-models",
-      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates."
+      "source_note": "See qwen3.8-max (same page). Also cited: the deepseek page, whose 'Parameter defaults' give max_tokens 393,216 — a budget SHARED between output and thinking, so max_output here is that shared ceiling, not an output-only one. 384k expands to 393,216 because the vendor multiplies by 1024. Present on the subscription's live compatible-model list (probe 2026-09-22), which the previously cited integration page predates. text_only=false: the QwenCloud DeepSeek page states verbatim 'deepseek-v4.1-flash has native visual understanding and accepts both text and image input, returning text. All other DeepSeek models accept text input only.' — so this model SEES images and its blocks are forwarded untouched."
     },
     "claude-fable-5-1": {
       "vendor": "anthropic",

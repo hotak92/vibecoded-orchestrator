@@ -87,6 +87,10 @@ export interface ChatModelContextDraft {
   context_window: string;
   max_output: string;
   window_1m: boolean;
+  /** The image-capability flag — a checkbox like `window_1m`, so a user
+   *  EDIT of a flagged row cannot silently drop the flag (a draft that
+   *  lost it would re-save the row as image-capable). */
+  text_only: boolean;
   source: string;
   source_note: string;
 }
@@ -100,6 +104,7 @@ export function draftFromRow(row: ChatModelContextRow): ChatModelContextDraft {
     // as a BLANK field, never as a "0" that reads like a real token count.
     max_output: row.max_output > 0 ? String(row.max_output) : '',
     window_1m: row.window_1m,
+    text_only: row.text_only,
     source: row.source,
     source_note: row.source_note,
   };
@@ -112,6 +117,7 @@ export function emptyDraft(): ChatModelContextDraft {
     context_window: '',
     max_output: '',
     window_1m: false,
+    text_only: false,
     source: '',
     source_note: '',
   };
@@ -241,6 +247,7 @@ export function validateDraft(
       context_window: contextWindow as number,
       max_output: maxOutput as number,
       window_1m: draft.window_1m,
+      text_only: draft.text_only,
       source,
       source_note: draft.source_note.trim(),
     },

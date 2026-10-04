@@ -23,6 +23,9 @@ export interface ChatModelContextRow {
   max_output: number;
   /** Advertise this id to Claude Code as `<id>[1m]`. */
   window_1m: boolean;
+  /** The vendor states this model takes TEXT-ONLY input — it cannot see an
+   *  image block; the gateway replaces image blocks with a text note. */
+  text_only: boolean;
   /** The official page these numbers were read from. Never empty. */
   source: string;
   /** Optional caveat that travels with the citation. */
@@ -40,6 +43,7 @@ export interface ChatModelContextInput {
   context_window: number;
   max_output: number;
   window_1m: boolean;
+  text_only: boolean;
   source: string;
   source_note: string;
 }

@@ -135,6 +135,25 @@ function literalArg(call: Node): unknown {
   return a?.type === 'Literal' ? a.value : undefined;
 }
 
+// ─── UpdateAllProjectsModal: a skipped row says why (v0.2.101) ──────────
+
+describe('UpdateAllProjectsModal — skipped rows show their reason', () => {
+  it('renders r.skip_reason inside the per-project row loop', () => {
+    const rowLoop = [...walk(MODAL.fragment)].find(
+      (n) => n.type === 'EachBlock' && (n.context as Node | undefined)?.name === 'r',
+    );
+    expect(rowLoop, 'no `{#each … as r}` row loop found').toBeTruthy();
+    const shown = [...walk(rowLoop!.body)].some(
+      (n) =>
+        n.type === 'ExpressionTag' &&
+        (n.expression as Node).type === 'MemberExpression' &&
+        isIdent((n.expression as Node).object, 'r') &&
+        ((n.expression as Node).property as Node).name === 'skip_reason',
+    );
+    expect(shown, 'the row loop never renders {r.skip_reason}').toBe(true);
+  });
+});
+
 // ─── UpdateAllProjectsModal: reaching `done` always tells the host ──────
 
 describe('UpdateAllProjectsModal — the done phase notifies the host', () => {

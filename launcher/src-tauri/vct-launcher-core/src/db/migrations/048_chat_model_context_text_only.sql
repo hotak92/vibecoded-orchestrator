@@ -1,0 +1,47 @@
+-- SPDX-License-Identifier: AGPL-3.0-or-later
+-- launcher.db — chat_model_context.text_only, the image-capability flag
+-- (migration 048, v0.2.101)
+--
+-- WHAT THE COLUMN DECIDES: `1` = the vendor's own page states this model
+-- takes TEXT-ONLY input (it cannot see an image block). The model gateway's
+-- reader (claude_mcp_servers/model_router/context_table.py, parity gap 7)
+-- reads the flag from the EXPORTED table and, for a flagged model, replaces
+-- every `type == "image"` block with a short text note (guarded, with an
+-- access-line record) — pre-empting the silent degrade the live
+-- zai-image.body capture showed (glm-5.3 replies "I cannot see images from
+-- URLs" with HTTP 200). `0` = images pass through untouched.
+--
+-- WHY THE LAUNCHER TABLE NEEDS IT: the launcher's seed parser
+-- (chat_model_context.rs::parse_document) mirrors the shipped seed
+-- field by field and was silently DROPPING `text_only` — the pane could not
+-- show the flag, a reseed could not carry it, and the export could not
+-- publish it. This migration gives the mirror the column the seed already
+-- has (the shipped seed states it on the rows the vendor page decides,
+-- absent = false).
+--
+-- CONSERVATIVE DEFAULT: existing rows backfill to 0 (false), the same
+-- direction the gateway reader defaults an absent key: an unflagged model
+-- keeps its image blocks exactly as the client sent them. Set the flag ONLY
+-- on positive doc evidence — a vision-capable model wrongly flagged would
+-- drop images it could have used.
+--
+-- SHAPE: plain `ALTER TABLE ... ADD COLUMN` (the migration-030 pattern —
+-- no CHECK to widen, so no table rebuild like 021/038/046). NOT NULL with a
+-- non-NULL default is allowed; the `IN (0, 1)` domain CHECK matches
+-- window_1m / user_edited. No index, no FK — the table has neither (043).
+--
+-- ATOMIC PAIRING (B-2 lesson, verbatim from migration 046): vco_lib/
+-- schema_versions.py's LAUNCHER_DB_TABLE_SET_VERSION bumps 47 -> 48 in the
+-- SAME merge as this file, then `python scripts/regen_schema_versions_json.py`
+-- refreshes the committed snapshot — a Python-side bump landing ahead of
+-- this registration would stamp a phantom schema version, and either half
+-- landing alone reds the two-sided parity gates (tests/
+-- test_v52_ag_schema_versions.py and launcher/src-tauri/tests/
+-- schema_versions_rust_parity.rs).
+--
+-- Forward-only, idempotent (the migrations runner gates by version in
+-- `_schema_migrations`; ADD COLUMN converges on a crash-window replay).
+
+ALTER TABLE chat_model_context
+    ADD COLUMN text_only INTEGER NOT NULL DEFAULT 0
+    CHECK (text_only IN (0, 1));

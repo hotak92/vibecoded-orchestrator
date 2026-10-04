@@ -316,6 +316,12 @@ class OrchestratorRootRebindTest(unittest.TestCase):
 
         # Pin PROJECT_ROOT to tmp so the sync subprocess env build doesn't
         # touch the real install dir.
+        spawns: list = []
+
+        def _fake_spawn(folder, *, python="", extra_env=None):
+            spawns.append({"folder": folder, "env": dict(extra_env or {})})
+            return True
+
         with mock.patch.object(
             install, "_is_orchestrator_root_install", return_value=False
         ), mock.patch.object(
@@ -329,6 +335,10 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             # the capture must keep seeing it or the no-sync assertions
             # would pass vacuously.
             install, "run_child_logged", side_effect=self._fake_run
+        ), mock.patch(
+            # v0.2.101 item 4: the shared seed is ENQUEUED to the detached
+            # driver for a non-root install instead of awaited here.
+            "vco_lib.deferral_retry.spawn_detached", side_effect=_fake_spawn,
         ):
             errors = install._seed_weaviate_shared_kg_only(
                 args=_make_args(),
@@ -351,15 +361,15 @@ class OrchestratorRootRebindTest(unittest.TestCase):
             "per-project install must not touch shared binding",
         )
 
-        # The sync subprocess WAS invoked (legacy path).
-        sync_calls = [
-            c for c in self.captured_cmds
-            if any("sync_knowledge_graph" in part for part in c)
-        ]
-        self.assertTrue(
-            len(sync_calls) >= 1,
-            f"legacy shared-seed sync MUST run for non-orchestrator-root, "
+        # The shared seed WAS owed (v0.2.101: enqueued to the detached driver,
+        # which runs `sync_knowledge_graph.py --all` against the shared class).
+        self.assertEqual(
+            len(spawns), 1,
+            f"the shared seed MUST be enqueued for non-orchestrator-root, "
             f"got: {self.captured_cmds!r}",
+        )
+        self.assertEqual(
+            spawns[0]["env"].get("VCT_KG_SEED_CTX_SHARED_KG_COLLECTION"), shared,
         )
 
     # ── Test 4: launcher.db missing → soft-fail ───────────────────────────

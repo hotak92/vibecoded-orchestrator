@@ -188,15 +188,18 @@ from .usage import (
     note_count_substitution,
     read_identity,
 )
+from .effort import translate_effort
 from .tool_ids import (
     COMPACT_JSON,
     JSON_BUFFER_LIMIT_BYTES,
     BoundedIdMap,
     RepairStats,
     SseIdRewriter,
+    is_server_tool_type,
     normalise_vendor_response,
     restore_vendor_ids,
     sanitise_for_anthropic,
+    unmark_thinking_signatures,
 )
 from .vendors import (
     ANTHROPIC_FAMILY,
@@ -1293,6 +1296,157 @@ def _images_field(payload: Any) -> str:
         return IMAGES_UNCOUNTED
 
 
+# ── item (f): text-only models get a text note where an image block was ──────
+#: The text block that REPLACES an image when the routed model is text-only
+#: (``chat_model_context.seed.json``'s ``text_only`` flag). ``{model}`` is the
+#: bare forwarded id. Short and honest: it tells the model an image was there
+#: and was dropped for a named reason, instead of letting it answer as though
+#: nothing were attached — the silent degrade the live ``zai-image.body``
+#: capture shows (glm-5.3: "I cannot see images from URLs").
+TEXT_ONLY_IMAGE_NOTE = (
+    "[image omitted — {model} is a text-only model and cannot see images]"
+)
+
+
+def _replace_image_blocks(blocks: Any, note: str) -> tuple[Any, int]:
+    """Replace every ``type == "image"`` block with a text ``note``.
+
+    Mirrors :func:`_count_image_blocks`'s traversal exactly — walking into any
+    nested ``content`` list, because a subagent that read an image file puts
+    the block inside a ``tool_result``'s own ``content[]``, not at the top of a
+    message. Returns ``(blocks, replaced_count)``; the input is returned
+    UNCHANGED (same object) when nothing was replaced, so an image-free
+    request is never re-serialised.
+    """
+    if not isinstance(blocks, list):
+        return blocks, 0
+    count = 0
+    out: list[Any] = []
+    for block in blocks:
+        if not isinstance(block, dict):
+            out.append(block)
+            continue
+        if block.get("type") == "image":
+            out.append({"type": "text", "text": note})
+            count += 1
+            continue
+        new_block = block
+        if "content" in block:
+            new_content, nested = _replace_image_blocks(block["content"], note)
+            if nested:
+                new_block = dict(block)
+                new_block["content"] = new_content
+                count += nested
+        out.append(new_block)
+    return (out, count) if count else (blocks, 0)
+
+
+def _strip_images_for_text_only(payload: Any, model_id: str) -> tuple[Any, int]:
+    """Replace image blocks in ``payload['messages']`` for a text-only model.
+
+    Returns ``(payload, replaced_count)``; ``payload`` is the same object when
+    there was nothing to replace. The caller decides whether the model is
+    text-only (from the catalog row) — this is the mechanism, not the policy.
+    """
+    if not isinstance(payload, dict):
+        return payload, 0
+    note = TEXT_ONLY_IMAGE_NOTE.format(model=model_id)
+    messages, count = _replace_image_blocks(payload.get("messages"), note)
+    if not count:
+        return payload, 0
+    patched = dict(payload)
+    patched["messages"] = messages
+    return patched, count
+
+
+def _apply_text_only_images(
+    payload: Any, gateway: "Gateway", vendor_id: str, model_id: str,
+) -> tuple[Any, int]:
+    """Replace image blocks IFF the catalog flags ``model_id`` text-only.
+
+    One guarded call covers both the catalog lookup and the rewrite, so a
+    defect in either abandons the whole step and the client's own bytes go on
+    unchanged (:func:`_guarded`). The flag is a property of the MODEL, read
+    from the per-model catalog row (``chat_model_context.seed.json``'s
+    ``text_only``), so the one ``glm-5.3`` row answers for both the z.ai and
+    the qwen route that serve it. Returns ``(payload, replaced_count)``.
+    """
+    row = gateway.context.current().lookup(model_id, vendor_id)
+    if row is None or not row.text_only:
+        return payload, 0
+    return _strip_images_for_text_only(payload, model_id)
+
+
+# ── item (e): Anthropic server tools a vendor route cannot serve ─────────────
+def _partition_server_tools(payload: Any) -> "Optional[tuple[list, list]]":
+    """Split ``payload['tools']`` into ``(server_tools, ordinary_tools)``.
+
+    ``None`` when the request declares no tools at all (nothing to decide). A
+    tool is a SERVER tool when its ``type`` names one
+    (:func:`vco_lib.transcript_repair.is_server_tool_type`) — the shape of
+    Claude Code's WebSearch sub-request, ``tools:[{"type":"web_search_20250305",
+    …}]``. A vendor route cannot serve these (parity gap 6, live: z.ai HTTP
+    500, qwen a silent no-op that answers from its weights), so the handler
+    needs the split to decide between refusing (only server tools) and
+    stripping (mixed).
+    """
+    if not isinstance(payload, dict):
+        return None
+    tools = payload.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return None
+    server: list[Any] = []
+    ordinary: list[Any] = []
+    for tool in tools:
+        if isinstance(tool, dict) and is_server_tool_type(tool.get("type")):
+            server.append(tool)
+        else:
+            ordinary.append(tool)
+    return server, ordinary
+
+
+def _strip_server_tools(payload: Any) -> tuple[Any, int]:
+    """Drop the server tools from ``payload['tools']``, keeping the rest.
+
+    Returns ``(payload, stripped_count)``; ``payload`` is the same object when
+    nothing was stripped. The mixed case of item (e): an ordinary tool the
+    request also declared still works, so the request is forwarded rather than
+    failed — only the tools the vendor cannot serve are removed.
+    """
+    if not isinstance(payload, dict):
+        return payload, 0
+    tools = payload.get("tools")
+    if not isinstance(tools, list) or not tools:
+        return payload, 0
+    kept = [
+        tool for tool in tools
+        if not (isinstance(tool, dict) and is_server_tool_type(tool.get("type")))
+    ]
+    stripped = len(tools) - len(kept)
+    if not stripped:
+        return payload, 0
+    patched = dict(payload)
+    patched["tools"] = kept
+    return patched, stripped
+
+
+def _server_tools_refusal(vendor_name: str) -> str:
+    """The gateway-authored 400 text for a server-tools-only vendor request.
+
+    Names the vendor and says what still works, because the alternative is the
+    vendor's own opaque answer (z.ai's HTTP 500 ``"Internal Network Failure"``,
+    qwen's silent no-op) which tells the user nothing they can act on.
+    """
+    return (
+        f"Anthropic server tools (web_search, web_fetch, code_execution) are "
+        f"not available on the {vendor_name} route: {vendor_name} answers them "
+        f"with an error or silently ignores them, so Claude Code's WebSearch "
+        f"would return nothing useful. Route this request to a first-party "
+        f"Claude model to use WebSearch. WebFetch and `curl` (via Bash) still "
+        f"work on {vendor_name}."
+    )
+
+
 def _access_line(
     *,
     requested: str,
@@ -1846,6 +2000,13 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
     #: line in ``note`` rather than being logged separately, so one request
     #: still means one line.
     rewrite_failed = False
+    #: Per-transform access-line counters (items a/e/f). Each rides in ``note``
+    #: so an operator can see WHICH request-shaping fired without the gateway
+    #: logging any body. Zero/False on the first-party route and on the
+    #: over-buffer path, where the vendor transforms do not run.
+    effort_translated = False
+    server_tools_stripped = 0
+    text_only_images_omitted = 0
     if decision.is_anthropic:
         oauth = gateway.oauth.read()
         if oauth.token is None:
@@ -1880,17 +2041,54 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 rewrite_failed = True
             else:
                 forward_payload, repair = repaired
-                if repair.changed:
+                if repair.changed or repair.thinking_param_dropped:
                     mutated = True
                     logger.info(
-                        "model-gateway: repaired inherited tool blocks before "
-                        "the first-party route (%s) at message index(es) %s",
+                        "model-gateway: repaired inherited tool/thinking "
+                        "blocks before the first-party route (%s) at message "
+                        "index(es) %s",
                         repair.summary(),
                         ", ".join(str(i) for i in repair.touched_indexes) or "-",
                     )
     else:
         vendor = decision.vendor
         assert vendor is not None  # noqa: S101 — guaranteed by Route
+
+        # item (e): Anthropic server tools a vendor route cannot serve (z.ai
+        # 500s, qwen silently ignores them). Decided BEFORE the key so a
+        # server-tools-only request — the shape of Claude Code's WebSearch
+        # sub-request — gets the clear gateway-authored 400 even with no key
+        # configured. count_tokens is exempt: it executes nothing, so counting
+        # a server tool is harmless and refusing a count would be wrong.
+        if forward_payload is not None and not is_count_tokens:
+            partition = _guarded(
+                _partition_server_tools, forward_payload,
+                what="server-tool scan",
+            )
+            if partition is not _ABANDON and partition is not None:
+                server_tools, ordinary_tools = partition
+                if server_tools and not ordinary_tools:
+                    log_local(400, "server_tools_unsupported_on_vendor")
+                    return _json_error(
+                        400, "invalid_request_error",
+                        _server_tools_refusal(vendor_display_name(vendor)),
+                    )
+                if server_tools and ordinary_tools:
+                    # Mixed: strip what the vendor cannot serve, forward the
+                    # rest — NEVER fail a request that has an ordinary tool
+                    # that still works.
+                    stripped_pair = _guarded(
+                        _strip_server_tools, forward_payload,
+                        what="server-tool strip",
+                    )
+                    if stripped_pair is _ABANDON:
+                        rewrite_failed = True
+                    else:
+                        forward_payload, stripped = stripped_pair
+                        if stripped:
+                            mutated = True
+                            server_tools_stripped = stripped
+
         key_result = await gateway.keys.aresolve(vendor)
         if not key_result.key:
             log_local(503, "vendor_key_unavailable")
@@ -1913,11 +2111,76 @@ async def messages_handler(request: web.Request) -> web.StreamResponse:
                 if restored:
                     mutated = True
 
+            # item (c): hand the vendor back its OWN thinking signatures too —
+            # strip the gateway marker the response seam added, so the vendor
+            # sees its own bytes and never our prefix.
+            unmarked_pair = _guarded(
+                unmark_thinking_signatures,
+                forward_payload,
+                what="vendor thinking-signature restoration",
+            )
+            if unmarked_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, unmarked = unmarked_pair
+                if unmarked:
+                    mutated = True
+
+            # item (a): translate an effort value THIS (vendor, model) rejects
+            # (e.g. medium on qwen-route glm-5.3, a live 400). Accepted values
+            # are left byte-identical; a route with no policy is untouched.
+            effort_pair = _guarded(
+                translate_effort,
+                forward_payload,
+                vendor.vendor_id,
+                decision.forward_model,
+                what="effort translation",
+            )
+            if effort_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, effort_changed = effort_pair
+                if effort_changed:
+                    mutated = True
+                    effort_translated = True
+
+            # item (f): a text-only model gets a short text note where each
+            # image block was, instead of silently ignoring the image.
+            images_pair = _guarded(
+                _apply_text_only_images,
+                forward_payload,
+                gateway,
+                vendor.vendor_id,
+                decision.forward_model,
+                what="text-only image replacement",
+            )
+            if images_pair is _ABANDON:
+                rewrite_failed = True
+            else:
+                forward_payload, omitted = images_pair
+                if omitted:
+                    mutated = True
+                    text_only_images_omitted = omitted
+
     headers["Content-Type"] = "application/json"
     headers.setdefault("anthropic-version", DEFAULT_ANTHROPIC_VERSION)
 
     body: "bytes | AsyncIterator[bytes]"
     note = "note=rewrite_failed" if rewrite_failed else ""
+    # Per-transform notes (items a/e/f). Each says a request-shaping fired,
+    # with the count where one is meaningful, and none of them logs a body
+    # byte. Assembled here so they ride EVERY access line this request writes.
+    if effort_translated:
+        note = f"{note} note=effort_translated".strip()
+    if server_tools_stripped:
+        note = (
+            f"{note} note=server_tools_stripped={server_tools_stripped}".strip()
+        )
+    if text_only_images_omitted:
+        note = (
+            f"{note} "
+            f"note=text_only_images_omitted={text_only_images_omitted}".strip()
+        )
     if unparseable:
         # Byte for byte, headers and all. The upstream is the only party that
         # can say whether these bytes are a request.

@@ -38,6 +38,7 @@ from tests.common.launcher_db_fixture import (  # noqa: E402
     make_launcher_db,
 )
 from vco_lib import install_weaviate as _install_weaviate  # noqa: E402
+from vco_lib import deferral_retry  # noqa: E402
 import install  # noqa: E402
 
 
@@ -68,6 +69,53 @@ def _fake_venv_py(tmp_dir: Path) -> Path:
     return stub
 
 
+def _fail_if_the_seed_runs_inline(cmd, **kwargs):
+    """v0.2.101 item 4: the whole-tree seed is ENQUEUED, never awaited here.
+
+    Any other child (enrichment, the shared seed) still succeeds, so a test
+    opting into this stub only forbids the inline KG seed.
+    """
+    if "sync_knowledge_graph.py" in str(cmd):
+        raise AssertionError(f"the whole-tree seed must not run inline: {cmd}")
+
+    class _Ret:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    return _Ret()
+
+
+def _fail_if_the_full_seed_runs_inline(cmd, **kwargs):
+    """Only the WHOLE-TREE seed is forbidden; the small per-file diff stays
+    foreground (v0.2.101 item 4 — the driver can only run `--all`)."""
+    if "sync_knowledge_graph.py" in str(cmd) and "--all" in list(cmd):
+        raise AssertionError(f"the whole-tree seed must not run inline: {cmd}")
+
+    class _Ret:
+        returncode = 0
+        stdout = ""
+        stderr = ""
+
+    return _Ret()
+
+
+def _isolate_service_endpoints(case) -> None:
+    """Drop the `ollama_owed` flag a sibling test's down-path leaves behind.
+
+    ``install._SERVICE_ENDPOINTS`` is a module global; install's own code sets
+    ``ollama_owed`` inside it, and no monkeypatch tracks that key, so a test
+    file exercising the Ollama-down path leaks it into every later test in the
+    same process — ``_seed_weaviate`` then short-circuits ("Skipping the KG
+    seed: Ollama is down") before this file's seed step runs. Pre-existing and
+    not this release's: made harmless here so THIS file is order-independent.
+    """
+    import install as _install
+
+    _install._SERVICE_ENDPOINTS.pop("ollama_owed", None)
+    case.addCleanup(_install._SERVICE_ENDPOINTS.pop, "ollama_owed", None)
+
+
 # ─── Tests ────────────────────────────────────────────────────────────────────
 
 
@@ -86,6 +134,7 @@ class SeedDiffGateTest(unittest.TestCase):
         self.addCleanup(_gate.stop)
         self.tmp = tempfile.mkdtemp()
         os.environ["VCT_STATE_DIR"] = self.tmp
+        _isolate_service_endpoints(self)
         # Minimal matching env to simulate "no context change".
         os.environ["ACTIVE_EMBEDDING"] = "qwen3"
         os.environ["KG_COLLECTION"] = "TestProject_KnowledgeGraph"
@@ -138,8 +187,18 @@ class SeedDiffGateTest(unittest.TestCase):
         """Run _seed_weaviate with mocked fs + Weaviate helpers.
 
         Returns: list of subprocess.run call args (what the gate invoked).
+            A detached spawn is recorded as ``("__SPAWN_DETACHED__", folder)``
+            and its ``extra_env`` on ``self.spawns``.
         """
         captured_calls: list[tuple] = []
+        self.spawns: list[dict] = []
+
+        def _fake_spawn(folder, *, python="", extra_env=None):
+            # v0.2.101 item 4: the whole-tree seed is ENQUEUED to the detached
+            # driver instead of run inline; record it like any other call.
+            self.spawns.append({"folder": Path(folder), "env": dict(extra_env or {})})
+            captured_calls.append(("__SPAWN_DETACHED__", str(folder)))
+            return True
 
         def _fake_subprocess_run(cmd, **kwargs):
             captured_calls.append(tuple(cmd))
@@ -190,10 +249,33 @@ class SeedDiffGateTest(unittest.TestCase):
                # runs and the captures keep recording the seed argvs.
                install, "run_child_logged",
                side_effect=_fake_subprocess_run,
+           ), mock.patch(
+               # v0.2.101 item 4: the whole-tree seed leaves via this spawn.
+               "vco_lib.deferral_retry.spawn_detached", side_effect=_fake_spawn,
            ):
             install._seed_weaviate(args)
 
         return captured_calls
+
+    def assert_enqueued_full_seed(self, calls) -> None:
+        """v0.2.101 item 4: the whole-tree seed left via the detached driver.
+
+        The intent each caller pins ("a fresh install / a profile change / a
+        rename must still cause the FULL seed") is unchanged; what changed is
+        the transport — install.py enqueues it and returns instead of waiting
+        for `sync_knowledge_graph.py --all`.
+        """
+        self.assertEqual(len(self.spawns), 1,
+                         f"expected exactly one detached seed spawn: {calls}")
+        self.assertEqual(
+            self.spawns[0]["env"].get(deferral_retry.SEED_CTX_ENV_ACTIVE_EMBEDDING),
+            os.environ["ACTIVE_EMBEDDING"],
+            "the driver must carry the context the seed embeds against",
+        )
+        self.assertEqual(
+            [c for c in calls if "sync_knowledge_graph.py" in str(c)], [],
+            "the whole-tree seed must not be awaited inline",
+        )
 
     # ── Test 1: empty diff → skip sync entirely ───────────────────────────
 
@@ -337,11 +419,7 @@ class SeedDiffGateTest(unittest.TestCase):
                                "failed": 2, "failures": []},
         )
 
-        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
-        self.assertTrue(
-            any("--all" in c for c in kg_sync_calls),
-            "an incomplete enrichment must fall back to the full re-embed",
-        )
+        self.assert_enqueued_full_seed(calls)
 
     def test_absent_previous_profile_still_forces_full_sync(self):
         """No RECORDED profile is not a model change — it is no record.
@@ -368,8 +446,7 @@ class SeedDiffGateTest(unittest.TestCase):
             [c for c in calls if "vco_lib.embedding_enrichment" in str(c)],
             "an absent record must not be treated as a slot change",
         )
-        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
-        self.assertTrue(any("--all" in c for c in kg_sync_calls))
+        self.assert_enqueued_full_seed(calls)
 
     # ── Test 4: collection rename → full sync ────────────────────────────
 
@@ -392,9 +469,7 @@ class SeedDiffGateTest(unittest.TestCase):
             stored_hashes=hashes,
         )
 
-        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
-        found_all = any("--all" in c for c in kg_sync_calls)
-        self.assertTrue(found_all, "collection rename must force --all sync")
+        self.assert_enqueued_full_seed(calls)
         # v0.2.95 WP-6: the half of leg (b) that enrichment CANNOT answer.
         # A renamed class has no rows to enrich — filling a slot on nothing
         # would report a clean pass and stamp a collection that is empty.
@@ -429,7 +504,11 @@ class SeedDiffGateTest(unittest.TestCase):
     # ── Test 6: fresh install (no --update flag) → full sync ─────────────
 
     def test_fresh_install_runs_full_sync(self):
-        """On fresh install (args.update=False), --all is always used."""
+        """On fresh install (args.update=False), the whole-tree seed is owed.
+
+        v0.2.101 item 4: it is ENQUEUED to the detached driver — which runs
+        `sync_knowledge_graph.py --all` — instead of being awaited inline.
+        """
         file_a = f"{self.tmp}/knowledge/concepts/foo.md"
         hashes = {file_a: "aabbcc"}
 
@@ -439,9 +518,7 @@ class SeedDiffGateTest(unittest.TestCase):
             args=_make_args(update=False),
         )
 
-        kg_sync_calls = [c for c in calls if "sync_knowledge_graph.py" in str(c)]
-        found_all = any("--all" in c for c in kg_sync_calls)
-        self.assertTrue(found_all, "fresh install must always run --all sync")
+        self.assert_enqueued_full_seed(calls)
 
 
 class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
@@ -469,6 +546,7 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         self.addCleanup(_gate.stop)
         self.tmp = tempfile.mkdtemp()
         os.environ["VCT_STATE_DIR"] = self.tmp
+        _isolate_service_endpoints(self)
         os.environ["ACTIVE_EMBEDDING"] = "qwen3"
         os.environ["KG_COLLECTION"] = "TestProject_KnowledgeGraph"
         os.environ["SHARED_KG_COLLECTION"] = ""  # shared seed skipped
@@ -525,6 +603,13 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         shape, which must still work.
         """
         tmp_dir = Path(self.tmp)
+        self.spawns: list[dict] = []
+
+        def _fake_spawn(folder, *, python="", extra_env=None):
+            # v0.2.101 item 4: the whole-tree seed is enqueued, not awaited.
+            self.spawns.append({"folder": Path(folder), "env": dict(extra_env or {})})
+            return True
+
         scripts_dir = tmp_dir / ".claude" / "scripts"
         scripts_dir.mkdir(parents=True, exist_ok=True)
         if write_sync_script:
@@ -553,6 +638,9 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             # v0.2.96 WP-1: see _run_seed_with_mocks — the sync child now
             # spawns via run_child_logged.
             install, "run_child_logged", side_effect=subprocess_side_effect,
+        ), mock.patch(
+            # v0.2.101 item 4: the whole-tree seed leaves via this spawn.
+            "vco_lib.deferral_retry.spawn_detached", side_effect=_fake_spawn,
         ):
             install._seed_weaviate(
                 _make_args(), deferral_report=deferral_report,
@@ -585,52 +673,56 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
     # repeated leg-(b) `--all` re-embeds only what never landed. Cheap enough
     # that honesty wins.
 
-    def test_leg_b_nonzero_exit_does_not_advance_the_context_triple(self):
-        """A context change that did not finish must not be recorded as done."""
-        import subprocess as _sp
+    def test_leg_b_is_enqueued_and_install_does_not_advance_the_context_triple(self):
+        """The context change is OWED, not recorded — v0.2.101 item 4.
 
-        def _raise_nonzero(cmd, **kwargs):
-            if "sync_knowledge_graph.py" in str(cmd):
-                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
-            class _Ret:
-                returncode = 0
-            return _Ret()
-
-        self._run_seed(subprocess_side_effect=_raise_nonzero)
+        Pre-v0.2.101 install.py observed the child's exit code and withheld the
+        triple on a non-zero one. It observes nothing now: the seed is
+        enqueued, install.py writes NO triple, and the detached handler stamps
+        it only after the child's own paired clear proves the seed ran against
+        that context (pinned in tests/test_v02101_seed_and_data_keys.py).
+        """
+        self._run_seed(subprocess_side_effect=_fail_if_the_seed_runs_inline)
 
         rows = self._read_triple()
         self.assertIsNone(
             rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
-            "WP-4: an INCOMPLETE leg-(b) re-embed must not advance "
-            "last_installed_active_embedding — that marker is the only thing "
-            "that makes the next --update try again",
+            "an ENQUEUED leg-(b) re-embed must not advance "
+            "last_installed_active_embedding — the marker must not claim work "
+            "that has not finished",
         )
-        # The attempt itself is still recorded: withholding these would hide
-        # that a run happened, which is a different (and also wrong) claim.
-        self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows)
-        self.assertIn(install._APP_STATE_KEY_LAST_KG_SYNC_STATS, rows)
+        # Nothing ran in this process, so the attempt record is not written
+        # either; the retry driver's own log/trail is where the run is visible.
+        self.assertNotIn(install._APP_STATE_KEY_LAST_KG_SYNC_AT, rows)
+        self.assertEqual(len(self.spawns), 1, "leg (b) must enqueue its full seed")
+        self.assertEqual(
+            self.spawns[0]["env"][deferral_retry.SEED_CTX_ENV_KG_COLLECTION],
+            os.environ["KG_COLLECTION"],
+            "the driver must carry the collection the seed targets",
+        )
 
-    def test_leg_b_nonzero_exit_records_owed_work_that_can_clear(self):
+    def test_leg_b_enqueue_records_owed_work_that_can_clear(self):
         """A withheld marker the user cannot see is not a report.
 
-        The entry must also be one that PROVABLY clears: this project treats a
+        v0.2.101 item 4: the owed work is recorded by the ENQUEUE (the driver
+        does the work), so the entry must exist the moment the install returns
+        — and it must be one that PROVABLY clears: this project treats a
         deferral with no way out as a defect, and the registry is where that
         is checked.
         """
-        import subprocess as _sp
         from vco_lib import deferral_registry as _dr
         from vco_lib.deferral_report import DeferralReport
 
-        def _raise_nonzero(cmd, **kwargs):
-            if "sync_knowledge_graph.py" in str(cmd):
-                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
-            class _Ret:
-                returncode = 0
-            return _Ret()
-
         report = DeferralReport()
         self._run_seed(
-            subprocess_side_effect=_raise_nonzero, deferral_report=report,
+            subprocess_side_effect=_fail_if_the_seed_runs_inline,
+            deferral_report=report,
+        )
+        self.assertEqual(len(self.spawns), 1, "the seed must be enqueued")
+        self.assertIn(
+            "deferral-retry-*.log",
+            "".join(e.command_to_apply for e in report.entries),
+            "the user must be told where the background seed's log is",
         )
 
         cids = [e.condition_id for e in report.entries]
@@ -660,25 +752,51 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
             "embedding work is still owed",
         )
 
-    def test_leg_b_exit_zero_advances_the_triple(self):
-        """The positive case: a context change that DID finish is recorded, so
-        the next --update takes the cheap diff path."""
-        def _ok(cmd, **kwargs):
-            class _Ret:
-                returncode = 0
-            return _Ret()
+    def test_leg_b_a_proven_seed_advances_the_triple_through_the_handler(self):
+        """The positive case: the context change IS recorded once it finished.
 
+        v0.2.101 item 4: install.py no longer writes the triple — the detached
+        handler does, after the child's own paired clear. This pins the leg-(b)
+        half of that contract next to the negative one above: `stamp_seed_context`
+        (fed the context the spawn carried) is what makes the next --update take
+        the cheap diff path.
+        """
         report = self._new_report()
-        self._run_seed(subprocess_side_effect=_ok, deferral_report=report)
+        self._run_seed(
+            subprocess_side_effect=_fail_if_the_seed_runs_inline,
+            deferral_report=report,
+        )
+
+        # install.py itself must NOT have stamped it (see the test above)...
+        self.assertIsNone(
+            self._read_triple().get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING))
+        # ...but the context the handler will stamp travelled with the spawn.
+        carried = self.spawns[0]["env"]
+        deferral_retry.stamp_seed_context(
+            {
+                "active_embedding": carried[deferral_retry.SEED_CTX_ENV_ACTIVE_EMBEDDING],
+                "kg_collection": carried[deferral_retry.SEED_CTX_ENV_KG_COLLECTION],
+                "shared_kg_collection": carried[
+                    deferral_retry.SEED_CTX_ENV_SHARED_KG_COLLECTION],
+            },
+            write_key=install._write_app_state_key,
+        )
 
         rows = self._read_triple()
         self.assertEqual(
             rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING), "qwen3",
         )
-        self.assertNotIn(
+        self.assertEqual(
+            rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION),
+            os.environ["KG_COLLECTION"],
+        )
+        # The owed row exists from the ENQUEUE (install.py cannot know yet
+        # whether the background seed will succeed); the seed's own paired
+        # clear is what retires it — the registry half of that is pinned by
+        # test_leg_b_enqueue_records_owed_work_that_can_clear.
+        self.assertIn(
             install._SEED_OWED_WORK_CONDITION_ID,
             [e.condition_id for e in report.entries],
-            "a clean run must not record owed work",
         )
 
     def _new_report(self):
@@ -702,6 +820,15 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         # requires.
         install._write_app_state_key(
             install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING, "qwen3",
+        )
+        # v0.2.101 item 4: this class's fixture omits the metadata-repair stamp
+        # on purpose (the absent embedding is what it is about), but leg (d)
+        # would then force a FULL seed — which is now the enqueued path, not
+        # the leg (c) diff this test pins. Complete the stamp so the run
+        # actually takes leg (c).
+        install._write_app_state_key(
+            _install_weaviate.KG_METADATA_REPAIR_STATE_KEY,
+            _install_weaviate.KG_METADATA_REPAIR_STAMP,
         )
 
         def _raise_nonzero(cmd, **kwargs):
@@ -765,45 +892,58 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
     # ── (iii) two-update integration: the retry TERMINATES ───────────────
 
     def test_incomplete_leg_b_retries_next_update_and_then_stops(self):
-        """The property that makes WP-4 safe rather than a re-run treadmill.
+        """The property that makes the detach safe rather than a re-run treadmill.
 
-        Run 1 is a leg-(b) re-embed that exits non-zero → the triple is NOT
-        advanced, so run 2 re-enters leg (b) (this is the intended retry, and
-        since v0.2.95 WP-5 it re-embeds only what never landed). Run 2 exits 0
-        → the triple IS advanced, so a run 3 would compute context_changed ==
-        False and take the cheap diff path. The loop ends.
+        Run 1 is a leg-(b) context change: the whole-tree seed is ENQUEUED and
+        the triple is NOT advanced, so run 2 re-enters the full-seed branch
+        (the intended retry; since v0.2.95 WP-5 it re-embeds only what never
+        landed). Once the detached handler has stamped the triple — its
+        post-clear write, simulated here with the context the spawn carried —
+        run 2 computes context_changed == False and takes the cheap diff path.
+        The loop ends.
         """
-        import subprocess as _sp
-
-        def _raise_nonzero(cmd, **kwargs):
-            if "sync_knowledge_graph.py" in str(cmd):
-                raise _sp.CalledProcessError(returncode=1, cmd=cmd)
-            class _Ret:
-                returncode = 0
-            return _Ret()
-
-        def _ok(cmd, **kwargs):
-            class _Ret:
-                returncode = 0
-            return _Ret()
-
-        # RUN 1 — incomplete.
-        self._run_seed(subprocess_side_effect=_raise_nonzero)
+        # RUN 1 — enqueued, not finished.
+        self._run_seed(subprocess_side_effect=_fail_if_the_seed_runs_inline)
         rows = self._read_triple()
         self.assertIsNone(
             rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING),
             "run 1 did not finish; the marker must still say so",
         )
-
-        # RUN 2 would therefore recompute a context change — the retry.
+        self.assertEqual(len(self.spawns), 1, "run 1 must enqueue the full seed")
         self.assertTrue(
             rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
             != os.environ["ACTIVE_EMBEDDING"],
-            "run 2 must re-enter the full-sync branch",
+            "run 2 must re-enter the full-seed branch — the retry",
         )
 
-        # RUN 2 — completes.
-        self._run_seed(subprocess_side_effect=_ok)
+        # The detached handler finishes the seed and stamps the context. A
+        # successful whole-tree run also records the one-time metadata-repair
+        # pass (the sync script writes its own file stamp; install.py's
+        # app_state record is a projection of it) — without that, run 2 would
+        # legitimately re-enter the FULL branch via leg (d) instead of the
+        # diff path this test is about.
+        install._write_app_state_key(
+            _install_weaviate.KG_METADATA_REPAIR_STATE_KEY,
+            _install_weaviate.KG_METADATA_REPAIR_STAMP,
+        )
+        carried = self.spawns[0]["env"]
+        deferral_retry.stamp_seed_context(
+            {
+                "active_embedding": carried[deferral_retry.SEED_CTX_ENV_ACTIVE_EMBEDDING],
+                "kg_collection": carried[deferral_retry.SEED_CTX_ENV_KG_COLLECTION],
+                "shared_kg_collection": carried[
+                    deferral_retry.SEED_CTX_ENV_SHARED_KG_COLLECTION],
+            },
+            write_key=install._write_app_state_key,
+        )
+
+        # RUN 2 — context unchanged → the cheap per-file diff, no enqueue.
+        self._run_seed(subprocess_side_effect=_fail_if_the_full_seed_runs_inline)
+        self.assertEqual(
+            self.spawns, [],
+            "once the context is stamped, the next update must NOT enqueue "
+            "another full seed — otherwise the retry became permanent",
+        )
         rows = self._read_triple()
         stored_embedding = rows.get(install._APP_STATE_KEY_LAST_ACTIVE_EMBEDDING)
         stored_kg = rows.get(install._APP_STATE_KEY_LAST_KG_COLLECTION)
@@ -818,8 +958,8 @@ class Seg1ContextPersistOnPartialFailureTest(unittest.TestCase):
         self.assertFalse(
             context_changed,
             "after a COMPLETED context change, the next --update must take "
-            "the content-hash diff path — otherwise WP-4 would have turned a "
-            "one-off retry into a permanent full re-embed",
+            "the content-hash diff path — otherwise the detach would have "
+            "turned a one-off retry into a permanent full re-embed",
         )
 
 

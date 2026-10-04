@@ -158,7 +158,10 @@ def test_network_label_with_nothing_attached_self_heals_and_retries(tmp_path):
     outcome, out = w.go()
     assert outcome == isu.OK
     assert ["podman", "network", "rm", "infrastructure_default"] in w.probe_calls
-    assert len(w.compose_calls) == 2 and w.ledger.cids == []
+    # v0.2.101: this World is a podman host whose only compose delegates to
+    # docker-compose with the GPU overlay selected, so the no-CDI-tool row is
+    # EXPECTED here (the post-start probe itself answers unknown → nothing).
+    assert len(w.compose_calls) == 2 and w.ledger.cids == ["compose_gpu_device_missing"]
 
 
 def test_network_label_with_attached_containers_is_ledgered_and_left(tmp_path):
@@ -178,8 +181,11 @@ def test_network_label_on_a_foreign_network_is_ledgered_and_left(tmp_path):
     outcome, _ = w.go()
     assert outcome == isu.FAIL and len(w.compose_calls) == 1
     assert not any(c[1:3] == ["network", "rm"] for c in w.probe_calls)
-    # + the hard-stop row the exit-path flush writes (v0.2.100 AD-9)
-    assert w.ledger.cids == [cr.CID_NETWORK_LABEL_ATTACHED, "services_compose_up_failed"]
+    # + the hard-stop row the exit-path flush writes (v0.2.100 AD-9); the
+    # v0.2.101 no-CDI-tool row lands first (podman + docker-compose delegate
+    # + GPU overlay — see the sibling test above).
+    assert w.ledger.cids == ["compose_gpu_device_missing",
+                             cr.CID_NETWORK_LABEL_ATTACHED, "services_compose_up_failed"]
 
 
 def test_socket_error_with_a_healthy_socket_is_one_attempt_and_no_heal_event(tmp_path):

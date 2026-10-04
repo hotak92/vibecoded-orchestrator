@@ -3254,6 +3254,11 @@ pub struct UpdateAllProjectEntry {
     /// Per-project summary counts (None on hard failure / skip — there
     /// was no install run to count).
     pub summary: Option<UpdateSummary>,
+    /// v0.2.101 (12b): why a row was skipped WITHOUT an error — today only
+    /// the already-current orchestrator root. `None` on every other row.
+    /// The typed `summary` stays `None` for skips (no install ran to count).
+    #[serde(default)]
+    pub skip_reason: Option<String>,
 }
 
 /// Aggregate report returned by `update_all_projects`.
@@ -3359,10 +3364,65 @@ fn build_progress_finished(
     }
 }
 
+/// v0.2.101 (12b): the reason carried on the Update-all row for the
+/// orchestrator root when its bundle is already current.
+const ROOT_BUNDLE_CURRENT_SKIP_SUMMARY: &str =
+    "bundle already current — manifest matches the shipped files; nothing to update";
+
+/// Pure Update-all skip decision (v0.2.101, 12b): skip the row ONLY when it
+/// is the orchestrator root AND the staleness census positively reports
+/// that root's bundle `current`. Every other combination — not the root,
+/// `stale`, `unknown`, an undetermined/failed/timed-out probe, a row for a
+/// different folder — returns `false`, i.e. update exactly as before this
+/// gate existed. The census (ONE engine, state-keyed — R26/R27) is the only
+/// currentness oracle; there is deliberately NO version-string compare here.
+pub(crate) fn update_all_skips_root_row(
+    folder: &std::path::Path,
+    orchestrator_root: Option<&std::path::Path>,
+    census: Option<&crate::commands::bundle_staleness::BundleStalenessCensus>,
+) -> bool {
+    let Some(root) = orchestrator_root else {
+        return false;
+    };
+    if !is_orchestrator_root_folder(folder, root) {
+        return false;
+    }
+    let Some(census) = census else {
+        // The probe never ran, failed, or timed out: NOT proven current.
+        return false;
+    };
+    crate::commands::bundle_staleness::census_reports_folder_current(
+        census,
+        &folder.to_string_lossy(),
+    )
+}
+
+/// The Update-all row emitted for an already-current orchestrator root:
+/// `status: "skipped"` with the reason on `skip_reason`. Pure so the
+/// emitted shape is unit-testable without a Tauri runtime.
+fn root_current_skip_entry(project_id: &str, project_name: &str) -> UpdateAllProjectEntry {
+    UpdateAllProjectEntry {
+        project_id: project_id.to_string(),
+        project_name: project_name.to_string(),
+        status: "skipped".to_string(),
+        error: None,
+        warnings: Vec::new(),
+        summary: None,
+        skip_reason: Some(ROOT_BUNDLE_CURRENT_SKIP_SUMMARY.to_string()),
+    }
+}
+
 /// Iterate every registered project sequentially and run the same
 /// per-project update flow as `update_project_v2`. See the doc on the
 /// ─── 0.2.x backlog #4 ─── header for the design rationale (sequential,
 /// no rollback, per-project status reporting).
+///
+/// v0.2.101 (12b): the orchestrator ROOT row is skipped — counted in
+/// `total_skipped` with a `skip_reason` — when the staleness census
+/// reports its bundle already current; `stale`, `unknown` or any probe
+/// failure updates the root like any other project (see
+/// `update_all_skips_root_row`). The root's per-project Settings page
+/// "Update bundle" button always runs.
 ///
 /// Soft-fail discipline mirrors `update_project_v2`:
 ///   * Hard failures (project gone, folder missing) → `status="failed"`,
@@ -3405,6 +3465,11 @@ pub async fn update_all_projects(
     // >u32::MAX case rather than wrapping.
     let total: u32 = projects.len().min(u32::MAX as usize) as u32;
 
+    // v0.2.101 (12b): resolve the orchestrator root once for the root-skip
+    // gate. `None` (standalone binary, no clone discoverable) disables the
+    // gate — every row updates, as before.
+    let orchestrator_root = crate::services::vco_lib_bridge::resolve_orchestrator_root(&db);
+
     for (idx, row) in projects.iter().enumerate() {
         let index: u32 = (idx as u64).min(u32::MAX as u64) as u32 + 1;
 
@@ -3422,9 +3487,41 @@ pub async fn update_all_projects(
                 error: None,
                 warnings: Vec::new(),
                 summary: None,
+                skip_reason: None,
             });
             total_skipped += 1;
             continue;
+        }
+
+        // v0.2.101 (12b): the orchestrator root is skipped when the
+        // staleness census (ONE engine, state-keyed) positively reports its
+        // bundle current. The filtered probe runs ONLY when the root row is
+        // reached — one ~sub-second subprocess per run, not per row. Any
+        // non-`current` verdict, probe failure or timeout falls through to
+        // the ordinary update below (conservative: update when currentness
+        // could not be proven).
+        let row_folder = std::path::PathBuf::from(&row.folder_path);
+        if orchestrator_root
+            .as_deref()
+            .is_some_and(|r| is_orchestrator_root_folder(&row_folder, r))
+        {
+            let census =
+                crate::commands::bundle_staleness::run_census(&db, Some(&row_folder)).await;
+            if update_all_skips_root_row(&row_folder, orchestrator_root.as_deref(), Some(&census))
+            {
+                tracing::info!(
+                    "[vct] update all: skipping {} — census verdict current ({})",
+                    row.name,
+                    ROOT_BUNDLE_CURRENT_SKIP_SUMMARY
+                );
+                let _ = app.emit(
+                    UPDATE_ALL_PROGRESS_EVENT,
+                    build_progress_finished(&row.id, &row.name, index, total, "skipped", 0),
+                );
+                entries.push(root_current_skip_entry(&row.id, &row.name));
+                total_skipped += 1;
+                continue;
+            }
         }
 
         // Announce this project is starting BEFORE the (potentially
@@ -3456,6 +3553,7 @@ pub async fn update_all_projects(
                     error: None,
                     warnings: r.warnings,
                     summary: Some(r.summary),
+                    skip_reason: None,
                 });
                 total_succeeded += 1;
             }
@@ -3471,6 +3569,7 @@ pub async fn update_all_projects(
                     error: Some(e),
                     warnings: Vec::new(),
                     summary: None,
+                    skip_reason: None,
                 });
                 total_failed += 1;
                 if opts.stop_on_error {
@@ -5938,14 +6037,25 @@ pub(crate) fn update_should_skip_root_autobuild(
     }
     match orchestrator_root {
         None => false,
-        Some(root) => {
-            let canon_root = root.canonicalize().unwrap_or(root);
-            let canon_folder = folder
-                .canonicalize()
-                .unwrap_or_else(|_| folder.to_path_buf());
-            canon_root == canon_folder
-        }
+        Some(root) => is_orchestrator_root_folder(folder, &root),
     }
+}
+
+/// Canonicalising same-folder test behind `update_should_skip_root_autobuild`
+/// and the v0.2.101 (12b) Update-all root gate: both sides canonicalize
+/// before compare so symlinked clones match. A side that cannot be
+/// canonicalized compares as itself (the callers fail open / conservative).
+pub(crate) fn is_orchestrator_root_folder(
+    folder: &std::path::Path,
+    orchestrator_root: &std::path::Path,
+) -> bool {
+    let canon_root = orchestrator_root
+        .canonicalize()
+        .unwrap_or_else(|_| orchestrator_root.to_path_buf());
+    let canon_folder = folder
+        .canonicalize()
+        .unwrap_or_else(|_| folder.to_path_buf());
+    canon_root == canon_folder
 }
 
 #[cfg(test)]
@@ -6026,6 +6136,139 @@ mod tests {
     fn root_autobuild_skip_fails_open_when_root_unresolvable() {
         let tmp = tempfile::tempdir().unwrap();
         assert!(!update_should_skip_root_autobuild(tmp.path(), None, false));
+    }
+
+    // ─── v0.2.101 (12b): Update-all skips an already-current root ────────
+
+    use crate::commands::bundle_staleness::{
+        BundleStalenessCensus, BundleStalenessProject, BundleStalenessSummary,
+    };
+
+    /// A determined single-row census carrying the given verdict.
+    fn synthetic_census(folder: &str, verdict: &str) -> BundleStalenessCensus {
+        BundleStalenessCensus {
+            determined: true,
+            error: None,
+            registry: Some("launcher.db".to_string()),
+            running_version: None,
+            projects: vec![BundleStalenessProject {
+                id: "root-1".to_string(),
+                name: "Root".to_string(),
+                folder: folder.to_string(),
+                verdict: verdict.to_string(),
+                reason: String::new(),
+                changed_files: Vec::new(),
+                user_modified: 0,
+            }],
+            summary: Some(BundleStalenessSummary::default()),
+            remedy_gui: None,
+            remedy_cli: None,
+        }
+    }
+
+    /// The pure decision truth table: skip = is_root && verdict == "current".
+    /// Every other cell of the table — stale, unknown, a failed/timed-out
+    /// probe (`None` or `undetermined`), a non-root folder, an unresolvable
+    /// orchestrator root — must UPDATE (i.e. return `false`).
+    #[test]
+    fn update_all_skip_decision_truth_table() {
+        let root_dir = tempfile::tempdir().unwrap();
+        let root = root_dir.path().to_path_buf();
+        let other_dir = tempfile::tempdir().unwrap();
+        let root_str = root_dir.path().to_string_lossy().to_string();
+
+        let current = synthetic_census(&root_str, "current");
+        let stale = synthetic_census(&root_str, "stale");
+        let unknown = synthetic_census(&root_str, "unknown");
+        let undetermined = BundleStalenessCensus::undetermined("probe timed out");
+        // A `current` row for a DIFFERENT folder must not grant this folder
+        // a skip (a loosely-matching --project filter leaks nothing).
+        let other_folder_current = synthetic_census("/p/elsewhere", "current");
+
+        // The ONE skip cell.
+        assert!(
+            update_all_skips_root_row(root_dir.path(), Some(&root), Some(&current)),
+            "root + current → skip"
+        );
+        // Everything else updates as before the gate existed.
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&stale)),
+            "root + stale → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&unknown)),
+            "root + unknown → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&undetermined)),
+            "root + undetermined probe → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), None),
+            "root + probe never ran → update"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), Some(&root), Some(&other_folder_current)),
+            "root + current verdict for ANOTHER folder → update"
+        );
+        assert!(
+            !update_all_skips_root_row(other_dir.path(), Some(&root), Some(&current)),
+            "not the root → update (even when current)"
+        );
+        assert!(
+            !update_all_skips_root_row(root_dir.path(), None, Some(&current)),
+            "unresolvable orchestrator root → update"
+        );
+    }
+
+    /// The emitted row for an already-current root: `status: "skipped"`,
+    /// no error, and the reason carried on `skip_reason` (the typed
+    /// `summary` stays `None` — no install ran to count).
+    #[test]
+    fn root_current_skip_entry_is_skipped_with_a_reason() {
+        let e = root_current_skip_entry("root-1", "Orchestrator root");
+        assert_eq!(e.status, "skipped");
+        assert!(e.error.is_none());
+        assert!(e.summary.is_none());
+        let reason = e.skip_reason.expect("the row carries its skip reason");
+        assert!(
+            reason.contains("already current") && reason.contains("nothing to update"),
+            "reason must say what was decided: {}",
+            reason
+        );
+    }
+
+    /// `update_all_projects` cannot be driven from a unit test (it needs a
+    /// Tauri `AppHandle`), so — following the F6 `fn_marker` pattern above —
+    /// we pin the load-bearing source invariant: the root-skip gate must
+    /// appear BEFORE the `update_project_v2` call and short-circuit with
+    /// `continue`, so a skipped root never reaches the per-project update.
+    #[test]
+    fn update_all_short_circuits_the_root_before_calling_update_project_v2() {
+        let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("src/commands/projects_v2.rs");
+        let body = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {}", path.display(), e));
+        let fn_marker = "pub async fn update_all_projects(";
+        let start = body
+            .find(fn_marker)
+            .expect("update_all_projects must exist; if you renamed it, update this test");
+        let window_end = (start + 12000).min(body.len());
+        let window = &body[start..window_end];
+        let gate = window
+            .find("update_all_skips_root_row(")
+            .expect("the root-skip decision must be called inside update_all_projects");
+        let update_call = window
+            .find("update_project_v2(row.id.clone()")
+            .expect("the per-project update call must exist in update_all_projects");
+        assert!(
+            gate < update_call,
+            "the root-skip gate must run BEFORE the per-project update call"
+        );
+        assert!(
+            window[gate..update_call].contains("continue"),
+            "a skipped root must short-circuit with `continue` before the update call"
+        );
     }
 
     // ─── v0.2.71 Piece 5b: kg-sync spawn gate (skip-when-unchanged) ─────
@@ -9822,6 +10065,7 @@ SHARED_KG_OPT_OUT=false\n"),
                     error: None,
                     warnings: Vec::new(),
                     summary: None,
+                    skip_reason: None,
                 });
                 total_skipped += 1;
                 continue;
@@ -9861,6 +10105,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         error: None,
                         warnings: r.warnings,
                         summary: Some(r.summary),
+                        skip_reason: None,
                     });
                     total_succeeded += 1;
                 }
@@ -9872,6 +10117,7 @@ SHARED_KG_OPT_OUT=false\n"),
                         error: Some(e),
                         warnings: Vec::new(),
                         summary: None,
+                        skip_reason: None,
                     });
                     total_failed += 1;
                     if opts.stop_on_error {

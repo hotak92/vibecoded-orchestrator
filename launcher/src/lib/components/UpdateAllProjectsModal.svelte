@@ -539,6 +539,9 @@
               <span class="ua-row-icon">{statusIcon(r.status)}</span>
               <span class="ua-row-name">{r.project_name}</span>
               <span class="ua-row-status">{statusLabel(r.status)}</span>
+              {#if r.skip_reason}
+                <span class="ua-row-skip-reason">{r.skip_reason}</span>
+              {/if}
               {#if r.error}
                 <details class="ua-row-error-details">
                   <summary class="ua-row-error-summary">
@@ -779,6 +782,11 @@
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.4px;
+    color: var(--color-mid, #aaa);
+  }
+  .ua-row-skip-reason {
+    grid-column: 2 / -1;
+    font-size: 11px;
     color: var(--color-mid, #aaa);
   }
   /* Expandable error disclosure (v0.2.73): full error text on demand,

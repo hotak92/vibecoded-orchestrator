@@ -350,21 +350,41 @@ def test_scope_shared_without_configured_shared_collection_is_skipped_not_missin
 SYNC_SCRIPT = REPO_ROOT / "templates" / "scripts" / "sync_knowledge_graph.py"
 
 
-def test_archive_segments_match_sync_script_source():
-    text = SYNC_SCRIPT.read_text(encoding="utf-8")
-    assert '_ARCHIVE_DIR_SEGMENTS = {"archive", ".archive", "_archive"}' in text, (
-        "sync_knowledge_graph.py's _ARCHIVE_DIR_SEGMENTS literal changed — "
-        "update vco_lib.kg_sync_drift.ARCHIVE_DIR_SEGMENTS to match"
-    )
+def test_archived_predicate_delegates_to_the_shared_home():
+    """v0.2.101 item 3: the mirror is RETIRED; this module CALLS the home.
+
+    Replaces a source-scan on ``sync_knowledge_graph.py``: the rule no longer
+    lives in the script's text (it imports ``vco_lib.kg_node_status``), so a
+    text scan would assert nothing. Behavioural instead — the same cases the
+    scan used to stand for, against the ONE home.
+    """
+    from vco_lib import kg_node_status
+
+    statuses = ("archived", "deprecated", "superseded", "Archived ", "active", "")
+    cases: list = [(("knowledge", "archive", "a.md"), "", True),
+                   (("knowledge", ".archive", "a.md"), "", True),
+                   (("knowledge", "_archive", "a.md"), "", True),
+                   # NOT a substring match: `architecture/` is legitimate.
+                   (("knowledge", "concepts", "architecture", "a.md"), "", False),
+                   (("knowledge", "concepts", "archived-notes", "a.md"), "", False)]
+    for status in statuses:
+        content = f"---\nstatus: {status}\n---\n" if status else ""
+        cases.append((("knowledge", "concepts", "a.md"), content,
+                      status.strip().lower() in ("archived", "deprecated", "superseded")))
+    for rel_parts, content, expected in cases:
+        assert drift.is_archived_node(rel_parts, content) is expected, (rel_parts, content)
+        assert drift.is_archived_path(rel_parts) is (expected and not content), rel_parts
+        assert kg_node_status.is_archived_content(
+            Path(*rel_parts), content)[0] is expected, (rel_parts, content)
+
+
+def test_archive_constants_are_the_shared_homes_own_objects():
+    """Identity, not equality: a re-copied literal would pass an == check."""
+    from vco_lib import kg_node_status
+
+    assert drift.ARCHIVE_DIR_SEGMENTS is kg_node_status.ARCHIVE_DIR_SEGMENTS
+    assert drift.ARCHIVED_STATUS_VALUES is kg_node_status.ARCHIVED_STATUS_VALUES
     assert drift.ARCHIVE_DIR_SEGMENTS == frozenset({"archive", ".archive", "_archive"})
-
-
-def test_archived_status_values_match_sync_script_source():
-    text = SYNC_SCRIPT.read_text(encoding="utf-8")
-    assert 'status in ("archived", "deprecated", "superseded")' in text, (
-        "sync_knowledge_graph.py's archived-status tuple changed — update "
-        "vco_lib.kg_sync_drift.ARCHIVED_STATUS_VALUES to match"
-    )
     assert drift.ARCHIVED_STATUS_VALUES == frozenset(
         {"archived", "deprecated", "superseded"}
     )

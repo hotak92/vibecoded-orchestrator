@@ -33,6 +33,10 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from unittest import mock  # noqa: E402
+
+from vco_lib import gateway_ensure  # noqa: E402
+from vco_lib import project_templates as pt  # noqa: E402
 from vco_lib import rendered_root_files as rrf  # noqa: E402
 from vco_lib import setup_sections as ss  # noqa: E402
 from vco_lib.deferral_probes import ProbeContext  # noqa: E402
@@ -255,6 +259,120 @@ class TestClearProbe(_Case):
         (self.root / "CLAUDE.md").mkdir()
         ctx = ProbeContext(folder=self.root)
         self.assertIsNone(first_run_setup_sections_still_pending(ctx))
+
+
+USER_TEMPLATE = REPO_ROOT / "templates" / "CLAUDE.md.template"
+SCOPING_HEADING = "## First session: offer to scope agents and skills"
+
+
+class _ProjectCase(unittest.TestCase):
+    """12a (v0.2.101 wave 2): the SAME lifecycle on a PROJECT's CLAUDE.md.
+
+    The scoping block ships inside the managed region of
+    ``templates/CLAUDE.md.template``; the project render path must honour the
+    acknowledgement exactly like the root path (one home:
+    ``setup_sections.apply_to_render``), emit ``first_run_setup_pending`` with
+    the PROJECT prose (template name + root label), and clear/re-arm with the
+    same rules.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = TemporaryDirectory(prefix="vco-setup-proj-")
+        self.tmp = Path(self._tmp.name)
+        self.orch = self.tmp / "orch"
+        (self.orch / "templates").mkdir(parents=True)
+        (self.orch / "vct-module.json").write_text("{}\n", encoding="utf-8")
+        (self.orch / "templates" / "CLAUDE.md.template").write_bytes(
+            USER_TEMPLATE.read_bytes())
+        self.project = self.tmp / "proj"
+        self.project.mkdir()
+        # A bundled project IS a managed install root: the remedy the row
+        # names ships into <project>/.claude/scripts/.
+        script = self.project / ss.CLEANUP_SCRIPT_REL
+        script.parent.mkdir(parents=True)
+        shutil.copy2(CLEANUP_SCRIPT, script)
+        self.addCleanup(self._tmp.cleanup)
+
+    def render(self) -> dict:
+        # Hermetic machine state: no gateway (the scoping block is module-
+        # independent — this only keeps the resolver's probes off the machine).
+        signal = gateway_ensure.MachineGatewaySignal(
+            configured=False, registration="test", panel="test", reason="test")
+        with contextlib.redirect_stderr(io.StringIO()), mock.patch.object(
+                gateway_ensure, "machine_gateway_signal", lambda *a, **k: signal):
+            return pt.install_project_level_templates(
+                self.project, orchestrator_root=self.orch,
+                project_name="Proj", dry_run=False)
+
+    def claude_md(self) -> str:
+        return (self.project / "CLAUDE.md").read_text(encoding="utf-8")
+
+    def has_row(self) -> bool:
+        return DeferralReport.read(self.project).has_condition(ss.CONDITION_ID)
+
+    def run_cleanup(self) -> int:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            rc = _load_cleanup_module().main(["--root", str(self.project)])
+        return rc
+
+
+class TestProjectFolderLifecycle(_ProjectCase):
+    def test_fresh_project_render_carries_the_block_and_the_project_row(
+            self) -> None:
+        self.render()
+        self.assertIn(SCOPING_HEADING, self.claude_md())
+        self.assertTrue(self.has_row(), "a fresh project must remind the agent")
+        entry = DeferralReport.read(self.project).entry_for(ss.CONDITION_ID)
+        # The parametrised prose names the PROJECT template and root label.
+        self.assertIn("templates/CLAUDE.md.template", entry.detected)
+        self.assertIn("this project's root", entry.why_deferred)
+        self.assertIn("For your Claude assistant", entry.why_deferred)
+        self.assertIn("cleanup-setup-sections.py", entry.command_to_apply)
+        self.assertIn(str(self.project), entry.command_to_apply)
+
+    def test_cleanup_removal_survives_the_rerender_and_clears_the_row(
+            self) -> None:
+        self.render()
+        self.assertEqual(self.run_cleanup(), 0)
+        self.assertNotIn(SCOPING_HEADING, self.claude_md())
+        # The bundle update re-renders the managed body from the template —
+        # the acknowledged block must not come back, and the row clears.
+        self.render()
+        self.assertNotIn(SCOPING_HEADING, self.claude_md())
+        self.assertFalse(self.has_row(), "all blocks acknowledged ⇒ row clears")
+
+    def test_changed_block_re_renders_and_re_arms_on_a_project(self) -> None:
+        self.render()
+        self.assertEqual(self.run_cleanup(), 0)
+        self.assertNotIn(SCOPING_HEADING, self.claude_md())
+        tpl = self.orch / "templates" / "CLAUDE.md.template"
+        tpl.write_text(
+            tpl.read_text(encoding="utf-8").replace(
+                SCOPING_HEADING, SCOPING_HEADING + " (revised)", 1),
+            encoding="utf-8")
+        self.render()
+        self.assertIn(SCOPING_HEADING, self.claude_md(), "a CHANGED block renders again")
+        self.assertIn("revised", self.claude_md())
+        self.assertTrue(self.has_row(), "a changed block re-arms the reminder")
+
+
+class TestBuildEntryParametrisation(_ProjectCase):
+    def test_project_call_names_the_project_template_and_root(self) -> None:
+        blocks = ss.find_blocks(BLOCK_ONE)
+        entry = ss.build_entry(
+            self.project, blocks,
+            template_name=ss.PROJECT_TEMPLATE_NAME,
+            root_label=ss.PROJECT_ROOT_LABEL)
+        self.assertIn(ss.PROJECT_TEMPLATE_NAME, entry.detected)
+        self.assertIn("this project's root", entry.why_deferred)
+        self.assertNotIn(ss.ROOT_TEMPLATE_NAME, entry.detected)
+
+    def test_default_call_keeps_the_root_prose(self) -> None:
+        blocks = ss.find_blocks(BLOCK_ONE)
+        entry = ss.build_entry(self.project, blocks)
+        self.assertIn(ss.ROOT_TEMPLATE_NAME, entry.detected)
+        self.assertIn("the orchestrator root", entry.why_deferred)
 
 
 class TestMarkerRule(unittest.TestCase):

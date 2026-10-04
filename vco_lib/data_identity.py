@@ -541,7 +541,15 @@ def guard_recreate(
         except _se.InvalidEndpointRow as exc:
             result.verdict, result.reason = REFUSE_UNKNOWN, f"the {service} row is invalid: {exc}"
             return result
-    if row is not None and row.mode == "vco_managed":
+    # The knob is projected whenever the row has a mount to state — for an
+    # adopted container too (item 2): compose substitutes
+    # ${VCT_*_DATA_SOURCE:-<empty volume>} on ANY recreate, so an adopted
+    # Ollama whose bind was never projected would be re-pointed at the empty
+    # named volume by the deferral's printed command. A vco_managed row with
+    # NO recorded mount still writes, to carry the file's existing knob
+    # (v0.2.100 W2R-01).
+    states_mount = result.row is not None and bool(result.row.data_mount)
+    if row is not None and (row.mode == "vco_managed" or states_mount):
         projected = {**dict(rows or {}), service: result.row}
         try:
             (write_env or _default_write_env(runtime))(infra, projected)

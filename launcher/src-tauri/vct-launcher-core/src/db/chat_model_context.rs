@@ -87,6 +87,14 @@ pub struct ChatModelContextRow {
     pub max_output: i64,
     /// `true` → the gateway advertises this id as `<id>[1m]`.
     pub window_1m: bool,
+    /// `true` → the vendor's page states this model takes TEXT-ONLY input:
+    /// it cannot see an image block. The gateway replaces image blocks
+    /// routed to a flagged model with a short text note instead of letting
+    /// the request silently degrade (v0.2.101 parity gap 7); the pane badges
+    /// it "text only" so the routing choice is visible BEFORE a chat fails.
+    /// Conservative default `false` — the gateway reader's own direction for
+    /// an absent key: an unflagged model keeps its image blocks untouched.
+    pub text_only: bool,
     /// The citation: the official vendor page these numbers were read from.
     /// Never empty (SQL `CHECK` + [`ChatModelContextInput::validated`]).
     pub source: String,
@@ -112,6 +120,11 @@ pub struct ChatModelContextInput {
     /// Negative is refused by [`validated`](Self::validated).
     pub max_output: i64,
     pub window_1m: bool,
+    /// `#[serde(default)]` (false) so a GUI payload that predates the field
+    /// is accepted rather than failing deserialisation — the same tolerance
+    /// the gateway's reader gives an absent key.
+    #[serde(default)]
+    pub text_only: bool,
     pub source: String,
     /// Optional; `""` when absent. `#[serde(default)]` so a GUI payload that
     /// omits it is accepted rather than failing deserialisation.
@@ -199,6 +212,7 @@ impl ChatModelContextInput {
             context_window: self.context_window,
             max_output: self.max_output,
             window_1m: self.window_1m,
+            text_only: self.text_only,
             source,
             source_note: self.source_note.trim().to_string(),
         })
@@ -213,6 +227,7 @@ impl ChatModelContextInput {
             && self.context_window == row.context_window
             && self.max_output == row.max_output
             && self.window_1m == row.window_1m
+            && self.text_only == row.text_only
             && self.source == row.source
             && self.source_note == row.source_note
     }
@@ -261,12 +276,13 @@ fn row_from_sql(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChatModelContextRow> 
         source_note: r.get(6)?,
         user_edited: r.get::<_, i64>(7)? != 0,
         updated_at: r.get(8)?,
+        text_only: r.get::<_, i64>(9)? != 0,
     })
 }
 
 const SELECT_COLUMNS: &str = "model_id, vendor, context_window, max_output, \
                               window_1m, source, source_note, user_edited, \
-                              updated_at";
+                              updated_at, text_only";
 
 impl Db {
     /// Every row, ordered by `model_id`. That order is the export's order
@@ -321,6 +337,7 @@ impl Db {
             context_window: input.context_window,
             max_output: input.max_output,
             window_1m: input.window_1m,
+            text_only: input.text_only,
             source: input.source,
             source_note: input.source_note,
             user_edited,
@@ -345,13 +362,14 @@ impl Db {
                 .execute(
                     "INSERT INTO chat_model_context
                         (model_id, vendor, context_window, max_output, window_1m,
-                         source, source_note, user_edited, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                         source, source_note, user_edited, updated_at, text_only)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
                      ON CONFLICT(model_id) DO UPDATE SET
                         vendor         = excluded.vendor,
                         context_window = excluded.context_window,
                         max_output     = excluded.max_output,
                         window_1m      = excluded.window_1m,
+                        text_only      = excluded.text_only,
                         source         = excluded.source,
                         source_note    = excluded.source_note,
                         user_edited    = excluded.user_edited,
@@ -366,6 +384,7 @@ impl Db {
                         row.source_note,
                         i64::from(row.user_edited),
                         row.updated_at,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("upsert_chat_model_context: {}", e))?;
@@ -583,7 +602,8 @@ fn converge_rows(
                         source         = ?6,
                         source_note    = ?7,
                         user_edited    = 0,
-                        updated_at     = ?8
+                        updated_at     = ?8,
+                        text_only      = ?9
                      WHERE model_id = ?1",
                     params![
                         row.model_id,
@@ -594,6 +614,7 @@ fn converge_rows(
                         row.source,
                         row.source_note,
                         now,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("converge update {}: {}", row.model_id, e))?;
@@ -610,8 +631,8 @@ fn converge_rows(
                 tx.execute(
                     "INSERT INTO chat_model_context
                         (model_id, vendor, context_window, max_output, window_1m,
-                         source, source_note, user_edited, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8)",
+                         source, source_note, user_edited, updated_at, text_only)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 0, ?8, ?9)",
                     params![
                         row.model_id,
                         row.vendor,
@@ -621,6 +642,7 @@ fn converge_rows(
                         row.source,
                         row.source_note,
                         now,
+                        i64::from(row.text_only),
                     ],
                 )
                 .map_err(|e| format!("converge insert {}: {}", row.model_id, e))?;
@@ -645,6 +667,7 @@ fn converge_rows(
 ///  "source": "launcher.db",
 ///  "models": {"<full-model-id>": {"vendor": "...", "context_window": 0,
 ///                                 "max_output": 0, "window_1m": false,
+///                                 "text_only": false,
 ///                                 "source": "...", "source_note": "..."}}}
 /// ```
 ///
@@ -675,6 +698,11 @@ pub fn export_document(
         );
         entry.insert("max_output".into(), serde_json::Value::from(row.max_output));
         entry.insert("window_1m".into(), serde_json::Value::from(row.window_1m));
+        // The image-capability flag always travels (never omitted, even for
+        // false): the gateway's reader defaults an ABSENT key to false too,
+        // but an explicit value is what makes this export a complete answer
+        // to "can this model see images?" — same treatment as `window_1m`.
+        entry.insert("text_only".into(), serde_json::Value::from(row.text_only));
         entry.insert("source".into(), serde_json::Value::from(row.source.clone()));
         if !row.source_note.is_empty() {
             entry.insert(
@@ -789,6 +817,15 @@ pub fn parse_document(payload: &serde_json::Value) -> Result<Vec<ChatModelContex
                 .get("window_1m")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false),
+            // The image-capability flag (v0.2.101). Absent → false, the SAME
+            // direction the gateway's reader defaults a missing key
+            // (context_table.py: `bool(raw.get("text_only"))`): the shipped
+            // seed states it only on the rows the vendor page decides, and
+            // an unflagged model keeps its image blocks untouched.
+            text_only: entry
+                .get("text_only")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
             source: text("source"),
             source_note: text("source_note"),
         };
@@ -820,6 +857,7 @@ mod tests {
             context_window: 200_000,
             max_output: 128_000,
             window_1m: false,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/glm-5.1".into(),
             source_note: String::new(),
         }
@@ -1491,6 +1529,7 @@ mod tests {
             context_window: if window_1m { 1_000_000 } else { 200_000 },
             max_output: 128_000,
             window_1m,
+            text_only: false,
             source: "https://docs.z.ai/guides/llm/x".into(),
             source_note: note.into(),
             user_edited: false,
@@ -1675,6 +1714,113 @@ mod tests {
         assert_eq!(
             parsed[0].max_output, 0,
             "0 round-trips through export → parse; nothing invents a figure"
+        );
+    }
+
+    // ── text_only (v0.2.101 — the image-capability flag) ────────────────
+    //
+    // Pre-fix, the launcher's seed mirror silently DROPPED the field: the
+    // pane could not show it, a reseed could not carry it, and the export
+    // could not publish it. These three pin the whole chain — parse reads
+    // it, converge carries it (including over rows that predate the column),
+    // export ships it.
+
+    #[test]
+    fn export_carries_the_image_capability_flag_on_every_row() {
+        let text_only_model = ChatModelContextRow {
+            text_only: true,
+            ..row("glm-5.3", false, "text_only=true: vendor page states verbatim")
+        };
+        let doc = export_document(&[text_only_model, row("glm-5.3-flash", false, "")], &[], "t");
+        assert_eq!(
+            doc["models"]["glm-5.3"]["text_only"],
+            serde_json::json!(true),
+            "a flagged row exports the flag"
+        );
+        // Always present, even when false — same treatment as `window_1m`,
+        // so the export is a complete answer to "can this model see images?"
+        assert_eq!(
+            doc["models"]["glm-5.3-flash"]["text_only"],
+            serde_json::json!(false),
+            "an unflagged row carries an explicit false, never an absent key"
+        );
+    }
+
+    #[test]
+    fn parse_document_reads_the_image_capability_flag_and_defaults_absent_to_false() {
+        // The shipped seed states `text_only` only on the rows the vendor
+        // page decides; absent must mean false — the SAME direction the
+        // gateway's reader defaults a missing key (`bool(raw.get(...))`).
+        let doc = serde_json::json!({
+            "schema_version": 1,
+            "models": {
+                "glm-5.3": {
+                    "vendor": "zai", "context_window": 200000, "max_output": 128000,
+                    "window_1m": false, "text_only": true,
+                    "source": "https://docs.z.ai/guides/llm/glm-5.3"
+                },
+                "glm-4.5-air": {
+                    "vendor": "zai", "context_window": 200000, "max_output": 128000,
+                    "window_1m": false,
+                    "source": "https://docs.z.ai/guides/llm/glm-4.5-air"
+                }
+            }
+        });
+        let parsed = parse_document(&doc).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(
+            parsed.iter().find(|r| r.model_id == "glm-5.3").unwrap().text_only,
+            true,
+            "a stated flag is READ, not dropped on the floor"
+        );
+        assert_eq!(
+            parsed
+                .iter()
+                .find(|r| r.model_id == "glm-4.5-air")
+                .unwrap()
+                .text_only,
+            false,
+            "an absent flag defaults to false (the gateway reader's direction)"
+        );
+    }
+
+    #[test]
+    fn converge_carries_text_only_and_pre_column_rows_converge_without_loss() {
+        // The upgrade shape: a table whose rows predate the `text_only`
+        // column (migration 048 backfilled them to 0 = false) converges
+        // against a seed that now states the flag — the pre-fix mirror
+        // dropped the field, so this exact converge was a silent no-op.
+        let db = make_db();
+        // Row 1: shipped-shaped, pre-column (text_only = false by backfill).
+        db.upsert_chat_model_context(input("glm-5.3"), false).unwrap();
+        // Row 2: a user edit — must stay untouched, flag included.
+        let mut edited = input("glm-5.2");
+        edited.source = "internal wiki".into();
+        db.upsert_chat_model_context(edited.clone(), true).unwrap();
+
+        // The shipped seed now states text_only on glm-5.3; every OTHER
+        // field of that row is unchanged.
+        let mut flagged = input("glm-5.3");
+        flagged.text_only = true;
+        let mut flagged_edit = edited.clone();
+        flagged_edit.text_only = true;
+
+        let outcome = db
+            .converge_chat_model_context_seed(&[flagged, flagged_edit])
+            .unwrap();
+        assert_eq!(
+            (outcome.inserted, outcome.updated, outcome.preserved_user_edits),
+            (0, 1, 1),
+            "the flagged row is an UPDATE (only the flag changed), the user \
+             edit is preserved"
+        );
+        let rows = db.list_chat_model_context().unwrap();
+        let glm53 = rows.iter().find(|r| r.model_id == "glm-5.3").unwrap();
+        assert!(glm53.text_only, "the converge WROTE the flag");
+        let glm52 = rows.iter().find(|r| r.model_id == "glm-5.2").unwrap();
+        assert!(
+            !glm52.text_only && glm52.user_edited && glm52.source == "internal wiki",
+            "the user-edited row is byte-identical to what they wrote"
         );
     }
 

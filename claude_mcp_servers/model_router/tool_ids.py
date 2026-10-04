@@ -50,7 +50,12 @@ from typing import Any, Iterator, MutableMapping, Optional
 from vco_lib.transcript_repair import (
     RepairStats,
     TranscriptRepairer,
+    final_assistant_turn_needs_thinking,
+    is_server_tool_type,
+    mark_thinking_signature,
     restore_ids,
+    thinking_enabled,
+    unmark_thinking_signatures,
 )
 
 logger = logging.getLogger(__name__)
@@ -162,10 +167,23 @@ class BoundedIdMap(MutableMapping[str, str]):
 def normalise_vendor_response(
     payload: Any, id_map: MutableMapping[str, str],
 ) -> tuple[Any, RepairStats]:
-    """Rewrite a vendor's buffered ``/v1/messages`` response in place-by-copy."""
+    """Rewrite a vendor's buffered ``/v1/messages`` response in place-by-copy.
+
+    ``mark_thinking=True``: a ``thinking`` block's signature is prefixed with
+    the gateway marker on the way out, so the signature the CLIENT stores is
+    unambiguously vendor-origin and a later first-party request can strip the
+    block by its marker rather than by a shape guess (item c). The vendor
+    branch reverses it with :func:`unmark_thinking_signatures` before
+    forwarding, so the vendor still gets its own bytes. ``strip_vendor_origin``
+    is deliberately OFF here — this is the response leg back to the client, not
+    a first-party request, and the vendor's own thinking is valid on its own
+    route.
+    """
     if not isinstance(payload, dict):
         return payload, RepairStats()
-    repairer = TranscriptRepairer(id_map=id_map, strip_nonportable=True)
+    repairer = TranscriptRepairer(
+        id_map=id_map, strip_nonportable=True, mark_thinking=True,
+    )
     # A Messages response IS the assistant turn, so the role is not in doubt
     # — and it decides whether a ``tool_result`` block may stay.
     content, changed = repairer.repair_content(
@@ -193,6 +211,17 @@ def sanitise_for_anthropic(payload: Any) -> tuple[Any, RepairStats]:
     ``id_map=None``: this direction is one-way. Nothing downstream will ever
     ask us to turn a normalised id back into the vendor id it came from, and
     remembering them would be a leak with no reader.
+
+    ``strip_vendor_origin=True`` also strips vendor ``thinking`` blocks (item
+    c): a vendor signature replayed here is HTTP 400 ``"Invalid `signature` in
+    `thinking` block"``. One edge case needs a payload-level fix rather than a
+    block-level one — when stripping leaves the FINAL assistant turn of a tool
+    loop without its required leading thinking block while the request enables
+    thinking, Anthropic rejects the whole request. The least invasive VALID
+    request is this one sent WITHOUT ``thinking``: a single turn answers
+    without extended thinking rather than the append-only transcript wedging
+    the session on a 400 forever. Only fired when THIS pass stripped a
+    thinking block, so a request the gateway did not touch is never reshaped.
     """
     if not isinstance(payload, dict):
         return payload, RepairStats()
@@ -200,10 +229,19 @@ def sanitise_for_anthropic(payload: Any) -> tuple[Any, RepairStats]:
         id_map=None, strip_nonportable=True, strip_vendor_origin=True,
     )
     messages, changed = repairer.repair_messages(payload.get("messages"))
-    if not changed:
+    drop_thinking = bool(
+        repairer.stats.thinking_blocks_stripped
+        and thinking_enabled(payload)
+        and final_assistant_turn_needs_thinking(messages)
+    )
+    if not changed and not drop_thinking:
         return payload, repairer.stats
     patched = dict(payload)
-    patched["messages"] = messages
+    if changed:
+        patched["messages"] = messages
+    if drop_thinking:
+        patched.pop("thinking", None)
+        repairer.stats.thinking_param_dropped = True
     return patched, repairer.stats
 
 
@@ -312,6 +350,12 @@ class SseIdRewriter:
         self._dropped_indexes: set[int] = set()
         self._next_index = 0
         self._passthrough = False
+        #: Block indexes whose ``signature_delta`` has already been marked
+        #: (item c). A signature CAN arrive in more than one delta; marking
+        #: only the first keeps the client's concatenation a single
+        #: ``vct_<full>`` rather than ``vct_<c1>vct_<c2>``, which would
+        #: un-mark to a corrupted signature and fail on replay.
+        self._signature_marked: set[int] = set()
         #: Positive ``input_tokens`` floor for a ``message_start`` that
         #: under-reports it (zero or partial). ``None`` (the default)
         #: disables the splice entirely.
@@ -459,11 +503,54 @@ class SseIdRewriter:
         kind = payload.get("type")
         if kind == "content_block_start":
             return self._on_block_start(payload)
-        if kind in ("content_block_delta", "content_block_stop"):
+        if kind == "content_block_delta":
+            return self._on_content_block_delta(payload)
+        if kind == "content_block_stop":
             return self._on_indexed(payload)
         if kind == "message_start":
             return self._on_message_start(payload)
         return _UNCHANGED
+
+    def _on_content_block_delta(self, payload: dict) -> Any:
+        """Index remap PLUS the vendor thinking-signature mark (item c).
+
+        A streamed ``thinking`` block carries its signature in a
+        ``signature_delta`` (the ``content_block_start`` opens it with
+        ``signature:""``), so the mark is applied HERE rather than in
+        ``repair_content`` — marking the start block's empty signature too
+        would concatenate into a double marker. Only the FIRST
+        ``signature_delta`` of a block is marked (see ``_signature_marked``).
+        The mark is what lets a later first-party request recognise the block
+        as vendor-origin by its marker instead of by its shape; the vendor
+        branch strips it back off before forwarding.
+        """
+        original_index = payload.get("index")
+        if isinstance(original_index, int) and original_index in self._dropped_indexes:
+            return None
+        patched: Optional[dict] = None
+        if isinstance(original_index, int):
+            mapped = self._index_map.get(original_index, original_index)
+            if mapped != original_index:
+                patched = dict(payload)
+                patched["index"] = mapped
+        delta = payload.get("delta")
+        if (
+            isinstance(delta, dict)
+            and delta.get("type") == "signature_delta"
+            and isinstance(original_index, int)
+            and original_index not in self._signature_marked
+        ):
+            signature = delta.get("signature")
+            marked = mark_thinking_signature(signature)
+            if isinstance(signature, str):
+                self._signature_marked.add(original_index)
+            if marked != signature:
+                if patched is None:
+                    patched = dict(payload)
+                new_delta = dict(delta)
+                new_delta["signature"] = marked
+                patched["delta"] = new_delta
+        return patched if patched is not None else _UNCHANGED
 
     def _on_message_start(self, payload: dict) -> Any:
         """Lift a deficient ``message_start`` ``input_tokens`` to the floor.
@@ -570,4 +657,11 @@ __all__ = [
     "restore_vendor_ids",
     "sanitise_for_anthropic",
     "split_sse_frames",
+    # Re-exported from the SSOT so server.py imports every request/response
+    # rewrite seam from this one adapter: the vendor branch strips the
+    # gateway's thinking-signature marker before forwarding (item c), and the
+    # request handler recognises Anthropic server tools a vendor cannot serve
+    # (item e).
+    "is_server_tool_type",
+    "unmark_thinking_signatures",
 ]

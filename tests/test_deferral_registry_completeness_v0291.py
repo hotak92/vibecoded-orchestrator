@@ -291,6 +291,17 @@ _V0298_OWNED_ADDITIONS = frozenset({
 })
 
 
+# v0.2.101 (plan items 1+5): the post-start GPU check's row. Emitted INSIDE
+# the install.py run (install step 5, `vco_lib.gpu_verify` via
+# `vco_lib.install_services_up`) and re-detected on every run that composes
+# with the GPU overlay; the wrappers' success path re-emits it between
+# installs (python -m vco_lib.gpu_verify), so install ownership is the
+# right lifecycle: a run that verifies the GPU present simply drops it.
+_V02101_OWNED_ADDITIONS = frozenset({
+    "compose_gpu_device_missing",
+})
+
+
 # v0.2.100 (PLAN-V0300-FIX AD-3 / AD-12, WP-04): fifteen ids registered in
 # wave 1 AHEAD of most of their emitters, every one `owned-drop-when-absent`
 # by the plan's ruling (state-keyed re-probe, R26). Two shapes:
@@ -756,7 +767,8 @@ class TestOwnershipMigrationPin(unittest.TestCase):
             | _V0295_OWNED_ADDITIONS
             | _V0297_OWNED_ADDITIONS
             | _V0298_OWNED_ADDITIONS
-            | _V02100_OWNED_ADDITIONS,
+            | _V02100_OWNED_ADDITIONS
+            | _V02101_OWNED_ADDITIONS,
             "ownership grants changed. Ownership of a FOREIGN cid means it is "
             "dropped whenever install.py does not re-detect it — intended for "
             "one-shot records, catastrophic for anything whose emitter runs "
