@@ -328,14 +328,26 @@ describe('draft helpers', () => {
 describe('summaries', () => {
   it('names the preserved user edits, which is the invisible half of reseed', () => {
     expect(
-      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1 }),
+      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 0 }),
     ).toBe('1 added, 2 refreshed, 3 already current, 1 of your edit kept.');
     expect(
-      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 2 }),
+      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 2, retired: 0 }),
     ).toBe('2 of your edits kept.');
     expect(
-      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 0 }),
+      describeReseed({ inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0 }),
     ).toBe('Nothing to reseed.');
+  });
+
+  it('names the retired rows — a row this very click deleted must not vanish unexplained (SF-1)', () => {
+    // (Red-proof mutation: drop the `retired` clause from describeReseed and
+    // both assertions below fail — the retire-only reseed would say
+    // "Nothing to reseed." while having deleted a row.)
+    expect(
+      describeReseed({ inserted: 0, updated: 0, unchanged: 12, preserved_user_edits: 0, retired: 1 }),
+    ).toBe('1 retired, 12 already current.');
+    expect(
+      describeReseed({ inserted: 1, updated: 2, unchanged: 3, preserved_user_edits: 1, retired: 2 }),
+    ).toBe('1 added, 2 refreshed, 2 retired, 3 already current, 1 of your edit kept.');
   });
 
   it('surfaces an export failure verbatim instead of a success sentence', () => {

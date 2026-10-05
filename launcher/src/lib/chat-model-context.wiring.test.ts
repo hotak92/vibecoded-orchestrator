@@ -23,6 +23,10 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parse } from 'svelte/compiler';
+// SF-1 (v0.2.101 review): the TS↔Rust field-mirror extractors and the Rust
+// source loader, from their one homes in test-support.
+import { loadRust } from './test-support/source-census';
+import { rustStructFields, tsInterfaceFields } from './test-support/wiring-ast';
 
 type Node = Record<string, unknown>;
 
@@ -91,5 +95,31 @@ describe('chat-model-context pane — text_only is wired (v0.2.101 G4)', () => {
       'utf8',
     );
     expect(source).toMatch(/<th[^>]*>Input<\/th>/);
+  });
+});
+
+// ─── the ReseedOutcome mirror (v0.2.101, review SF-1) ──────────────────────
+// THE DEFECT IT PINS: the Rust `ReseedOutcome` gained `retired` (the NB-02
+// converge/reseed retire counter) but the TS mirror kept four counters — a
+// drifted mirror type-checks and silently drops the field at runtime, so the
+// reseed toast under-reported deletions its own click performed. Same shape
+// as the `PackInfo` mirror in `packs.wiring.test.ts`.
+
+describe('TS ReseedOutcome mirrors the Rust ReseedOutcome struct', () => {
+  it('field sets are identical (and the retire counter is among them)', () => {
+    const db = loadRust().find(
+      (f) => f.rel === 'vct-launcher-core/src/db/chat_model_context.rs',
+    );
+    expect(db, 'the chat_model_context.rs crate file moved?').toBeTruthy();
+    const rust = rustStructFields(db!.text, 'ReseedOutcome');
+    const ts = tsInterfaceFields(
+      readFileSync(resolve(here, 'types/chat-model-context.ts'), 'utf8'),
+      'ReseedOutcome',
+    );
+    expect(rust.length).toBeGreaterThan(0);
+    // (Red-proof mutation: delete `retired: number;` from the TS interface
+    // and the set comparison below fails.)
+    expect(rust).toContain('retired');
+    expect([...ts].sort()).toEqual([...rust].sort());
   });
 });

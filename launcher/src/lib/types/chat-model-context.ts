@@ -59,12 +59,20 @@ export interface ExportReport {
   error: string | null;
 }
 
-/** What a reseed did. Four counters so the `user_edited` guard is visible. */
+/** What a reseed did. Five counters so the `user_edited` guard — and the
+ *  retire of machine-seeded rows the converged seed no longer ships
+ *  (v0.2.101, NB-02) — are visible. Field-for-field mirror of
+ *  `db::chat_model_context::ReseedOutcome`, pinned by
+ *  `chat-model-context.wiring.test.ts`. */
 export interface ReseedOutcome {
   inserted: number;
   updated: number;
   unchanged: number;
   preserved_user_edits: number;
+  /** Machine-seeded rows (`user_edited = 0`) the converged seed no longer
+   *  ships, deleted by this very reseed — unnamed in the toast, their
+   *  disappearance would be unexplained (review SF-1). */
+  retired: number;
 }
 
 /** Every mutating command returns its own result AND the export outcome. */

@@ -12,6 +12,7 @@
 // suite inside the importer — that is why these live HERE, in test-support
 // (which `source-census.ts` already established), not in any test file.
 
+import { expect } from 'vitest';
 import type { SourceFile } from './source-census';
 
 /** Command names in the `generate_handler![ … ]` list of lib.rs. `#[cfg]`
@@ -56,4 +57,24 @@ export function isIdent(n: unknown, name: string): boolean {
     (n as Record<string, unknown> | undefined)?.type === 'Identifier' &&
     (n as Record<string, unknown>).name === name
   );
+}
+
+// ─── TS↔Rust field-mirror extractors (v0.2.101, review SF-1) ───────────────
+// Graduated here from `packs.wiring.test.ts` when the ReseedOutcome mirror
+// test became their second consumer (same one-home rule as SF-5 above).
+// Run against `SourceFile.text` (comments stripped) so a doc comment naming
+// a field does not count as a field.
+
+/** Field names of `pub struct <name> { … }` in a Rust source text. */
+export function rustStructFields(src: string, struct: string): string[] {
+  const m = new RegExp(`pub struct ${struct}\\s*\\{([^}]*)\\}`).exec(src);
+  expect(m, `struct ${struct} not found`).toBeTruthy();
+  return [...m![1].matchAll(/pub\s+([a-z_][a-z0-9_]*)\s*:/g)].map((x) => x[1]);
+}
+
+/** Field names of `export interface <name> { … }` in a TS source text. */
+export function tsInterfaceFields(src: string, iface: string): string[] {
+  const m = new RegExp(`export interface ${iface}\\s*\\{([^}]*)\\}`).exec(src);
+  expect(m, `interface ${iface} not found`).toBeTruthy();
+  return [...m![1].matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*)\?*\s*:/gm)].map((x) => x[1]);
 }

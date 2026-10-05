@@ -248,6 +248,13 @@ pub struct ReseedOutcome {
     pub unchanged: usize,
     /// Rows with `user_edited = 1`: LEFT ALONE, byte-identical.
     pub preserved_user_edits: usize,
+    /// Machine-seeded rows (`user_edited = 0`) the converged seed no longer
+    /// ships, retired by the converge (v0.2.101, NB-02). The instance that
+    /// motivated the counter: `glm-5.2`, owner-retired in v0.2.100 — the
+    /// seed stopped listing it, but the seed converge only ever merged, so
+    /// every existing install kept a dead row the model-context pane and the
+    /// exported JSON still listed while the gateway refused the id.
+    pub retired: usize,
 }
 
 // ─── Timestamps ───────────────────────────────────────────────────────────
@@ -480,8 +487,11 @@ impl Db {
     ///     explicit "Reseed from shipped defaults" clears tombstones, and a
     ///     deliberate click may.
     ///
-    /// Rows in the table that the shipped seed does not mention are never
-    /// removed: converge adds and refreshes, it does not prune.
+    /// Rows in the table that the shipped seed does not mention are retired
+    /// when — and only when — no human hand wrote them (`user_edited = 0`):
+    /// converge adds, refreshes and retires stale seeded rows, but never
+    /// prunes a user's own (see [`retire_rows_absent_from_seed`] for the
+    /// exact predicate).
     pub fn converge_chat_model_context_seed(
         &self,
         rows: &[ChatModelContextInput],
@@ -545,6 +555,10 @@ impl Db {
 /// values → update; present with `user_edited = 0` and identical values →
 /// written not at all (so `updated_at` keeps meaning "when this row last
 /// changed"); present with `user_edited = 1` → LEFT ALONE ENTIRELY.
+///
+/// After the per-row merge, rows the seed does NOT mention are retired when
+/// they are machine-written — [`retire_rows_absent_from_seed`], shared by
+/// both callers for the same reason this whole function is.
 ///
 /// `restore_deleted` is the ONLY difference between the two callers: when it
 /// is `true` (the reseed button — a deliberate click) an absent row is
@@ -650,7 +664,86 @@ fn converge_rows(
             }
         }
     }
+    retire_rows_absent_from_seed(tx, rows, &mut outcome)?;
     Ok(outcome)
+}
+
+/// Retire rows the converged seed no longer ships (v0.2.101, NB-02).
+///
+/// PREDICATE — a row is RETIRED exactly when BOTH hold:
+///
+///   * `user_edited = 0`. A human edit is never deleted by any automatic
+///     path, per row, ever — the same guard the merge half applies. The only
+///     writer of a `user_edited = 0` row is a previous seed converge, so
+///     this arm names rows that are machine-written and nothing else.
+///   * the id is absent from the seed being converged — the one shipped
+///     catalog surface this layer holds. The gateway's other catalog
+///     surfaces (`model_router/vendors.py`: `static_ids`, `verified_ids`,
+///     `retired_ids`) are Python-side data with no Rust reader, and this
+///     module deliberately does no file I/O, so a seed-absent machine row is
+///     the strongest "appears in no shipped catalog surface" test available
+///     here — and it is exactly right: such a row was written by an OLDER
+///     seed and dropped from the shipped set, which is a model the vendor
+///     no longer serves.
+///
+/// There is deliberately NO second hardcoded tombstone list here. The
+/// gateway's tombstone set for retired ids lives in
+/// `claude_mcp_servers/model_router/vendors.py` (`retired_ids`, today
+/// `("glm-5.2",)` on both routes); duplicating those ids in Rust would be a
+/// (C)-tier mirror without the parity test that would keep it honest — the
+/// seed-absent predicate reaches the same rows from data this layer already
+/// holds. When a model is retired from the shipped seed, this pass retires
+/// it from every existing table on the next boot; if a future release
+/// re-ships an id, the merge half re-inserts it (a retire writes NO
+/// `chat_model_context_tombstone` row — that table is the user's delete
+/// marker and must stay exactly that).
+///
+/// One `tracing::info!` line per retired row. The retire COUNT also
+/// surfaces elsewhere — the boot summary line
+/// (`commands::chat_model_context::converge_summary_line`) and the reseed
+/// toast after "Reseed from shipped defaults" both carry it — but neither
+/// names the retired IDS; this per-row line is where a user learns which
+/// row went, which no pane shows (a removed row simply disappears).
+fn retire_rows_absent_from_seed(
+    tx: &rusqlite::Transaction<'_>,
+    seed: &[ChatModelContextInput],
+    outcome: &mut ReseedOutcome,
+) -> Result<(), String> {
+    let mut stmt = tx
+        .prepare("SELECT model_id FROM chat_model_context WHERE user_edited = 0")
+        .map_err(|e| format!("retire scan prepare: {}", e))?;
+    let machine_rows: Vec<String> = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("retire scan: {}", e))?
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("retire scan collect: {}", e))?;
+    drop(stmt);
+    for model_id in machine_rows {
+        if seed.iter().any(|row| row.model_id == model_id) {
+            continue;
+        }
+        // The `user_edited = 0` re-check is defensive: the scan and the
+        // delete share one transaction, but the guard costs nothing and a
+        // future edit that moves this off the scanned set must not be able
+        // to turn it into a delete of a user's row.
+        let deleted = tx
+            .execute(
+                "DELETE FROM chat_model_context WHERE model_id = ?1 AND user_edited = 0",
+                params![model_id],
+            )
+            .map_err(|e| format!("retire delete {}: {}", model_id, e))?;
+        if deleted > 0 {
+            outcome.retired += 1;
+            tracing::info!(
+                "[vct] chat-model context: retired `{}` — machine-seeded and \
+                 absent from the shipped seed, so the gateway refuses it on \
+                 every route. Re-add it in the model-context pane if you \
+                 still want it listed (a hand-added row is never retired).",
+                model_id
+            );
+        }
+    }
+    Ok(())
 }
 
 // ─── Export document ──────────────────────────────────────────────────────
@@ -998,10 +1091,14 @@ mod tests {
         assert_eq!(created.max_output, 0);
 
         assert_eq!(
-            db.converge_chat_model_context_seed(&[ChatModelContextInput {
-                max_output: 0,
-                ..input("deepseek-v4-pro")
-            }])
+            db.converge_chat_model_context_seed(&[
+                // The pre-upserted row travels IN the seed so this test stays
+                // about the unstated marker, not the retire pass: a
+                // machine-written seed-absent row would (correctly, v0.2.101)
+                // be retired here and shrink the listing below.
+                ChatModelContextInput { max_output: 0, ..input("qwen3.8-max") },
+                ChatModelContextInput { max_output: 0, ..input("deepseek-v4-pro") },
+            ])
             .unwrap()
             .inserted,
             1,
@@ -1194,7 +1291,7 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0 },
             "an untouched row with stale values is REFRESHED, not skipped"
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1224,7 +1321,7 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0 }
         );
 
         // BYTE-IDENTICAL: context_window, max_output, window_1m, source,
@@ -1257,7 +1354,7 @@ mod tests {
         let outcome = db.converge_chat_model_context_seed(&[input("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0 },
             "an identical row is counted, not written"
         );
         assert_eq!(
@@ -1434,7 +1531,7 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0 }
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 0, preserved_user_edits: 0, retired: 0 }
         );
         let row = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
         assert_eq!(row.context_window, 1_000_000);
@@ -1461,7 +1558,7 @@ mod tests {
         let outcome = db.reseed_chat_model_context(&[one_m("glm-5.1")]).unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1 }
+            ReseedOutcome { inserted: 0, updated: 0, unchanged: 0, preserved_user_edits: 1, retired: 0 }
         );
 
         let after = db.get_chat_model_context("glm-5.1").unwrap().unwrap();
@@ -1483,13 +1580,13 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0 },
+            ReseedOutcome { inserted: 1, updated: 0, unchanged: 1, preserved_user_edits: 0, retired: 0 },
             "a new vendor model arrives; the identical row is not rewritten"
         );
     }
 
     #[test]
-    fn reseed_never_prunes_a_row_the_shipped_seed_does_not_mention() {
+    fn reseed_never_prunes_a_user_edited_row_the_seed_does_not_mention() {
         let db = make_db();
         db.upsert_chat_model_context(
             ChatModelContextInput {
@@ -1505,8 +1602,124 @@ mod tests {
 
         assert!(
             db.get_chat_model_context("kimi-k2").unwrap().is_some(),
-            "reseed adds and refreshes; it does not prune the user's own rows"
+            "reseed adds, refreshes and retires stale SEEDED rows; a row a \
+             human wrote is never one of them"
         );
+    }
+
+    // ── retire: stale seeded rows (v0.2.101, NB-02) ───────────────────────
+    //
+    // The defect this section pins: the seed converge only ever MERGED, so a
+    // model retired from the shipped seed (glm-5.2, owner ruling v0.2.100)
+    // stayed in every existing table — a row the pane listed and the export
+    // served while the gateway refused the id on every route.
+
+    /// The NB-02 shape exactly: an existing table holding the retired row a
+    /// pre-v0.2.100 seed wrote (plain, `user_edited = 0`), the same retired
+    /// id re-added BY HAND (`user_edited = 1`), and a current-seed row.
+    /// After the converge: the machine-written retired row is GONE, the
+    /// hand-added one is KEPT, the seed row is kept, and the outcome counts
+    /// exactly one retirement.
+    #[test]
+    fn converge_retires_a_stale_seeded_row_but_never_a_user_edited_one() {
+        let db = make_db();
+        // The retired row exactly as an earlier boot seeded it.
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+        // The user's OWN glm-5.2 row (they re-added it by hand): a human
+        // hand wrote it, so no automatic path may remove it.
+        db.upsert_chat_model_context(
+            ChatModelContextInput {
+                context_window: 555_555,
+                source: "my own measurement".into(),
+                ..one_m("glm-5.2")
+            },
+            true,
+        )
+        .unwrap();
+        // A row the current seed still ships.
+        db.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+        let seed = vec![input("glm-5.1"), one_m("glm-5.3")];
+
+        let outcome = db.converge_chat_model_context_seed(&seed).unwrap();
+
+        assert_eq!(outcome.retired, 0, "glm-5.2 is user_edited now, not stale");
+        assert!(
+            db.get_chat_model_context("glm-5.2")
+                .unwrap()
+                .expect("the user's row must survive every automatic path")
+                .user_edited,
+            "the hand-re-added row keeps its user-edited guard"
+        );
+
+        // The actual stale shape: a SECOND table (an install where nobody
+        // touched the row) holding the machine-written glm-5.2.
+        let db2 = make_db();
+        db2.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+        db2.upsert_chat_model_context(input("glm-5.1"), false).unwrap();
+
+        let outcome2 = db2.converge_chat_model_context_seed(&seed).unwrap();
+
+        assert_eq!(outcome2.retired, 1, "exactly the stale seeded row");
+        assert!(
+            db2.get_chat_model_context("glm-5.2").unwrap().is_none(),
+            "the machine-written glm-5.2 row is retired, not refreshed"
+        );
+        assert!(
+            db2.get_chat_model_context("glm-5.1").unwrap().is_some(),
+            "a row the seed still ships is kept"
+        );
+        assert!(
+            db2.get_chat_model_context("glm-5.3").unwrap().is_some(),
+            "the newly shipped row landed"
+        );
+        assert_eq!(db2.list_chat_model_context().unwrap().len(), 2);
+
+        // The next boot is a no-op retire: nothing left to remove, no
+        // counter creep.
+        let again = db2.converge_chat_model_context_seed(&seed).unwrap();
+        assert_eq!(again.retired, 0, "a retired row does not linger anywhere");
+    }
+
+    /// The retire writes NO delete tombstone — that table is the user's
+    /// delete marker ("do not reseed this id"), and a model retired from the
+    /// seed must come BACK automatically if a future release re-ships it.
+    #[test]
+    fn a_retired_stale_row_leaves_no_delete_tombstone_behind() {
+        let db = make_db();
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+
+        db.converge_chat_model_context_seed(&[input("glm-5.1")])
+            .unwrap();
+
+        assert!(
+            db.list_chat_model_context_tombstones()
+                .unwrap()
+                .is_empty(),
+            "the retire is not the user's delete; it must not block a future \
+             seed that re-ships the id"
+        );
+
+        // And indeed: a future seed re-shipping the id re-inserts it through
+        // the ordinary boot converge, no button press needed.
+        let outcome = db
+            .converge_chat_model_context_seed(&[input("glm-5.1"), one_m("glm-5.2")])
+            .unwrap();
+        assert_eq!(outcome.inserted, 1);
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_some());
+    }
+
+    /// "Reseed from shipped defaults" applies the same retire: the button's
+    /// label promises the shipped set, and a stale machine row is not part
+    /// of it. (A user's own row is exempt — pinned by the test above.)
+    #[test]
+    fn reseed_retires_a_stale_seeded_row_too() {
+        let db = make_db();
+        db.upsert_chat_model_context(one_m("glm-5.2"), false).unwrap();
+
+        let outcome = db.reseed_chat_model_context(&[input("glm-5.1")]).unwrap();
+
+        assert_eq!(outcome.retired, 1);
+        assert!(db.get_chat_model_context("glm-5.2").unwrap().is_none());
     }
 
     #[test]

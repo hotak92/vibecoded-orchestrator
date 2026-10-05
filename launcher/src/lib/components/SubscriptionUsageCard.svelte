@@ -16,16 +16,32 @@
     fetchUsage,
     INITIAL_CARD_STATE,
     nextPollMs,
+    restartOffered,
     settle,
     unknownLabel,
     vendorStatus,
     visibleVendors,
     type UsageCardState,
   } from '$lib/subscription-usage';
+  // v0.2.101 (P299-A2): the "Restart gateway…" affordance for an outdated
+  // gateway. offer() re-asks the backend ignoring any stored dismissal and
+  // opens the (layout-mounted) GatewayRestartModal only when the gateway is
+  // proven stale; the modal's Continue stays the ONLY restart path. A click
+  // whose fresh verdict is NOT stale (e.g. the gateway restarted between
+  // polls) shows the backend's summary instead of doing nothing — review
+  // nit 2; `offerNote` is the one home of that rule, shared with Services.
+  import { gatewayFreshness } from '$lib/stores/gateway-freshness';
+  import { offerNote } from '$lib/gateway-freshness';
 
   let card = $state<UsageCardState>(INITIAL_CARD_STATE);
   let result = $derived(card.result);
   let now = $state(Date.now());
+  let freshnessNote = $state<string | null>(null);
+
+  async function offerGatewayRestart() {
+    freshnessNote = null;
+    freshnessNote = offerNote(await gatewayFreshness.offer());
+  }
 
   onMount(() => {
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -57,6 +73,17 @@
 
     {#if !result.ok}
       <p class="usage-problem" role="alert">{result.message}</p>
+      {#if restartOffered(result)}
+        <button
+          class="btn-3d btn-3d-primary btn-3d-sm usage-restart"
+          onclick={() => void offerGatewayRestart()}
+        >
+          Restart gateway…
+        </button>
+        {#if freshnessNote}
+          <p class="usage-muted usage-note">{freshnessNote}</p>
+        {/if}
+      {/if}
     {:else}
       {#if card.warning}
         <p class="usage-warning">{card.warning}</p>
@@ -210,5 +237,12 @@
     color: var(--color-pink, #ff4fa0);
     font-size: 12px;
     margin: 0;
+  }
+  .usage-restart {
+    margin-top: 10px;
+  }
+  .usage-note {
+    margin: 8px 0 0;
+    font-size: 11px;
   }
 </style>

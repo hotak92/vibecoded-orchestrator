@@ -77,6 +77,12 @@
     GatewayAgentsGate,
     RoutingGuidanceState,
   } from '$lib/api/model_gateway';
+  // v0.2.101 (P299-A2): the user-initiated gateway-freshness ask. The store
+  // is the same one the layout-mounted GatewayRestartModal reads; this page
+  // only calls `offer()`, renders the store's `error` when a check fails, and
+  // shows `offerNote`'s one-liner when the fresh verdict is not stale.
+  import { gatewayFreshness } from '$lib/stores/gateway-freshness';
+  import { offerNote } from '$lib/gateway-freshness';
   import { projects } from '$lib/stores/projects';
   import DialogRoot from '$lib/components/DialogRoot.svelte';
   import ExternalServicesDialog from '$lib/components/ExternalServicesDialog.svelte';
@@ -197,6 +203,23 @@
     } catch (e) {
       gwError = String(e);
     }
+  }
+
+  // ─── Gateway freshness (v0.2.101, P299-A2) ─────────────────────────────
+  // "Restart gateway…" re-asks the backend IGNORING any stored dismissal and
+  // opens the GatewayRestartModal when the running gateway is proven stale —
+  // its Continue stays the only restart path, so this button never restarts
+  // anything itself. A FAILED check is visible: the store records it in
+  // `error` and the banner below renders it (it used to be console-only).
+  const gwFreshness = $derived($gatewayFreshness);
+  let freshnessNote = $state<string | null>(null);
+
+  async function offerGatewayRestart() {
+    freshnessNote = null;
+    // The modal opens only for a proven-stale gateway; any other verdict
+    // gets a one-line answer here so the button is never a silent no-op.
+    // `offerNote` is the one home of that rule (shared with the usage card).
+    freshnessNote = offerNote(await gatewayFreshness.offer());
   }
 
   async function refreshVSCodeTargets() {
@@ -768,6 +791,12 @@
       <div class="banner error">{gwError}</div>
     {/if}
 
+    <!-- v0.2.101 (P299-A2): a freshness check that FAILED (background or
+         user-initiated) is a visible state, not a console.warn nobody sees. -->
+    {#if gwFreshness.error}
+      <div class="banner error" role="alert">{gwFreshness.error}</div>
+    {/if}
+
     <div class="bulk-actions">
       <button
         onclick={() => gwAction(() => startModelGateway())}
@@ -810,7 +839,19 @@
       >
         Diagnose
       </button>
+      <button
+        class="secondary"
+        onclick={() => void offerGatewayRestart()}
+        disabled={gwBusy}
+        title="Re-check the running gateway against the checkout; if it is serving older code, offer the restart (its Continue is the only restart path)"
+      >
+        Restart gateway…
+      </button>
     </div>
+
+    {#if freshnessNote}
+      <p class="gw-detail">{freshnessNote}</p>
+    {/if}
 
     {#if gw?.boot === 'unsupported'}
       <p class="muted small">

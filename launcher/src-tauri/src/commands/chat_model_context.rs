@@ -227,6 +227,31 @@ pub fn export_now(db: &Db) -> ExportReport {
 
 // ─── Boot ─────────────────────────────────────────────────────────────────
 
+/// The one-line boot summary of a converge, or `None` for a boot that wrote
+/// nothing (a quiet boot stays quiet — no line, so `unchanged`-only runs do
+/// not spam the log on every launch).
+///
+/// A RETIRE-ONLY converge is not quiet (v0.2.101, review nit 3): a row
+/// vanished from the table and no pane shows a per-row trace (the reseed
+/// toast carries the count, the retire log lines in the core module name
+/// the ids). Extracted as a pure function so the fire/quiet boundary is
+/// testable without a tracing subscriber.
+fn converge_summary_line(path: &Path, outcome: &ReseedOutcome) -> Option<String> {
+    if outcome.inserted == 0 && outcome.updated == 0 && outcome.retired == 0 {
+        return None;
+    }
+    Some(format!(
+        "[vct] chat-model context: converged with {}: {} new, {} refreshed, \
+         {} retired, {} unchanged, {} user edit(s) preserved",
+        path.display(),
+        outcome.inserted,
+        outcome.updated,
+        outcome.retired,
+        outcome.unchanged,
+        outcome.preserved_user_edits
+    ))
+}
+
 /// Boot converge + export, called once from `lib.rs::run`.
 ///
 /// The converge brings the table in step with the shipped seed per row —
@@ -251,16 +276,8 @@ pub fn seed_and_export_on_boot(db: &Db) {
     match load_seed_rows(db) {
         Ok(Some((path, rows))) => match db.converge_chat_model_context_seed(&rows) {
             Ok(outcome) => {
-                if outcome.inserted > 0 || outcome.updated > 0 {
-                    tracing::info!(
-                        "[vct] chat-model context: converged with {}: {} new, {} \
-                         refreshed, {} unchanged, {} user edit(s) preserved",
-                        path.display(),
-                        outcome.inserted,
-                        outcome.updated,
-                        outcome.unchanged,
-                        outcome.preserved_user_edits
-                    );
+                if let Some(line) = converge_summary_line(&path, &outcome) {
+                    tracing::info!("{}", line);
                 }
             }
             Err(e) => tracing::warn!("[vct] chat-model context: seeding failed: {}", e),
@@ -783,6 +800,62 @@ mod tests {
         // The row is still in the DB — the export failure did not roll it back.
         assert_eq!(db.list_chat_model_context().unwrap().len(), 1);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ── boot summary (v0.2.101, review nit 3) ────────────────────────────
+
+    /// A RETIRE-ONLY converge is not a quiet boot: the row vanished, no pane
+    /// shows it, and the summary line is the only trace. It must fire and
+    /// must carry the retired count.
+    #[test]
+    fn the_boot_summary_fires_on_a_retire_only_converge_and_names_the_count() {
+        let line = converge_summary_line(
+            Path::new("/clone/claude_mcp_servers/model_router/chat_model_context.seed.json"),
+            &ReseedOutcome {
+                inserted: 0,
+                updated: 0,
+                unchanged: 20,
+                preserved_user_edits: 1,
+                retired: 1,
+            },
+        )
+        .expect("a retire-only converge must produce a summary line");
+        assert!(line.contains("1 retired"), "got: {}", line);
+        assert!(line.contains("converged with /clone"), "got: {}", line);
+        assert!(line.contains("1 user edit(s) preserved"), "got: {}", line);
+    }
+
+    /// A boot that wrote nothing stays quiet — the unchanged/preserved
+    /// counters alone never produce a line, or every launch would log.
+    #[test]
+    fn the_boot_summary_stays_quiet_when_nothing_was_written() {
+        assert!(converge_summary_line(
+            Path::new("/clone/seed.json"),
+            &ReseedOutcome {
+                inserted: 0,
+                updated: 0,
+                unchanged: 21,
+                preserved_user_edits: 0,
+                retired: 0,
+            }
+        )
+        .is_none());
+    }
+
+    /// The pre-existing half: a converge that only inserted or refreshed
+    /// still fires (the condition is ANY of the three write kinds).
+    #[test]
+    fn the_boot_summary_fires_on_writes_without_retires_too() {
+        for outcome in [
+            ReseedOutcome { inserted: 2, updated: 0, unchanged: 0, preserved_user_edits: 0, retired: 0 },
+            ReseedOutcome { inserted: 0, updated: 1, unchanged: 3, preserved_user_edits: 0, retired: 0 },
+        ] {
+            assert!(
+                converge_summary_line(Path::new("/s"), &outcome).is_some(),
+                "a converge that wrote must not be silenced: {:?}",
+                outcome
+            );
+        }
     }
 
     // ── every mutation re-exports (R16 item 4) ───────────────────────────

@@ -28,6 +28,7 @@ import type {
   ChatModelContextRow,
   ChatModelContextStatus,
   ExportReport,
+  ReseedOutcome,
 } from '$lib/types/chat-model-context';
 
 /** All rows, ordered by `model_id`. */
@@ -258,17 +259,17 @@ export function validateDraft(
  * One-line summary of a reseed, for a toast.
  *
  * Names the preserved edits explicitly, because "nothing happened to your
- * row" is the part of the guarantee a user cannot otherwise see.
+ * row" is the part of the guarantee a user cannot otherwise see — and, since
+ * v0.2.101 (review SF-1), the RETIRED rows too, because a row deleted by
+ * this very click (a machine-seeded id the converged seed no longer ships,
+ * e.g. `glm-5.2`) is otherwise unexplained in the only surface that
+ * summarizes the action.
  */
-export function describeReseed(o: {
-  inserted: number;
-  updated: number;
-  unchanged: number;
-  preserved_user_edits: number;
-}): string {
+export function describeReseed(o: ReseedOutcome): string {
   const parts: string[] = [];
   if (o.inserted > 0) parts.push(`${o.inserted} added`);
   if (o.updated > 0) parts.push(`${o.updated} refreshed`);
+  if (o.retired > 0) parts.push(`${o.retired} retired`);
   if (o.unchanged > 0) parts.push(`${o.unchanged} already current`);
   if (o.preserved_user_edits > 0) {
     parts.push(

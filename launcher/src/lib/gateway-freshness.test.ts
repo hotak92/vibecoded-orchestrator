@@ -12,6 +12,7 @@ import {
   DISMISS_STORAGE_KEY,
   INITIAL_FRESHNESS_STATE,
   MODAL_MESSAGE,
+  offerNote,
   promptIdentity,
   scheduleStartupCheck,
   shouldOfferRestart,
@@ -308,5 +309,144 @@ describe('gateway freshness modal (v0.2.97)', () => {
     expect(state.error).toMatch(/boom/);
     expect(state.restarting).toBe(false);
     expect(state.open).toBe(true);
+  });
+});
+
+// ── v0.2.101 (P299-A2): the user-initiated ask ────────────────────────────
+// Before offer(): a single Dismiss suppressed the prompt for this exact
+// situation forever, the usage card's `outdated_gateway` had no affordance,
+// and a failed check lived in the console only.
+
+describe('offer() — the user-initiated ask (v0.2.101, P299-A2)', () => {
+  it('opens the modal for a proven-stale gateway EVEN when the exact situation was dismissed', async () => {
+    const h = harness(report());
+    // A stored dismissal for THIS identity keeps the automatic check silent…
+    h.storage.data.set(DISMISS_STORAGE_KEY, promptIdentity(report()));
+    await h.ctl.check();
+    expect(h.state().open).toBe(false);
+    // …but the user asking again IS the point of offer(): it ignores it.
+    // (Red-proof mutation: make offer() consult DISMISS_STORAGE_KEY — e.g.
+    // gate the open on shouldOfferRestart(report, readDismissed(storage)) —
+    // and the open assertion below fails.)
+    const got = await h.ctl.offer();
+    expect(got?.prompt).toBe(true);
+    expect(h.calls).toEqual(['model_gateway_freshness', 'model_gateway_freshness']);
+    expect(h.state().open).toBe(true);
+    expect(h.state().report?.pid).toBe(42);
+    // offer() leaves the stored dismissal alone; the next Dismiss re-stores it.
+    expect(h.storage.data.get(DISMISS_STORAGE_KEY)).toBe(promptIdentity(report()));
+  });
+
+  it("never restarts without the modal's Continue — offer only opens", async () => {
+    const h = harness(report());
+    await h.ctl.offer();
+    // (Red-proof mutation: call continueRestart() from inside offer() and the
+    // single-command assertion below fails with a restart nobody confirmed.)
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+    expect(h.state().open).toBe(true);
+    expect(h.state().restarting).toBe(false);
+    expect(h.state().result).toBeNull();
+    // Continue, pressed by the user, remains the ONLY restart path.
+    await h.ctl.continueRestart();
+    expect(h.calls).toEqual(['model_gateway_freshness', 'model_gateway_restart_stale']);
+    expect(h.state().result?.restarted).toBe(true);
+  });
+
+  it('a non-stale verdict opens nothing but still reports what the backend said', async () => {
+    for (const r of [
+      report({ verdict: 'current', prompt: false }),
+      report({ verdict: 'unknown', prompt: false }),
+      report({ verdict: 'not_running', prompt: false, pid: null }),
+    ]) {
+      const h = harness(r);
+      const got = await h.ctl.offer();
+      expect(got?.verdict, r.verdict).toBe(r.verdict);
+      expect(h.state().open).toBe(false);
+      expect(h.state().report).toEqual(r);
+      expect(h.calls).toEqual(['model_gateway_freshness']);
+      await h.ctl.continueRestart();
+      expect(h.calls, r.verdict).toEqual(['model_gateway_freshness']);
+    }
+  });
+
+  it('a failed offer is a VISIBLE error state, not console-only', async () => {
+    const h = harness(new Error('no python'));
+    await expect(h.ctl.offer()).resolves.toBeNull();
+    // (Red-proof mutation: drop the error from the failure set and both
+    // assertions below fail — the click would be silently dead again.)
+    expect(h.state().error).toMatch(/freshness check failed/);
+    expect(h.state().error).toMatch(/no python/);
+    expect(h.state().open).toBe(false);
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+    // And the dead check cannot be turned into a restart.
+    await h.ctl.continueRestart();
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+  });
+
+  it('a failed BACKGROUND check is recorded in error too (Services page renders it)', async () => {
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const h = harness(new Error('no python'));
+    await h.ctl.check();
+    expect(h.state().open).toBe(false);
+    expect(h.state().error).toMatch(/freshness check failed/);
+    // Still no modal, still no restart path.
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+    warn.mockRestore();
+  });
+
+  it('does not disturb a decision already under way', async () => {
+    const h = harness(report());
+    await h.ctl.check();
+    expect(h.state().open).toBe(true);
+    const got = await h.ctl.offer();
+    expect(got?.prompt).toBe(true);
+    // The modal in front of the user is untouched and the backend was asked once.
+    expect(h.calls).toEqual(['model_gateway_freshness']);
+    expect(h.state().open).toBe(true);
+  });
+
+  it('a FAILED offer never clobbers a decision that started while it was in flight', async () => {
+    // Review nit 1: user clicks while the 4 s startup check is in flight;
+    // the background check opens the modal; the offer's invoke then rejects.
+    let state: FreshnessState = INITIAL_FRESHNESS_STATE;
+    let rejectCheck: (e: unknown) => void = () => {};
+    const calls: string[] = [];
+    const ctl = createFreshnessController({
+      invoke: ((cmd: string) => {
+        calls.push(cmd);
+        return new Promise((_resolve, reject) => (rejectCheck = reject));
+      }) as never,
+      storage: memoryStore(),
+      set: (s) => (state = s),
+      get: () => state,
+    });
+    const pending = ctl.offer();
+    // Meanwhile the background check landed and opened the modal.
+    const busy: FreshnessState = { ...INITIAL_FRESHNESS_STATE, report: report(), open: true };
+    state = busy;
+    rejectCheck(new Error('no python'));
+    await expect(pending).resolves.toBeNull();
+    // (Red-proof mutation: drop the catch path's decisionInProgress guard
+    // and the failed ask resets the store — the assertion below fails with
+    // the modal the user is reading closed by a check that failed.)
+    expect(state).toBe(busy);
+    expect(calls).toEqual(['model_gateway_freshness']);
+  });
+});
+
+// ── review nit 2: the click is never a silent no-op ────────────────────────
+
+describe('offerNote (v0.2.101 review nit 2)', () => {
+  it('says why for a non-stale verdict', () => {
+    const current = report({ verdict: 'current', prompt: false, summary: 'gateway is current' });
+    expect(offerNote(current)).toBe('gateway is current');
+    expect(offerNote(report({ verdict: 'not_running', prompt: false, pid: null }))).toBe(
+      report({ verdict: 'not_running', prompt: false, pid: null }).summary,
+    );
+  });
+
+  it('adds nothing when the modal opened or the check failed — those have their own answer', () => {
+    expect(offerNote(report())).toBeNull(); // stale: the modal IS the answer
+    expect(offerNote(null)).toBeNull(); // failed: the visible error state is
   });
 });

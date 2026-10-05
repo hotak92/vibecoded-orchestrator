@@ -26,7 +26,14 @@ import { parse } from 'svelte/compiler';
 import { loadRust, sourceFile } from './test-support/source-census';
 // SF-5 (v0.2.101): the shared extractors' ONE home — no local copies (an
 // earlier copy of `registeredCommands` here is what the L3 review flagged).
-import { registeredCommands, walk, isIdent } from './test-support/wiring-ast';
+// The field-mirror extractors moved there too (review SF-1).
+import {
+  isIdent,
+  registeredCommands,
+  rustStructFields,
+  tsInterfaceFields,
+  walk,
+} from './test-support/wiring-ast';
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -94,20 +101,9 @@ describe('generate_handler! registers both pack commands', () => {
 });
 
 // ─── the PackInfo mirror ───────────────────────────────────────────────────
-
-/** Field names of `pub struct <name> { … }` in a Rust source text. */
-function rustStructFields(src: string, struct: string): string[] {
-  const m = new RegExp(`pub struct ${struct}\\s*\\{([^}]*)\\}`).exec(src);
-  expect(m, `struct ${struct} not found`).toBeTruthy();
-  return [...m![1].matchAll(/pub\s+([a-z_][a-z0-9_]*)\s*:/g)].map((x) => x[1]);
-}
-
-/** Field names of `export interface <name> { … }` in a TS source text. */
-function tsInterfaceFields(src: string, iface: string): string[] {
-  const m = new RegExp(`export interface ${iface}\\s*\\{([^}]*)\\}`).exec(src);
-  expect(m, `interface ${iface} not found`).toBeTruthy();
-  return [...m![1].matchAll(/^\s{2}([A-Za-z_][A-Za-z0-9_]*)\?*\s*:/gm)].map((x) => x[1]);
-}
+// `rustStructFields` / `tsInterfaceFields` graduated to test-support/
+// wiring-ast.ts (v0.2.101, review SF-1) when the ReseedOutcome mirror test
+// became their second consumer — imported above, no local copies.
 
 describe('TS PackInfo mirrors the Rust PackInfo struct', () => {
   it('field sets are identical', () => {

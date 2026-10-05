@@ -109,6 +109,28 @@ export function writeDismissed(storage: KeyValueStore | null, identity: string):
   }
 }
 
+/**
+ * The one format of the visible check-failure state (v0.2.101, P299-A2).
+ * Both ask paths use it, so a failure reads the same wherever it surfaces.
+ */
+export function checkFailureMessage(e: unknown): string {
+  return `gateway freshness check failed: ${String(e)}`;
+}
+
+/**
+ * What a "Restart gateway…" click that did NOT open the modal should still
+ * say (review, 1A nit 2): the backend's own summary for a non-stale verdict,
+ * so the click is never a silent no-op — e.g. the gateway restarted between
+ * the usage bridge's polls and is already current while the card still says
+ * `outdated_gateway`. `null` when there is nothing to add: the modal opened
+ * (a proven-stale verdict IS the answer), or the check failed (its own
+ * visible `error` state is the answer). One home: the usage card and the
+ * Services page render the same rule.
+ */
+export function offerNote(report: GatewayFreshnessReport | null): string | null {
+  return report && report.prompt !== true ? report.summary : null;
+}
+
 export type Invoker = <T>(cmd: string, args?: Record<string, unknown>) => Promise<T>;
 
 export interface FreshnessState {
@@ -128,7 +150,7 @@ export const INITIAL_FRESHNESS_STATE: FreshnessState = {
 };
 
 /**
- * The three actions, with I/O injected. The Svelte store is a thin shell
+ * The four actions, with I/O injected. The Svelte store is a thin shell
  * around this; the tests drive it with a fake invoker and assert which
  * backend commands each action does — and does NOT — reach.
  */
@@ -152,27 +174,82 @@ export function createFreshnessController(deps: {
     return state.open || state.restarting || state.result !== null;
   }
 
-  /** Ask the backend. Never restarts anything. A failed check shows nothing. */
+  /**
+   * Ask the backend. Never restarts anything; never opens the modal for a
+   * dismissed situation. A failed check shows no MODAL, but since v0.2.101
+   * (P299-A2) it is recorded in `error` — a visible state the Services page
+   * renders — instead of living in the console only.
+   */
   function check(): Promise<void> {
     if (pendingCheck) return pendingCheck;
     pendingCheck = (async () => {
       // A modal already up is never replaced mid-decision.
       if (decisionInProgress(get())) return;
       let report: GatewayFreshnessReport | null = null;
+      let failure: string | null = null;
       try {
         report = await invoke<GatewayFreshnessReport>('model_gateway_freshness');
       } catch (e) {
         console.warn('[gateway-freshness] check failed:', e);
         report = null;
+        failure = checkFailureMessage(e);
       }
       // Re-read AFTER the await: the state may have moved on while we waited.
       if (decisionInProgress(get())) return;
       const open = shouldOfferRestart(report, readDismissed(storage));
-      set({ ...INITIAL_FRESHNESS_STATE, report, open });
+      set({ ...INITIAL_FRESHNESS_STATE, report, open, error: failure });
     })().finally(() => {
       pendingCheck = null;
     });
     return pendingCheck;
+  }
+
+  /**
+   * The user-initiated ask (v0.2.101, P299-A2): a FRESH check that IGNORES
+   * the stored dismissal — pressing "Restart gateway…" IS the user asking
+   * again, and before this a single Dismiss suppressed the prompt forever —
+   * opening the existing modal when, and only when, the backend proves the
+   * gateway stale. It never restarts anything itself: the modal's Continue
+   * stays the ONLY restart path. A failed check is recorded in `error` (a
+   * visible state), because this ran on an explicit click and silence would
+   * look like a dead button. Returns the fresh report; `null` only when the
+   * check itself failed.
+   *
+   * Deliberately NOT folded into `check`'s single-flight: that one coalesces
+   * automatic asks (launch timer, post-update) where a second caller wants
+   * the same answer. Here the user asked NOW and must get a fresh verdict;
+   * the post-await `decisionInProgress` guard keeps overlapping landings
+   * from clobbering a modal, a restart or a result already under way.
+   */
+  async function offer(): Promise<GatewayFreshnessReport | null> {
+    // Never disturb a decision already under way — the modal being up means
+    // the user is already looking at the only restart path.
+    if (decisionInProgress(get())) return get().report;
+    let report: GatewayFreshnessReport | null = null;
+    try {
+      report = await invoke<GatewayFreshnessReport>('model_gateway_freshness');
+    } catch (e) {
+      // Same post-await guard as the success path (review, 1A nit 1): a
+      // background check may have opened the modal while this ask was in
+      // flight, and a FAILED ask must never reset the store and close the
+      // modal the user is reading. The failure stays console-only in that
+      // case — the open modal outranks it.
+      if (!decisionInProgress(get())) {
+        set({ ...INITIAL_FRESHNESS_STATE, error: checkFailureMessage(e) });
+      }
+      return null;
+    }
+    // Re-read AFTER the await: a background check may have opened the modal
+    // (or a restart begun) while this ask was in flight.
+    if (decisionInProgress(get())) return report;
+    if (report.prompt === true) {
+      // The stored dismissal is deliberately NOT consulted — see above. The
+      // next Dismiss re-stores it, so nothing is lost by leaving it alone.
+      set({ ...INITIAL_FRESHNESS_STATE, report, open: true });
+    } else {
+      set({ ...INITIAL_FRESHNESS_STATE, report });
+    }
+    return report;
   }
 
   /** Continue: the ONLY path that restarts the gateway. */
@@ -200,7 +277,7 @@ export function createFreshnessController(deps: {
     set({ ...INITIAL_FRESHNESS_STATE, report: state.report });
   }
 
-  return { check, continueRestart, dismiss };
+  return { check, continueRestart, dismiss, offer };
 }
 
 /** How long after launcher start the first check runs (boot probes first). */

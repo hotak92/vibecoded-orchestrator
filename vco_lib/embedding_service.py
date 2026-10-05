@@ -76,6 +76,7 @@ import logging
 import os
 import random
 import sys
+import threading
 import time
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -1066,6 +1067,110 @@ def _resolve_arctic_secondary() -> bool:
     return raw in ("1", "true", "yes", "on")
 
 
+# ── P299-B4 (v0.2.101): secondary-slot circuit breaker ────────────────────────
+#
+# A missing secondary model (e.g. ``snowflake-arctic-embed2`` not pulled) makes
+# every secondary fan-out attempt raise, and the pre-breaker code CALLED the
+# dead backend and logged a fresh warning on every embed — hours of identical
+# 404s in one sync, and a WAN round trip per embed for the OpenAI secondaries
+# (P299 §5; V0299-OUTAGE-INVESTIGATION §5). The breaker SKIPS the call once the
+# slot is known to be down.
+#
+# Correctness is UNCHANGED, by design: an OPEN breaker omits the slot from the
+# returned dict exactly as a failure does, so callers, the ``truncated_slots``
+# record and the stored-vector semantics need no change (the slot is optional /
+# opt-in, so skipping it can never reduce active-slot functionality). The
+# ACTIVE slot is NEVER routed through the breaker — a primary-backend outage is
+# never quietened or skipped.
+#
+# State machine, per slot, per instance (``_SecondarySlotBreaker``):
+#   * CLOSED    — the attempt runs. Success drops the state (fresh count next
+#                 time). A failure bumps the consecutive-failure count; below
+#                 the threshold the per-call warning is kept (an isolated
+#                 failure stays visible).
+#   * OPEN      — tripped at the threshold (ONE consolidated warning naming the
+#                 remedy). The backend is NOT called; the slot is omitted.
+#   * HALF-OPEN — after a cool-down the breaker lets ONE probe through, so a
+#                 slot that recovers is picked back up WITHOUT a process
+#                 restart. (Pure skip-for-process-life could never earn the
+#                 success that closes it.) Success CLOSES the breaker; a failed
+#                 probe RE-OPENS it and restarts the cool-down.
+#
+# Half-open trigger: ``HALF_OPEN_SKIPS`` skipped calls OR ``HALF_OPEN_SECS``
+# seconds since opening, whichever comes first. Both legs are needed: a busy
+# sync reaches the call count in seconds, while an idle process needs the clock
+# leg. The cool-down is deliberately short (60 s, not the origin's ~10 min)
+# because a localhost probe is free and the RL-corpus standing rule favours
+# quick recovery; corpus loss is bounded by one probe interval.
+#
+# N = 3 mirrors the watchdog's conservative give-up threshold
+# (``infra_watchdog.rs::MAX_CONSECUTIVE_FAILURES``): three consecutive failures
+# is a persistent fault, not a blip. A slot that keeps failing re-reports its
+# running count every ``REPORT_EVERY`` suppressed calls, so the log stays honest
+# about how long the outage has run (a one-shot line could not tell 4 failures
+# from 40 000).
+SECONDARY_BREAKER_THRESHOLD = 3
+SECONDARY_BREAKER_HALF_OPEN_SKIPS = 100
+SECONDARY_BREAKER_HALF_OPEN_SECS = 60.0
+SECONDARY_BREAKER_REPORT_EVERY = 500
+
+# The remedy named in the consolidated warning — what to check / pull /
+# configure to bring the slot back. The origin asked for the remedy inline
+# ("pull the model or disable DUAL_EMBEDDING_ARCTIC_SECONDARY"); ONE home here
+# so every slot names a concrete action and the trip line can never drift from
+# the fix.
+_SECONDARY_SLOT_REMEDIES: dict[str, str] = {
+    "qwen3_embed": (
+        "check Ollama is running and pull the model "
+        "(`ollama pull qwen3-embedding:0.6b`)"
+    ),
+    "arctic2_embed": (
+        "pull the model (`ollama pull snowflake-arctic-embed2`) or disable "
+        "`DUAL_EMBEDDING_ARCTIC_SECONDARY`"
+    ),
+    "openai_text_embed": (
+        "check the OpenAI key / rate limit, or disable the secondary fan-out "
+        "with `DUAL_EMBEDDING_WRITE_ALL_SLOTS=false`"
+    ),
+    "codesage_embed": (
+        "check the code-embed service (`CODE_EMBED_SERVICE_URL`), or leave the "
+        "code graph on its active embedder"
+    ),
+    "openai_code_embed": (
+        "check the OpenAI key / rate limit, or disable the secondary fan-out "
+        "with `DUAL_EMBEDDING_WRITE_ALL_SLOTS=false`"
+    ),
+}
+_SECONDARY_SLOT_REMEDY_DEFAULT = (
+    "check the slot's backend and its model / credentials, or disable its "
+    "secondary fan-out"
+)
+
+
+@dataclass
+class _SecondarySlotBreaker:
+    """Per-slot circuit-breaker state (see the P299-B4 block above).
+
+    ``failures`` counts consecutive failed ATTEMPTS (drives the trip and a
+    probe-fail re-open). ``skipped`` counts calls skipped while OPEN (cumulative
+    for the outage, so the running count shown in the log only grows).
+    ``skips_since_probe`` is the count-leg trigger for the half-open probe;
+    ``opened_at`` is a monotonic timestamp for the time-leg trigger (both reset
+    per cool-down). ``probing`` is set while a probe is in flight so a
+    concurrent call keeps skipping. ``last_report_count`` is the
+    ``failures + skipped`` value of the last emitted line (drives the periodic
+    re-report).
+    """
+
+    failures: int = 0
+    skipped: int = 0
+    skips_since_probe: int = 0
+    open: bool = False
+    probing: bool = False
+    opened_at: float = 0.0
+    last_report_count: int = 0
+
+
 # ── WP-O rework (2026-07-22, no-functionality-loss rule) ──────────────────────
 #
 # STANDING RULE: the ACTIVE slot's chunk fidelity must NEVER drop below the
@@ -1983,6 +2088,20 @@ class EmbeddingService:
         # ``truncated_slots`` chunk property and derives the secondary-only
         # view from it (see the WP-O block above).
         self._last_truncated_slots: dict[str, bool] = {}
+        # P299-B4 (v0.2.101): per-slot circuit-breaker state for the OPTIONAL
+        # SECONDARY fan-out slots (text: qwen3/openai/arctic; code:
+        # codesage/openai). An OPEN breaker SKIPS the failing backend until a
+        # half-open probe; the ACTIVE slot is not tracked here — its error path
+        # is unchanged. See the ``SECONDARY_BREAKER_*`` block above and
+        # ``_SecondarySlotBreaker``.
+        self._secondary_breakers: dict[str, _SecondarySlotBreaker] = {}
+        # Serialises the breaker state machine. A re-entrant lock (not a plain
+        # ``Lock``) because ``_note_secondary_embed_skipped`` /
+        # ``..._failure`` call ``_emit_secondary_breaker_report`` while already
+        # holding it. Cheap, and closes the check-then-set race on ``probing``
+        # (else N concurrent calls could each grant a probe). Never raises — a
+        # bookkeeping error inside the guarded body fails OPEN at the caller.
+        self._secondary_breaker_lock = threading.RLock()
         # v0.2.100: set by ``for_project`` when the configured CodeSage
         # backend is down (no silent switch) — code embeds raise it.
         self._code_backend_error: Optional[NoEmbeddingBackendError] = None
@@ -3024,22 +3143,29 @@ class EmbeddingService:
         # wider) so the same tagged-degradation
         # contract holds for every secondary.
         if self._text_slot != "qwen3_embed" and self.ollama.is_reachable():
-            try:
-                # Attempt at the secondary budget, then shrink on a LENGTH
-                # refusal until the runner accepts (round-3 BLOCKER-B:
-                # truncate=false makes an over-window chunk a hard 400, so an
-                # unhandled refusal loses the vector entirely).
-                result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
-                    self.ollama, DEFAULT_TEXT_MODEL, _q(DEFAULT_TEXT_MODEL, text)
-                )
-                if trunc:
-                    self._last_truncated_slots["qwen3_embed"] = True
-                    logger.info(
-                        "qwen3 secondary embedded from a bounded sub-window "
-                        "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
+            if self._secondary_breaker_should_skip("qwen3_embed"):
+                self._note_secondary_embed_skipped("qwen3_embed")
+            else:
+                try:
+                    # Attempt at the secondary budget, then shrink on a LENGTH
+                    # refusal until the runner accepts (round-3 BLOCKER-B:
+                    # truncate=false makes an over-window chunk a hard 400, so an
+                    # unhandled refusal loses the vector entirely).
+                    result["qwen3_embed"], trunc = _embed_secondary_with_refusal_retry(
+                        self.ollama, DEFAULT_TEXT_MODEL, _q(DEFAULT_TEXT_MODEL, text)
                     )
-            except Exception as exc:
-                logger.warning("qwen3 fallback embedding failed: %s", exc)
+                    if trunc:
+                        self._last_truncated_slots["qwen3_embed"] = True
+                        logger.info(
+                            "qwen3 secondary embedded from a bounded sub-window "
+                            "(chunk exceeded qwen3 num_ctx); slot tagged truncated"
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "qwen3_embed", "qwen3 fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("qwen3_embed")
         # Arctic SECONDARY slot (WP-O) — opt-in via DUAL_EMBEDDING_ARCTIC_SECONDARY,
         # only when arctic isn't already the active slot and Ollama is up. This is
         # what lets a qwen3-active install collect the arctic RL corpus without an
@@ -3060,24 +3186,33 @@ class EmbeddingService:
             and _resolve_arctic_secondary()
             and self.ollama.is_reachable()
         ):
-            try:
-                # Attempt at the secondary budget, then shrink on a LENGTH
-                # refusal until the runner accepts (round-3 BLOCKER-B).
-                result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
-                    self.ollama, ARCTIC_SECONDARY_MODEL, _q(ARCTIC_SECONDARY_MODEL, text)
-                )
-                if trunc:
-                    self._last_truncated_slots["arctic2_embed"] = True
-                    logger.info(
-                        "arctic secondary embedded from a bounded sub-window "
-                        "(chunk %d chars exceeded arctic num_ctx); slot tagged "
-                        "truncated (active slot unaffected)", len(text)
+            if self._secondary_breaker_should_skip("arctic2_embed"):
+                self._note_secondary_embed_skipped("arctic2_embed")
+            else:
+                try:
+                    # Attempt at the secondary budget, then shrink on a LENGTH
+                    # refusal until the runner accepts (round-3 BLOCKER-B).
+                    result["arctic2_embed"], trunc = _embed_secondary_with_refusal_retry(
+                        self.ollama, ARCTIC_SECONDARY_MODEL, _q(ARCTIC_SECONDARY_MODEL, text)
                     )
-            except Exception as exc:
-                logger.warning("arctic secondary embedding failed: %s", exc)
+                    if trunc:
+                        self._last_truncated_slots["arctic2_embed"] = True
+                        logger.info(
+                            "arctic secondary embedded from a bounded sub-window "
+                            "(chunk %d chars exceeded arctic num_ctx); slot tagged "
+                            "truncated (active slot unaffected)", len(text)
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "arctic2_embed", "arctic secondary", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("arctic2_embed")
         # OpenAI if not already and key configured + valid
         if "openai" not in self._text_slot and self.openai_api_key:
-            if self.openai.validate().valid:
+            if self._secondary_breaker_should_skip("openai_text_embed"):
+                self._note_secondary_embed_skipped("openai_text_embed")
+            elif self.openai.validate().valid:
                 try:
                     # OPENAI_EMBEDDING_MODEL canonically holds the raw API
                     # name (back-compat with env-driven installs), but a
@@ -3126,7 +3261,11 @@ class EmbeddingService:
                             "(chunk exceeded openai num_ctx); slot tagged truncated"
                         )
                 except Exception as exc:
-                    logger.warning("OpenAI fallback embedding failed: %s", exc)
+                    self._note_secondary_embed_failure(
+                        "openai_text_embed", "OpenAI fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("openai_text_embed")
         return result
 
     def embed_text_all_configured_tagged(
@@ -3190,27 +3329,36 @@ class EmbeddingService:
             self._code_slot not in ("codesage_embed", "jina_embed")
             and self.codeembed.is_reachable()
         ):
-            try:
-                # W1 (2026-09-05): shrink on the service's over-window
-                # refusal and TAG it, like every secondary leg. Without this
-                # the service's new 400 refusal would DROP the slot where
-                # the gpu backend used to silently half-embed it — a
-                # refusal with no catcher is strictly worse than the silent
-                # truncation it replaces.
-                vec, trunc = self._embed_codeembed_one_bounded(code)
-                result["codesage_embed"] = vec
-                if trunc:
-                    self._last_truncated_slots["codesage_embed"] = True
-                    logger.info(
-                        "codesage secondary embedded from a bounded sub-window "
-                        "(entity exceeded the served window); slot tagged "
-                        "truncated"
+            if self._secondary_breaker_should_skip("codesage_embed"):
+                self._note_secondary_embed_skipped("codesage_embed")
+            else:
+                try:
+                    # W1 (2026-09-05): shrink on the service's over-window
+                    # refusal and TAG it, like every secondary leg. Without this
+                    # the service's new 400 refusal would DROP the slot where
+                    # the gpu backend used to silently half-embed it — a
+                    # refusal with no catcher is strictly worse than the silent
+                    # truncation it replaces.
+                    vec, trunc = self._embed_codeembed_one_bounded(code)
+                    result["codesage_embed"] = vec
+                    if trunc:
+                        self._last_truncated_slots["codesage_embed"] = True
+                        logger.info(
+                            "codesage secondary embedded from a bounded sub-window "
+                            "(entity exceeded the served window); slot tagged "
+                            "truncated"
+                        )
+                except Exception as exc:
+                    self._note_secondary_embed_failure(
+                        "codesage_embed", "CodeEmbed fallback", exc
                     )
-            except Exception as exc:
-                logger.warning("CodeEmbed fallback embedding failed: %s", exc)
+                else:
+                    self._note_secondary_embed_success("codesage_embed")
         # OpenAI — same prefix-strip defense as embed_text_all_configured
         if "openai" not in self._code_slot and self.openai_api_key:
-            if self.openai.validate().valid:
+            if self._secondary_breaker_should_skip("openai_code_embed"):
+                self._note_secondary_embed_skipped("openai_code_embed")
+            elif self.openai.validate().valid:
                 try:
                     openai_model = _to_openai_api_model(
                         os.environ.get(
@@ -3221,8 +3369,144 @@ class EmbeddingService:
                         openai_model, code
                     )
                 except Exception as exc:
-                    logger.warning("OpenAI code fallback embedding failed: %s", exc)
+                    self._note_secondary_embed_failure(
+                        "openai_code_embed", "OpenAI code fallback", exc
+                    )
+                else:
+                    self._note_secondary_embed_success("openai_code_embed")
         return result
+
+    # ---- secondary-slot circuit breaker (P299-B4, v0.2.101) --------------
+
+    def _secondary_breaker_should_skip(self, slot: str) -> bool:
+        """True iff the breaker is OPEN and this call must be SKIPPED.
+
+        Called before each OPTIONAL-secondary attempt. On the half-open trigger
+        (``HALF_OPEN_SKIPS`` skipped calls OR ``HALF_OPEN_SECS`` since opening) a
+        single probe is allowed through — returns False and marks ``probing`` so
+        a concurrent call keeps skipping. A probe that has been "in flight"
+        longer than the cool-down is treated as LOST: ``probing`` is cleared and
+        a fresh probe is granted, so a stranded probe can never skip the slot
+        for the process life. That is the SF-N1 fix — a ``BaseException``
+        (``asyncio.CancelledError`` / ``KeyboardInterrupt`` / ``SystemExit``)
+        escaping the call-site's ``except Exception`` arm runs neither breaker
+        note, leaving ``probing`` set. Never raises: any bookkeeping error fails
+        OPEN (returns False → the attempt proceeds), so the breaker can only
+        ever reduce outage cost, never block a healthy embed.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None or not st.open:
+                    return False
+                if st.probing and (
+                    time.monotonic() - st.opened_at
+                ) < SECONDARY_BREAKER_HALF_OPEN_SECS:
+                    st.skipped += 1
+                    st.skips_since_probe += 1
+                    return True  # a live probe is in flight — keep skipping
+                # No probe, or a probe stranded past the cool-down: fall through
+                # and let the trigger (aged clock) grant a fresh one.
+                st.probing = False
+                st.skips_since_probe += 1
+                if (
+                    st.skips_since_probe >= SECONDARY_BREAKER_HALF_OPEN_SKIPS
+                    or (time.monotonic() - st.opened_at)
+                    >= SECONDARY_BREAKER_HALF_OPEN_SECS
+                ):
+                    st.probing = True
+                    st.skips_since_probe = 0
+                    st.opened_at = time.monotonic()
+                    return False  # let ONE probe through
+                st.skipped += 1
+                return True
+        except Exception:  # noqa: BLE001 — bookkeeping must never block an embed
+            return False
+
+    def _note_secondary_embed_skipped(self, slot: str) -> None:
+        """Record a SKIPPED secondary call (breaker open). Omit the slot.
+
+        Emits the periodic re-report every ``REPORT_EVERY`` suppressed calls so
+        a long outage stays visible with a GROWING count (a one-shot line could
+        not tell 4 suppressed calls from 40 000). Never raises.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None:
+                    return
+                count = st.failures + st.skipped
+                if count - st.last_report_count >= SECONDARY_BREAKER_REPORT_EVERY:
+                    self._emit_secondary_breaker_report(slot, st)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
+
+    def _note_secondary_embed_failure(
+        self, slot: str, leg_label: str, exc: Exception
+    ) -> None:
+        """Record a failed secondary embed ATTEMPT at a bounded log cadence.
+
+        Below ``SECONDARY_BREAKER_THRESHOLD`` this is the existing per-call
+        warning (an isolated failure stays visible). At the threshold it TRIPS
+        the breaker (the next calls are SKIPPED) and emits ONE consolidated
+        warning naming the remedy. A failed half-open probe simply re-opens it —
+        the periodic re-report covers the "still failing" cadence. Never raises
+        into the caller.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                st = self._secondary_breakers.get(slot)
+                if st is None:
+                    st = _SecondarySlotBreaker()
+                    self._secondary_breakers[slot] = st
+                first_trip = not st.open
+                st.failures += 1
+                st.probing = False
+                if st.failures < SECONDARY_BREAKER_THRESHOLD:
+                    logger.warning("%s embedding failed: %s", leg_label, exc)
+                    return
+                # Trip / re-open: skip the backend until the next half-open probe.
+                st.open = True
+                st.skips_since_probe = 0
+                st.opened_at = time.monotonic()
+                if first_trip:
+                    self._emit_secondary_breaker_report(slot, st)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
+
+    def _emit_secondary_breaker_report(
+        self, slot: str, st: _SecondarySlotBreaker
+    ) -> None:
+        """Emit the ONE consolidated breaker line (trip + periodic re-report).
+
+        Names the slot, the running count of suppressed calls and the concrete
+        remedy for that slot. Kept in ONE home so the trip line and the
+        re-report can never drift. Runs under the breaker lock (re-entrant) so
+        the decision and the ``last_report_count`` stamp cannot be torn.
+        """
+        with self._secondary_breaker_lock:
+            count = st.failures + st.skipped
+            st.last_report_count = count
+            logger.warning(
+                "secondary slot %s failing: suppressed after %d failures "
+                "(count=%d); %s",
+                slot,
+                SECONDARY_BREAKER_THRESHOLD,
+                count,
+                _SECONDARY_SLOT_REMEDIES.get(slot, _SECONDARY_SLOT_REMEDY_DEFAULT),
+            )
+
+    def _note_secondary_embed_success(self, slot: str) -> None:
+        """Close the breaker for ``slot`` after a successful embed.
+
+        Drops the state entirely, so the next failure starts a fresh count and a
+        NEW outage is announced again. Never raises.
+        """
+        try:
+            with self._secondary_breaker_lock:
+                self._secondary_breakers.pop(slot, None)
+        except Exception:  # noqa: BLE001 — the breaker must never fail the caller
+            pass
 
     # ---- internal dispatch -------------------------------------------
 
