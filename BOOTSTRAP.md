@@ -123,7 +123,7 @@ If anything fails, the installer prints what it tried and what failed. Re-run wi
 curl -s http://localhost:8081/v1/.well-known/ready    # Weaviate
 curl -s http://localhost:11435/api/tags               # Ollama
 
-# Set up GitHub access (optional, for the search MCP):
+# Set up GitHub access (optional, for the git credential helper / hooks):
 mkdir -p ~/.vct-secrets/{shared,projects}
 chmod 700 ~/.vct-secrets
 cp tools/vct-secrets/vct ~/.vct-secrets/vct
@@ -204,7 +204,7 @@ Then ask the user what they want to work on.
 |---|---|---|
 | `hybrid_search` returns nothing | Weaviate not running or KG not synced | `cd infrastructure && podman-compose -f docker-compose.yml up -d` (or `docker compose up -d`) then `.claude/scripts/kg-sync --all` |
 | Hooks don't fire | `VCT_DISABLE_HOOKS=1` set in shell | `unset VCT_DISABLE_HOOKS` |
-| Search MCP errors on GitHub queries | `~/.vct-secrets/shared/github_pat` missing or wrong perms | `vct doctor` |
+| GitHub auth errors (git push / `gh`) | `~/.vct-secrets/shared/github_pat` missing or wrong perms | `vct doctor` |
 | `code-graph-query search` returns nothing | Code graph not analyzed yet | `.claude/scripts/code-graph-analyze . --project "MyProject"` |
 | Ollama models slow/missing | Models not pulled | `ollama list` to check; `ollama pull qwen3-embedding:0.6b` if missing |
 | Container runtime not detected | Neither podman nor docker on PATH | Install one, or set `VCT_CONTAINER_RUNTIME=podman` (or `docker`) |

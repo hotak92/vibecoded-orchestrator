@@ -132,8 +132,8 @@ const PROJECT_LIST_RE_POLL: Duration = Duration::from_secs(30);
 /// doubt, keep the key.
 ///
 /// MUST MATCH the `os.getenv(...)` / `os.environ.get(...)` reads in
-/// `claude_mcp_servers/weaviate_mcp/server.py` and
-/// `claude_mcp_servers/search_mcp/server.py`, intersected with the keys
+/// `claude_mcp_servers/weaviate_mcp/server.py` (the only in-tree Python MCP
+/// after v0.2.101 deleted `search_mcp`), intersected with the keys
 /// `vco_lib/config_projection.py::_CANONICAL_KEYS` actually writes into
 /// `.claude/settings.json` `env` (plus a few MCP-consumed keys — GRPC_PORT,
 /// EMBEDDING_MODEL, CODE_EMBED_SERVICE_URL, DUAL_EMBEDDING_ENABLED — that a

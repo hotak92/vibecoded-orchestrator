@@ -1,20 +1,23 @@
 # MCP Servers & Infrastructure Scripts
 
-Five MCP servers ship with VCO by default:
+Two MCP servers are registered with VCO by default (v0.2.101):
 
 - `weaviate-kg` — semantic + graph search over the knowledge graph, project docs, and code graph (Python, `claude_mcp_servers/weaviate_mcp/server.py`). **Enabled per project by default.**
-- `search` — academic-paper search via OpenAlex + arXiv (Python, `claude_mcp_servers/search_mcp/`). **Enabled per project by default.**
-- `mermaid` — diagram describe/extract for Mermaid (`.mmd`) sources (Python wrapper around `vco_lib/mermaid_mcp_fork/`). **Registered but project-default-disabled** via `BUNDLED_MCP_DEFAULT_DISABLED` in `launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs`. `claude mcp list` shows it Connected, but its tools are not callable until the user enables it in the launcher's Diagrams tab. Since v0.2.91 every seeding path applies that rule through one shared DB helper, so the claim holds for the orchestrator root too.
-- `excalidraw` — diagram describe/extract for Excalidraw sources (Python wrapper around `vco_lib/excalidraw_mcp_fork/`). **Registered but project-default-disabled** — same opt-in path as `mermaid`.
 - `playwright` — browser automation via `npx -y @playwright/mcp@latest`. **Enabled** by default; opt out with `VCT_SKIP_PLAYWRIGHT=1`.
 
-Authoritative writer for the four Python MCPs: `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Pure-Python fallback for installs that bypass the launcher: `install.py:20654-20661`. Playwright is invoked separately via `_install_playwright_browsers` (`install.py:24784-24858`) so users without npx still get the other four MCPs.
+The `search` (paper-search) MCP was **deleted** in v0.2.101, and the `mermaid` / `excalidraw` diagram wrapper MCPs are **no longer registered by default** in the same release. An install that already has a diagram entry keeps it (the update never removes it). A still-live `search` entry is **removed automatically by the ordinary install/update** (`[deprecated.search]` carries `auto_scrub = true`), with one notice line and no consent prompt — the module it pointed at no longer exists, so a leftover entry would fail to spawn on every session. The launcher's Diagrams tab and `describe_excalidraw` read diagram files on disk and never depended on those MCPs.
 
-The Python MCPs run from the orchestrator install's shared venv — canonical `<install>/.venv`, with the legacy `claude_mcp_servers/.venv` accepted as a fallback (`mcp_registration.rs::resolve_venv_python`). Pro-tier MCPs are excluded from the default install — see `mcp_registration.rs:16` for the rationale. The `mermaid` + `excalidraw` default-disabled list in `project_mcp_servers.rs` keeps the per-project tool surface narrow for users who don't author diagrams; the GUI toggle flips them on without re-running install.py.
+Authoritative writer for the Python MCPs: `launcher/src-tauri/src/mcp_registration.rs::build_default_mcp_entries`. Pure-Python fallback for installs that bypass the launcher: `vco_lib/install_mcp.py::_build_python_mcp_entries`. Playwright is invoked separately via `_install_playwright_browsers` so users without npx still get the Python MCP.
 
-### Wrapper-MCP spawn shape and `PYTHONPATH` (v0.2.91)
+### Per-project MCP enable/disable (v0.2.101)
 
-`mermaid` and `excalidraw` are the only entries invoked as a **module** rather than a script: `<venv-python> -m claude_mcp_servers.wrappers.<proxy>`. Resolving that dotted name needs the package's PARENT on `sys.path`, so their registered `env.PYTHONPATH` is `<install_root><pathsep><install_root>/claude_mcp_servers` — both roots, install root first. The absolute-script entries (`weaviate-kg`, `search`) keep the package-internal path alone, because they import their neighbours as top-level modules.
+`~/.claude.json mcpServers` is USER-scope — every entry spawns in every project's session. The documented per-project opt-out is `~/.claude.json → projects[<absolute project path>].disabledMcpServers`, and that is the ONLY channel Claude Code honours for a user-scope server. (The settings-file keys `disabledMcpjsonServers` / `enabledMcpjsonServers` govern only servers defined in the project's own `.mcp.json`, and are ignored in an untrusted folder — they are NOT the channel.) The launcher's project Permissions tab toggle writes it from the registration module (`mcp_registration.rs::set_project_disabled_mcps`, under the same lock/atomic-write discipline as `register_mcp`), recomputing the project's full disabled set from launcher.db on every flip so a re-enable never leaves a stale opt-out.
+
+The Python MCPs run from the orchestrator install's shared venv — canonical `<install>/.venv`, with the legacy `claude_mcp_servers/.venv` accepted as a fallback (`mcp_registration.rs::resolve_venv_python`). Pro-tier MCPs are excluded from the default install — see `mcp_registration.rs:16` for the rationale.
+
+### Wrapper-MCP spawn shape and `PYTHONPATH` (v0.2.91, historical after v0.2.101)
+
+Before v0.2.101, `mermaid` and `excalidraw` were the only entries invoked as a **module** rather than a script: `<venv-python> -m claude_mcp_servers.wrappers.<proxy>`. Resolving that dotted name needs the package's PARENT on `sys.path`, so their registered `env.PYTHONPATH` was `<install_root><pathsep><install_root>/claude_mcp_servers` — both roots, install root first. The absolute-script entry (`weaviate-kg`) keeps the package-internal path alone, because it imports its neighbours as top-level modules. A legacy install that still carries a wrapper entry keeps this shape (the update never rewrites/removes it).
 
 Through v0.2.90 the wrapper entries carried only the package-internal path, and the sole thing making them work was `python -m`'s implicit cwd-prepend. Claude Code spawns stdio MCPs with cwd = the **session's project directory** and `~/.claude.json` is global, so the entries resolved for the orchestrator root and died with `ModuleNotFoundError: No module named 'claude_mcp_servers'` (rc=1) in every other project — the long-standing mermaid/excalidraw "Failed to connect". The failure happens during `-m` module resolution, before any package code runs, so the proxies' own script-mode import fallbacks could never help. Regression-pinned by `tests/test_wrapper_mcp_cwd_independence_v0291.py`, which spawns the built entry from a temp cwd (a shape test on the env string cannot catch this).
 
@@ -29,7 +32,7 @@ Two invariants bound every write: **provenance wins** (a `is_user_added = 1` / `
 
 This replaces the migration-010 follow-up backfill that ran at boot from 2026-05-10 to v0.2.90 and converged nothing: it was gated to projects with zero rows (so stale rows were unreachable) and its only action was to re-run the disk mirror (which inserts nothing once bundled MCPs live in the global `~/.claude.json`). `project_mcp_servers` is the engine's first write-enabled tenant; the other declared tenants (`project_backfill`, `codegraph_bindings`, `module_settings`) are report-only this cycle and keep their own reconcilers until v0.2.92.
 
-**Deliberately NOT MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding CPU fallback) — there is no Ollama MCP; Claude's native reasoning, `Read` tool, and built-in vision serve chat, document-reading, and image use cases at higher quality. The Search MCP exposes `search_papers` only — Claude's built-in WebFetch covers ad-hoc web retrieval, and no local search proxy runs in the default container stack.
+**Deliberately NOT MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding CPU fallback) — there is no Ollama MCP; Claude's native reasoning, `Read` tool, and built-in vision serve chat, document-reading, and image use cases at higher quality. Web / academic retrieval is covered by Claude's built-in WebSearch / WebFetch, and no local search proxy runs in the default container stack.
 
 For agents, skills, and hooks built on top of these MCPs → see [03-agents-skills-hooks.md](03-agents-skills-hooks.md). For the knowledge graph and code graph data layer → see [04-knowledge-and-code-graph.md](04-knowledge-and-code-graph.md).
 
@@ -152,19 +155,6 @@ If you need local-LLM inference for a specific use case (e.g., privacy-sensitive
 
 ---
 
-## MCP: Search (`claude_mcp_servers/search_mcp/server.py`)
-
-The Search MCP exposes a single tool: `search_papers`. General web search and page fetching are covered by Claude's built-in WebFetch, and in-project code search is covered by the semantic `search_code_graph` tool — so no local search proxy is part of the default container stack.
-
-The `search_papers` tool carries clear value because OpenAlex and arXiv are structured APIs that return citation-rich, date-filtered, deduplicated academic metadata that ad-hoc web search cannot replicate.
-
-### `search_papers`
-Search academic papers via OpenAlex (240M works, CC0) or arXiv (CS/ML preprints). Returns structured metadata: title, authors, DOI, abstract excerpt, citation count, publication year.
-
-Params: `query`, `limit` (1-25, default 10), `source` (`"openalex"` default | `"arxiv"`), `year_from`. Set `OPENALEX_EMAIL` env var for polite-pool priority on OpenAlex API. Calls the structured OpenAlex and arXiv HTTP APIs directly — no local search proxy required.
-
----
-
 ## Code Embedding Service (`claude_mcp_servers/code_embedding_service/`)
 
 FastAPI service that produces code embeddings via CodeSage-Large-v2 (1.3B params, 2048-dim, Apache 2.0) — preferentially on GPU, with an Ollama fallback for CPU-only users. Used by the Weaviate MCP for `search_code_graph` queries.
@@ -188,9 +178,9 @@ Environment vars: `CODE_EMBED_BACKEND`, `CODE_EMBED_MODEL`, `CODE_EMBED_DEVICE`,
 
 Browser automation MCP. Not in `claude_mcp_servers/` — registered against `~/.claude.json` and pre-cached at install time so first browser launch doesn't stall.
 
-Install path: `install.py::_install_playwright_browsers` runs `npx -y @playwright/mcp@latest --version` (caches the package) then `npx playwright install chromium` (fetches the Chromium binary). Skip with `VCT_SKIP_PLAYWRIGHT=1`. Exposed to Claude Code as the `playwright` MCP server (tool prefix `mcp__playwright__browser_*`). Used by the `gui-tester` agent and the `gui-test` skill for visual regression / GUI smoke runs.
+Install path: `install.py::_install_playwright_browsers` runs `npx -y @playwright/mcp@latest --version` (caches the package) then `npx playwright install chromium` (fetches the Chromium binary). Skip with `VCT_SKIP_PLAYWRIGHT=1`. Exposed to Claude Code as the `playwright` MCP server (tool prefix `mcp__playwright__browser_*`). Used by the `gui-tester` agent for visual regression / GUI smoke runs.
 
-Failure modes: `npx` not on PATH → the install step skips with WARN **and the registered MCP cannot spawn at all** (its command string *is* `npx`, so there is nothing to invoke and nothing to lazy-install into — Claude Code reports only "Failed to connect"). Since v0.2.91 that case is no longer silent: the doctor phase at the end of every install/update probes the ladder in `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable` into `UPDATE_DEFERRED.md`, and the launcher's MCP-registration badge turns yellow with the same remediation. Chromium fetch timeout (600 s) → install step skips with WARN; that one *is* a genuine lazy-install-later case (the MCP fetches the browser on the first browser call). The orchestrator works without Playwright; only `gui-tester` / `gui-test` go inert.
+Failure modes: `npx` not on PATH → the install step skips with WARN **and the registered MCP cannot spawn at all** (its command string *is* `npx`, so there is nothing to invoke and nothing to lazy-install into — Claude Code reports only "Failed to connect"). Since v0.2.91 that case is no longer silent: the doctor phase at the end of every install/update probes the ladder in `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable` into `UPDATE_DEFERRED.md`, and the launcher's MCP-registration badge turns yellow with the same remediation. Chromium fetch timeout (600 s) → install step skips with WARN; that one *is* a genuine lazy-install-later case (the MCP fetches the browser on the first browser call). The orchestrator works without Playwright; only `gui-tester` goes inert.
 
 ---
 

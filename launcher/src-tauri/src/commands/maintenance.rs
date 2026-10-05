@@ -123,8 +123,9 @@ pub struct McpRegistrationStatusReport {
     pub claude_json_path: String,
     /// True iff `~/.claude.json` exists and is readable.
     pub claude_json_exists: bool,
-    /// Per-MCP status. Ordered: `weaviate-kg`, `search` (the canonical
-    /// default-orchestrator set per PR-23).
+    /// Per-MCP status. Ordered: the canonical default-orchestrator set
+    /// (`weaviate-kg`, then any probe-only bundled names — see
+    /// `DEFAULT_MCP_NAMES`).
     pub entries: Vec<McpRegistrationEntry>,
     /// Overall: `green` (all registered + paths match), `yellow` (some
     /// missing, path-mismatched, or holding an unspawnable bare command),
@@ -158,21 +159,20 @@ pub struct RegistrationReport {
 /// whose absence (or wrong `path_matches_install`) means a broken install.
 /// The other bundled defaults are intentionally excluded from the badge:
 ///   * `playwright` — bare `npx @playwright/mcp` (no install-root path to
-///     match, so `path_matches_install` is meaningless for it);
-///   * `mermaid` / `excalidraw` — default-DISABLED per project
-///     (`BUNDLED_MCP_DEFAULT_DISABLED`), so their legitimate absence must
-///     not turn the badge yellow.
+///     match, so `path_matches_install` is meaningless for it).
 /// A cross-catalog agreement test (`mcp_registration.rs`) pins
 /// `DEFAULT_MCP_NAMES ⊆ DEFAULT_MCP_ENTRY_NAMES` so this stays a subset
 /// rather than drifting into a 4th disagreeing catalog.
-const DEFAULT_MCP_NAMES: &[&str] = &["weaviate-kg", "search"];
+const DEFAULT_MCP_NAMES: &[&str] = &["weaviate-kg"];
 
 /// Bundled MCPs whose registered `command` is a BARE NAME resolved from PATH.
 ///
 /// v0.2.91 WP-D. These are evaluated ONLY when the entry is actually present
-/// in `~/.claude.json` — `mermaid`/`excalidraw` are default-DISABLED per
-/// project and `playwright` may be legitimately absent, so their absence must
-/// never move the badge (the reason `DEFAULT_MCP_NAMES` excludes them). What
+/// in `~/.claude.json` — `mermaid`/`excalidraw` are no longer registered by
+/// default (retired in v0.2.101) and `playwright` may be legitimately absent,
+/// so their absence must never move the badge (the reason
+/// `DEFAULT_MCP_NAMES` excludes them). A legacy install may still have the
+/// diagram wrappers present; they too spawn `npx` as a child. What
 /// DOES move the badge is a PRESENT entry whose command cannot be resolved:
 /// that MCP is registered, enabled, and structurally incapable of starting —
 /// the failure that went unseen for months in the field because nothing on any
@@ -1241,7 +1241,6 @@ pub async fn rewrite_stale_mcp_entries(
 /// `_mcp/server.py` alone would over-match.
 const MCP_PROCESS_PATTERNS: &[&str] = &[
     "weaviate_mcp/server.py",
-    "search_mcp/server.py",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1475,7 +1474,6 @@ mod tests {
     fn healthy_defaults(root: &str) -> serde_json::Value {
         serde_json::json!({
             "weaviate-kg": {"command": format!("{}/.venv/bin/python", root)},
-            "search":      {"command": format!("{}/.venv/bin/python", root)},
         })
     }
 
@@ -1532,10 +1530,10 @@ mod tests {
 
     #[test]
     fn absent_npx_mcps_do_not_move_the_badge() {
-        // mermaid/excalidraw are default-DISABLED per project and playwright
-        // may be absent. Their absence is not a fault (the reason
-        // DEFAULT_MCP_NAMES excludes them) — only a PRESENT+unspawnable entry
-        // is.
+        // mermaid/excalidraw are no longer registered by default (retired in
+        // v0.2.101) and playwright may be absent. Their absence is not a fault
+        // (the reason DEFAULT_MCP_NAMES excludes them) — only a
+        // PRESENT+unspawnable entry is.
         let root = "/opt/vco";
         let servers = servers_from(healthy_defaults(root));
         let probe = probe_with(None, false);
@@ -1587,17 +1585,34 @@ mod tests {
     }
 
     #[test]
-    fn missing_default_mcp_still_dominates_the_badge() {
-        // The pre-existing rules keep working: a missing weaviate-kg is
-        // yellow even when every npx entry is fine.
+    fn path_mismatched_default_still_dominates_the_badge() {
+        // The pre-existing rules keep working: weaviate-kg registered but
+        // pointing at a DIFFERENT install root is yellow even when every npx
+        // entry is fine. (v0.2.101: weaviate-kg is the only probe default, so
+        // its complete ABSENCE is now red — see `no_default_mcp_is_red`.)
         let root = "/opt/vco";
         let servers = servers_from(serde_json::json!({
-            "search": {"command": format!("{}/.venv/bin/python", root)},
+            "weaviate-kg": {"command": "/other/install/.venv/bin/python"},
             "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
         }));
         let probe = probe_with(Some("/usr/bin/npx"), true);
         let (_entries, badge, _) = build_registration_view(root, &servers, Some(&probe));
         assert_eq!(badge, "yellow");
+    }
+
+    #[test]
+    fn no_default_mcp_is_red() {
+        // v0.2.101: the only default-probe MCP is weaviate-kg. With it absent
+        // (and only an npx-dependent entry present) the badge is red — "no
+        // default registered" — which the pre-v0.2.101 `search` fixture used
+        // to mask into yellow.
+        let root = "/opt/vco";
+        let servers = servers_from(serde_json::json!({
+            "playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]},
+        }));
+        let probe = probe_with(Some("/usr/bin/npx"), true);
+        let (_entries, badge, _) = build_registration_view(root, &servers, Some(&probe));
+        assert_eq!(badge, "red");
     }
 
     #[test]
@@ -1633,11 +1648,12 @@ mod tests {
     // reaches ~/.claude.json, or a bundled MCP that `remove_mcp_server`
     // wrongly deletes-then-the-updater-re-adds). Before v0.2.73 NO test
     // asserted any two agree; these do:
-    //   * types.rs `default_mcp_servers()`  — the GUI catalog (5 ids)
+    //   * types.rs `default_mcp_servers()`  — the GUI catalog (2 ids)
     //   * mcp_registration `DEFAULT_MCP_ENTRY_NAMES` — the ~/.claude.json
-    //     builder output (5, pinned to the builder by its own test)
-    //   * project_mcp_servers `BUNDLED_MCP_NAMES` — the full bundled set (8)
-    //   * maintenance `DEFAULT_MCP_NAMES` — the health-badge probe subset (2)
+    //     builder output (2, pinned to the builder by its own test)
+    //   * project_mcp_servers `BUNDLED_MCP_NAMES` — the full bundled set (8,
+    //     retains the retired/legacy names for classification + uninstall)
+    //   * maintenance `DEFAULT_MCP_NAMES` — the health-badge probe subset (1)
 
     /// The GUI catalog ids (types.rs) must equal the ~/.claude.json builder
     /// names — every catalog card must have a builder entry and vice-versa.
@@ -1851,9 +1867,9 @@ mod tests {
                     "command": user_path,
                     "args": ["/srv/user-mcp/server.js"],
                 },
-                "search": {
-                    "command": format!("{}/claude_mcp_servers/search_mcp/wrapper.sh", install_root),
-                    "args": [],
+                "mermaid": {
+                    "command": format!("{}/.venv/bin/python", install_root),
+                    "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
                 },
             }
         });
@@ -1861,7 +1877,7 @@ mod tests {
 
         let stale = detect_stale_mcp_entries(install_root, &tmp);
         // `weaviate-kg` is stale (venv outside install_root).
-        // `search` already anchored on install_root — not stale.
+        // `mermaid` already anchored on install_root — not stale.
         // `user-mcp` is /usr/bin/node — not vco-shaped, ignored.
         assert_eq!(stale.len(), 1, "expected exactly 1 stale entry, got: {:?}", stale);
         assert_eq!(stale[0].name, "weaviate-kg");
@@ -2039,27 +2055,25 @@ mod tests {
 
     #[test]
     fn reload_mcps_signals_all_matching_pids() {
-        // Two patterns, each returning a different PID set. Expected:
-        // we send SIGHUP to all 3 distinct PIDs, no errors.
+        // Each pattern returning its PID set; all distinct PIDs get one
+        // SIGHUP, no errors. (v0.2.101: only weaviate-kg remains a shipped
+        // in-tree Python MCP process.)
         let mut runner = StubRunner::new();
         runner
             .pgrep_responses
             .insert("weaviate_mcp/server.py".to_string(), Ok("1111\n2222\n".into()));
-        runner
-            .pgrep_responses
-            .insert("search_mcp/server.py".to_string(), Ok("3333\n".into()));
 
         let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
 
-        assert_eq!(report.signaled_count, 3);
-        assert_eq!(report.pids, vec![1111, 2222, 3333]);
+        assert_eq!(report.signaled_count, 2);
+        assert_eq!(report.pids, vec![1111, 2222]);
         assert!(report.errors.is_empty(), "errors: {:?}", report.errors);
         assert!(!report.posix_only_skipped);
 
         // Verify the kill stub recorded exactly the expected PIDs in
         // discovery order.
         let kills = runner.kill_calls.borrow().clone();
-        assert_eq!(kills, vec![1111, 2222, 3333]);
+        assert_eq!(kills, vec![1111, 2222]);
     }
 
     #[test]
@@ -2069,10 +2083,7 @@ mod tests {
         let mut runner = StubRunner::new();
         runner
             .pgrep_responses
-            .insert("weaviate_mcp/server.py".to_string(), Ok("9999\n".into()));
-        runner
-            .pgrep_responses
-            .insert("search_mcp/server.py".to_string(), Ok("9999\n".into()));
+            .insert("weaviate_mcp/server.py".to_string(), Ok("9999\n9999\n".into()));
 
         let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
 
@@ -2122,16 +2133,18 @@ mod tests {
         // One pattern's pgrep crashes; the other still works. We want
         // a partial-success report (not a fatal Err) so the watcher /
         // GUI can show "some MCPs signaled" rather than total failure.
+        // Two explicit patterns (the shipped set is one pattern now).
+        let patterns = ["alpha_mcp/server.py", "beta_mcp/server.py"];
         let mut runner = StubRunner::new();
         runner.pgrep_responses.insert(
-            "weaviate_mcp/server.py".to_string(),
+            "alpha_mcp/server.py".to_string(),
             Err("pgrep: command not found".into()),
         );
         runner
             .pgrep_responses
-            .insert("search_mcp/server.py".to_string(), Ok("7777\n".into()));
+            .insert("beta_mcp/server.py".to_string(), Ok("7777\n".into()));
 
-        let report = reload_mcps_with(&runner, MCP_PROCESS_PATTERNS);
+        let report = reload_mcps_with(&runner, &patterns);
         assert_eq!(report.pids, vec![7777]);
         assert_eq!(report.signaled_count, 1);
         assert_eq!(report.errors.len(), 1);
@@ -2169,9 +2182,11 @@ mod tests {
             MCP_PROCESS_PATTERNS.iter().any(|p| p.contains("weaviate_mcp")),
             "weaviate_mcp pattern missing"
         );
+        // v0.2.101: `search_mcp` was deleted, so only weaviate-kg remains an
+        // in-tree Python MCP process to reload.
         assert!(
-            MCP_PROCESS_PATTERNS.iter().any(|p| p.contains("search_mcp")),
-            "search_mcp pattern missing"
+            !MCP_PROCESS_PATTERNS.iter().any(|p| p.contains("search_mcp")),
+            "search_mcp was removed in v0.2.101 — its pattern must be gone"
         );
         // Each pattern must be specific enough to NOT match unrelated
         // python scripts. `_mcp/server.py` is the discipline.

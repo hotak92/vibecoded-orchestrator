@@ -3,13 +3,13 @@ title: Orchestrator MCP Servers
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, mcp, tools]
 created: 2026-04-27T18:30:00Z
-updated: 2026-06-25T00:00:00Z
+updated: 2026-10-05T00:00:00Z
 status: active
 ---
 
 # Orchestrator MCP Servers
 
-The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search and academic paper search. All servers run as native Python processes registered in the user's MCP config and share a virtual environment at `claude_mcp_servers/.venv`.
+The orchestrator ships MCP (Model Context Protocol) servers that extend Claude Code with semantic search. All servers run as native Python processes registered in the user's MCP config and share the orchestrator root's venv (`<orchestrator-root>/.venv`; the legacy `claude_mcp_servers/.venv` location is a fallback only).
 
 [[implements::Model Context Protocol]] [[uses::Weaviate]] [[uses::Ollama]] [[relatedTo::Orchestrator Knowledge Graph]]
 
@@ -18,19 +18,18 @@ The orchestrator ships MCP (Model Context Protocol) servers that extend Claude C
 | Server | Purpose | Key Tools |
 |---|---|---|
 | weaviate-kg | Semantic search + KG/code-graph management | hybrid_search, semantic_graph_search, search_code_graph, query_code_structure, store_knowledge_node, describe_excalidraw |
-| search | Academic paper search | search_papers |
-| mermaid | Mermaid diagram describe/extract | (registered, default-disabled per project) |
-| excalidraw | Excalidraw diagram describe/extract | (registered, default-disabled per project) |
 | code-embedding-service | GPU/CPU code-embedding HTTP service (port 11440) | `/embed`, `/health` (REST, not MCP) |
 
 A separately-invoked **playwright** MCP (browser automation) is enabled by default and runs via `npx -y @playwright/mcp@latest`. The code-embedding FastAPI service on port 11440 is backend infrastructure for `weaviate-kg`, not an MCP exposed to Claude.
+
+v0.2.101 retired the default REGISTRATION of the diagram wrapper MCPs (`mermaid`, `excalidraw`) and deleted the `search` (paper-search) MCP outright. An install that already has a diagram entry keeps it; the Diagrams tab and `describe_excalidraw` read files on disk and never needed the MCPs. Per-project MCP enable/disable is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers.
 
 ## Not exposed as MCP tools
 
 | Capability | Rationale |
 |---|---|
 | Ollama (chat, read_document, read_image) | Covered by Claude's native reasoning, the `Read` tool, and built-in vision. Ollama keeps running as infrastructure for Weaviate text embeddings and the code-embedding CPU fallback. |
-| Web search / page fetch | Covered by Claude's built-in WebFetch. Structured academic retrieval is served by `search_papers`. |
+| Web search / page fetch | Covered by Claude's built-in WebSearch / WebFetch. |
 
 ## weaviate-kg
 
@@ -121,23 +120,6 @@ Structural queries without reading source files. `path` type uses BFS (max depth
 
 Ollama is not exposed as an MCP server. Claude's native reasoning, the `Read` tool, and built-in vision cover the chat / read-document / read-image use cases. Ollama runs at `http://localhost:11435` — its container is started by `ensure-containers.sh`.
 
-## search
-
-**Script**: `claude_mcp_servers/search_mcp/server.py`
-
-**Purpose**: structured academic paper retrieval via OpenAlex and arXiv. Returns citation-rich, date-filtered metadata that ad-hoc web search cannot replicate.
-
-**Environment**:
-```
-OPENALEX_EMAIL=<optional, polite-pool priority>
-```
-
-### search_papers
-```python
-search_papers(query, source="openalex", limit=10)
-```
-OpenAlex (CC0) or arXiv (CS/ML preprints, rate-limited). `OPENALEX_EMAIL` enables polite-pool priority. Calls structured APIs directly — no local search proxy needed. `search_papers` is the only tool this server exposes; general web access is covered by Claude's built-in WebFetch.
-
 ## code-embedding-service
 
 **Script**: `claude_mcp_servers/code_embedding_service/server.py`
@@ -164,7 +146,6 @@ All servers register via the user's `~/.claude.json` (or per-project MCP config)
 | Architecture queries | `query_code_structure` |
 | Quick analysis / rewrites | Claude's own reasoning |
 | Large file extraction | `Read` tool with `offset`/`limit` |
-| Web / current events | Claude's built-in WebFetch |
-| Academic research | `search_papers` |
+| Web / current events | Claude's built-in WebSearch / WebFetch |
 | Exact strings | Grep |
 | Specific file content | Read |

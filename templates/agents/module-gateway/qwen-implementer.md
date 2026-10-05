@@ -1,9 +1,10 @@
 ---
 name: qwen-implementer
-description: Implementation lane routed to Qwen3.8-Max through the local claude-gw gateway. Use for bounded code fixes that span several files or need multi-step reasoning inside one lane — the top rung of the qwen-vendor implementation lanes, above deepseek-implementer and the flash lanes. Not for open-ended design; it is not a reviewer. Requires the model gateway.
+description: Qwen3.8-Max implementation lane via the claude-gw gateway for bounded multi-file or multi-step fixes — the top qwen-vendor rung, above deepseek-implementer. Not open-ended design; not a reviewer. Needs the model gateway.
 model: claude-gw/qwen/qwen3.8-max[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
+disallowedTools: mcp__vct-coordination__*
 ---
 
 You implement a bounded, fully-specified fix package.

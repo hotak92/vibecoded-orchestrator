@@ -28,6 +28,9 @@ import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { parse } from 'svelte/compiler';
+// SF-5 (v0.2.101): `walk`/`isIdent` graduated to the ONE home in
+// test-support (they were copied across wiring test files).
+import { walk, isIdent } from './test-support/wiring-ast';
 
 type Node = Record<string, unknown>;
 
@@ -40,21 +43,6 @@ function load(rel: string): Node {
 
 const MODAL = load('components/UpdateAllProjectsModal.svelte');
 const PAGE = load('../routes/projects/+page.svelte');
-
-/** Every node in a subtree, depth-first. */
-function* walk(node: unknown): Generator<Node> {
-  if (node === null || typeof node !== 'object') return;
-  if (Array.isArray(node)) {
-    for (const child of node) yield* walk(child);
-    return;
-  }
-  const obj = node as Node;
-  if (typeof obj.type === 'string') yield obj;
-  for (const [k, v] of Object.entries(obj)) {
-    if (k === 'parent' || k === 'loc') continue;
-    yield* walk(v);
-  }
-}
 
 /** Every node in a subtree, each paired with its chain of ancestors. */
 function* walkWithAncestors(
@@ -74,10 +62,6 @@ function* walkWithAncestors(
     if (k === 'parent' || k === 'loc') continue;
     yield* walkWithAncestors(v, next);
   }
-}
-
-function isIdent(n: unknown, name: string): boolean {
-  return (n as Node | undefined)?.type === 'Identifier' && (n as Node).name === name;
 }
 
 /** `obj.prop` */

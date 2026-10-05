@@ -473,11 +473,19 @@ class DeliveryAuditTests(unittest.TestCase):
         enumeration (owner Q3), the leftovers policy went to
         ``vco_lib/bundle_leftovers.py`` and the adoption-backup writer to
         ``vco_lib/bundle_backup.py``.
+
+        v0.2.101 (catalogue plan §3/§5) — LOWERED 15_176 -> 15_164: the opt-in
+        PACKS plumbing (``--pack`` / ``--remove-pack`` / manifest ``packs`` map /
+        ``specializations`` kind) landed as new engine wiring, but the KIND
+        classifiers moved to ``vco_lib/bundle_kinds.py``, the bundle-update
+        resume sentinel to ``vco_lib/bundle_sentinel.py`` and the two hash
+        helpers to ``vco_lib/hashing.py`` (all leaving same-name aliases here),
+        so the file NET shrank despite the additions.
         """
         n = len((REPO_ROOT / "vco_lib" / "project_init.py")
                 .read_text(encoding="utf-8").splitlines())
         self.assertLessEqual(
-            n, 15_176,
+            n, 15_164,
             f"project_init.py is {n} lines. It may not grow further — extract "
             "new logic into a vco_lib module and lower this ceiling.",
         )

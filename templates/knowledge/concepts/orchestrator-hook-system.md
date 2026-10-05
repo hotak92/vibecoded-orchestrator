@@ -143,7 +143,7 @@ Context nearing limit
 - Historical note (v0.2.77 9-bis): this hook previously wrote every tool call to a `.claude/logs/toucan_dataset.jsonl` "TOUCAN dataset" log. That collector had zero consumers (never wired into RL training — RL training data lives in `launcher.db rl_events` + the citation drain), so it was retired to drop the per-tool-call I/O.
 
 **SSRF guard** (inside `pre-tool-use.sh`, matcher: `*`, acts on `WebFetch`)
-- Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860). `search_papers` reaches its APIs directly and is not routed through this guard.
+- Inspects `WebFetch` target URLs and blocks private/internal addresses unless whitelisted (Weaviate 8081, Ollama 11435, code-embed 11440, Gradio 7860).
 
 **Shell injection scan** (inside `pre-tool-use.sh`, acts on `Bash`)
 - Blocks fetch-piped-to-shell patterns (`curl|sh`, `eval $(curl …)`, `base64 -d | sh`), then delegates to `bash_security.py` (a flat list of ~24 regex rules covering disk-destroy, credential exfil, secret-file reads, world-writable chmod, remote installs, reverse shells, etc.).

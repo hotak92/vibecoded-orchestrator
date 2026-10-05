@@ -218,9 +218,8 @@ if ($ToolName -eq "WebFetch") {
     if ($url) {
         # Allowed local services (Weaviate, Ollama, code-embed, vct-hub, :8082,
         # Gradio). SearXNG (:8888) and the mcp__search__fetch_page tool both
-        # removed in v0.2.11 (see PR-14a). Search MCP now exposes only
-        # `search_papers` which uses OpenAlex+arXiv HTTP directly — its
-        # outbound HTTP doesn't go through this WebFetch SSRF guard.
+        # removed in v0.2.11 (see PR-14a); the search MCP itself was deleted
+        # in v0.2.101, so nothing else reaches the network outside WebFetch.
         # v0.2.100: the decision is `python -m vco_lib.ssrf_url` (one
         # implementation for every OS; its docstring is the contract), run
         # once through _lib/ssrf-allowlist.ps1. MUST MATCH the .sh sibling.

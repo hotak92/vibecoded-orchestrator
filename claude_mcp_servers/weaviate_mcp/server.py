@@ -1406,14 +1406,15 @@ def _fetch_writable_collections_for_project(project_id: str) -> list[str]:
 mcp = FastMCP(
     "weaviate-kg",
     instructions=(
-        "Semantic knowledge graph and code graph. "
-        "ALWAYS call hybrid_search BEFORE using Grep or Read for conceptual, architectural, or pattern questions — "
-        "it searches semantic embeddings across KG + project docs and finds results that literal grep cannot. "
-        "Only fall back to Grep for exact literal strings (variable names, error messages). "
-        "Tool order: hybrid_search (concepts) → semantic_graph_search (relationships) → "
-        "search_code_graph (code by purpose) → query_code_structure (callers, deps, inheritance). "
-        "store_knowledge_node persists new knowledge (scope='project' default, scope='shared' for cross-project). "
-        "describe_excalidraw inspects .excalidraw diagram files that hybrid_search returns as diagram results."
+        "Semantic knowledge graph and code graph. Call hybrid_search BEFORE "
+        "Grep/Read for conceptual, architectural, or pattern questions — it "
+        "searches semantic embeddings across the KG + project docs; fall back "
+        "to Grep only for exact literal strings. Tool order: hybrid_search "
+        "(concepts) → semantic_graph_search (relationships) → "
+        "search_code_graph (code by purpose) → query_code_structure (callers, "
+        "deps, inheritance). store_knowledge_node persists new knowledge "
+        "(scope='project' default, 'shared' cross-project). describe_excalidraw "
+        "inspects .excalidraw files hybrid_search returns as diagrams."
     )
 )
 
@@ -5241,39 +5242,17 @@ async def semantic_graph_search(
     include_stale: bool = False,
 ) -> str:
     """
-    Semantic search with WikiLink graph traversal (GraphRAG). Finds concepts
-    related to the query AND their connected neighbors via typed WikiLinks
-    (uses, implements, extends, buildsOn, relatedTo).
+    Semantic search WITH WikiLink graph traversal (GraphRAG): concepts related
+    to the query plus connected neighbours via typed WikiLinks (uses,
+    implements, extends, buildsOn, relatedTo). For simple lookups use
+    hybrid_search.
 
-    Use when exploring how concepts relate to each other, tracing dependency
-    chains, or understanding the broader context around a topic. Returns both
-    primary matches and their graph neighbors.
+    Args: query (concept to explore); limit (max primary results, default 5);
+    depth (1 = primary only; 2 default+ = one hop of neighbours); detail
+    ("auto" default; neighbours always "summary"); include_stale (False
+    excludes superseded).
 
-    When to use: "what depends on X?", "what concepts are related to Y?",
-    "show me the network around Z". Best for exploring connections.
-    Example: semantic_graph_search("update deferral pattern") returns matching
-    nodes plus the concepts they link to via [[uses::...]] / [[buildsOn::...]].
-    When NOT to use: simple factual lookups — use hybrid_search instead.
-
-    Args:
-        query: Natural language query describing the concept to explore
-        limit: Max primary results (default: 5). Connected nodes are additional.
-        depth: 1 = primary matches only, no neighbor fetch. 2 (default) or
-               higher = also fetch the nodes WikiLinked from the primary
-               matches (one hop, up to 10 neighbors). Values above 2 behave
-               the same as 2.
-        detail: Verbosity tier per result (default "auto"). See hybrid_search
-            for the full tier semantics. Auto-mode applies per-result score
-            tiering to primary results. Connected nodes always render at the
-            "summary" tier regardless of this value — graph topology, not
-            relevance score, selected them, so they carry no score to tier on.
-        include_stale: Default False excludes nodes whose valid_until date has
-            passed. Pass True only when superseded knowledge is wanted.
-
-    Returns:
-        JSON with primary_results (direct matches) + connected_nodes (graph
-        neighbors discovered via WikiLink traversal). Each result carries title,
-        file_path, node_type, score, tier, and content at the chosen detail.
+    Returns: JSON — primary_results + connected_nodes, same fields as above.
     """
     # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
     # Catches BOTH connection-time and query-time Weaviate failures.
@@ -6083,59 +6062,18 @@ async def hybrid_search(
     include_stale: bool = False,
 ) -> str:
     """
-    Combined semantic + keyword search across KG and project docs.
-    Use this as the DEFAULT and FIRST search tool for any conceptual,
-    architectural, pattern, or knowledge query. Do NOT use Grep or Read for
-    conceptual questions — this tool searches semantic embeddings and finds
-    results that literal string matching cannot.
+    Combined semantic + keyword search over the project KG, shared KG and
+    project docs; the FIRST tool for conceptual/architectural questions.
+    Grep/Read only for exact literal strings.
 
-    Automatically searches project KG, shared KG, and project docs. No need
-    to specify collections — scoping is handled transparently via env vars.
-    Pass days=N to filter by recency.
+    Args: query (what to find); limit (default 5); node_type (optional; type
+    set is OPEN — knowledge/VOCABULARY.md); tags (without '#'); days (recency
+    filter); include_stale (False excludes superseded); detail ("auto" default,
+    else a tier name, "titles"…"full" —
+    knowledge/concepts/score-driven-retrieval-tiers.md).
 
-    When to use: asking "how does X work?", "what patterns exist for Y?",
-    "what was decided about Z?", or any question about concepts, architecture,
-    decisions, or project knowledge.
-    Example: hybrid_search("embedding model fallback strategy") finds nodes
-    about hardware-tiered embedding selection even if none contain that
-    exact phrase.
-
-    When NOT to use: searching for exact literal strings like variable names,
-    error messages, or specific file paths — use Grep for those instead. For
-    finding code entities by purpose, use search_code_graph; for exploring
-    how KG concepts link to each other, use semantic_graph_search.
-
-    Args:
-        query: Natural language query describing what you want to find
-        limit: Max results to return (default: 5)
-        node_type: Filter by type (built-ins: project, concept, tool, model,
-            hardware, research, pattern, insight, guide — the set is OPEN:
-            projects may declare additional types in knowledge/VOCABULARY.md)
-        tags: Filter by tags (e.g., ["AI", "python"])
-        days: If set, only return nodes updated in the last N days
-        include_stale: Default False excludes nodes whose valid_until date has
-            passed (superseded knowledge). Pass True only when you deliberately
-            need expired/superseded nodes (audits, history research).
-        detail: Verbosity tier per result. Default "auto" — selected per result by
-            relevance score (thresholds env-tunable via KG_TIER_*):
-              - score < 0.42  → discarded (noise)
-              - 0.42..0.55    → "summary" (LLM description, ~6 lines)
-              - 0.55..0.65    → "single_chunk" (matched chunk, ~2000 chars)
-              - 0.65..0.75    → "three_chunks" (matched + neighbours)
-              - >= 0.75       → "full" (whole node, up to 7 nearest chunks)
-            Explicit overrides apply uniformly to all results:
-              - "titles"        → title + file_path + node_type only
-              - "summary"       → LLM description / summary / 200-char content
-                                  ("descriptions" is an accepted alias)
-              - "single_chunk"  → matched chunk only
-              - "three_chunks"  → 3 chunks centred on hit
-              - "full"          → whole node (assembled from chunks when the node
-                                  is chunked; 300-char snippet for unchunked)
-
-    Returns:
-        JSON with deduplicated results ranked by combined semantic + keyword score.
-        Each result includes title, file_path, node_type, score (0..1), tier (the
-        verbosity actually applied), and content at the requested detail level.
+    Returns: JSON ranked by score — title, file_path, node_type, score, tier,
+    content.
     """
     # Loud-fail wrapper (2026-05-08 silent-zero antipattern fix v2).
     # Catches BOTH connection-time (get_weaviate_client raises
@@ -6622,32 +6560,14 @@ async def _hybrid_search_body(
 @mcp.tool()
 async def describe_excalidraw(file_path: str) -> str:
     """
-    Describe an Excalidraw scene by its text labels and element shape.
+    Describe an Excalidraw scene by its text labels and element shape — scene
+    name, all labels, and a count per element type, without the canvas. Use on
+    a `.excalidraw` file hybrid_search returned as a diagram
+    (`result_kind="diagram"`); `.mmd` diagrams are plain text — Read them.
 
-    Use this for .excalidraw files when ``hybrid_search`` returns a
-    diagram (``result_kind="diagram"``) you want to inspect — gives you
-    the scene name, all text labels, and a count of each element type
-    without needing to see the canvas. For .mmd (Mermaid) diagrams,
-    just ``Read(file_path)`` — those are plain text.
+    Args: file_path (absolute path to the `.excalidraw` file).
 
-    Args:
-        file_path: Absolute path to an ``.excalidraw`` file. Returned
-            by ``hybrid_search`` as the ``file_path`` field of a
-            diagram result.
-
-    Returns:
-        JSON with::
-
-            {
-                "success": true,
-                "scene_name": "Auth Flow" | null,
-                "text_labels": ["Login", "Submit", ...],
-                "element_counts": {"rectangle": 4, "text": 2, ...},
-                "file_path": "..."
-            }
-
-        On error (file missing, not JSON, not an .excalidraw file)
-        returns ``{"success": false, "error": "..."}``.
+    Returns: JSON — success, scene_name, text_labels, element_counts, file_path.
     """
     payload: dict = {
         "file_path": file_path,
@@ -6793,51 +6713,18 @@ async def store_knowledge_node(
     scope: str = "project",
 ) -> str:
     """
-    Create or update a knowledge-graph node: writes the markdown file to the
-    project's knowledge/ folder AND upserts its embedding into Weaviate, so
-    the node is immediately findable via hybrid_search. Upsert semantics —
-    same file_path with identical content is skipped; changed content is
-    re-written and re-embedded.
+    Create or update a knowledge-graph node: writes the markdown file and
+    upserts its embedding, findable via hybrid_search. Upsert — identical
+    content is skipped, changed content re-embeds.
 
-    When to use: persisting a non-obvious learning, decision rationale,
-    architecture pattern, or gotcha so future sessions can retrieve it.
-    When NOT to use: if you can write files directly, prefer writing the
-    knowledge/**/*.md file yourself (a PostToolUse hook auto-syncs it to
-    Weaviate); this tool is the path for agents without file-write access.
+    Args: title + content (title unique per file); node_type (OPEN set —
+    knowledge/VOCABULARY.md); tags (without '#'); links (WikiLinks,
+    "relationshipType::Target"); file_path (relative to KG_BASE_DIR or
+    absolute; omitted → derived); scope ("project" default | "shared"; shared
+    writes are REFUSED, not rerouted, when SHARED_KG_WRITE_DISABLED=true).
 
-    Args:
-        title: Node title (unique per file)
-        content: Full markdown content
-        node_type: Type (built-ins: project, concept, tool, model, hardware,
-                   research, pattern, insight, guide — the set is OPEN: declare
-                   additional types in knowledge/VOCABULARY.md as a class
-                   heading with an alias, optionally with a `- **Folder**:`
-                   line to give the type its own knowledge/ subfolder)
-        tags: Tags without # (e.g., ["AI", "VRAM"])
-        links: Typed WikiLinks in "relationshipType::Target" format
-        file_path: Relative path from KG_BASE_DIR (e.g., "knowledge/concepts/VRAM_Management.md")
-                   OR absolute path (e.g., "/home/user/project/knowledge/concepts/VRAM_Management.md").
-                   Absolute paths work even when KG_BASE_DIR is not configured.
-                   If omitted, path is auto-derived from title and node_type.
-        scope: "project" (default) — writes to KG_COLLECTION (project-scoped).
-               "shared" — writes to SHARED_KG_COLLECTION (cross-project
-               knowledge, visible to every project on this machine); use for
-               patterns genuinely reusable beyond this project.
-               Falls back to KG_COLLECTION if SHARED_KG_COLLECTION is not configured.
-               scope="shared" returns an error (does NOT silently fall back to
-               the project KG) when SHARED_KG_WRITE_DISABLED=true for this
-               project — on that error, either keep the knowledge project-scoped
-               or ask the user to lift the gate.
-
-    Returns:
-        JSON with success status, file_written flag, and absolute_path of the
-        markdown file (check these to confirm where the node landed).
-
-        A ``warning`` field appears — on success AND on failure — when the
-        write came from a folder that is not registered with VCO. It names the
-        collection the write went to and the remedy (the launcher's Adopt
-        flow). Surface it to the user: it is the only signal that arrives
-        before a later read comes back empty.
+    Returns: JSON — success, file_written, absolute_path; a `warning` when the
+    folder is not registered.
     """
     # v0.2.95 R6: computed inside the try (it needs the resolved collection)
     # but declared HERE, because the failure payload must carry it too — the
@@ -7512,56 +7399,18 @@ async def search_code_graph(
 ) -> str:
     """
     Find code entities (functions, classes, modules, APIs) by describing what
-    they do in natural language. Searches semantic embeddings of code, not
-    literal text — so "authentication middleware" finds auth-related functions
-    even if they don't contain those exact words.
+    they do (semantic). Use BEFORE Grep to find code by purpose; for exact
+    callers/deps use query_code_structure.
 
-    Use this BEFORE grep when looking for code by purpose or concept. Use Grep
-    only when you know the exact symbol name or string.
+    Args: query (what the code does); scope ("all" default | "code" |
+    "interaction" for APIs/cross-service calls); limit (default 8);
+    expand_hops (0 default; 1-2 follow call/interaction edges); layer
+    (lowercase values: api, service, data, ui, utility; an unpopulated
+    filter re-runs without it);
+    project (omit for workspace default, "" for all); detail ("auto" default,
+    else "titles"/"full" — knowledge/concepts/score-driven-retrieval-tiers.md).
 
-    When to use: "find the function that handles X", "where is Y implemented?",
-    "what code deals with Z?". Best for discovering code by intent.
-    Example: search_code_graph("retry logic for hub requests") surfaces
-    backoff/timeout helpers even when their names contain neither "retry"
-    nor "hub".
-    When NOT to use: searching for exact function/variable names — use Grep.
-    Once you know the entity's name, use query_code_structure for its exact
-    callers/dependencies.
-
-    Args:
-        query: Natural language description of the code you're looking for
-        scope: "all" (default) — all entity types; "code" — functions/classes/modules
-               only; "interaction" — service boundaries (APIs, cross-service calls) only
-        limit: Max results (default: 8).
-        expand_hops: 0 (default) — no expansion; 1 or 2 — follow call/interaction
-                     edges from seed nodes to discover related code
-        layer: Filter by architectural layer — lowercase values: api, service,
-               data, ui, utility (mixed-case input is lowercased before
-               matching). If the filter yields zero candidates (the `layer`
-               property is unpopulated on many indexes), the search re-runs
-               without it and the response carries a "note" explaining that.
-        project: Project name override. Omit to use the workspace default;
-                 pass "" (empty string) to search across all projects.
-        detail: Verbosity per result (default "auto"; any other value than the
-            three below is treated as "auto"):
-            - "auto"   → score-tiered per result via the code-calibrated gate
-                         (_CODE_TIER_THRESHOLDS, env-overridable CODE_TIER_*):
-                           score < min          → dropped (min derives from the
-                                                  post-rerank floor at call
-                                                  time, default 0.22)
-                           min..0.32            → "summary" (signature + doc)
-                           0.32..0.48           → "single_chunk" (matched chunk)
-                           0.48..0.62           → "three_chunks" (hit + neighbours)
-                           >= 0.62              → "full" (up to 7 chunks)
-                         A shared chunk budget degrades late results to
-                         cheaper tiers regardless of score.
-            - "titles" → metadata-only refs for every result (cheapest)
-            - "full"   → full details for every result (most expensive)
-
-    Returns:
-        JSON with code entities, each including file_path, score, tier (the
-        verbosity actually applied in auto mode), and tier-dependent content
-        (full_name/signature/doc/body chunks). Metadata refs for cheap tiers.
+    Returns: JSON code entities — file_path, score, tier, tier-dependent content.
     """
     _SCOPES: dict[str, list[str]] = {
         "all":         ["CodeFunction", "CodeClass", "CodeModule", "CodeAPI", "CodeInteraction"],
@@ -8544,40 +8393,18 @@ def query_code_structure(
     project: str = None
 ) -> str:
     """
-    Query exact code structure and relationships using the code graph. Unlike
-    search_code_graph (semantic/fuzzy), this returns precise structural data:
-    what calls what, what depends on what, inheritance chains, call paths.
+    Exact code structure from the code graph (the graph, not semantic search).
+    Use when the entity name is known; find it by description via
+    search_code_graph.
 
-    Use this when you already know the entity name and want to understand its
-    relationships. Use search_code_graph first if you need to discover the
-    entity by description.
+    Args: query_type — "dependencies" (imports), "imports" (who imports this),
+    "callers", "methods", "extends", "interactions" (cross-service calls),
+    "path" (shortest call path, "src.func->dst.func", BFS ≤ 6),
+    "composes"/"composed_by", "type_users"; target (full_name for
+    functions/classes, path for modules, the arrow pair for "path"); project
+    (omit for workspace default, "" for all).
 
-    When to use: "what calls function X?", "what does module Y depend on?",
-    "find the call path from A to B", "what classes extend Z?".
-    Example: query_code_structure("callers", "auth.validate_token") lists
-    every function that calls validate_token.
-    When NOT to use: discovering code by concept — use search_code_graph.
-
-    Args:
-        query_type: The kind of structural query to run:
-            - "dependencies": what this module imports
-            - "imports": reverse of dependencies — who imports this module
-            - "callers": what functions call this function
-            - "methods": methods belonging to a class
-            - "extends": what classes this class inherits from
-            - "interactions": cross-service calls (HTTP, gRPC, etc.)
-            - "path": shortest call path between two functions (format:
-              "source.func->dest.func", BFS up to depth 6)
-            - "composes"/"composed_by": composition relationships
-            - "type_users": functions using a given type in annotations
-        target: The code entity to query (full_name for functions/classes,
-                file path for modules, arrow-separated pair for "path")
-        project: Optional project name filter. Omit for the workspace default;
-                 pass "" (empty string) to query across all projects.
-
-    Returns:
-        JSON with the structural query results (entity names, file paths,
-        relationship details).
+    Returns: JSON — structural results (names, file_path, relations).
     """
     try:
         client = get_weaviate_client()

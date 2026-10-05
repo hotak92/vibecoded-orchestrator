@@ -1982,7 +1982,7 @@ MERGE_BLOCK_END = "<!-- /vct-merge-pending -->"
 # Note (PR-31 / v0.2.12): ``CLAUDE.md`` was removed from this whitelist.
 # The root CLAUDE.md is orchestrator-self development docs, not a user-
 # project scaffold. User projects render their CLAUDE.md from
-# ``templates/CLAUDE.md.template`` via the project-bootstrapper. The
+# ``templates/CLAUDE.md.template`` via the project-bootstrapper skill. The
 # ``DEFAULT_PRESERVE_LIST`` constant above still includes ``CLAUDE.md``
 # — that is the existing-user-CLAUDE.md preservation concern on
 # update, separate from the whitelist concern this section governs.
@@ -3772,15 +3772,14 @@ def _run_lightweight(args: argparse.Namespace) -> int:
     _run_machine_migrations(_lightweight_deferral)  # after venv triage (v0.2.97)
 
     # PR-14b (v0.2.11 MCP simplification): SearXNG no longer ships in the
-    # default compose stack; Ollama MCP is dropped from the default install;
-    # SEARXNG_URL + GITHUB_TOKEN are no longer needed in the search MCP env.
+    # default compose stack; Ollama MCP is dropped from the default install.
     # Surface deferral notices so existing users know to clean up manually.
+    # (v0.2.101: the search-MCP env-remnant check was deleted with the MCP.)
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
         # v0.2.83 (WP-B3): searxng-remnant producer RETIRED (harmful `rm -r`
         # advice for users running their own searxng); ID self-clears — see
         # the note in _INSTALL_OWNED_CONDITION_IDS.
         _check_ollama_mcp_remnants(_lightweight_deferral)
-        _check_search_mcp_env_obsolete(_lightweight_deferral)
     _materialize_boot_service(PROJECT_ROOT, None, args,
                               deferral_report=_lightweight_deferral)
     _rerender_model_gateway_boot_service(args)
@@ -5632,8 +5631,8 @@ def main() -> int:
     parser.add_argument("--suppress-mcp-deprecation-warnings", action="store_true",
                         default=False,
                         help="Suppress v0.2.11 MCP-simplification deprecation notices "
-                             "(SearXNG removed from default stack, Ollama MCP removed, "
-                             "search MCP env simplified). Use after you have manually "
+                             "(SearXNG removed from default stack, Ollama MCP removed). "
+                             "Use after you have manually "
                              "cleaned up these remnants.")
     parser.add_argument("--skip-mcp-registration", action="store_true",
                         default=False,
@@ -6394,14 +6393,13 @@ def main() -> int:
     _write_install_manifest(sysinfo, args, install_method="install.py")
 
     # PR-14b (v0.2.11 MCP simplification): Ollama MCP dropped from the default
-    # install; SEARXNG_URL + GITHUB_TOKEN no longer needed in the search MCP
-    # env. Surface deferral notices so existing users know to clean up.
-    # Soft-fail: each helper catches its own errors; install completes even if
-    # both checks fail. (v0.2.83 WP-B3: the searxng-remnant check was RETIRED —
+    # install. Surface deferral notices so existing users know to clean up.
+    # (v0.2.101: the search-MCP env-remnant check was deleted with the MCP.)
+    # Soft-fail: the helper catches its own errors; install completes even if
+    # it fails. (v0.2.83 WP-B3: the searxng-remnant check was RETIRED —
     # see the note in _INSTALL_OWNED_CONDITION_IDS.)
     if not getattr(args, "suppress_mcp_deprecation_warnings", False):
         _check_ollama_mcp_remnants(_deferral_report)
-        _check_search_mcp_env_obsolete(_deferral_report)
 
     # v0.2.89 FIX 2: on --update, quarantine an orphan `.mcp.json` weaviate-kg
     # block that shadows the migrated settings.json (soft-fails on ambiguity).
@@ -6517,6 +6515,8 @@ def main() -> int:
                     "remove_deprecated_mcps", "error",
                     f"unexpected exception: {exc}",
                 )
+
+        _auto_scrub_removed_mcp_entries(PROJECT_ROOT)  # v0.2.101; soft-fails inside
 
     # v0.2.21 Step 8: deploy vct-hub binary alongside vct-launcher and
     # start it idempotently. The launcher binary has already been
@@ -16631,96 +16631,6 @@ def _check_ollama_mcp_remnants(
         )
 
 
-def _check_search_mcp_env_obsolete(
-    deferral_report: "DeferralReport",
-) -> None:
-    """Emit a deferral when obsolete env vars remain in the search MCP entry.
-
-    In v0.2.11 the search MCP was simplified to ``search_papers`` only.
-    ``SEARXNG_URL`` (no longer needed — SearXNG dropped) and
-    ``GITHUB_TOKEN`` (no longer needed — GitHub code search removed) are
-    now obsolete in ``mcpServers.search.env``.
-
-    Reads ``_user_home_for_install() / ".claude.json"`` if it exists.
-    Soft-fail throughout — missing or malformed JSON is logged and skipped.
-
-    Uses :func:`_user_home_for_install` (introduced by PR-16) so that
-    pytest fixtures can redirect the lookup via ``VCT_USER_HOME_OVERRIDE``
-    without touching the real user home.
-
-    Args:
-        deferral_report: Run-scoped :class:`DeferralReport` to append the
-            entry to when obsolete keys are found.
-    """
-    claude_json = _user_home_for_install() / ".claude.json"
-    if not claude_json.is_file():
-        return
-    try:
-        data = json.loads(claude_json.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _log_install_event(
-            "search_mcp_env_check", "warn",
-            f"could not read {claude_json}: {exc}",
-        )
-        return
-    try:
-        if not isinstance(data, dict):
-            return
-        search_env = (
-            data.get("mcpServers", {})
-            .get("search", {})
-            .get("env", {})
-        )
-        if not isinstance(search_env, dict):
-            return
-
-        obsolete_keys = [
-            k for k in ("SEARXNG_URL", "GITHUB_TOKEN")
-            if k in search_env
-        ]
-        if not obsolete_keys:
-            return
-
-        keys_str = ", ".join(f"`{k}`" for k in obsolete_keys)
-        deferral_report.add_entry(
-            DeferralEntry(
-                condition_id="search_mcp_simplified",
-                title="Obsolete env vars in search MCP entry in ~/.claude.json",
-                detected=(
-                    f"The following env vars in `mcpServers.search.env` of "
-                    f"{claude_json} are no longer used by the search MCP "
-                    f"in v0.2.11: {keys_str}. "
-                    "The search MCP now provides only `search_papers` "
-                    "(OpenAlex + arXiv)."
-                ),
-                why_deferred=(
-                    "Automatic removal of ~/.claude.json env vars would "
-                    "silently break setups where users forward these "
-                    "variables for other purposes. Manual review required."
-                ),
-                command_to_apply=(
-                    f"# Remove obsolete env vars from mcpServers.search.env "
-                    f"in {claude_json}:\n"
-                    + "\n".join(
-                        f"# Delete the `\"{k}\": \"...\"` line from "
-                        "`mcpServers.search.env`."
-                        for k in obsolete_keys
-                    )
-                    + "\n# Only `OPENALEX_EMAIL` is needed going forward."
-                ),
-                severity="info",
-                kg_node_refs=[
-                    "knowledge/concepts/orchestrator-mcp-servers.md",
-                ],
-            )
-        )
-    except Exception as exc:  # noqa: BLE001 — soft-fail
-        _log_install_event(
-            "search_mcp_env_check", "warn",
-            f"could not check search MCP env remnants: {exc}",
-        )
-
-
 # ---------------------------------------------------------------------------
 # v0.2.89 FIX 2 — orphan legacy `.mcp.json` that shadows the migrated
 # `.claude/settings.json`. Real logic (detect predicate + backup/quarantine)
@@ -16823,6 +16733,7 @@ from vco_lib.install_mcp import (  # noqa: E402
     _python_fallback_write_mcp_entries,
     _scan_deprecated_mcp_entries,
     _scan_stale_mcp_entries,
+    auto_scrub_mcp_entries as _auto_scrub_mcp_entries,
     uninstall_scrub_mcp_names as _uninstall_scrub_mcp_names,
 )
 
@@ -19604,6 +19515,45 @@ def _rewrite_stale_mcp_entries(
 #   still requires the explicit --remove-deprecated-mcps flag.
 
 
+def _auto_scrub_removed_mcp_entries(
+    install_root: Path,
+    output_fn=print,
+) -> list[str]:
+    """v0.2.101: remove ``auto_scrub`` deprecated MCP entries from
+    ``~/.claude.json`` on the ordinary install/update and print one notice
+    line per removed entry.
+
+    Owner ruling (PLAN-V0300 item 15): ``search`` was DELETED, so its
+    now-orphaned registration is removed automatically — no consent prompt —
+    because the module it pointed at no longer exists (a leftover entry
+    guarantees a failing MCP subprocess every session). ``mermaid`` /
+    ``excalidraw`` are NOT auto-scrubbed (owner: users keep those). Idempotent
+    and soft-fail: no entry → no write, no print.
+
+    Returns the removed names.
+    """
+    try:
+        claude_json = _user_home_for_install() / ".claude.json"
+        removed = _auto_scrub_mcp_entries(install_root, claude_json)
+    except Exception as exc:  # noqa: BLE001 — soft-fail: the install always completes
+        _log_install_event(
+            "auto_scrub_mcp", "warn",
+            f"auto-scrub of removed MCP entries failed: {exc}",
+        )
+        return []
+    for name in removed:
+        output_fn(
+            f"  Removed obsolete MCP entry `{name}` from {claude_json} "
+            f"— that module no longer ships."
+        )
+    if removed:
+        _log_install_event(
+            "auto_scrub_mcp", "ok",
+            f"removed obsolete MCP entries: {', '.join(removed)}",
+        )
+    return removed
+
+
 def _remove_deprecated_mcp_entries(
     install_root: Path,
     deferral_report: "DeferralReport",
@@ -19639,6 +19589,9 @@ def _remove_deprecated_mcp_entries(
     """
     claude_json = _user_home_for_install() / ".claude.json"
     deprecated = _scan_deprecated_mcp_entries(install_root, claude_json)
+    # auto_scrub entries are removed by the ordinary update
+    # (`_auto_scrub_removed_mcp_entries`) — never offered for consent.
+    deprecated = [d for d in deprecated if not d[3].get("auto_scrub", False)]
     if not deprecated:
         return
 

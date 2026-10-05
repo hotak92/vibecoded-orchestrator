@@ -51,6 +51,11 @@
     hooks_inserted: number;
     mcp_servers_inserted: number;
     kg_access_rows_inserted: number;
+    // v0.2.101 (L3 review N-6): bundled rows the populate prune deleted
+    // (retired agents/skills, removed pack members) — surfaced so rows
+    // vanishing after a catalogue retirement are explained.
+    agents_pruned?: number;
+    skills_pruned?: number;
     warnings: string[];
   };
 
@@ -65,10 +70,14 @@
       if (r.skills_inserted > 0) parts.push(`${r.skills_inserted} skills`);
       if (r.hooks_inserted > 0) parts.push(`${r.hooks_inserted} hooks`);
       if (r.mcp_servers_inserted > 0) parts.push(`${r.mcp_servers_inserted} MCP servers`);
+      const pruned =
+        (r.agents_pruned ?? 0) + (r.skills_pruned ?? 0) > 0
+          ? ` (${(r.agents_pruned ?? 0) + (r.skills_pruned ?? 0)} retired item(s) pruned)`
+          : '';
       toast.success(
         parts.length > 0
-          ? `Re-scanned from disk: ${parts.join(', ')}`
-          : 'Re-scan complete (nothing new to register)'
+          ? `Re-scanned from disk: ${parts.join(', ')}${pruned}`
+          : `Re-scan complete (nothing new to register)${pruned}`
       );
       if (r.warnings.length > 0) {
         // Show warnings in console so power users can investigate

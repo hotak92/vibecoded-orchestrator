@@ -198,18 +198,20 @@ Secrets never live in env files or JSON configs. They live in the OS keychain (m
 
 | Slot | Written by | Consumed by |
 |---|---|---|
-| `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Secrets → Shared (this user) | `claude_mcp_servers/search_mcp/wrapper.sh` (exported as `GITHUB_TOKEN`), bundled hooks that need to talk to GitHub |
+| `github_pat` | OnboardingWizard `register_github_pat` step OR Preferences → Secrets → Shared (this user) | bundled hooks that need to talk to GitHub, and the `git-credential-vct` helper |
 | `openai_api_key` | OnboardingWizard OpenAI step OR Preferences → Secrets | `vco_lib/embedding_service.py` when `ACTIVE_EMBEDDING=openai` or as multi-slot fallback. Validated via `GET /v1/models/text-embedding-3-small` — no token consumption, no billing entry. |
 
 **Per-module / per-project secrets**: paid modules declare their own `bundled_secrets[]` in their manifest; the launcher's SecretsPanel surfaces a tab per scope. Per-project license keys, API tokens, and module-specific secrets are scoped by `project_id` and never leak across projects.
 
 **Resolver flow** (subprocess perspective):
 
-1. Wrapper script (`search_mcp/wrapper.sh` or equivalent) runs.
-2. Wrapper checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
+1. A consuming process (the `git-credential-vct` helper, or a bundled hook that talks to GitHub) runs.
+2. It checks `$GITHUB_TOKEN` — if already exported in its environment (by you, or by `vct exec --secret github_pat=GITHUB_TOKEN`), use it directly. The launcher never writes secret values into project files (v0.2.73), so this is not populated for you.
 3. Otherwise call `vct_secrets_resolve.sh <project_path> github_pat` → hub HTTP API at `GET /api/v1/projects/{id}/env?key=github_pat`.
 4. Hub resolves via SENTINEL_SHARED + `module_id=user`, applies the cross-launcher active-flag gate, returns the secret.
-5. Wrapper exports the value and `exec`s the real MCP server binary.
+5. The process uses the value and discards it.
+
+(Until v0.2.101 the `search` MCP's `wrapper.sh` was also a consumer; it was deleted with the MCP.)
 
 Don't put PATs or API keys in `~/.claude.json` `env:` blocks — Claude Code's env loader does not expand `${VAR}` (anthropics/claude-code#2065, #4276), so embedded secrets would land in argv and become visible to `ps`.
 
@@ -444,18 +446,14 @@ MCP servers are registered in the user's `~/.claude.json`. Each launches via the
 - Command: `<install>/.venv/bin/python claude_mcp_servers/weaviate_mcp/server.py` (legacy installs: `claude_mcp_servers/.venv/bin/python`)
 - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_WRITE_DISABLED` (write gate; legacy alias `SHARED_KG_OPT_OUT` kept for ~3 releases), plus the EmbeddingService vars (`ACTIVE_EMBEDDING`, `CODE_EMBED_SERVICE_URL`, etc.). The OpenAI key is NOT among them — it is a secret-shaped key and never reaches this file; the embedding stack resolves it in-process from VCO's own shared slot (see the env table above).
 
-**search** — academic paper search via OpenAlex and arXiv.
-- Command (Unix): `claude_mcp_servers/search_mcp/wrapper.sh` — exports `GITHUB_TOKEN` from the keychain (env-first then resolver), then `exec`s the real server.
-- Command (Windows): `<install>/.venv/Scripts/python.exe claude_mcp_servers/search_mcp/server.py` (no wrapper; PowerShell resolver client handles the secret; legacy installs use `claude_mcp_servers/.venv/Scripts/python.exe`).
-- Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API); `GITHUB_TOKEN` (resolved at wrapper startup from the `github_pat` shared keychain slot).
-- Tools: `search_papers` only. (Claude's built-in WebFetch covers ad-hoc web retrieval, so no general web-search tool is exposed.)
-
-**mermaid** and **excalidraw** — diagram describe/extract servers. Registered in `~/.claude.json` at install but **per-project default-disabled**: `claude mcp list` shows them Connected, yet their tools aren't callable until you opt in via the launcher's Diagrams tab.
+> **v0.2.101**: the `search` MCP (paper search) was deleted outright, and the `mermaid` / `excalidraw` diagram wrapper MCPs are no longer registered by default. An install that already has a diagram entry keeps it; a still-live `search` entry is **removed automatically by the ordinary install/update**, with one notice line (no consent prompt — the module is gone). Claude's built-in WebSearch / WebFetch cover web and academic retrieval.
 
 **playwright** — browser automation, enabled by default and invoked separately via `npx -y @playwright/mcp@latest`. `install.py` pre-caches it (opt out with `VCT_SKIP_PLAYWRIGHT=1`).
 - The entry stores the bare name `npx`, which Claude Code resolves from the spawn PATH at MCP-launch time. On a machine without Node.js there is nothing to resolve, so the MCP never starts — and pre-v0.2.91 nothing said so (the installer printed "the MCP will lazy-install when first invoked", which is impossible without npx). Since v0.2.91 the doctor phase probes it via `vco_lib/npx_resolver.py`, defers `npx_missing_mcp_unspawnable`, and the launcher's registration badge turns yellow with the same remediation.
 
-**Not MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding service CPU fallback) — there is no Ollama MCP server; Claude's native reasoning, `Read` tool, and built-in vision cover analysis, document reading, and image tasks. The code-embedding FastAPI service on port 11440 is likewise backend infrastructure. `search_papers` calls OpenAlex and arXiv directly — no local search proxy runs in the default container stack.
+**Per-project enable/disable**: a per-project MCP toggle writes `~/.claude.json` `projects[<absolute project path>].disabledMcpServers` — the per-project opt-out list Claude Code honours for user-scope servers. (The settings-file `disabledMcpjsonServers` / `enabledMcpjsonServers` keys govern only servers defined in the project's own `.mcp.json`; they are not the channel for a user-scope entry.)
+
+**Not MCPs**: Ollama runs as infrastructure only (Weaviate text embeddings + code-embedding service CPU fallback) — there is no Ollama MCP server; Claude's native reasoning, `Read` tool, and built-in vision cover analysis, document reading, and image tasks. The code-embedding FastAPI service on port 11440 is likewise backend infrastructure. Web / academic retrieval uses Claude's built-in WebSearch / WebFetch — no local search proxy runs in the default container stack.
 
 **Stale MCP cleanup**: `install.py --rewrite-stale-mcps` detects deprecated MCP entries left over from older versions in `~/.claude.json` and offers consent-prompted auto-rewrite. Run after upgrading from an older install.
 
@@ -827,8 +825,10 @@ unreadable, `3` = `--fix` failed or contract idempotency broken.
 
 End-to-end verifier for the Diagrams Integration feature. Runs 13
 focused checks covering: project row in launcher DB, `project_modules`
-seed row, migration 022 applied, MCP wrappers registered in
-`~/.claude.json`, hub allowlist HTTP route alive, env projection
+seed row, migration 022 applied, MCP wrapper entries in `~/.claude.json`
+(absent = OK: the wrapper MCPs are optional since v0.2.101 and the
+Diagrams tab does not need them; a PRESENT entry still has its module
+path verified), hub allowlist HTTP route alive, env projection
 across the three surfaces, per-project Weaviate `<Project>_Diagrams`
 class present, `PreToolUse` + `PostToolUse` hooks registered, hook
 scripts on disk + executable, `vco_lib.diagram_indexer` /
@@ -852,7 +852,7 @@ verify-diagrams: demo (project_id=p-1)
   [OK]   project_row — project 'demo' (id=p-1)
   [OK]   project_modules_row — project_modules('diagrams', enabled=1) row present
   [OK]   migration_022 — migration 22 applied + all 6 tables present
-  [OK]   mcp_wrappers — mermaid + excalidraw wrappers registered with correct module path
+  [OK]   mcp_wrappers — wrapper MCPs not registered — optional since v0.2.101; the Diagrams tab does not need them
   [SKIP] hub_allowlist — --quick: hub HTTP probe skipped
   [FAIL] env_projection — 1 drift entries: DIAGRAMS_COLLECTION on .vscode/settings.json: expected 'Demo_Diagrams', got '<missing>'
          > fix: vco verify-env-projection p-1 --fix

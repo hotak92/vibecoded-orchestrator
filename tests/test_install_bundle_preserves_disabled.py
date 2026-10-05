@@ -65,7 +65,7 @@ def _make_fake_orchestrator(root: Path) -> None:
     Layout:
       <root>/vct-module.json                     — repo-root marker
       <root>/templates/agents/free/foo.md
-      <root>/templates/skills/tdd/SKILL.md
+      <root>/templates/skills/example-skill/SKILL.md
       <root>/templates/settings.json.{linux,windows}.template — required
         by _enumerate_bundle_files / smart-merge path.
     """
@@ -79,10 +79,11 @@ def _make_fake_orchestrator(root: Path) -> None:
     )
 
     skills = root / "templates" / "skills"
-    tdd = skills / "tdd"
-    tdd.mkdir(parents=True)
-    (tdd / "SKILL.md").write_text(
-        "---\nname: tdd\nmodel: sonnet\n---\n# tdd skill body\n",
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+    example_skill = skills / "example-skill"
+    example_skill.mkdir(parents=True)
+    (example_skill / "SKILL.md").write_text(
+        "---\nname: example-skill\nmodel: sonnet\n---\n# example-skill skill body\n",
         encoding="utf-8",
     )
 
@@ -156,23 +157,23 @@ class AgentSkillAlreadyPresentTests(unittest.TestCase):
     def test_returns_false_when_neither_location_has_skill(self) -> None:
         self.assertFalse(
             project_init._agent_or_skill_already_present(
-                self.project, "tdd", "skill"
+                self.project, "example-skill", "skill"
             )
         )
 
     def test_returns_true_when_enabled_skill_dir_present(self) -> None:
-        (self.project / ".claude" / "skills" / "tdd").mkdir()
+        (self.project / ".claude" / "skills" / "example-skill").mkdir()
         self.assertTrue(
             project_init._agent_or_skill_already_present(
-                self.project, "tdd", "skill"
+                self.project, "example-skill", "skill"
             )
         )
 
     def test_returns_true_when_disabled_skill_dir_present(self) -> None:
-        (self.project / ".claude" / "skills.disabled" / "tdd").mkdir()
+        (self.project / ".claude" / "skills.disabled" / "example-skill").mkdir()
         self.assertTrue(
             project_init._agent_or_skill_already_present(
-                self.project, "tdd", "skill"
+                self.project, "example-skill", "skill"
             ),
             "Disabled-only skill must be treated as 'already present'",
         )
@@ -213,23 +214,23 @@ class ClassifyBundleOpKindTests(unittest.TestCase):
         # Top-level SKILL.md
         self.assertEqual(
             project_init._classify_bundle_op_kind(
-                ".claude/skills/tdd/SKILL.md"
+                ".claude/skills/example-skill/SKILL.md"
             ),
-            ("skill", "tdd"),
+            ("skill", "example-skill"),
         )
         # Companion file inside the skill dir — same skill name returned
         self.assertEqual(
             project_init._classify_bundle_op_kind(
-                ".claude/skills/tdd/extra.txt"
+                ".claude/skills/example-skill/extra.txt"
             ),
-            ("skill", "tdd"),
+            ("skill", "example-skill"),
         )
         # Windows separator
         self.assertEqual(
             project_init._classify_bundle_op_kind(
-                ".claude\\skills\\tdd\\SKILL.md"
+                ".claude\\skills\\example-skill\\SKILL.md"
             ),
-            ("skill", "tdd"),
+            ("skill", "example-skill"),
         )
 
     def test_non_agent_skill_paths_return_none(self) -> None:
@@ -416,30 +417,30 @@ class InstallBundlePreservesDisabledTests(unittest.TestCase):
             self.proj, orchestrator_root=self.orch, update_mode=False,
         )
         self.assertEqual(result["errors"], [])
-        self.assertTrue((self._skill_dest("tdd") / "SKILL.md").exists())
+        self.assertTrue((self._skill_dest("example-skill") / "SKILL.md").exists())
         self.assertEqual(result["actions"]["skip-disabled"], [])
 
     def test_disabled_skill_is_not_resurrected_on_update(self) -> None:
         """Same don't-resurrect invariant for skills (which are whole
         directories, not single files).
         """
-        # 1. Fresh install of tdd skill.
+        # 1. Fresh install of example-skill skill.
         first = project_init.install_project_bundle(
             self.proj, orchestrator_root=self.orch, update_mode=False,
         )
         self.assertEqual(first["errors"], [])
-        self.assertTrue((self._skill_dest("tdd") / "SKILL.md").exists())
+        self.assertTrue((self._skill_dest("example-skill") / "SKILL.md").exists())
 
         # 2. Simulate launcher disable: move whole skill dir.
-        self._skill_disabled_dest("tdd").parent.mkdir(parents=True)
-        self._skill_dest("tdd").rename(self._skill_disabled_dest("tdd"))
-        self.assertFalse(self._skill_dest("tdd").exists())
+        self._skill_disabled_dest("example-skill").parent.mkdir(parents=True)
+        self._skill_dest("example-skill").rename(self._skill_disabled_dest("example-skill"))
+        self.assertFalse(self._skill_dest("example-skill").exists())
         self.assertTrue(
-            (self._skill_disabled_dest("tdd") / "SKILL.md").exists()
+            (self._skill_disabled_dest("example-skill") / "SKILL.md").exists()
         )
 
         before_bytes = (
-            self._skill_disabled_dest("tdd") / "SKILL.md"
+            self._skill_disabled_dest("example-skill") / "SKILL.md"
         ).read_bytes()
 
         # 3. install-bundle --update.
@@ -450,16 +451,16 @@ class InstallBundlePreservesDisabledTests(unittest.TestCase):
         self.assertEqual(second["errors"], [])
         # 4. INVARIANT: skill dir not recreated.
         self.assertFalse(
-            self._skill_dest("tdd").exists(),
+            self._skill_dest("example-skill").exists(),
             "install-bundle --update resurrected a disabled skill",
         )
         self.assertEqual(
-            (self._skill_disabled_dest("tdd") / "SKILL.md").read_bytes(),
+            (self._skill_disabled_dest("example-skill") / "SKILL.md").read_bytes(),
             before_bytes,
             "the .disabled/ skill SKILL.md was modified by --update",
         )
         # The skill's SKILL.md op was classified as skip-disabled.
-        skill_md_rel = str(Path(".claude") / "skills" / "tdd" / "SKILL.md")
+        skill_md_rel = str(Path(".claude") / "skills" / "example-skill" / "SKILL.md")
         self.assertIn(
             skill_md_rel,
             second["actions"]["skip-disabled"],
@@ -474,8 +475,8 @@ class InstallBundlePreservesDisabledTests(unittest.TestCase):
         create / overwrite / preserve / skip-existing — only in
         skip-disabled.
         """
-        self._skill_disabled_dest("tdd").mkdir(parents=True)
-        (self._skill_disabled_dest("tdd") / "SKILL.md").write_text(
+        self._skill_disabled_dest("example-skill").mkdir(parents=True)
+        (self._skill_disabled_dest("example-skill") / "SKILL.md").write_text(
             "USER_DISABLED\n", encoding="utf-8",
         )
 
@@ -484,7 +485,7 @@ class InstallBundlePreservesDisabledTests(unittest.TestCase):
         )
 
         self.assertEqual(result["errors"], [])
-        skill_md_rel = str(Path(".claude") / "skills" / "tdd" / "SKILL.md")
+        skill_md_rel = str(Path(".claude") / "skills" / "example-skill" / "SKILL.md")
         # Pin: ONLY skip-disabled.
         for bucket in ("create", "overwrite", "preserve", "skip-existing",
                        "always-overwrite", "noop"):

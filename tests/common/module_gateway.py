@@ -35,6 +35,12 @@ from __future__ import annotations
 #: (owner ruling 2026-09-28) is execution and research, and deliberately
 #: carries NO reviewer or planner definition: those roles stay on GLM and
 #: on the Anthropic tiers. `qwen3.6-flash` gets no definition at all.
+#:
+#: v0.2.101: two qwen lanes were folded away — `qwen-flash-researcher`
+#: into `deepseek-researcher` (its cheap-bulk-research brief) and
+#: `qwen-flash-implementer` into `qwen-flash-sweeper` (its
+#: mechanical-edits brief). The set is now eight; the retired files are
+#: orphan-cleaned on the next bundle update (modified copies are kept).
 MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "glm-implementer.md",
     "glm-reviewer.md",
@@ -42,8 +48,6 @@ MODULE_GATEWAY_AGENT_FILES: tuple[str, ...] = (
     "glm-flash-researcher.md",
     "deepseek-implementer.md",
     "qwen-implementer.md",
-    "qwen-flash-implementer.md",
     "deepseek-researcher.md",
-    "qwen-flash-researcher.md",
     "qwen-flash-sweeper.md",
 )

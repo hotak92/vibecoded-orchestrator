@@ -12,9 +12,11 @@
 //! ## PR-23 (v0.2.12, 2026-05-16): default-orchestrator-MCP registration
 //!
 //! `register_default_orchestrator_mcps` constructs the canonical bundled
-//! MCP entries (`weaviate-kg`, `search` — Ollama MCP was dropped from the
-//! default install in v0.2.11; `vct-coordination` is Pro-tier and intentionally
-//! omitted here) and writes them via `register_mcp` above. Same function is
+//! MCP entries (`weaviate-kg`, `playwright` — Ollama was dropped in v0.2.11,
+//! `search` was deleted and the diagram wrappers `mermaid`/`excalidraw`
+//! retired from default shipping in v0.2.101; `vct-coordination` is Pro-tier
+//! and intentionally omitted here) and writes them via `register_mcp` above.
+//! Same function is
 //! invoked both from the launcher's `install_orchestrator()` Tauri command
 //! AND from a thin CLI subcommand on the launcher binary
 //! (`vct-launcher --register-default-mcps <install_root>`) which install.py
@@ -88,6 +90,24 @@ pub fn register_mcp(
     Ok(())
 }
 
+/// The names of every MCP entry registered in a `~/.claude.json`-shaped
+/// file's `mcpServers` map (empty when the file or map is absent). One
+/// home for this read: the GUI's server list uses it to surface legacy
+/// wrapper entries (v0.2.101 — registered-but-uncataloged) for the
+/// per-project toggle.
+pub fn registered_mcp_names(claude_json: &Path) -> Result<Vec<String>, String> {
+    if !claude_json.exists() {
+        return Ok(Vec::new());
+    }
+    let root = crate::json_file::read_json_or_empty(claude_json)?;
+    let names = root
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .map(|obj| obj.keys().cloned().collect())
+        .unwrap_or_default();
+    Ok(names)
+}
+
 pub fn deregister_mcp(target: &Path, mcp_name: &str) -> Result<(), String> {
     if !target.exists() {
         return Ok(());
@@ -105,6 +125,108 @@ pub fn deregister_mcp(target: &Path, mcp_name: &str) -> Result<(), String> {
         }
     }
     atomic_write_json(target, &root, CLAUDE_JSON_BACKUP)?;
+    Ok(())
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// v0.2.101: per-project MCP opt-out (the channel Claude Code honours)
+// ═══════════════════════════════════════════════════════════════════════
+//
+// `~/.claude.json mcpServers` is USER-scope: every entry there spawns in
+// every project's session. The launcher's per-project MCP toggle used to
+// write only launcher.db, so "disabled for this project" never reached
+// Claude Code — a false promise. The documented per-project opt-out is
+// `projects[<path>].disabledMcpServers`, and this module (the owner of
+// `~/.claude.json` writes) is the ONE home for it.
+
+/// The `~/.claude.json` `projects` map key for a project folder.
+///
+/// Claude Code keys the map by the path the session was OPENED in — the
+/// literal, as-entered folder path, not a symlink-resolved/canonicalized
+/// one (confirmed against Claude Code's own `disabledMcpServers` write on
+/// this machine, which sits under the literal project path). Keying by
+/// `fs::canonicalize` produced a physical path Claude Code never reads
+/// whenever the folder is reached through a symlink, silently voiding the
+/// per-project opt-out — so the key is the stored path AS GIVEN, and this
+/// ONE function is used by the writer and every reader so the two sides
+/// cannot drift apart.
+pub fn project_key_for_claude_json(project_folder: &Path) -> String {
+    project_folder.to_string_lossy().to_string()
+}
+
+/// Record a project's per-project MCP opt-out list in `~/.claude.json`.
+///
+/// `disabled` is the COMPLETE desired list for the project (not a delta):
+/// the caller recomputes it from the launcher DB on every toggle, so the
+/// write is idempotent and a re-enabled name can never linger as a stale
+/// opt-out. An empty list REMOVES the `disabledMcpServers` key rather than
+/// writing `[]` (Claude Code treats the two identically; omitting keeps the
+/// user's file minimal).
+///
+/// Same discipline as [`register_mcp`]: sidecar lock, read, mutate ONLY
+/// `projects[<key>].disabledMcpServers`, atomic write. Every other key —
+/// `mcpServers`, other projects' entries, and unrelated top-level keys —
+/// is left exactly as it was. When `disabled` is empty AND neither the
+/// `projects` map nor the project's entry exists, nothing is written at all
+/// (there is no stale opt-out to remove, and creating empty containers
+/// would be noise in the user's file).
+pub fn set_project_disabled_mcps(
+    claude_json: &Path,
+    project_folder: &Path,
+    disabled: &[String],
+) -> Result<(), String> {
+    let _lock = acquire_lock(claude_json, 5000)?;
+    let mut root = read_json_or_empty(claude_json)?;
+    let root_obj = root
+        .as_object_mut()
+        .ok_or("target file root is not a JSON object")?;
+
+    let mut list: Vec<String> = disabled.to_vec();
+    list.sort();
+    list.dedup();
+
+    let projects_missing = !root_obj.contains_key("projects");
+    if projects_missing && list.is_empty() {
+        // Nothing to record and nothing to remove — leave the file untouched.
+        return Ok(());
+    }
+    if projects_missing {
+        root_obj.insert("projects".into(), serde_json::json!({}));
+    }
+    let projects = root_obj
+        .get_mut("projects")
+        .and_then(|v| v.as_object_mut())
+        .ok_or("projects is not an object")?;
+
+    let project_key = project_key_for_claude_json(project_folder);
+    let entry_exists = projects.contains_key(&project_key);
+    if !entry_exists && list.is_empty() {
+        // No project entry, so no opt-out to clear. (The `projects` container
+        // may have just been created above only when list was non-empty, so
+        // this branch implies the container was already present.)
+        return Ok(());
+    }
+
+    #[allow(clippy::map_entry)]
+    if !entry_exists {
+        projects.insert(
+            project_key,
+            serde_json::json!({ "disabledMcpServers": list }),
+        );
+    } else {
+        // `shift_remove`, never `remove` (preserve_order; see `deregister_mcp`).
+        let entry = projects
+            .get_mut(&project_key)
+            .and_then(|v| v.as_object_mut())
+            .ok_or("projects entry is not an object")?;
+        if list.is_empty() {
+            entry.shift_remove("disabledMcpServers");
+        } else {
+            entry.insert("disabledMcpServers".into(), serde_json::json!(list));
+        }
+    }
+
+    atomic_write_json(claude_json, &root, CLAUDE_JSON_BACKUP)?;
     Ok(())
 }
 
@@ -256,6 +378,11 @@ pub struct RegistrationReport {
     pub outcomes: Vec<McpRegisterOutcome>,
     /// Soft-failures from the optional launcher.db sync step. Never fatal.
     pub db_warnings: Vec<String>,
+    /// v0.2.101: names of `auto_scrub` deprecated MCP entries removed from
+    /// `~/.claude.json` during this registration pass (a VCO-shaped entry
+    /// whose module no longer ships). The caller prints one notice line per
+    /// name. Empty on an idempotent second run.
+    pub removed_deprecated: Vec<String>,
 }
 
 impl RegistrationReport {
@@ -364,34 +491,6 @@ pub fn build_default_mcp_entries(
     let code_embed_url = ports.code_embed_url.clone();
     let mcp_root = install_root.join("claude_mcp_servers");
     let pythonpath = mcp_root.display().to_string();
-    // v0.2.91 WP-E item 1 — cwd-INDEPENDENT PYTHONPATH for the `-m`-invoked
-    // wrapper entries (mermaid / excalidraw).
-    //
-    // `pythonpath` above points INSIDE the `claude_mcp_servers` package. That
-    // is enough for the absolute-script entries (weaviate-kg / search import
-    // their siblings as top-level modules) but NOT for
-    // `python -m claude_mcp_servers.wrappers.<proxy>`: resolving that dotted
-    // name needs the package's PARENT (the install root) on sys.path. Until
-    // v0.2.91 the only thing supplying it was `python -m`'s implicit
-    // cwd-prepend, so the wrapper MCPs resolved ONLY when Claude Code was
-    // launched from the orchestrator root. Claude Code spawns stdio MCPs with
-    // cwd = the SESSION's project directory, and `~/.claude.json` is global —
-    // so every OTHER project got `ModuleNotFoundError: No module named
-    // 'claude_mcp_servers'` (rc=1, before any package code runs, so the
-    // wrappers' own script-mode import fallbacks cannot help). That is the
-    // long-reported mermaid/excalidraw "Failed to connect".
-    //
-    // Both roots stay on the path (root FIRST) so the wrappers' `vco_lib`
-    // imports and any package-relative import keep resolving. MUST stay in
-    // sync with the Python mirror `install_mcp.py::_build_python_mcp_entries`
-    // (`wrapper_pythonpath`).
-    let path_sep = if cfg!(target_os = "windows") { ";" } else { ":" };
-    let wrapper_pythonpath = format!(
-        "{}{}{}",
-        install_root.display(),
-        path_sep,
-        pythonpath
-    );
     let venv_python_str = venv_python.display().to_string();
 
     // ── weaviate-kg ─────────────────────────────────────────────────────
@@ -417,31 +516,6 @@ pub fn build_default_mcp_entries(
         "command": venv_python_str.clone(),
         "args": [weaviate_server.display().to_string()],
         "env": serde_json::Value::Object(weaviate_env_safe),
-    });
-
-    // ── search ──────────────────────────────────────────────────────────
-    // v0.2.11 search MCP needs no secrets (SEARXNG / GITHUB_TOKEN removed)
-    // but we still go through the wrapper.sh on Unix for backward-compat
-    // with anything that exports its own GITHUB_TOKEN or OPENALEX_EMAIL.
-    // On Windows there is no wrapper.sh, so invoke python directly.
-    let search_server = mcp_root.join("search_mcp").join("server.py");
-    let search_wrapper = mcp_root.join("search_mcp").join("wrapper.sh");
-    let (search_cmd, search_args) = if cfg!(target_os = "windows") {
-        (
-            venv_python_str.clone(),
-            vec![search_server.display().to_string()],
-        )
-    } else {
-        (search_wrapper.display().to_string(), Vec::<String>::new())
-    };
-    let mut search_env = serde_json::Map::new();
-    search_env.insert("PYTHONPATH".into(), pythonpath.clone().into());
-    let (search_env_safe, search_dropped) = filter_env_for_global_json(&search_env);
-    let search_entry = serde_json::json!({
-        "type": "stdio",
-        "command": search_cmd,
-        "args": search_args,
-        "env": serde_json::Value::Object(search_env_safe),
     });
 
     // ── playwright (F-1, v0.2.73) ───────────────────────────────────
@@ -483,67 +557,15 @@ pub fn build_default_mcp_entries(
     });
     let playwright_dropped: Vec<String> = Vec::new();
 
-    // ── mermaid (Phase 1.2 — wrapper MCP) ───────────────────────────
-    // The wrapper proxies the npm `claude-mermaid` package and filters
-    // its tool surface per-project. Spawn command: `<venv-python> -m
-    // claude_mcp_servers.wrappers.mermaid_proxy`. NOT a direct `npx`
-    // invocation — the wrapper is the entry point; it spawns `npx` as
-    // its own child once it's resolved the per-project allowlist.
-    //
-    // Default-disabled per project (see `BUNDLED_MCP_DEFAULT_DISABLED`
-    // in vct-launcher-core/src/db/project_mcp_servers.rs). The user
-    // opts in via the launcher's DiagramsTab. Until opted in the entry
-    // sits in ~/.claude.json but the launcher's per-project gate keeps
-    // Claude Code from spawning it.
-    let mut mermaid_env = serde_json::Map::new();
-    // v0.2.91 WP-E item 1: `wrapper_pythonpath` (root + package dir), NOT the
-    // package-internal `pythonpath` — see its definition above.
-    mermaid_env.insert("PYTHONPATH".into(), wrapper_pythonpath.clone().into());
-    let (mermaid_env_safe, mermaid_dropped) = filter_env_for_global_json(&mermaid_env);
-    let mermaid_entry = serde_json::json!({
-        "type": "stdio",
-        "command": venv_python_str.clone(),
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.mermaid_proxy",
-        ],
-        "env": serde_json::Value::Object(mermaid_env_safe),
-    });
-
-    // ── excalidraw (Phase 2 — wrapper MCP) ──────────────────────────
-    // The wrapper proxies the in-tree-vendored `excalidraw-mcp-server`
-    // (see claude_mcp_servers/excalidraw_mcp_fork/VENDORED.md) and
-    // filters its tool surface per-project. Spawn command:
-    // `<venv-python> -m claude_mcp_servers.wrappers.excalidraw_proxy`.
-    // The wrapper itself spawns Node on the vendored entry point
-    // once it's resolved the per-project allowlist.
-    //
-    // Default-disabled per project (see `BUNDLED_MCP_DEFAULT_DISABLED`
-    // in vct-launcher-core/src/db/project_mcp_servers.rs). The user
-    // opts in via the launcher's DiagramsTab. Until opted in the entry
-    // sits in ~/.claude.json but the launcher's per-project gate keeps
-    // Claude Code from spawning it. Same posture as Mermaid above.
-    let mut excalidraw_env = serde_json::Map::new();
-    // v0.2.91 WP-E item 1: same cwd-independent PYTHONPATH as mermaid.
-    excalidraw_env.insert("PYTHONPATH".into(), wrapper_pythonpath.clone().into());
-    let (excalidraw_env_safe, excalidraw_dropped) =
-        filter_env_for_global_json(&excalidraw_env);
-    let excalidraw_entry = serde_json::json!({
-        "type": "stdio",
-        "command": venv_python_str.clone(),
-        "args": [
-            "-m",
-            "claude_mcp_servers.wrappers.excalidraw_proxy",
-        ],
-        "env": serde_json::Value::Object(excalidraw_env_safe),
-    });
+    // NOTE (v0.2.101): `search` (module deleted) and the diagram wrapper MCPs
+    // `mermaid` / `excalidraw` (registration retired) no longer appear here.
+    // An install that already has those entries keeps them — they stay in
+    // `[bundled].all_names` / `uninstall_scrub_names` — but no default
+    // registration composes them.
 
     vec![
         ("weaviate-kg".to_string(), weaviate_entry, weaviate_dropped),
-        ("search".to_string(), search_entry, search_dropped),
         ("playwright".to_string(), playwright_entry, playwright_dropped),
-        ("mermaid".to_string(), mermaid_entry, mermaid_dropped),
-        ("excalidraw".to_string(), excalidraw_entry, excalidraw_dropped),
     ]
 }
 
@@ -566,8 +588,7 @@ pub fn build_default_mcp_entries(
 /// test time) + the cross-language `tests/test_mcp_scan_rules_parity.py`.
 /// Edit the .toml, then this copy, then run the tests (sanctioned
 /// compiled-copy-with-parity-test pattern, CLAUDE.md A>B>C tier B).
-pub const DEFAULT_MCP_ENTRY_NAMES: &[&str] =
-    &["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"];
+pub const DEFAULT_MCP_ENTRY_NAMES: &[&str] = &["weaviate-kg", "playwright"];
 
 /// Compose the canonical `~/.claude.json` entry for ONE bundled MCP id
 /// (F-2, v0.2.73).
@@ -638,6 +659,7 @@ pub fn register_default_orchestrator_mcps(
         claude_json_path: claude_json.clone(),
         outcomes: Vec::new(),
         db_warnings: Vec::new(),
+        removed_deprecated: Vec::new(),
     };
 
     let py = match venv_python.as_ref() {
@@ -695,9 +717,9 @@ pub fn register_default_orchestrator_mcps(
                 // The raw UPSERT's SQL writes `enabled = 1` on INSERT
                 // unconditionally, so this path used to seed the orchestrator
                 // root's `mermaid` / `excalidraw` rows ENABLED — against
-                // `BUNDLED_MCP_DEFAULT_DISABLED` and against
-                // docs/GETTING_STARTED.md's "default-disabled per project"
-                // claim, while the populate path applied the rule correctly.
+                // `BUNDLED_MCP_DEFAULT_DISABLED` (the members it carried then;
+                // the list is empty after the v0.2.101 diagram retirement),
+                // while the populate path applied the rule correctly.
                 // Same discipline, one home (`project_mcp_servers.rs`).
                 if let Err(e) = db.register_project_mcp_server_honoring_defaults(
                     &project_id,
@@ -718,7 +740,112 @@ pub fn register_default_orchestrator_mcps(
         }
     }
 
+    // v0.2.101: remove `auto_scrub` deprecated MCP entries from the SAME
+    // `~/.claude.json` — the module they pointed at no longer ships, so a
+    // leftover entry fails to spawn on every session. Owner ruling
+    // (PLAN-V0300 item 15): delete now + scrub, no consent prompt; the caller
+    // prints one notice line. Only VCO-shaped entries are removed (path inside
+    // install_root), so a user's own MCP that shares a name is left alone.
+    // `mermaid`/`excalidraw` are NOT marked auto_scrub (owner: users keep
+    // them). Idempotent — a second run finds nothing.
+    report.removed_deprecated = scrub_auto_scrub_mcp_entries(&claude_json, install_root);
+
     Ok(report)
+}
+
+/// Remove every `[deprecated.<name>]` entry flagged `auto_scrub = true` whose
+/// on-disk `command`/`args[0]` points INSIDE `install_root` (i.e. it is VCO's
+/// entry, not a user's own MCP with the same name). Uses `deregister_mcp`
+/// (the module's one writer, with its lock + atomic write). Returns the names
+/// removed, in the table's stable (BTreeMap) order. Idempotent; soft-fail.
+fn scrub_auto_scrub_mcp_entries(claude_json: &Path, install_root: &Path) -> Vec<String> {
+    let deprecated = vct_launcher_core::mcp_scan_rules::deprecated_default_mcps();
+    let auto_scrub: Vec<&String> = deprecated
+        .iter()
+        .filter(|(_, d)| d.auto_scrub)
+        .map(|(name, _)| name)
+        .collect();
+    if auto_scrub.is_empty() || !claude_json.is_file() {
+        return Vec::new();
+    }
+    let root = match fs::canonicalize(install_root) {
+        Ok(c) => c,
+        Err(_) => install_root.to_path_buf(),
+    };
+    let root_str = root.display().to_string();
+    let root_str = root_str.trim_end_matches(['/', '\\']).to_string();
+
+    let mut removed: Vec<String> = Vec::new();
+    for name in auto_scrub {
+        // Re-read the file per entry: `deregister_mcp` writes between calls,
+        // so a cached read would go stale. Cheap — the set is one name.
+        let root_json = match read_json_or_empty(claude_json) {
+            Ok(v) => v,
+            Err(_) => break,
+        };
+        let Some(entry) = root_json
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .and_then(|m| m.get(name.as_str()))
+        else {
+            continue;
+        };
+        if !entry_path_inside_install_root(entry, &root_str) {
+            // A user's own MCP that happens to share the name — leave it.
+            continue;
+        }
+        match deregister_mcp(claude_json, name) {
+            Ok(()) => {
+                tracing::info!(
+                    "[vct] removed obsolete MCP entry `{}` from {} (module no longer ships)",
+                    name,
+                    claude_json.display()
+                );
+                removed.push(name.clone());
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "[vct] could not remove obsolete MCP entry `{}` from {}: {}",
+                    name,
+                    claude_json.display(),
+                    e
+                );
+            }
+        }
+    }
+    removed
+}
+
+/// True iff an MCP entry's `command` or `args[0]` is an absolute path that
+/// starts with `install_root_str` (trailing separators trimmed). Mirrors the
+/// `_path_is_inside_install_root` gate on the Python side so the two agree on
+/// what "VCO's entry" means.
+fn entry_path_inside_install_root(entry: &serde_json::Value, install_root_str: &str) -> bool {
+    if install_root_str.is_empty() {
+        return false;
+    }
+    let command = entry.get("command").and_then(|v| v.as_str()).unwrap_or("");
+    let first_arg = entry
+        .get("args")
+        .and_then(|v| v.as_array())
+        .and_then(|a| a.first())
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    [command, first_arg].iter().any(|candidate| {
+        if candidate.is_empty() {
+            return false;
+        }
+        let looks_absolute = candidate.starts_with('/')
+            || candidate.starts_with("C:\\")
+            || candidate.starts_with("c:\\")
+            || candidate.starts_with("\\\\");
+        if !looks_absolute {
+            return false;
+        }
+        let cand = candidate.replace('\\', "/");
+        let root = install_root_str.replace('\\', "/");
+        cand == root || cand.starts_with(&format!("{}/", root))
+    })
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -1129,16 +1256,8 @@ mod tests {
             perms.set_mode(0o755);
             fs::set_permissions(&p, perms).unwrap();
         }
-        // Also create the MCP server dirs so paths look plausible.
+        // Also create the MCP server dir so paths look plausible.
         fs::create_dir_all(root.join("claude_mcp_servers/weaviate_mcp")).unwrap();
-        fs::create_dir_all(root.join("claude_mcp_servers/search_mcp")).unwrap();
-        // wrapper.sh placeholder (Unix only — Windows path uses python directly).
-        #[cfg(not(target_os = "windows"))]
-        fs::write(
-            root.join("claude_mcp_servers/search_mcp/wrapper.sh"),
-            b"#!/usr/bin/env bash\nexit 0\n",
-        )
-        .unwrap();
         root
     }
 
@@ -1223,14 +1342,10 @@ mod tests {
         // Note: Ollama MCP was dropped from the default install in v0.2.11
         // (see install.py:_check_ollama_mcp_remnants); we explicitly do NOT
         // include it here. vct-coordination is Pro-tier and likewise excluded.
-        // Phase 1.2 (diagrams plan): mermaid wrapper appended.
-        // Phase 2 (diagrams plan): excalidraw wrapper appended.
-        // F-1 (v0.2.73): playwright added — was promised default-enabled by
-        // the docs + GUI catalog but never written by any install path.
-        assert_eq!(
-            names,
-            vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"]
-        );
+        // v0.2.101: `search` (module deleted) and the diagram wrapper MCPs
+        // (`mermaid`/`excalidraw`, registration retired) were removed from the
+        // builder. F-1 (v0.2.73): playwright stays — default-enabled.
+        assert_eq!(names, vec!["weaviate-kg", "playwright"]);
 
         // ── weaviate-kg shape ────────────────────────────────────────
         let (_, weaviate, _) = &entries[0];
@@ -1256,27 +1371,10 @@ mod tests {
         );
         assert!(weaviate["env"].get("GITHUB_TOKEN").is_none(), "secrets MUST be absent");
 
-        // ── search shape ──────────────────────────────────────────────
-        let (_, search, _) = &entries[1];
-        assert_eq!(search["type"], "stdio");
-        if cfg!(target_os = "windows") {
-            assert_eq!(search["command"], py.display().to_string());
-            assert_eq!(search["args"].as_array().unwrap().len(), 1);
-        } else {
-            assert!(
-                search["command"]
-                    .as_str()
-                    .unwrap()
-                    .ends_with("search_mcp/wrapper.sh"),
-                "Unix search MCP must use wrapper.sh"
-            );
-            assert_eq!(search["args"].as_array().unwrap().len(), 0);
-        }
-
         // ── playwright shape (F-1, v0.2.73) ──────────────────────────
         // Must match the shipped launch command everywhere else:
         // `npx -y @playwright/mcp@latest`, empty env, no venv-python.
-        let (_, playwright, playwright_dropped) = &entries[2];
+        let (_, playwright, playwright_dropped) = &entries[1];
         assert_eq!(playwright["type"], "stdio");
         assert_eq!(playwright["command"], "npx");
         let playwright_args = playwright["args"].as_array().unwrap();
@@ -1294,31 +1392,6 @@ mod tests {
             playwright_dropped
         );
 
-        // ── wrapper PYTHONPATH shape (v0.2.91 WP-E item 1) ───────────
-        // `python -m claude_mcp_servers.wrappers.<proxy>` resolves the
-        // dotted name from sys.path, so the package's PARENT (the install
-        // root) MUST be on PYTHONPATH. Pre-v0.2.91 only the package-
-        // internal dir was, and the entries worked ONLY from a cwd that
-        // happened to be the install root.
-        let sep = if cfg!(target_os = "windows") { ";" } else { ":" };
-        let expected_wrapper_pp = format!(
-            "{}{}{}",
-            root.display(),
-            sep,
-            root.join("claude_mcp_servers").display()
-        );
-        for (name, entry, _) in entries.iter().filter(|(n, _, _)| {
-            n == "mermaid" || n == "excalidraw"
-        }) {
-            assert_eq!(
-                entry["env"]["PYTHONPATH"].as_str().unwrap(),
-                expected_wrapper_pp,
-                "`{}` PYTHONPATH must be <install_root>{}<install_root>/claude_mcp_servers \
-                 so `python -m` resolves the package from ANY cwd",
-                name,
-                sep
-            );
-        }
         // The absolute-script entries keep the package-internal path (their
         // imports are top-level siblings, not a dotted package name).
         assert_eq!(
@@ -1332,18 +1405,19 @@ mod tests {
     // ── v0.2.91 WP-E item 3: default-disabled parity on the DB-sync ────
 
     /// ACT: the registration DB-sync seeds the orchestrator-root project's
-    /// rows through the SHARED default-disabled helper, so `mermaid` and
-    /// `excalidraw` land `enabled = false` exactly like the populate path
-    /// does — while the default-ENABLED entries land `enabled = true`.
+    /// rows through the SHARED default-disabled helper. v0.2.101: the
+    /// default-disabled registry is empty (the diagram MCPs retired), so the
+    /// builder rows all land `enabled = true` and NO row is created for the
+    /// retired `search`/`mermaid`/`excalidraw` names.
     ///
-    /// Red-proof (c67ef888): this path called the raw
-    /// `register_project_mcp_server`, whose SQL writes `enabled = 1` on
-    /// INSERT unconditionally, so both diagram MCPs came back enabled and
-    /// this assertion failed. That is why the field DB showed the root
+    /// Red-proof (c67ef888): before the shared helper, this path called the
+    /// raw `register_project_mcp_server`, whose SQL writes `enabled = 1` on
+    /// INSERT unconditionally. That is why the field DB showed the root
     /// project's mermaid/excalidraw rows enabled against
-    /// `BUNDLED_MCP_DEFAULT_DISABLED`.
+    /// `BUNDLED_MCP_DEFAULT_DISABLED`. The per-name loop below stays meaningful
+    /// if the registry ever gains a member again.
     #[test]
-    fn db_sync_applies_default_disabled_on_fresh_insert() {
+    fn db_sync_seeds_builder_rows_enabled() {
         use crate::db::models::ProjectHost;
         use crate::db::Db;
 
@@ -1397,16 +1471,28 @@ mod tests {
                 name
             );
         }
+        // v0.2.101: the retired names get NO DB row from the registration
+        // sync (they are not in the builder set any more). Red-proof: re-add
+        // `search`/`mermaid`/`excalidraw` to the builder → this fails.
+        for retired in ["search", "mermaid", "excalidraw"] {
+            assert!(
+                !by_name.contains_key(retired),
+                "`{}` was retired from default registration — no DB row must \
+                 be seeded for it",
+                retired
+            );
+        }
 
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&root).ok();
     }
 
-    /// LEAVE-ALONE: a re-run must NOT re-apply the default-disabled flip, and
-    /// must NOT undo a deliberate user opt-in. The row already exists, so the
-    /// UPSERT's enabled-preserving `DO UPDATE` is the only thing that runs.
+    /// LEAVE-ALONE: a re-run must NOT re-apply any default-enabled/dis-
+    /// enabled flip, and must NOT undo a deliberate user toggle. The row
+    /// already exists, so the UPSERT's enabled-preserving `DO UPDATE` is the
+    /// only thing that runs.
     #[test]
-    fn db_sync_rerun_preserves_user_enabled_toggle() {
+    fn db_sync_rerun_preserves_user_disabled_toggle() {
         use crate::db::models::ProjectHost;
         use crate::db::Db;
 
@@ -1425,18 +1511,18 @@ mod tests {
 
         register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), Some(&db))
             .unwrap();
-        // The user opts into diagrams via the launcher's DiagramsTab.
-        db.set_project_mcp_server_enabled(&pid, "mermaid", true).unwrap();
+        // The user silences playwright for this project via the launcher.
+        db.set_project_mcp_server_enabled(&pid, "playwright", false).unwrap();
 
         register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), Some(&db))
             .unwrap();
 
         let rows = db.list_project_mcp_servers(&pid).unwrap();
-        let mermaid = rows.iter().find(|r| r.mcp_name == "mermaid").unwrap();
+        let playwright = rows.iter().find(|r| r.mcp_name == "playwright").unwrap();
         assert!(
-            mermaid.enabled,
-            "re-registration must never re-apply the default-disabled flip over \
-             a user opt-in (enabled is set on INSERT only)"
+            !playwright.enabled,
+            "re-registration must never re-enable a row the user disabled \
+             (enabled is set on INSERT only)"
         );
 
         fs::remove_file(&target).ok();
@@ -1600,18 +1686,14 @@ mod tests {
         .expect("register_default_orchestrator_mcps");
 
         assert!(report.all_succeeded(), "report.outcomes: {:?}", report.outcomes);
-        // Phase 1.2 (diagrams plan): mermaid wrapper added → 3 entries.
-        // Phase 2 (diagrams plan): excalidraw wrapper added → 4 entries.
-        // F-1 (v0.2.73): playwright added → 5 entries.
-        // Prior: weaviate-kg + search (2). Both wrappers register in
-        // ~/.claude.json but are default-DISABLED at the per-project
-        // gate (see BUNDLED_MCP_DEFAULT_DISABLED in vct-launcher-core).
-        assert_eq!(report.success_count(), 5);
+        // v0.2.101: the builder registers exactly weaviate-kg + playwright.
+        // `search` (module deleted) and the diagram wrappers (registration
+        // retired) are no longer written; the ollama MCP was dropped in v0.2.11.
+        assert_eq!(report.success_count(), 2);
 
         let raw = fs::read_to_string(&target).unwrap();
         let json: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert!(json["mcpServers"]["weaviate-kg"].is_object());
-        assert!(json["mcpServers"]["search"].is_object());
         assert!(
             json["mcpServers"]["playwright"].is_object(),
             "playwright MCP must be registered in ~/.claude.json (F-1)"
@@ -1620,39 +1702,15 @@ mod tests {
             json["mcpServers"]["playwright"]["command"], "npx",
             "playwright registration must match the shipped launch command (npx)"
         );
-        assert!(
-            json["mcpServers"]["mermaid"].is_object(),
-            "mermaid wrapper MCP must be registered in ~/.claude.json"
-        );
-        assert!(
-            json["mcpServers"]["excalidraw"].is_object(),
-            "excalidraw wrapper MCP must be registered in ~/.claude.json"
-        );
-        // ollama MCP must NOT be written (deprecated in v0.2.11).
-        assert!(
-            json["mcpServers"].get("ollama").is_none(),
-            "Ollama MCP was dropped from default install in v0.2.11 and must NOT be auto-registered"
-        );
-        // Mermaid entry points at the wrapper module, NOT direct npx.
-        // The wrapper internally spawns `npx -y claude-mermaid@<pin>`.
-        let mermaid_args = json["mcpServers"]["mermaid"]["args"]
-            .as_array()
-            .expect("mermaid.args is an array");
-        assert_eq!(mermaid_args[0], "-m");
-        assert_eq!(
-            mermaid_args[1], "claude_mcp_servers.wrappers.mermaid_proxy",
-            "mermaid MCP must point at the wrapper module, not direct npx"
-        );
-        // Excalidraw entry points at the wrapper module, NOT direct node.
-        // The wrapper internally spawns Node on the vendored entry point.
-        let excalidraw_args = json["mcpServers"]["excalidraw"]["args"]
-            .as_array()
-            .expect("excalidraw.args is an array");
-        assert_eq!(excalidraw_args[0], "-m");
-        assert_eq!(
-            excalidraw_args[1], "claude_mcp_servers.wrappers.excalidraw_proxy",
-            "excalidraw MCP must point at the wrapper module, not direct node"
-        );
+        // Retired defaults must NOT be written any more. Red-proof: re-add
+        // the entry to the builder → the corresponding assert fails.
+        for retired in ["search", "mermaid", "excalidraw", "ollama"] {
+            assert!(
+                json["mcpServers"].get(retired).is_none(),
+                "`{}` must NOT be auto-registered by v0.2.101",
+                retired
+            );
+        }
 
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&root).ok();
@@ -1707,7 +1765,7 @@ mod tests {
         assert_eq!(json["permissions"]["allow"][0], "Read");
         // Orchestrator MCPs were added.
         assert!(json["mcpServers"]["weaviate-kg"].is_object());
-        assert!(json["mcpServers"]["search"].is_object());
+        assert!(json["mcpServers"]["playwright"].is_object());
 
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&root).ok();
@@ -1885,6 +1943,302 @@ mod tests {
             "a vco-shaped path INSIDE install_root is current, not stale: {:?}",
             stale_names
         );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    // ── v0.2.101: per-project disabledMcpServers ─────────────────────────
+    //
+    // The channel Claude Code honours for disabling a USER-scope MCP in one
+    // project. These pin the writer, not the command wiring (that lives in
+    // `commands::project_state_cmd`).
+
+    fn project_entry<'a>(
+        json: &'a serde_json::Value,
+        folder: &Path,
+    ) -> Option<&'a serde_json::Value> {
+        json["projects"].get(project_key_for_claude_json(folder))
+    }
+
+    #[test]
+    fn set_project_disabled_mcps_records_names_and_leaves_the_rest_untouched() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-a");
+        fs::create_dir_all(&folder).unwrap();
+        let other = "/some/other/project";
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"weaviate-kg": {"command": "x"}},
+                "projects": {other: {"history": [1, 2, 3], "disabledMcpServers": ["keep"]}},
+                "numStartups": 7
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        set_project_disabled_mcps(
+            &target,
+            &folder,
+            &["playwright".to_string(), "weaviate-kg".to_string()],
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        // New project entry carries the sorted, deduped list.
+        assert_eq!(
+            project_entry(&json, &folder).unwrap()["disabledMcpServers"],
+            serde_json::json!(["playwright", "weaviate-kg"]),
+        );
+        // Other project + unrelated top-level keys are byte-identical.
+        assert_eq!(json["projects"][other]["disabledMcpServers"], serde_json::json!(["keep"]));
+        assert_eq!(json["projects"][other]["history"], serde_json::json!([1, 2, 3]));
+        assert_eq!(json["mcpServers"]["weaviate-kg"]["command"], "x");
+        assert_eq!(json["numStartups"], 7);
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// The `projects` map key is the path AS OPENED (Claude Code's own key
+    /// form), never a symlink-resolved one: a project reached through a
+    /// symlink must record its opt-out under the literal path or Claude
+    /// Code never reads it. Red-proof: restoring `fs::canonicalize` in
+    /// `project_key_for_claude_json` resolves the symlink → this fails.
+    #[test]
+    fn set_project_disabled_mcps_keys_by_the_as_opened_symlinked_path() {
+        let target = tmp_target();
+        let base = std::env::temp_dir().join("vct-proj-keyed");
+        let real = base.join("real-project");
+        let link = base.join("link-project");
+        fs::create_dir_all(&real).unwrap();
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        set_project_disabled_mcps(&target, &link, &["mermaid".to_string()]).unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        let projects = json["projects"].as_object().unwrap();
+        assert!(
+            projects.contains_key(link.to_string_lossy().as_ref()),
+            "opt-out must sit under the literal (as-opened) path {}; got keys {:?}",
+            link.display(),
+            projects.keys().collect::<Vec<_>>(),
+        );
+        assert!(
+            !projects.contains_key(real.to_string_lossy().as_ref()),
+            "the symlink-resolved path {} is a key Claude Code never reads",
+            real.display(),
+        );
+
+        fs::remove_file(&link).ok();
+        fs::remove_dir_all(&base).ok();
+        fs::remove_file(&target).ok();
+    }
+
+    #[test]
+    fn set_project_disabled_mcps_dedupes_and_sorts() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-dedupe");
+        fs::create_dir_all(&folder).unwrap();
+
+        set_project_disabled_mcps(
+            &target,
+            &folder,
+            &["b".to_string(), "a".to_string(), "b".to_string()],
+        )
+        .unwrap();
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            project_entry(&json, &folder).unwrap()["disabledMcpServers"],
+            serde_json::json!(["a", "b"]),
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// Re-enabling a server must DELETE the name, never leave a stale opt-out.
+    /// Red-proof: an early `if disabled.is_empty() { return }` (before the
+    /// mutation) leaves the old entry in place → this fails.
+    #[test]
+    fn set_project_disabled_mcps_empty_removes_the_key() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-reenable");
+        fs::create_dir_all(&folder).unwrap();
+        set_project_disabled_mcps(&target, &folder, &["playwright".to_string()]).unwrap();
+        // The project entry exists with the name…
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert_eq!(
+            project_entry(&json, &folder).unwrap()["disabledMcpServers"],
+            serde_json::json!(["playwright"]),
+        );
+
+        // …then re-enable (empty desired list) must REMOVE the key.
+        set_project_disabled_mcps(&target, &folder, &[]).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(
+            project_entry(&json, &folder)
+                .and_then(|e: &serde_json::Value| e.get("disabledMcpServers"))
+                .is_none(),
+            "re-enable must delete the stale opt-out: {}",
+            json,
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    /// An empty list with nothing to remove must not create `projects` (or the
+    /// file) — no noise in the user's file.
+    #[test]
+    fn set_project_disabled_mcps_empty_is_a_noop_when_nothing_to_clear() {
+        let target = tmp_target();
+        let folder = std::env::temp_dir().join("vct-proj-noop");
+        fs::create_dir_all(&folder).unwrap();
+
+        set_project_disabled_mcps(&target, &folder, &[]).unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(&target).unwrap_or_else(|_| "{}".to_string()),
+        )
+        .unwrap();
+        assert!(
+            json.get("projects").is_none(),
+            "no `projects` container may be created for an empty no-op: {}",
+            json,
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&folder).ok();
+    }
+
+    // ── v0.2.101: auto-scrub of deleted-MCP entries ──────────────────────
+
+    fn pseudo_venv_python(root: &Path) -> PathBuf {
+        let (sub, py) = if cfg!(target_os = "windows") {
+            ("Scripts", "python.exe")
+        } else {
+            ("bin", "python")
+        };
+        root.join(".venv").join(sub).join(py)
+    }
+
+    fn vco_search_entry(root: &Path) -> serde_json::Value {
+        serde_json::json!({
+            "type": "stdio",
+            "command": pseudo_venv_python(root).display().to_string(),
+            "args": [root.join("claude_mcp_servers/search_mcp/server.py").display().to_string()],
+        })
+    }
+
+    /// ACT: the ordinary registration pass removes a VCO-shaped orphaned
+    /// `search` entry (module deleted) and reports it once. Red-proof: drop
+    /// `auto_scrub` from the table / skip the scrub call → this fails.
+    #[test]
+    fn auto_scrub_removes_a_vco_shaped_deleted_mcp_entry() {
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "search": vco_search_entry(&root),
+                    "my-user-mcp": {"command": "/usr/bin/my-mcp"},
+                },
+                "numStartups": 5,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert_eq!(report.removed_deprecated, vec!["search".to_string()]);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(json["mcpServers"].get("search").is_none(), "{}", json);
+        // Unrelated keys survive; the defaults are still registered.
+        assert_eq!(json["mcpServers"]["my-user-mcp"]["command"], "/usr/bin/my-mcp");
+        assert_eq!(json["numStartups"], 5);
+        assert!(json["mcpServers"]["weaviate-kg"].is_object());
+
+        // Idempotent: a second pass reports nothing.
+        let second =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert!(
+            second.removed_deprecated.is_empty(),
+            "second run must remove nothing: {:?}",
+            second.removed_deprecated
+        );
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// LEAVE-ALONE: the diagram MCP entries (mermaid/excalidraw) are NOT
+    /// auto-scrubbed — owner ruling: an existing install keeps them.
+    #[test]
+    fn auto_scrub_leaves_diagram_mcp_entries_untouched() {
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+        let py = pseudo_venv_python(&root).display().to_string();
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {
+                    "mermaid": {"command": py, "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"]},
+                    "excalidraw": {"command": py, "args": ["-m", "claude_mcp_servers.wrappers.excalidraw_proxy"]},
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert!(report.removed_deprecated.is_empty(), "{:?}", report.removed_deprecated);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(json["mcpServers"]["mermaid"].is_object());
+        assert!(json["mcpServers"]["excalidraw"].is_object());
+
+        fs::remove_file(&target).ok();
+        fs::remove_dir_all(&root).ok();
+    }
+
+    /// LEAVE-ALONE: a user's OWN MCP named `search` (command outside
+    /// install_root) is never removed.
+    #[test]
+    fn auto_scrub_leaves_a_users_own_search_entry() {
+        let root = make_pseudo_install_root();
+        let target = tmp_target();
+        fs::write(
+            &target,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": {"search": {"command": "/usr/local/bin/my-search"}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let report =
+            register_default_orchestrator_mcps(&root, ServicePorts::default(), Some(&target), None)
+                .unwrap();
+        assert!(report.removed_deprecated.is_empty(), "{:?}", report.removed_deprecated);
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&target).unwrap()).unwrap();
+        assert!(json["mcpServers"]["search"].is_object());
 
         fs::remove_file(&target).ok();
         fs::remove_dir_all(&root).ok();

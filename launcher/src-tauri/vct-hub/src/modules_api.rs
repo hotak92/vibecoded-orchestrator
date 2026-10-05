@@ -1826,11 +1826,10 @@ mod tests {
         let _kc_lock = h1_lock();
         let guard = vct_launcher_core::test_env::state_dir_guard();
         // A module manifest that declares one setting — built from the
-        // bundled `vct-search.json` (which parses, pinned by
-        // `bundled_search_manifest_parses_cleanly`) with a `settings` entry
-        // and its own id, installed under the scratch state dir.
+        // bundled `vct-kg.json` (which parses) with a `settings` entry and
+        // its own id, installed under the scratch state dir.
         let mut manifest: serde_json::Value =
-            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-kg.json")).unwrap();
         manifest["id"] = serde_json::json!("vct-f43-probe");
         manifest["settings"] = serde_json::json!([
             {"key": "RL_RERANK_TOP_K", "type": "integer", "default": 10}
@@ -2016,7 +2015,7 @@ mod tests {
         let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
         let guard = vct_launcher_core::test_env::state_dir_guard();
         let mut manifest: serde_json::Value =
-            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-kg.json")).unwrap();
         manifest["id"] = serde_json::json!("vct-sec-probe");
         manifest["secrets"] = serde_json::json!([{ "key": "PROBE_TOKEN", "scope": "per-project" }]);
         let module_dir = guard.path().join("modules").join("vct-sec-probe");
@@ -2073,7 +2072,7 @@ mod tests {
         assert_eq!((pat.scope.as_str(), pat.module_id.as_str()), ("shared", "user"));
 
         let mut manifest: serde_json::Value =
-            serde_json::from_str(include_str!("../../../bundled_manifests/vct-search.json")).unwrap();
+            serde_json::from_str(include_str!("../../../bundled_manifests/vct-kg.json")).unwrap();
         manifest["id"] = serde_json::json!("vct-div-probe");
         manifest["secrets"] = serde_json::json!([{ "key": "DIV_TOKEN", "scope": "shared" }]);
         let module_dir = guard.path().join("modules").join("vct-div-probe");

@@ -728,7 +728,7 @@ def _ensure_claude_md_reminder(
 ) -> None:
     """Inject (or refresh) the reminder block in ``<folder>/CLAUDE.md``.
 
-    No-op if CLAUDE.md is missing — the project-bootstrapper owns CLAUDE.md
+    No-op if CLAUDE.md is missing — the project-bootstrapper skill owns CLAUDE.md
     creation, not the deferral writer. Best-effort: never raises into the
     caller (an install run shouldn't fail just because the user holds an
     exclusive lock on CLAUDE.md).

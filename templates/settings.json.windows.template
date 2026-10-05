@@ -16,8 +16,7 @@
       "Bash(mv *)",
       "Bash(cp *)",
       "Bash(git *)",
-      "mcp__weaviate-kg__*",
-      "mcp__search__*"
+      "mcp__weaviate-kg__*"
     ],
     "deny": [
       "Read(./.env)",

@@ -1750,7 +1750,11 @@ impl BundleMode {
 /// Cross-language pin: `vco_lib/self_install.py::root_bundle_argv` emits the
 /// SAME flag set for the root client (WP-1). The parity test
 /// `tests/test_v0285_install_parity.py` asserts the two stay in lockstep.
-fn build_bundle_argv(folder_str: &str, templates_str: &str, mode: BundleMode) -> Vec<String> {
+// v0.2.101 (L3 review SF-3): `pub(crate)` so `commands::packs_cmd` CALLS
+// this — the ONE owner of the install-bundle base argv — and appends the
+// pack flag instead of mirroring the base (a mirror would silently diverge
+// from every other bundle spawn on the next base change).
+pub(crate) fn build_bundle_argv(folder_str: &str, templates_str: &str, mode: BundleMode) -> Vec<String> {
     let mut argv: Vec<String> = vec![
         "-m".into(),
         "vco_lib.project_init".into(),

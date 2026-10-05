@@ -200,11 +200,29 @@
                       <span class="service-badge port">:{server.port}</span>
                     {/if}
                   </div>
-                  <label class="toggle-switch">
-                    <input type="checkbox" checked={server.enabled}
-                      onchange={(e) => toggleMcp(server.id, (e.target as HTMLInputElement).checked)} />
-                    <span class="toggle-slider"></span>
-                  </label>
+                  {#if server.configurable}
+                    <label class="toggle-switch">
+                      <input type="checkbox" checked={server.enabled}
+                        onchange={(e) => toggleMcp(server.id, (e.target as HTMLInputElement).checked)} />
+                      <span class="toggle-slider"></span>
+                    </label>
+                  {:else}
+                    <!-- SF-1 (v0.2.101): legacy wrapper rows get NO destructive
+                         global switch — the global toggle's OFF deregisters the
+                         entry (a one-way loss: ON is refused because registration
+                         was retired), so the switch renders INERT (disabled, no
+                         onchange) and the note names the channel that works: the
+                         per-project Permissions toggle (disabledMcpServers). -->
+                    <div class="legacy-mcp-wrap">
+                      <label class="toggle-switch"
+                        title="Global on/off is not available for this legacy entry">
+                        <input type="checkbox" checked={server.enabled} disabled
+                          data-testid={`mcp-legacy-switch-${server.id}`} />
+                        <span class="toggle-slider"></span>
+                      </label>
+                      <span class="legacy-mcp-note">Per-project toggle only — each project's Permissions tab</span>
+                    </div>
+                  {/if}
                 </div>
 
                 <!-- Settings (expandable) -->
@@ -419,6 +437,17 @@
   .toggle-switch input:checked + .toggle-slider { background: var(--color-teal); }
   .toggle-switch input:checked + .toggle-slider::before { transform: translateX(20px); }
   .toggle-switch input:disabled + .toggle-slider { opacity: 0.4; cursor: not-allowed; }
+
+  /* SF-1 (v0.2.101): legacy wrapper row — inert switch + note pointing at
+     the per-project Permissions toggle (the non-destructive channel). */
+  .legacy-mcp-wrap { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; }
+  .legacy-mcp-note {
+    font-size: 11px;
+    color: var(--color-muted);
+    max-width: 240px;
+    text-align: right;
+    line-height: 1.4;
+  }
 
   /* Settings panel */
   .settings-toggle {

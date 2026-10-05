@@ -1,9 +1,10 @@
 ---
 name: glm-reviewer
-description: Read-only review lane routed to GLM 5.3 via the local claude-gw gateway. THE review lane — use for substantive review rounds on real diffs (fix verification, adversarial review rounds, review-before-merge) that write one report. Not for edits (glm-implementer), research/surveys (glm-flash-researcher), or the final pre-tag adversarial ship-gate (Fable). Requires the model gateway.
+description: GLM 5.3 read-only review lane via the claude-gw gateway — THE lane for substantive rounds on real diffs; one report. Not edits (glm-implementer), research (glm-flash-researcher) or the pre-tag ship-gate (Fable). Needs the model gateway.
 model: claude-gw/glm-5.3[1m]
-effort: high
+effort: medium
 tools: Read, Grep, Glob, Bash, Write
+disallowedTools: mcp__vct-coordination__*
 ---
 
 You are a read-only reviewer. You may run read-only shell commands (grep, ls, git log/diff/show, cat) and

@@ -290,16 +290,53 @@ _PROJECT_HOOK_SCRIPT_RE = re.compile(
     r"\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$"
 )
 
+#: An INVOKED script under the project's ``.claude/scripts/`` (v0.2.101,
+#: NB-13) — the same relative / anchored spellings as the hook regex above.
+#: The subpath allows ``/`` segments and extension-less scripts
+#: (``kg-sync``, ``lib/vct_project_config.sh``, ``lib/vct_project_config.ps1``),
+#: so the group is the project-relative SUBPATH, not a basename — basenames
+#: collide across the script subfolders.
+_PROJECT_SCRIPT_RE = re.compile(
+    r"^(?:\./|\$CLAUDE_PROJECT_DIR/|\$\{CLAUDE_PROJECT_DIR\}/|\$\{CLAUDE_PROJECT_DIR:-\.\}/)?"
+    r"\.claude/scripts/([A-Za-z0-9][A-Za-z0-9._/-]*)$"
+)
+
+
+def _invoked_project_script(token: str) -> Optional[Tuple[str, str]]:
+    """``(identity, project-relative path)`` for an INVOKED project script
+    token, or ``None``.
+
+    * ``.claude/hooks/<basename>.{sh,ps1}`` → identity is the BASENAME
+      (``x.sh``) — the same key :func:`vco_lib.hook_relative_paths.relative_scripts`
+      returns for a hook and the same key the ``only=`` filter has always used.
+    * ``.claude/scripts/<subpath>`` (v0.2.101 NB-13) → identity is the
+      project-relative path (``.claude/scripts/kg-sync``), because a script
+      basename collides across subfolders.
+
+    The token must already be quote-stripped and ``\\`` → ``/`` normalised
+    (the caller's ``norm`` list); an anchored spelling resolves to the same
+    identity as its relative form, which is what makes the rewrite idempotent.
+    """
+    match = _PROJECT_HOOK_SCRIPT_RE.match(token)
+    if match is not None:
+        return match.group(1), f".claude/hooks/{match.group(1)}"
+    match = _PROJECT_SCRIPT_RE.match(token)
+    if match is not None:
+        relative = f".claude/scripts/{match.group(1)}"
+        return relative, relative
+    return None
+
 
 def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -> str:
-    """``command`` with every INVOKED project hook script anchored at the
-    project root, in the per-OS form VCO ships:
+    """``command`` with every INVOKED project script anchored at the project
+    root, in the per-OS form VCO ships:
 
-    * a ``.sh`` script → ``"${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/x.sh"``
+    * a ``.sh`` script (or an extension-less one, e.g. ``kg-sync``) →
+      ``"${CLAUDE_PROJECT_DIR:-.}/.claude/…"``
       (:data:`PROJECT_DIR_FALLBACK_PLACEHOLDER` — the POSIX ``:-`` default
       keeps the command resolving when Claude Code provides neither the
       placeholder substitution nor the exported variable);
-    * a ``.ps1`` script → ``"${CLAUDE_PROJECT_DIR}/.claude/hooks/x.ps1"``
+    * a ``.ps1`` script → ``"${CLAUDE_PROJECT_DIR}/.claude/…"``
       (:data:`PROJECT_DIR_PLACEHOLDER` — the exact placeholder, because
       ``:-`` is POSIX-only and breaks under the PowerShell shell fallback).
 
@@ -311,16 +348,31 @@ def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -
     anywhere; at the session's starting directory the two forms name the same
     file, so the rewrite changes nothing else.
 
+    Scope (v0.2.101, NB-13): TWO token shapes are anchored — an
+    ``.claude/hooks/<basename>`` hook and an ``.claude/scripts/<subpath>``
+    script. Both are PROJECT-relative paths that fail after a ``cd`` for the
+    same reason, and both are matched only at an invocation anchor.
+
     Only tokens at an invocation anchor (the same walk as
-    :func:`invoked_script_tokens`) are rewritten — a hook path that is an
-    ARGUMENT (``bash wrap.sh --target .claude/hooks/x.sh``) is left alone —
-    and everything else in the command (interpreter, flags, trailing
-    arguments, whitespace) is kept byte-for-byte. An already-anchored token in
-    EITHER spelling (exact placeholder or ``:-.`` fallback) is normalised to
-    the one per-OS quoted form, so the result is idempotent AND an install
-    migrated to the exact-placeholder Linux form earlier in the cycle is
-    rewritten to the fallback form, never duplicated. ``only`` limits the
-    rewrite to those script basenames (the hooks VCO ships).
+    :func:`invoked_script_tokens`) are rewritten — a path that is an ARGUMENT
+    (``bash wrap.sh --target .claude/hooks/x.sh``) is left alone — and
+    everything else in the command (interpreter, flags, trailing arguments,
+    whitespace) is kept byte-for-byte. An already-anchored token in EITHER
+    spelling (exact placeholder or ``:-.`` fallback) is normalised to the one
+    per-OS quoted form, so the result is idempotent AND an install migrated to
+    the exact-placeholder Linux form earlier in the cycle is rewritten to the
+    fallback form, never duplicated.
+
+    ``only`` limits the rewrite to those script IDENTITIES: a hook's identity
+    is its basename (``x.sh``), a script's identity is its project-relative
+    path (``.claude/scripts/kg-sync``) — exactly the values
+    :func:`vco_lib.hook_relative_paths.relative_scripts` returns. ``None``
+    anchors every project script (hook or ``.claude/scripts/``); that is the
+    shared :func:`vco_lib.hook_retirements.hook_command_key` path, where two
+    spellings of one registration must compare equal — including a
+    ``.claude/scripts/`` invocation a user rewrote with
+    ``python -m vco_lib.hook_relative_paths anchor`` while a launcher DB mirror
+    row still holds the old relative form.
     """
     if not isinstance(command, str) or not command:
         return command
@@ -330,12 +382,14 @@ def anchor_hook_command(command: str, *, only: Optional[Iterable[str]] = None) -
     norm = [t.replace("\\", "/").strip("\"'") for t in tokens]
     changed = False
     for index in _anchor_indices(norm):
-        match = _PROJECT_HOOK_SCRIPT_RE.match(norm[index])
-        if match is None or (allowed is not None and match.group(1) not in allowed):
+        found = _invoked_project_script(norm[index])
+        if found is None:
             continue
-        script = match.group(1)
-        form = PROJECT_DIR_PLACEHOLDER if script.endswith(".ps1") else PROJECT_DIR_FALLBACK_PLACEHOLDER
-        anchored = f'"{form}/.claude/hooks/{script}"'
+        identity, relative = found
+        if allowed is not None and identity not in allowed:
+            continue
+        form = PROJECT_DIR_PLACEHOLDER if relative.endswith(".ps1") else PROJECT_DIR_FALLBACK_PLACEHOLDER
+        anchored = f'"{form}/{relative}"'
         if tokens[index] != anchored:
             tokens[index] = anchored
             changed = True

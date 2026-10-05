@@ -15,7 +15,9 @@ This test ratchets the shipped surface so the ruling cannot silently drift:
 - every shipped agent declares ``medium`` except the ALLOW_HIGH allowlist
   (each entry carries the one-line reason it was deliberately kept at the
   ceiling — an entry without a real reason is exactly the drift this test
-  exists to catch);
+  exists to catch). The ratchet covers the default catalogue AND the members
+  of the opt-in packs (``templates/packs/``), which ship as surely as the
+  defaults do — a pack member is not a loophole;
 - ``templates/ORCHESTRATOR-CLAUDE.md.template`` documents the ``medium``
   default and does not regress to telling readers to brief ad-hoc agents at
   ``high`` by default.
@@ -28,6 +30,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 AGENTS_DIR = REPO_ROOT / "templates" / "agents"
 SKILLS_DIR = REPO_ROOT / "templates" / "skills"
+PACKS_DIR = REPO_ROOT / "templates" / "packs"
 ORCH_TEMPLATE = REPO_ROOT / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
 
 VALID_EFFORTS = {"low", "medium", "high"}
@@ -35,16 +38,14 @@ VALID_EFFORTS = {"low", "medium", "high"}
 # Agents deliberately kept at the `high` ceiling (genuinely hard-reasoning
 # roles only).  Keyed by frontmatter `name`, value = reason it stays at high.
 AGENTS_ALLOWED_HIGH: dict[str, str] = {
-    "deep-researcher": "sustained multi-source research synthesis",
     "sre-incident-responder": "live-incident debugging under time pressure",
-    "glm-reviewer": "adversarial review lane on real diffs",
 }
 
 # Skills deliberately kept at the `high` ceiling.  Keyed by skill dir name.
-SKILLS_ALLOWED_HIGH: dict[str, str] = {
-    "equation-check": "symbolic math verification (was xhigh before v0.2.97)",
-    "terraform-plan-reviewer": "cross-resource implication analysis at scale",
-}
+# Empty since v0.2.101: `equation-check` and `terraform-plan-reviewer` moved
+# into packs and were dropped to `medium` (owner R8), so no shipped skill
+# justifies `high`.
+SKILLS_ALLOWED_HIGH: dict[str, str] = {}
 
 
 def _frontmatter(path: Path) -> dict[str, str]:
@@ -65,15 +66,19 @@ def _frontmatter(path: Path) -> dict[str, str]:
 
 def _agent_definitions() -> list[Path]:
     # `_archive/` never materializes for users (see test_v0297_shipped_script_refs).
+    # Pack members ship only to a project that opts into the pack, but they are
+    # shipped definitions all the same — the ratchet covers them too.
     return sorted(
         p
-        for p in AGENTS_DIR.rglob("*.md")
+        for p in [*AGENTS_DIR.rglob("*.md"), *PACKS_DIR.glob("*/agents/*.md")]
         if "_archive" not in p.parts
     )
 
 
 def _skill_definitions() -> list[Path]:
-    return sorted(SKILLS_DIR.glob("*/SKILL.md"))
+    return sorted(
+        [*SKILLS_DIR.glob("*/SKILL.md"), *PACKS_DIR.glob("*/skills/*/SKILL.md")]
+    )
 
 
 def test_no_shipped_subagent_pins_xhigh_or_max() -> None:

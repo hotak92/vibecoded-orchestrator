@@ -290,7 +290,7 @@ jobs:
         #
         # v0.2.54 Track E amendment: scope comes from the repo-root
         # `pyrightconfig.json` — vco_lib/ + claude_mcp_servers/
-        # {weaviate_mcp,search_mcp,model_router}/ + .github/scripts are
+        # {weaviate_mcp,model_router}/ + .github/scripts are
         # gated at ZERO errors (repo-wide had 813 pre-existing errors
         # across 429 files, which is why the old swallow existed).
         #

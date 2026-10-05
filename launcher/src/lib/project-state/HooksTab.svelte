@@ -94,6 +94,10 @@
     hooks_inserted: number;
     mcp_servers_inserted: number;
     kg_access_rows_inserted: number;
+    // v0.2.101 (L3 review N-6): optional-in-older-commands prune counts —
+    // this tab's toast doesn't use them, the field keeps the mirror honest.
+    agents_pruned?: number;
+    skills_pruned?: number;
     warnings: string[];
   };
 

@@ -54,6 +54,10 @@
 //!     unregister's `.claude/env` + JSON env-block routing-key strip);
 //!   * `vco_lib.env_projection_check` — [`read_settings_env_blocks`];
 //!   * `vco_lib.hooks_settings` — [`list_settings_hooks`];
+//!   * `vco_lib.packs` — [`packs_status`] (v0.2.101: the packs catalogue
+//!     read behind the launcher's Packs tab; the pack TOGGLE is not a
+//!     bridge verb — it shells the ordinary `install-bundle` engine, see
+//!     `commands::packs_cmd`);
 //!   * `vco_lib.env_template` — [`apply_project_env_template`],
 //!     [`write_project_env_reference`], [`strip_project_env_keys`],
 //!     [`repair_project_env_kg`], [`sentinel_project_env_keys`] (the project
@@ -407,6 +411,61 @@ pub fn list_settings_hooks(
 /// The launcher-resolved service ports a project `.env`'s managed block
 /// renders (`ProjectEnvSettings`: app_state overrides / adopted services),
 /// forwarded to the Python resolver, whose own defaults are the stock ports.
+/// Wall-clock cap for one `vco_lib.packs status` spawn: the verb reads one
+/// committed toml + the project manifest — a fraction of a second. Past
+/// this the child is stuck.
+const PACKS_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// v0.2.101 (catalogue plan §3.6): the packs catalogue for one project —
+/// `python -m vco_lib.packs status --folder <path> --json`. The ONE home of
+/// this spawn (moved out of `commands::packs_cmd` per the L3 review's
+/// one-home rule for `-m vco_lib` verbs). Python is the SSOT — it reads
+/// `templates/packs/packs.toml` + the project manifest's `packs` map; Rust
+/// parses only the JSON. Returns the WHOLE `ok: true` reply
+/// (`{"ok": true, "packs": […]}`); the packs-specific shaping into
+/// `commands::packs_cmd::PackInfo` lives with the command, in the pure
+/// `parse_packs_status_reply` (the committed cross-lane fixture is
+/// `tests/fixtures/packs_status_contract.json` — lane L1's Python emitter
+/// tests against the same file). A refusal or crash is `Err` carrying the
+/// child's own message, prefixed "packs status".
+pub fn packs_status(root: &Path, project_folder: &Path) -> Result<serde_json::Value, String> {
+    let python = vco_lib_python()?;
+    let mut cmd = Command::new(&python).silent();
+    cmd.arg("-m")
+        .arg("vco_lib.packs")
+        .arg("status")
+        .arg("--folder")
+        .arg(project_folder)
+        .arg("--json");
+    reinject_minimal_env(&mut cmd);
+    cmd.current_dir(root);
+    let done = match vct_launcher_core::process::output_bounded(
+        &mut cmd,
+        None,
+        PACKS_STATUS_TIMEOUT,
+    ) {
+        Ok(done) => done,
+        Err(vct_launcher_core::process::BoundedError::Spawn(e)) => {
+            return Err(format!(
+                "packs status: spawn failed (python={}): {}",
+                python.display(),
+                e
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::TimedOut { after, stderr, .. }) => {
+            return Err(format!(
+                "packs status: timed out after {} s. stderr: {}",
+                after.as_secs(),
+                String::from_utf8_lossy(&stderr).trim()
+            ))
+        }
+        Err(vct_launcher_core::process::BoundedError::Wait(e)) => {
+            return Err(format!("packs status: wait failed: {}", e))
+        }
+    };
+    parse_ok_reply_named("packs status", &done.stdout, &done.stderr)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EnvTemplatePorts {
     pub weaviate: u16,
@@ -972,12 +1031,18 @@ fn list_at(reply: &serde_json::Value, field: &str) -> Vec<String> {
 /// the whole object; anything else → `Err` with the child's own message (a
 /// refusal names the file and why), or the raw output when it is not that
 /// shape (a crash before the emit is reported, never degraded).
-pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+///
+/// v0.2.101 (L3 review N-1): the messages name the CALLING verb via `what`
+/// so a packs-status failure does not read as a settings-editor failure in
+/// the user-facing toast. `parse_ok_reply` keeps the historical
+/// "settings editor" wording for every pre-existing caller.
+pub fn parse_ok_reply_named(what: &str, stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
     let out = String::from_utf8_lossy(stdout);
     let err = String::from_utf8_lossy(stderr);
     let parsed: serde_json::Value = serde_json::from_str(out.trim()).map_err(|e| {
         format!(
-            "settings editor produced unreadable output ({}). stdout: {} stderr: {}",
+            "{} produced unreadable output ({}). stdout: {} stderr: {}",
+            what,
             e,
             out.trim(),
             err.trim()
@@ -990,8 +1055,14 @@ pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value,
     let message = parsed
         .get("message")
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("the settings editor refused the write");
+        .unwrap_or("the child refused the write");
     Err(format!("{} ({})", message, code))
+}
+
+/// [`parse_ok_reply_named`] with the historical "settings editor" context —
+/// the wording every pre-existing caller's tests assert on.
+pub fn parse_ok_reply(stdout: &[u8], stderr: &[u8]) -> Result<serde_json::Value, String> {
+    parse_ok_reply_named("settings editor", stdout, stderr)
 }
 
 #[cfg(test)]

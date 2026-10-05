@@ -109,7 +109,7 @@ scores = ["5", "5", "5", "5", "8", "5", "6*", "7", "6*", "8", "8"]
 id = "qwen3.8-flash"
 model = "Qwen3.8-Flash"
 dagger = true
-reach_via = "qwen-flash-researcher / qwen-flash-sweeper / qwen-flash-implementer"
+reach_via = "qwen-flash-sweeper"
 providers = ["qwen"]
 scores = ["5*", "4", "4*", "4*", "7", "4", "8*", "7", "5*", "7", "9"]
 

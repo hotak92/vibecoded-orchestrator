@@ -102,9 +102,14 @@ fn accessors_match_on_disk_table() {
 #[test]
 fn table_pins_known_values() {
     let disk = load_disk_table();
+    // v0.2.101 (owner ruling, PLAN-V0300 item 15): `search` was deleted
+    // and the diagram wrappers retired from default registration — the
+    // pin is the two-name truth. (This integration test was missed when
+    // the lib-side pins were updated; the five-name pin failed every
+    // `test-keychain-safe.sh --offline` run since.)
     assert_eq!(
         disk.default_mcp_entry_names,
-        vec!["weaviate-kg", "search", "playwright", "mermaid", "excalidraw"],
+        vec!["weaviate-kg", "playwright"],
         "the builder-composed default entry names must be pinned"
     );
     assert!(

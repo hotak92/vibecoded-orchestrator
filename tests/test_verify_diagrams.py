@@ -336,12 +336,39 @@ def test_mcp_wrappers_registered(claude_json):
     assert result.status == vd.STATUS_OK
 
 
-def test_mcp_wrappers_missing(tmp_path, monkeypatch):
+def test_mcp_wrappers_absent_is_ok_by_design(tmp_path, monkeypatch):
+    """v0.2.101: fresh installs never register the wrapper MCPs, so their
+    ABSENCE is a PASS — and no fix hint may tell the user to re-register
+    them (install.py cannot any more)."""
     p = tmp_path / ".claude.json"
     p.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
     monkeypatch.setattr(vd, "_claude_json_path", lambda: p)
     result = vd._check_mcp_wrappers()
-    assert result.status == vd.STATUS_FAIL
+    assert result.status == vd.STATUS_OK
+    assert "optional since v0.2.101" in result.detail
+    assert not result.fix_hint or "re-register" not in result.fix_hint
+
+
+def test_mcp_wrappers_one_present_one_absent_is_ok(tmp_path, monkeypatch):
+    """A legacy install that kept exactly one wrapper entry: the present one
+    is verified, the absent one is reported as optional — not a failure."""
+    p = tmp_path / ".claude.json"
+    p.write_text(
+        json.dumps(
+            {
+                "mcpServers": {
+                    "mermaid": {
+                        "command": "python",
+                        "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+                    },
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(vd, "_claude_json_path", lambda: p)
+    result = vd._check_mcp_wrappers()
+    assert result.status == vd.STATUS_OK
     assert "mermaid" in result.detail
     assert "excalidraw" in result.detail
 
@@ -372,6 +399,9 @@ def test_mcp_wrappers_wrong_module(tmp_path, monkeypatch):
     result = vd._check_mcp_wrappers()
     assert result.status == vd.STATUS_FAIL
     assert "mermaid" in result.detail
+    # v0.2.101: the remedy must not tell the user to re-run install.py —
+    # the ordinary install never registers the wrapper MCPs any more.
+    assert "install.py" not in (result.fix_hint or "")
 
 
 def test_mcp_wrappers_json_absent(tmp_path, monkeypatch):

@@ -4,7 +4,6 @@
   import { toast } from '$lib/stores/toast';
   import type {
     ProjectPermission,
-    McpToolGrant,
   } from '$lib/types/project-state';
   import Dropdown from '$lib/components/Dropdown.svelte';
 
@@ -89,144 +88,16 @@
     }
   }
 
-  // ─── MCP Tools sub-section (diagrams-integration plan Phase 1 item 7) ──
+  // ─── (v0.2.101) MCP Tools sub-section REMOVED ─────────────────────────
   //
-  // Per-tool allowlist surface: for each MCP server registered for this
-  // project, render a collapsible group showing per-tool enabled/disabled
-  // toggles. Backed by `project_mcp_tool_grants` (Phase 1.1 DB migration).
-  //
-  // Decision recap (plan §3 Phase 1.2): we ship per-tool granularity for
-  // all MCPs in Phase 4, but Phase 1 only needs the Mermaid wrapper's
-  // tools controllable. The UI generalises from the start so Phase 4
-  // doesn't reshape this section — just adds rows for more MCPs.
-  //
-  // Default state (no rows in DB for an MCP): all tools enabled. The
-  // "Customize" button populates the table with all-enabled rows so the
-  // user can then toggle individual tools off.
-
-  type McpInfo = {
-    mcp_name: string;
-    project_enabled: boolean;
-    explicit: boolean;
-  };
-  type McpToolsGroup = {
-    info: McpInfo;
-    expanded: boolean;
-    loading: boolean;
-    loaded: boolean;
-    customized: boolean; // true iff any row exists in project_mcp_tool_grants
-    tools: McpToolGrant[];
-  };
-  let mcpToolGroups = $state<McpToolsGroup[]>([]);
-
-  // v0.2.35 Agent L fix (a): atomic MCPs (weaviate-kg / search / playwright)
-  // ship no `tool_allowlist` — they're on/off-only, not per-tool gated. The
-  // generic MCP Tools section rendered an empty "No tools exposed" placeholder
-  // for them which looked like a bug. We now filter atomic MCPs out of the
-  // per-tool section entirely (they remain in the MCP servers toggle table
-  // above).
-  //
-  // The frontend mirrors the Rust-side `fallback_default_allowlist` in
-  // `launcher/src-tauri/src/commands/diagrams_cmd.rs` — see the integration
-  // test `fallback_default_allowlist_matches_hub_constants` for the sync
-  // contract with `vct-hub`. If new wrapper MCPs ship with default tool
-  // allowlists, add their IDs here.
-  const PER_TOOL_CAPABLE_MCPS = new Set(['mermaid', 'excalidraw']);
-
-  async function loadMcpToolGroups() {
-    // Reuse the same MCP list that drives the per-server toggle table
-    // above. Derive a thin Info[] from `mcpRows` once it's loaded.
-    if (!mcpRows.length) {
-      mcpToolGroups = [];
-      return;
-    }
-    // Filter to per-tool-capable MCPs only (fix (a) above). Atomic MCPs
-    // still appear in the MCP servers section above with on/off toggles.
-    mcpToolGroups = mcpRows
-      .filter((row) => PER_TOOL_CAPABLE_MCPS.has(row.id))
-      .map((row) => ({
-        info: {
-          mcp_name: row.id,
-          project_enabled: row.project_enabled,
-          explicit: row.explicit,
-        },
-        expanded: false,
-        loading: false,
-        loaded: false,
-        customized: false,
-        tools: [],
-      }));
-  }
-
-  async function expandMcpToolGroup(group: McpToolsGroup) {
-    group.expanded = !group.expanded;
-    if (!group.expanded || group.loaded) return;
-    group.loading = true;
-    try {
-      const tools = await invoke<McpToolGrant[]>('list_project_mcp_tools', {
-        projectId,
-        mcpName: group.info.mcp_name,
-      });
-      group.tools = tools;
-      group.customized = tools.length > 0;
-      group.loaded = true;
-    } catch (e) {
-      // Defensive — `list_project_mcp_tools` is wired since v0.2.33,
-      // so this branch only fires on a real Tauri-IPC error (DB lock,
-      // schema migration mid-flight). No toast: each MCP would fire
-      // its own and the user can't act on the failure anyway.
-      console.warn('[permissions] list_project_mcp_tools failed:', e);
-      group.tools = [];
-      group.customized = false;
-      group.loaded = true;
-    } finally {
-      group.loading = false;
-    }
-  }
-
-  async function toggleMcpTool(group: McpToolsGroup, tool: McpToolGrant) {
-    const next = !tool.enabled;
-    const prev = tool.enabled;
-    tool.enabled = next; // optimistic
-    try {
-      await invoke('set_project_mcp_tool_enabled', {
-        projectId,
-        mcpName: group.info.mcp_name,
-        toolName: tool.tool_name,
-        enabled: next,
-      });
-      group.customized = true;
-    } catch (e) {
-      toast.error(e);
-      tool.enabled = prev; // revert
-    }
-  }
-
-  async function customizeMcpToolGroup(group: McpToolsGroup) {
-    // "Customize" pre-populates the grant table with all-enabled rows
-    // by calling the backend's seed helper. From there the user can
-    // toggle off the ones they don't want.
-    group.loading = true;
-    try {
-      const tools = await invoke<McpToolGrant[]>('seed_project_mcp_tool_grants', {
-        projectId,
-        mcpName: group.info.mcp_name,
-      });
-      group.tools = tools;
-      group.customized = true;
-    } catch (e) {
-      toast.error(e);
-    } finally {
-      group.loading = false;
-    }
-  }
-
-  function enabledCount(group: McpToolsGroup): string {
-    if (!group.loaded) return '?';
-    if (!group.customized) return 'all';
-    const on = group.tools.filter((t) => t.enabled).length;
-    return `${on}/${group.tools.length}`;
-  }
+  // The per-tool allowlist UI existed for the mermaid/excalidraw wrapper
+  // MCPs, which VCO no longer registers by default. The shipped catalog has
+  // no per-tool-capable MCP, so the section rendered an empty placeholder on
+  // every fresh install. The wrapper modules still ship — an install that
+  // already has the entry keeps working, filtered by the hub's tool-grant
+  // route with its defaults — but VCO no longer offers a per-tool editor for
+  // a retired MCP. The per-SERVER on/off toggle table above stays (it is
+  // generic and serves the servers VCO does register).
 
   const KIND_HELP: Record<string, string> = {
     write_scope: 'Glob the agent is allowed to write to (e.g. src/**).',
@@ -299,14 +170,6 @@
       void loadMcp();
     }
   });
-  // Re-derive the per-MCP tool-grant groups whenever the MCP server list
-  // refreshes. Cheap (just builds metadata; tools are lazy-loaded on
-  // expand) so safe to run on every refresh.
-  $effect(() => {
-    if (mcpRows.length >= 0) {
-      void loadMcpToolGroups();
-    }
-  });
 </script>
 
 <section class="ps-tab">
@@ -376,102 +239,12 @@
       </table>
       <p class="ps-mcp-hint">
         Toggling here flips a row in <code>project_permissions</code> with
-        <code>kind=mcp_server</code>. The launcher's env-writer mirrors this
-        into <code>.claude/settings.json::disabledMcpjsonServers</code> so
-        Claude Code skips spawning the server in this project. Default state
-        (no row) is <em>enabled</em>.
-      </p>
-    {/if}
-  </div>
-
-  <!--
-    diagrams-integration plan Phase 1 item 7: per-MCP tool grants.
-    Each collapsible group shows "<enabled>/<total>" once expanded; a
-    project that has never customised the allowlist for an MCP shows
-    "all" + a Customize button (pre-populates an all-enabled grant
-    table the user can then trim).
-  -->
-  <div class="ps-mcp-tools-section">
-    <h4 class="ps-group-h">MCP Tools <small>(per-MCP allowlist)</small></h4>
-    {#if mcpLoading}
-      <p class="ps-empty">Loading MCP tools…</p>
-    {:else if mcpToolGroups.length === 0}
-      <p class="ps-empty">
-        No per-tool-gated MCPs registered. Atomic MCPs (e.g.
-        <code>weaviate-kg</code>, <code>search</code>, <code>playwright</code>)
-        are controlled by the on/off toggle above.
-      </p>
-    {:else}
-      <ul class="ps-mcp-tool-groups">
-        {#each mcpToolGroups as group (group.info.mcp_name)}
-          <li class="ps-mcp-tool-group">
-            <button
-              class="ps-mcp-tool-summary"
-              onclick={() => expandMcpToolGroup(group)}
-              aria-expanded={group.expanded}
-              aria-controls="mcp-tools-{group.info.mcp_name}"
-            >
-              <span class="ps-mcp-tool-chevron" aria-hidden="true">
-                {group.expanded ? '▾' : '▸'}
-              </span>
-              <code class="ps-mcp-tool-name">{group.info.mcp_name}</code>
-              <span class="ps-mcp-tool-count">
-                {enabledCount(group)} tools enabled
-              </span>
-              {#if !group.info.project_enabled}
-                <span class="ps-tag ps-tag-off" title="The MCP server itself is disabled for this project; per-tool grants have no effect until you re-enable the server above.">server off</span>
-              {/if}
-            </button>
-            {#if group.expanded}
-              <div
-                id="mcp-tools-{group.info.mcp_name}"
-                class="ps-mcp-tool-body"
-              >
-                {#if group.loading}
-                  <p class="ps-empty">Loading tools…</p>
-                {:else if !group.loaded}
-                  <p class="ps-empty">Failed to load tools.</p>
-                {:else if !group.customized}
-                  <p class="ps-mcp-tool-default">
-                    Using defaults: <strong>all tools enabled</strong>.
-                  </p>
-                  <button class="ps-btn-primary" onclick={() => customizeMcpToolGroup(group)}>
-                    Customize
-                  </button>
-                {:else if group.tools.length === 0}
-                  <p class="ps-empty">No tools exposed by this MCP.</p>
-                {:else}
-                  <ul class="ps-mcp-tool-grid" role="list">
-                    {#each group.tools as tool (tool.tool_name)}
-                      <li class="ps-mcp-tool-cell">
-                        <label
-                          class="ps-mcp-tool-label"
-                          title={tool.description ?? '(no description)'}
-                        >
-                          <input
-                            type="checkbox"
-                            checked={tool.enabled}
-                            disabled={!group.info.project_enabled}
-                            onchange={() => toggleMcpTool(group, tool)}
-                            aria-label="{tool.tool_name} {tool.enabled ? 'enabled' : 'disabled'}"
-                          />
-                          <code>{tool.tool_name}</code>
-                          <span class="ps-mcp-tool-help" aria-hidden="true">?</span>
-                        </label>
-                      </li>
-                    {/each}
-                  </ul>
-                {/if}
-              </div>
-            {/if}
-          </li>
-        {/each}
-      </ul>
-      <p class="ps-mcp-hint">
-        Per-tool toggles flip rows in
-        <code>project_mcp_tool_grants</code>. Wrapper MCPs read these on
-        each <code>tools/list</code> request and filter the response — the
-        upstream MCP never sees the call for disabled tools.
+        <code>kind=mcp_server</code> and mirrors the project's disabled set
+        into <code>~/.claude.json</code> →
+        <code>projects[&lt;this project&gt;].disabledMcpServers</code> — the
+        channel Claude Code honours for user-scope servers, so it stops
+        spawning the server in this project. Default state (no row) is
+        <em>enabled</em>.
       </p>
     {/if}
   </div>
@@ -577,58 +350,4 @@
   .ps-toggle input:checked + .ps-toggle-slider { background: rgb(0,191,166); }
   .ps-toggle input:checked + .ps-toggle-slider::before { transform: translateX(18px); }
   .ps-toggle input:disabled + .ps-toggle-slider { opacity: 0.4; cursor: not-allowed; }
-
-  /* MCP Tools sub-section (diagrams-integration plan Phase 1 item 7). */
-  .ps-mcp-tools-section { margin-bottom: 20px; }
-  .ps-mcp-tool-groups { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
-  .ps-mcp-tool-group {
-    background: rgba(255,255,255,0.02);
-    border: 1px solid rgba(255,255,255,0.06);
-    border-radius: 4px;
-  }
-  .ps-mcp-tool-summary {
-    width: 100%;
-    background: none;
-    border: none;
-    color: inherit;
-    padding: 8px 12px;
-    cursor: pointer;
-    display: flex;
-    align-items: center;
-    gap: 10px;
-    font-size: 12px;
-    text-align: left;
-  }
-  .ps-mcp-tool-summary:hover { background: rgba(255,255,255,0.04); }
-  .ps-mcp-tool-chevron { color: #888; width: 12px; display: inline-block; }
-  .ps-mcp-tool-name { font-family: ui-monospace, monospace; font-size: 12px; flex: 1; }
-  .ps-mcp-tool-count { color: #888; font-size: 11px; }
-  .ps-mcp-tool-body {
-    padding: 10px 12px 12px;
-    border-top: 1px solid rgba(255,255,255,0.04);
-  }
-  .ps-mcp-tool-default { font-size: 12px; color: #aaa; margin: 0 0 8px; }
-  .ps-mcp-tool-grid {
-    list-style: none; margin: 0; padding: 0;
-    display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
-    gap: 6px;
-  }
-  .ps-mcp-tool-cell { display: flex; }
-  .ps-mcp-tool-label {
-    display: flex; align-items: center; gap: 6px;
-    padding: 4px 6px;
-    border-radius: 3px;
-    cursor: pointer;
-    font-size: 11px;
-    width: 100%;
-  }
-  .ps-mcp-tool-label:hover { background: rgba(255,255,255,0.03); }
-  .ps-mcp-tool-label code { font-family: ui-monospace, monospace; font-size: 11px; flex: 1; }
-  .ps-mcp-tool-help {
-    color: #666; font-size: 10px;
-    border: 1px solid #444; border-radius: 50%;
-    width: 14px; height: 14px;
-    display: inline-flex; align-items: center; justify-content: center;
-    cursor: help;
-  }
 </style>

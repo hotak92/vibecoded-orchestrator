@@ -24,6 +24,7 @@ The fail-without-fix pins here (PIN-R1/R2/R3) were RED on the pre-v0.2.85 tree:
 """
 from __future__ import annotations
 
+import argparse
 import ast
 import json
 import shutil
@@ -59,6 +60,7 @@ def _stage_root() -> Path:
     ``--folder <root> --orchestrator-root <root> --project-folder <root>``.
     """
     tmp = Path(tempfile.mkdtemp(prefix="v0285-root-deleg-"))
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
     make_fake_orchestrator(tmp)
     return tmp
 
@@ -96,7 +98,7 @@ class PinR1ManifestClobberTests(unittest.TestCase):
         shutil.rmtree(str(self.root), ignore_errors=True)
 
     def test_agents_manifest_entry_survives_root_update(self):
-        # Fresh install → manifest tracks .claude/agents/coder.md.
+        # Fresh install → manifest tracks .claude/agents/example-agent.md.
         self_install.run_root_bundle_install(self.root, update_mode=False)
         files = _manifest(self.root).get("files", {})
         agent_keys = [k for k in files if "agents" in k]
@@ -125,20 +127,20 @@ class PinR1ManifestClobberTests(unittest.TestCase):
         man = _manifest(self.root)
         # Inject a Windows-shaped (backslash) agents key that the bundle path
         # did not write (simulating a manifest authored on Windows).
-        win_key = ".claude\\agents\\coder.md"
+        win_key = ".claude\\agents\\example-agent.md"
         man.setdefault("files", {})[win_key] = {"sha256": "deadbeef", "source": ""}
         _write_manifest(self.root, man)
 
         self_install.run_root_bundle_install(self.root, update_mode=True)
         files_after = _manifest(self.root).get("files", {})
-        # The bundle writer keys by its own (host-OS) path for coder.md; the
-        # foreign backslash key must not be *actively deleted* by a
-        # hooks/scripts/settings-only rebuild. Either the host-OS coder.md key
-        # is present OR the backslash key was carried — the F-NEW-1 clobber
+        # The bundle writer keys by its own (host-OS) path for example-agent.md;
+        # the foreign backslash key must not be *actively deleted* by a
+        # hooks/scripts/settings-only rebuild. Either the host-OS example-agent.md
+        # key is present OR the backslash key was carried — the F-NEW-1 clobber
         # would have wiped BOTH under the old writer.
         self.assertTrue(
-            any("agents" in k and "coder.md" in k for k in files_after),
-            "no agents/coder.md manifest entry survived the root update "
+            any("agents" in k and "example-agent.md" in k for k in files_after),
+            "no agents/example-agent.md manifest entry survived the root update "
             "(F-NEW-1 clobber would drop every agents entry)",
         )
 
@@ -382,7 +384,9 @@ class LeaveAloneBatteryTests(unittest.TestCase):
         self.assertEqual(man_after[hook_rel], man_before[hook_rel],
                          "carried-forward manifest entry must be byte-identical")
         # (4) agents still install (were not skipped).
-        self.assertTrue((self.root / ".claude" / "agents" / "coder.md").exists())
+        self.assertTrue(
+            (self.root / ".claude" / "agents" / "example-agent.md").exists()
+        )
 
     def test_no_hooks_flag_still_lands_hooks_byte_parity(self):
         """--no-hooks is an HONEST no-op (D5): hooks still install byte-for-
@@ -420,12 +424,12 @@ class LeaveAloneBatteryTests(unittest.TestCase):
         NO backup. D4: manifest absent ⇒ first-install."""
         # Pre-create a divergent file at a shipped destination BEFORE any
         # install (so no manifest exists → update_mode=False).
-        pre = self.root / ".claude" / "agents" / "coder.md"
+        pre = self.root / ".claude" / "agents" / "example-agent.md"
         pre.parent.mkdir(parents=True, exist_ok=True)
         pre.write_text("PRE-EXISTING USER FILE\n", encoding="utf-8")
 
         res = self_install.run_root_bundle_install(self.root, update_mode=False)
-        rel = ".claude/agents/coder.md"
+        rel = ".claude/agents/example-agent.md"
         self.assertIn(rel, res["actions"].get("skip-existing", []),
                       "pre-existing shipped-dest file must be skip-existing")
         self.assertNotIn(rel, res["actions"].get("adopt", []),
@@ -689,14 +693,15 @@ class D4RealRuleResolutionTests(unittest.TestCase):
             (self.tmp / ".claude" / ".vco-manifest.json").write_text(
                 '{"files": {}}', encoding="utf-8")
 
-        class _Args:
-            update = arg_update
-            skip_materialize_claude_dir = False
-            with_agents = True
-            with_skills = True
-            with_hooks = True
-            force_materialize_claude_dir = False
-            adopt_project_dry_run = False
+        args = argparse.Namespace(
+            update=arg_update,
+            skip_materialize_claude_dir=False,
+            with_agents=True,
+            with_skills=True,
+            with_hooks=True,
+            force_materialize_claude_dir=False,
+            adopt_project_dry_run=False,
+        )
 
         captured: dict = {}
 
@@ -714,7 +719,7 @@ class D4RealRuleResolutionTests(unittest.TestCase):
                 mock.patch.object(self._install,
                                   "_materialize_orchestrator_self_claude_md",
                                   lambda *_a, **_k: None):
-            self._install._run_root_claude_dir_install(_Args())
+            self._install._run_root_claude_dir_install(args)
         return captured["update_mode"]
 
     def test_fresh_tree_no_manifest_no_update_flag_is_first_install(self):

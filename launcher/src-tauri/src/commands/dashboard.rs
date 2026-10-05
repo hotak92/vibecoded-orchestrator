@@ -297,10 +297,92 @@ async fn update_orchestrator_setting_inner(
 // MCP server management
 // ---------------------------------------------------------------------------
 
+/// The retired diagram-wrapper MCP ids (v0.2.101): no longer registered on
+/// install, but an install that already has an entry KEEPS it (owner
+/// ruling). Rows for them are appended to the server list ONLY when the
+/// entry is actually registered, so the per-project Permissions toggle
+/// keeps working on legacy installs and fresh installs see nothing.
+pub(crate) const LEGACY_WRAPPER_MCP_IDS: [&str; 2] = ["mermaid", "excalidraw"];
+
+/// Testable core of [`get_mcp_servers`]: the catalog rows plus a read-only
+/// row per LEGACY wrapper id that is registered in `~/.claude.json` but
+/// absent from the catalog (v0.2.101). Pure — no filesystem.
+pub(crate) fn with_legacy_wrapper_rows(
+    catalog: Vec<McpServerConfig>,
+    registered: &[String],
+) -> Vec<McpServerConfig> {
+    let mut servers = catalog;
+    for id in LEGACY_WRAPPER_MCP_IDS {
+        if !registered.iter().any(|n| n == id) {
+            continue; // not on this install — nothing to show
+        }
+        if servers.iter().any(|s| s.id == id) {
+            continue; // catalog still lists it — no duplicate row
+        }
+        servers.push(McpServerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: "Legacy diagram wrapper MCP kept from a pre-v0.2.101 \
+                install (not re-registered). Per-project on/off lives in the \
+                project's Permissions tab."
+                .to_string(),
+            enabled: true,
+            command: String::new(),
+            args: Vec::new(),
+            env: std::collections::HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: false,
+            settings: std::collections::HashMap::new(),
+        });
+    }
+    servers
+}
+
+/// The registered legacy wrapper names for THIS machine (empty on a fresh
+/// install or when `~/.claude.json` cannot be read — the list is then just
+/// the catalog). Separate from the pure core so tests need no filesystem.
+fn registered_names_here() -> Vec<String> {
+    crate::mcp_registration::registered_mcp_names(
+        &crate::mcp_registration::user_claude_json(),
+    )
+    .unwrap_or_default()
+}
+
 /// Get all MCP server configurations.
 #[command]
 pub fn get_mcp_servers() -> Vec<McpServerConfig> {
-    load_config().mcp_servers
+    with_legacy_wrapper_rows(load_config().mcp_servers, &registered_names_here())
+}
+
+/// SF-1 (v0.2.101): the GLOBAL toggle must never be a one-way loss for a
+/// legacy wrapper entry. Disable used to deregister it from
+/// `~/.claude.json` (irreversible from the GUI), while enable is refused
+/// because the canonical registration builder retired the wrappers — so
+/// OFF destroyed the entry and ON was an error. Both directions are now
+/// refused with the truthful remedy: the non-destructive channel for
+/// these rows is the per-project Permissions toggle, which writes the
+/// project's `disabledMcpServers` and needs no global registration
+/// change. Pure — no filesystem — so tests need no `~/.claude.json`.
+///
+/// Mirrors the row condition in `with_legacy_wrapper_rows`: an id that is
+/// REGISTERED but ABSENT from the catalog.
+pub(crate) fn legacy_wrapper_toggle_refusal(
+    mcp_id: &str,
+    in_catalog: bool,
+    registered: bool,
+) -> Option<String> {
+    if in_catalog || !registered {
+        return None;
+    }
+    Some(format!(
+        "MCP server '{}' is a legacy diagram-wrapper entry kept from a pre-v0.2.101 \
+         install (registration retired in v0.2.101); the launcher does not modify \
+         its global registration. Turn it off per project instead: the project's \
+         Permissions tab → MCP servers (stored as `disabledMcpServers` under this \
+         project's entry in ~/.claude.json)",
+        mcp_id
+    ))
 }
 
 /// Toggle an MCP server on/off.
@@ -329,6 +411,23 @@ async fn toggle_mcp_server_inner(mcp_id: String, enabled: bool, tier: &str) -> R
     // Cloned up front: composing the canonical bundled entry below needs
     // the install path while `server` mutably borrows `config`.
     let install_path = config.install_path.clone();
+
+    // v0.2.101: a legacy wrapper entry that is registered but no longer in
+    // the catalog (appended to `get_mcp_servers` for the per-project
+    // toggle) has no catalog row to flip. SF-1 (v0.2.101 re-review): BOTH
+    // directions are refused — disable used to deregister the entry, a
+    // one-way loss since enable cannot re-register it (the canonical
+    // entry builder retired the wrappers). The owner ruling is that an
+    // install which kept the entry KEEPS it; the launcher never makes
+    // keeping it a one-way loss. The per-project `disabledMcpServers`
+    // toggle is the non-destructive off-switch for these rows.
+    if let Some(err) = legacy_wrapper_toggle_refusal(
+        &mcp_id,
+        config.mcp_servers.iter().any(|s| s.id == mcp_id),
+        registered_names_here().iter().any(|n| *n == mcp_id),
+    ) {
+        return Err(err);
+    }
 
     let server = config.mcp_servers.iter_mut()
         .find(|s| s.id == mcp_id)
@@ -817,6 +916,138 @@ mod tests {
     #[allow(dead_code)]
     static SERIALIZE: Mutex<()> = Mutex::new(());
 
+    fn catalog_row(id: &str) -> McpServerConfig {
+        McpServerConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            enabled: true,
+            command: "python".into(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            min_tier: OrchestratorTier::Free,
+            port: None,
+            configurable: true,
+            settings: HashMap::new(),
+        }
+    }
+
+    /// v0.2.101 (owner ruling): a legacy install that still carries a
+    /// diagram-wrapper entry keeps its row in the server list — the
+    /// Permissions tab builds the per-project toggle table from it.
+    /// Red-proof: drop the `with_legacy_wrapper_rows` append (or gate it on
+    /// something other than registration) → this fails.
+    #[test]
+    fn legacy_wrapper_rows_appear_only_when_registered() {
+        // Registered legacy wrapper → appended after the catalog rows.
+        let out = with_legacy_wrapper_rows(
+            vec![catalog_row("weaviate-kg")],
+            &["weaviate-kg".to_string(), "mermaid".to_string()],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[1].id, "mermaid");
+        assert!(!out[1].configurable, "no catalog row backs this toggle");
+
+        // Nothing registered → catalog only (fresh install sees nothing).
+        let out = with_legacy_wrapper_rows(vec![catalog_row("weaviate-kg")], &[]);
+        assert_eq!(out.len(), 1);
+
+        // Catalog already lists the id → no duplicate row.
+        let out = with_legacy_wrapper_rows(
+            vec![catalog_row("weaviate-kg"), catalog_row("excalidraw")],
+            &["excalidraw".to_string()],
+        );
+        assert_eq!(out.len(), 2);
+    }
+
+    /// SF-1 (v0.2.101 re-review): pure core — the refusal fires ONLY for
+    /// registered-but-uncataloged (legacy wrapper) ids.
+    /// Red-proof: restore the old disable-arms-deregister behavior (or
+    /// drop the refusal) → this fails.
+    #[test]
+    fn legacy_wrapper_toggle_refusal_only_for_registered_uncataloged() {
+        // Registered + not in catalog → refused.
+        let err = legacy_wrapper_toggle_refusal("mermaid", false, true)
+            .expect("legacy wrapper toggle must be refused");
+        assert!(err.contains("legacy"), "error names what the row is: {err}");
+        assert!(
+            err.contains("disabledMcpServers"),
+            "error names the per-project channel that works: {err}"
+        );
+
+        // In the catalog (normal bundled row) → no refusal, both directions.
+        assert!(legacy_wrapper_toggle_refusal("mermaid", true, true).is_none());
+        // Not registered anywhere → falls through to "not found" below.
+        assert!(legacy_wrapper_toggle_refusal("mermaid", false, false).is_none());
+    }
+
+    /// SF-1 (v0.2.101 re-review): the global toggle must never make a
+    /// legacy wrapper entry a one-way loss. Disable used to DEREGISTER the
+    /// entry from ~/.claude.json (irreversible: enable is refused because
+    /// the canonical builder retired the wrappers). Post-fix: BOTH
+    /// directions are refused and the ~/.claude.json entry is untouched.
+    /// Red-proof: re-arm the `deregister_mcp` call on disable → this
+    /// fails on the "entry untouched" assertion.
+    #[test]
+    fn test_toggle_mcp_server_refuses_legacy_wrapper_both_directions_entry_untouched() {
+        let (home, _guard) = setup_temp_env();
+        seed_default_config(&home);
+
+        // Pre-seed ~/.claude.json with a legacy mermaid entry (a
+        // pre-v0.2.101 install that kept its wrapper registration).
+        let claude_json = home.join(".claude.json");
+        let seeded_entry = serde_json::json!({
+            "type": "stdio",
+            "command": "python",
+            "args": ["-m", "claude_mcp_servers.wrappers.mermaid_proxy"],
+            "env": {}
+        });
+        std::fs::write(
+            &claude_json,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "mcpServers": { "mermaid": seeded_entry }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        // Disable: refused, entry untouched.
+        let err = rt().block_on(async {
+            toggle_mcp_server_inner("mermaid".to_string(), false, "free").await
+        })
+        .expect_err("legacy wrapper disable must be refused");
+        assert!(err.contains("legacy diagram-wrapper entry"), "got: {err}");
+        assert!(
+            err.contains("disabledMcpServers"),
+            "error must name the per-project channel: {err}"
+        );
+        let cj = read_claude_json(&home);
+        assert_eq!(
+            cj["mcpServers"].get("mermaid"),
+            Some(&seeded_entry),
+            "legacy entry must be untouched in ~/.claude.json, got: {}",
+            cj["mcpServers"]
+        );
+
+        // Enable: refused too (no canonical builder for it any more).
+        let err = rt().block_on(async {
+            toggle_mcp_server_inner("mermaid".to_string(), true, "free").await
+        })
+        .expect_err("legacy wrapper enable must be refused");
+        assert!(err.contains("legacy diagram-wrapper entry"), "got: {err}");
+        assert!(
+            err.contains("disabledMcpServers"),
+            "enable refusal must also name the per-project channel: {err}"
+        );
+        let cj = read_claude_json(&home);
+        assert_eq!(
+            cj["mcpServers"].get("mermaid"),
+            Some(&seeded_entry),
+            "legacy entry must still be untouched after enable attempt, got: {}",
+            cj["mcpServers"]
+        );
+    }
+
     /// Set up a temp dir as the launcher's state root + the user's HOME.
     /// Returns a guard that restores prior env on drop and the temp path.
     /// Run the closure under the SERIALIZE mutex.
@@ -912,13 +1143,6 @@ mod tests {
             std::fs::set_permissions(&p, perms).unwrap();
         }
         std::fs::create_dir_all(root.join("claude_mcp_servers/weaviate_mcp")).unwrap();
-        std::fs::create_dir_all(root.join("claude_mcp_servers/search_mcp")).unwrap();
-        #[cfg(not(target_os = "windows"))]
-        std::fs::write(
-            root.join("claude_mcp_servers/search_mcp/wrapper.sh"),
-            b"#!/usr/bin/env bash\nexit 0\n",
-        )
-        .unwrap();
         root
     }
 
@@ -1134,24 +1358,25 @@ mod tests {
     /// in place, so Claude Code kept spawning the "disabled" server.
     /// Post-fix: the entry is removed from ~/.claude.json on disable.
     ///
-    /// v0.2.11: was `ollama`; now uses `search` (Ollama MCP removed from
-    /// the default install — see types.rs `default_mcp_servers` comment).
+    /// v0.2.101: uses `weaviate-kg` (the only venv-python-backed bundled
+/// default left after `search` was deleted and the diagram wrappers
+/// retired).
     #[test]
     fn test_toggle_mcp_server_off_removes_from_claude_json() {
         let (home, _guard) = setup_temp_env();
         seed_default_config(&home);
 
-        // Pre-seed ~/.claude.json with the search entry registered (mimic
-        // post-install state where the launcher had already mirrored
+        // Pre-seed ~/.claude.json with the weaviate-kg entry registered
+        // (mimic post-install state where the launcher had already mirrored
         // every default-enabled server during install).
         let claude_json = home.join(".claude.json");
         std::fs::write(
             &claude_json,
             serde_json::to_string_pretty(&serde_json::json!({
                 "mcpServers": {
-                    "search": {
+                    "weaviate-kg": {
                         "type": "stdio",
-                        "command": "claude_mcp_servers/search_mcp/server.py",
+                        "command": "claude_mcp_servers/weaviate_mcp/server.py",
                         "args": [],
                         "env": {}
                     }
@@ -1161,42 +1386,42 @@ mod tests {
         .unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server_inner("search".to_string(), false, "free")
+            toggle_mcp_server_inner("weaviate-kg".to_string(), false, "free")
                 .await
                 .expect("toggle_mcp_server off");
         });
 
         let cj = read_claude_json(&home);
         assert!(
-            cj["mcpServers"].get("search").is_none(),
-            "expected `search` removed from ~/.claude.json mcpServers, got: {}",
+            cj["mcpServers"].get("weaviate-kg").is_none(),
+            "expected `weaviate-kg` removed from ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
 
         // And the launcher's own config carries enabled=false.
         let cfg_text = std::fs::read_to_string(home.join("orchestrator.json")).unwrap();
         let cfg: serde_json::Value = serde_json::from_str(&cfg_text).unwrap();
-        let search = cfg["mcp_servers"]
+        let entry = cfg["mcp_servers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|s| s["id"] == "search")
-            .expect("search entry");
-        assert_eq!(search["enabled"], serde_json::Value::Bool(false));
+            .find(|s| s["id"] == "weaviate-kg")
+            .expect("weaviate-kg entry");
+        assert_eq!(entry["enabled"], serde_json::Value::Bool(false));
     }
 
     /// Inverse of the off-case: toggle on must register the entry back
     /// into ~/.claude.json with the CANONICAL builder shape (F-2,
     /// v0.2.73) so Claude Code can actually spawn it.
     ///
-    /// (v0.2.5: previously used `code-embed`. v0.2.11: was `ollama`; now
-    /// uses `search` after Ollama MCP was removed from the default install.
-    /// Exercise the toggle-on path by first flipping `search` off in the
+    /// (v0.2.5: previously used `code-embed`. v0.2.11: was `ollama`. v0.2.101:
+/// now uses `weaviate-kg` — the last venv-python-backed bundled default.
+    /// Exercise the toggle-on path by first flipping `weaviate-kg` off in the
     /// seeded config and then toggling it back on.)
     ///
     /// F-2 regression (was audit finding F-2, green-tested pre-fix): the
     /// old assertions only checked field PRESENCE, so the GUI-catalog
-    /// stub (`command: "claude_mcp_servers/search_mcp/server.py"`,
+    /// stub (`command: "claude_mcp_servers/weaviate_mcp/server.py"`,
     /// relative, no interpreter) passed. Now we assert the command is an
     /// ABSOLUTE path that EXISTS on disk — the runnable canonical shape.
     #[test]
@@ -1204,28 +1429,28 @@ mod tests {
         let (home, _guard) = setup_temp_env();
         let (cfg_path, install_root) = seed_config_with_install_root(&home);
 
-        // Flip `search` to disabled in the seeded config so the toggle-on
-        // call has something disabled to enable.
+        // Flip `weaviate-kg` to disabled in the seeded config so the
+        // toggle-on call has something disabled to enable.
         let mut cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
         for entry in cfg["mcp_servers"].as_array_mut().unwrap() {
-            if entry["id"] == "search" {
+            if entry["id"] == "weaviate-kg" {
                 entry["enabled"] = serde_json::Value::Bool(false);
             }
         }
         std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
         rt().block_on(async {
-            toggle_mcp_server_inner("search".to_string(), true, "free")
+            toggle_mcp_server_inner("weaviate-kg".to_string(), true, "free")
                 .await
                 .expect("toggle_mcp_server on");
         });
 
         let cj = read_claude_json(&home);
-        let entry = &cj["mcpServers"]["search"];
+        let entry = &cj["mcpServers"]["weaviate-kg"];
         assert!(
             entry.is_object(),
-            "expected `search` registered in ~/.claude.json mcpServers, got: {}",
+            "expected `weaviate-kg` registered in ~/.claude.json mcpServers, got: {}",
             cj["mcpServers"]
         );
         assert_eq!(entry["type"], "stdio");
@@ -1249,7 +1474,7 @@ mod tests {
             cmd
         );
         assert_ne!(
-            cmd, "claude_mcp_servers/search_mcp/server.py",
+            cmd, "claude_mcp_servers/weaviate_mcp/server.py",
             "must NOT write the GUI catalog's relative stub (F-2)"
         );
         assert!(entry.get("args").is_some(), "missing args field: {}", entry);
@@ -1267,14 +1492,14 @@ mod tests {
         let mut cfg: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
         for entry in cfg["mcp_servers"].as_array_mut().unwrap() {
-            if entry["id"] == "search" {
+            if entry["id"] == "weaviate-kg" {
                 entry["enabled"] = serde_json::Value::Bool(false);
             }
         }
         std::fs::write(&cfg_path, serde_json::to_string_pretty(&cfg).unwrap()).unwrap();
 
         let err = rt().block_on(async {
-            toggle_mcp_server_inner("search".to_string(), true, "free").await
+            toggle_mcp_server_inner("weaviate-kg".to_string(), true, "free").await
         });
         let msg = err.expect_err("bundled toggle-on without venv must error");
         assert!(
@@ -1286,21 +1511,21 @@ mod tests {
         // Nothing written to ~/.claude.json.
         let cj = read_claude_json(&home);
         assert!(
-            cj["mcpServers"].get("search").is_none(),
+            cj["mcpServers"].get("weaviate-kg").is_none(),
             "no entry may be written on the failed toggle: {}",
             cj
         );
         // The enabled flip was NOT persisted (error before save_config).
         let cfg_after: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg_path).unwrap()).unwrap();
-        let search = cfg_after["mcp_servers"]
+        let entry = cfg_after["mcp_servers"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|s| s["id"] == "search")
-            .expect("search entry");
+            .find(|s| s["id"] == "weaviate-kg")
+            .expect("weaviate-kg entry");
         assert_eq!(
-            search["enabled"],
+            entry["enabled"],
             serde_json::Value::Bool(false),
             "failed toggle must not persist the enabled flip"
         );
@@ -1317,7 +1542,7 @@ mod tests {
         let (cfg_path, install_root) = seed_config_with_install_root(&home);
         let claude_json = home.join(".claude.json");
         let claude_json_before = serde_json::to_string_pretty(&serde_json::json!({
-            "mcpServers": {"search": {"type": "stdio", "command": "x", "args": [], "env": {}}}
+            "mcpServers": {"weaviate-kg": {"type": "stdio", "command": "x", "args": [], "env": {}}}
         }))
         .unwrap();
         std::fs::write(&claude_json, &claude_json_before).unwrap();
@@ -1327,7 +1552,7 @@ mod tests {
         std::fs::write(&settings, broken).unwrap();
         let cfg_before = std::fs::read_to_string(&cfg_path).unwrap();
 
-        let res = rt().block_on(toggle_mcp_server_inner("search".to_string(), false, "free"));
+        let res = rt().block_on(toggle_mcp_server_inner("weaviate-kg".to_string(), false, "free"));
 
         let msg = res.expect_err("the refused settings write must fail the toggle");
         assert!(msg.contains("NOT updated"), "the refusal names the file: {}", msg);
@@ -1703,7 +1928,7 @@ mod tests {
         // DEVELOPMENT_COLLECTION="Development", enabled=true) — use it
         // as-is so the test exercises the exact shipped shape. Add one
         // legit non-routing setting to prove those still flow.
-        if let Some(server) = config.mcp_servers.iter_mut().find(|s| s.id == "search") {
+        if let Some(server) = config.mcp_servers.iter_mut().find(|s| s.id == "playwright") {
             server.settings.insert(
                 "OPENALEX_EMAIL".to_string(),
                 McpSetting {

@@ -521,8 +521,14 @@ def _check_mcp_wrappers() -> _CheckResult:
             STATUS_FAIL,
             "mcpServers is not an object in ~/.claude.json",
         )
-    missing: list[str] = []
+    # v0.2.101 (owner ruling, PLAN-V0300 item 15): the wrapper MCPs are no
+    # longer registered on install — the Diagrams tab renders without them.
+    # An install that already has an entry KEEPS it, so ABSENT means "fresh
+    # install, by design" (never a failure and never a re-register remedy)
+    # while PRESENT still gets its module path verified.
+    absent: list[str] = []
     wrong_module: list[str] = []
+    verified: list[str] = []
     expected_modules = {
         "mermaid": "claude_mcp_servers.wrappers.mermaid_proxy",
         "excalidraw": "claude_mcp_servers.wrappers.excalidraw_proxy",
@@ -530,32 +536,37 @@ def _check_mcp_wrappers() -> _CheckResult:
     for name, module in expected_modules.items():
         entry = servers.get(name)
         if not isinstance(entry, Mapping):
-            missing.append(name)
+            absent.append(name)
             continue
         args = entry.get("args")
         if not isinstance(args, list) or module not in args:
             wrong_module.append(
                 f"{name}: expected -m {module} in args, got {args!r}"
             )
-    if missing:
-        return _CheckResult(
-            "mcp_wrappers",
-            STATUS_FAIL,
-            f"mcpServers missing entries: {missing}",
-            fix_hint="re-run install.py to re-register wrapper MCPs",
-        )
+        else:
+            verified.append(name)
     if wrong_module:
         return _CheckResult(
             "mcp_wrappers",
             STATUS_FAIL,
             "wrapper(s) point at unexpected module: " + "; ".join(wrong_module),
-            fix_hint="re-run install.py to fix the wrapper command line",
+            fix_hint=(
+                "edit the entry in ~/.claude.json (args must include "
+                "-m <module>) or delete it — registration is not re-added "
+                "since v0.2.101"
+            ),
         )
-    return _CheckResult(
-        "mcp_wrappers",
-        STATUS_OK,
-        "mermaid + excalidraw wrappers registered with correct module path",
-    )
+    if absent and not verified:
+        return _CheckResult(
+            "mcp_wrappers",
+            STATUS_OK,
+            "wrapper MCPs not registered — optional since v0.2.101; "
+            "the Diagrams tab does not need them",
+        )
+    detail = f"wrapper(s) registered with correct module path: {verified}"
+    if absent:
+        detail += f"; not registered (optional): {absent}"
+    return _CheckResult("mcp_wrappers", STATUS_OK, detail)
 
 
 # ---------------------------------------------------------------------------

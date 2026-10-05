@@ -61,7 +61,14 @@ UUID = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
 LEAN_CTX_SECTION = "**Lean-ctx Bash compression — allow-listed, lossless**"
 LEAN_CTX_POINTER = "[lean-ctx-tee]"
 RL_SECTION = "**RL retrieval reranking is active for this project**"
-DIAGRAMS_BULLET = "- **mermaid** / **excalidraw**"
+# v0.2.101: the root template's diagrams bullet ("**mermaid** /
+# **excalidraw**" as registered MCP servers) was REMOVED — the wrapper MCPs
+# are no longer registered on install, so the bullet's claim was false on
+# every fresh install. The root template carries no diagrams conditional
+# any more (the PROJECT template keeps its true one — the Diagrams-tab
+# workflow section — and the `diagrams` module row stays default-on), so
+# the pinned expectation is now the bullet's ABSENCE.
+RETIRED_DIAGRAMS_MCP_BULLET = "- **mermaid** / **excalidraw**"
 
 
 # ---------------------------------------------------------------------------
@@ -130,7 +137,7 @@ class TestRootRenderConditionalSections:
         assert LEAN_CTX_SECTION not in text
         assert LEAN_CTX_POINTER not in text
         assert RL_SECTION not in text
-        assert DIAGRAMS_BULLET not in text
+        assert RETIRED_DIAGRAMS_MCP_BULLET not in text
         # The document around the dropped sections still renders.
         assert "## Context Efficiency" in text
         assert "### Hook System" in text
@@ -144,7 +151,7 @@ class TestRootRenderConditionalSections:
         assert "{{#" not in text and "{{/if_" not in text
         assert LEAN_CTX_SECTION in text and LEAN_CTX_POINTER in text
         assert RL_SECTION in text
-        assert DIAGRAMS_BULLET in text
+        assert RETIRED_DIAGRAMS_MCP_BULLET not in text
 
     def test_malformed_conditional_fails_the_entry_never_ships_raw_tags(
             self, tmp_path):
@@ -224,7 +231,7 @@ class TestConservativeProbeFailures:
         assert outcome.status in ("created", "auto_block_updated", "full_rewrite")
         text = (root / "CLAUDE.md").read_text(encoding="utf-8")
         assert LEAN_CTX_SECTION in text and RL_SECTION in text
-        assert DIAGRAMS_BULLET in text
+        assert RETIRED_DIAGRAMS_MCP_BULLET not in text
         assert "{{#" not in text and "{{/if_" not in text
         assert "section resolver failed" in err.getvalue()
 

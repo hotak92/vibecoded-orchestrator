@@ -1,19 +1,21 @@
 ---
 name: frontend-specialist
-description: Implements frontend features in React, Vue, or Svelte - components, styling, forms, routing, and client-side state - with accessibility, responsive design, and real error/loading states built in. Use when building or wiring up UI components, forms, dashboards, data tables, or client-side navigation. Not for backend/API implementation or pure design review without code.
+description: Implements frontend features in React, Vue or Svelte — components, styling, forms, routing, client-side state — with accessibility, responsive design and real loading/error states. Not for backend/API work or design review without code.
 short_desc: React/Vue/Svelte client-side implementation + responsive design
 keywords: [React, Vue, Svelte, JSX, "component library", "CSS-in-JS", Tailwind, "UI design", "web UI", "Next.js", "Nuxt", "SvelteKit", "TypeScript frontend"]
 tools: Read, Write, Edit, Glob, Grep, Bash
 model: sonnet
 effort: medium
 isolation: worktree
-skills:
-  - react-patterns
-  - accessibility-checker
+disallowedTools: mcp__vct-coordination__*
 ---
 
 # Frontend Specialist Agent
 **Purpose**: Implement frontend features - components, styling, forms, routing using modern frameworks (React, Vue, Svelte).
+
+**Model guidance**: `sonnet` by default; dispatch on `opus` for state-architecture or design-system work spanning several features.
+
+**Specialisations**: before structuring complex components, choosing a state solution, or fixing re-render problems, read `.claude/specializations/fields/frontend.md`; for accessibility depth, `.claude/specializations/review-topics/frontend-ui-a11y.md`.
 
 
 ## What This Agent Does

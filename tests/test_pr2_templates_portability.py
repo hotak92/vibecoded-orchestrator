@@ -178,16 +178,17 @@ class StaleOrchRootHealTests(unittest.TestCase):
         (root / "vct-module.json").write_text("{}\n", encoding="utf-8")
         agents = root / "templates" / "agents" / "free"
         agents.mkdir(parents=True)
-        (agents / "coder.md").write_text(
+        # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        (agents / "example-agent.md").write_text(
             "---\n"
-            "name: coder\n"
+            "name: example-agent\n"
             "mcpServers:\n"
             "  example-mcp:\n"
             "    command: {{ORCHESTRATOR_ROOT}}/.venv/bin/python\n"
             "    args:\n"
             "      - {{ORCHESTRATOR_ROOT}}/example_mcp/server.py\n"
             "---\n"
-            "# Coder\n",
+            "# Example agent\n",
             encoding="utf-8",
         )
 
@@ -209,7 +210,7 @@ class StaleOrchRootHealTests(unittest.TestCase):
             project_init.install_project_bundle(
                 project, orchestrator_root=old_orch, update_mode=False,
             )
-            agent_path = project / ".claude" / "agents" / "coder.md"
+            agent_path = project / ".claude" / "agents" / "example-agent.md"
             installed_text = agent_path.read_text(encoding="utf-8")
             self.assertIn(str(old_orch), installed_text)
             self.assertNotIn(str(new_orch), installed_text)
@@ -224,7 +225,7 @@ class StaleOrchRootHealTests(unittest.TestCase):
             self.assertIn(str(new_orch), healed)
             # Action should be `overwrite` (heal), not `preserve` (would
             # have skipped) and not `noop` (content actually changed).
-            agent_rel = str(Path(".claude") / "agents" / "coder.md")
+            agent_rel = str(Path(".claude") / "agents" / "example-agent.md")
             self.assertIn(agent_rel, result["actions"]["overwrite"])
             self.assertNotIn(agent_rel, result["actions"]["preserve"])
 
@@ -255,7 +256,7 @@ class StaleOrchRootHealTests(unittest.TestCase):
             project_init.install_project_bundle(
                 project, orchestrator_root=old_orch, update_mode=False,
             )
-            agent_path = project / ".claude" / "agents" / "coder.md"
+            agent_path = project / ".claude" / "agents" / "example-agent.md"
             # User customisation
             tampered = agent_path.read_text(encoding="utf-8") + "\n# user note\n"
             agent_path.write_text(tampered, encoding="utf-8")
@@ -263,13 +264,13 @@ class StaleOrchRootHealTests(unittest.TestCase):
             result = project_init.install_project_bundle(
                 project, orchestrator_root=new_orch, update_mode=True,
             )
-            agent_rel = str(Path(".claude") / "agents" / "coder.md")
+            agent_rel = str(Path(".claude") / "agents" / "example-agent.md")
             # Adopted (heal did NOT fire — the tampered bytes failed the
             # round-trip), never overwrite/heal.
             self.assertIn(agent_rel, result["actions"]["adopt"])
             self.assertNotIn(agent_rel, result["actions"]["overwrite"])
             # User bytes are preserved in the backup (never lost).
-            backup = project / result["adopt_backup_dir"] / ".claude" / "agents" / "coder.md"
+            backup = project / result["adopt_backup_dir"] / ".claude" / "agents" / "example-agent.md"
             self.assertTrue(backup.exists())
             self.assertIn("# user note\n", backup.read_text(encoding="utf-8"))
 

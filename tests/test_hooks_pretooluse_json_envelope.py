@@ -412,6 +412,7 @@ def test_no_uncovered_pretooluse_hooks() -> None:
 
 
 # ── v0.2.100: context injection must never approve a tool call ─────────────
+import shutil as _shutil  # noqa: E402
 import subprocess as _sp  # noqa: E402
 from pathlib import Path as _Path  # noqa: E402
 
@@ -452,3 +453,45 @@ def test_emit_context_sh_envelope_has_no_decision(tmp_path) -> None:
     env = json.loads(lines[-1])["hookSpecificOutput"]
     assert env["additionalContext"].startswith("some kg context")
     assert "permissionDecision" not in env
+
+
+@pytest.mark.skipif(
+    _shutil.which("pwsh") is None,
+    reason="pwsh not installed locally; the hook-parity workflow's pwsh step "
+           "(.github/workflows/hook-parity.yml) runs this same check in CI",
+)
+def test_emit_context_ps1_envelope_has_no_decision() -> None:
+    """Behavioural (NB-16, v0.2.101): the real .ps1 emitter's JSON carries
+    context and no decision — the .ps1 sibling of the .sh leg above.
+
+    Before this test the .ps1 side was covered only by the SOURCE-SCAN leg
+    (``test_context_envelopes_never_approve``), exactly the "never guard
+    wiring with a source scan" gap: a comment mentioning the right keys
+    satisfied it while the runtime envelope could be broken. Single
+    definition: this leg invokes ``.github/scripts/check_emit_context_ps1.ps1``
+    — the SAME script the hook-parity workflow runs in a ``shell: pwsh``
+    step, so the check is guaranteed to execute in CI even on machines
+    where this skipif swallows the pytest leg.
+
+    Red-proof (2026-10-05): temporarily adding ``permissionDecision =
+    'allow'`` to the ``[ordered]`` envelope in
+    ``templates/hooks/_lib/emit-context.ps1`` (Emit-AdditionalContext) made
+    BOTH the pwsh script exit 1 (this test fails on the non-zero return)
+    AND the source-scan leg go red, confirming the mutation is a real one.
+    Reverted afterwards from a cp copy, md5-verified. The check script also
+    fails (not skips) on empty stdout, so a crash inside emit-context.ps1
+    is an assertion failure, never a silent pass.
+    """
+    pwsh = _shutil.which("pwsh")
+    assert pwsh is not None, "pwsh not on PATH (skipif guard should have skipped)"
+    repo_root = _Path(__file__).resolve().parents[1]
+    script = repo_root / ".github" / "scripts" / "check_emit_context_ps1.ps1"
+    assert script.is_file(), f"missing behavioural check script: {script}"
+    out = _sp.run(
+        [pwsh, "-NoProfile", "-File", str(script), "-RepoRoot", str(repo_root)],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert out.returncode == 0, (
+        f"check_emit_context_ps1.ps1 failed (exit {out.returncode}):\n"
+        f"stdout: {out.stdout[-800:]!r}\nstderr: {out.stderr[-800:]!r}"
+    )

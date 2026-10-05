@@ -64,26 +64,18 @@ pub const BUNDLED_MCP_NAMES: &[&str] = &[
 /// project-create flow registers them with `enabled=false` so the user
 /// has to opt in via the launcher GUI before they fire.
 ///
-/// Plan §3 Phase 1 item 2: "mermaid — Default-enabled: off (opt-in per
-/// project, unlike Playwright). Reasoning: not all projects need diagrams;
-/// mermaid MCP boot adds ~150 ms."
-///
-/// Plan §3 Phase 2 (2026-05-25): excalidraw follows the same posture —
-/// opt-in per project. The wrapper spawns a vendored Node MCP
-/// (~10 MB on disk via the in-tree fork) plus its own subprocess on
-/// project use, so default-off keeps idle projects free of the cost.
-///
-/// Keep this list narrow — most bundled MCPs should default to on so the
-/// orchestrator "just works". This list is the explicit opt-out for the
-/// few that don't apply universally.
+/// EMPTY as of v0.2.101: its only two members were the diagram wrapper MCPs
+/// (`excalidraw`, `mermaid`), whose default REGISTRATION was retired — no
+/// fresh registration path composes them, so nothing ships default-disabled
+/// any more. They remain in `BUNDLED_MCP_NAMES` (an install that already has
+/// the entry keeps it, and the uninstall scrub still removes it). The
+/// mechanism below stays live for any future bundled MCP that should ship
+/// opt-in.
 ///
 /// Source-of-truth: `vco_lib/mcp_scan_rules.toml` [bundled].default_disabled
 /// (v0.2.83 WP-B5), same compiled-mirror + drift-test discipline as
 /// `BUNDLED_MCP_NAMES` (see `bundled_mcp_default_disabled_matches_table`).
-pub const BUNDLED_MCP_DEFAULT_DISABLED: &[&str] = &[
-    "excalidraw",
-    "mermaid",
-];
+pub const BUNDLED_MCP_DEFAULT_DISABLED: &[&str] = &[];
 
 /// True iff `name` is bundled AND ships default-disabled (per
 /// `BUNDLED_MCP_DEFAULT_DISABLED`). Used by the per-project install/
@@ -309,9 +301,9 @@ impl Db {
     /// — called the raw UPSERT, whose SQL inserts `enabled = 1`
     /// unconditionally. Result: on the orchestrator ROOT project (the only
     /// project that path ever writes) `mermaid` and `excalidraw` landed
-    /// `enabled = 1`, contradicting [`BUNDLED_MCP_DEFAULT_DISABLED`] and
-    /// `docs/GETTING_STARTED.md`'s "registered but default-disabled per
-    /// project" claim. Two seeding paths, one discipline, one copy of it.
+    /// `enabled = 1`, contradicting [`BUNDLED_MCP_DEFAULT_DISABLED`] (the
+    /// members it carried then; empty after the v0.2.101 diagram
+    /// retirement). Two seeding paths, one discipline, one copy of it.
     ///
     /// Contract (identical to the pre-extraction populate behaviour):
     ///   * The UPSERT itself NEVER writes `enabled` on conflict, so a user
@@ -678,15 +670,16 @@ mod tests {
     }
 
     #[test]
-    fn default_disabled_includes_mermaid() {
-        // Plan §3 Phase 1 item 2 contract.
-        assert!(is_default_disabled_mcp("mermaid"));
-    }
-
-    #[test]
-    fn default_disabled_includes_excalidraw() {
-        // Plan §3 Phase 2 contract: excalidraw is opt-in per project.
-        assert!(is_default_disabled_mcp("excalidraw"));
+    fn default_disabled_is_empty_after_diagram_retirement() {
+        // v0.2.101: the diagram wrapper MCPs were retired from default
+        // REGISTRATION, and they were the only default-disabled members, so
+        // the list is now empty. They stay BUNDLED (legacy entries survive),
+        // but nothing ships opt-in any more. Red-proof: re-adding either name
+        // here fails this assertion.
+        assert!(BUNDLED_MCP_DEFAULT_DISABLED.is_empty());
+        assert!(!is_default_disabled_mcp("mermaid"));
+        assert!(!is_default_disabled_mcp("excalidraw"));
+        assert!(is_bundled_mcp("mermaid"));
         assert!(is_bundled_mcp("excalidraw"));
     }
 

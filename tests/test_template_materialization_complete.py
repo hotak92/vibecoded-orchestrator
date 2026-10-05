@@ -333,7 +333,21 @@ class TestEveryShippedTemplateRenders:
             elif label.startswith("Windows:"):
                 ET.fromstring(text.encode("utf-8"))
                 parsed += 1
-        assert parsed > 50
+        # The floor is DERIVED from the catalogue this bundle ships: the 11
+        # default free agents + 8 machine-gated gateway agents + 6 default
+        # skills (all frontmatter-bearing), plus the boot units counted above.
+        # Opt-in packs are NOT part of the default bundle render, so they are
+        # not in this count. A count below the default catalogue means renders
+        # are being skipped — not that the catalogue shrank.
+        defs = (
+            len(list((REPO_ROOT / "templates" / "agents" / "free").glob("*.md")))
+            + len(list((REPO_ROOT / "templates" / "agents" / "module-gateway").glob("*.md")))
+            + len(list((REPO_ROOT / "templates" / "skills").glob("*/SKILL.md")))
+        )
+        assert parsed >= defs, (
+            f"only {parsed} documents parsed at the gate; the bundle ships at "
+            f"least {defs} frontmatter-bearing agent/skill definitions"
+        )
 
     def test_rendered_values_are_this_installs(self, synthetic, monkeypatch):
         rendered = _render_root_table(synthetic)
@@ -380,7 +394,7 @@ class TestMutationProof:
         syn = _make(tmp_path, "Linux")
         op = next(o for o in _bundle_ops(monkeypatch)
                   if isinstance(o.transform, materialize.Transform)
-                  and o.dest_rel.endswith("coder.md"))
+                  and o.dest_rel.endswith("expert-coder.md"))
         mutated = op.source_abs.read_bytes() + b"\nSee {{BOGUS}}.\n"
         data, result = op.transform.render(mutated, materialize.LazyContext(syn.context))
         violations = _violations({op.dest_rel: (data.decode("utf-8"), result)})

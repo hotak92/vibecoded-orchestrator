@@ -444,12 +444,12 @@ Symptom: Claude says "MCP server weaviate-kg is not connected" or tool calls lik
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓ Connected, search ✓ Connected,
-#           mermaid ✓ Connected, excalidraw ✓ Connected
-# mermaid + excalidraw show Connected but their tools are per-project
-# default-disabled until you opt in via the launcher's Diagrams tab.
-# playwright also appears (enabled by default, via npx) — but ONLY when
-# npx resolves on PATH; see "npx is not on PATH" below.
+# Expected: weaviate-kg ✓ Connected, playwright ✓ Connected
+# playwright appears only when npx resolves on PATH; see "npx is not on
+# PATH" below. (v0.2.101 deleted the search MCP and stopped registering the
+# mermaid/excalidraw diagram wrappers; a legacy install keeps those entries,
+# and the launcher's Permissions tab disables a server per project via
+# ~/.claude.json projects[<project>].disabledMcpServers.)
 # (lean-ctx or Pro-tier MCPs may also appear if installed.)
 ```
 
@@ -556,7 +556,7 @@ Symptom: a script or wrapper calling `http://127.0.0.1:7700/api/v1/...` gets `40
 Every `/api/v1/*` route (except `/health`) requires `Authorization: Bearer <token>` where the token lives in `<vct_root_dir>/hub.token`. The token is **regenerated on every hub startup** — so any client that cached an old token will 401 after a `vct-hub --stop` + restart.
 
 - **Python clients** (`vco_lib.project_config`): auto-recover. The internal `_get_with_401_retry` wrapper catches a single 401, invalidates the 5-second discovery cache, re-reads `hub.token` + `hub.port` from disk, and re-issues the request. Subsequent 401s after the retry are surfaced as `HubUnreachable`. You don't need to do anything in calling code.
-- **In-tree wrappers** (`claude_mcp_servers/search_mcp/wrapper.sh`, the `vct-cli` launcher CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
+- **In-tree wrappers** (the `vct-cli` launcher CLI, the `vct_secrets_resolve.{sh,ps1}` helpers): read the token per-call automatically — no extra config — but they don't auto-retry. If they 401, re-source / re-invoke them.
 - **Custom bash / PowerShell scripts**: re-read `<vct_root_dir>/hub.token` per call (or per failure-and-retry). Don't cache the token across hub restarts. See `templates/scripts/vct_project_config.sh` and `templates/scripts/vct_project_config.ps1` for reference implementations of the discover-and-call pattern.
 - **`hub.token` missing**: the hub hasn't started, or `VCT_STATE_DIR` differs between the hub and your client. `vct-hub --status` first; if `not-running`, start it with `vct-hub --start-if-not-running`.
 

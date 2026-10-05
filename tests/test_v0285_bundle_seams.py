@@ -80,7 +80,8 @@ class _BundleSeamCase(unittest.TestCase):
         return self.proj / ".claude" / "hooks" / f"foo.{self.ext}"
 
     def _agent_rel(self) -> str:
-        return str(Path(".claude") / "agents" / "coder.md")
+        # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+        return str(Path(".claude") / "agents" / "example-agent.md")
 
     def _script_rel(self) -> str:
         return str(Path(".claude") / "scripts" / "kg-search")
@@ -396,21 +397,24 @@ class SkipKindActTests(_BundleSeamCase):
         agent_rel = self._agent_rel()
         for action, paths in result["actions"].items():
             self.assertNotIn(agent_rel, paths)
-        self.assertFalse((self.proj / ".claude" / "agents" / "coder.md").exists())
+        self.assertFalse((self.proj / ".claude" / "agents" / "example-agent.md").exists())
         self.assertEqual(result.get("skip_kinds"), ["agents"])
         # Other kinds still installed.
         self.assertIn(self._hook_rel(), result["actions"]["create"])
 
     def test_skip_skills_no_skill_ops(self):
-        # Ship a skill so the kind is populated.
-        skill_dir = self.orch / "templates" / "skills" / "tdd"
+        # Ship a skill so the kind is populated. Neutral fixture name
+        # (`tdd` was a real skill retired in v0.2.101 — a synthetic tree
+        # must not read as one).
+        skill_dir = self.orch / "templates" / "skills" / "example-skill"
         skill_dir.mkdir(parents=True)
-        (skill_dir / "SKILL.md").write_text("# TDD\n", encoding="utf-8")
+        (skill_dir / "SKILL.md").write_text("# Example Skill\n", encoding="utf-8")
         result = self._install(update_mode=False, skip_kinds=frozenset({"skills"}))
-        skill_rel = str(Path(".claude") / "skills" / "tdd" / "SKILL.md")
+        skill_rel = str(Path(".claude") / "skills" / "example-skill" / "SKILL.md")
         for action, paths in result["actions"].items():
             self.assertNotIn(skill_rel, paths)
-        self.assertFalse((self.proj / ".claude" / "skills" / "tdd").exists())
+        self.assertFalse(
+            (self.proj / ".claude" / "skills" / "example-skill").exists())
 
     def test_skip_settings_leaves_settings_action_empty(self):
         result = self._install(update_mode=False, skip_kinds=frozenset({"settings"}))
@@ -476,9 +480,13 @@ class SchemaConstantStructuralTests(unittest.TestCase):
         )
 
     def test_skip_kinds_vocabulary(self):
+        # v0.2.101 (catalogue plan §5): `specializations` joins the vocabulary
+        # as the fifth enumerated FILE kind (settings is the merge step, not a
+        # file kind). ONE home is `vco_lib.bundle_kinds`; project_init re-exports.
         self.assertEqual(
             project_init.BUNDLE_SKIP_KINDS,
-            frozenset({"agents", "skills", "hooks", "scripts", "settings"}),
+            frozenset({"agents", "skills", "hooks", "scripts", "settings",
+                       "specializations"}),
         )
 
     def test_both_result_dicts_derive_action_keys_from_constant(self):

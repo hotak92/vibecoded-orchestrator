@@ -47,7 +47,7 @@ The scrub happens at the top of each hook script, before any other logic. This i
 
 **Threat**: a prompt injection or compromised tool call could make Claude issue HTTP requests to internal services (cloud metadata APIs, internal dashboards, localhost services not intended for Claude access).
 
-**Implementation**: the `pre-tool-use.sh` PreToolUse hook inspects the `WebFetch` tool's target URL. `search_papers` reaches OpenAlex/arXiv via its own HTTP path and is not routed through this guard.
+**Implementation**: the `pre-tool-use.sh` PreToolUse hook inspects the `WebFetch` tool's target URL.
 
 Private / internal addresses blocked by default:
 - `10.0.0.0/8`

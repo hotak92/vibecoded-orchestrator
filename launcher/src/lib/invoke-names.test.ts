@@ -19,28 +19,12 @@
 
 import { describe, expect, it } from 'vitest';
 import { loadFrontend, loadRust, sourceFile, type SourceFile } from './test-support/source-census';
+// SF-5 (v0.2.101): the shared extractor's ONE home is test-support; this
+// file re-exports it so existing importers keep working.
+import { registeredCommands } from './test-support/wiring-ast';
+export { registeredCommands };
 
 // ─── extraction ────────────────────────────────────────────────────────────
-
-/** Command names in the `generate_handler![ … ]` list of lib.rs. `#[cfg]`
- *  attributes are skipped; the name is the last path segment. */
-export function registeredCommands(lib: SourceFile): string[] {
-  const k = lib.code.search(/\bgenerate_handler!\s*\[/);
-  if (k < 0) return [];
-  const open = lib.code.indexOf('[', k);
-  let depth = 0;
-  let end = open;
-  for (; end < lib.code.length; end++) {
-    if (lib.code[end] === '[') depth++;
-    else if (lib.code[end] === ']' && --depth === 0) break;
-  }
-  const body = lib.code.slice(open + 1, end).replace(/#\[[^\]]*\]/g, ' ');
-  return body
-    .split(',')
-    .map((s) => s.trim())
-    .filter((s) => s !== '')
-    .map((s) => s.split('::').pop()!.trim());
-}
 
 export interface InvokeSite {
   file: string;

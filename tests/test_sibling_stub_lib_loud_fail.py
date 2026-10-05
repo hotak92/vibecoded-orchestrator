@@ -5,7 +5,7 @@
 The search-mcp and code-embedding-service servers used to end their
 ``_lib`` import dance with a SILENT soft-fail stub:
 
-  * ``search_mcp/server.py``:
+  * ``search_mcp/server.py`` (deleted in v0.2.101):
       - ``register_sighup_exit_handler`` fell back to ``lambda: False``
         (silently disabled SIGHUP env-reload).
       - ``exit_if_update_in_progress`` fell back to ``None`` (silently
@@ -86,7 +86,8 @@ class BootstrapHelperBehaviorTests(unittest.TestCase):
 class SiblingSourceGuardTests(unittest.TestCase):
     """T-SRC — the masking stubs are gone and the shared helper is used."""
 
-    SEARCH_MCP = "claude_mcp_servers/search_mcp/server.py"
+    # v0.2.101 deleted `search_mcp`; code_embedding_service is the surviving
+    # sibling that carried the same soft-fail stub shape.
     CODE_EMBED = "claude_mcp_servers/code_embedding_service/server.py"
 
     def _src(self, rel: str) -> str:
@@ -114,32 +115,6 @@ class SiblingSourceGuardTests(unittest.TestCase):
             out.append(line)
         return "\n".join(out)
 
-    def test_search_mcp_no_sighup_false_stub(self) -> None:
-        code = self._code_lines(self._src(self.SEARCH_MCP))
-        # The pre-fix stub returned False from a redefined handler.
-        self.assertNotIn(
-            "def register_sighup_exit_handler(_logger):",
-            code,
-            "search_mcp must not redefine register_sighup_exit_handler as a "
-            "soft-fail stub — route through import_lib_member (loud-fail)",
-        )
-
-    def test_search_mcp_no_update_gate_none_stub(self) -> None:
-        code = self._code_lines(self._src(self.SEARCH_MCP))
-        self.assertNotIn(
-            "exit_if_update_in_progress = None",
-            code,
-            "search_mcp must not set exit_if_update_in_progress = None "
-            "(silently disables the fork-bomb guard)",
-        )
-        # And the None-guard branch must be gone too.
-        self.assertNotIn(
-            "if exit_if_update_in_progress is not None:",
-            code,
-            "search_mcp must call the gate unconditionally (it loud-fails on "
-            "import now, so the None-guard is dead)",
-        )
-
     def test_code_embed_no_update_gate_none_stub(self) -> None:
         code = self._code_lines(self._src(self.CODE_EMBED))
         self.assertNotIn(
@@ -154,8 +129,8 @@ class SiblingSourceGuardTests(unittest.TestCase):
             "code_embedding_service must call the gate unconditionally",
         )
 
-    def test_both_siblings_use_shared_helper(self) -> None:
-        for rel in (self.SEARCH_MCP, self.CODE_EMBED):
+    def test_siblings_use_shared_helper(self) -> None:
+        for rel in (self.CODE_EMBED,):
             with self.subTest(script=rel):
                 src = self._src(rel)
                 self.assertIn(

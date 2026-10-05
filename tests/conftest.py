@@ -254,7 +254,8 @@ if not _ALLOW_REAL_STATE:
 #     `templates/scripts/detect_duplicates.py`).
 #   * `VCT_USER_HOME_OVERRIDE` -> `install._user_home_for_install()`, which
 #     already existed (v0.2.11 PR-16) and already resolves `~/.claude.json`
-#     for `_check_ollama_mcp_remnants` / `_check_search_mcp_env_obsolete`.
+#     for `_check_ollama_mcp_remnants` (the search-MCP env check that also
+#     hung off it was deleted with the search MCP in v0.2.101).
 #     The lever was simply never pulled suite-wide, so four tests read the
 #     developer's real global Claude config and branched on its contents —
 #     de-hermeticising, since CI has no such file.

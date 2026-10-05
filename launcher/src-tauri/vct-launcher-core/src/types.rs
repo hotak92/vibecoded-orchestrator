@@ -189,33 +189,10 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
         // removed from the default install in v0.2.11 — those tools are
         // redundant with Claude's native capabilities. Ollama as embedding
         // infrastructure (Weaviate vectorizers) is unchanged; it continues
-        // to run as a container service. Users who had the ollama MCP entry
-        // in ~/.claude.json will see a deferral notice from install.py
-        // guiding manual cleanup.
-        McpServerConfig {
-            id: "search".to_string(),
-            name: "Academic Paper Search".to_string(),
-            // v0.2.11: Search MCP simplified to search_papers only.
-            // SearXNG (web_search) and GitHub code-search (search_code)
-            // removed. Only OPENALEX_EMAIL env var needed going forward.
-            description: "Academic paper search via OpenAlex (240 M papers) and arXiv CS/ML preprints. Uses search_papers tool only.".to_string(),
-            enabled: true,
-            command: "claude_mcp_servers/search_mcp/server.py".to_string(),
-            args: vec![],
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None,
-            configurable: true,
-            settings: HashMap::from([
-                ("OPENALEX_EMAIL".to_string(), McpSetting {
-                    label: "OpenAlex Email".to_string(),
-                    value: String::new(),
-                    setting_type: McpSettingType::Text,
-                    description: "Optional email for OpenAlex polite-pool priority (higher rate limits, no token needed).".to_string(),
-                    editable: true,
-                }),
-            ]),
-        },
+        // to run as a container service. The `search` (paper-search) MCP was
+        // deleted outright in v0.2.101; the `mermaid`/`excalidraw` diagram
+        // wrappers were retired from default registration in the same release.
+        // See docs/features/02-mcps-and-agents.md.
         // NOTE: `code-embed` (CodeSage-Large-v2 container at port 11440) is
         // NOT an MCP — it's a backend HTTP service consumed by `weaviate-kg`
         // for code-graph embeddings. It lives in the Services tab, not the
@@ -238,59 +215,13 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
             configurable: false, // No user-editable settings on day one (can be added later)
             settings: HashMap::new(),
         },
-        // ── mermaid (v0.2.33 Phase 1.2 — diagrams integration) ───────────
-        //
-        // Wrapper MCP at `claude_mcp_servers/wrappers/mermaid_proxy.py`
-        // (see `mcp_registration.rs:436-460` for the ~/.claude.json
-        // registration). Proxies the npm `claude-mermaid` package with
-        // path-allowlist enforcement to keep diagram writes inside
-        // `.claude/diagrams/`. Listed here so the launcher's global MCP
-        // Servers tab + per-project Permissions tab can render
-        // enable/disable cards (v0.2.34 Agent D fix — without this entry
-        // both surfaces were blind to the wrapper).
-        //
-        // configurable: false — no user-editable env (the wrapper's
-        // PYTHONPATH is resolved by mcp_registration at write time).
-        McpServerConfig {
-            id: "mermaid".to_string(),
-            name: "Mermaid diagrams".to_string(),
-            description: "Render and save Mermaid diagrams (`render`, `save_diagram`). Wraps the npm `claude-mermaid` package via a Python proxy that enforces the `.claude/diagrams/` scoped-path boundary. Used by the launcher's Diagrams tab and by Claude when asked to sketch flowcharts / architecture / GUI diagrams.".to_string(),
-            enabled: true, // Default-enabled — bundled diagrams feature is opt-out, mirrors `set_project_module_enabled('diagrams', true)` seeded on project create
-            command: "python".to_string(),
-            args: vec![
-                "-m".to_string(),
-                "claude_mcp_servers.wrappers.mermaid_proxy".to_string(),
-            ],
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None, // stdio MCP
-            configurable: false,
-            settings: HashMap::new(),
-        },
-        // ── excalidraw (v0.2.33 Phase 2 — diagrams integration) ──────────
-        //
-        // Wrapper MCP at `claude_mcp_servers/wrappers/excalidraw_proxy.py`
-        // (see `mcp_registration.rs:461-489`). Proxies the in-tree
-        // vendored `excalidraw-mcp-server` fork with the same path
-        // allowlist as the mermaid wrapper. Same launcher-visibility
-        // story as mermaid: listed here so the global MCP Servers tab +
-        // per-project Permissions tab show it (v0.2.34 Agent D fix).
-        McpServerConfig {
-            id: "excalidraw".to_string(),
-            name: "Excalidraw diagrams".to_string(),
-            description: "Create and edit Excalidraw scenes (`create_scene`, `add_element`, ...). Wraps an in-tree fork of `excalidraw-mcp-server` via a Python proxy that enforces the `.claude/diagrams/` scoped-path boundary. Used by the launcher's Diagrams tab embedded editor and by Claude when asked to sketch freehand whiteboard visuals.".to_string(),
-            enabled: true, // Default-enabled — same rationale as mermaid above
-            command: "python".to_string(),
-            args: vec![
-                "-m".to_string(),
-                "claude_mcp_servers.wrappers.excalidraw_proxy".to_string(),
-            ],
-            env: HashMap::new(),
-            min_tier: OrchestratorTier::Free,
-            port: None, // stdio MCP
-            configurable: false,
-            settings: HashMap::new(),
-        },
+        // NOTE (v0.2.101): the `mermaid` / `excalidraw` diagram wrapper MCPs
+        // were removed from this catalog. Their default registration was
+        // retired (mcp_registration.rs / install_mcp.py) and the Permissions
+        // tab no longer ships toggle cards for them; an install that already
+        // has the entries keeps them. The launcher's Diagrams tab never used
+        // these MCPs (it renders Mermaid in the webview and lists diagrams via
+        // Tauri commands), so it is unaffected.
     ]
 }
 
@@ -298,56 +229,38 @@ fn default_mcp_servers() -> Vec<McpServerConfig> {
 mod tests {
     use super::*;
 
-    /// v0.2.34 Agent D: regression test — the default MCP catalog MUST
-    /// include the diagrams wrapper MCPs so the launcher's global
-    /// "MCP Servers" tab + per-project Permissions tab render them.
-    /// Without this entry both surfaces were blind to mermaid/excalidraw
-    /// even though `mcp_registration.rs` wrote them into ~/.claude.json
-    /// (the catalog and the on-disk registration are two separate
-    /// surfaces; both must list the MCP).
+    /// v0.2.101: the default MCP catalog is exactly the builder set
+    /// (weaviate-kg + playwright). `search` was deleted and the diagram
+    /// wrapper MCPs (`mermaid`/`excalidraw`) were retired from default
+    /// registration — the catalog must NOT list them, or the Permissions tab
+    /// shows cards for servers no install path registers (the pre-v0.2.101
+    /// false-promise shape). Red-proof: re-add either id → this fails.
     #[test]
-    fn default_mcp_servers_includes_diagrams_wrappers() {
+    fn default_mcp_servers_is_the_builder_set() {
         let servers = default_mcp_servers();
         let ids: Vec<&str> = servers.iter().map(|s| s.id.as_str()).collect();
-        assert!(ids.contains(&"mermaid"), "default catalog must include mermaid wrapper MCP (got {:?})", ids);
-        assert!(ids.contains(&"excalidraw"), "default catalog must include excalidraw wrapper MCP (got {:?})", ids);
-    }
-
-    /// v0.2.34 Agent D: shape regression — the diagrams wrappers are
-    /// stdio MCPs (no port), free tier, default-enabled, not
-    /// user-configurable (no per-MCP env). Locks the catalog entry's
-    /// observable contract so a future refactor can't silently change
-    /// the per-project Permissions tab's behaviour.
-    #[test]
-    fn diagrams_wrapper_entries_have_expected_shape() {
-        let servers = default_mcp_servers();
-        for id in &["mermaid", "excalidraw"] {
-            let entry = servers
-                .iter()
-                .find(|s| s.id == *id)
-                .unwrap_or_else(|| panic!("missing MCP entry for {}", id));
-            assert!(entry.enabled, "{} should be default-enabled (opt-out diagrams feature)", id);
-            assert_eq!(entry.min_tier, OrchestratorTier::Free, "{} should be free-tier", id);
-            assert!(entry.port.is_none(), "{} is stdio MCP, port must be None", id);
-            assert!(!entry.configurable, "{} has no user-editable env, configurable=false", id);
-            assert!(entry.settings.is_empty(), "{} settings map should be empty", id);
-            assert!(!entry.command.is_empty(), "{} command should be set", id);
+        assert_eq!(ids, vec!["weaviate-kg", "playwright"]);
+        for retired in ["search", "mermaid", "excalidraw"] {
+            assert!(
+                !ids.contains(&retired),
+                "retired MCP `{}` must not be in the default catalog (got {:?})",
+                retired,
+                ids
+            );
         }
     }
 
-    /// The catalog should now expose exactly the five default MCPs:
-    /// weaviate-kg, search, playwright, mermaid, excalidraw. If a sixth
-    /// is added, bump this count + the contains_diagrams_wrappers test
-    /// will still pass. Pre-v0.2.34 this was 3.
+    /// Shape contract for the two remaining default MCPs: stdio, free tier,
+    /// default-enabled, and a non-empty command.
     #[test]
-    fn default_mcp_servers_count_is_five() {
+    fn default_mcp_servers_have_expected_shape() {
         let servers = default_mcp_servers();
-        assert_eq!(
-            servers.len(),
-            5,
-            "expected 5 default MCPs (weaviate-kg, search, playwright, mermaid, excalidraw), got {} — if a new MCP was added, bump this count",
-            servers.len()
-        );
+        for entry in &servers {
+            assert!(entry.enabled, "{} should be default-enabled", entry.id);
+            assert_eq!(entry.min_tier, OrchestratorTier::Free, "{} should be free-tier", entry.id);
+            assert!(entry.port.is_none(), "{} is stdio MCP, port must be None", entry.id);
+            assert!(!entry.command.is_empty(), "{} command should be set", entry.id);
+        }
     }
 }
 

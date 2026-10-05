@@ -394,7 +394,7 @@ fn parse_managed_paths_text(text: &'static str) -> Vec<&'static str> {
 /// whitelist. The root CLAUDE.md is the orchestrator-self's own
 /// development documentation, not a per-project scaffold. User
 /// projects render CLAUDE.md from `templates/CLAUDE.md.template` via
-/// the project-bootstrapper. `DEFAULT_PRESERVE_LIST` (below) still
+/// the project-bootstrapper skill. `DEFAULT_PRESERVE_LIST` (below) still
 /// includes `CLAUDE.md` because that's the user-edits-on-update
 /// concern, not the whitelist-copy concern this constant governs.
 ///
@@ -2867,6 +2867,14 @@ pub async fn install_orchestrator(
             for w in &report.db_warnings {
                 tracing::warn!("[vct] install_orchestrator: db warning: {}", w);
             }
+            // v0.2.101: an auto_scrub deprecated MCP (search) was removed from
+            // ~/.claude.json — its module no longer ships.
+            for name in &report.removed_deprecated {
+                tracing::info!(
+                    "[vct] install_orchestrator: removed obsolete MCP entry `{}` (module no longer ships)",
+                    name
+                );
+            }
         }
         Err(e) => {
             tracing::warn!(
@@ -3288,6 +3296,13 @@ async fn run_install_orchestrator_lightweight(
                         o.error.as_deref().unwrap_or("unknown")
                     );
                 }
+            }
+            // v0.2.101: an auto_scrub deprecated MCP (search) was removed.
+            for name in &report.removed_deprecated {
+                tracing::info!(
+                    "[vct] lightweight: removed obsolete MCP entry `{}` (module no longer ships)",
+                    name
+                );
             }
         }
         Err(e) => {

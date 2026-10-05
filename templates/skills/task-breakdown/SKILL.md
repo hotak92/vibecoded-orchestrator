@@ -1,6 +1,6 @@
 ---
 name: task-breakdown
-description: Breaks a complex feature or epic into implementable 1-2 hour tasks with three-point effort estimates, a dependency graph plus critical path, and a technical/scope/dependency risk assessment. Use when the user says "break down [feature] into tasks", "estimate effort for [feature]", "what are the dependencies for [X]", or "plan the implementation of [Y]". Not for already-decomposed work or single-step tasks.
+description: Breaks a feature or epic into implementable 1-2 hour tasks with three-point estimates, a critical-path dependency graph and risk assessment. Use for "break down / estimate / plan [feature]"; not already-decomposed or single-step work.
 short_desc: decompose feature into tasks, estimates, dependencies
 keywords: [task decomposition, effort estimation, dependency mapping, sprint planning, risk assessment, "implementation plan", "break into tasks", "task list for", "estimate this", "effort estimate", "decompose this"]
 model: sonnet

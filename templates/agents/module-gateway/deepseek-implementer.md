@@ -1,9 +1,10 @@
 ---
 name: deepseek-implementer
-description: Implementation lane routed to DeepSeek V4.1 Flash through the local claude-gw gateway (qwen vendor). Use for bounded, well-specified code fixes where the brief names the files and the acceptance criteria and the change needs real reasoning rather than mechanical application. Not for open-ended design; it is not a reviewer. Requires the model gateway.
+description: DeepSeek V4.1 Flash implementation lane via the claude-gw gateway (qwen vendor) for bounded, well-specified fixes needing real reasoning, not mechanical application. Not open-ended design; not a reviewer. Needs the model gateway.
 model: claude-gw/qwen/deepseek-v4.1-flash[1m]
 effort: medium
 tools: Read, Write, Edit, Grep, Glob, Bash
+disallowedTools: mcp__vct-coordination__*
 ---
 
 You implement a bounded, fully-specified fix package.

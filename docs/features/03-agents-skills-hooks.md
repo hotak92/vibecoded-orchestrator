@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 44 bundled agents, 54 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. Neither is dead code; both run standalone). Templates in `templates/agents/` and `templates/skills/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 6 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. Neither is dead code; both run standalone). Alongside them: 8 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -8,120 +8,33 @@ For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-
 
 ## Bundled Agents (`templates/agents/free/`)
 
-Free agents install to `~/.claude/agents/` via `install.py --with-agents` (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`, `skills`, `mcpServers`. The 44 agents split roughly into builders (write code), researchers (read & report), and lifecycle helpers (install / bootstrap-refinement); the list below describes the most-used of them, not all 44 — `ls templates/agents/free/` is the complete set. The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
+Default agents install to a project's `.claude/agents/` on the bundle install (default-on). Each agent is a single `.md` file with YAML frontmatter: `name`, `description`, `model` (required), plus optional `tools`, `effort`, `isolation`. v0.2.101 right-sized the catalogue to **11 default agents**: the topical specialists moved into opt-in packs (below), so a fresh install carries the general roles and a project adds the specialities it needs. `ls templates/agents/free/` is the complete set. The `project-migrator` agent was archived in v0.2.54 to `templates/agents/_archive/` — `install.py --add-project` and the launcher GUI's "+ Existing Project" tab now handle that flow automatically.
 
-**Every bundled agent declares `effort: medium`** (v0.2.97 — they all declared `high` in v0.2.96, and ten of them `xhigh` before that). Frontmatter effort *overrides* the session's level and cannot be overridden from the Agent tool, so the value a shipped agent pins is the value you get. `medium` is the shipped default; the few agents in genuinely hard-reasoning roles (deep research, incident response, adversarial review) are kept at `high`, which is the ceiling — `xhigh` and `max` are not used for subagents at all, both for the cost and because `xhigh` is rejected outright by models that do not expose extended thinking, making the agent fail to start rather than run more carefully. Raise it per-agent if you want it; the frontmatter still accepts `xhigh` and `max`, on a model you know supports them.
+**Every bundled agent declares `effort: medium`** (v0.2.97 — they all declared `high` in v0.2.96, and ten of them `xhigh` before that). Frontmatter effort *overrides* the session's level and cannot be overridden from the Agent tool, so the value a shipped agent pins is the value you get. `medium` is the shipped default for the whole default catalogue; the pack agents in genuinely hard-reasoning roles — `sre-incident-responder` (live-incident debugging) — are kept at `high`, which is the ceiling. `xhigh` and `max` are not used for subagents at all, both for the cost and because `xhigh` is rejected outright by models that do not expose extended thinking, making the agent fail to start rather than run more carefully. Raise it per-agent if you want it; the frontmatter still accepts `xhigh` and `max`, on a model you know supports them.
 
-**Gateway agents (machine-gated).** Bundled agents used to ship to every project unconditionally. `templates/agents/module-gateway/` holds **ten definitions**: the z.ai lane `glm-implementer`, `glm-reviewer`, `glm-planner` and `glm-flash-researcher`, plus the qwen-vendor lane `deepseek-implementer`, `qwen-implementer`, `qwen-flash-implementer`, `deepseek-researcher`, `qwen-flash-researcher` and `qwen-flash-sweeper`. Since v0.2.100 they follow the **machine**: every bundle update — a project's, and the orchestrator root's own — delivers them whenever the model gateway is set up on this machine (registered at login, running, or run before) **and** a VS Code panel points at it. A per-project switch (Services → Model gateway) overrides that either way: switched on, the project always receives them; switched off, it receives none and previously delivered copies are removed; toggling it runs the project's bundle update at once. If the installer cannot decide (launcher.db locked or unreadable, a settings file that does not parse), it adds nothing, removes nothing — previously delivered definitions are carried forward — and records `gated_delivery_unknown`; an explicit opt-out on a configured machine is recorded as `gated_delivery_skipped`. (Until v0.2.100 the only opener was that per-project switch, which nothing in the ordinary flow ever set, so the definitions reached no project.) The Services card also lists any agent definition — the project's or your own `~/.claude/agents` — whose `claude-gw/*` model id the gateway does not know, with the closest valid ids (`python -m vco_lib.module_gated_delivery check-agent-ids --folder <project>`). They are deliberately outside the 44 free-agent count, which measures `templates/agents/free/` alone. Spawn them by definition **name** with no model override — the Agent tool's model list cannot carry `claude-gw/*` ids, while an agent's own frontmatter can. (`glm-flash-reviewer` was retired in the same release: flash is kept for research and investigation, review moved to `glm-5.3`. An already-delivered copy is orphan-cleaned on the next bundle update if unmodified; an edited copy is kept on disk and simply no longer managed.) The qwen-vendor lane deliberately ships **no reviewer and no planner** definition: an implementation or research lane may be cheap, a verdict may not be — those two roles stay on the z.ai lane and the Anthropic tiers.
+**Gateway agents (machine-gated).** Bundled agents used to ship to every project unconditionally. `templates/agents/module-gateway/` holds **eight definitions**: the z.ai lane `glm-implementer`, `glm-reviewer`, `glm-planner` and `glm-flash-researcher`, plus the qwen-vendor lane `deepseek-implementer`, `qwen-implementer`, `deepseek-researcher` and `qwen-flash-sweeper`. (v0.2.101 folded `qwen-flash-researcher` into `deepseek-researcher` and `qwen-flash-implementer` into `qwen-flash-sweeper`; an already-delivered copy of either is orphan-cleaned on the next bundle update if unmodified, and kept on disk — no longer managed — if edited.) Since v0.2.100 they follow the **machine**: every bundle update — a project's, and the orchestrator root's own — delivers them whenever the model gateway is set up on this machine (registered at login, running, or run before) **and** a VS Code panel points at it. A per-project switch (Services → Model gateway) overrides that either way: switched on, the project always receives them; switched off, it receives none and previously delivered copies are removed; toggling it runs the project's bundle update at once. If the installer cannot decide (launcher.db locked or unreadable, a settings file that does not parse), it adds nothing, removes nothing — previously delivered definitions are carried forward — and records `gated_delivery_unknown`; an explicit opt-out on a configured machine is recorded as `gated_delivery_skipped`. (Until v0.2.100 the only opener was that per-project switch, which nothing in the ordinary flow ever set, so the definitions reached no project.) The Services card also lists any agent definition — the project's or your own `~/.claude/agents` — whose `claude-gw/*` model id the gateway does not know, with the closest valid ids (`python -m vco_lib.module_gated_delivery check-agent-ids --folder <project>`). They are deliberately outside the 11 free-agent count, which measures `templates/agents/free/` alone. Spawn them by definition **name** with no model override — the Agent tool's model list cannot carry `claude-gw/*` ids, while an agent's own frontmatter can. (`glm-flash-reviewer` was retired in the same release: flash is kept for research and investigation, review moved to `glm-5.3`. An already-delivered copy is orphan-cleaned on the next bundle update if unmodified; an edited copy is kept on disk and simply no longer managed.) The qwen-vendor lane deliberately ships **no reviewer and no planner** definition: an implementation or research lane may be cheap, a verdict may not be — those two roles stay on the z.ai lane and the Anthropic tiers.
 
-### `coder` (Sonnet, `isolation: worktree`)
-Writes code from a spec, following patterns from the KG. Runs in git worktree isolation by default.
+### Default agents (11)
 
-<details>
-<summary>Details</summary>
+- **`expert-coder`** (Opus, `isolation: worktree`) — implementation for features, refactors and fixes of any size; absorbs the former `coder`, `backend-specialist` and `api-integration-scaffolder` roles. Before backend or API-client work, read `.claude/specializations/fields/backend.md` / `fields/api-design.md`.
+- **`frontend-specialist`** (Sonnet) — React/Vue/Svelte components, forms, routing, client state.
+- **`code-explorer`** (Haiku) — read-heavy codebase research; can also write findings reports to `.claude/context/`, `docs/` or `knowledge/`.
+- **`web-explorer`** (Haiku) — read-only web / docs research; absorbs the former `deep-researcher` "deep mode" (decompose the question, recurse per sub-question, synthesise with provenance).
+- **`planner`** (Opus) — requirements analysis, architecture/design, and phased task breakdowns; absorbs the former `project-architect`.
+- **`tester`** (Sonnet) — pytest unit/integration/edge-case tests, failure investigation to root cause, and coverage review.
+- **`gui-tester`** (Sonnet) — automated GUI testing through the Playwright MCP (navigate, screenshot, click, type, evaluate).
+- **`doc-maintainer`** (Sonnet) — create, update and organise project docs and knowledge files; absorbs the former `doc-extractor`, `doc-organizer` and `project-organizer`.
+- **`kg-maintainer`** (Sonnet) — KG search, node creation/updates, duplicate and health checks; merges the former `kg-navigator`, `knowledge-curator` and `graph-health-checker`.
+- **`code-reviewer`** (Fable, read-only tools) — adversarial review of code, tests, security, architecture and docs-vs-code; returns findings with evidence and never edits.
+- **`agent-author`** (Sonnet) — writes and refines agent definitions, skill files and helper scripts; absorbs the former `helper-scripter` and `prompt-engineer`.
 
-Tools: Read, Write, Edit, Grep, Glob, Bash, plus the `weaviate-kg` MCP tools registered in `~/.claude.json`. Worktree isolation puts changes on a throwaway branch until reviewed — a half-finished implementation can't dirty the working directory.
+### Gateway agents (machine-gated)
 
-</details>
+The eight machine-gated definitions are described in the paragraph above (`templates/agents/module-gateway/`).
 
-### `planner` (Sonnet)
-Requirements analysis, architectural design, and task breakdown. Injects `task-breakdown` and `architect` skills.
+### Opt-in packs (`templates/packs/`)
 
-### `tester` (Sonnet)
-Test creation, verification, and bug investigation. Injects `code-review-expert` skill.
-
-### `code-explorer` (Haiku)
-Read-heavy research agent that can also write findings reports.
-
-<details>
-<summary>Details</summary>
-
-Tools: Read, Glob, Grep, Bash, Write, Edit. Unlike the built-in Explore agent (read-only), `code-explorer` can save findings to `.claude/context/`, `docs/`, or `knowledge/`. Use for audits, gap analyses, pattern inventories. Write scope is enforced by convention in the agent's system prompt rather than tool restriction. Haiku keeps cost low for scan-heavy tasks.
-
-</details>
-
-### `code-migrator` (Sonnet, `isolation: worktree`)
-Migrate code between languages, frameworks, or versions. Injects `architecture-consultant` skill.
-
-### `helper-scripter` (Haiku, `isolation: worktree`)
-Create hooks, scripts, agents, and skills. Self-improves the automation system.
-
-### `doc-extractor` (Sonnet)
-Pulls knowledge out of scattered docs and into KG nodes. Read-only on its sources by instruction, not enforcement: the agent's frontmatter declares no hook, and its tool list includes `Write`/`Edit` for the extraction reports it produces.
-
-### `doc-maintainer` (Sonnet)
-Keeps documentation current and prunes stale material — but always extracts to the KG before archival, so context isn't lost when files are removed.
-
-### `doc-organizer` (Sonnet)
-Detects/merges duplicates, moves loose files, archives old docs, maintains the doc tree. Does not write new documentation — only organizes what exists.
-
-### `graph-health-checker` (Haiku)
-Validates KG and code-graph integrity: orphaned nodes, broken links, missing metadata. Background maintenance trigger.
-
-### `knowledge-curator` (Haiku)
-Extracts WikiLink relationships from KG nodes and updates Weaviate cross-references. Background maintenance.
-
-### `kg-navigator` (Sonnet)
-Searches and explores the KG, surfaces relevant patterns before implementation, flags gaps. Read-only (Read, Grep, Bash only).
-
-### `code-graph-updater` (Haiku)
-Incremental code-graph updates when files change. Background maintenance trigger.
-
-### `gui-tester` (Sonnet, explicit model: `claude-sonnet-4-6`)
-Automated GUI testing through Playwright MCP: navigate, screenshot, click, type, evaluate. Produces structured reports on layout, functionality, and regressions.
-
-<details>
-<summary>Details</summary>
-
-Tools: restricted to Playwright MCP tools only (`mcp__playwright__browser_*`). Requires the Playwright MCP to be connected in `~/.claude.json`. Used for visual regression testing, frontend bug reproduction, and automated UI verification.
-
-</details>
-
-### `web-explorer` (Haiku)
-The web counterpart to `code-explorer`: searches, reads pages, cross-references with local files, writes a single markdown report.
-
-### `prompt-engineer` (Sonnet)
-Reviews and rewrites agent prompts using current Claude 4.x patterns.
-
-### `orchestrator-installer` (Opus)
-Diagnose and recover from a partially-failed install. Canonical install path: `bash first-install.sh` → `install.py`.
-
-### `project-bootstrapper` (Sonnet)
-Refine bootstrap docs (CLAUDE.md, ARCHITECTURE.md) after the launcher's "+ New/Existing Project" flow generates them.
-
----
-
-### `expert-coder` (Opus, `isolation: worktree`)
-Complex implementation work that needs cross-layer architectural reasoning, security analysis, or multi-layer debugging. Use sparingly — Sonnet handles most implementations fine and costs less.
-
-### `project-architect` (Sonnet)
-End-to-end project design: requirements, architecture, implementation plan. Injects `architect` + `architecture-consultant` skills.
-
-### `ai-agentic-architect` (Sonnet)
-Designs multi-agent systems and agentic workflows with coordination strategies. Injects `architect` + `task-breakdown` skills.
-
-### `project-coordinator` (Sonnet)
-Coordinates multi-agent workflows, tracks progress, manages blackboard task assignment.
-
-### `project-organizer` (Sonnet)
-Keeps the project tidy over time and captures cross-project patterns for reuse.
-
-### `backend-specialist` (Sonnet, `isolation: worktree`)
-APIs, services, databases, business logic. Injects `api-designer` + `database-advisor` skills.
-
-### `frontend-specialist` (Sonnet, `isolation: worktree`)
-React/Vue/Svelte components, forms, routing. Injects `react-patterns` + `accessibility-checker` skills.
-
-### `gui-expert` (Sonnet)
-Designs and implements Gradio web applications with WCAG 2.1 AA compliance.
-
-### `ai-llm-expert` (Sonnet)
-LLM integration work: prompt engineering, context management, multi-model routing, cost optimization. Injects `ai-prompting` + `ai-model-selector` skills.
-
-### `deep-researcher` (Sonnet)
-Multi-level web research: spawns recursive sub-agents to chase down branches without losing the parent thread.
-
----
+v0.2.101 moved the topical specialists out of the default catalogue into **eleven opt-in packs**, so an install carries only the roles it needs: `dev-advisors`, `devops-reliability`, `ai-engineering`, `science`, `marketing-sales-product`, `consulting`, `design-media`, `design-ux`, `gtm-marketing`, `ops-sre`, `migration`. A pack installs with `install-bundle --pack <name>` (or the launcher's Packs tab), records itself in the project manifest, and comes along on every later bundle update; `--remove-pack` backs a modified member up before removing it. Members are ordinary agent and skill definitions — e.g. `dev-advisors` carries the `architect`, `debug-expert`, `security-reviewer`, `accessibility-checker` and `ai-rag-advisor` skills; `ops-sre` carries the `sre-incident-responder`, `postmortem-author` and `automation-engineer` agents.
 
 ## Worktree Isolation
 
@@ -131,69 +44,28 @@ Agents with `isolation: worktree` run in a temporary git worktree (isolated bran
 
 ## Bundled Skills (`templates/skills/`)
 
-Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`, or list them in an agent's `skills:` frontmatter. Install to `~/.claude/skills/` via `install.py --with-skills` (default-on). 54 skills, organized across multiple model tiers (Opus for deep reasoning, Sonnet for implementation guidance, Haiku for quick checks).
+Skills are smaller and lighter than agents — they're injected into context as a single `SKILL.md` file rather than spawning a fresh process. Invoke directly via `/skill-name`. v0.2.101 right-sized the catalogue to **6 default skills**: the topical review/advisor skills moved into the opt-in packs, and several former skills now ship as reference docs under `.claude/specializations/`. (Agent `skills:` frontmatter was retired in the same release — specialist depth is read from the specialisation docs instead.)
 
-### Opus-tier skills (deep reasoning)
+### Default skills (6)
 
-**`architect`** — Design complex system architectures, evaluate tradeoffs, make critical technical decisions. (`templates/skills/architect/SKILL.md`)
+- **`context-compress`** — the `/compact` pipeline (what it saves and reinjects) plus `CONTEXT_STATE.md` inspection and maintenance. Absorbs the former `context` skill.
+- **`fix-issue`** — investigate and fix a GitHub issue or bug report: read, reproduce, root-cause, fix, add a regression test.
+- **`rc-native`** — run Claude Code Remote Control (claude.ai/code + mobile) as a detached native-auth server alongside the gateway panel.
+- **`task-breakdown`** — break a feature or epic into estimated tasks with a dependency graph and a risk assessment.
+- **`orchestrator-installer`** — diagnose a partially-failed VCO install and advise on `install.py` flags (re-assigned from an agent).
+- **`project-bootstrapper`** — a human-led second pass over the seeded CLAUDE.md / ARCHITECTURE.md / knowledge nodes (re-assigned from an agent).
 
-**`architecture-consultant`** — Cross-domain architecture decisions: technology selection, infrastructure design, long-term tradeoff analysis. (`templates/skills/architecture-consultant/SKILL.md`)
+### Pack skills
 
-**`code-review-expert`** — Deep code analysis: subtle bugs, security issues, performance problems, architectural concerns. (`templates/skills/code-review-expert/SKILL.md`)
+The packs carry the topical skills that used to ship by default — among them `security-reviewer`, `debug-expert`, `architect`, `accessibility-checker` and `ai-rag-advisor` (`dev-advisors`); `terraform-plan-reviewer`, `k8s-manifest-reviewer`, `slo-designer`, `idempotency-keys` and `webhook-receiver` (`devops-reliability`); `equation-check`, `hpc-submit`, `repro-audit` and `stats-consult` (`science`); `seo-content-brief` and `saas-pricing-strategist` (`marketing-sales-product`); `gui-ux-expert` and `design-system-auditor` (`design-media`); and the consulting / design / gtm / ops groups. Install the packs you need.
 
-**`debug-expert`** — Investigate complex bugs, intermittent failures, performance degradations across multiple components. (`templates/skills/debug-expert/SKILL.md`)
+### Specialisation docs (`.claude/specializations/`)
 
-**`security-reviewer`** — Cross-layer security analysis: frontend XSS/CSRF, backend injection, AI prompt injection, infrastructure. (`templates/skills/security-reviewer/SKILL.md`)
+Former specialist skills now ship as plain reference documents the agents read on demand, referenced by ONE line in the agent's body with the exact path (e.g. "Read `.claude/specializations/fields/backend.md` before starting backend-heavy work"):
 
-### Sonnet-tier skills
-
-**`ai-model-selector`** — Quick guidance on choosing AI models (LLM/VLM/Embedding) based on task, VRAM, cost, quality. (`templates/skills/ai-model-selector/SKILL.md`)
-
-**`ai-rag-advisor`** — RAG system design: chunking strategies, embedding selection, retrieval methods, vector DB choices. (`templates/skills/ai-rag-advisor/SKILL.md`)
-
-**`api-designer`** — API design guidance: REST vs GraphQL vs gRPC, endpoint patterns, auth strategies, versioning. (`templates/skills/api-designer/SKILL.md`)
-
-**`database-advisor`** — Database design, schema optimization, query performance, technology selection. (`templates/skills/database-advisor/SKILL.md`)
-
-**`deployment-advisor`** — Deployment strategy: platform selection, CI/CD pipeline design, environment config, monitoring. Includes example CI/CD workflows and platform comparison docs. (`templates/skills/deployment-advisor/SKILL.md`)
-
-**`explore-codebase`** — Systematic codebase onboarding: structure, architecture, key data models, entry points, auth patterns. Argument hint: `[project-path-or-question]`. (`templates/skills/explore-codebase/SKILL.md`)
-
-**`extract-docs`** — Systematically extract knowledge from scattered documentation to prevent catastrophic forgetting. Creates structured extraction reports with status tags. Argument hint: `[source-path-or-pattern]`. (`templates/skills/extract-docs/SKILL.md`)
-
-**`fix-issue`** — Investigate and fix a GitHub issue or bug: read, reproduce, root-cause, implement fix, add regression test. Argument hint: `[issue-url-or-description]`. (`templates/skills/fix-issue/SKILL.md`)
-
-**`gui-test`** — Automated visual testing with Playwright MCP across multiple reviewer perspectives. (`templates/skills/gui-test/SKILL.md`)
-
-**`gui-ux-expert`** — Quick GUI/UX/UI design consultations and recommendations. (`templates/skills/gui-ux-expert/SKILL.md`)
-
-**`interview`** — Interview the user via `AskUserQuestion` to discover requirements for a feature or task. Writes final spec to `SPEC.md`. Argument hint: `[feature-or-task-description]`. (`templates/skills/interview/SKILL.md`)
-
-**`kg-research`** — Research using ONLY knowledge graph semantic search — no file tools, forces KG-first approach. Argument hint: `[search-query]`. (`templates/skills/kg-research/SKILL.md`)
-
-**`performance-optimizer`** — Cross-domain performance analysis: frontend render, backend queries, AI model inference. Includes optimization checklist and pattern examples. (`templates/skills/performance-optimizer/SKILL.md`)
-
-**`react-patterns`** — React best practices: component patterns, state management selection, performance optimization, testing strategies. Includes component pattern, performance, and state management examples. (`templates/skills/react-patterns/SKILL.md`)
-
-**`task-breakdown`** — Break complex features into implementable tasks with estimates, dependencies, and risk matrix. Includes dependency patterns, estimation methods, and risk matrix examples. (`templates/skills/task-breakdown/SKILL.md`)
-
-**`tdd`** — Test-Driven Development workflow: write failing test first, implement to pass. Argument hint: `[feature-or-bug-description]`. (`templates/skills/tdd/SKILL.md`)
-
-**`workflow-maintain`** — Analyze project workflow setup and suggest/create needed automation for hooks, scripts, skills, agents. (`templates/skills/workflow-maintain/SKILL.md`)
-
-### Haiku-tier skills (cheap/fast)
-
-**`accessibility-checker`** — Quick A11y review: WCAG 2.1 checklist, screen reader compatibility, keyboard navigation, color contrast. Includes contrast check script and examples. (`templates/skills/accessibility-checker/SKILL.md`)
-
-**`ai-prompting`** — Prompt engineering tips and templates: few-shot, chain-of-thought, constraint specification, output formatting. (`templates/skills/ai-prompting/SKILL.md`)
-
-**`context`** — Efficient context state inspection, task lifecycle management, session tracking. (`templates/skills/context/SKILL.md`)
-
-**`context-compress`** — Guide for `/compact` with the pre-compact save pipeline. Documents what gets saved and reinjected. Argument hint: `[focus-topic]`. (`templates/skills/context-compress/SKILL.md`)
-
-**`doc-template`** — Documentation templates: README, API docs, ADRs, user guides. Includes README template. (`templates/skills/doc-template/SKILL.md`)
-
-**`hardware-calculator`** — Quick VRAM/RAM calculations, hardware recommendations, AI model feasibility checks. (`templates/skills/hardware-calculator/SKILL.md`)
+- `fields/` — `backend`, `api-design`, `database`, `deployment`, `frontend`, `prompt-engineering`
+- `review-kinds/` — `code`, `security`, `test`, `architecture-design`, `docs-vs-code`
+- `review-topics/` — `performance`, `frontend-ui-a11y`, `database-migrations`, `api-design`, `infra-ci`, `data-ml`
 
 ---
 
@@ -440,11 +312,8 @@ A hook's `.claude/settings.json` entry is merged by `_merge_hooks_for_bundle`, w
 
 ## Composition Patterns
 
-### Agent → Skill injection
-The `skills:` list in agent frontmatter injects skill `SKILL.md` files into the agent's context window before it runs. This provides the agent with specialist knowledge and decision frameworks without changing its tool permissions. Example: `planner` injects `task-breakdown` (Sonnet) and `architect` (Opus) — Opus-level reasoning is available as a reference even though the planner itself runs on Sonnet.
-
-### Blackboard coordination
-The `project-coordinator` agent implements a blackboard pattern: agents volunteer for tasks from a shared `CONTEXT_STATE.md` rather than receiving delegated assignments. This pattern reduces inter-agent communication overhead and supports parallelism without a central scheduler: the shared file is the only coordination point, so no agent needs to know which others exist or wait on them.
+### Specialisation docs, not skill injection
+v0.2.101 retired agent `skills:` frontmatter in favour of on-demand specialisation docs: an agent's body names the exact `.claude/specializations/…` path to read before a specialist task, and reads it only when the agent runs — the depth is available as a reference without loading every skill into every context. Example: `expert-coder` points at `fields/backend.md` and `fields/api-design.md`; `code-reviewer` points at the `review-kinds/` and `review-topics/` docs matching the review it is running.
 
 ### Hook → Agent delegation
 Several hooks spawn background Claude Code agents for heavyweight tasks: `kg-summary-generator.sh` → Haiku agent to update KG summaries; `post-git-commit-kg-sync.sh` → Haiku agent to sync KG after commits. All delegating hooks guard with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside subprocesses.

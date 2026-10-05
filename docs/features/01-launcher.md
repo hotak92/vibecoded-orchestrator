@@ -437,7 +437,7 @@ Lists which other projects can read this project's code graph (or none).
 Sets the access level (`read` / `none`) between two projects. Audits the grant.
 
 ### Reading access and counts
-`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the search MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph; a subgraph is available through the `codegraph-diagram` skill) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
+`codegraph_list_projects` returns every project card with its per-class counts and the acting project's access level (read / none), and drives the `/codegraph` dashboard. There is no per-call access-check command: cross-project code-graph reads are enforced by the weaviate-kg MCP through `VCT_CODE_GRAPH_ACCESS_LIST`, which the launcher projects from the `codegraph_access` table. The retired v0.2.100 commands `codegraph_check_access`, `codegraph_summary`, `codegraph_load_graph` (the in-launcher force-layout graph; a subgraph is available through the `vco codegraph-diagram` CLI) and `codegraph_set_entity_access_bulk` (per-entity access was project-level by design, and nothing read the property it wrote) are gone.
 
 ---
 
@@ -482,7 +482,7 @@ Empties the local queue without uploading. Audits the action.
 
 ## Installer Commands (`commands/installer.rs`)
 
-Twenty-one commands wired in `lib.rs` cover the orchestrator-installer surface used by the install screen and the GitHub-PAT keychain UI.
+Twenty-one commands wired in `lib.rs` cover the orchestrator-install surface used by the install screen and the GitHub-PAT keychain UI.
 
 ### Detection
 - `detect_system()` — OS, Python version, container runtime, GPU.

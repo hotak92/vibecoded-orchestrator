@@ -103,7 +103,7 @@ python3 install.py --bootstrap                            # human-readable summa
 4. Pulls embedding models (`qwen3-embedding:0.6b` by default; CodeSage-Large-v2 on GPU installs; the code backend's fallback chain is CodeSage → qwen3 → Jina, picked at construction time)
 5. Writes `.env`, `.claude/settings.json` (canonical MCP-env channel — propagates to MCP subprocesses on every Claude Code surface), and `.claude/env` (POSIX shell-sourceable copy). `.vscode/settings.json` is touched only for VS Code editor preferences (Pylance/watcher excludes); `.vscode/tasks.json` is written so that opening the folder in VS Code runs the same `session-start-ensure-hub` hook Claude Code runs on `SessionStart` — which ensures `vct-hub`, the model gateway (when one is registered) and the launcher GUI (when session-autostart is on)
 6. Copies 44 agent templates into `.claude/agents/` and 54 skill templates into `.claude/skills/`; renders 46 hooks (both `.sh` and `.ps1` per hook on every OS — cross-OS workflows don't get stale orphans) into `.claude/hooks/`
-7. Registers four MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) and `search` (academic-paper search via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` (Mermaid diagram describe/extract) and `excalidraw` (Excalidraw diagram describe/extract) are **registered but default-disabled per project** via `BUNDLED_MCP_DEFAULT_DISABLED` in `launcher/src-tauri/vct-launcher-core/src/db/project_mcp_servers.rs` (`claude mcp list` shows them connected, but their tools are not callable until you opt in via the launcher's Diagrams tab). Since v0.2.91 that claim holds for **every** seeding path: the fresh-insert default-disabled rule lives in one shared DB helper (`register_project_mcp_server_honoring_defaults`) used by the filesystem-mirror populate, by the install-time registration DB-sync, and by the launcher's convergence pass — previously the registration DB-sync seeded them `enabled = 1`. A row that already exists is never re-flagged, so a deliberate opt-in survives every later pass. A fifth MCP — `playwright` (browser automation) — is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
+7. Registers two MCP servers in `~/.claude.json`: `weaviate-kg` (semantic + graph search) is **enabled by default per project**, and `playwright` (browser automation) is **enabled by default** and invoked separately via `npx -y @playwright/mcp@latest`; install.py pre-caches it at `_install_playwright_browsers`. Opt out with `VCT_SKIP_PLAYWRIGHT=1`. Being registered as a bare `npx` command, it is only spawnable when `npx` resolves on PATH — the doctor phase at the end of every install/update checks exactly that and defers `npx_missing_mcp_unspawnable` when it does not. Disable either server for a single project in the launcher's Permissions tab: it writes `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code honours for user-scope servers. (v0.2.101 removed the `search` paper MCP and stopped registering the `mermaid`/`excalidraw` diagram wrappers by default; a legacy install keeps those entries.) The code-embedding service is a backend HTTP service on `:11440`, not an MCP — it's started in step 3 alongside Weaviate/Ollama.
 8. Deploys the detached `vct-hub` binary alongside the launcher, invokes `vct-hub --start-if-not-running`, probes `/health`. The hub listens on `127.0.0.1:7700` by default (`VCT_HUB_PORT` to override); auth via fresh-per-startup bearer token at `<vct_root>/hub.token` (mode `0o600`)
 
 ### Code-embedding backend by host
@@ -246,13 +246,15 @@ Verify MCP servers connected:
 
 ```bash
 claude mcp list
-# Expected: weaviate-kg ✓, search ✓, mermaid ✓, excalidraw ✓, playwright ✓
-# All 5 register as Connected. mermaid + excalidraw are project-default-disabled
-# (BUNDLED_MCP_DEFAULT_DISABLED at project_mcp_servers.rs:73-76) — connect but
-# their tools won't be callable until you opt in via the launcher's Diagrams tab.
+# Expected: weaviate-kg ✓, playwright ✓
+# Both register as Connected and are enabled per project. Disable one for a
+# single project in the launcher's Permissions tab — it writes
+# ~/.claude.json projects[<project>].disabledMcpServers, the channel Claude Code
+# honours. (v0.2.101 deleted the search MCP and stopped registering the diagram
+# wrapper MCPs; a legacy entry you already have keeps working.)
 # Ollama runs as embedding infrastructure (Weaviate vectorizer + code-embed CPU
 # fallback) — visible in `podman ps` / `docker ps`, no MCP wrapper. Pro-tier MCPs
-# is Pro-tier and excluded from the default install.
+# are excluded from the default install.
 ```
 
 Verify the hub is up:

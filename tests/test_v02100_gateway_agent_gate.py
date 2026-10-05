@@ -2,7 +2,7 @@
 # Copyright (c) 2026 VibeCoded Tools
 """v0.2.100 WP-10 (AD-7, U20) — the gateway agent gate, end to end.
 
-The ten ``templates/agents/module-gateway/`` definitions reached no project on
+The ``templates/agents/module-gateway/`` definitions reached no project on
 any machine before this release: the only opener was a per-project launcher.db
 row nothing in the ordinary flow wrote, and "could not read the DB" collapsed
 into "no" on a path that DELETES (L5-F01/F02). These tests pin the rebuilt
@@ -19,7 +19,7 @@ and the REAL bundle engine:
 * a retired definition is orphan-removed on a decisive run (F-W1-18) and
   carried forward on an undecidable one;
 * the machine signal's own legs (registration x panel, tri-state);
-* the shipped set is EXACTLY the owner's ten, and every ``model:`` id is one
+* the shipped set is EXACTLY the owner's eight, and every ``model:`` id is one
   the gateway registry routes and knows (F-W1-11a / F-W1-17);
 * the hand-written-definition check names the closest valid ids.
 
@@ -60,14 +60,16 @@ from vco_lib.deferral_report import DeferralReport  # noqa: E402
 GATED_SRC = REPO_ROOT / "templates" / "agents" / "module-gateway"
 UUID = "0f1e2d3c-4b5a-6978-8976-a5b4c3d2e1f0"
 
-#: The owner's shipped set (F-W1-17, owner correction 2026-09-29): z.ai
-#: implementer/reviewer/planner/flash-researcher and the six qwen-provider
-#: lanes. NO flash reviewer on either provider.
+#: The owner's shipped set (F-W1-17, owner correction 2026-09-29; reduced to
+#: eight in v0.2.101 when ``qwen-flash-researcher`` folded into
+#: ``deepseek-researcher`` and ``qwen-flash-implementer`` into
+#: ``qwen-flash-sweeper``): z.ai implementer/reviewer/planner/flash-researcher
+#: and the four qwen-provider lanes. NO flash reviewer on either provider.
 OWNER_SHIPPED_SET = frozenset({
     "glm-implementer.md", "glm-reviewer.md", "glm-planner.md",
     "glm-flash-researcher.md",
-    "qwen-implementer.md", "qwen-flash-implementer.md",
-    "qwen-flash-sweeper.md", "qwen-flash-researcher.md",
+    "qwen-implementer.md",
+    "qwen-flash-sweeper.md",
     "deepseek-implementer.md", "deepseek-researcher.md",
 })
 
@@ -252,7 +254,7 @@ class GateVerdictTableTests(_Env):
 
 
 class BundleDeliveryTests(_Env):
-    def test_configured_machine_no_row_delivers_all_ten_to_a_project(self) -> None:
+    def test_configured_machine_no_row_delivers_all_eight_to_a_project(self) -> None:
         self.db()
         with _patch_signal(True):
             self.install()
@@ -280,7 +282,7 @@ class BundleDeliveryTests(_Env):
         with _patch_signal(False):
             result = self.install()
         self.assertEqual(self.delivered(), set())
-        self.assertIn(str(Path(".claude") / "agents" / "coder.md"),
+        self.assertIn(str(Path(".claude") / "agents" / "example-agent.md"),
                       result["actions"]["create"])
 
     def test_explicit_off_delivers_nothing_and_records_the_skip(self) -> None:
@@ -429,7 +431,7 @@ class RecordGateOutcomesTests(unittest.TestCase):
             {"source": "templates\\agents\\module-gateway\\glm-implementer.md"},
             outcomes))
         self.assertFalse(mgd.carries_forward(
-            {"source": "templates/agents/free/coder.md"}, outcomes))
+            {"source": "templates/agents/free/example-agent.md"}, outcomes))
         deliver = mgd.GateVerdict(mgd.GateState.DELIVER, "machine", "x")
         self.assertFalse(mgd.carries_forward(
             {"source": "templates/agents/module-gateway/glm-implementer.md"},
@@ -524,11 +526,11 @@ class MachineSignalTests(unittest.TestCase):
 
 
 class ShippedDefinitionContractTests(unittest.TestCase):
-    def test_the_shipped_set_is_exactly_the_owners_ten(self) -> None:
+    def test_the_shipped_set_is_exactly_the_owners_eight(self) -> None:
         shipped = {p.name for p in GATED_SRC.iterdir() if p.is_file()}
         self.assertEqual(shipped, OWNER_SHIPPED_SET,
                          "templates/agents/module-gateway/ must hold exactly the "
-                         "owner's ten definitions (no flash reviewer, no strays)")
+                         "owner's eight definitions (no flash reviewer, no strays)")
         self.assertEqual(set(MODULE_GATEWAY_AGENT_FILES), OWNER_SHIPPED_SET)
 
     def test_every_model_id_routes_and_is_known_to_the_registry(self) -> None:

@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 # Copyright (c) 2026 VibeCoded Tools
-"""Project-own hooks registered by a RELATIVE ``.claude/hooks/...`` path —
-detected by the bundle update and OFFERED an anchored rewrite (v0.2.100 WP-17,
-F-W1-16).
+"""Project-own hooks registered by a RELATIVE ``.claude/hooks/...`` or
+``.claude/scripts/...`` path — detected by the bundle update and OFFERED an
+anchored rewrite (v0.2.100 WP-17, F-W1-16; ``.claude/scripts/`` added v0.2.101
+NB-13).
 
 Why
 ===
@@ -62,28 +63,47 @@ CID = "project_hooks_relative_paths"
 #: The settings files Claude Code reads hooks from, project-relative.
 SETTINGS_FILES = (".claude/settings.json", ".claude/settings.local.json")
 
-#: An invoked script under ``.claude/hooks/`` by a path that does NOT start at
-#: the project root (after quote-stripping and ``\\`` -> ``/``).
+#: An invoked hook script under ``.claude/hooks/`` by a path that does NOT
+#: start at the project root (after quote-stripping and ``\\`` -> ``/``).
 _RELATIVE_HOOK_RE = re.compile(r"^(?:\./)?\.claude/hooks/([A-Za-z0-9][A-Za-z0-9._-]*\.(?:sh|ps1))$")
+
+#: An invoked script under ``.claude/scripts/`` by a relative path (v0.2.101,
+#: NB-13). The subpath allows ``/`` segments and extension-less scripts
+#: (``kg-sync``, ``lib/vct_project_config.sh``); the identity is the
+#: project-relative path, NOT the basename — basenames collide across the
+#: script subfolders.
+_RELATIVE_SCRIPT_RE = re.compile(r"^(?:\./)?\.claude/scripts/([A-Za-z0-9][A-Za-z0-9._/-]*)$")
 
 
 def relative_scripts(command: Any) -> List[str]:
-    """Basenames of the ``.claude/hooks/`` scripts ``command`` INVOKES by a
-    relative path. An already-anchored command, a hook path that is only an
-    ARGUMENT, and a non-string all yield ``[]``."""
+    """Identities of the project scripts ``command`` INVOKES by a relative
+    path: a ``.claude/hooks/<basename>`` hook contributes its basename; a
+    ``.claude/scripts/<subpath>`` script contributes its project-relative path
+    (``.claude/scripts/kg-sync``) — a script basename collides across
+    subfolders (``lib/x.sh``), so the path is the identity. An already-anchored
+    command, a path that is only an ARGUMENT, and a non-string all yield
+    ``[]``."""
     if not isinstance(command, str) or not command:
         return []
     found: List[str] = []
     for token in invoked_script_tokens(command):
         match = _RELATIVE_HOOK_RE.match(token)
-        if match and match.group(1) not in found:
-            found.append(match.group(1))
+        if match:
+            identity = match.group(1)
+        else:
+            match = _RELATIVE_SCRIPT_RE.match(token)
+            if not match:
+                continue
+            identity = f".claude/scripts/{match.group(1)}"
+        if identity not in found:
+            found.append(identity)
     return found
 
 
 def find_relative_hook_commands(hooks_block: Any) -> List[Dict[str, Any]]:
-    """Every hook item in ``hooks_block`` that invokes a ``.claude/hooks/``
-    script relatively, with the anchored command the rewrite would write."""
+    """Every hook item in ``hooks_block`` that invokes a project-own
+    ``.claude/hooks/`` or ``.claude/scripts/`` script relatively, with the
+    anchored command the rewrite would write."""
     out: List[Dict[str, Any]] = []
     if not isinstance(hooks_block, dict):
         return out
@@ -135,8 +155,9 @@ def relative_hooks_still_present(folder: Path) -> Optional[bool]:
 
 
 def anchor_relative_hooks(folder: Path, *, dry_run: bool = False) -> Dict[str, Any]:
-    """Rewrite every relative ``.claude/hooks/`` invocation in ``folder``'s
-    settings files to the anchored form, through the ONE settings writer.
+    """Rewrite every relative ``.claude/hooks/`` or ``.claude/scripts/``
+    invocation in ``folder``'s settings files to the anchored form, through the
+    ONE settings writer.
 
     Returns ``{"changed": {file: [{event, matcher, command, anchored}]},
     "refused": {file: message}}``. A file the writer refuses (symlink,
@@ -213,7 +234,8 @@ def emit_relative_hooks_deferral(folder: Path, *, log: Callable[..., Any]) -> bo
             title="Project hooks registered by a relative path fail after a `cd`",
             detected=(
                 f"{count} hook command(s) in this project's own settings invoke a "
-                f"`.claude/hooks/` script by a RELATIVE path:\n{_listing(found)}\n"
+                f"project script (`.claude/hooks/` or `.claude/scripts/`) by a "
+                f"RELATIVE path:\n{_listing(found)}\n"
                 "Claude Code runs a hook in the session's CURRENT directory, so once the "
                 "session (or a subagent) works from a subdirectory these fail with "
                 "\"No such file or directory\" on every call — the hook silently stops "
@@ -238,8 +260,8 @@ def emit_relative_hooks_deferral(folder: Path, *, log: Callable[..., Any]) -> bo
             f"could not record {count} relative hook command(s): {exc}")
         return False
     log("4.bundle.settings.relative_hooks", "warn" if emitted else "ok",
-        f"{count} project hook command(s) use a relative .claude/hooks/ path; "
-        "anchored rewrite offered in UPDATE_DEFERRED.md",
+        f"{count} project hook command(s) use a relative .claude/hooks/ or "
+        ".claude/scripts/ path; anchored rewrite offered in UPDATE_DEFERRED.md",
         data={"found": found})
     return bool(emitted)
 
@@ -252,7 +274,8 @@ def emit_relative_hooks_deferral(folder: Path, *, log: Callable[..., Any]) -> bo
 def main(argv: Optional[Sequence[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m vco_lib.hook_relative_paths",
-        description="Find / anchor project hooks registered by a relative .claude/hooks/ path.")
+        description="Find / anchor project hooks registered by a relative "
+                    ".claude/hooks/ or .claude/scripts/ path.")
     sub = parser.add_subparsers(dest="op", required=True)
     for name, help_text in (("list", "Report relative hook commands (read-only)."),
                             ("anchor", "Rewrite them to the ${CLAUDE_PROJECT_DIR}-anchored form.")):

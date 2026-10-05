@@ -67,26 +67,26 @@ Dedicated agents for specific role archetypes (exact names vary per install — 
 - an architecture consultant — high-stakes design decisions on a premium model tier (often shipped as a skill, e.g. `/architect`)
 
 **Implementation roles**:
-- a coding agent — code implementation (e.g. `coder`)
-- an automation-script agent — helper scripts and tooling (e.g. `helper-scripter`)
+- a coding agent — code implementation (e.g. `expert-coder`)
+- an automation/authoring agent — helper scripts, agent and skill definitions (e.g. `agent-author`)
 - a testing agent — test creation and verification (e.g. `tester`)
 
 **Maintenance roles**:
 - a documentation-sync agent (e.g. `doc-maintainer`)
 - context/working-memory curation — typically the main session itself, via the working-memory-document discipline
-- a code-review capability on a premium tier (e.g. a `code-review-expert` skill)
+- a code-review capability on a premium tier (e.g. the `code-reviewer` agent)
 
 ### 3. Workflow Orchestration
 The main session (acting as coordinator) sequences agent interactions:
 
 **Simple Flow**:
 ```
-coder → tester → doc-maintainer
+expert-coder → tester → doc-maintainer
 ```
 
 **Complex Flow**:
 ```
-coordinator → planner → coder → tester → doc-maintainer
+coordinator → planner → expert-coder → tester → doc-maintainer
 (coordinator updates working memory between phases)
 ```
 

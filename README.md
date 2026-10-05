@@ -32,7 +32,7 @@ Every session starts from zero: you paste the same architecture summary, the sam
 Keeping context notes fresh, re-indexing what you just edited, catching a credential before it lands in a file — these are chores you'd have to remember to ask for, every time. Dozens of automation hooks fire at the right lifecycle moments instead: relevant knowledge is injected when you submit a prompt, edited notes and code re-index themselves, context survives a `/compact` instead of evaporating, and written files are scanned for leaked secrets. You feel this one as an absence — the maintenance requests you never had to type.
 
 **MCP servers — Claude gets tools, not just files.**
-Out of the box, Claude can only read what you point it at. VCO registers local MCP servers that give Claude callable tools: semantic search across your knowledge and docs, structural queries over your code graph, academic-paper search, browser automation, and opt-in diagram tools. All local, no per-tool API keys. You feel it when you ask "how did we handle retries?" and Claude runs an actual search over everything you've ever written down instead of guessing.
+Out of the box, Claude can only read what you point it at. VCO registers local MCP servers that give Claude callable tools: semantic search across your knowledge and docs, structural queries over your code graph, and browser automation. All local, no per-tool API keys. You feel it when you ask "how did we handle retries?" and Claude runs an actual search over everything you've ever written down instead of guessing.
 
 **Secrets — credentials resolve, they never get pasted.**
 The usual failure mode: an agent needs a GitHub token, so it ends up in a chat message, an environment dump, or a committed `.env`. VCO stores secrets in your OS keychain (plus a permission-locked file store) and gives agents a resolver: a credential is injected into the child process that needs it, by key name, without ever being printed. Grepping the environment for tokens is blocked by a hook. You feel it when `git push` just works and the token never appears in the transcript.
@@ -85,7 +85,7 @@ VCO sits on top of Claude Code rather than replacing your AI assistant. The comp
 | Persistent memory across sessions | No | Yes (Copilot Memory, repo-scoped, 28-day expiry) | Partial (team memory) | Partial (session-bound) | No | No | No | **Yes (KG, no expiry)** |
 | Code graph (AST, callers, APIs) | Partial (file index, opaque) | Partial (vector index) | Yes (Context Engine) | Yes | No | Yes (repomap) | Partial (Tree-sitter, not persisted) | **Yes (persisted graph)** |
 | Bring your own LLM subscription | Partial (chat only) | No | Partial (BYO agent, not LLM) | No | Yes (OpenAI) | Yes (75+ providers) | Yes (30+ providers) | **Yes (Claude)** |
-| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (46 hooks, 54 skills, 44 agents)** |
+| User-extensible (hooks / agents / skills) | Yes (hooks + skills, no marketplace) | No | Limited (MCP only) | No | Limited (skills as prompts) | Yes (open source) | Yes (open source) | **Yes (46 hooks, 6 skills, 11 agents)** |
 | Pricing model | $20/mo SaaS | $10–20/user/mo | BYOA + cloud compute | $20/mo + usage | Per-token OpenAI | Free + your LLM | Free + your LLM | **Free + your Claude sub; €19/mo Pro** |
 | Polished v1 product (vs. alpha) | Yes | Yes | Yes | Yes | Yes | Yes | Yes | **No — alpha** |
 
@@ -137,9 +137,9 @@ Each task gets a status banner on the project page (`pending` / `running` / `fai
 - **Knowledge Graph** — Obsidian-style markdown nodes with typed WikiLinks, indexed in Weaviate via qwen3 embeddings (1024-dim, local). Optional OpenAI embeddings.
 - **Code Graph** — per-language structural analysis across 10+ languages, populating `CodeModule`, `CodeClass`, `CodeFunction`, `CodeAPI`, `CodeInteraction` collections. Call edges (`callers` / `path` queries) come from Python's `ast`; installing the optional `codegraph-ts` extra (`pip install '.[codegraph-ts]'`, opt out at install with `VCT_SKIP_CODEGRAPH_TS=1`) adds tree-sitter grammars so call edges extend to rust, go, javascript, typescript, java, c#, c/c++, ruby, lua, and bash. Without the extra those languages simply get no call edges (the rest of the graph is unaffected).
 - **46 automation hooks** — context injection on prompt submit, KG/code-graph auto-sync on file edit, credential scans, compaction-preserving context replay, security checks. 44 are event-registered in `settings.json`; 2 more ship unwired — `code-graph-incremental` is invoked by `post-file-edit` rather than registered, and `kg-sync-on-edit` is an opt-in single-purpose hook superseded by that same auto-sync. Every hook ships as `.sh` (Linux/macOS) with a native `.ps1` sibling (Windows). The `vct-hub` background service resolves per-project config for hooks, MCPs, and scripts.
-- **MCP servers (default install)** — 4 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) and `search` (academic papers via OpenAlex + arXiv) are **enabled by default per project**; `mermaid` and `excalidraw` are **registered but default-disabled** — connected in `claude mcp list`, tools not callable until you opt in via the launcher's Diagrams tab. A fifth MCP — `playwright` — is **enabled by default**, invoked via `npx -y @playwright/mcp@latest` (pre-cached at install; opt out with `VCT_SKIP_PLAYWRIGHT=1`). That entry needs `npx` resolvable on PATH: without Node.js installed it cannot spawn at all, and Claude Code reports only "Failed to connect". `vco doctor` (and the launcher's MCP registration badge) names that case explicitly. All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
+- **MCP servers (default install)** — 2 registered in `~/.claude.json` at install: `weaviate-kg` (semantic + graph search + code graph) is **enabled by default per project**; `playwright` is **enabled by default**, invoked via `npx -y @playwright/mcp@latest` (pre-cached at install; opt out with `VCT_SKIP_PLAYWRIGHT=1`). That entry needs `npx` resolvable on PATH: without Node.js installed it cannot spawn at all, and Claude Code reports only "Failed to connect". `vco doctor` (and the launcher's MCP registration badge) names that case explicitly. The per-project toggle in the launcher's Permissions tab writes `~/.claude.json` `projects[<project>].disabledMcpServers`, so disabling a server for one project actually reaches Claude Code. (v0.2.101 removed the `search` paper MCP and stopped registering the `mermaid`/`excalidraw` diagram wrappers by default; an install that already has them keeps them.) All local, no per-tool API keys. Ollama (Weaviate vectorizer + embedding fallback) and the code-embedding FastAPI service on port 11440 are backend infrastructure, not MCPs.
 - **Secrets primitive** — OS-keychain storage (launcher-managed) plus a chmod-600 file store under `~/.vct-secrets/`, resolved through the `vct` CLI and the `vct-hub` service. Agents inject credentials into child processes by key name (`vct exec --secret KEY=ENV_VAR -- cmd`) instead of printing them; a hook blocks env-grepping for tokens. See [`docs/VCT_SECRETS_PRIMITIVE.md`](docs/VCT_SECRETS_PRIMITIVE.md).
-- **44 agents + 54 skills** — shipped via `install.py` templates. Agents handle planning, coding, testing, doc maintenance, KG navigation, code-graph health. Skills cover security review, debugging, architecture, RAG advisory, accessibility, etc.
+- **11 default agents + 8 machine-gated gateway agents + 6 skills, plus 11 opt-in packs** — shipped via `install.py` templates. The default agents handle planning, coding, testing, review, doc maintenance, KG maintenance and web/code exploration; the gateway agents cover the vendor models you have keys for; the packs carry the topical specialists (security, k8s, consulting, science, design — install only the ones you want). Skills cover context compression, issue fixing, task breakdown, and the installer / bootstrapper flows.
 - **Workflow plumbing** — session state tracking (`CONTEXT_STATE.md`), plan files, memory management, pre-/post-compact context replay so a `/compact` doesn't lose your thread.
 
 ## Downloads (Launcher GUI)
@@ -230,14 +230,15 @@ vibecoded-orchestrator/
 │   ├── scripts/               # CLI tools for KG and code graph
 │   └── settings.json          # Claude Code configuration
 ├── claude_mcp_servers/
-│   ├── weaviate_mcp/          # Semantic + graph search (default)
-│   ├── search_mcp/            # Academic-paper search via OpenAlex + arXiv (default)
+│   ├── weaviate_mcp/          # Semantic + graph search (registered by default)
+│   ├── wrappers/              # mermaid / excalidraw proxies (no longer registered by default)
 │   └── code_embedding_service/ # CodeSage-Large-v2 via FastAPI (backend service, not an MCP)
-│   # mermaid + excalidraw MCPs are registered at install but default-disabled
-│   # per project — opt in via the launcher's Diagrams tab
+│   # Default-registered MCPs are weaviate-kg + playwright. The old search
+│   # (paper search) MCP was removed and the diagram wrapper MCPs are no
+│   # longer registered by default (v0.2.101)
 ├── templates/
-│   ├── agents/free/           # 44 bundled agents
-│   ├── skills/                # 54 bundled skills
+│   ├── agents/free/           # 11 default agents (+ machine-gated gateway agents)
+│   ├── skills/                # 6 default skills (+ opt-in pack skills)
 │   └── hooks/                 # Hook sources rendered into .claude/hooks/ at install
 ├── infrastructure/
 │   ├── docker-compose.yml     # Weaviate + Ollama
@@ -253,7 +254,7 @@ The whole repository is AGPL-3.0. The codebase you see here is the Free tier —
 
 | Tier            | Price                | What you get                                                                                  |
 |-----------------|----------------------|-----------------------------------------------------------------------------------------------|
-| **Free**        | €0                   | Full orchestrator: KG, code graph, 46 hooks, 44 agents, 54 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
+| **Free**        | €0                   | Full orchestrator: KG, code graph, 46 hooks, 11 agents, 6 skills, all default MCP servers (see [Under the hood](#under-the-hood)). AGPL-3.0. |
 | **Pro**         | €19/month            | Free + RL-scored retrieval reranking module. Modules ship as separate signed binaries via the launcher. |
 | **Enterprise**  | Contact us           | Free + commercial AGPL exemption, priority support, custom SLAs. [team@vibecodedtools.com](mailto:team@vibecodedtools.com) |
 

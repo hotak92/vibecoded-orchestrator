@@ -111,6 +111,23 @@ export interface ProjectStateSnapshot {
   codegraph_binding: ProjectCodegraphBinding | null;
 }
 
+// ─── Packs (v0.2.101 catalogue plan §3.6) ─────────────────────────────────
+//
+// Mirrors the Rust struct `PackInfo` in
+//   launcher/src-tauri/src/commands/packs_cmd.rs
+// (the wiring test `src/lib/packs.wiring.test.ts` pins the two stay in
+// lockstep). Backed by the Python SSOT (`vco_lib.packs status`) — the
+// launcher only bridges and parses JSON.
+
+export interface PackInfo {
+  name: string;
+  description: string;
+  /** Member names: agent file stems + skill directory names. */
+  members: string[];
+  /** True iff the pack is recorded in the project manifest's `packs` map. */
+  installed: boolean;
+}
+
 // ─── Access scoping (UI-side aggregate, mapped to backend kg/codegraph access) ──
 
 export interface AccessMode {
@@ -332,18 +349,6 @@ export interface DiagramChangedPayload {
   kind: 'edit' | 'create' | 'delete' | 'snapshot';
 }
 
-// ─── Per-MCP tool grants (PermissionsTab "MCP Tools" sub-section) ────────
-//
-// Backed by `project_mcp_tool_grants(project_id, mcp_name, tool_name, enabled)`
-// in the launcher SQLite DB (Phase 1.1).
-
-export interface McpToolGrant {
-  project_id: string;
-  mcp_name: string;
-  tool_name: string;
-  enabled: boolean;
-  // Best-effort description sourced from upstream MCP's tools/list; null
-  // when the upstream MCP doesn't expose one.
-  description: string | null;
-}
+// (v0.2.101) `McpToolGrant` removed: its only consumer was the PermissionsTab
+// "MCP Tools" sub-section, removed with the retired diagram wrapper MCPs.
 

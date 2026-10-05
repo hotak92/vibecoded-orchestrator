@@ -763,7 +763,9 @@ def probe_mcp_commands_spawnable(folder: Path, res: DoctorResolvers, ctx: dict) 
 
     * ``npx_resolvable`` — the ladder's verdict on npx itself, reported even
       when no entry needs it (it is the prerequisite VCO's own bundled
-      playwright/mermaid entries assume).
+      playwright entry assumes — and the legacy diagram wrappers on
+      pre-v0.2.101 installs that still have them, whose proxy spawns npx
+      as a child; fresh installs register no wrapper).
     * ``mcp_commands_spawnable`` — the per-entry verdict.
 
     The problem finding is ``defer``: installing Node.js is not something VCO
@@ -4602,8 +4604,10 @@ def _npx_entry(finding: Finding):
         why_deferred=(
             "Installing Node.js changes the user's machine, so VCO "
             "never does it unattended. Until npx resolves, every MCP "
-            "registered as `npx` (playwright by default; mermaid when "
-            "enabled) fails to start — Claude Code shows only "
+            "registered as `npx` (playwright by default; the diagram "
+            "wrappers on legacy installs that still have them — the "
+            "wrappers are optional since v0.2.101 and absent on fresh "
+            "installs) fails to start — Claude Code shows only "
             "'Failed to connect', with no indication that the cause is "
             "a missing binary. This entry clears itself on the first "
             "install/update run that finds npx."

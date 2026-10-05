@@ -54,13 +54,13 @@ def tmp_root() -> Path:
 
 class TestDirectSymlinkTarget:
     def test_symlink_file_target_redirects_to_vco_new(self, tmp_root: Path) -> None:
-        """Writing to ``<root>/coder.md`` when that path is a symlink to
+        """Writing to ``<root>/example-agent.md`` when that path is a symlink to
         an unrelated file must NOT overwrite the symlink target. The new
-        content must land at ``<root>/coder.md.vco-new``."""
+        content must land at ``<root>/example-agent.md.vco-new``."""
         unrelated_target = tmp_root / "unrelated.md"
         unrelated_target.write_text("ORIGINAL UNRELATED CONTENT\n", encoding="utf-8")
 
-        symlink_path = tmp_root / "coder.md"
+        symlink_path = tmp_root / "example-agent.md"
         os.symlink(unrelated_target, symlink_path)
         assert symlink_path.is_symlink()
 
@@ -72,7 +72,7 @@ class TestDirectSymlinkTarget:
         # Unrelated file UNTOUCHED — this is the load-bearing assertion.
         assert unrelated_target.read_text(encoding="utf-8") == "ORIGINAL UNRELATED CONTENT\n"
         # New content landed at the .vco-new sibling.
-        vco_new = tmp_root / "coder.md.vco-new"
+        vco_new = tmp_root / "example-agent.md.vco-new"
         assert vco_new.exists()
         assert vco_new.read_bytes() == new_content
 
@@ -94,8 +94,8 @@ class TestDirectSymlinkTarget:
         os.symlink(shared, project_claude)
         assert project_claude.is_symlink()
 
-        # VCO tries to write `.claude/agents/coder.md`.
-        target = project_claude / "agents" / "coder.md"
+        # VCO tries to write `.claude/agents/example-agent.md`.
+        target = project_claude / "agents" / "example-agent.md"
         new_content = b"VCO shipped content\n"
         _write_file_atomic(target, new_content)
 
@@ -106,8 +106,8 @@ class TestDirectSymlinkTarget:
         )
         # .vco-new sibling holds the content.
         vco_new_claude = tmp_root / "project" / ".claude.vco-new"
-        assert (vco_new_claude / "agents" / "coder.md").exists()
-        assert (vco_new_claude / "agents" / "coder.md").read_bytes() == new_content
+        assert (vco_new_claude / "agents" / "example-agent.md").exists()
+        assert (vco_new_claude / "agents" / "example-agent.md").read_bytes() == new_content
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -155,7 +155,7 @@ class TestDanglingSymlinkTarget:
         on POSIX creates the destination, which may be in an unrelated
         location)."""
         nonexistent_dest = tmp_root / "does-not-exist.md"
-        symlink_path = tmp_root / "coder.md"
+        symlink_path = tmp_root / "example-agent.md"
         os.symlink(nonexistent_dest, symlink_path)
         assert symlink_path.is_symlink()
         assert not symlink_path.exists()  # dangling
@@ -169,7 +169,7 @@ class TestDanglingSymlinkTarget:
             "VCO must NOT have created the dangling-symlink destination"
         )
         # New content at .vco-new.
-        vco_new = tmp_root / "coder.md.vco-new"
+        vco_new = tmp_root / "example-agent.md.vco-new"
         assert vco_new.exists()
         assert vco_new.read_bytes() == new_content
 
@@ -198,13 +198,13 @@ class TestRedirectIsPersistent:
             project_claude / "agents" / "a.md", b"agent A\n"
         )
         _write_file_atomic(
-            project_claude / "skills" / "tdd" / "SKILL.md", b"skill TDD\n"
+            project_claude / "skills" / "example-skill" / "SKILL.md", b"skill TDD\n"
         )
 
         # Both writes ended up in the .vco-new sibling.
         vco_new = tmp_root / "project" / ".claude.vco-new"
         assert (vco_new / "agents" / "a.md").read_bytes() == b"agent A\n"
-        assert (vco_new / "skills" / "tdd" / "SKILL.md").read_bytes() == b"skill TDD\n"
+        assert (vco_new / "skills" / "example-skill" / "SKILL.md").read_bytes() == b"skill TDD\n"
         # Shared dir UNTOUCHED.
         assert not (shared / "agents").exists()
         assert not (shared / "skills").exists()
@@ -227,11 +227,11 @@ class TestWriteFileAtomicReturnContract:
     def test_redirected_write_returns_vco_new_path(self, tmp_root: Path) -> None:
         unrelated = tmp_root / "unrelated.md"
         unrelated.write_text("ORIG\n", encoding="utf-8")
-        link = tmp_root / "coder.md"
+        link = tmp_root / "example-agent.md"
         os.symlink(unrelated, link)
 
         ret = _write_file_atomic(link, b"new\n")
-        expected = tmp_root / "coder.md.vco-new"
+        expected = tmp_root / "example-agent.md.vco-new"
         assert ret == expected, "a redirected write must return the .vco-new path"
         assert expected.read_bytes() == b"new\n"
         assert unrelated.read_text(encoding="utf-8") == "ORIG\n"
@@ -261,8 +261,9 @@ def _make_minimal_orchestrator_root(root: Path) -> Path:
     agents.mkdir(parents=True)
     # An agent with a `model:` frontmatter so the (optional) populate step
     # doesn't warn — keeps the test focused on the symlink deferral.
-    (agents / "coder.md").write_text(
-        "---\nname: coder\nmodel: sonnet\ndescription: test agent\n---\n\nbody\n",
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+    (agents / "example-agent.md").write_text(
+        "---\nname: example-agent\nmodel: sonnet\ndescription: test agent\n---\n\nbody\n",
         encoding="utf-8",
     )
     # OS-specific settings template (mirror of _settings_template_path).
@@ -356,7 +357,7 @@ class TestSymlinkRedirectDeferralWiring:
         assert (claude / "agents").is_symlink()
         assert (external / "user-edit.md").read_text(encoding="utf-8") == "USER OWNS THIS\n"
         # The fresh agent content landed in the .vco-new sibling.
-        assert (claude / "agents.vco-new" / "coder.md").exists()
+        assert (claude / "agents.vco-new" / "example-agent.md").exists()
 
     def test_v0270_symlinked_dotclaude_deferral_lists_settings_json(
         self, tmp_root: Path, orch_root: Path
@@ -381,7 +382,7 @@ class TestSymlinkRedirectDeferralWiring:
             "W-F1 regression: settings.json redirect not threaded into the "
             f"symlink deferral. Body:\n{body}"
         )
-        assert "coder.md" in body or "agents" in body, (
+        assert "example-agent.md" in body or "agents" in body, (
             "an agent redirect must also be listed alongside settings.json"
         )
         # Exactly ONE section for the condition (W-F2: not one-per-event).
@@ -390,7 +391,7 @@ class TestSymlinkRedirectDeferralWiring:
         )
         # The fresh content landed in the .vco-new sibling of `.claude`.
         vco_new = project / ".claude.vco-new"
-        assert (vco_new / "agents" / "coder.md").exists()
+        assert (vco_new / "agents" / "example-agent.md").exists()
         assert (vco_new / "settings.json").exists()
 
     def test_v0270_multiple_symlink_redirects_collapse_to_one_deferral(
@@ -413,7 +414,7 @@ class TestSymlinkRedirectDeferralWiring:
         assert body.count("## symlink_preserved_under_install_path") == 1
         # The consolidated detected block names a count >= 2 (both pairs).
         assert "settings.json" in body
-        assert ("coder.md" in body) or ("agents" in body)
+        assert ("example-agent.md" in body) or ("agents" in body)
 
     def test_v0270_symlink_redirect_appends_warnings_summary(
         self, tmp_root: Path, orch_root: Path

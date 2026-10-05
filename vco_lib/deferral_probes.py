@@ -718,7 +718,7 @@ def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
 
 def project_hooks_relative_paths_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``project_hooks_relative_paths`` — does a project-own hook still invoke a
-    ``.claude/hooks/`` script by a relative path?
+    ``.claude/hooks/`` or ``.claude/scripts/`` script by a relative path?
 
     A thin wrapper over :func:`vco_lib.hook_relative_paths.relative_hooks_still_present`,
     the SAME detection the bundle update emits from, so the probe can never clear

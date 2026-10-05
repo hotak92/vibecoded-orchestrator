@@ -318,7 +318,7 @@ All 31 project hooks scrub `SUPABASE_KEY`, `GITHUB_TOKEN`, `OPENAI_API_KEY`, AWS
 Secrets rotation runbook (maintainer docs): (1) Roll key in Supabase dashboard, (2) write to `~/.vct-secrets/shared/supabase_token`, (3) `supabase secrets set`, (4) update Vercel env, (5) restart local services. Old key valid ~24 h (zero-downtime window).
 
 ### GitHub PAT rotation — single file write
-PAT lives at `~/.vct-secrets/shared/github_pat` (Phase 1 layout, since 2026-04-24). Legacy flat path `~/.vct-secrets/github_pat` is still honored as a fallback. Rotation = update file + chmod 600. Credential helper, search MCP wrapper, and `gh` CLI all re-read on each invocation.
+PAT lives at `~/.vct-secrets/shared/github_pat` (Phase 1 layout, since 2026-04-24). Legacy flat path `~/.vct-secrets/github_pat` is still honored as a fallback. Rotation = update file + chmod 600. Credential helper and `gh` CLI both re-read on each invocation.
 
 ### Security reporting: `security@vibecodedtools.it`
 Preferred: GitHub Security Advisories at `https://github.com/hotak92/vibecoded-orchestrator/security/advisories/new`. Email as fallback for reporters who cannot use GitHub. SLA: ack 3 days, initial assessment 10 days, fix plan 30 days (high/critical) / 90 days (medium/low).

@@ -287,6 +287,16 @@ fn cli_register_default_mcps(install_root: &std::path::Path) -> i32 {
                 // [vct-print-contract] CLI output — see handle_cli_args() above.
                 eprintln!("[vct] db warning: {}", w);
             }
+            // v0.2.101: an auto_scrub deprecated MCP (search) whose module no
+            // longer ships was removed from ~/.claude.json. One line each;
+            // empty on an idempotent second run.
+            for name in &report.removed_deprecated {
+                // [vct-print-contract] CLI output — see handle_cli_args() above.
+                println!(
+                    "[vct]   removed obsolete MCP entry `{}` — that module no longer ships",
+                    name
+                );
+            }
             if report.all_succeeded() {
                 0
             } else {
@@ -3077,6 +3087,12 @@ pub fn run() {
             commands::project_state_cmd::list_project_mcp_servers,
             commands::project_state_cmd::set_project_mcp_server_enabled,
             commands::project_state_cmd::unregister_project_mcp_server,
+            // v0.2.101 catalogue plan §3.6: opt-in agent/skill packs.
+            // Listed + toggled from the project page's Packs tab; the
+            // toggle runs the ordinary bundle engine (--pack /
+            // --remove-pack) behind the per-folder single-flight turn.
+            commands::packs_cmd::list_project_packs,
+            commands::packs_cmd::set_project_pack_enabled,
             // Phase 1.1 — Diagrams (Mermaid + Excalidraw) registry,
             // snapshots, cross-project access grants, per-tool MCP
             // allowlists, and per-project module-active flags. Schema:
@@ -3094,14 +3110,11 @@ pub fn run() {
             commands::diagrams_cmd::delete_diagram_snapshot,
             commands::diagrams_cmd::diagram_grant_access,
             commands::diagrams_cmd::list_diagram_access,
-            commands::diagrams_cmd::set_project_mcp_tool_enabled,
-            commands::diagrams_cmd::list_project_mcp_tools,
-            // v0.2.34 Agent E (Phase 4 generalisation, 2026-05-25):
-            // PermissionsTab's "Customize" button populates the
-            // per-tool allowlist from manifest-shipped defaults (or
-            // the hardcoded fallback). Generalised so any MCP — not
-            // just diagrams — gets the same surface.
-            commands::diagrams_cmd::seed_project_mcp_tool_grants,
+            // v0.2.101: the per-tool MCP-grant commands
+            // (list_project_mcp_tools / set_project_mcp_tool_enabled /
+            // seed_project_mcp_tool_grants) were removed with the retired
+            // diagram wrapper MCPs' GUI surface. The DB layer + the hub's
+            // tool-grant route stay for existing wrapper registrations.
             commands::diagrams_cmd::set_project_module_enabled,
             commands::diagrams_cmd::clear_project_module,
             // v0.2.49 Stream B: per-project enable toggle for global-

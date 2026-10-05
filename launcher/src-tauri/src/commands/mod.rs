@@ -223,6 +223,10 @@ pub mod project_folder_health;
 // `project_hooks` rows, which nothing reads (review
 // v0291-wave5-phase2-ux-completeness, P2-B2).
 pub mod project_hooks_settings;
+// v0.2.101 catalogue plan §3.6: opt-in agent/skill packs — the GUI's
+// Packs tab. Python (vco_lib.packs / install-bundle --pack) is the SSOT;
+// these commands only bridge and parse JSON.
+pub mod packs_cmd;
 pub mod project_state_cmd;
 pub mod project_state_populate;
 pub mod restart;

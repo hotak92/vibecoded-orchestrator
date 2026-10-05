@@ -446,6 +446,13 @@ clear_probe = "bundle-reconciled"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-12, owner Q3, WP-15): project-bundle copies of infrastructure compose files were removed (modified copies backed up first). A completed action. Emitted by `bundle_leftovers.retire_compose_copies`; cleared by `_reconcile_bundle_deferrals` on the next update that removed nothing. NOT install.py-owned (F-W1-12), same reason as `bundle_leftover_removed`."
 
+[conditions.pack_removed]
+class = "informational_record"
+owner = "vco_lib.packs"
+clear_probe = "paired-resolution"
+emit_surfaces = ["ledger"]
+notes = "v0.2.101 (catalogue plan §3.5): an opt-in agent/skill PACK was removed via `install-bundle --remove-pack <name>`. A completed action — unmodified members were deleted, edited members were backed up under `.claude/backups/bundle-adoptions/<ts>/` FIRST (never a silent delete; a backup failure leaves the file in place and warns instead). Emitted by `vco_lib.packs.remove_packs`; the paired resolution is `vco_lib.packs.note_packs_installed`, which calls `resolve_conditions(['pack_removed'])` when a later `--pack` install re-records a pack (the natural inverse: what a remove-pack emitted, a re-install clears). NOT install.py-owned: the root bundle runs inside an install.py run whose finalize would otherwise drop the row."
+
 [conditions.module_container_unlabelled]
 class = "informational_record"
 owner = "vct-launcher-core (container_runtime.rs reaper)"
@@ -694,6 +701,10 @@ class = "informational_record"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
+notes = """v0.2.101: the search MCP and its producer (`_check_search_mcp_env_obsolete`) \
+were deleted outright. The condition stays registered so any entry written by an \
+older install still self-clears via `owned-drop-when-absent` (owner=install.py no \
+longer re-emits it). Nothing emits it any more."""
 
 [conditions.stale_mcp_json_shadow_quarantined]
 class = "informational_record"
@@ -777,7 +788,7 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger", "gui_badge"]
 notes = """v0.2.91 WP-D. Registration writes `command = "npx"` unconditionally, \
 so on a machine without npx every npx-based MCP (playwright by default, \
-mermaid when enabled) fails to spawn and Claude Code shows only "Failed to \
+the diagram wrappers on legacy installs that kept them) fails to spawn and Claude Code shows only "Failed to \
 connect". install.py DETECTED this since v0.2.51 and answered it with a \
 stdout line claiming the MCP "will lazy-install when first invoked" — false, \
 there is nothing to lazy-install into. The doctor phase now emits this \
@@ -1168,7 +1179,7 @@ owner = "vco_lib.hook_relative_paths"
 clear_probe = "probe:py:project_hooks_relative_paths_still_present"
 emit_surfaces = ["ledger"]
 notes = """v0.2.100 WP-17 (F-W1-16). A project's OWN hook command invokes a \
-`.claude/hooks/` script by a relative path, so it fails ("No such file or \
+`.claude/hooks/` or (v0.2.101, NB-13) `.claude/scripts/` script by a relative path, so it fails ("No such file or \
 directory", exit 127) whenever the session's cwd moves — on every call, each \
 failure written into the transcript. VCO's shipped hooks are anchored by the \
 bundle merge; the project's own are the user's configuration, so the bundle \

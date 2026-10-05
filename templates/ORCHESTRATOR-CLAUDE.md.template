@@ -14,7 +14,7 @@ opened this session for something else.
    catalogue and less listing noise; anything disabled can be re-enabled with one click later. "Keep all" is a valid
    answer.
 2. If they agree, choose from their description, `.claude/CONTEXT_STATE.md` and each item's `description:`
-   frontmatter. Keep a small core (planner, coder, tester, kg-navigator) plus whatever fits their stack; keep
+   frontmatter. Keep a small core (planner, expert-coder, tester, kg-maintainer) plus whatever fits their stack; keep
    borderline items enabled.
 3. Disable through the launcher's per-project Agents / Skills / Hooks tabs. They move agents and skills to
    `.claude/agents.disabled/` / `.claude/skills.disabled/` and park hook entries in the launcher DB, which updates
@@ -201,7 +201,7 @@ For questions about this project's state, decisions, patterns, or architecture, 
 - Literal strings (variable names, error messages), an exact file path the user gave, or line-by-line detail → Grep / Read
 - Summarize or extract from a known file → `Read` with `offset`/`limit`, or native reasoning
 - Image / vision task → `Read` on the image path (built-in vision)
-- Academic research → `search_papers` (search MCP)
+- Web research / academic papers → built-in `WebSearch` / `WebFetch`
 - Quick analysis or rewrite of content already in context → Claude directly
 - Still unsure → `hybrid_search` (most comprehensive)
 
@@ -363,14 +363,9 @@ If you find install.py running with the wrong embedding (e.g. stuck at 40-50% on
 The installer registers the bundled MCP servers in `~/.claude.json`; `claude mcp list` shows which are live on this machine. Each Python-backed server launches via the orchestrator root's venv (`<orchestrator-root>/.venv`; the legacy `claude_mcp_servers/.venv` location is tried as a fallback):
 - **weaviate-kg** — semantic search and code graph. **Enabled by default per project.**
   - Env: `WEAVIATE_URL`, `OLLAMA_URL`, `EMBEDDING_MODEL`, `KG_COLLECTION`, `SHARED_KG_COLLECTION`, `DEVELOPMENT_COLLECTION`, `GRPC_PORT`, `SHARED_KG_READ_DISABLED` (read gate), `SHARED_KG_WRITE_DISABLED` (write gate).
-- **search** — academic paper search via OpenAlex and arXiv. **Enabled by default per project.**
-  - Env: `OPENALEX_EMAIL` (optional, gives polite-pool priority on OpenAlex API).
-  - Tools: `search_papers` only.
 - **playwright** — browser automation. **Enabled by default**, invoked via `npx -y @playwright/mcp@latest`; install.py pre-caches the browsers (opt out with `VCT_SKIP_PLAYWRIGHT=1`). Being registered as the bare command `npx`, it can only spawn where `npx` actually resolves — with no Node.js installed, Claude Code reports just "Failed to connect". The doctor phase at the end of every install/update probes for it and defers `npx_missing_mcp_unspawnable`; run `vco doctor` (or `python -m vco_lib.npx_resolver --json`) to check.
 
-{{#if_module_active diagrams}}
-- **mermaid** / **excalidraw** — diagram describe/extract. **Registered but default-disabled per project**; `claude mcp list` shows them Connected, but their tools are not callable until you opt in via the launcher's Diagrams tab.
-{{/if_module_active}}
+A per-project MCP toggle (launcher's project Permissions tab) is written to `~/.claude.json` `projects[<project>].disabledMcpServers`, the channel Claude Code actually honours for user-scope servers.
 
 The code-embedding FastAPI service is backend infrastructure, not an MCP.
 
@@ -515,7 +510,7 @@ Code graph rows are not cross-project value by default. Source code from one pro
 
 The installer drops a default set of agents into `.claude/agents/` and skills into `.claude/skills/`. Customize freely — they are templates, not framework code.
 
-**Invoke skills**: `/skill-name` (e.g. `/architect`, `/tdd`).
+**Invoke skills**: `/skill-name` (e.g. `/fix-issue`, `/task-breakdown`).
 **Spawn agents**: `@agent-name (Model)` via the Agent tool. (`Task` is a legacy alias for `Agent`.)
 
 **Model selection.** Name the model on every subagent dispatch — via the Agent-tool `model` parameter or `model:` in the agent definition's frontmatter. Never rely on a subagent inheriting the session's model: an unnamed dispatch makes "which model wrote this?" depend on ambient state. When several sources name a model, the resolution order is: Agent-tool `model` parameter > definition frontmatter > `CLAUDE_CODE_SUBAGENT_MODEL` env var > session model. `/tasks` shows the model each subagent actually ran on.
@@ -626,7 +621,7 @@ re-check.
 - Search code: `.claude/scripts/code-graph-query search "pattern"`.
 - Search knowledge: `hybrid_search("concept")` (Weaviate MCP).
 - Quick analysis: use Claude directly.
-- Academic research: `search_papers("topic")` (Search MCP).
+- Web / academic research: built-in `WebSearch` / `WebFetch`.
 - Active plans: `.claude/context/plans/`.
 - Tag hierarchy: `knowledge/TAG_HIERARCHY.md`.
 - Score-tier reference: `knowledge/concepts/score-driven-retrieval-tiers.md`.
@@ -715,7 +710,7 @@ curl -s {{OLLAMA_URL}}/api/tags               # Ollama models
 
 To check which KG collection the weaviate-kg MCP actually picked up, look for the `weaviate-kg: resolved collections (...)` line in its startup log (`/context` shows context usage, not KG routing). If the collection is wrong (e.g. it's reusing another project's KG), you opened Claude in the wrong directory — see the per-project isolation note above and [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md).
 
-**GitHub access** (only if you push from this project): register the PAT via the launcher GUI (OnboardingWizard step 4, or Preferences → Secrets) — it lands in the OS keychain and the search MCP + hooks resolve it through vct-hub automatically. For shell use, see the **Secrets** section above (`vct exec` / `git-credential-vct`). Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) §Secrets.
+**GitHub access** (only if you push from this project): register the PAT via the launcher GUI (OnboardingWizard step 4, or Preferences → Secrets) — it lands in the OS keychain and the bundled hooks resolve it through vct-hub automatically. For shell use, see the **Secrets** section above (`vct exec` / `git-credential-vct`). Don't store the PAT in `~/.claude.json`. Details: [`docs/CONFIGURATION.md`](docs/CONFIGURATION.md) §Secrets.
 
 *Once you've completed first-run setup, remove this section: `python .claude/scripts/cleanup-setup-sections.py`*
 <!-- END: SETUP-ONLY -->

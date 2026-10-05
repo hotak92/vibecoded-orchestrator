@@ -82,16 +82,17 @@ def _simulate_disable_skill(folder: Path, skill_name: str) -> None:
 
 @pytest.fixture
 def tmp_project() -> Path:
-    """Create a temp project folder with a minimal `.claude/agents/coder.md`
-    + `.claude/skills/tdd/SKILL.md` to disable later."""
+    """Create a temp project folder with a minimal `.claude/agents/example-agent.md`
+    + `.claude/skills/example-skill/SKILL.md` to disable later."""
     folder = Path(tempfile.mkdtemp(prefix="vct-fs-disable-test-"))
+    # Neutral fixture names — no shipped-catalogue meaning (retired in v0.2.101).
     (folder / ".claude" / "agents").mkdir(parents=True)
-    (folder / ".claude" / "agents" / "coder.md").write_text(
-        "---\nname: coder\nmodel: sonnet\n---\nbody\n", encoding="utf-8"
+    (folder / ".claude" / "agents" / "example-agent.md").write_text(
+        "---\nname: example-agent\nmodel: sonnet\n---\nbody\n", encoding="utf-8"
     )
-    (folder / ".claude" / "skills" / "tdd").mkdir(parents=True)
-    (folder / ".claude" / "skills" / "tdd" / "SKILL.md").write_text(
-        "---\nname: tdd\n---\nbody\n", encoding="utf-8"
+    (folder / ".claude" / "skills" / "example-skill").mkdir(parents=True)
+    (folder / ".claude" / "skills" / "example-skill" / "SKILL.md").write_text(
+        "---\nname: example-skill\n---\nbody\n", encoding="utf-8"
     )
     yield folder
     shutil.rmtree(folder, ignore_errors=True)
@@ -108,13 +109,13 @@ class TestAgentFsDisableContract:
         `.claude/agents/<name>.md` to `.claude/agents.disabled/<name>.md`.
         Without this, an `install-bundle --update` would re-overwrite the
         enabled-side file from the template (silently re-enabling)."""
-        enabled = tmp_project / ".claude" / "agents" / "coder.md"
-        disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
+        enabled = tmp_project / ".claude" / "agents" / "example-agent.md"
+        disabled = tmp_project / ".claude" / "agents.disabled" / "example-agent.md"
 
         assert enabled.exists(), "pre: enabled file present"
         assert not disabled.exists(), "pre: disabled file absent"
 
-        _simulate_disable_agent(tmp_project, "coder")
+        _simulate_disable_agent(tmp_project, "example-agent")
 
         assert not enabled.exists(), (
             "post: enabled file must be GONE — without the move, "
@@ -124,11 +125,11 @@ class TestAgentFsDisableContract:
 
     def test_enable_moves_agent_back(self, tmp_project: Path) -> None:
         """The enable toggle (after disable) restores the .md file."""
-        _simulate_disable_agent(tmp_project, "coder")
-        _simulate_enable_agent(tmp_project, "coder")
+        _simulate_disable_agent(tmp_project, "example-agent")
+        _simulate_enable_agent(tmp_project, "example-agent")
 
-        enabled = tmp_project / ".claude" / "agents" / "coder.md"
-        disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
+        enabled = tmp_project / ".claude" / "agents" / "example-agent.md"
+        disabled = tmp_project / ".claude" / "agents.disabled" / "example-agent.md"
         assert enabled.exists(), "enable restored the file"
         assert not disabled.exists(), "disabled sibling removed"
 
@@ -140,7 +141,7 @@ class TestAgentFsDisableContract:
         and return action="skip-disabled" — NOT re-overwrite the
         enabled-side file."""
         # Disable.
-        _simulate_disable_agent(tmp_project, "coder")
+        _simulate_disable_agent(tmp_project, "example-agent")
 
         # Spawn install_project_bundle in update mode and look for the
         # skip-disabled action.
@@ -167,8 +168,8 @@ class TestAgentFsDisableContract:
         # reasons (template path missing in the test fixture etc.), so the
         # two filesystem assertions below — not the exit code — carry the
         # contract.
-        enabled = tmp_project / ".claude" / "agents" / "coder.md"
-        disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
+        enabled = tmp_project / ".claude" / "agents" / "example-agent.md"
+        disabled = tmp_project / ".claude" / "agents.disabled" / "example-agent.md"
         assert disabled.exists(), (
             "post-update: disabled file must STILL exist; the FS-disable "
             "contract requires install-bundle to honour the .disabled/ companion"
@@ -177,29 +178,29 @@ class TestAgentFsDisableContract:
         # point: `_simulate_disable_agent` renamed the file away, so `enabled`
         # was already absent going in. It can only exist now if the update
         # RE-CREATED it — the exact violation this test exists to catch. It is
-        # not conditional on the bundle enumerating `coder.md` either: if the
+        # not conditional on the bundle enumerating `example-agent.md` either: if the
         # template never shipped it, nothing wrote it and the file is still gone.
         assert not enabled.exists(), (
             "post-update: install-bundle re-created the enabled-side file, "
             "silently re-enabling an agent the user disabled"
         )
         # Belt-and-braces on the JSON when the run succeeded: the action for
-        # coder.md should be skip-disabled.
+        # example-agent.md should be skip-disabled.
         if result.returncode == 0 and result.stdout.strip():
             try:
                 payload = json.loads(result.stdout)
                 actions = payload.get("actions", {})
-                # If the bundle DID enumerate `coder.md`, the action
+                # If the bundle DID enumerate `example-agent.md`, the action
                 # must be "skip-disabled". If it didn't enumerate it,
                 # the action is absent — that's also fine.
                 skip_list = actions.get("skip-disabled", []) or actions.get(
                     "skipped_disabled", []
                 )
                 if skip_list:
-                    # Confirm coder is in the skip list when it was in
+                    # Confirm example-agent is in the skip list when it was in
                     # the enumeration.
                     skip_names = [str(p) for p in skip_list]
-                    matched = any("coder.md" in s for s in skip_names)
+                    matched = any("example-agent.md" in s for s in skip_names)
                     if not matched:
                         # The enumeration might use a different path
                         # shape; we don't fail the test on that — the
@@ -215,13 +216,13 @@ class TestAgentFsDisableContract:
         """If the enabled file is already missing (user removed it
         manually), the disable toggle must be a no-op rather than
         raising."""
-        enabled = tmp_project / ".claude" / "agents" / "coder.md"
+        enabled = tmp_project / ".claude" / "agents" / "example-agent.md"
         enabled.unlink()  # user already deleted it
         # Simulate disable — should be a no-op, no exception.
-        _simulate_disable_agent(tmp_project, "coder")
+        _simulate_disable_agent(tmp_project, "example-agent")
         # Neither file present after the toggle.
         assert not enabled.exists()
-        disabled = tmp_project / ".claude" / "agents.disabled" / "coder.md"
+        disabled = tmp_project / ".claude" / "agents.disabled" / "example-agent.md"
         assert not disabled.exists()
 
 
@@ -234,13 +235,13 @@ class TestSkillFsDisableContract:
     def test_disable_moves_skill_dir_to_disabled(self, tmp_project: Path) -> None:
         """Disable on a skill must move the whole `.claude/skills/<name>/`
         directory to `.claude/skills.disabled/<name>/`."""
-        enabled_dir = tmp_project / ".claude" / "skills" / "tdd"
-        disabled_dir = tmp_project / ".claude" / "skills.disabled" / "tdd"
+        enabled_dir = tmp_project / ".claude" / "skills" / "example-skill"
+        disabled_dir = tmp_project / ".claude" / "skills.disabled" / "example-skill"
 
         assert (enabled_dir / "SKILL.md").exists(), "pre: enabled dir present"
         assert not disabled_dir.exists(), "pre: disabled dir absent"
 
-        _simulate_disable_skill(tmp_project, "tdd")
+        _simulate_disable_skill(tmp_project, "example-skill")
 
         assert not enabled_dir.exists(), (
             "post: enabled dir must be GONE — without the move, "

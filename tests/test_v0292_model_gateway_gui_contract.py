@@ -610,9 +610,7 @@ def test_shipped_gateway_agents_pin_to_the_router_namespace():
         "glm-flash-researcher.md": ("zai", "glm-5.3-flash"),
         "deepseek-implementer.md": ("qwen", "deepseek-v4.1-flash"),
         "qwen-implementer.md": ("qwen", "qwen3.8-max"),
-        "qwen-flash-implementer.md": ("qwen", "qwen3.8-flash"),
         "deepseek-researcher.md": ("qwen", "deepseek-v4.1-flash"),
-        "qwen-flash-researcher.md": ("qwen", "qwen3.8-flash"),
         "qwen-flash-sweeper.md": ("qwen", "qwen3.8-flash"),
     }
 

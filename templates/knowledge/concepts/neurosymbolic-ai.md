@@ -171,12 +171,12 @@ Feedback to LLM          Return verified solution
 **1. Multi-agent plan verification** (ASP):
 ```python
 asp_rules = """
-agent_skill(coder, [python, testing]).
+agent_skill(expert_coder, [python, testing]).
 task_requires(implement_auth, [python, security]).
 :- assign(Agent, Task), task_requires(Task, Skills),
    not all_skills_present(Agent, Skills).
 """
-# @project_coordinator proposes plan → ASP verifies → return verified or constraint violations
+# @planner proposes plan → ASP verifies → return verified or constraint violations
 ```
 
 **2. Resource allocation** (CSP):

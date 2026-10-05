@@ -89,6 +89,18 @@ jobs:
         run: |
           python3 .github/scripts/check_hook_parity.py
 
+      # NB-16 (v0.2.101): RUNTIME leg for templates/hooks/_lib/emit-context.ps1.
+      # The .ps1 sibling of emit-context.sh was previously covered only by a
+      # source-scan pytest leg; this step executes the real emitter under pwsh
+      # (preinstalled on GitHub ubuntu runners) and asserts on the JSON it
+      # produces — additionalContext present, permissionDecision absent. Same
+      # script the pytest leg invokes (single definition); running it here
+      # guarantees the check fires in CI even where the pytest skipif would
+      # swallow it.
+      - name: Runtime check emit-context.ps1 envelope (pwsh)
+        shell: pwsh
+        run: .github/scripts/check_emit_context_ps1.ps1 -RepoRoot "${{ github.workspace }}"
+
   hook-set-discipline:
     name: Check `set -e` always paired with `pipefail`
     runs-on: ubuntu-latest

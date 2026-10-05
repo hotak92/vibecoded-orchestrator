@@ -75,6 +75,7 @@ __all__ = ["merge_hooks_block", "smart_merge_settings"]
 def smart_merge_settings(
     user: dict, template: dict, *, retired_removed: Optional[list] = None,
     parked: Optional[ParkedHooksState] = None, kept_out: Optional[list] = None,
+    retired_allow: tuple[str, ...] = (),
 ) -> dict:
     """Recursive dict merge with a hooks-block special-case.
 
@@ -93,7 +94,22 @@ def smart_merge_settings(
     copied from the template wholesale: it goes through the hooks merge too,
     because the launcher deletes the whole key when the last hook is disabled,
     and copying it back would switch every one of them on again.
+
+    ``retired_allow`` (v0.2.101): exact ``permissions.allow`` strings a
+    retired MCP left behind (from
+    ``mcp_scan_rules.retired_settings_allow_patterns`` — the ONE rule table
+    the registration scrub also reads). They are dropped from the user's
+    list before the merge; this is the single exception to user-wins, the
+    same authority the retired-hooks scrub carries: VCO shipped the entry,
+    VCO retired what it pointed at. A user's own allow entry is untouched
+    unless it is byte-identical to a retired pattern.
     """
+    if retired_allow:
+        perms = user.get("permissions")
+        if isinstance(perms, dict) and isinstance(perms.get("allow"), list):
+            kept = [e for e in perms["allow"] if e not in retired_allow]
+            if len(kept) != len(perms["allow"]):
+                user = {**user, "permissions": {**perms, "allow": kept}}
     out = dict(user)
     for key, tval in template.items():
         if key not in out:

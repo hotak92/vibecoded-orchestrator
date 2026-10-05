@@ -57,7 +57,7 @@ def _make_fake_orchestrator(root: Path) -> None:
         <root>/templates/hooks/_lib/find-python.ps1
         <root>/templates/scripts/kg-search
         <root>/templates/scripts/notify.py
-        <root>/templates/agents/free/coder.md (with {{ORCHESTRATOR_ROOT}})
+        <root>/templates/agents/free/example-agent.md (with {{ORCHESTRATOR_ROOT}})
         <root>/templates/skills/architect/SKILL.md (with {{HOME}})
         <root>/templates/skills/architect/extra.txt
         <root>/templates/settings.json.linux.template
@@ -85,8 +85,9 @@ def _make_fake_orchestrator(root: Path) -> None:
 
     agents = root / "templates" / "agents" / "free"
     agents.mkdir(parents=True)
-    (agents / "coder.md").write_text(
-        "# Coder agent\n"
+    # Neutral fixture name — no shipped-catalogue meaning (retired in v0.2.101).
+    (agents / "example-agent.md").write_text(
+        "# Example agent\n"
         "Orchestrator at {{ORCHESTRATOR_ROOT}}\n"
         "Projects under {{PROJECTS_ROOT}}\n"
         "Home {{HOME}}\n",
@@ -209,7 +210,7 @@ class InstallBundleFreshTests(unittest.TestCase):
         )
         # Agents.
         self.assertIn(
-            str(Path(".claude") / "agents" / "coder.md"),
+            str(Path(".claude") / "agents" / "example-agent.md"),
             result["actions"]["create"],
         )
         # Skills (recursive — note the relative path includes the skill dirname).
@@ -254,15 +255,15 @@ class InstallBundleFreshTests(unittest.TestCase):
             orchestrator_root=self.orch,
             update_mode=False,
         )
-        coder = (self.proj / ".claude" / "agents" / "coder.md").read_text(
+        agent_text = (self.proj / ".claude" / "agents" / "example-agent.md").read_text(
             encoding="utf-8",
         )
-        self.assertIn(str(self.orch), coder)
-        self.assertIn(str(self.orch.parent), coder)
-        self.assertIn(str(Path.home()), coder)
-        self.assertNotIn("{{ORCHESTRATOR_ROOT}}", coder)
-        self.assertNotIn("{{PROJECTS_ROOT}}", coder)
-        self.assertNotIn("{{HOME}}", coder)
+        self.assertIn(str(self.orch), agent_text)
+        self.assertIn(str(self.orch.parent), agent_text)
+        self.assertIn(str(Path.home()), agent_text)
+        self.assertNotIn("{{ORCHESTRATOR_ROOT}}", agent_text)
+        self.assertNotIn("{{PROJECTS_ROOT}}", agent_text)
+        self.assertNotIn("{{HOME}}", agent_text)
 
     def test_skill_md_substituted_text_files_byte_copied(self):
         project_init.install_project_bundle(
@@ -511,7 +512,7 @@ class ModuleGatewayAgentDeliveryTests(unittest.TestCase):
             self.assertFalse((self.proj / ".claude" / "agents" / name).exists())
         # The free bucket is untouched by the gate either way.
         self.assertIn(
-            str(Path(".claude") / "agents" / "coder.md"),
+            str(Path(".claude") / "agents" / "example-agent.md"),
             result["actions"]["create"],
         )
 
