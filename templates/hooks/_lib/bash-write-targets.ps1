@@ -14,6 +14,11 @@
 # sibling: it is the same decision on both operating systems and a
 # mirrored implementation would drift.
 #
+# v0.2.101 (PLAN-V02101 section 3 WP-A1): the injection redesign's EDIT
+# classifier (vco_lib/inject_intent.py::classify_bash) is a SECOND Python
+# consumer of the same parser, imported in-process by
+# hook_context_router.py. Still exactly ONE parser; nothing here changed.
+#
 # MUST MATCH: templates/hooks/_lib/bash-write-targets.sh -- in particular
 # Test-VcoWriteSuspicious and vco_bash_write_prefilter must accept the same
 # commands, which tests/test_v0295_bash_write_sync.py pins.

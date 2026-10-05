@@ -7,8 +7,9 @@ and asserts:
   - put/get round-trip within TTL (fresh hit returns the stored blob)
   - a distinct key MISSES (returns non-zero, no output)
   - stale entry (age >= TTL) MISSES so the caller re-queries
-  - an EMPTY result is cached and served as a HIT (rc 0, no output) so an empty
-    symbol isn't re-queried within the TTL
+  - an EMPTY result is NEVER cached (v0.2.101 §9 poison fix — an empty blob is
+    indistinguishable from a timed-out/killed leg and suppressed retries for
+    the whole TTL; detailed coverage in test_v02101_query_cache_poison_fix.py)
   - the key is deterministic + namespaced by surface (cg vs kg don't collide)
   - codegraph_query_block serves the SECOND identical call from cache WITHOUT
     re-launching the CLI (the load-bearing latency win)
@@ -96,9 +97,11 @@ def test_stale_entry_misses(tmp_path: Path) -> None:
     assert "MISS" in r.stdout, r.stdout
 
 
-def test_empty_result_is_cached_as_hit(tmp_path: Path) -> None:
-    # A cached empty result must be a HIT (rc 0) that emits nothing — so an
-    # empty symbol is NOT re-queried within the TTL.
+def test_empty_result_is_never_cached(tmp_path: Path) -> None:
+    # v0.2.101 §9 (kickoff probe Cause 1b): an empty put writes NOTHING, and
+    # a get on a pre-existing empty entry is a MISS — an empty blob cannot be
+    # told apart from a timed-out leg, and caching it poisoned the key for
+    # the whole TTL. Detailed coverage: test_v02101_query_cache_poison_fix.py.
     r = _run(
         'K="$(vco_query_cache_key cg emptysym "" 2)"\n'
         'vco_query_cache_put "$K" ""\n'
@@ -106,7 +109,7 @@ def test_empty_result_is_cached_as_hit(tmp_path: Path) -> None:
         tmp_path,
     )
     assert r.returncode == 0, r.stderr
-    assert "HIT[]" in r.stdout, r.stdout
+    assert "MISS" in r.stdout, r.stdout
 
 
 def test_key_is_deterministic_and_surface_namespaced(tmp_path: Path) -> None:
@@ -175,9 +178,10 @@ def test_codegraph_query_block_second_call_served_from_cache(tmp_path: Path) -> 
     )
 
 
-def test_codegraph_query_block_caches_empty_result(tmp_path: Path) -> None:
-    """An empty CLI result is cached, so the second identical query does not
-    re-launch the CLI (empty-symbol thrash avoidance)."""
+def test_codegraph_query_block_does_not_cache_empty_result(tmp_path: Path) -> None:
+    """v0.2.101 §9: an empty CLI result (no hits OR a killed leg — the two
+    are indistinguishable here) is NOT cached, so the second identical query
+    re-launches the CLI instead of replaying a poisoned empty hit."""
     proj = tmp_path / "proj"
     (proj / ".claude" / "scripts").mkdir(parents=True)
     (proj / ".claude" / "state").mkdir(parents=True)
@@ -198,8 +202,9 @@ def test_codegraph_query_block_caches_empty_result(tmp_path: Path) -> None:
     )
     assert r.returncode == 0, r.stderr
     calls = marker.read_text("utf-8") if marker.exists() else ""
-    assert len(calls) == 1, (
-        f"empty result must be cached; CLI ran {len(calls)} times (expected 1)."
+    assert len(calls) == 2, (
+        f"an EMPTY result must NOT be cached; the CLI must run again "
+        f"(ran {len(calls)} times, expected 2)."
     )
 
 

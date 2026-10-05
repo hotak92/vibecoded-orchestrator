@@ -28,8 +28,14 @@
 #     dedup state accurate (a node seen since the cache was written is still
 #     filtered out on replay). This mirrors the pre-edit hook's raw-cache
 #     invariant.
-#   - Caches EMPTY results too (via a one-byte sentinel file) so a symbol that
-#     genuinely returns nothing isn't re-queried every call within the TTL.
+#   - NEVER caches an EMPTY result (v0.2.101 §9 poison fix). An empty blob is
+#     indistinguishable from a leg killed by its inner timeout, and caching it
+#     suppressed EVERY retry of that query for the whole TTL (kickoff probe
+#     Cause 1b: a timed-out Read query poisoned its key for 900 s). A
+#     genuinely-empty symbol now re-queries live — the cost of one extra
+#     round-trip per empty symbol per call, paid deliberately. A pre-existing
+#     EMPTY entry (written by an older version) reads as a MISS and is
+#     removed, so poisoned keys self-heal on first touch.
 #   - TTL default 900 s (15 min); override with VCO_QUERY_CACHE_TTL.
 #   - Best-effort throughout: any cache error falls back to running the query
 #     live. A broken cache must never break injection.
@@ -72,11 +78,13 @@ vco_query_cache_key() {
     printf '%s' "$joined" | tr -c 'a-zA-Z0-9' '_' | head -c 96
 }
 
-# vco_query_cache_get <key> — if a fresh (within-TTL) cache entry exists for
-# <key>, print its stored blob to stdout and return 0. An empty-result entry
-# prints nothing and still returns 0 (the caller must distinguish "cached
-# empty" from "miss" via the return code, NOT via output emptiness). Return
+# vco_query_cache_get <key> — if a fresh (within-TTL) NON-EMPTY cache entry
+# exists for <key>, print its stored blob to stdout and return 0. Return
 # non-zero on miss / stale / error so the caller runs the query live.
+# v0.2.101 §9: an EMPTY stored file is a MISS (and is removed) — empty is
+# never cached any more, so a leftover empty entry can only be poison from
+# an older version or a concurrent partial write; both must not suppress the
+# live retry.
 vco_query_cache_get() {
     local key="$1"
     [ -n "$key" ] || return 1
@@ -84,6 +92,11 @@ vco_query_cache_get() {
     dir="$(vco_query_cache_dir)" || return 1
     local f="$dir/$key"
     [ -f "$f" ] || return 1
+    # §9 self-heal: empty (0-byte) entry → miss + remove.
+    if [ ! -s "$f" ]; then
+        rm -f "$f" 2>/dev/null || true
+        return 1
+    fi
     local ttl="${VCO_QUERY_CACHE_TTL:-$_VCO_QUERY_CACHE_TTL_DEFAULT}"
     local mtime
     mtime=$(stat -c '%Y' "$f" 2>/dev/null || stat -f '%m' "$f" 2>/dev/null || echo "")
@@ -95,18 +108,24 @@ vco_query_cache_get() {
     if [ "$age" -ge "$ttl" ]; then
         return 1
     fi
-    # Fresh hit. The stored file is the raw blob (may be empty for a cached
-    # empty result). Emit it verbatim.
+    # Fresh hit. The stored file is the raw (non-empty — see the guard above)
+    # blob. Emit it verbatim.
     cat "$f" 2>/dev/null || true
     return 0
 }
 
-# vco_query_cache_put <key> <blob> — store <blob> (may be empty) for <key>.
+# vco_query_cache_put <key> <blob> — store a NON-EMPTY <blob> for <key>.
+# v0.2.101 §9: an EMPTY blob is NEVER stored (this is the one chokepoint
+# every cached surface — codegraph_query_block, vco_kg_search_cached,
+# vco_dual_search_cached — puts through, so the guard lives HERE once).
 # Also opportunistically GCs stale entries so the dir stays bounded. Soft-fail.
 vco_query_cache_put() {
     local key="$1"
     local blob="$2"
     [ -n "$key" ] || return 0
+    # §9: empty (a killed/timed-out leg or a genuine no-hit — the two are
+    # indistinguishable at this layer) must not poison the key for the TTL.
+    [ -n "$blob" ] || return 0
     local dir
     dir="$(vco_query_cache_dir)" || return 0
     # Atomic write: temp then rename, so a concurrent reader never sees a
@@ -138,10 +157,11 @@ vco_query_cache_put() {
 # NOTE: the KG cache is keyed on the "kg" surface + query + limit + prompt_id
 # so it does NOT collide with the "cg" code-graph entries. The result is RAW
 # (pre-dedup); the caller dedups per-session via the seen-store, so cached
-# replays stay dedup-accurate. Empty results ARE cached (an empty symbol
-# isn't re-queried). Best-effort: missing cache helper OR missing
-# venv/script -> falls back to a direct call (pre-edit/pre-bash already
-# guard the venv/script existence).
+# replays stay dedup-accurate. Empty results are NEVER cached (v0.2.101 §9 —
+# the put chokepoint below drops them; an empty blob cannot be told apart
+# from a killed leg and must not suppress the live retry). Best-effort:
+# missing cache helper OR missing venv/script -> falls back to a direct call
+# (pre-edit/pre-bash already guard the venv/script existence).
 #
 # WP-E (v0.2.92) query enrichment: [prompt_id] and [transcript_path] are OPTIONAL
 # trailing args, default "" (an omitting caller reproduces pre-WP-E behaviour

@@ -20,9 +20,11 @@
 # Semantics (identical to the .sh sibling):
 #   - Stores the RAW producer block (pre-dedup); callers dedup per-session
 #     after the cached value is returned.
-#   - Caches EMPTY results too (empty file) so a genuinely-empty symbol isn't
-#     re-queried within the TTL. Miss vs cached-empty is signalled by the
-#     return object, not by output emptiness.
+#   - NEVER caches an EMPTY result (v0.2.101 poison fix, section 9): an empty
+#     blob is indistinguishable from a leg killed by its inner timeout, and
+#     caching it suppressed EVERY retry of that query for the whole TTL. A
+#     pre-existing EMPTY entry (written by an older version) reads as a MISS
+#     and is removed, so poisoned keys self-heal on first touch.
 #   - TTL default 900 s; override with $env:VCO_QUERY_CACHE_TTL.
 #   - Best-effort: any error falls back to running the query live.
 #
@@ -59,8 +61,11 @@ function Get-VcoQueryCacheKey {
 }
 
 # Get-VcoQueryCache <Key> -- returns a hashtable @{Hit=$bool; Value=$string}.
-# Hit is $true when a fresh (within-TTL) entry exists (Value may be "" for a
-# cached empty result). Hit is $false on miss/stale/error -> caller runs live.
+# Hit is $true ONLY for a fresh (within-TTL) NON-EMPTY entry. An empty stored
+# file is a miss (v0.2.101 poison fix, section 9) and is removed so a key
+# poisoned by an older version self-heals. Hit is $false on
+# miss/stale/empty/error -> caller runs live.
+# MUST MATCH query-cache.sh vco_query_cache_get.
 function Get-VcoQueryCache {
     param([string]$Key)
     $miss = @{ Hit = $false; Value = "" }
@@ -69,6 +74,12 @@ function Get-VcoQueryCache {
     if (-not $dir) { return $miss }
     $f = Join-Path $dir $Key
     if (-not (Test-Path -LiteralPath $f)) { return $miss }
+    try {
+        if ((Get-Item -LiteralPath $f).Length -eq 0) {
+            Remove-Item -LiteralPath $f -Force -ErrorAction SilentlyContinue
+            return $miss
+        }
+    } catch { return $miss }
     $ttl = if ($env:VCO_QUERY_CACHE_TTL) { [int]$env:VCO_QUERY_CACHE_TTL } else { $script:VcoQueryCacheTtlDefault }
     try {
         $mtime = (Get-Item -LiteralPath $f).LastWriteTime
@@ -83,11 +94,15 @@ function Get-VcoQueryCache {
     }
 }
 
-# Set-VcoQueryCache <Key> <Blob> -- store Blob (may be "") for Key, then GC
-# stale entries. Soft-fail.
+# Set-VcoQueryCache <Key> <Blob> -- store a NON-EMPTY Blob for Key, then GC
+# stale entries. An empty Blob is NEVER stored (v0.2.101 poison fix, section
+# 9 -- this is the one chokepoint every cached surface puts through, so the
+# guard lives HERE once). Soft-fail.
+# MUST MATCH query-cache.sh vco_query_cache_put.
 function Set-VcoQueryCache {
     param([string]$Key, [string]$Blob)
     if (-not $Key) { return }
+    if ([string]::IsNullOrEmpty($Blob)) { return }
     $dir = Get-VcoQueryCacheDir
     if (-not $dir) { return }
     $f = Join-Path $dir $Key

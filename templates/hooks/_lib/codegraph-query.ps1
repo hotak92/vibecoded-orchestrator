@@ -10,8 +10,17 @@
 # dedup (via _lib/seen-store.ps1) -- this helper returns RAW blocks.
 #
 # MUST MATCH: templates/hooks/_lib/codegraph-query.sh -- the query/format
-# contract (CODE:-prefixed --hook-format output, the inner timeout bound) AND the
-# Test-VcoCodegraphBashGate + Test-VcoCodegraphPatternGate regexes.
+# contract (CODE:-prefixed --hook-format output, the inner timeout bound, the
+# section-9 no-cache-on-timeout guard) AND the Test-VcoCodegraphBashGate +
+# Test-VcoCodegraphPatternGate regexes.
+#
+# v0.2.101 (PLAN-V02101 section 3 WP-A1): the ONE HOME for the gate logic is
+# now vco_lib/inject_intent.py; the gates below are the INTERIM copy that
+# keeps the LEGACY hooks working until Wave 2 retires them WITH THEIR
+# CALLERS. tests/test_v02101_inject_intent_classifier.py pins the shell and
+# Python sides against one corpus -- change a rule in ONE place and the
+# parity test goes red (that is the design). Delete these gates here and in
+# the .sh sibling when the last legacy caller is rewired.
 #
 # Plain ASCII only. Dot-sourced, never executed. Library, not a hook.
 
@@ -85,7 +94,8 @@ function Invoke-VcoCodegraphQueryBlock {
     if ($qcKey -and (Get-Command Get-VcoQueryCache -ErrorAction SilentlyContinue)) {
         $qc = Get-VcoQueryCache $qcKey
         if ($qc.Hit) {
-            # Fresh hit (Value may be "" for a cached-empty result).
+            # Fresh hit (non-empty by contract since the v0.2.101 section-9
+            # fix -- an empty entry now reads as a miss and self-heals).
             return $qc.Value
         }
     }
@@ -106,7 +116,13 @@ function Invoke-VcoCodegraphQueryBlock {
     # PATH only; never transcript contents (see -Transcript doc above).
     if ($Transcript) { $argList += @("--transcript", $Transcript) }
 
+    # v0.2.101 section 9: $legOk tracks whether the job finished inside the
+    # 4 s bound. A timed-out/killed leg's output is missing-or-partial and
+    # must NEVER reach the cache (a killed leg poisoned its key for the
+    # whole TTL -- kickoff probe Cause 1b). MUST MATCH codegraph-query.sh's
+    # $_rc guard.
     $raw = ""
+    $legOk = $false
     try {
         $job = Start-Job -ScriptBlock {
             param($cli, $argList)
@@ -118,6 +134,7 @@ function Invoke-VcoCodegraphQueryBlock {
         } -ArgumentList $cli, $argList
         if (Wait-Job $job -Timeout 4) {
             $raw = (Receive-Job $job) -join "`n"
+            $legOk = $true
         } else {
             Stop-Job $job -ErrorAction SilentlyContinue
         }
@@ -127,14 +144,17 @@ function Invoke-VcoCodegraphQueryBlock {
     # Cap the volume. Self-reference exclusion happens INSIDE the CLI via
     # --exclude-file (B2) -- the old line-wise filter here stripped only the
     # CODE: header line and left orphaned body lines. Do not re-add it.
-    # v0.2.77 Part 9 task 2: compute the final block ONCE, store it (incl. the
-    # EMPTY result so an empty symbol isn't re-queried within TTL), then return.
+    # v0.2.77 Part 9 task 2: compute the final block ONCE, store it, then
+    # return. v0.2.101 section 9: stored ONLY on a clean finish ($legOk) --
+    # and Set-VcoQueryCache itself drops empty blobs, so neither a killed
+    # leg nor a genuine no-hit can poison the key. The old "cache the EMPTY
+    # result" behaviour is GONE by design.
     $out = ""
     if (-not [string]::IsNullOrEmpty($raw)) {
         $lines = $raw -split "`n"
         $out = (($lines | Select-Object -First 20) -join "`n")
     }
-    if ($qcKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
+    if ($legOk -and $qcKey -and (Get-Command Set-VcoQueryCache -ErrorAction SilentlyContinue)) {
         Set-VcoQueryCache $qcKey $out
     }
     return $out

@@ -28,8 +28,10 @@ import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import requests
+from functools import lru_cache
 from pathlib import Path
 from typing import Optional, List
 
@@ -1418,8 +1420,26 @@ class CodeGraphQuery:
         except Exception as e:
             print(f"❌ Error finding similar code: {e}", file=sys.stderr)
 
-    def query_structure(self, query_type: str, target: str):
-        """Structural query (dependencies, callers, etc.)."""
+    def query_structure(self, query_type: str, target: str,
+                        hook_format: bool = False,
+                        indexed_revision: bool = False,
+                        source_file: Optional[str] = None,
+                        exclude_file: Optional[str] = None):
+        """Structural query (dependencies, callers, etc.).
+
+        v0.2.101 WP-B2: ``hook_format`` emits the compact CODE:-row block
+        for injection surfaces (symbol + file:line ONLY, never bodies; ≤5
+        rows; ≤5 items per row, honest (+N) truncation). ``indexed_revision``
+        prepends the ``CODE-REV:`` stamp so the router can stay SILENT when
+        the ref being read (``git show <rev>``) does not match the graph's
+        revision (wave-4 caveat (a)). ``source_file`` enables the
+        same-language identity check (cross-language only on an exact
+        full_name equality — kills the WP-03b wrong-language hit class).
+        All three default off: interactive CLI behaviour is unchanged.
+        """
+        stamp = None
+        if hook_format and indexed_revision:
+            stamp = compute_indexed_revision(str(_calling_project_root()))
         try:
             if query_type == "dependencies":
                 # Module imports
@@ -1431,6 +1451,8 @@ class CodeGraphQuery:
                 )
 
                 if not response.objects:
+                    if hook_format:
+                        return
                     print(f"❌ Module '{target}' not found")
                     return
 
@@ -1457,6 +1479,20 @@ class CodeGraphQuery:
                 imports = dedup_ref_targets(
                     normalize_reference_targets(_refs.get("imports")), ("path",)
                 )
+
+                if hook_format:
+                    entities = [{
+                        "full_name": target, "kind": "module", "rel": "imports",
+                        "items": [str(i.properties.get("path") or "") for i in imports],
+                    }]
+                    block = format_structure_hook_block(
+                        query_type, target,
+                        filter_same_language(entities, target, source_file),
+                        revision_stamp=stamp)
+                    if block:
+                        print(block, end="")
+                    return
+
                 print(f"\n🔗 Dependencies of module '{target}':")
                 print(f"   Imports {len(imports)} modules:\n")
 
@@ -1493,13 +1529,35 @@ class CodeGraphQuery:
                 # legitimately exists in several files. Collect every uuid —
                 # the call edge below is confirmed against the whole set.
                 TARGET_ROWS_LIMIT = 32
+                # v0.2.101 WP-B2: the hook-format row renders def <file>:<line>
+                # and the same-language identity check, so those properties
+                # join the fetch. Interactive runs keep the old single-prop
+                # fetch (zero functionality change).
+                target_props = (
+                    ["full_name", "name", "file_path", "start_line", "language"]
+                    if hook_format else ["full_name"]
+                )
                 response = coll.query.fetch_objects(
                     filters=Filter.by_property("full_name").equal(target),
                     limit=TARGET_ROWS_LIMIT,
-                    return_properties=["full_name"],
+                    return_properties=target_props,
                 )
 
+                if not response.objects and hook_format:
+                    # WP-B2 leaf-name fallback: injection surfaces extract
+                    # enclosing symbols as BARE leaf names (`bar`, not
+                    # `mod::Foo::bar`), so an exact full_name miss retries on
+                    # `name`. Interactive callers keep full_name-exact-only
+                    # (behaviour unchanged).
+                    response = coll.query.fetch_objects(
+                        filters=Filter.by_property("name").equal(target),
+                        limit=TARGET_ROWS_LIMIT,
+                        return_properties=target_props,
+                    )
+
                 if not response.objects:
+                    if hook_format:
+                        return
                     print(f"❌ Function '{target}' not found")
                     return
 
@@ -1544,6 +1602,50 @@ class CodeGraphQuery:
                 callers = _dedup_objects_by_full_name(caller_response.objects)
                 truncated = len(caller_response.objects) >= CALLERS_FETCH_LIMIT
 
+                if hook_format:
+                    # WP-B2 injection block: one CODE: row per matched target
+                    # entity (<= 5), callers <= 5 each, edge-confirmed callers
+                    # first, symbol+file:line ONLY. The language identity
+                    # filter and the revision stamp are applied by the shared
+                    # pure helpers (hermetically tested).
+                    ordered_callers = sorted(
+                        callers,
+                        key=lambda c: 0 if ((c.properties or {}).get("full_name") in confirmed_names) else 1,
+                    )
+                    caller_items = [
+                        {
+                            "full_name": (c.properties or {}).get("full_name") or "",
+                            "file": (c.properties or {}).get("file_path") or "",
+                            "line": (c.properties or {}).get("start_line"),
+                        }
+                        for c in ordered_callers
+                    ]
+                    if exclude_file:
+                        # §2.1 Edit row: self-file callers are context the
+                        # model already has (it is editing that file).
+                        caller_items = [
+                            c for c in caller_items
+                            if not _same_source_file(c.get("file") or "", exclude_file)
+                        ]
+                    entities = []
+                    for row in response.objects[:HOOK_FORMAT_MAX_ROWS]:
+                        p = row.properties or {}
+                        entities.append({
+                            "full_name": p.get("full_name") or target,
+                            "kind": "function",
+                            "language": p.get("language") or "",
+                            "file": p.get("file_path") or "",
+                            "line": p.get("start_line"),
+                            "rel": "callers",
+                            "callers": caller_items,
+                        })
+                    entities = filter_same_language(entities, target, source_file)
+                    block = format_structure_hook_block(
+                        query_type, target, entities, revision_stamp=stamp)
+                    if block:
+                        print(block, end="")
+                    return
+
                 print(f"\n🔗 Callers of function '{target}':")
                 print(f"   Found {len(callers)} callers:\n")
 
@@ -1580,10 +1682,30 @@ class CodeGraphQuery:
                 )
 
                 if not response.objects:
+                    if hook_format:
+                        return
                     print(f"❌ Class '{target}' not found")
                     return
 
                 methods = response.objects[0].properties.get("methods", [])
+
+                if hook_format:
+                    p = response.objects[0].properties or {}
+                    entities = [{
+                        "full_name": p.get("full_name") or target, "kind": "class",
+                        "language": p.get("language") or "",
+                        "file": p.get("file_path") or "",
+                        "line": p.get("start_line"), "rel": "methods",
+                        "items": [str(m) for m in methods],
+                    }]
+                    block = format_structure_hook_block(
+                        query_type, target,
+                        filter_same_language(entities, target, source_file),
+                        revision_stamp=stamp)
+                    if block:
+                        print(block, end="")
+                    return
+
                 print(f"\n🔗 Methods in class '{target}':")
                 print(f"   {len(methods)} methods:\n")
 
@@ -1600,6 +1722,8 @@ class CodeGraphQuery:
                 )
 
                 if not response.objects:
+                    if hook_format:
+                        return
                     print(f"❌ Class '{target}' not found")
                     return
 
@@ -1616,6 +1740,24 @@ class CodeGraphQuery:
                     ),
                     ("full_name", "name"),
                 )
+
+                if hook_format:
+                    p = response.objects[0].properties or {}
+                    entities = [{
+                        "full_name": p.get("full_name") or target, "kind": "class",
+                        "language": p.get("language") or "",
+                        "file": p.get("file_path") or "",
+                        "line": p.get("start_line"), "rel": "extends",
+                        "items": [str(b.properties.get("full_name") or "") for b in extends],
+                    }]
+                    block = format_structure_hook_block(
+                        query_type, target,
+                        filter_same_language(entities, target, source_file),
+                        revision_stamp=stamp)
+                    if block:
+                        print(block, end="")
+                    return
+
                 print(f"\n🔗 Base classes of '{target}':")
                 print(f"   Extends {len(extends)} classes:\n")
 
@@ -1647,6 +1789,8 @@ class CodeGraphQuery:
                         limit=1
                     )
                     if not mod_resp.objects:
+                        if hook_format:
+                            return
                         print(f"❌ Function or module '{target}' not found")
                         return
                     source_uuid = str(mod_resp.objects[0].uuid)
@@ -1656,6 +1800,26 @@ class CodeGraphQuery:
                     )
 
                 truncated = len(ix_resp.objects) >= INTERACTIONS_FETCH_LIMIT
+
+                if hook_format:
+                    items = [
+                        f"{(o.properties or {}).get('interaction_type', '')} "
+                        f"{(o.properties or {}).get('protocol', '')} -> "
+                        f"{(o.properties or {}).get('endpoint', '')}".strip()
+                        for o in ix_resp.objects
+                    ]
+                    entities = [{
+                        "full_name": target, "kind": "interaction",
+                        "rel": "interactions", "items": items,
+                    }]
+                    block = format_structure_hook_block(
+                        query_type, target,
+                        filter_same_language(entities, target, source_file),
+                        revision_stamp=stamp)
+                    if block:
+                        print(block, end="")
+                    return
+
                 print(f"\n🔗 Cross-service interactions from '{target}':")
                 print(f"   Found {len(ix_resp.objects)} interactions:\n")
                 for obj in ix_resp.objects:
@@ -1683,6 +1847,148 @@ class CodeGraphQuery:
         """Close Weaviate connection."""
         if self.client:
             self.client.close()
+
+
+# --- v0.2.101 WP-B2: hook-format structural output ---------------------------
+# Pure helpers (no Weaviate) so the block shape, the caps, the language
+# identity rule and the revision stamp are hermetically testable —
+# tests/test_v02101_structure_hook_format.py.
+
+#: Row / item caps for the injection block (PLAN-V02101 §3 WP-B2: ≤5 rows,
+#: callers ≤5 each, symbol+file:line ONLY — never bodies, orchestrator
+#: answer 5). The router's own CgPolicy caps mirror these values; the
+#: formatter caps are the last line of defence, not the only one.
+HOOK_FORMAT_MAX_ROWS = 5
+HOOK_FORMAT_MAX_ITEMS = 5
+
+
+def format_structure_hook_block(
+    query_type: str,
+    target: str,
+    entities: List[dict],
+    revision_stamp: Optional[str] = None,
+    max_rows: int = HOOK_FORMAT_MAX_ROWS,
+    max_items: int = HOOK_FORMAT_MAX_ITEMS,
+) -> str:
+    """Render the ``--hook-format`` structure block.
+
+    One ``CODE:`` row per matched entity::
+
+        CODE: <full_name> | <kind> | def <file>:<line> | <rel>: <items> | src=<file>
+
+    ``def`` is emitted only when file AND line are known; ``items`` are
+    ``<full_name>@<file>:<line>`` for dict entries (callers) or bare strings
+    (imports/methods/extends). Truncation is HONEST: a capped list carries a
+    ``(+N)`` marker (Pattern B). An optional first line ``CODE-REV: <stamp>``
+    carries the indexed-revision stamp — the router compares it to the ref
+    being read (``git show <rev>``) and stays SILENT on mismatch.
+    """
+    lines: List[str] = []
+    if revision_stamp:
+        lines.append(f"CODE-REV: {revision_stamp}")
+    for ent in entities[:max_rows]:
+        full_name = ent.get("full_name") or target
+        kind = ent.get("kind") or "entity"
+        parts = [f"CODE: {full_name}", kind]
+        file_ = ent.get("file") or ""
+        line_no = ent.get("line")
+        if file_ and line_no is not None:
+            parts.append(f"def {file_}:{line_no}")
+        rel = ent.get("rel") or ("callers" if query_type == "callers" else query_type)
+        items = ent.get("callers") or ent.get("items") or []
+        rendered: List[str] = []
+        for it in items[:max_items]:
+            if isinstance(it, dict):
+                rendered.append(
+                    f"{it.get('full_name') or '?'}@{it.get('file') or '?'}:{it.get('line') or 0}"
+                )
+            else:
+                rendered.append(str(it))
+        more = len(items) - len(rendered)
+        items_str = ", ".join(rendered) if rendered else "(none)"
+        if more > 0:
+            items_str += f" (+{more})"
+        parts.append(f"{rel}: {items_str}")
+        if file_:
+            parts.append(f"src={file_}")
+        lines.append(" | ".join(parts))
+    if not lines:
+        return ""
+    return "\n".join(lines) + "\n"
+
+
+def _same_source_file(a: str, b: str) -> bool:
+    """Path identity for the --exclude-file filter: graph rows hold
+    repo-relative POSIX paths while the hook passes whatever the Edit
+    tool_input carried (often absolute). Equal after normpath, or one is the
+    other's ``/``-separated suffix. Pure + hermetically testable."""
+    if not a or not b:
+        return False
+    na = os.path.normpath(a).replace(os.sep, "/")
+    nb = os.path.normpath(b).replace(os.sep, "/")
+    if na == nb:
+        return True
+    return na.endswith("/" + nb) or nb.endswith("/" + na)
+
+
+def filter_same_language(
+    entities: List[dict], target: str, source_file: Optional[str]
+) -> List[dict]:
+    """Language/file identity check (WP-B2, kills the WP-03b wrong-language
+    hit class): an exact-symbol match must be SAME-LANGUAGE as the file the
+    symbol was extracted from; a cross-language entity survives ONLY on an
+    exact ``full_name`` equality (a deliberately shared name across the
+    A>B>C language boundary). No source_file (or an unknown extension)
+    disables the filter — a bare CLI run keeps today's behaviour."""
+    if not source_file:
+        return list(entities)
+    from vco_lib.inject_intent import language_for_path
+
+    want = language_for_path(source_file)
+    if not want:
+        return list(entities)
+    out: List[dict] = []
+    for ent in entities:
+        lang = str(ent.get("language") or "").strip().lower()
+        if lang == want or ent.get("full_name") == target:
+            out.append(ent)
+    return out
+
+
+@lru_cache(maxsize=16)
+def compute_indexed_revision(project_root: str) -> str:
+    """The code graph's revision stamp for the router's pinned-ref check.
+
+    Memoized per root for the process lifetime (GLM review nit-2): the Read
+    surface runs up to 5 structure calls in one router process and each
+    would otherwise shell out to `git rev-parse` — one call per process is
+    enough (the CLI/hook process is per-turn; HEAD moving mid-turn is inside
+    the stamp's documented approximation anyway).
+
+    HONEST APPROXIMATION (v0.2.101, recorded in the wave-1 report): the
+    analyzer does not record the commit it indexed, so the stamp is the
+    project's HEAD AT QUERY TIME. Incremental analysis drains on the stop
+    hook, so the graph tracks HEAD closely; the wave-4 failure mode this
+    protects against — injecting HEAD-derived callers while the model reads
+    ``git show <old-rev>:file`` — is caught exactly (rev != HEAD → the
+    router stays silent). The residual gap (graph stale vs a HEAD that
+    moved since the last drain) is bounded by the drain cadence, and
+    closes fully when the analyzer grows a recorded revision (a follow-up
+    the coordinator owns; NOT silently pretended away here).
+    """
+    if not project_root:
+        return "unknown"
+    try:
+        r = subprocess.run(
+            ["git", "-C", project_root, "rev-parse", "HEAD"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return "unknown"
+    sha = (r.stdout or "").strip()
+    if r.returncode == 0 and re.fullmatch(r"[0-9a-f]{7,64}", sha):
+        return sha
+    return "unknown"
 
 
 def _calling_project_root():
@@ -1714,7 +2020,12 @@ def _calling_project_root():
     return _Path.cwd()
 
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
+    """The CLI parser (extracted from main() in v0.2.101 so the argv
+    contract is testable without a Weaviate connection; main() below is its
+    only production caller and hook_dual_search's argv-pinning shim keeps
+    working — it replaces this module's `argparse` attribute, which
+    build_parser resolves at call time)."""
     parser = argparse.ArgumentParser(
         description="Query code graph with semantic and structural search",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1778,8 +2089,34 @@ def main():
     structure_parser.add_argument('target', type=str, help='Target entity')
     structure_parser.add_argument('--project', '-p', type=str,
                                  help='Filter by project name')
+    # v0.2.101 WP-B2 — the injection surface's exact-symbol lookup:
+    structure_parser.add_argument('--hook-format', action='store_true',
+                                 help=("Emit the compact CODE:-row block for injection "
+                                       "hooks: '<full_name> | <kind> | def <file>:<line> | "
+                                       "<rel>: [...]' — <=5 rows, <=5 items per row, "
+                                       "symbol+file:line only (never bodies)."))
+    structure_parser.add_argument('--indexed-revision', action='store_true',
+                                 help=("Prepend a 'CODE-REV: <sha|unknown>' stamp line "
+                                       "(with --hook-format) so the router can stay "
+                                       "SILENT when the ref being read (git show <rev>) "
+                                       "does not match the code graph's revision."))
+    structure_parser.add_argument('--source-file', type=str, default=None,
+                                 help=("The file the target symbol was extracted from: "
+                                       "enables the same-language identity check (a "
+                                       "cross-language match survives only on an exact "
+                                       "full_name equality)."))
+    structure_parser.add_argument('--exclude-file', type=str, default=None,
+                                 help=("(--hook-format) drop caller rows whose source "
+                                       "file is this path — the Edit surface passes the "
+                                       "edited file so self-file callers are not "
+                                       "re-injected (§2.1 'self-file excluded')."))
+    return parser
 
-    args = parser.parse_args()
+
+def main(argv=None):
+    parser = build_parser()
+
+    args = parser.parse_args(argv)
 
     if not args.command:
         parser.print_help()
@@ -1834,7 +2171,13 @@ def main():
         elif args.command == 'similar':
             querier.find_similar(args.reference, args.collection, args.limit)
         elif args.command == 'structure':
-            querier.query_structure(args.query_type, args.target)
+            querier.query_structure(
+                args.query_type, args.target,
+                hook_format=getattr(args, 'hook_format', False),
+                indexed_revision=getattr(args, 'indexed_revision', False),
+                source_file=getattr(args, 'source_file', None),
+                exclude_file=getattr(args, 'exclude_file', None),
+            )
 
         return 0
 

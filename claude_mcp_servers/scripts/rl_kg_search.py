@@ -57,6 +57,13 @@ def dual_embed_budget_s(task_type: str) -> float:
 #: pre-bash, pre-tool-use and subagent-start events (and their loss-ledger
 #: lines) stay distinguishable. ``--task-type`` wins; else the hook's
 #: ``VCO_RL_TASK_TYPE``; else an interactive CLI run.
+#: v0.2.101 WP-B1: the injection-redesign surfaces partition the corpus by
+#: surface — the four new types MUST exist before any wrapper sets them
+#: (PLAN-V02101 risk table: "RL corpus gap during the transition").
+#: ``pre_search_kg_search`` is registered even though the SEARCH/Grep
+#: profiles run no KG leg today (vco_lib/inject_intent.py §2.1 table): an
+#: unknown value must never leak free text into the partition key, and the
+#: type is correct the day a KG leg is enabled there.
 TASK_TYPE_ENV = "VCO_RL_TASK_TYPE"
 DEFAULT_TASK_TYPE = "cli_kg_search"
 KNOWN_TASK_TYPES = (
@@ -65,6 +72,10 @@ KNOWN_TASK_TYPES = (
     "pre_tool_use_kg_search",
     "subagent_kg_search",
     "cli_kg_search",
+    "pre_read_kg_search",
+    "pre_write_kg_search",
+    "pre_search_kg_search",
+    "agent_brief_kg_search",
 )
 
 
@@ -123,9 +134,35 @@ async def main():
         choices=KNOWN_TASK_TYPES,
         help=f"RL task_type of this search (default: ${TASK_TYPE_ENV}, else {DEFAULT_TASK_TYPE})",
     )
+    # v0.2.101 WP-B1: injection-profile mode. The §2.1 noise-gate table
+    # (vco_lib/inject_intent.py — the ONE home) replaces the interactive
+    # score tiers for hook-injection surfaces: a per-surface floor, a
+    # titles-only tier below 0.85, a per-surface ceiling tier at/above 0.85,
+    # row and char caps. `_get_result_verbosity_by_score` and the KG_TIER_*
+    # tunables stay the default for explicit searches and the MCP — this flag
+    # does NOT touch interactive tiers.
+    from vco_lib.inject_intent import KG_PROFILES
+
+    parser.add_argument(
+        "--injection-profile",
+        default=None,
+        choices=list(KG_PROFILES),
+        help=("apply the §2.1 injection noise-gate table for this surface "
+              "profile instead of the interactive score tiers"),
+    )
     args = parser.parse_args()
     task_type = resolve_task_type(args.task_type)
     header_prefix = "KG: " if args.hook_format else ""
+
+    from vco_lib.inject_intent import kg_gate
+
+    gate = kg_gate(args.injection_profile) if args.injection_profile else None
+    if args.injection_profile and gate is None:
+        # A profile with NO KG leg (§2.1: bash_search / grep) must never
+        # reach this script from the router; if it does, stay silent rather
+        # than fall back to interactive tiers (which would inject BELOW the
+        # surface's floor). Exit before paying any weaviate import.
+        return
 
     # Import the MCP server's internals
     # V52-J (v0.2.52): rerank+emit is now routed through the canonical
@@ -300,7 +337,10 @@ async def main():
             # if it WILL be captured into context it's better to give it a
             # name. Non-hook callers (CLI) get nothing on empty — they're
             # interactive and the silence is informative on its own.
-            if args.hook_format:
+            # v0.2.101 WP-B1: injection-profile mode stays SILENT on empty
+            # (the router reads silence as "nothing above the floor"; a
+            # no-results line would be injected noise).
+            if args.hook_format and gate is None:
                 print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
             return
 
@@ -446,12 +486,64 @@ async def main():
         # Render per-result tier through the shared helper. Output format mirrors
         # the legacy "title | type | score=X.XX | <body>" contract that the
         # pre-edit hook expects so the hook stays compatible after the refactor.
+        # v0.2.101 WP-B1: in --injection-profile mode the §2.1 gate REPLACES
+        # the interactive tier: floor → discard, [floor, 0.85) → a TITLES
+        # header-only line, ≥0.85 → the profile's ceiling tier; row and char
+        # caps bound the whole block. The three print branches below were
+        # folded into ONE block builder (byte-identical stdout on the legacy
+        # path — each old print pair ended in the same "\n" the builder adds).
+        label_map = {
+            "summary":      "SUMMARY",
+            "single_chunk": "1 CHUNK",
+            "three_chunks": "3 CHUNKS",
+            "full":         "FULL NODE",
+            "titles":       "TITLES",
+        }
+
+        def _titles_line(entry: dict, score: float) -> str:
+            title = entry.get("title", "")
+            node_type = entry.get("node_type", "")
+            fp = entry.get("file_path", "") or ""
+            src = f" | src={fp}" if (args.hook_format and fp) else ""
+            return f"{header_prefix}{title} | {node_type} | score={score:.2f} | TITLES{src}\n"
+
         printed_count = 0
+        emitted_chars = 0
         for r in results:
             score = float(r.get("score") or 0.0)
-            tier = _get_result_verbosity_by_score(score)
-            if tier == "discard":
+            if gate is not None:
+                # §2.1 profile gating — floors/tiers/caps from the ONE home
+                # (vco_lib/inject_intent.py), NOT the interactive KG_TIER_*.
+                if score < gate.floor:
+                    continue
+                if gate.max_rows and printed_count >= gate.max_rows:
+                    break
+                tier = (
+                    "titles"
+                    if score < gate.strong_threshold
+                    else gate.tier_above
+                )
+            else:
+                tier = _get_result_verbosity_by_score(score)
+                if tier == "discard":
+                    continue
+
+            if tier == "titles":
+                # Header-only: identity + score + the src trailer (the
+                # seen-store dedup key and the reads-ledger suppression both
+                # read the header). The summary tier is the cheapest render
+                # that carries the needed fields; its body is dropped.
+                entry = _format_result_by_tier(r, "summary", sidecar_db=None, coll=coll)
+                if entry is None:
+                    continue
+                line = _titles_line(entry, score)
+                if gate is not None and gate.max_chars and emitted_chars + len(line) > gate.max_chars:
+                    break
+                print(line, end="")
+                emitted_chars += len(line)
+                printed_count += 1
                 continue
+
             entry = _format_result_by_tier(r, tier, sidecar_db=None, coll=coll)
             if entry is None:
                 continue
@@ -467,12 +559,6 @@ async def main():
             # exists, so interactive CLI output is unchanged.
             file_path = entry.get("file_path", "") or ""
             src_trailer = f" | src={file_path}" if (args.hook_format and file_path) else ""
-            label_map = {
-                "summary":      "SUMMARY",
-                "single_chunk": "1 CHUNK",
-                "three_chunks": "3 CHUNKS",
-                "full":         "FULL NODE",
-            }
             label = label_map.get(tier, tier.upper())
             chunks_shown = entry.get("chunks_shown")
             chunks_total = entry.get("chunks_total")
@@ -485,18 +571,37 @@ async def main():
                     or entry.get("summary")
                     or entry.get("content", "")
                 )
-                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {body}{src_trailer}")
+                block = f"{header_prefix}{title} | {node_type} | score={score:.2f} | {body}{src_trailer}\n"
             elif chunks_shown and chunks_total and chunks_total > 1:
                 body = entry.get("content", "")
-                print(
+                block = (
                     f"{header_prefix}{title} | {node_type} | score={score:.2f} | "
-                    f"{label} ({chunks_shown}/{chunks_total} chunks):{src_trailer}"
+                    f"{label} ({chunks_shown}/{chunks_total} chunks):{src_trailer}\n"
+                    f"{body}\n"
                 )
-                print(body)
             else:
                 body = entry.get("content", "")
-                print(f"{header_prefix}{title} | {node_type} | score={score:.2f} | {label}:{src_trailer}")
-                print(body)
+                block = (
+                    f"{header_prefix}{title} | {node_type} | score={score:.2f} | "
+                    f"{label}:{src_trailer}\n"
+                    f"{body}\n"
+                )
+
+            if gate is not None and gate.max_chars:
+                # The char budget (the agent brief's 1 500) is a HARD bound:
+                # a block that does not fit degrades to its titles line, and
+                # if even that does not fit the emission stops.
+                if emitted_chars + len(block) > gate.max_chars:
+                    line = _titles_line(entry, score)
+                    if emitted_chars + len(line) > gate.max_chars:
+                        break
+                    print(line, end="")
+                    emitted_chars += len(line)
+                    printed_count += 1
+                    continue
+
+            print(block, end="")
+            emitted_chars += len(block)
             printed_count += 1
 
         # v0.2.21 audit fix: if EVERY result was filtered out (tier=discard
@@ -504,7 +609,10 @@ async def main():
         # None for all of them), the loop above produced no stdout. Mirror
         # the all_formatted=[] branch: under --hook-format, emit one short
         # identifying line so the model sees what was searched.
-        if printed_count == 0 and args.hook_format:
+        # v0.2.101 WP-B1: NOT in injection-profile mode — the router treats
+        # silence as "nothing above the floor" and the no-results line would
+        # be injected noise (the survey's precision complaint).
+        if printed_count == 0 and args.hook_format and gate is None:
             print(f"KG: no-results | query='{args.query}' | limit={args.limit}")
     finally:
         client.close()

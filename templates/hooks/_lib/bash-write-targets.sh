@@ -16,6 +16,13 @@
 # decision on both operating systems and a mirrored shell implementation
 # would drift (A>B>C: shared code beats shared config beats a mirror).
 #
+# v0.2.101 (PLAN-V02101 §3 WP-A1): the promotion this file was built for is
+# complete — the injection redesign's EDIT classifier
+# (vco_lib/inject_intent.py::classify_bash) is a SECOND Python consumer of
+# the same parser (extract_write_targets / prebash_query_parts /
+# strip_heredocs), imported in-process by hook_context_router.py. There is
+# still exactly ONE parser; nothing here needed to change for it.
+#
 # Contract:
 #   . _lib/bash-write-targets.sh
 #   vco_bash_write_init "<hooks_dir>" "<fallback_python>"

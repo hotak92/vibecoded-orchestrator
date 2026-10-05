@@ -18,6 +18,17 @@
 # codegraph_bash_gate + codegraph_pattern_gate regexes must agree cross-OS. See
 # the "MUST MATCH" notes on each gate below.
 #
+# v0.2.101 (PLAN-V02101 §3 WP-A1): the ONE HOME for the gate logic is now
+# vco_lib/inject_intent.py (pattern_gate / bash_gate / extract_symbol), used
+# by the new hook_context_router.py surfaces. The shell functions below are
+# the INTERIM copy that keeps the LEGACY hooks (pre-bash-context-inject,
+# pre-tool-use) working until Wave 2 retires them WITH THEIR CALLERS — they
+# must not drift from the Python one-home in the meantime, and
+# tests/test_v02101_inject_intent_classifier.py::TestShellParity pins both
+# sides against one corpus (drift is a finding — plan §3 WP-A1). When the
+# last legacy caller is rewired, DELETE the gates here and in the .ps1
+# sibling in the same change.
+#
 # This file is sourced, never executed — no shebang. Library, not a hook.
 
 # --- Idempotent double-source guard ---------------------------------------
@@ -109,8 +120,9 @@ codegraph_query_block() {
     if [ -n "$_qc_key" ] && command -v vco_query_cache_get >/dev/null 2>&1; then
         local _qc_hit
         if _qc_hit="$(vco_query_cache_get "$_qc_key")"; then
-            # Fresh hit (may be an empty cached-empty result). Emit and return
-            # WITHOUT touching the CLI.
+            # Fresh hit (non-empty by contract since the v0.2.101 §9 fix —
+            # an empty entry now reads as a miss and self-heals). Emit and
+            # return WITHOUT touching the CLI.
             [ -n "$_qc_hit" ] && printf '%s\n' "$_qc_hit"
             return 0
         fi
@@ -147,12 +159,20 @@ codegraph_query_block() {
     # folded into the "$@" chain built above) so a textual regression test can
     # pin its presence on the producer call — the same discipline used to fix
     # the pre-edit/pre-tool-use KG-side --hook-format regression this cycle.
-    local raw=""
+    #
+    # v0.2.101 §9: the leg's EXIT STATUS is captured (_rc). A non-zero exit
+    # (124 = the inner timeout killed it, 137 = the watchdog's kill -9, 1 =
+    # producer error) means the output is missing-or-partial, and it must
+    # NEVER reach the cache — a killed leg's blob poisoned its key for the
+    # whole TTL (kickoff probe Cause 1b). The empty-blob guard inside
+    # vco_query_cache_put covers the fully-killed case; _rc covers the
+    # PARTIAL-output case. MUST MATCH codegraph-query.ps1.
+    local raw="" _rc=0
     if command -v timeout >/dev/null 2>&1; then
         if [ -n "$transcript" ]; then
-            raw="$(timeout 4 "$cli" "$@" --transcript "$transcript" 2>/dev/null || true)"
+            raw="$(timeout 4 "$cli" "$@" --transcript "$transcript" 2>/dev/null)" || _rc=$?
         else
-            raw="$(timeout 4 "$cli" "$@" 2>/dev/null || true)"
+            raw="$(timeout 4 "$cli" "$@" 2>/dev/null)" || _rc=$?
         fi
     else
         local _tmp
@@ -165,7 +185,7 @@ codegraph_query_block() {
         local _pid=$!
         ( sleep 4; kill -9 "$_pid" 2>/dev/null ) >/dev/null 2>&1 &
         local _watchdog=$!
-        wait "$_pid" 2>/dev/null || true
+        wait "$_pid" 2>/dev/null || _rc=$?
         kill "$_watchdog" 2>/dev/null || true
         raw="$(cat "$_tmp" 2>/dev/null || true)"
         rm -f "$_tmp" 2>/dev/null || true
@@ -175,15 +195,18 @@ codegraph_query_block() {
     # --exclude-file (B2) — the old line-wise `grep -v` here stripped only the
     # CODE: header line and left orphaned body lines. Do not re-add it.
     # v0.2.77 Part 9 task 2: compute the final (capped) block ONCE, store it in
-    # the shared cache (including the EMPTY result, so an empty symbol isn't
-    # re-queried within the TTL), then emit. An empty block is stored so the
-    # next identical query is a cache hit that emits nothing without a live
-    # Weaviate round-trip.
+    # the shared cache, then emit.
+    # v0.2.101 §9: the result is cached ONLY when the leg exited cleanly
+    # (_rc == 0) AND is non-empty (the put chokepoint drops empties) — a
+    # timed-out or failed leg must never poison the key. The old "cache the
+    # EMPTY result so an empty symbol isn't re-queried" behaviour is GONE by
+    # design: an empty blob was indistinguishable from a killed leg and
+    # suppressed retries for the whole TTL (kickoff probe Cause 1b).
     local _out=""
     if [ -n "$raw" ]; then
         _out="$(printf '%s\n' "$raw" | head -20)"
     fi
-    if [ -n "$_qc_key" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
+    if [ "$_rc" -eq 0 ] && [ -n "$_qc_key" ] && command -v vco_query_cache_put >/dev/null 2>&1; then
         vco_query_cache_put "$_qc_key" "$_out"
     fi
     [ -n "$_out" ] && printf '%s\n' "$_out"
