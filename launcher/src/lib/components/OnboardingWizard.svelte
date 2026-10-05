@@ -162,6 +162,7 @@
 
   // Bug 22: optional GitHub PAT for future auto-update flow.
   let githubPat = $state('');
+  let githubPatVisible = $state(false);
   let savingPat = $state(false);
   let patError = $state<string | null>(null);
   let patSaved = $state(false);
@@ -1553,9 +1554,36 @@
             {#if patSaved}
               <p class="ow-ok">Token saved to your OS keychain.</p>
             {:else}
-              <label class="ow-label">
+              <label class="ow-label" for="ow-github-pat-input">
                 <span>GitHub token (optional)</span>
-                <input type="password" bind:value={githubPat} placeholder="ghp_…" />
+                <!-- v0.2.101: reveal toggle mirrors the OpenAI-key field's
+                     mask-by-default pattern (the same password-input UX, one
+                     row over) — the token the user is pasting must be
+                     checkable before Save. Local state only: nothing is read
+                     back from the keychain here. -->
+                <div class="ow-openai-key-row">
+                  <input
+                    id="ow-github-pat-input"
+                    type={githubPatVisible ? 'text' : 'password'}
+                    bind:value={githubPat}
+                    placeholder="ghp_…"
+                    autocomplete="off"
+                    spellcheck="false"
+                    class="ow-openai-key-input"
+                    aria-label="GitHub token"
+                    disabled={savingPat}
+                  />
+                  <button
+                    type="button"
+                    class="ow-btn ow-openai-eye"
+                    onclick={() => (githubPatVisible = !githubPatVisible)}
+                    aria-label={githubPatVisible ? 'Hide GitHub token' : 'Show GitHub token'}
+                    title={githubPatVisible ? 'Hide' : 'Show'}
+                    disabled={savingPat}
+                  >
+                    {githubPatVisible ? 'Hide' : 'Show'}
+                  </button>
+                </div>
               </label>
               <p class="ow-secondary">
                 How to get one: github.com → Settings → Developer settings →

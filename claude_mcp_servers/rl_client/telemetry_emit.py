@@ -120,9 +120,12 @@ def emit_rl_event(
     """Canonical emit. Validates mandatory fields then writes via the
     project's cached ``RLTelemetryWriter``.
 
-    Returns True on success, False on soft-fail (writer unavailable, hub
-    unreachable, etc). Raises ``EmitValidationError`` on
-    caller-correctable bugs (missing query, dim mismatch).
+    Returns True when the event was HANDLED -- including a POST that was
+    attempted and failed (the per-event loss line is written by
+    ``hub_writer`` in that case; v0.2.101 deferred_emit relies on this).
+    Returns False only when the event never reached the POST (writer
+    unavailable, validation-side soft-fail). Raises ``EmitValidationError``
+    on caller-correctable bugs (missing query, dim mismatch).
 
     ``writer_factory`` is for test injection. Production calls leave it
     None and the module-level resolver lazy-imports

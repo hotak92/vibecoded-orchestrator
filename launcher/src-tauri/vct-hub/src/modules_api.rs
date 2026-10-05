@@ -941,6 +941,16 @@ async fn project_env(
         .map(slot_exclusive_keys)
         .unwrap_or_default();
 
+    // v0.2.101 (Q7 / audit P3-1): module-declared keys whose active flag
+    // refused them for THIS requester, collected during the resolution
+    // loops so the keyed-miss branch below can distinguish "exists but
+    // paused" (404 `key_paused`) from "not declared / not granted" (404
+    // `key_not_active`). Only keys DECLARED for this project ever land
+    // here, and only the key NAME is kept — the set exists to classify a
+    // miss, never to transport a value.
+    let mut paused_module_keys: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+
     for manifest in active {
         // Settings (non-secret). An installed module's value is the
         // project's row, else (and always, for a `scope: "global"` setting)
@@ -1028,7 +1038,13 @@ async fn project_env(
                 SecretLookup::Value(val) => {
                     env.insert(s.key.clone(), serde_json::Value::String(val));
                 }
-                SecretLookup::Inactive | SecretLookup::Missing | SecretLookup::NoProject => {}
+                // v0.2.101 (Q7): record the pause so the keyed-miss branch
+                // can answer `key_paused` — the declaration exists for this
+                // project; only the flag refused it.
+                SecretLookup::Inactive => {
+                    paused_module_keys.insert(s.key.clone());
+                }
+                SecretLookup::Missing | SecretLookup::NoProject => {}
                 SecretLookup::ReadError(e) => {
                     tracing::warn!(
                         key = ?s.key,
@@ -1090,9 +1106,14 @@ async fn project_env(
                     mark_keychain_degraded(&mut keychain_degraded);
                 }
                 SecretLookup::Value(_)
-                | SecretLookup::Inactive
                 | SecretLookup::Missing
                 | SecretLookup::NoProject => {}
+                // v0.2.101 (Q7): same pause record as the installed-module
+                // loop above — the bundled declaration exists; the flag
+                // refused it for this requester.
+                SecretLookup::Inactive => {
+                    paused_module_keys.insert(bs.key.clone());
+                }
             }
 
             // 2026-05-10 (post-0.2.0 backlog #6): legacy slot fallback
@@ -1136,9 +1157,13 @@ async fn project_env(
                         mark_keychain_degraded(&mut keychain_degraded);
                     }
                     SecretLookup::Value(_)
-                    | SecretLookup::Inactive
                     | SecretLookup::Missing
                     | SecretLookup::NoProject => {}
+                    // v0.2.101 (Q7): same pause record — the legacy slot's
+                    // OWN active flag refused it for this requester.
+                    SecretLookup::Inactive => {
+                        paused_module_keys.insert(bs.key.clone());
+                    }
                 }
             }
         }
@@ -1325,15 +1350,55 @@ async fn project_env(
                     want, project.id
                 ),
             ),
-            None => error_response(
-                StatusCode::NOT_FOUND,
-                "key_not_active",
-                format!(
-                    "key {:?} is not active for project {} (not declared by any installed module, \
-                     or paused via the secret active-flag)",
-                    want, project.id
-                ),
-            ),
+            None => {
+                // v0.2.101 (Q7 / audit P3-1): distinguish "exists but PAUSED
+                // for this requester" from "absent / not granted". A paused
+                // key still 404s — the value must not leak, and a 403 on
+                // this route is semantically claimed by the scoped-token
+                // boundary (`auth.rs`, pinned by both shell resolvers and
+                // their parity tests) — but the CODE is distinct so callers
+                // can stop conflating a deliberate pause with an empty slot
+                // (the P3-1 defect: the root `.env` auto-store re-copying a
+                // paused key into the shared file store).
+                //
+                // Sources, in order: a module-declared key the loops above
+                // recorded as flag-refused, then the user-declared buckets
+                // (`user_secret_paused_for_requester` — the requester's OWN
+                // buckets only, GAP-2 gate mirrored, no keychain read). A
+                // slot-exclusive key name is NEVER classified from a
+                // user-bucket stand-in — the miss reason is exclusivity, not
+                // pause, and cross-project grants stay `key_not_active` by
+                // the documented split ("not granted" is an absence-class
+                // answer). The message names neither the value nor the scope.
+                let paused = paused_module_keys.contains(want)
+                    || (!slot_exclusive.contains(&want.to_string())
+                        && vct_launcher_core::db::secret_active::user_secret_paused_for_requester(
+                            &h.0,
+                            &project.id,
+                            &project.id,
+                            want,
+                        ));
+                if paused {
+                    return error_response(
+                        StatusCode::NOT_FOUND,
+                        "key_paused",
+                        format!(
+                            "key {:?} exists but is paused for project {} — resume it in the \
+                             launcher's Secrets panel (the value is not served while paused)",
+                            want, project.id
+                        ),
+                    );
+                }
+                error_response(
+                    StatusCode::NOT_FOUND,
+                    "key_not_active",
+                    format!(
+                        "key {:?} is not active for project {} (not declared by any installed \
+                         module, or paused via the secret active-flag)",
+                        want, project.id
+                    ),
+                )
+            }
         };
     }
 
@@ -2104,6 +2169,25 @@ mod tests {
         let paused = get().await;
         assert!(paused.get("DIV_TOKEN").is_none(), "module loop served a paused key: {paused}");
         assert!(paused.get("github_pat").is_none(), "bundled loop served a paused key: {paused}");
+
+        // v0.2.101 (Q7): the KEYED form of the same request must classify
+        // both misses as `key_paused` — the declarations exist for this
+        // project, only the active flag refused them — while never echoing
+        // the values.
+        for key in ["DIV_TOKEN", "github_pat"] {
+            let resp = reqwest::get(format!("{}/projects/p-div/env?key={}", base, key))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 404, "keyed paused {key} must stay 404");
+            let body: serde_json::Value = resp.json().await.unwrap();
+            assert_eq!(
+                body.pointer("/error/code").and_then(|v| v.as_str()),
+                Some("key_paused"),
+                "module-declared paused {key} must classify as key_paused: {body}"
+            );
+            assert!(!body.to_string().contains("div-value"));
+            assert!(!body.to_string().contains("pat-value"));
+        }
     }
 
     /// v0.2.97 (lane V round 3): the legacy `installer` slot fallback for
@@ -2561,7 +2645,9 @@ mod tests {
         delete_shared_keychain_canary("user", "github_pat");
 
         // Hub MUST refuse to serve the value: the active-flag gate is
-        // honoured at the SENTINEL_SHARED slot. Returns 404 + key_not_active.
+        // honoured at the SENTINEL_SHARED slot. Returns 404 + key_paused
+        // (v0.2.101: the shared row exists — the canonical `*` flag is
+        // off — so the miss names the pause, not an absence).
         assert_eq!(
             status, 404,
             "paused shared secret leaked through hub resolver: status={}, body={}",
@@ -2569,8 +2655,8 @@ mod tests {
         );
         assert_eq!(
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
-            Some("key_not_active"),
-            "expected key_not_active envelope; body: {}",
+            Some("key_paused"),
+            "expected key_paused envelope; body: {}",
             body
         );
     }
@@ -3119,7 +3205,8 @@ mod tests {
     }
 
     /// PERMISSION-MATRIX GATE: the same key paused FOR THIS REQUESTER
-    /// returns 404 `key_not_active` — the keychain value must not leak
+    /// returns 404 `key_paused` (v0.2.101 — previously the undistinguished
+    /// `key_not_active`) — the keychain value must not leak
     /// past the per-(secret × requester) active flag.
     #[tokio::test]
     async fn hub_env_honours_requester_pause_on_user_secret() {
@@ -3161,9 +3248,77 @@ mod tests {
         );
         assert_eq!(
             body.get("error").and_then(|e| e.get("code")).and_then(|v| v.as_str()),
-            Some("key_not_active")
+            Some("key_paused"),
+            "a key that exists but is paused for this requester must classify \
+             as key_paused, not key_not_active; body: {}",
+            body
         );
         // The value string must appear nowhere in the error body.
+        assert!(
+            !body.to_string().contains("synthetic-not-a-real-secret"),
+            "error envelope must never echo the secret value"
+        );
+        // And neither the scope nor the owning slot leaks: the message
+        // names the key (the caller asked for it by name) and the pause,
+        // nothing more.
+        assert!(
+            !body.to_string().contains("_user_shared_"),
+            "error envelope must not name the owning slot"
+        );
+    }
+
+    /// v0.2.101 review B1: a key saved in the SecretsPanel "Global (this
+    /// machine)" bucket and paused for this requester must classify as
+    /// `key_paused` on the keyed route — the classifier consults the
+    /// GLOBAL bucket in the default (shared-reads-enabled) case too, not
+    /// only when the shared tier is switched off. Pre-fix the shared-leg
+    /// early return shadowed the global walk and this answered the
+    /// undistinguished `key_not_active`.
+    #[tokio::test]
+    async fn hub_env_honours_pause_on_global_user_secret() {
+        let _kc_lock = h1_lock();
+        let _mock = vct_launcher_core::secrets::for_tests::MockGuard::new();
+        let (base, h) = spawn_modules_api_hub().await;
+        seed_project(&h.0, "u-proj-g", "Global Pause Project", "/tmp/u-proj-g");
+
+        vct_launcher_core::secrets::set(
+            vct_launcher_core::secrets::SecretScope::Global,
+            "user",
+            "GLOBAL_API_TOKEN",
+            "synthetic-not-a-real-secret",
+        )
+        .unwrap();
+        // Same rows the SecretsPanel's Global tab writes: the global
+        // user-bucket slot, paused for THIS requester.
+        h.0.mark_secret_inactive_for_requester(
+            "global",
+            "_global_",
+            "user",
+            "GLOBAL_API_TOKEN",
+            "u-proj-g",
+        )
+        .unwrap();
+
+        let resp = reqwest::get(format!(
+            "{}/projects/u-proj-g/env?key=GLOBAL_API_TOKEN",
+            base
+        ))
+        .await
+        .expect("hub reachable");
+        let status = resp.status();
+        let body: serde_json::Value = resp.json().await.expect("json body");
+        assert_eq!(
+            status, 404,
+            "paused global user secret leaked through the hub: body: {}",
+            body
+        );
+        assert_eq!(
+            body.pointer("/error/code").and_then(|v| v.as_str()),
+            Some("key_paused"),
+            "a GLOBAL-bucket key paused for this requester must classify as \
+             key_paused, not key_not_active; body: {}",
+            body
+        );
         assert!(
             !body.to_string().contains("synthetic-not-a-real-secret"),
             "error envelope must never echo the secret value"

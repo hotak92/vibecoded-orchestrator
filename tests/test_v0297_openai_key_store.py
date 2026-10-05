@@ -247,6 +247,48 @@ def test_migrate_leaves_the_line_when_it_cannot_be_stored(stores, tmp_path, monk
     assert CANARY not in json.dumps(result)
 
 
+def test_migrate_never_stores_over_a_paused_key(stores, tmp_path, monkeypatch, capsys) -> None:
+    """v0.2.101 (audit P3-1): a hub `key_paused` answer means the key
+    EXISTS and the owner paused it. The migration must NOT plant a
+    file-store copy that would shadow the pause (tier 2 serves every
+    project without a `.no-shared-fallback` marker) — it leaves the line,
+    says why once on stderr, and never carries the value."""
+    from vco_lib import agent_secrets
+
+    original = _LEGACY.format(value=CANARY)
+    (tmp_path / ".env").write_text(original)
+    monkeypatch.setattr(
+        agent_secrets,
+        "lookup_stored",
+        lambda *_a, **_k: (agent_secrets.STORED_PAUSED, None),
+    )
+    result = openai_key.migrate_dotenv_openai_key(tmp_path)
+    assert result["status"] == "left_paused"
+    assert (tmp_path / ".env").read_text() == original, "the line stays"
+    assert not _stored(stores).exists(), "a paused key is never shadowed"
+    err = capsys.readouterr().err
+    assert "paused" in err, "one stderr line names the pause"
+    assert CANARY not in err and CANARY not in json.dumps(result)
+
+
+def test_migrate_still_stores_on_a_genuine_absence(stores, tmp_path, monkeypatch) -> None:
+    """The paused gate must not widen: a PROVEN absence (the hub answered
+    `absent`, tier 2 empty) still stores, exactly as before."""
+    from vco_lib import agent_secrets
+
+    calls = iter([
+        (agent_secrets.STORED_ABSENT, None),   # pre-store lookup
+        (agent_secrets.STORED_FILE, CANARY),   # read-back after storing
+    ])
+    (tmp_path / ".env").write_text(_LEGACY.format(value=CANARY))
+    monkeypatch.setattr(
+        agent_secrets, "lookup_stored", lambda *_a, **_k: next(calls)
+    )
+    assert openai_key.migrate_dotenv_openai_key(tmp_path)["status"] == "migrated"
+    assert _stored(stores).read_text().strip() == CANARY
+    assert CANARY not in (tmp_path / ".env").read_text()
+
+
 # ─── install.py end to end ──────────────────────────────────────────────
 
 

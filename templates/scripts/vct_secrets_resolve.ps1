@@ -18,13 +18,15 @@
 #           the miss diagnostic says so).
 #
 # Fall-through: tier 1 -> 2 on hub unreachable / project not registered /
-# 401 / key_not_active / 403 forbidden / 503 keychain_locked |
-# keychain_error (the OS keychain is locked/unreadable -- the file store
+# 401 / key_not_active (undeclared or not granted) / key_paused (v0.2.101:
+# the key EXISTS but is paused for this requester -- the file store is an
+# independent store, so the chain behaviour is the same) / 403 forbidden /
+# 503 keychain_locked | keychain_error (the OS keychain is locked/unreadable -- the file store
 # never depended on it, so a locked keychain must not strand a file-store
 # key); tier 2 -> 3 on file absent/unreadable. All-miss -> non-zero exit
-# preserving the tier-1 exit-code contract below (exit 3 `key_not_active`
-# only after tiers 2 and 3 also missed). Errors name the KEY and the tiers
-# consulted -- NEVER the value.
+# preserving the tier-1 exit-code contract below (exit 3
+# `key_not_active`/`key_paused` only after tiers 2 and 3 also missed).
+# Errors name the KEY and the tiers consulted -- NEVER the value.
 #
 # Tier-3 parsing rule (identical x3): line-oriented; accept `KEY=VALUE`
 # and `export KEY=VALUE`; strip one matching pair of single/double
@@ -579,6 +581,17 @@ function Read-KeyHubEnv {
                 }
                 "key_not_active" {
                     Write-Err "key $Key not active for project $pid_ (paused for this project, or not declared by any installed module)"
+                    return @{ ExitCode = 3 }
+                }
+                "key_paused" {
+                    # v0.2.101 (Q7 / audit P3-1): the key EXISTS but its
+                    # per-(scope, key, requester) active flag is off. Same
+                    # tier-1 exit as key_not_active (3) and the same chain
+                    # semantics — the outer chain still consults the file
+                    # store + project .env (independent stores) — but the
+                    # message names the pause so a full-chain miss is honest
+                    # about WHY. Mirrors the .sh sibling's key_paused arm.
+                    Write-Err "key $Key exists but is paused for project $pid_ (resume it in the launcher's Secrets panel; the value is not served while paused)"
                     return @{ ExitCode = 3 }
                 }
                 Default {

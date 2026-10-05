@@ -35,8 +35,13 @@ Every sanctioned resolver walks the SAME chain, in this order:
 1. **vct-hub (tier 1, keychain-backed)** — `GET
    /api/v1/projects/{id}/env?key=NAME` against the launcher's hub.
    Values live in the OS keychain; reads are gated by the launcher's
-   per-`(secret × requester)` active-flag matrix (a paused or ungranted
-   key answers `key_not_active` — respect it, don't route around).
+   per-`(secret × requester)` active-flag matrix. An ungranted or
+   undeclared key answers `key_not_active` — respect it, don't route
+   around. A key that EXISTS but is paused for this requester answers
+   the distinct code `key_paused` (v0.2.101, same 404 status and the
+   same tier-1 exit 3 from `vct_secrets_resolve.sh`): the pause is a
+   deliberate owner decision, so never "fix" it by storing a second
+   copy — resume it in the launcher instead.
    Hub discovery: `$VCT_HUB_PORT` / `$VCT_HUB_TOKEN` env →
    `<vct_root>/hub.port` + `hub.token` → defaults (a PROVABLY-stale
    `$VCT_HUB_TOKEN` is retried once against the on-disk token — see
