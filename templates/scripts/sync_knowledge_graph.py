@@ -1664,9 +1664,19 @@ def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[s
     warnings = []
 
     # 1. Type validation (open vocabulary: built-ins + VOCABULARY.md aliases)
+    # v0.2.101 P299-A3: membership is CASE-INSENSITIVE — the declaration
+    # parser lowercases every alias, so `Concept` and `concept` are the same
+    # type. The shared gate (vco_lib.kg_vocabulary.classify_node_type)
+    # classifies case-insensitively; a case-sensitive compare here warned on
+    # a type the gate called known. This validator stays warn-only (it is
+    # also the migrate_to_vocabulary.py report path); the ACT/FAIL decision
+    # lives in sync_node's `_apply_vocabulary_type_gate`.
     valid_types = _load_vocabulary_node_types()
     node_type = node_data.get("node_type", "")
-    if node_type not in valid_types:
+    node_type_key = (
+        node_type.strip().lower() if isinstance(node_type, str) else ""
+    )
+    if node_type_key not in valid_types:
         warnings.append(
             f"Node type '{node_type}' not declared (known: {', '.join(sorted(valid_types))}). "
             f"Declare custom types in knowledge/VOCABULARY.md as a class heading with (alias: `{node_type}`)"
@@ -1725,6 +1735,142 @@ def validate_node_against_vocabulary(node_data: Dict, file_path: Path) -> List[s
             warnings.append("external_links is not valid JSON")
 
     return warnings
+
+
+def _invalid_type_reason(node_type: object) -> str:
+    """The ONE refusal message for an invalid frontmatter `type:` — shared
+    by the pre-write precheck and the post-parse gate so the two can never
+    teach different things."""
+    return (
+        f"invalid node type {node_type!r} — a frontmatter `type:` must be "
+        f"a non-empty single token of letters/digits/'-'/'_'; empty or "
+        f"malformed types are never stored (fix the frontmatter, then "
+        f"re-sync; an UNDECLARED but wellformed type is fine — it is "
+        f"auto-declared in knowledge/VOCABULARY.md)"
+    )
+
+
+def _invalid_type_precheck(
+    content: str, file_path: Path, rel_path: str
+) -> "Optional[SyncOutcome]":
+    """GLM wave-2 review nit 3 (v0.2.101 P299-A3) — refuse an INVALID
+    frontmatter `type:` BEFORE ``_update_frontmatter_timestamp`` runs.
+
+    The gate proper (``_apply_vocabulary_type_gate``) sits after the parse,
+    which is after the timestamp step's file write — so a permanently
+    invalid node (one that can never sync until its frontmatter is fixed)
+    could still get its ``updated:`` field rewritten by the pass that
+    refuses it. This precheck runs the SAME shared decision
+    (``vco_lib.kg_vocabulary.classify_node_type``) on the raw frontmatter,
+    ahead of ANY file side effect, and returns the FAILED outcome for the
+    invalid half only; the extendable half (auto-extend + report line)
+    stays in the post-parse gate, which is where the parsed node lives.
+
+    Archived precedence is preserved: a frontmatter-archived node is
+    deliberately not indexed, so its type never matters — the precheck
+    stands aside (via the shared ``_is_archived_node`` predicate) and the
+    normal frontmatter-archive skip handles it, exactly as before.
+
+    VERSION SKEW: same contract as the gate — ImportError ⇒ ``None`` (the
+    historical warn-only path), never a refusal this install cannot back.
+    """
+    frontmatter, _body = parse_frontmatter(content)
+    if not isinstance(frontmatter, dict) or 'type' not in frontmatter:
+        return None  # folder-derived type — historical warn-only path
+    if _is_archived_node(file_path, frontmatter=frontmatter)[0]:
+        return None  # archived wins: deliberately not indexed, type moot
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_INVALID,
+            classify_node_type,
+            load_vocabulary,
+        )
+    except ImportError:
+        return None  # version skew — warn-only legacy path
+    node_type = frontmatter['type']
+    if classify_node_type(node_type, load_vocabulary(PROJECT_ROOT)) != TYPE_INVALID:
+        return None
+    reason = _invalid_type_reason(node_type)
+    print(f"❌ {rel_path}: {reason}")
+    return SyncOutcome(OUTCOME_FAILED, rel_path, reason)
+
+
+def _apply_vocabulary_type_gate(
+    node_data: Dict, rel_path: str
+) -> "Optional[SyncOutcome]":
+    """v0.2.101 P299-A3 — the node-type vocabulary gate for ONE parsed node.
+
+    ONE home for the decision: ``vco_lib.kg_vocabulary`` — the SAME rule the
+    MCP ``store_knowledge_node`` path applies and ``kg_sync_drift``'s skip
+    predicate mirrors (parity pinned by
+    ``tests/test_v02101_kg_vocabulary_autoextend.py``).
+
+    * unknown-but-wellformed frontmatter ``type:`` → the type is APPENDED to
+      ``knowledge/VOCABULARY.md`` (``extend_vocabulary`` — open vocabulary:
+      the 2026-09 incident rejected 169 of 546 nodes for undeclared types)
+      with a visible report line, and the node syncs normally;
+    * empty/malformed frontmatter ``type:`` → INVALID: returns a FAILED
+      outcome (named in the run's not-synced summary) — never stored, never
+      silently skipped;
+    * folder-derived types (no frontmatter ``type:`` key) keep the historical
+      warn-only path in ``validate_node_against_vocabulary`` — auto-declaring
+      folder names would pollute the vocabulary with "concepts"/"general"
+      nobody declared, and a folder name with odd characters must not FAIL a
+      node whose author never wrote a ``type:`` line;
+    * VERSION SKEW (this bundled script newer than the install's vco_lib —
+      the only ImportError branch, same contract as
+      ``_load_vocabulary_node_types``): historical warn-only behaviour, never
+      extend, never fail.
+
+    Returns the FAILED ``SyncOutcome`` for an invalid type, else ``None``
+    (side effects: the vocabulary append + its report line).
+    """
+    global _VOCABULARY_TYPES_CACHE
+    if not node_data.get("type_from_frontmatter"):
+        return None
+    node_type = node_data.get("node_type")
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_EXTENDABLE,
+            TYPE_INVALID,
+            classify_node_type,
+            extend_vocabulary,
+            load_vocabulary,
+        )
+    except ImportError:
+        return None  # version skew — warn-only legacy path (see docstring)
+
+    decision = classify_node_type(node_type, load_vocabulary(PROJECT_ROOT))
+    if decision == TYPE_INVALID:
+        # Backstop: `_invalid_type_precheck` already refuses these BEFORE the
+        # timestamp side effect (nit 3); this branch only fires if the two
+        # ever disagree, and keeps the gate self-contained. ONE message home.
+        reason = _invalid_type_reason(node_type)
+        print(f"❌ {rel_path}: {reason}")
+        return SyncOutcome(OUTCOME_FAILED, rel_path, reason)
+    if decision == TYPE_EXTENDABLE:
+        result = extend_vocabulary(PROJECT_ROOT, [node_type])
+        if result.added:
+            # The file just grew — drop this script's resolved-types cache so
+            # the validator below (and every later node in this run) sees the
+            # declaration instead of re-warning on a type now declared.
+            _VOCABULARY_TYPES_CACHE = None
+            print(
+                f"📖 Auto-declared node type '{result.added[0]}' in "
+                f"knowledge/VOCABULARY.md (open vocabulary — the node syncs "
+                f"normally)"
+            )
+        if result.error:
+            # Soft-fail, LOUD: the node still syncs (a vocabulary write
+            # failure must never drop a node — that is the very defect this
+            # gate closes), and the next run retries the append.
+            print(
+                f"⚠️  Could not extend knowledge/VOCABULARY.md "
+                f"({result.error}) — syncing the node anyway; declare "
+                f"`(alias: {str(node_type).strip().lower()})` manually to "
+                f"silence the type warning"
+            )
+    return None
 
 
 def parse_markdown_node(content: str, file_path: Path) -> Dict:
@@ -1818,9 +1964,11 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     # directory)
     if frontmatter and 'type' in frontmatter:
         node_type = frontmatter['type']
+        type_from_frontmatter = True
     else:
         rel_path = file_path.relative_to(KNOWLEDGE_ROOT)
         node_type = str(rel_path.parts[0]) if len(rel_path.parts) > 1 else "general"
+        type_from_frontmatter = False
 
     # Temporal metadata from frontmatter
     temporal_data = {}
@@ -1937,6 +2085,14 @@ def parse_markdown_node(content: str, file_path: Path) -> Dict:
     # an explicit key list, so this never reaches the collection schema.
     if frontmatter and 'scope' in frontmatter:
         result["scope"] = frontmatter['scope']
+
+    # v0.2.101 P299-A3: where node_type came from. The vocabulary gate in
+    # `sync_node` auto-extends / fails ONLY a frontmatter-declared `type:` —
+    # a folder-derived value keeps the historical warn-only path (auto-
+    # declaring folder names like "concepts"/"general" would pollute the
+    # vocabulary with types nobody declared). Same key-list contract as
+    # `scope` above: NOT a Weaviate property.
+    result["type_from_frontmatter"] = type_from_frontmatter
 
     # Add temporal metadata if present
     result.update(temporal_data)
@@ -3939,6 +4095,19 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
 
         # Read, auto-update `updated:` timestamp, write back, then parse
         content = file_path.read_text(encoding='utf-8')
+
+        # v0.2.101 nit 3 (GLM wave-2 review): refuse an INVALID frontmatter
+        # `type:` BEFORE the timestamp write below — a node that can never
+        # sync must not get its `updated:` bumped by the run that refuses it
+        # (no file side effect at all for a refused node).
+        _precheck_failure = _invalid_type_precheck(
+            content, file_path, _relative_file_path(file_path)
+        )
+        if _precheck_failure is not None:
+            # NOT dead: consumed by the finally-block ToolUsageLogger row.
+            error_msg = _precheck_failure.reason
+            return _precheck_failure
+
         content = _update_frontmatter_timestamp(file_path, content)
         node_data = parse_markdown_node(content, file_path)
 
@@ -4045,6 +4214,24 @@ def sync_node(server: WeaviateMCPServer, file_path: Path) -> "SyncOutcome":
         )
         if targets_shared:
             print(f"   ↪ scope: shared → routing to '{target_collection_name}'")
+
+        # ── v0.2.101 P299-A3: node-type vocabulary gate ──────────────────
+        # The ACT/FAIL decision (shared home: vco_lib.kg_vocabulary — the
+        # MCP store path and the drift scanner apply the SAME rule): an
+        # undeclared wellformed `type:` AUTO-EXTENDS knowledge/VOCABULARY.md
+        # and syncs; an empty/malformed one FAILS loudly into this run's
+        # not-synced summary. Runs BEFORE the warn-only validation below (an
+        # auto-declared type no longer warns) and BEFORE any Weaviate
+        # query/write for this node.
+        _gate_failure = _apply_vocabulary_type_gate(
+            node_data, _relative_file_path(file_path)
+        )
+        if _gate_failure is not None:
+            # NOT dead: consumed by the finally-block ToolUsageLogger row
+            # (success=error_msg is None) — the same contract the scope
+            # refusals above follow.
+            error_msg = _gate_failure.reason
+            return _gate_failure
 
         # Validate against vocabulary (report warnings, don't block sync)
         validation_warnings = validate_node_against_vocabulary(node_data, file_path)
@@ -4815,7 +5002,7 @@ def _details_log_path() -> "Optional[Path]":
 
 
 def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
-    """End-of-run honesty block (v0.2.92 WP-B1 / D12).
+    """End-of-run honesty block (v0.2.92 WP-B1 / D12; v0.2.101 P299-A3).
 
     Names every path that did NOT end in a real sync — failures with their
     reason, and every skip category with its reason — instead of letting
@@ -4823,6 +5010,20 @@ def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
     ``_DETAILS_PRINT_CAP`` stdout lines; the complete list is written to
     the run log under ``<vct_root>/logs/`` (soft-fail: if the log can't be
     written, the bounded stdout block still prints).
+
+    v0.2.101 (P299-A3): this line IS the owner-directed
+    ``N of M … not synced: <reasons>`` summary — N of the M items the run
+    CONSIDERED, with counts per reason category (the per-path lines below
+    carry each item's exact reason). It deliberately extends THIS mechanism
+    instead of adding a second summary printer (one concern, one home).
+    GLM wave-2 review nit 4: the noun is ``items``, not ``nodes`` — M is
+    every considered outcome, which INCLUDES excluded non-nodes (meta
+    files like VOCABULARY.md/TAG_HIERARCHY.md, out-of-root targets), and
+    N counts their records too; the breakdown names that category
+    explicitly (``K excluded-skipped``), so the denominator stays honest.
+    The ``📊 … S succeeded, F failed, K skipped`` fragment parsed by the
+    launcher (kg_sync.rs::parse_summary_line) is a DIFFERENT line and
+    stays untouched.
 
     ``tallies`` may be empty (nothing to report → no output at all).
     """
@@ -4839,7 +5040,11 @@ def _print_run_details(*tallies: "SyncTally", run_kind: str) -> None:
             OUTCOME_FRONTMATTER_SKIPPED, OUTCOME_EXCLUDED_SKIPPED,
         ) if counts.get(c)
     )
-    print(f"📋 {len(records)} not-synced item(s) this run ({run_kind}): {breakdown}")
+    considered = sum(t.total for t in tallies)
+    print(
+        f"📋 {len(records)} of {considered} items not synced this run "
+        f"({run_kind}): {breakdown}"
+    )
 
     log_path = None
     try:
@@ -5279,8 +5484,15 @@ def _run_check_drift() -> None:
     print(
         f"   scanned={report.scanned} archived_skipped={report.archived_skipped} "
         f"excluded_skipped={report.excluded_skipped} "
-        f"shared_scope_skipped={report.shared_scope_skipped}"
+        f"shared_scope_skipped={report.shared_scope_skipped} "
+        f"invalid_type_skipped={report.invalid_type_skipped}"
     )
+    if report.invalid_type_skipped:
+        print(
+            "   ⚠️  invalid-type node(s) skipped — a frontmatter `type:` that "
+            "is empty/malformed can never sync (kg-sync FAILS it loudly); "
+            "fix the frontmatter, then re-run `.claude/scripts/kg-sync --all`."
+        )
     if report.missing:
         print(f"   missing from Weaviate ({len(report.missing)}):")
         for p in report.missing:

@@ -410,6 +410,10 @@ def live_poster(monkeypatch, tmp_path):
     from vco_lib import rl_telemetry_loss
 
     rl_telemetry_loss._reset_warned_for_test()
+    # NB-06 (v0.2.101): the hub_not_running ledger line is now coalesced per
+    # process; reset that bookkeeping so a per-test one-line assertion sees a
+    # fresh episode regardless of suite order.
+    hub_writer._reset_hub_down_bookkeeping_for_test()
     return hub_writer
 
 

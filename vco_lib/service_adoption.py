@@ -965,6 +965,24 @@ def render_adoption_override(plans: Sequence[ServicePlan], *,
             services_block[plan.service] = svc
         for key, name in sorted((frag.get("volume_aliases") or {}).items()):
             volumes_block[key] = {"external": True, "name": name}
+    # The service-level "default" leg (dual-homing: the project default network
+    # + every live network) must ALSO be declared top-level, or standalone
+    # podman-compose refuses the chain with "missing networks: default" (it
+    # validates that every service-referenced network is declared; docker
+    # compose auto-creates default and is unaffected). Declaring it keeps the
+    # two runtimes on the SAME topology — dropping the service leg instead
+    # would move podman's default-network services onto the single external
+    # net, diverging from docker. Scanning the FINAL `services_block` (not
+    # just this run's plans) is what makes the invariant hold on the
+    # `preserve=` path too: a partial re-adoption whose plan has no live
+    # networks keeps a preserved stanza that already carries the leg, and
+    # re-emitting that reference with no declaration would resurrect the exact
+    # refusal this fixes.
+    if any(
+        isinstance(stanza.get("networks"), dict) and "default" in stanza["networks"]
+        for stanza in services_block.values()
+    ):
+        networks_block.setdefault("default", {})
     body = {"services": services_block or {}}
     body["networks"] = networks_block or {}
     body["volumes"] = volumes_block or {}

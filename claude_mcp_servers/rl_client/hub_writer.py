@@ -15,7 +15,11 @@ Soft-fail discipline (locked decision 2026-06-04):
     - v0.2.100 (F4): a lost event is VISIBLE. Every failure branch records
       one line in the RL telemetry loss ledger
       (``vco_lib.rl_telemetry_loss``, read by ``vco doctor``) and logs one
-      WARNING per failure reason per process. A REFUSED connection (the hub
+      WARNING per failure reason per process. Repeated ``hub_not_running``
+      lines are coalesced to one per hub-down episode (NB-06, v0.2.101): a
+      CLI-only user's per-search rows would otherwise be identical noise, so
+      repeats only bump a counter that the next recorded line carries as
+      ``suppressed=<n>``. A REFUSED connection (the hub
       restarting; the request never reached it) gets ONE bounded retry. A
       reset does not (W5R-06: the hub may already have inserted the event,
       and a retry would store it twice); nor does a timeout (retrying it
@@ -150,6 +154,48 @@ def _read_hub_token() -> str | None:
         return None
 
 
+# ---------------------------------------------------------------------------
+# NB-06 (v0.2.101): coalesce repeated ``hub_not_running`` loss-ledger lines.
+# A CLI-only user (no hub ever running) emits one RL event per search, so the
+# old code appended one ``hub_not_running`` line PER SEARCH — a growing wall of
+# identical rows in ``vco doctor`` that carry no new information. Mirror the
+# stop-failure-notify coalescing (one per episode, count carried forward):
+#   * the FIRST hub-down observation in a process records one line;
+#   * repeats while the hub stays down only bump a counter (no line);
+#   * a successful hub contact ENDS the episode, and the next recorded line
+#     carries ``suppressed=<n>`` — the repeats that were not written.
+# The counter is deliberately NOT cleared by the success: it is carried onto
+# the next recorded line, exactly like stop-failure-notify's suppressed count.
+_hub_down_active = False
+_hub_down_suppressed = 0
+
+
+def _reset_hub_down_bookkeeping_for_test() -> None:
+    """Reset the NB-06 coalescing state (tests share one process)."""
+    global _hub_down_active, _hub_down_suppressed
+    _hub_down_active = False
+    _hub_down_suppressed = 0
+
+
+def _note_hub_contact() -> None:
+    """A hub POST succeeded — the hub-down episode is over (NB-06). The
+    suppressed count is kept so the next line can report it."""
+    global _hub_down_active
+    _hub_down_active = False
+
+
+def _record_hub_not_running(event: Any) -> None:
+    """Record ``hub_not_running`` at most once per process per episode (NB-06)."""
+    global _hub_down_active, _hub_down_suppressed
+    if _hub_down_active:
+        _hub_down_suppressed += 1
+        return
+    _hub_down_active = True
+    n = _hub_down_suppressed
+    _hub_down_suppressed = 0
+    _record_post_loss(event, "hub_not_running", **({"suppressed": n} if n else {}))
+
+
 def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) -> bool:
     """POST one v3 RL event to the hub's ``/api/v1/rl/events`` route.
 
@@ -200,7 +246,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
 
     token = _read_hub_token()
     if token is None:
-        _record_post_loss(event, "hub_not_running")
+        _record_hub_not_running(event)
         return False
 
     port = _read_hub_port()
@@ -229,6 +275,7 @@ def post_rl_event(event: dict[str, Any], timeout: float = _DEFAULT_TIMEOUT_S) ->
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 if 200 <= resp.status < 300:
+                    _note_hub_contact()
                     return True
                 _record_post_loss(event, f"http_{resp.status}")
                 return False
@@ -285,8 +332,12 @@ def _url_error_reason(e: "urllib.error.URLError") -> str:
     return "url_error"
 
 
-def _record_post_loss(event: Any, reason: str) -> None:
-    """Record one lost RL event in the shared loss ledger. Never raises."""
+def _record_post_loss(event: Any, reason: str, **detail: Any) -> None:
+    """Record one lost RL event in the shared loss ledger. Never raises.
+
+    ``detail`` adds small, non-sensitive fields to the ledger line (e.g. the
+    NB-06 ``suppressed`` count).
+    """
     try:
         from vco_lib.rl_telemetry_loss import KIND_HUB_POST_FAILED, record_loss
 
@@ -298,6 +349,7 @@ def _record_post_loss(event: Any, reason: str) -> None:
             task_type=ev.get("task_type"),
             embedding_source=ev.get("embedding_source"),
             task_id=ev.get("task_id"),
+            **detail,
         )
     except Exception as exc:  # noqa: BLE001 — the loss record must not raise
         logger.debug("rl_events POST loss could not be recorded (%s)", exc)

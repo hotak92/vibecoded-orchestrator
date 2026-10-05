@@ -1208,7 +1208,7 @@ def probe_rl_telemetry_loss(folder: Path, res: DoctorResolvers, ctx: dict) -> li
     Standing rule: RL is optional, but its training logs are ALWAYS collected.
     Losses are recorded by their writers in the RL telemetry loss ledger
     (:mod:`vco_lib.rl_telemetry_loss`): a vct-hub POST that did not land
-    (``hub_post_failed``), a dual-log twin that was wanted but not produced
+    (``hub_post_failed``), deferred events that never reached the POST (``deferred_unsent``, v0.2.101), a dual-log twin that was wanted but not produced
     (``dual_skip``), or a twin written with fewer nodes than its primary
     (``dual_partial``, reported apart: no event was lost). This probe is that
     ledger's surface. Blind spot, stated in the summary: a hook search killed

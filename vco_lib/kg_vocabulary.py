@@ -20,9 +20,31 @@ Consumers (keep this list current):
   ``_KNOWLEDGE_SUBFOLDERS`` / ``_NODE_TYPE_TO_FOLDER`` literals are the
   built-in base of this open set and MUST match the ``BUILTIN_*`` constants
   below (pinned by ``tests/test_v0291_kg_vocabulary_consumers.py``).
+  ``store_knowledge_node`` applies the shared node-type gate
+  (:func:`classify_node_type`) and auto-extends through
+  :func:`extend_vocabulary` (v0.2.101, P299-A3).
 * ``templates/scripts/sync_knowledge_graph.py`` — the node validator
   delegates here (A-leg); its inline ImportError-fallback parser MUST match
   ``parse_vocabulary_text``'s type extraction (same parity test).
+  ``sync_node`` applies the shared node-type gate and auto-extends through
+  :func:`extend_vocabulary` (v0.2.101, P299-A3).
+* ``vco_lib/kg_sync_drift.py`` — the drift scanner's skip predicate calls
+  :func:`is_wellformed_type` so it skips EXACTLY the nodes ``sync_node``
+  fails loudly for (an invalid-type node can never reach Weaviate;
+  reporting it as drift would be a permanent phantom).
+
+The node-type GATE (v0.2.101, P299-A3) — one shared decision for every KG
+write path, born from the 2026-09 incident where a project's sync held 377
+of 546 disk nodes because a per-path validator REJECTED every undeclared
+``type:``:
+
+* :func:`classify_node_type` → ``known`` / ``extendable`` / ``invalid``;
+* ``extendable`` (wellformed but undeclared) is INGESTED and the type is
+  auto-declared via :func:`extend_vocabulary` — the vocabulary is OPEN by
+  design, so an unknown type grows the file instead of dropping the node;
+* ``invalid`` (empty/malformed) is refused LOUDLY by the caller (a failed
+  sync outcome / a store error payload) — never stored, never silently
+  skipped.
 
 Declaration format (the shape ``templates/knowledge/VOCABULARY.md`` already
 uses for the built-ins — see its "Declaring your own node types" section):
@@ -68,7 +90,7 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import Mapping, Optional, Union
+from typing import Iterable, Mapping, Optional, Union
 
 __all__ = [
     "BUILTIN_NODE_TYPES",
@@ -76,11 +98,19 @@ __all__ = [
     "BUILTIN_NODE_TYPE_TO_FOLDER",
     "DEFAULT_NODE_FOLDER",
     "RL_TYPE_CAPACITY_SOFT_CAP",
+    "TYPE_KNOWN",
+    "TYPE_EXTENDABLE",
+    "TYPE_INVALID",
+    "AUTO_SECTION_MARKER",
     "KgVocabulary",
+    "VocabularyExtension",
     "builtin_vocabulary",
     "parse_vocabulary_text",
     "load_vocabulary",
     "clear_vocabulary_cache",
+    "is_wellformed_type",
+    "classify_node_type",
+    "extend_vocabulary",
 ]
 
 # ── Built-ins (behavior-preserving base of the open set) ─────────────────────
@@ -333,3 +363,268 @@ def load_vocabulary(
 def clear_vocabulary_cache() -> None:
     """Drop every cached vocabulary (tests / long-lived processes)."""
     _CACHE.clear()
+
+
+# ── The node-type gate — ONE shared decision (v0.2.101, P299-A3) ─────────────
+#
+# Every KG write path classifies a node's ``type:`` value with the SAME rule
+# (see the module docstring): kg-sync's ``sync_node``, the weaviate-kg MCP's
+# ``store_knowledge_node``, and the drift scanner's skip predicate. The
+# 2026-09 incident this closes: one path's validator rejecting what the
+# others accepted dropped 169 of 546 nodes from a project's collection.
+
+#: The alias charset of :data:`_CLASS_HEADING_RE` — a type value that cannot
+#: be spelled in this charset can never be declared, so it is INVALID
+#: (reported loudly by the callers, never stored, never auto-extended).
+_TYPE_CHARSET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+#: Gate verdicts returned by :func:`classify_node_type`.
+TYPE_KNOWN = "known"            # declared (built-in or VOCABULARY.md alias)
+TYPE_EXTENDABLE = "extendable"  # wellformed but undeclared → auto-declare
+TYPE_INVALID = "invalid"        # empty/malformed → refuse loudly
+
+
+def is_wellformed_type(node_type: object) -> bool:
+    """True when *node_type* could become a vocabulary alias: a non-empty
+    ``[A-Za-z0-9_-]+`` string (surrounding whitespace ignored).
+
+    This is the SHARED invalid/valid boundary — ``sync_node`` fails a node
+    loudly exactly when this returns False for its frontmatter-declared
+    ``type:``, and ``kg_sync_drift`` skips exactly those nodes (parity
+    pinned by ``tests/test_v02101_kg_vocabulary_autoextend.py``).
+    """
+    return isinstance(node_type, str) and bool(
+        _TYPE_CHARSET_RE.match(node_type.strip())
+    )
+
+
+def classify_node_type(node_type: object, vocab: KgVocabulary) -> str:
+    """The one gate decision for a node's ``type:`` value.
+
+    Returns :data:`TYPE_KNOWN` (declared — case-insensitive, because the
+    declaration parser lowercases every alias, so ``Concept`` and
+    ``concept`` are the same type), :data:`TYPE_EXTENDABLE` (wellformed
+    but undeclared — ingest and auto-declare), or :data:`TYPE_INVALID`
+    (empty/malformed — refuse loudly, never store).
+    """
+    if not is_wellformed_type(node_type):
+        return TYPE_INVALID
+    alias = str(node_type).strip().lower()
+    if alias in vocab.node_types:
+        return TYPE_KNOWN
+    return TYPE_EXTENDABLE
+
+
+# ── Auto-extend (append-only) ────────────────────────────────────────────────
+
+#: Marker of the auto-extended section :func:`extend_vocabulary` maintains.
+#: An HTML comment so it is inert for every markdown renderer AND for the
+#: declaration parser (only ``#### **`co:…`** (alias: `…`)`` headings count).
+AUTO_SECTION_MARKER = "<!-- vco-auto-extended-types -->"
+
+_AUTO_SECTION_HEADING = """\
+## Auto-extended node types
+
+Declared automatically by VCO when a node used an undeclared, wellformed
+`type:` value — the node-type vocabulary is OPEN, so kg-sync and the
+weaviate-kg MCP grow this file instead of rejecting the node (v0.2.101,
+P299-A3). Edit the definitions freely; keep the heading shape so the
+parser sees them. A type declared here files under `knowledge/concepts/`
+unless you add a `- **Folder**: `name`` bullet (see "Declaring your own
+node types" above).
+"""
+
+_NEW_FILE_HEADER = """\
+# Knowledge Graph Vocabulary
+
+This project's KG node-type vocabulary. The built-in types (project,
+concept, tool, research, model, hardware, pattern, insight, guide) are
+always available even when this file does not declare them. This file was
+created automatically by VCO to declare auto-extended types; see the
+orchestrator's `templates/knowledge/VOCABULARY.md` for the full shipped
+ontology and the declaration format.
+
+"""
+
+
+@dataclass(frozen=True)
+class VocabularyExtension:
+    """Outcome of one :func:`extend_vocabulary` call.
+
+    ``added`` carries the lowercased aliases appended; ``already_declared``
+    the inputs that needed no write; ``invalid`` the inputs rejected by
+    :func:`is_wellformed_type` (repr-ed for non-strings). ``error`` is
+    non-empty when the file could not be written — a SOFT failure the
+    caller must report loudly (the node still syncs; the type simply stays
+    undeclared and the next run retries).
+    """
+
+    added: tuple[str, ...] = ()
+    already_declared: tuple[str, ...] = ()
+    invalid: tuple[str, ...] = ()
+    vocabulary_path: str = ""
+    error: str = ""
+
+
+def _pascal_class_name(alias: str) -> str:
+    """Canonical ``co:`` class name for an alias: hyphen/underscore
+    segments capitalised (``source-person`` → ``SourcePerson``) — the shape
+    the shipped VOCABULARY.md uses for its built-in classes."""
+    parts = [p for p in re.split(r"[-_]+", alias) if p]
+    return "".join(p[:1].upper() + p[1:] for p in parts) or alias
+
+
+def _existing_class_names(text: str) -> "set[str]":
+    """Every ``co:`` name already declared by a real heading line (fenced
+    blocks excluded by the same skip the type parser uses)."""
+    names: "set[str]" = set()
+    fence: Optional[str] = None
+    for line in text.splitlines():
+        fence_m = _FENCE_RE.match(line)
+        if fence_m:
+            delim = fence_m.group("delim")
+            if fence is None:
+                fence = delim
+            elif delim == fence:
+                fence = None
+            continue
+        if fence is not None:
+            continue
+        m = _CLASS_HEADING_RE.match(line)
+        if m:
+            names.add(str(m.group("name")))
+    return names
+
+
+def extend_vocabulary(
+    project_root: Union[str, Path],
+    new_types: Iterable[object],
+) -> VocabularyExtension:
+    """APPEND undeclared, wellformed node types to the project's
+    ``knowledge/VOCABULARY.md`` — the owner-directed auto-extend (P299:
+    "auto-extend the vocabulary instead of rejecting").
+
+    Strictly append-only: the file is user data, so no existing byte is
+    ever rewritten — new declarations go to the END of the file, under an
+    :data:`AUTO_SECTION_MARKER` section that is created on the first
+    extension. A missing file is created with a minimal header (never a
+    copy of the shipped ontology — that is the installer's job, and
+    clobbering a user's absent-by-choice file with 464 shipped lines is
+    not this function's call).
+
+    Each declaration is a real class heading in the canonical shape the
+    parser requires (``#### **`co:SourcePerson`** (alias: `source-person`)``)
+    so the very next :func:`load_vocabulary` call sees the type. The alias
+    is the LOWERCASED input (the parser lowercases anyway); no Folder line
+    is written, so the type files under ``knowledge/concepts/`` — the same
+    default the built-in pattern/insight/guide types use.
+
+    Never raises: any OSError/decode problem is returned as
+    ``VocabularyExtension.error`` (soft-fail — the caller reports loudly
+    and carries on; a vocabulary write failure must never drop a node,
+    which is the very defect this mechanism closes). Invalid inputs are
+    recorded in ``invalid`` and never appended. Idempotent: an already
+    declared type (this file's fresh parse wins, case-insensitive) is a
+    no-op.
+    """
+    vocab_path = Path(project_root) / "knowledge" / "VOCABULARY.md"
+    # Fresh parse (no cache) so a same-process second call sees the first
+    # call's append even on a coarse-mtime filesystem.
+    vocab = load_vocabulary(project_root, use_cache=False)
+
+    added_order: "list[str]" = []   # lowercased aliases, first-seen order
+    already: "list[str]" = []
+    invalid: "list[str]" = []
+    seen: "set[str]" = set()
+    for raw in new_types:
+        if not is_wellformed_type(raw):
+            token = raw.strip() if isinstance(raw, str) else repr(raw)
+            if token not in invalid:
+                invalid.append(token)
+            continue
+        alias = str(raw).strip().lower()
+        if alias in vocab.node_types:
+            if alias not in already:
+                already.append(alias)
+            continue
+        if alias in seen:
+            continue
+        seen.add(alias)
+        added_order.append(alias)
+
+    if not added_order:
+        return VocabularyExtension(
+            already_declared=tuple(already),
+            invalid=tuple(invalid),
+            vocabulary_path=str(vocab_path),
+        )
+
+    try:
+        existed = vocab_path.is_file()
+        current_text = ""
+        if existed:
+            # errors="replace": a mis-encoded file still gets a valid
+            # append (bytes preserved — we never rewrite what is there).
+            current_text = vocab_path.read_text(
+                encoding="utf-8", errors="replace"
+            )
+        used_names = _existing_class_names(current_text)
+
+        blocks: "list[str]" = []
+        if not existed:
+            blocks.append(_NEW_FILE_HEADER)
+        if AUTO_SECTION_MARKER not in current_text:
+            blocks.append(
+                f"{AUTO_SECTION_MARKER}\n{_AUTO_SECTION_HEADING}\n"
+            )
+        for alias in added_order:
+            name = _pascal_class_name(alias)
+            if name in used_names:
+                name = alias          # valid charset; keeps the heading unique
+            if name in used_names:
+                # GLM wave-2 review nit 5: the raw alias can ALSO be a taken
+                # class name (a file declaring `co:source-person` under a
+                # different alias). Duplicate `co:` headings are cosmetic
+                # (the parser is alias-keyed) but sloppy — take the smallest
+                # free numeric suffix instead.
+                suffix = 2
+                while f"{alias}-{suffix}" in used_names:
+                    suffix += 1
+                name = f"{alias}-{suffix}"
+            used_names.add(name)
+            blocks.append(
+                f"#### **`co:{name}`** (alias: `{alias}`)\n"
+                f"- **Definition**: Auto-declared by VCO — a node used this "
+                f"undeclared type and the vocabulary is open. Replace this "
+                f"line with a real definition; keep the heading shape.\n\n"
+            )
+        block = "".join(blocks)
+
+        vocab_path.parent.mkdir(parents=True, exist_ok=True)
+        if existed:
+            # Byte-preserving append: open in append mode and never touch
+            # the existing bytes. The leading "\n" terminates a last line
+            # that lacks its newline AND separates the block visually when
+            # the file already ends with one.
+            with open(vocab_path, "a", encoding="utf-8") as fh:
+                fh.write("\n" + block)
+        else:
+            vocab_path.write_text(block, encoding="utf-8")
+    except OSError as exc:
+        return VocabularyExtension(
+            already_declared=tuple(already),
+            invalid=tuple(invalid),
+            vocabulary_path=str(vocab_path),
+            error=f"{exc.__class__.__name__}: {exc}",
+        )
+
+    # Refresh this process's cache entry so a long-lived consumer (the MCP
+    # server) sees the declaration immediately, without an mtime race.
+    load_vocabulary(project_root, use_cache=False)
+
+    return VocabularyExtension(
+        added=tuple(added_order),
+        already_declared=tuple(already),
+        invalid=tuple(invalid),
+        vocabulary_path=str(vocab_path),
+    )

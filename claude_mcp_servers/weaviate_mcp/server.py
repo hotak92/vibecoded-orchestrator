@@ -3665,10 +3665,91 @@ def _kg_vocabulary():
                 exc,
             )
         return None
-    base = Path(KG_BASE_DIR) if KG_BASE_DIR else (
+    return load_vocabulary(_kg_vocabulary_base())
+
+
+def _kg_vocabulary_base() -> Path:
+    """The project root the OPEN vocabulary is read from AND auto-extended
+    into — the SAME root relative .md writes resolve to: KG_BASE_DIR →
+    CLAUDE_PROJECT_DIR chain → the server-inferred base. One home so
+    ``_kg_vocabulary`` (read) and the store path's ``extend_vocabulary``
+    (write, v0.2.101 P299-A3) can never target different trees."""
+    return Path(KG_BASE_DIR) if KG_BASE_DIR else (
         _resolve_project_root_for_deferral() or _SERVER_INFERRED_BASE
     )
-    return load_vocabulary(base)
+
+
+def _node_type_vocabulary_gate(node_type: object):
+    """v0.2.101 P299-A3 — the store path's node-type gate.
+
+    SAME shared decision as ``sync_knowledge_graph.sync_node`` and the
+    drift scanner's skip predicate (one home: ``vco_lib.kg_vocabulary``):
+
+    * INVALID (empty/malformed) → a refusal error string. The caller
+      returns it BEFORE any write (no Weaviate row, no .md file,
+      ``file_written`` honestly False) — garbage node types are never
+      stored and never silently accepted.
+    * EXTENDABLE (wellformed, undeclared) → the type is APPENDED to the
+      project's ``knowledge/VOCABULARY.md`` (open vocabulary — the
+      owner-directed auto-extend) and the node is stored normally.
+    * KNOWN → nothing.
+
+    Returns ``(refusal_error, extended_aliases, note)``. ``refusal_error``
+    is None unless the type is INVALID; ``note`` carries a loud soft-fail
+    line when the vocabulary append itself could not be written (the node
+    is still stored — a vocabulary write failure must never drop a node).
+
+    VERSION SKEW (kg_vocabulary unimportable, or older than the gate — the
+    only ImportError branch, same contract as ``_kg_vocabulary``): the gate
+    stays OFF and the historical accept-everything behaviour is preserved
+    (``_kg_vocabulary`` already warned once at module level).
+    """
+    try:
+        from vco_lib.kg_vocabulary import (
+            TYPE_EXTENDABLE,
+            TYPE_INVALID,
+            classify_node_type,
+            extend_vocabulary,
+        )
+    except ImportError:
+        return None, [], None
+
+    vocab = _kg_vocabulary()
+    if vocab is None:  # skew — import worked above but the loader degraded
+        return None, [], None
+
+    decision = classify_node_type(node_type, vocab)
+    if decision == TYPE_INVALID:
+        return (
+            f"invalid node_type {node_type!r}: must be a non-empty single "
+            f"token of letters/digits/'-'/'_' — an empty or malformed type "
+            f"is never stored. Use a declared type from "
+            f"knowledge/VOCABULARY.md (project, concept, tool, research, "
+            f"model, hardware, pattern, insight, guide, …), or ANY "
+            f"wellformed new one: an undeclared wellformed type is "
+            f"auto-declared in the vocabulary, not rejected.",
+            [],
+            None,
+        )
+    if decision == TYPE_EXTENDABLE:
+        result = extend_vocabulary(_kg_vocabulary_base(), [node_type])
+        note = None
+        if result.error:
+            note = (
+                f"could not auto-declare node type '{node_type}' in "
+                f"knowledge/VOCABULARY.md ({result.error}) — the node was "
+                f"stored anyway; declare the type manually to silence "
+                f"validation warnings"
+            )
+            logger.warning("weaviate-kg: %s", note)
+        elif result.added:
+            logger.info(
+                "weaviate-kg: auto-declared node type %r in %s (open "
+                "vocabulary — P299-A3)",
+                result.added[0], result.vocabulary_path,
+            )
+        return None, list(result.added), note
+    return None, [], None
 
 
 def _normalize_kg_file_path(file_path: str, node_type: str, title: str) -> tuple[str, list[str]]:
@@ -6718,10 +6799,11 @@ async def store_knowledge_node(
     content is skipped, changed content re-embeds.
 
     Args: title + content (title unique per file); node_type (OPEN set —
-    knowledge/VOCABULARY.md); tags (without '#'); links (WikiLinks,
-    "relationshipType::Target"); file_path (relative to KG_BASE_DIR or
-    absolute; omitted → derived); scope ("project" default | "shared"; shared
-    writes are REFUSED, not rerouted, when SHARED_KG_WRITE_DISABLED=true).
+    knowledge/VOCABULARY.md; undeclared auto-declared); tags (without '#');
+    links (WikiLinks, "relationshipType::Target"); file_path (relative to
+    KG_BASE_DIR or absolute; omitted → derived); scope ("project" default |
+    "shared"; shared writes are REFUSED, not rerouted, when
+    SHARED_KG_WRITE_DISABLED=true).
 
     Returns: JSON — success, file_written, absolute_path; a `warning` when the
     folder is not registered.
@@ -6738,6 +6820,29 @@ async def store_knowledge_node(
         # CORRUPT another project's knowledge, strictly worse than a wrong read.
         # The reaper prevents the stale process; this is the per-call guard.
         _assert_workspace_unchanged("store_knowledge_node")
+
+        # ── v0.2.101 P299-A3: node-type vocabulary gate ──────────────────
+        # The SAME shared decision kg-sync's sync_node applies (one home:
+        # vco_lib.kg_vocabulary — the drift scanner mirrors it too). An
+        # INVALID (empty/malformed) type is refused HERE, before the client
+        # is even fetched: no Weaviate row and no .md file for it, ever. An
+        # UNDECLARED but wellformed type AUTO-EXTENDS the project's
+        # knowledge/VOCABULARY.md (open vocabulary — append-only) and the
+        # node proceeds; the extension rides along in the result JSON
+        # (`vocabulary_extended`) so the agent sees what was declared.
+        _type_refusal, vocabulary_extended, vocabulary_note = (
+            _node_type_vocabulary_gate(node_type)
+        )
+        if _type_refusal is not None:
+            logger.error("store_knowledge_node refused: %s", _type_refusal)
+            return json.dumps({
+                "status": "error",
+                "success": False,
+                "error": _type_refusal,
+                "scope": scope,
+                "file_written": False,
+            }, indent=2)
+
         client = get_weaviate_client()
         # Determine target collection based on scope
         target_collection_name = KG_COLLECTION
@@ -7350,6 +7455,12 @@ async def store_knowledge_node(
             result["warning"] = unregistered_warning
         if path_adjustments:
             result["path_adjustments"] = path_adjustments
+        if vocabulary_extended:
+            # P299-A3: the auto-extend is NEVER silent — the agent sees
+            # which aliases this write declared in knowledge/VOCABULARY.md.
+            result["vocabulary_extended"] = vocabulary_extended
+        if vocabulary_note:
+            result["vocabulary_note"] = vocabulary_note
         if file_write_error:
             result["file_error"] = file_write_error
         elif md_path is not None and not file_written:

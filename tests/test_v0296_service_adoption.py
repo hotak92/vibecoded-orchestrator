@@ -509,6 +509,64 @@ class MergeComposeSemanticsTests(unittest.TestCase):
         self.assertIn("code_embed_cache", merged["volumes"])
 
 
+class RenderOverrideDefaultNetworkTests(unittest.TestCase):
+    """v0.2.101 Q1: the emitted override must DECLARE the project `default`
+    network in its top-level block whenever a service carries the
+    service-level `default` leg — standalone podman-compose refuses the chain
+    with "missing networks: default" otherwise, while docker compose
+    auto-creates it. The service-level leg itself is preserved
+    (dual-homing: the adopted service keeps a foot on the project default
+    network AND every live network — the model_router DNS dependency)."""
+
+    @staticmethod
+    def _plan(**frag):
+        # `live` only ever has its `is None` observed by the renderer.
+        return SimpleNamespace(service="code_embed", adoptable=True,
+                               live=object(), override_fragments=frag)
+
+    def _render(self, plan, **kw):
+        return yaml.safe_load(
+            service_adoption.render_adoption_override([plan], **kw))
+
+    def test_default_is_declared_top_level_when_a_service_references_it(self):
+        doc = self._render(self._plan(networks={"vibecoded-network": None}))
+        self.assertEqual(doc["networks"]["default"], {})
+        self.assertEqual(doc["networks"]["vibecoded-network"],
+                         {"external": True})
+        # the service-level leg is PRESERVED, not dropped
+        self.assertEqual(
+            doc["services"]["code_embed"]["networks"],
+            {"default": {}, "vibecoded-network": {"aliases": ["code_embed"]}},
+        )
+
+    def test_no_default_declared_when_no_service_references_it(self):
+        doc = self._render(self._plan(restart="unless-stopped"))
+        self.assertNotIn("default", doc["networks"])
+        self.assertNotIn("networks", doc["services"]["code_embed"])
+
+    def test_preserved_stanza_that_references_default_gets_it_declared(self):
+        """A partial re-adoption (the code_embed migration shape) whose plan
+        has NO live networks keeps the preserved stanzas verbatim — a preserved
+        stanza that carries the service-level `default` leg must still get the
+        top-level declaration, or podman-compose refuses the chain again."""
+        preserve = {"services": {"ollama": {"networks": {
+            "default": {}, "vibecoded-network": {"aliases": ["ollama"]}}}}}
+        doc = self._render(self._plan(restart="unless-stopped"),
+                           preserve=preserve, replacing=("code_embed",))
+        self.assertIn("default", doc["networks"])
+        self.assertEqual(doc["networks"]["default"], {})
+        self.assertIn("default", doc["services"]["ollama"]["networks"])
+
+    def test_preserved_stanza_without_default_leaves_the_block_alone(self):
+        """The scan keys on `default` specifically: a preserved stanza on some
+        OTHER network does not drag a `default` declaration in."""
+        preserve = {"services": {"ollama": {"networks": {
+            "vibecoded-network": {"aliases": ["ollama"]}}}}}
+        doc = self._render(self._plan(restart="unless-stopped"),
+                           preserve=preserve, replacing=("code_embed",))
+        self.assertNotIn("default", doc["networks"])
+
+
 class GpuOverlayFormTests(unittest.TestCase):
     def test_form_only_helper_is_retired(self):
         """v0.2.100 F-W2-15: `gpu_overlay_for_form` had no production caller
@@ -692,9 +750,12 @@ class AdoptionFlowTests(_TempCase):
                          ["code_embed_cache:/cache"])
         self.assertEqual(doc["volumes"]["code_embed_cache"],
                          {"external": True, "name": "code_embed_data"})
-        # the model-router network leg: external network + service alias
+        # the model-router network leg: external network + service alias; the
+        # project default network is declared top-level too, because the
+        # service-level `default` leg references it (podman-compose refuses a
+        # chain that references an undeclared network).
         self.assertEqual(doc["networks"],
-                         {"vibecoded-network": {"external": True}})
+                         {"default": {}, "vibecoded-network": {"external": True}})
         for svc in ("weaviate", "ollama", "code_embed"):
             nets = svcs[svc]["networks"]
             self.assertIn("default", nets)
