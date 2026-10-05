@@ -1116,8 +1116,16 @@ def insert_hook(
             vco_hook_script_identity,
         )
 
+        # v0.2.101 (review SF-3): the parked blob carries the registration's
+        # `async` flag — hand it over, because the async-only retirement rows
+        # (the dispatcher merge) refuse to match without positive evidence.
+        # A user's own SYNC registration of one of those scripts restores.
+        _parked_async = item.get("async")
         retired = match_retired_registration(
-            event, command, hook_identity=vco_hook_script_identity(command)
+            event, command, hook_identity=vco_hook_script_identity(command),
+            is_async=(
+                _parked_async if isinstance(_parked_async, bool) else None
+            ),
         )
         if retired is not None:
             raise HooksSettingsError(

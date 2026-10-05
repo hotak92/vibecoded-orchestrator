@@ -350,28 +350,6 @@
         ]
       },
       {
-        "matcher": "Edit|Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-edit-outcome.ps1\"",
-            "timeout": 5,
-            "async": true
-          }
-        ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-bash-context-record.ps1\"",
-            "timeout": 5,
-            "async": true
-          }
-        ]
-      },
-      {
         "matcher": "Bash",
         "hooks": [
           {
@@ -402,68 +380,15 @@
         ]
       },
       {
-        "matcher": "Edit",
+        "matcher": "*",
         "hooks": [
           {
             "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
-            "timeout": 5,
-            "async": true,
-            "if": "Edit(knowledge/**/*.md)"
-          }
-        ]
-      },
-      {
-        "matcher": "Write",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
-            "timeout": 5,
-            "async": true,
-            "if": "Write(knowledge/**/*.md)"
-          }
-        ]
-      },
-      {
-        "matcher": "mcp__weaviate-kg__store_knowledge_node",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-summary-generator.ps1\"",
-            "timeout": 5,
+            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-tool-use-async.ps1\"",
+            "timeout": 15,
             "async": true
           }
         ]
-      },
-      {
-        "matcher": "Bash",
-        "hooks": [
-          {
-            "type": "command",
-            "if": "Bash(git commit *)",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-git-commit-kg-sync.ps1\"",
-            "timeout": 10,
-            "async": true
-          },
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/post-file-delete.ps1\"",
-            "timeout": 5,
-            "async": true
-          }
-        ]
-      },
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "powershell -NoProfile -ExecutionPolicy Bypass -File \"${CLAUDE_PROJECT_DIR}/.claude/hooks/kg-update-nudge.ps1\"",
-            "async": true,
-            "timeout": 3
-          }
-        ],
-        "matcher": "*"
       },
       {
         "matcher": "mcp__weaviate-kg__hybrid_search|mcp__weaviate-kg__semantic_graph_search|mcp__weaviate-kg__search_code_graph",

@@ -3,7 +3,7 @@ title: Orchestrator Hook System
 type: concept
 tags: [mid-level-architecture, vibecoded-orchestrator, hooks, automation, workflow]
 created: 2026-04-27T18:30:00Z
-updated: 2026-10-04T07:45:00Z
+updated: 2026-10-05T12:40:00Z
 status: active
 ---
 
@@ -174,8 +174,11 @@ Context nearing limit
   - code files → appended to the per-session code-graph queue in `.claude/state/`, drained at end-of-turn by the `Stop` hook `stop-codegraph-drain.sh` (ONE analyzer pass per canonical root, rate-limited). `code-graph-incremental.sh` is NOT called by it — that hook ships unregistered and uninvoked, for standalone use.
 - Runs duplicate detection periodically.
 
-**post-edit-outcome.sh** (matcher: `Edit|Write`)
-- Records the edit outcome for retrieval-quality telemetry.
+**post-tool-use-async.sh** (matcher: `*`, async — the ONE async PostToolUse registration, v0.2.101)
+- Dispatcher for every background PostToolUse concern. Reads the hook payload once, routes it by `tool_name` to the unchanged per-concern scripts and runs them concurrently, guaranteeing silence: child stdout is discarded and child stderr / non-zero exits condense to one line per failure in `<VCO metrics dir>/post-tool-use-async.log`, so a tool call can no longer write up to three `async_hook_response` transcript records (measured pre-fix: 700k records / 462 MB in one transcript).
+- Routes: `Edit|Write` → **post-edit-outcome.sh** (edit-outcome telemetry for the RL retrieval pipeline) + **kg-summary-generator.sh** (background summary refresh of `knowledge/.node_formats.json` for knowledge-path edits — its own path validation is the gate; see [[KG-Summary Three-Tier Generation Pipeline]] for backend selection); `Bash` → **post-bash-context-record.sh** (bash-outcome telemetry) + **post-file-delete.sh** (diagram-delete cascade) + **post-git-commit-kg-sync.sh** (commit-review agent, behind a `git commit` command-prefix gate reproducing the retired `if: Bash(git commit *)` key); `mcp__weaviate-kg__store_knowledge_node` → **kg-summary-generator.sh**; every tool → **kg-update-nudge.sh** (work-unit bookkeeping so the next-prompt nudge fires at the right threshold).
+- Per-sub-hook on/off survives the merge: a stem listed in `VCO_ASYNC_DISABLED_HOOKS` (`<project>/.claude/env`, comma-separated — the lean-ctx knob's own channel, written by the launcher Hooks tab's sub-hook checkboxes via `set_claude_env_value`) is skipped by both siblings, and a disable parked before the merge is carried into that key by the bundle update (a failed carry write defers as `async_subhook_disable_carry_failed` and keeps the parked bytes protected until it lands).
+- Pre-v0.2.101 these six scripts held eight individual async registrations; those are declared retired (event-scoped to PostToolUse, async-only) in `vco_lib/hook_retirements.py`, so an existing install loses them at the next bundle update while the nudge's SYNC UserPromptSubmit / SessionStart(compact) registrations survive.
 
 **py_compile** (inline `python3 -c`, matcher: `Write`)
 - Compile-checks a Python file immediately after it is written, surfacing syntax errors.
@@ -183,23 +186,10 @@ Context nearing limit
 **post-tool-security.sh** (matcher: `Edit|Write`)
 - Scans written file content for credential patterns. Logs findings to `.claude/logs/security-scan.jsonl`. Non-blocking — informational only.
 
-**sync_knowledge_graph.py + kg-summary-generator.sh** (matcher: `Edit|Write`)
-- Syncs an edited knowledge node to Weaviate and spawns a background summary job to refresh `knowledge/.node_formats.json`.
-- See [[KG-Summary Three-Tier Generation Pipeline]] for backend selection (claude CLI → Ollama → API → skip).
-
-**kg-summary-generator.sh** (matcher: `mcp__weaviate-kg__store_knowledge_node`)
-- Refreshes the sidecar summary when a node is written through the MCP tool rather than a file edit.
-
 **post-bash-file-sync.sh** (matcher: `Bash`)
 - Closes the CLI half of the sync gap: a file written from a shell command (`cat > knowledge/x.md <<EOF`, a heredoc, `sed -i` on a docs page, `cp` into a source tree) never reached Weaviate, because `post-file-edit.sh` is registered on `Edit|Write` only.
 - The command is parsed for the paths it wrote, and each one goes through the SAME routing home (`_lib/route-touched-path.sh`) that the Edit/Write hook uses, so a CLI write syncs identically. A pure-shell prefilter rejects the routine commands (`ls`, `git status`, a redirect to `/dev/null`) with no subprocess at all.
 - Writes an interpreter performs from its own source text (`python - <<EOF`, `patch`, `git checkout --`) cannot be recovered from the command string; for `knowledge/` and `docs/` those are caught by a bounded, watermarked mtime scan of those two directories.
-
-**post-bash-context-record.sh** (matcher: `Bash`)
-- Records Bash context for later retrieval; **post-git-commit-kg-sync.sh** + **post-file-delete.sh** also fire on `Bash` to sync KG on commit and prune deleted-file entries.
-
-**kg-update-nudge.sh** (matcher: `*`)
-- Tracks accumulated work units across all tool use so the next-prompt nudge fires at the right threshold.
 
 ### ConfigChange
 

@@ -328,8 +328,11 @@ def merge_hooks_block(
         # (timeout/async).
         #
         # v0.2.97 (multi-matcher gap): the template ships a few scripts under
-        # SEVERAL matchers in one event (`kg-summary-generator.sh` under
-        # `Edit`, `Write` and a store tool). Deduplicating those event-wide
+        # SEVERAL matchers in one event (`pre-diagram-path-validation.sh`
+        # under `Write|Edit` and the diagram MCP matchers; until v0.2.101
+        # also `kg-summary-generator.sh` under `Edit`, `Write` and a store
+        # tool — those merged into the `post-tool-use-async` dispatcher).
+        # Deduplicating those event-wide
         # meant a lost `Edit` registration was never re-added, because the
         # `Write` one carried the same command string. For such a script the
         # identity is (script, matcher), the same key the parked-hook matching

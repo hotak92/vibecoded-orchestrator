@@ -1173,6 +1173,27 @@ which clears the stale parked row). Emitted by the bundle update; cleared by the
 probe once no hook is both parked and running (None — keep — when launcher.db \
 or settings.json cannot be read)."""
 
+[conditions.async_subhook_disable_carry_failed]
+class = "action_required"
+owner = "vco_lib.hook_retirements"
+clear_probe = "probe:py:async_subhook_disable_carry_still_owed"
+emit_surfaces = ["ledger"]
+notes = """v0.2.101 (re-review SF-A). The bundle update's carry of a parked \
+(user-disabled) retired async PostToolUse registration into \
+VCO_ASYNC_DISABLED_HOOKS (<project>/.claude/env) failed on the env-file \
+write/read — e.g. a permission bit, an immutable flag, or a directory where \
+the file should be. Until the key lands, the merged post-tool-use-async \
+dispatcher would run the sub-hook(s) the user had switched off. This row is \
+the user-visible record and the update-retry trail; the launcher's eager \
+prune gate keys on POSITIVE carry success (the classifier's carry_pending \
+answer, computed by the same owed rule as this condition's probe), so the \
+parked bytes — the only record of the choice — stay protected even if this \
+row itself could not be written (re-review-2 nit 3). \
+Emitted by the bundle update (vco_lib.hook_retirements.carry_parked_async_disables); \
+every later update retries the carry and closes the row on success; the probe \
+also closes it on the hand-fix path (the key already holds every parked stem) \
+and keeps it when launcher.db or the env file cannot be read (None — no verdict)."""
+
 [conditions.project_hooks_relative_paths]
 class = "action_required"
 owner = "vco_lib.hook_relative_paths"

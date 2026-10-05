@@ -3,10 +3,18 @@
   import { toast } from '$lib/stores/toast';
   import Dropdown from '$lib/components/Dropdown.svelte';
   import {
+    ASYNC_DISABLED_KEY,
+    ASYNC_SUBHOOK_DESCRIPTIONS,
+    ASYNC_SUBHOOK_HINT,
+    ASYNC_SUBHOOK_STEMS,
+    asyncDisabledValueAfterToggle,
+    asyncSubhookToastText,
     canToggle,
     detectHintOs,
+    dispatcherRowPresent,
     gitVisibilityNote,
     isChecked,
+    isAsyncSubhookDisabled,
     leanCtxChoiceFromEnvValue,
     leanCtxEnvValueForChoice,
     leanCtxToastText,
@@ -71,6 +79,49 @@
   let leanCtxChoice = $state<LeanCtxChoice>('default');
   let leanCtxLoading = $state(true);
   let leanCtxSaving = $state(false);
+
+  // v0.2.101 (review SF-2): per-sub-hook toggles for the merged async
+  // PostToolUse dispatcher. Same file, channel and command as the lean-ctx
+  // knob (get/set_claude_env_value on <project>/.claude/env); the list
+  // semantics + copy live in ./hooks-view (unit-tested there), the section
+  // is rendered below and gated on the dispatcher registration existing.
+  let asyncDisabledRaw = $state<string | null>(null);
+  let asyncLoading = $state(true);
+  let asyncSaving = $state<string | null>(null);
+
+  async function loadAsyncDisables() {
+    asyncLoading = true;
+    try {
+      asyncDisabledRaw = await invoke<string | null>('get_claude_env_value', {
+        projectId,
+        key: ASYNC_DISABLED_KEY,
+      });
+    } catch (e) {
+      toast.error(e);
+    } finally {
+      asyncLoading = false;
+    }
+  }
+
+  async function setAsyncSubhook(stem: string, disabled: boolean) {
+    const previous = asyncDisabledRaw;
+    const next = asyncDisabledValueAfterToggle(previous, stem, disabled);
+    asyncDisabledRaw = next; // optimistic
+    asyncSaving = stem;
+    try {
+      await invoke('set_claude_env_value', {
+        projectId,
+        key: ASYNC_DISABLED_KEY,
+        value: next,
+      });
+      toast.success(asyncSubhookToastText(stem, disabled));
+    } catch (e) {
+      asyncDisabledRaw = previous;
+      toast.error(e);
+    } finally {
+      asyncSaving = null;
+    }
+  }
 
   async function load() {
     loading = true;
@@ -254,6 +305,7 @@
     if (projectId) {
       void load();
       void loadLeanCtx();
+      void loadAsyncDisables();
     }
   });
 </script>
@@ -284,6 +336,27 @@
     </div>
     <p class="ps-lean-hint">{LEAN_CTX_HINT}</p>
   </div>
+
+  {#if view && dispatcherRowPresent(view.hooks)}
+    <div class="ps-lean-card" data-testid="async-subhook-toggles">
+      <div class="ps-lean-row">
+        <span class="ps-lean-title">Async PostToolUse sub-hooks (routed by the dispatcher)</span>
+        {#if asyncSaving}<span class="ps-lean-saving">Saving…</span>{/if}
+      </div>
+      {#each ASYNC_SUBHOOK_STEMS as stem (stem)}
+        <label class="ps-async-row">
+          <input
+            type="checkbox"
+            checked={!isAsyncSubhookDisabled(asyncDisabledRaw, stem)}
+            disabled={asyncLoading || asyncSaving !== null}
+            onchange={(e) => void setAsyncSubhook(stem, !(e.target as HTMLInputElement).checked)} />
+          <code>{stem}</code>
+          <span class="ps-async-note">{ASYNC_SUBHOOK_DESCRIPTIONS[stem]}</span>
+        </label>
+      {/each}
+      <p class="ps-lean-hint">{ASYNC_SUBHOOK_HINT}</p>
+    </div>
+  {/if}
 
   {#if view && !readable}
     <div class="ps-banner" role="alert">
@@ -392,6 +465,8 @@
   .ps-lean-title { font-size: 12px; font-weight: 600; color: inherit; }
   .ps-lean-saving { font-size: 11px; color: #888; }
   .ps-lean-hint { color: #aaa; font-size: 11px; line-height: 1.5; margin: 8px 0 0; }
+  .ps-async-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; font-size: 12px; }
+  .ps-async-note { color: #aaa; font-size: 11px; }
   .ps-banner {
     display: flex; flex-direction: column; gap: 6px; align-items: flex-start;
     background: rgba(255,120,120,0.10); border: 1px solid rgba(255,120,120,0.35);

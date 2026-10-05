@@ -33,7 +33,11 @@ These tests cover:
   - task_id pairing via state file
   - Cross-language parity: OUTCOME_EVENT_TYPES (Python) matches
     allowed_event_types (Rust source string-grep)
-  - settings.json registers the three new hooks
+  - settings.json wiring — dispatcher-era (v0.2.101): pre-bash-context-
+    inject stays a DIRECT PreToolUse registration; the two post-* outcome
+    producers fire THROUGH the single async post-tool-use-async
+    dispatcher's routing table (the eight individual async PostToolUse
+    registrations were merged to kill transcript bloat)
 """
 from __future__ import annotations
 
@@ -373,27 +377,94 @@ class OutcomeEmitModuleSurface(unittest.TestCase):
 
 
 class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
-    """templates/settings.json.{linux,windows}.template must register the
-    three new hooks at the correct PreToolUse / PostToolUse positions.
+    """The V52-M hooks must be wired on both OSes — dispatcher-era form.
+
+    v0.2.101 UPDATE (promise kept, mechanism moved): the two PostToolUse
+    outcome producers (``post-bash-context-record``, ``post-edit-outcome``)
+    are no longer REGISTERED individually — the eight async PostToolUse
+    registrations merged into ONE async dispatcher registration
+    (``post-tool-use-async.{sh,ps1}``, matcher ``*``) that routes by
+    tool_name to the same unchanged scripts, killing the per-tool-call
+    ``async_hook_response`` transcript bloat. The RL outcome-event pair
+    (pre_bash producer → bash_outcome / edit_outcome recorder, allowed
+    event types pinned in OutcomeEventTypeParity above and in
+    ``launcher/src-tauri/vct-hub/src/rl_events_api.rs``) therefore still
+    fires on every Bash / Edit / Write — THROUGH the dispatcher. These
+    tests assert the dispatcher-era wiring; the full derived routing
+    coverage (every retired stem must have a route row) lives in
+    ``tests/test_v02101_async_posttooluse_dispatcher.py``.
+    ``pre-bash-context-inject`` remains a DIRECT PreToolUse registration
+    (it injects additionalContext in-turn; it was never async).
     """
 
+    #: The dispatcher's routing-table rows for the V52-M outcome pair
+    #: (line fingerprints — the table is the one declaration both
+    #: siblings mirror byte-for-byte).
+    DISPATCHER_ROWS_SH = (
+        "Bash|post-bash-context-record|-",
+        "Edit|post-edit-outcome|-",
+        "Write|post-edit-outcome|-",
+    )
+    DISPATCHER_ROWS_PS1 = DISPATCHER_ROWS_SH  # table is extension-less
+
+    def _dispatcher_text(self, ext: str) -> str:
+        p = REPO_ROOT / "templates" / "hooks" / f"post-tool-use-async.{ext}"
+        self.assertTrue(p.is_file(), f"missing dispatcher: {p}")
+        return p.read_text(encoding="utf-8", errors="replace")
+
+    def _async_posttooluse(self, template: str) -> list:
+        p = REPO_ROOT / "templates" / f"settings.json.{template}.template"
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return [
+            (group.get("matcher", ""), h)
+            for group in cfg["hooks"]["PostToolUse"]
+            for h in group.get("hooks", [])
+            if h.get("async")
+        ]
+
     def test_linux_template_registers_three_hooks(self) -> None:
+        """pre-bash DIRECTLY; the two post-* outcome producers THROUGH the
+        dispatcher's routing table (dispatcher-era form of this pin)."""
         p = REPO_ROOT / "templates" / "settings.json.linux.template"
         self.assertTrue(p.is_file(), f"missing: {p}")
         text = p.read_text(encoding="utf-8")
         self.assertIn(".claude/hooks/pre-bash-context-inject.sh", text)
-        self.assertIn(".claude/hooks/post-bash-context-record.sh", text)
-        self.assertIn(".claude/hooks/post-edit-outcome.sh", text)
+        self.assertIn(".claude/hooks/post-tool-use-async.sh", text)
+        dispatcher = self._dispatcher_text("sh")
+        # The producers are wired through the dispatcher's route table.
+        for row in self.DISPATCHER_ROWS_SH:
+            self.assertIn(row, dispatcher,
+                          f"dispatcher route row missing: {row}")
+        # And NOT registered directly under PostToolUse any more (a direct
+        # registration beside the dispatcher would double-fire the event).
+        for group_matcher, h in self._posttooluse_all("linux"):
+            self.assertNotIn("post-bash-context-record.sh", h.get("command", ""))
+            self.assertNotIn("post-edit-outcome.sh", h.get("command", ""))
         # Validate JSON well-formedness
         json.loads(text)
+
+    def _posttooluse_all(self, template: str) -> list:
+        p = REPO_ROOT / "templates" / f"settings.json.{template}.template"
+        cfg = json.loads(p.read_text(encoding="utf-8"))
+        return [
+            (group.get("matcher", ""), h)
+            for group in cfg["hooks"]["PostToolUse"]
+            for h in group.get("hooks", [])
+        ]
 
     def test_windows_template_registers_three_hooks(self) -> None:
         p = REPO_ROOT / "templates" / "settings.json.windows.template"
         self.assertTrue(p.is_file(), f"missing: {p}")
         text = p.read_text(encoding="utf-8")
         self.assertIn("pre-bash-context-inject.ps1", text)
-        self.assertIn("post-bash-context-record.ps1", text)
-        self.assertIn("post-edit-outcome.ps1", text)
+        self.assertIn("post-tool-use-async.ps1", text)
+        dispatcher = self._dispatcher_text("ps1")
+        for row in self.DISPATCHER_ROWS_PS1:
+            self.assertIn(row, dispatcher,
+                          f".ps1 dispatcher route row missing: {row}")
+        for _matcher, h in self._posttooluse_all("windows"):
+            self.assertNotIn("post-bash-context-record.ps1", h.get("command", ""))
+            self.assertNotIn("post-edit-outcome.ps1", h.get("command", ""))
         json.loads(text)
 
     def test_pre_bash_hook_runs_on_bash_matcher(self) -> None:
@@ -412,36 +483,31 @@ class SettingsTemplatesRegisterNewHooks(unittest.TestCase):
         )
 
     def test_post_bash_hook_runs_on_bash_matcher(self) -> None:
-        """Post-bash recorder must be PostToolUse, matcher=Bash."""
-        p = REPO_ROOT / "templates" / "settings.json.linux.template"
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-        hooks = cfg["hooks"]["PostToolUse"]
-        registered = []
-        for group in hooks:
-            for h in group.get("hooks", []):
-                if "post-bash-context-record.sh" in h.get("command", ""):
-                    registered.append(group.get("matcher", ""))
-        self.assertIn(
-            "Bash", registered,
-            "post-bash-context-record.sh must be registered under PostToolUse matcher=Bash",
+        """Dispatcher-era form: the async PostToolUse registration is the
+        dispatcher on matcher ``*`` (it fires for Bash too), and its route
+        table sends Bash to post-bash-context-record."""
+        async_regs = self._async_posttooluse("linux")
+        self.assertEqual(
+            len(async_regs), 1,
+            "PostToolUse must carry exactly ONE async registration (the "
+            f"merged dispatcher); found {async_regs}",
         )
+        matcher, hook = async_regs[0]
+        self.assertEqual(matcher, "*")
+        self.assertIn("post-tool-use-async.sh", hook.get("command", ""))
+        self.assertIn("Bash|post-bash-context-record|-", self._dispatcher_text("sh"),
+                      "the bash_outcome producer must be routed for Bash")
 
     def test_post_edit_outcome_runs_on_edit_or_write(self) -> None:
-        """Post-edit-outcome must be PostToolUse with Edit|Write matcher."""
-        p = REPO_ROOT / "templates" / "settings.json.linux.template"
-        cfg = json.loads(p.read_text(encoding="utf-8"))
-        hooks = cfg["hooks"]["PostToolUse"]
-        registered = []
-        for group in hooks:
-            for h in group.get("hooks", []):
-                if "post-edit-outcome.sh" in h.get("command", ""):
-                    registered.append(group.get("matcher", ""))
-        # Accept either "Edit|Write" or two separate Edit/Write registrations
-        self.assertTrue(
-            any("Edit" in m and "Write" in m for m in registered) or
-            ("Edit" in registered and "Write" in registered),
-            f"post-edit-outcome.sh must run on Edit|Write; found matchers: {registered}",
-        )
+        """Dispatcher-era form: the route table fires post-edit-outcome for
+        BOTH Edit and Write (the retired registration's Edit|Write matcher).
+        """
+        dispatcher = self._dispatcher_text("sh")
+        self.assertIn("Edit|post-edit-outcome|-", dispatcher)
+        self.assertIn("Write|post-edit-outcome|-", dispatcher)
+        ps1 = self._dispatcher_text("ps1")
+        self.assertIn("Edit|post-edit-outcome|-", ps1)
+        self.assertIn("Write|post-edit-outcome|-", ps1)
 
 
 class HookEnvAndSecurityHygiene(unittest.TestCase):

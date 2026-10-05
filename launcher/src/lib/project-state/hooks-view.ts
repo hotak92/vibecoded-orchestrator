@@ -212,6 +212,114 @@ export function newHookCommandPlaceholder(os: HintOs): string {
     : 'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/my-hook.sh"';
 }
 
+// ─── async PostToolUse sub-hook toggles (v0.2.101 review SF-2) ───────────
+//
+// The merged async dispatcher (post-tool-use-async) replaced eight
+// individually-toggleable PostToolUse registrations with ONE row — parking
+// that row would stop all six sub-hooks at once. The per-sub-hook switch is
+// kept: a stem listed in VCO_ASYNC_DISABLED_HOOKS (<project>/.claude/env —
+// the SAME per-project knob file, channel and write command
+// (set_claude_env_value) the lean-ctx toggle below uses; never a second
+// store) is skipped by both dispatcher siblings. A disable that predates
+// the merge is carried into the key by the bundle update
+// (vco_lib.hook_retirements.carry_parked_async_disables), so turning a
+// sub-hook off before v0.2.101 keeps it off after.
+
+/** The `.claude/env` key this section owns. */
+export const ASYNC_DISABLED_KEY = 'VCO_ASYNC_DISABLED_HOOKS';
+
+/** The routed sub-hooks. MUST MATCH the dispatcher ROUTE_TABLEs
+ * (templates/hooks/post-tool-use-async.{sh,ps1}) — the vitest suite
+ * DERIVES the set from the shipped table, so a routing row without a
+ * toggle here (or a toggle without a row) is red. */
+export const ASYNC_SUBHOOK_STEMS: readonly string[] = [
+  'post-edit-outcome',
+  'kg-summary-generator',
+  'post-bash-context-record',
+  'post-git-commit-kg-sync',
+  'post-file-delete',
+  'kg-update-nudge',
+];
+
+/** One line per row: what turning the sub-hook off stops. */
+export const ASYNC_SUBHOOK_DESCRIPTIONS: Record<string, string> = {
+  'post-edit-outcome': 'Edit/Write outcome telemetry for the RL retrieval pipeline',
+  'kg-summary-generator': 'KG node summary refresh after knowledge edits and node writes',
+  'post-bash-context-record': 'Bash outcome telemetry paired with the pre-bash injection',
+  'post-git-commit-kg-sync': 'Background KG review agent after a git commit',
+  'post-file-delete': 'Diagram delete cascade (SQLite + sidecar + Weaviate)',
+  'kg-update-nudge': 'Per-tool-call work-unit bookkeeping behind the KG-write nudge',
+};
+
+/** Parse the env value: split on ',', trim, drop empties, de-dupe, keep
+ * order. Mirrors what both dispatcher siblings accept. */
+export function parseAsyncDisabled(raw: string | null | undefined): string[] {
+  if (!raw) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const part of raw.split(',')) {
+    const s = part.trim();
+    if (s && !seen.has(s)) {
+      seen.add(s);
+      out.push(s);
+    }
+  }
+  return out;
+}
+
+/** Whether one stem is currently switched off (exact stem match — a
+ * `post-file` entry must never disable `post-file-delete`). */
+export function isAsyncSubhookDisabled(
+  raw: string | null | undefined,
+  stem: string,
+): boolean {
+  return parseAsyncDisabled(raw).includes(stem);
+}
+
+/** The value to persist after a toggle (`disabled` = switch the stem OFF).
+ * `null` removes the key entirely — the last re-enable must not leave an
+ * empty `VCO_ASYNC_DISABLED_HOOKS=` behind; an absent key is the file's
+ * "nothing disabled" state. Unknown stems (a hand edit) are preserved. */
+export function asyncDisabledValueAfterToggle(
+  raw: string | null | undefined,
+  stem: string,
+  disabled: boolean,
+): string | null {
+  const current = parseAsyncDisabled(raw);
+  const next = disabled
+    ? current.includes(stem)
+      ? current
+      : [...current, stem]
+    : current.filter((s) => s !== stem);
+  return next.length > 0 ? next.join(',') : null;
+}
+
+/** Whether the tab should offer the sub-hook toggles at all: only when the
+ * dispatcher registration is actually among the project's listed hooks (a
+ * not-yet-updated project still has the eight direct registrations and
+ * their own rows). */
+export function dispatcherRowPresent(hooks: EffectiveHook[]): boolean {
+  return hooks.some(
+    (h) => h.event === 'PostToolUse' && h.command.includes('post-tool-use-async'),
+  );
+}
+
+/** The copy under the section. */
+export const ASYNC_SUBHOOK_HINT =
+  'These background PostToolUse hooks are routed by the single async ' +
+  'post-tool-use-async dispatcher (one registration — a tool call no longer ' +
+  'grows your session transcript per hook). Turning one off adds its stem to ' +
+  'VCO_ASYNC_DISABLED_HOOKS in <project>/.claude/env and the dispatcher skips ' +
+  'it on every tool call. A disable you set before v0.2.101 was carried into ' +
+  'this key by the bundle update.';
+
+/** Confirmation copy after a successful toggle write. */
+export function asyncSubhookToastText(stem: string, disabled: boolean): string {
+  return disabled
+    ? `${stem} is now skipped by the async dispatcher`
+    : `${stem} runs again on matching tool calls`;
+}
+
 // ─── lean-ctx per-project toggle (PR-6 v0.2.11; copy fixed + control wired
 // in v0.2.101 alongside the allow-list inversion) ─────────────────────────
 //

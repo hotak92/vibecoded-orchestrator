@@ -858,7 +858,7 @@ verify-diagrams: demo (project_id=p-1)
          > fix: vco verify-env-projection p-1 --fix
   [SKIP] weaviate_diagrams_class — --quick: Weaviate connectivity check skipped
   [OK]   pretooluse_hooks — both PreToolUse entries (Write|Edit + MCP matchers) present
-  [OK]   post_delete_hook — PostToolUse Bash entry → post-file-delete registered
+  [OK]   post_delete_hook — PostToolUse → post-tool-use-async dispatcher registered (routes Bash → post-file-delete)
   [OK]   hook_scripts_on_disk — all 2 hook scripts present + executable
   [OK]   indexer_importable — key functions resolvable
   [OK]   path_validator — round-trip OK (good→None, bad→string)

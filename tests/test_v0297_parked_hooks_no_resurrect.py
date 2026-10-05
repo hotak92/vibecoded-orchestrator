@@ -50,7 +50,16 @@ GUARD = '[ -n "$VCT_DISABLE_HOOKS" ] || '
 CONTAINERS = "bash .claude/hooks/ensure-containers.sh"
 LOADER = "bash .claude/hooks/session-start-kg-loader.sh"
 NOTIFY = "bash .claude/hooks/notify-stop.sh"
-SUMMARY = "bash .claude/hooks/kg-summary-generator.sh"
+# The multi-matcher fixture script. v0.2.101: this used to be
+# `kg-summary-generator.sh` (then shipped under three PostToolUse matchers);
+# those registrations are RETIRED (merged into the post-tool-use-async
+# dispatcher — vco_lib/hook_retirements.py), so parking a copy would now hit
+# the retirement refusal and these tests would exercise the retirement table
+# instead of the parked-hook mechanism. `pre-diagram-path-validation.sh` is
+# the script that ships under several matchers in one event today
+# (PreToolUse `Write|Edit` + the diagram MCP matchers); the event named in
+# the synthetic documents below is arbitrary for the parking mechanism.
+SUMMARY = "bash .claude/hooks/pre-diagram-path-validation.sh"
 USER_OWN = "python3 /home/me/my-own-hook.py --loud"
 
 

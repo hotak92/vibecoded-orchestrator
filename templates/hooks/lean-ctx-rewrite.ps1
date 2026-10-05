@@ -58,6 +58,17 @@ if ($env:VCT_DISABLE_HOOKS) { exit 0 }
 #    syntax). Anything else in the file is ignored — this script doesn't
 #    `Invoke-Expression` user env files (avoids arbitrary code-exec from a
 #    malformed .claude/env).
+# One-quote-pair rule for the raw .claude/env scan -- SHARED home
+# templates/hooks/_lib/strip-one-quote-pair.ps1 (post-tool-use-async.ps1 dots
+# the SAME helper; the rule's rationale, its consumers and its PS1_ONLY_LIB
+# parity declaration live there). The .sh sibling needs no helper: it SOURCES
+# the file and the shell already removes one quote pair. Guarded dot-source so
+# a partial install cannot break the hook; the calls below tolerate an absent
+# function, and a syntax error in an EXISTING helper is deliberately NOT
+# swallowed (a real bug -- same stance as pre-edit-context-inject.ps1).
+$QuotePairLib = Join-Path $PSScriptRoot "_lib/strip-one-quote-pair.ps1"
+if (Test-Path -LiteralPath $QuotePairLib -PathType Leaf) { . $QuotePairLib }
+
 $envFile = Join-Path (Get-Location) ".claude/env"
 $leanCtxDefault = "on"
 $leanCtxTtl = "168"
@@ -65,10 +76,17 @@ if (Test-Path -LiteralPath $envFile) {
     try {
         foreach ($line in Get-Content -LiteralPath $envFile -ErrorAction Stop) {
             if ($line -match '^\s*VCO_LEAN_CTX_DEFAULT\s*=\s*(.+?)\s*$') {
-                $leanCtxDefault = $Matches[1].Trim('"').Trim("'").ToLowerInvariant()
+                $leanCtxDefault = $Matches[1]
+                if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
+                    $leanCtxDefault = Strip-OneQuotePair $leanCtxDefault
+                }
+                $leanCtxDefault = $leanCtxDefault.ToLowerInvariant()
             }
             if ($line -match '^\s*VCO_LEAN_CTX_TEE_TTL_HOURS\s*=\s*(.+?)\s*$') {
-                $leanCtxTtl = $Matches[1].Trim('"').Trim("'")
+                $leanCtxTtl = $Matches[1]
+                if (Get-Command Strip-OneQuotePair -ErrorAction SilentlyContinue) {
+                    $leanCtxTtl = Strip-OneQuotePair $leanCtxTtl
+                }
             }
         }
     } catch {

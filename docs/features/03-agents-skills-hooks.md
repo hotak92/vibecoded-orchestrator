@@ -1,6 +1,6 @@
 # Agents, Skills & Hooks
 
-The Claude Code automation surface: 11 free agents, 6 skills, and 46 hooks (44 event-registered in the default `.claude/settings.json`; 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. Neither is dead code; both run standalone). Alongside them: 8 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
+The Claude Code automation surface: 11 free agents, 6 skills, and 47 hooks (40 event-registered in the default `.claude/settings.json`; 5 more are invoked by the single async `post-tool-use-async` dispatcher instead of being registered individually — v0.2.101 merged the eight async PostToolUse registrations into one so a tool call can no longer grow the session transcript by up to three hook records; and 2 ship **unregistered and uninvoked**, kept for users who want to wire them themselves — `kg-sync-on-edit.sh`, superseded by `post-file-edit.sh`'s auto-sync, and `code-graph-incremental.sh`, whose scheduling moved to `stop-codegraph-drain.sh`. None is dead code; all run standalone). Alongside them: 8 machine-gated gateway agents (`templates/agents/module-gateway/`) and 11 opt-in packs (`templates/packs/`). Templates in `templates/agents/`, `templates/skills/` and `templates/packs/`; hooks in `.claude/hooks/`, registered in `.claude/settings.json`.
 
 For the MCP servers that agents use → see [02-mcps-and-agents.md](02-mcps-and-agents.md).
 
@@ -165,11 +165,18 @@ Also: reminds to update project expert when `CONTEXT_STATE.md` changes substanti
 
 </details>
 
-### `kg-summary-generator.sh` — PostToolUse Edit/Write(knowledge/**) + store_knowledge_node
-Spawns a background Haiku agent to generate/update summary descriptions for KG nodes after edits. Content-hash dedup: skips regeneration if node content unchanged. Summaries written to `knowledge/.node_formats.json`.
+### `post-tool-use-async.sh` — PostToolUse `*` (async dispatcher, v0.2.101)
+The ONE async PostToolUse registration. Reads the hook stdin once to a temp file, routes it by `tool_name` (plus a `git commit` command-prefix gate carrying the retired `if: Bash(git commit *)` key) to the five concern scripts below plus `kg-update-nudge`, runs the matched children concurrently, and **guarantees silence**: child stdout is discarded, child stderr / non-zero exits condense to one line per failure in `<VCO metrics dir>/post-tool-use-async.log`. Always exits 0.
 
-### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *)
-Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses.
+Why: pre-v0.2.101 the templates carried EIGHT async PostToolUse registrations across six scripts. One Bash tool call spawned up to 3 async processes, and every async run that spoke or died wrote a ~660 B `async_hook_response` attachment into the session transcript (measured: 700,330 records / 462 MB in one maintainer transcript). The merge makes it 1 registration and 0 records per successful tool call (≤1, and only if the dispatcher itself is killed). The routing table is one declaration mirrored byte-for-byte in the `.ps1` sibling and pinned by `tests/test_v02101_async_posttooluse_dispatcher.py` against the v0.2.101 retirement rows, so a sub-hook can never be routed on one OS only or dropped without a red test.
+
+**Per-sub-hook on/off (the toggle granularity the eight registrations had)**: a stem listed in `VCO_ASYNC_DISABLED_HOOKS` (`<project>/.claude/env`, comma-separated — the same per-project knob channel `VCO_LEAN_CTX_DEFAULT` uses) is skipped by both siblings. The launcher's Hooks tab renders the six sub-hooks as individual checkboxes writing that key through the existing `set_claude_env_value` command (no second store), gated on the dispatcher registration being present; the vitest suite derives the toggle list from the shipped route table, so a routing row without a toggle is red. A disable set BEFORE v0.2.101 (parked registration in launcher.db) is carried into the key by the next bundle update (`vco_lib.hook_retirements.carry_parked_async_disables`, with an auto-resolution trail row), and the launcher's eager prune keeps the parked bytes until that update has run — the merge never silently re-enables a sub-hook you had turned off. If the carry's env-file write itself fails (a read-only or immutably-flagged `.claude/env`, a directory in the way), the update records an `async_subhook_disable_carry_failed` deferral row for visibility and every later update retries the carry. The prune gate itself keys on POSITIVE evidence of carry success — the classifier's `carry_pending` answer is computed by the same `carry_still_owed` rule the deferral probe uses (dispatcher registered AND the key holds every parked stem; anything still owed or unreadable keeps the bytes) — so a disable stays protected even in the double-failure case where the ledger row could not be written either.
+
+### `kg-summary-generator.sh` — PostToolUse Edit/Write(knowledge/**) + store_knowledge_node (routed by `post-tool-use-async`)
+Spawns a background Haiku agent to generate/update summary descriptions for KG nodes after edits. Content-hash dedup: skips regeneration if node content unchanged. Summaries written to `knowledge/.node_formats.json`. Since v0.2.101 it is no longer registered directly (three registrations retired into the dispatcher); its own knowledge-path validation is the gate the retired `if:` keys used to pre-filter.
+
+### `post-git-commit-kg-sync.sh` — PostToolUse Bash(git commit *) (routed by `post-tool-use-async`)
+Spawn a background Haiku agent to review the commit diff and update relevant KG nodes and docs. Non-blocking. Guards with `CLAUDE_CODE_DISABLE_AUTO_MEMORY` to prevent infinite recursion inside agent subprocesses. Since v0.2.101 the registration is the dispatcher's `git-commit-prefix` routing gate, which reproduces the retired `if: Bash(git commit *)` key.
 
 ### `post-tool-security.sh` — PostToolUse Edit|Write (background)
 Scan written files for accidentally included credentials. Non-blocking; alerts logged to `.claude/logs/credential_alerts.jsonl` with desktop notification.
@@ -208,8 +215,8 @@ Notifications are **coalesced** (v0.2.96): at most one per 5 minutes per `(proje
 
 If you are seeing that storm, `vco doctor` now reads Claude Code's `hasTrustDialogAccepted` flag for the folder: when it is false every headless `claude -p` fails "this workspace has not been trusted", including the ones VCO's own summary generators make. The probe names the state and the one-step recovery (run `claude` in the folder and accept the dialog); it never writes the flag, because that is the CLI's own decision to record.
 
-### `kg-update-nudge.sh` — UserPromptSubmit + Stop (background)
-Counts substantive work tokens since the last KG node write; nudges to write a KG node when the threshold (~150k tokens) is exceeded. Bypass with `KG_NUDGE_OFF=1`.
+### `kg-update-nudge.sh` — UserPromptSubmit + SessionStart(compact) (sync) + PostToolUse (routed by `post-tool-use-async`)
+Counts substantive work units since the last KG node write; nudges to write a KG node when the threshold (~175k work units, then every ~50k) is exceeded. The PostToolUse leg (counter bookkeeping / baseline resets) fires through the dispatcher since v0.2.101 — its former direct async registration is retired; the SYNC UserPromptSubmit and SessionStart(compact) registrations are event-scoped out of that retirement and unchanged. Bypass with `KG_NUDGE_OFF=1`.
 
 ### `verify-container-ports.sh` — SessionStart (startup, background)
 Verifies that the Weaviate / Ollama / code-embed container ports are bound and reachable. Non-blocking.
@@ -247,7 +254,7 @@ Surfaces embedding-backend failure hints written by `vco_lib/embedding_service.p
 ### `pre-diagram-path-validation.sh` — PreToolUse (Write/Edit + Bash)
 Defense-in-depth guard for diagrams integration. Rejects `.mmd` / `.excalidraw` writes outside `.claude/diagrams/` to keep the diagram index consistent.
 
-### `post-file-delete.sh` — PostToolUse Bash
+### `post-file-delete.sh` — PostToolUse Bash (routed by `post-tool-use-async`)
 Detects deletes of `.mmd` / `.excalidraw` files under `.claude/diagrams/` and cascades the delete across SQLite + sidecar + Weaviate via `vco_lib.diagram_indexer drop <file>`. Matches `rm` / `unlink` / `mv` / PowerShell `Remove-Item` / `Move-Item`.
 
 ### `pre-bash-context-inject.sh` — PreToolUse Bash (V52-M)
@@ -269,10 +276,10 @@ Two costs are deliberately bounded:
 ### `_lib/code-extensions.{sh,ps1}` — "is this a code file?" (v0.2.95)
 One home for the extension alternation the code graph acts on. `pre-edit-context-inject`, `pre-bash-context-inject` and the routing home read it; four remaining pairs (`pre-tool-use`, `code-graph-incremental`, `stop-codegraph-drain`, `_lib/command-noise-strip`) still spell it out for reasons recorded in `tests/test_v0295_code_extension_one_home.py`, which fails if any of them drifts from the home.
 
-### `post-bash-context-record.sh` — PostToolUse Bash (V52-M)
+### `post-bash-context-record.sh` — PostToolUse Bash (V52-M; routed by `post-tool-use-async`)
 Outcome recorder paired with `pre-bash-context-inject.sh`. Writes a `bash` event into the per-session learning log (exit code, elapsed time, stderr-tail). Used by the RL retrieval reranker training pipeline. PowerShell sibling ships alongside.
 
-### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M)
+### `post-edit-outcome.sh` — PostToolUse Edit|Write (V52-M; routed by `post-tool-use-async`)
 Outcome event recorder for file edits. Companion to the V52-M bash pair; mirrors the contract for edit-shaped tools. PowerShell sibling at `templates/hooks/post-edit-outcome.ps1`.
 
 ### V52-M cross-OS bug fixes (v0.2.53)
@@ -307,6 +314,8 @@ v0.2.53 Track F (B2) verified the end-to-end contract: GUI toggle off → `mv` t
 A hook's `.claude/settings.json` entry is merged by `_merge_hooks_for_bundle`, which recognises a VCO hook by the presence of its script identity in the CURRENT template: a shipped command whose form changed SUPERSEDES the stale one, while anything it does not recognise is the user's own hook and is preserved byte-for-byte. That rule has one blind spot — when a hook stops being shipped at all, its registration stops being recognised as VCO's and survives every future update, invoking a script the same update deleted.
 
 `vco_lib/hook_retirements.py` closes it by declaring retired registrations as data (event, matcher, reason, retiring release, replacement). The bundle engine consults that table on every run, removes a matching inner hook, prunes an emptied group and writes one `record_auto_resolution` row per removal into `.claude/logs/auto-resolutions.jsonl`. Matching is deliberately narrow — a `.claude/hooks/` retiree by invoked-script identity, an inline one by whole-command equality — so a user command that merely *mentions* a retired path keeps running untouched.
+
+**v0.2.101 extended the table with a registration-only retirement**: the eight async PostToolUse registrations (six scripts, both OS extensions → twelve rows) merged into the single `post-tool-use-async` dispatcher registration. Unlike the v0.2.95/v0.2.73 rows the SCRIPTS STILL SHIP — the dispatcher routes to them — so only the registrations are scrubbed from an existing install's `settings.json` at the next bundle update, each removal recording the dispatcher as the replacement. The rows are event-scoped to PostToolUse, which keeps `kg-update-nudge`'s SYNC UserPromptSubmit + SessionStart(compact) registrations alive, AND `async_only`: they match only a registration that positively carries `"async": true`, so a user's own synchronous PostToolUse registration of one of the six scripts is theirs and survives every pass (scrub, parked re-enable, launcher prune classifier — no positive evidence, no removal). A launcher-parked copy of a retired async entry refuses re-enable through the one `insert_hook` gate, naming the dispatcher and the per-sub-hook switch (`hook_retired`); its parked bytes are carried into `VCO_ASYNC_DISABLED_HOOKS` at the next bundle update, and the eager prune may release them only on positive evidence that the carry landed — the classifier's `carry_pending` answer requires the dispatcher registration AND the owed computation (`carry_still_owed`, the deferral probe's own rule) answering "nothing owed"; a still-owed or unreadable state keeps the bytes (see the per-sub-hook on/off paragraph above).
 
 ---
 

@@ -71,6 +71,13 @@ writes one ``record_auto_resolution`` audit row per removal via
 with and the audit emitters were extracted here from ``project_init`` in
 v0.2.95 — that module is under a line-count ratchet that (correctly)
 refuses further growth.
+
+v0.2.101 consumers of the SAME table: :func:`carry_parked_async_disables`
+(the bundle update's migration of a parked — disabled — retired async
+registration into the per-project ``DISABLED_STEMS_ENV_KEY``), and the
+``match`` CLI's ``carry_pending`` answer, with which the launcher's eager
+prune holds a carry-pending row's bytes until the project's update has run
+(``commands/project_hooks_settings.rs::parked_rows_to_prune``).
 """
 
 from __future__ import annotations
@@ -165,6 +172,16 @@ class RetiredRegistration:
         replacement: what does the job now — named in the audit row so the
             removal never reads as "VCO deleted a thing and told you nothing".
             ``""`` when the capability itself was removed.
+        async_only: (v0.2.101, review SF-3) match ONLY registrations that
+            positively carry ``"async": true``. The v0.2.101 dispatcher rows
+            set it: what VCO retired is its own ASYNC registration shape —
+            a user's hand-made SYNCHRONOUS PostToolUse registration of the
+            same script is theirs and is left alone (scrub, parked
+            re-enable refusal and the launcher's prune classifier all take
+            the evidence through ``match_retired_registration``'s
+            ``is_async`` argument). Callers that cannot tell pass ``None``
+            and async-only rows do NOT match — no positive evidence, no
+            removal.
     """
 
     event: str
@@ -173,12 +190,53 @@ class RetiredRegistration:
     reason: str
     retired_in: str
     replacement: str
+    async_only: bool = False
 
     @property
     def audit_replacement(self) -> str:
         """The replacement clause for the audit row (never empty prose)."""
         return self.replacement or "nothing (the capability was removed)"
 
+
+#: The six scripts whose ASYNC PostToolUse registrations merged into the
+#: single ``post-tool-use-async`` dispatcher in v0.2.101 (the scripts keep
+#: shipping; the dispatcher routes to them). ONE list, three consumers: the
+#: retirement rows below, :func:`carry_parked_async_disables`, and — by
+#: derivation through the routing-table parity test — the dispatchers'
+#: ROUTE_TABLEs (tests/test_v02101_async_posttooluse_dispatcher.py pins the
+#: row set and the table stems to each other, so this list cannot drift
+#: from what the dispatcher actually routes).
+_ASYNC_MERGED_STEMS_V02101: Tuple[str, ...] = (
+    "post-edit-outcome",
+    "post-bash-context-record",
+    "kg-summary-generator",
+    "post-git-commit-kg-sync",
+    "post-file-delete",
+    "kg-update-nudge",
+)
+
+#: Deferral recorded when the SF-2 carry's env-file write FAILS (v0.2.101
+#: re-review SF-A). While this row is open in a project's UPDATE_DEFERRED
+#: ledger the launcher's prune gate keeps the parked bytes (the user's only
+#: copy of their pre-merge disable), the next bundle update retries the
+#: carry, and the probe ``async_subhook_disable_carry_still_owed`` clears
+#: the row once the key holds every parked stem (or the evidence is gone).
+#: Declared in ``vco_lib/deferral_conditions.toml``.
+CARRY_FAILED_CID = "async_subhook_disable_carry_failed"
+
+#: The per-project sub-hook disable key (v0.2.101 review SF-2 — the
+#: per-registration toggle the merge would otherwise have lost). Lives in
+#: ``<project>/.claude/env`` — the SAME per-project hook-knob channel the
+#: lean-ctx toggle uses: the launcher writes it with its existing
+#: ``set_claude_env_value`` command (``commands/claude_env.rs``, one home
+#: for the file format on the GUI side), both dispatcher siblings read it
+#: (the ``.sh`` sources the file like ``lean-ctx-rewrite.sh`` does, the
+#: ``.ps1`` scans it like ``lean-ctx-rewrite.ps1`` does), and
+#: :func:`vco_lib.envfile.upsert_env_key` is the Python writer the bundle
+#: migration uses (mirroring the Rust ``write_key`` semantics). Value:
+#: comma-separated hook STEMS (``kg-summary-generator,post-file-delete``);
+#: a routed stem in the list is skipped by the dispatcher.
+DISABLED_STEMS_ENV_KEY = "VCO_ASYNC_DISABLED_HOOKS"
 
 #: The table. One row per retired registration shape.
 RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
@@ -269,6 +327,75 @@ RETIRED_REGISTRATIONS: Tuple[RetiredRegistration, ...] = (
         retired_in="v0.2.95",
         replacement="",
     ),
+    # ── the eight async PostToolUse registrations, merged in v0.2.101 ──────
+    #
+    # Unlike the retirements above, these SCRIPTS STILL SHIP — what is
+    # retired is their individual PostToolUse REGISTRATIONS. Pre-v0.2.101
+    # the settings templates carried eight async PostToolUse entries across
+    # the six scripts below; one Bash tool call spawned up to 3 async
+    # processes, and every async run that spoke (any stdout/stderr — e.g.
+    # the kg-update-nudge E2BIG "Argument list too long" class) or died
+    # (timeout) wrote a ~660 B `async_hook_response` attachment into the
+    # session transcript. Measured on one maintainer machine: 700,330 such
+    # records / 462.3 MB in a single transcript. The single
+    # `post-tool-use-async.{sh,ps1}` dispatcher registration (matcher `*`,
+    # async, timeout 15) now reads the hook stdin once and routes it to the
+    # SAME unchanged scripts by tool_name, guaranteeing silence (child
+    # stdout discarded; child stderr/non-zero exits condense to one line in
+    # `<VCO metrics dir>/post-tool-use-async.log`).
+    #
+    # EVENT-SCOPED on purpose: every row is PostToolUse only, so
+    # `kg-update-nudge`'s SYNC UserPromptSubmit + SessionStart(compact)
+    # registrations (and any user registration of these scripts under
+    # another event) are untouched by the scrub. Rows exist per OS
+    # extension because the identity walk returns the BASENAME WITH
+    # extension — a Windows install's `.ps1` registration must match too.
+    #
+    # ASYNC-ONLY (v0.2.101 review SF-3): every row also carries
+    # `async_only=True`, so ONLY a registration that positively carries
+    # `"async": true` matches — VCO shipped these six scripts under
+    # PostToolUse exclusively as async registrations, and a user's own
+    # SYNCHRONOUS registration of one of them is theirs: the scrub, the
+    # parked re-enable refusal and the launcher's prune classifier all
+    # leave it alone. Callers that cannot see the flag pass `is_async=None`
+    # and get the same conservative leave-alone.
+    #
+    # DISABLE CARRIED ACROSS THE MERGE (review SF-2): pre-merge each of the
+    # eight registrations was an individually toggleable Hooks-tab row, and
+    # that granularity is kept — see `DISABLED_STEMS_ENV_KEY` and
+    # :func:`carry_parked_async_disables`. The classifier's
+    # `carry_pending` answer (below) additionally keeps a PARKED retired
+    # row's bytes out of the launcher's eager prune until the project's
+    # bundle update has run the carry — otherwise a Hooks-tab load before
+    # the update would release the user's only copy of their disable.
+    *(
+        RetiredRegistration(
+            event="PostToolUse",
+            kind=KIND_HOOK_SCRIPT,
+            target=f"{stem}.{ext}",
+            reason=(
+                "the ASYNC PostToolUse registration (async_only: a "
+                "synchronous registration of this script is the user's own "
+                "and is never matched) was superseded in v0.2.101 by the "
+                "merged async dispatcher: each separate async registration "
+                "wrote a ~660 B async_hook_response transcript record "
+                "whenever it spoke or died (measured: 700k records / "
+                "462 MB in one session transcript). The script itself "
+                "still ships — the dispatcher routes to it"
+            ),
+            retired_in="v0.2.101",
+            replacement=(
+                f".claude/hooks/post-tool-use-async.{'sh' if ext == 'sh' else 'ps1'} "
+                f"(the single async PostToolUse dispatcher; routes payloads "
+                f"to {stem} by tool_name — switch this sub-hook off "
+                f"individually with {DISABLED_STEMS_ENV_KEY} in "
+                f"<project>/.claude/env or the launcher's Hooks tab)"
+            ),
+            async_only=True,
+        )
+        for stem in _ASYNC_MERGED_STEMS_V02101
+        for ext in ("sh", "ps1")
+    ),
 )
 
 
@@ -277,6 +404,7 @@ def match_retired_registration(
     command: str,
     *,
     hook_identity: Optional[str],
+    is_async: Optional[bool] = None,
 ) -> Optional[RetiredRegistration]:
     """Return the retirement this ``(event, command)`` matches, or ``None``.
 
@@ -290,6 +418,13 @@ def match_retired_registration(
             caller cannot silently skip the ``KIND_HOOK_SCRIPT`` half by
             forgetting an argument; ``None`` is the correct value for every
             command that invokes no shipped hook.
+        is_async: (v0.2.101, review SF-3) the registration's ``"async"``
+            flag — ``True``/``False`` when the caller can see it (the scrub
+            walks the inner-hook dicts; the parked paths parse the entry
+            blob), ``None`` when it cannot. Rows with ``async_only`` match
+            ONLY on ``is_async is True``: no positive evidence, no removal.
+            Callers WITH the evidence must pass it; omitting it silently
+            degrades to the conservative leave-alone, never to a deletion.
 
     The walk is deliberately not re-implemented beside this table:
     :func:`vco_hook_script_identity` — the one home for "which token is the
@@ -308,6 +443,8 @@ def match_retired_registration(
     for entry in RETIRED_REGISTRATIONS:
         if entry.event != event:
             continue
+        if entry.async_only and is_async is not True:
+            continue  # SF-3: only a positively-async registration matches
         if entry.kind == KIND_HOOK_SCRIPT:
             if hook_identity and hook_identity == entry.target:
                 return entry
@@ -429,9 +566,13 @@ def scrub_retired_registrations(user_hooks: dict) -> Tuple[dict, list]:
                 cmd = h.get("command") if isinstance(h, dict) else None
                 match = None
                 if isinstance(cmd, str) and cmd:
+                    _async = h.get("async") if isinstance(h, dict) else None
                     match = match_retired_registration(
                         event, cmd,
                         hook_identity=vco_hook_script_identity(cmd),
+                        # SF-3: the scrub SEES the inner-hook dict, so the
+                        # async-only rows get their positive evidence here.
+                        is_async=None if not isinstance(_async, bool) else _async,
                     )
                 if match is None:
                     kept_hooks.append(h)
@@ -510,6 +651,272 @@ def emit_removal_audit_rows(
         data={"count": len(removals)})
 
 
+def carry_parked_async_disables(
+    folder: Path,
+    parked: Any,
+    *,
+    dry_run: bool = False,
+    log_auto: Any = None,
+    log: Any = None,
+) -> list:
+    """Carry the user's DISABLED retired async registrations across the
+    v0.2.101 merge (review SF-2, the migration half).
+
+    Pre-merge, disabling an async PostToolUse hook from the launcher parked
+    its registration (bytes in ``launcher.db``). The merge retires that
+    registration — and a retired registration the dispatcher replaces would
+    otherwise come back ON: the routed sub-hook runs unless something says
+    otherwise. So the bundle update reads the parked state it ALREADY holds
+    for the merge (``parked`` is the caller's
+    :class:`vco_lib.parked_hooks.ParkedHooksState`, duck-typed to keep this
+    module's import graph acyclic) and unions the stem of every parked row
+    that matches an ``async_only`` retirement into the per-project
+    ``DISABLED_STEMS_ENV_KEY`` in ``<folder>/.claude/env`` — the same key
+    both dispatcher siblings read and the Hooks tab writes, so a disable
+    that predates the merge keeps working through it with ONE channel.
+
+    Conservative throughout: an unreadable parked state carries nothing
+    (the caller's merge already warns about it); a row without positive
+    ``is_async`` evidence carries nothing (a user's own sync registration
+    of a shipped script stays theirs — SF-3); a failed env write is a
+    logged warning, never a failed update. Idempotent: stems already in
+    the key are not re-added, the writer skips a no-op rewrite, and the
+    return value is the list of NEWLY carried stems (empty on a repeat
+    run). ``dry_run`` reports what WOULD be carried without writing —
+    the envelope on both paths, same rule as the removals.
+
+    Returns the newly-carried stems, in parked-row order.
+
+    FAILURE (re-review SF-A): when the env-file write (or read) fails, the
+    owed work is RECORDED — a :data:`CARRY_FAILED_CID` deferral row — and
+    the classifier's ``carry_pending`` answer keeps the launcher's prune
+    from releasing the parked bytes while that row is open, so a failed
+    carry can never silently re-enable a sub-hook the user had turned off.
+    The next update retries (this function runs on every update); a
+    successful run closes the row, and the registry probe
+    ``async_subhook_disable_carry_still_owed`` closes it on the hand-fix
+    path too (same computation, one home — it can never clear an entry the
+    next update would re-emit).
+    """
+    if parked is None or not getattr(parked, "readable", False):
+        return []
+
+    stems = _carry_candidate_stems(parked)
+    existing = _read_disabled_stems(folder)
+    if existing is None:
+        # The env file exists but cannot be read — the same owed-work class
+        # as a failed write. No evidence, no guess: record and keep.
+        if stems:
+            if log is not None:
+                log("4.bundle.settings", "warn",
+                    f"cannot read .claude/env to carry the parked async-hook "
+                    f"disables ({DISABLED_STEMS_ENV_KEY}); the owed work is "
+                    f"deferred")
+            if not dry_run:
+                _emit_carry_failed(
+                    folder, stems,
+                    "<project>/.claude/env cannot be read", log,
+                )
+        return []
+    new = [s for s in stems if s not in existing]
+    if dry_run:
+        return new
+    if new:
+        from vco_lib import envfile  # lazy: keeps the module graph acyclic
+        try:
+            envfile.upsert_env_key(
+                folder / ".claude" / "env",
+                DISABLED_STEMS_ENV_KEY, ",".join(existing + new),
+            )
+        except OSError as exc:
+            if log is not None:
+                log("4.bundle.settings", "warn",
+                    f"could not carry the parked async-hook disables into "
+                    f".claude/env ({DISABLED_STEMS_ENV_KEY}): {exc}")
+            _emit_carry_failed(folder, new, str(exc), log)
+            return []
+    # Landed (or nothing was owed): close our own owed-work row. Cheap read
+    # first — the resolve cycle rewrites the ledger, and an update on a
+    # healthy project must not churn it.
+    if _carry_deferral_open(folder):
+        try:
+            from vco_lib import deferral_emit as _de
+            _de.resolve_conditions(folder, [CARRY_FAILED_CID], log=log_auto)
+        except Exception as _exc:  # noqa: BLE001 — bookkeeping only
+            if log is not None:
+                log("4.bundle.settings", "warn",
+                    f"could not close the {CARRY_FAILED_CID} deferral: {_exc}")
+    if not new:
+        return []
+    if log_auto is not None:
+        try:
+            from vco_lib import deferral_emit as _de
+            _de.record_auto_resolution(
+                folder,
+                # The same auto-resolution-only condition id the retired-
+                # registration removals use: nothing was deferred here.
+                "bundle_retired_hook_registration",
+                "carried_parked_async_disable",
+                f"carried the parked (user-disabled) retired async "
+                f"PostToolUse registration(s) for {', '.join(new)} into "
+                f"{DISABLED_STEMS_ENV_KEY} in .claude/env, so the merged "
+                f"post-tool-use-async dispatcher keeps them switched off "
+                f"(retired in v0.2.101; the launcher's Hooks tab toggles "
+                f"the same key)",
+                log=log_auto,
+            )
+        except Exception as _exc:  # noqa: BLE001 — bookkeeping only
+            if log is not None:
+                log("4.bundle.settings", "warn",
+                    f"async-disable carry auto-resolution record failed: {_exc}")
+    if log is not None:
+        log("4.bundle.settings", "info",
+            f"carried {len(new)} parked async-hook disable(s) into "
+            f".claude/env {DISABLED_STEMS_ENV_KEY}",
+            data={"stems": new})
+    return new
+
+
+def _carry_candidate_stems(parked: Any) -> list:
+    """The stems of parked rows matching an ``async_only`` retirement — the
+    ONE computation shared by the carry writer, its owed-work probe and (via
+    them) the prune gate, so the probe can never clear an entry the next
+    update would re-emit. Duck-typed :class:`~vco_lib.parked_hooks.ParkedHooksState`."""
+    stems: list = []
+    for ph in getattr(parked, "hooks", ()) or ():
+        command = getattr(ph, "command", "")
+        if not command:
+            continue
+        match = match_retired_registration(
+            getattr(ph, "event", ""), command,
+            hook_identity=vco_hook_script_identity(command),
+            is_async=getattr(ph, "is_async", None),
+        )
+        if match is None or not match.async_only:
+            continue
+        stem = match.target.rsplit(".", 1)[0]
+        if stem not in stems:
+            stems.append(stem)
+    return stems
+
+
+def _read_disabled_stems(folder: Path) -> Optional[list]:
+    """The current ``DISABLED_STEMS_ENV_KEY`` list for ``folder``.
+
+    ``[]`` when the file or the key is absent; ``None`` when the file
+    exists but cannot be read — no evidence, and every caller treats that
+    as "keep / still owed", never as a guess. LAST occurrence wins (the
+    semantics the .sh dispatcher's `source` and the launcher's `read_key`
+    give the key).
+    """
+    from vco_lib import envfile  # lazy: keeps the module graph acyclic
+
+    env_path = Path(folder) / ".claude" / "env"
+    try:
+        text = env_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    except OSError:
+        return None
+    value: Optional[str] = None
+    for k, v in envfile.parse_env_lines(text):
+        if k == DISABLED_STEMS_ENV_KEY:
+            value = v
+    if not value:
+        return []
+    return [s.strip() for s in value.split(",") if s.strip()]
+
+
+def _carry_deferral_open(folder: Path) -> bool:
+    """True when the project's UPDATE_DEFERRED ledger holds an open
+    :data:`CARRY_FAILED_CID` row. Used by the carry's success path to close
+    its own row without churning a healthy project's ledger (the prune GATE
+    keys on :func:`carry_still_owed`, not on this row — re-review-2 nit 3:
+    a row that failed to write cannot be the evidence). Any doubt (an
+    unreadable ledger) answers True — the conservative direction, which
+    here only means "run the idempotent resolve"."""
+    try:
+        from vco_lib.deferral_report import DeferralReport
+        return any(
+            getattr(e, "condition_id", None) == CARRY_FAILED_CID
+            for e in DeferralReport.read(Path(folder)).entries
+        )
+    except Exception:  # noqa: BLE001 — unreadable is not "cleared"
+        return True
+
+
+def _emit_carry_failed(
+    folder: Path, stems: list, error: str, log: Any,
+) -> None:
+    """Record the owed carry as an UPDATE_DEFERRED row (SF-A). Best-effort
+    like every ledger write here: a failure to record is logged, never
+    raised — the update itself must not fail."""
+    try:
+        from vco_lib.deferral_emit import emit
+        from vco_lib.deferral_report import DeferralEntry
+
+        emit(folder, DeferralEntry(
+            condition_id=CARRY_FAILED_CID,
+            title=(
+                "A hook you disabled could not be carried into the async "
+                "dispatcher's disable list"
+            ),
+            detected=(
+                f"the bundle update tried to carry the parked (user-disabled) "
+                f"retired async PostToolUse registration(s) for "
+                f"{', '.join(stems)} into {DISABLED_STEMS_ENV_KEY} in "
+                f".claude/env, and the env file could not be used: {error}"
+            ),
+            why_deferred=(
+                "until the key is written, the merged post-tool-use-async "
+                "dispatcher would run the sub-hook(s) you had switched off, "
+                "and the launcher keeps your parked disable bytes protected "
+                "while this row is open — releasing them now would destroy "
+                "the only record of your choice"
+            ),
+            command_to_apply=(
+                "make <project>/.claude/env writable as a regular FILE "
+                "(permission bit / immutable flag / a directory in the way), "
+                "then re-run the bundle update — it retries the carry and "
+                f"clears this row. Or write the key by hand: "
+                f"{DISABLED_STEMS_ENV_KEY}={','.join(stems)} in "
+                "<project>/.claude/env (the launcher's Hooks tab toggles the "
+                "same key)."
+            ),
+        ), log=log)
+    except Exception as _exc:  # noqa: BLE001 — best-effort ledger
+        if log is not None:
+            log("4.bundle.settings", "warn",
+                f"could not record the {CARRY_FAILED_CID} deferral: {_exc}")
+
+
+def carry_still_owed(folder: Path) -> Optional[bool]:
+    """``async_subhook_disable_carry_failed`` probe semantics (registered in
+    :mod:`vco_lib.deferral_probes`).
+
+    True  — at least one parked candidate stem is still missing from the key
+            (the next update would re-emit; the entry must stand);
+    False — the key holds every candidate (or there is no parked evidence
+            left): the owed work is done;
+    None  — the parked state or the env file cannot be read: no verdict,
+            keep the entry (positive evidence only, the house probe rule).
+    """
+    try:
+        from vco_lib.parked_hooks import read_parked_hooks  # lazy: import cycle
+        state = read_parked_hooks(Path(folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+    if not getattr(state, "readable", False):
+        return None
+    stems = _carry_candidate_stems(state)
+    if not stems:
+        return False
+    have = _read_disabled_stems(Path(folder))
+    if have is None:
+        return None
+    return any(s not in have for s in stems)
+
+
 # ── the machine interface (v0.2.95 F7, the eager-prune half) ──────────────
 #
 # The scrub above walks a project's ``settings.json``. A PARKED entry is, by
@@ -536,7 +943,46 @@ def emit_removal_audit_rows(
 # per tab load — a user action, not a hot loop.
 
 
-def _match_pairs(pairs: Any) -> list:
+def _dispatcher_registration_present(project_folder: Any) -> bool:
+    """True when the project's settings.json already carries the merged
+    ``post-tool-use-async`` registration — the positive signal that the
+    bundle update (and with it :func:`carry_parked_async_disables`) has
+    run. False on ANY doubt (absent folder, unreadable or unparseable
+    settings, no PostToolUse array, no dispatcher identity): an answer
+    that cannot be positive keeps the launcher's eager prune OFF a parked
+    row, which is the conservative direction — releasing the bytes is
+    irreversible, keeping them costs one honest row in the Hooks tab.
+    """
+    if not isinstance(project_folder, str) or not project_folder:
+        return False
+    try:
+        raw = (
+            Path(project_folder) / ".claude" / "settings.json"
+        ).read_text(encoding="utf-8", errors="replace")
+        data = json.loads(raw)
+    except (OSError, ValueError):
+        return False
+    if not isinstance(data, dict):
+        return False
+    hooks = data.get("hooks")
+    post = hooks.get("PostToolUse") if isinstance(hooks, dict) else None
+    if not isinstance(post, list):
+        return False
+    for group in post:
+        if not isinstance(group, dict):
+            continue
+        for h in group.get("hooks") or []:
+            cmd = h.get("command") if isinstance(h, dict) else None
+            if not isinstance(cmd, str) or not cmd:
+                continue
+            if vco_hook_script_identity(cmd) in (
+                "post-tool-use-async.sh", "post-tool-use-async.ps1",
+            ):
+                return True
+    return False
+
+
+def _match_pairs(pairs: Any, project_folder: Any = None) -> list:
     """One verdict per input pair, in input order.
 
     Every pair gets a row, retired or not, so the caller can zip the answer
@@ -544,6 +990,34 @@ def _match_pairs(pairs: Any) -> list:
     descriptive fields are ``""`` on a non-retired row rather than absent: a
     stable shape is what lets a typed consumer parse the answer without
     branching.
+
+    v0.2.101 (review SF-2/SF-3) extension, optional and additive: the
+    request may carry a top-level ``project_folder``. It enables BOTH
+    halves the ``async_only`` rows need, and it keeps the launcher's
+    side of the contract unchanged — pairs stay identity-level
+    ``(event, matcher?, command)``; the parked BYTES never travel (the
+    Rust-side pin ``the_request_carries_every_parked_pair_and_nothing_else``
+    stays true). With the folder, this process:
+
+      * resolves the ``async`` evidence ITSELF, by reading the project's
+        parked rows through :func:`vco_lib.parked_hooks.read_parked_hooks`
+        (read-only) — the entry blob's shape stays owned by Python, one
+        home. No folder / no parked row / unreadable DB ⇒ no positive
+        evidence ⇒ ``async_only`` rows answer not-retired (conservative:
+        the launcher keeps the row, and the refusal half in
+        ``insert_hook`` — which DOES hold the blob — still catches it at
+        click time);
+      * answers ``carry_pending`` on a matched ``async_only`` row: True
+        unless the carry has POSITIVE evidence of success (re-review SF-A,
+        hardened by re-review-2 nit 3) — the project's settings.json holds
+        the dispatcher registration AND :func:`carry_still_owed` answers
+        exactly ``False`` (the key holds every parked stem; the same
+        one-home computation the deferral probe uses). Still-owed (True —
+        including a double failure whose ledger row never landed) and
+        unreadable evidence (None) both keep the launcher's eager prune
+        OFF the row's bytes: they are the user's only disable evidence
+        until the carry lands. ``carry_pending`` is always present (False
+        when not applicable) — stable shape.
 
     Raises:
         ValueError: if ``pairs`` is not a list of objects. A malformed request
@@ -554,6 +1028,47 @@ def _match_pairs(pairs: Any) -> list:
     if not isinstance(pairs, list):
         raise ValueError("`pairs` must be a list of {event, command} objects")
     out: list = []
+    carry_gate_open: Optional[bool] = None
+    parked_index: Optional[dict] = None
+    _MISSING = object()
+
+    def _parked_is_async(event: str, matcher: Any, command: str) -> Optional[bool]:
+        """The parked blob's async flag for this identity, or None.
+
+        Lazy (one read-only DB open per request, only when an async_only
+        candidate exists) and keyed (event, matcher, command) with an
+        (event, command) fallback for callers on the pre-matcher shape."""
+        nonlocal parked_index
+        if parked_index is None:
+            parked_index = {}
+            if isinstance(project_folder, str) and project_folder:
+                try:
+                    from vco_lib.parked_hooks import read_parked_hooks
+                    state = read_parked_hooks(Path(project_folder))
+                    if state.readable:
+                        for ph in state.hooks:
+                            parked_index[(ph.event, ph.matcher, ph.command)] = ph.is_async
+                            # (event, command) fallback for a pre-matcher
+                            # request shape: True when ANY parked row for
+                            # that command is positively async, else the
+                            # last non-True evidence seen.
+                            prev = parked_index.get((ph.event, ph.command))
+                            parked_index[(ph.event, ph.command)] = (
+                                True if (prev is True or ph.is_async is True)
+                                else ph.is_async
+                            )
+                except Exception:  # noqa: BLE001 — no evidence, conservative
+                    parked_index = {}
+        if isinstance(matcher, str):
+            # A row FOUND with is_async None (blob without the flag) is the
+            # answer for that exact row — it must not fall through to the
+            # any-positive (event, command) fallback and borrow a twin's
+            # evidence. Sentinel distinguishes "absent" from "None".
+            keyed = parked_index.get((event, matcher, command), _MISSING)
+            if keyed is not _MISSING:
+                return keyed  # type: ignore[return-value]
+        return parked_index.get((event, command))
+
     for index, pair in enumerate(pairs):
         if not isinstance(pair, dict):
             raise ValueError(f"pairs[{index}] is not an object")
@@ -563,9 +1078,41 @@ def _match_pairs(pairs: Any) -> list:
             raise ValueError(
                 f"pairs[{index}] needs string `event` and `command` fields"
             )
+        identity = vco_hook_script_identity(command)
+        is_async: Optional[bool] = None
+        if identity and any(
+            e.async_only and e.event == event and e.target == identity
+            for e in RETIRED_REGISTRATIONS
+        ):
+            is_async = _parked_is_async(event, pair.get("matcher"), command)
         match = match_retired_registration(
-            event, command, hook_identity=vco_hook_script_identity(command)
+            event, command, hook_identity=identity, is_async=is_async,
         )
+        carry_pending = False
+        if match is not None and match.async_only:
+            if carry_gate_open is None:
+                # SF-A, hardened by re-review-2 nit 3: the gate requires
+                # POSITIVE EVIDENCE of carry success — the dispatcher
+                # registration present AND the owed computation (the carry
+                # deferral probe's OWN one-home rule) answering exactly
+                # False ("the key holds every parked stem"). True (still
+                # owed — including the DOUBLE-failure case where the carry's
+                # own failure row could not be recorded either) and None
+                # (unreadable evidence) both KEEP the bytes: the absence of
+                # a failure row cannot distinguish "carry landed" from
+                # "recording the failure failed too". The
+                # `async_subhook_disable_carry_failed` ledger row remains —
+                # for user visibility and the update-retry trail — but is no
+                # longer a gate input.
+                try:
+                    owed = carry_still_owed(Path(project_folder))
+                except Exception:  # noqa: BLE001 — no verdict is a keep
+                    owed = None
+                carry_gate_open = (
+                    _dispatcher_registration_present(project_folder)
+                    and owed is False
+                )
+            carry_pending = not carry_gate_open
         out.append(
             {
                 "event": event,
@@ -574,6 +1121,7 @@ def _match_pairs(pairs: Any) -> list:
                 "retired_in": match.retired_in if match else "",
                 "replacement": match.audit_replacement if match else "",
                 "reason": match.reason if match else "",
+                "carry_pending": carry_pending,
             }
         )
     return out
@@ -609,7 +1157,10 @@ def _cmd_match(_args: "argparse.Namespace") -> int:
         )
         return 2
     try:
-        matches = _match_pairs(request.get("pairs", []))
+        matches = _match_pairs(
+            request.get("pairs", []),
+            project_folder=request.get("project_folder"),
+        )
     except ValueError as exc:
         _emit({"ok": False, "code": "bad_request", "error": str(exc)})
         return 2
@@ -630,7 +1181,14 @@ def build_parser() -> "argparse.ArgumentParser":
         "match",
         help=(
             "Classify a batch of (event, command) pairs read from stdin as "
-            'retired or not. Request: {"pairs":[{"event":..,"command":..}]}.'
+            'retired or not. Request: {"pairs":[{"event":..,"command":..,'
+            '"matcher":..?}],"project_folder":..?}. The optional '
+            "project_folder lets the classifier resolve the v0.2.101 "
+            "async-only rows' evidence itself (read-only, from the "
+            "project's parked rows) and adds the carry_pending answer that "
+            "gates the launcher's eager prune until the bundle update has "
+            "carried a parked disable into .claude/env. Pairs stay "
+            "identity-level: parked bytes never travel."
         ),
     )
     p_match.add_argument(
@@ -652,11 +1210,13 @@ def main(argv: "Optional[list]" = None) -> int:
 
 
 __all__ = [
+    "DISABLED_STEMS_ENV_KEY",
     "KIND_COMMAND",
     "KIND_HOOK_SCRIPT",
     "RETIRED_REGISTRATIONS",
     "RetiredRegistration",
     "build_parser",
+    "carry_parked_async_disables",
     "emit_removal_audit_rows",
     "hook_command_key",
     "main",

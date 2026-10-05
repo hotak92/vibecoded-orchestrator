@@ -105,12 +105,22 @@ if (-not $PY) {
 }
 $pythonCmd = $PY
 
-# Hand the payload to Python via stdin; pass thresholds + paths via env.
-# Note (audit fix 2026-05-07): the .ps1 sibling already passes INPUT via env
-# var rather than interpolating it into the Python heredoc, so the bash-side
-# bug (Python SyntaxError on triple-quoted INPUT) does not exist here.
-# Parity-touch only — no behavioural change.
-$env:_KG_NUDGE_INPUT       = $input_json
+# Hand the payload to Python via a temp file whose PATH rides an env var;
+# thresholds + paths stay direct env vars (they are ours, and small).
+# v0.2.101 E2BIG-parity fix: the payload used to BE the env var value. A
+# Windows env var caps at 32,767 chars (and POSIX at MAX_ARG_STRLEN, 128 KB
+# - the .sh sibling's "Argument list too long" transcript-bloat class), so a
+# fat PostToolUse payload could not reach the interpreter. The temp file
+# keeps the 2026-05-07 property (Python reads the payload as DATA, never as
+# interpolated source) without the size ceiling. Mirrors kg-update-nudge.sh.
+$nudgeInputFile = [System.IO.Path]::GetTempFileName()
+try {
+    [System.IO.File]::WriteAllText($nudgeInputFile, $input_json)
+} catch {
+    try { Remove-Item -LiteralPath $nudgeInputFile -Force -ErrorAction SilentlyContinue } catch { }
+    exit 0
+}
+$env:_KG_NUDGE_INPUT_FILE  = $nudgeInputFile
 $env:_KG_NUDGE_FIRST       = $FIRST_THRESHOLD
 $env:_KG_NUDGE_INTERVAL    = $INTERVAL
 $env:_KG_NUDGE_METRICS     = $metricsFile
@@ -126,7 +136,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 # Read inputs from environment (set by the calling shell shim).
-INPUT = os.environ.get("_KG_NUDGE_INPUT", "")
+# v0.2.101 E2BIG-parity fix: the payload rides a temp FILE (path via env),
+# not the env var itself — a Windows env var caps at 32,767 chars (POSIX:
+# MAX_ARG_STRLEN, 128 KB). Mirrors the .sh sibling's KG_NUDGE_INPUT_FILE.
+INPUT = ""
+_input_file = os.environ.get("_KG_NUDGE_INPUT_FILE", "")
+if _input_file:
+    try:
+        with open(_input_file, "r", encoding="utf-8", errors="replace") as _f:
+            INPUT = _f.read()
+    except OSError:
+        INPUT = ""
 FIRST_THRESHOLD = int(os.environ.get("_KG_NUDGE_FIRST", "175000"))
 INTERVAL = int(os.environ.get("_KG_NUDGE_INTERVAL", "50000"))
 METRICS_FILE = os.environ.get("_KG_NUDGE_METRICS", "")
@@ -392,7 +412,9 @@ sys.exit(0)
 # Claude Code surfaces as a system-reminder for UserPromptSubmit hooks.
 & $pythonCmd -c $pythonScript
 
-# Cleanup the temp env vars we set (per-process, harmless but tidy).
-Remove-Item Env:_KG_NUDGE_INPUT, Env:_KG_NUDGE_FIRST, Env:_KG_NUDGE_INTERVAL, Env:_KG_NUDGE_METRICS, Env:_KG_NUDGE_VERSION -ErrorAction SilentlyContinue
+# Cleanup the temp payload file + the env vars we set (per-process, harmless
+# but tidy).
+Remove-Item -LiteralPath $nudgeInputFile -Force -ErrorAction SilentlyContinue
+Remove-Item Env:_KG_NUDGE_INPUT_FILE, Env:_KG_NUDGE_FIRST, Env:_KG_NUDGE_INTERVAL, Env:_KG_NUDGE_METRICS, Env:_KG_NUDGE_VERSION -ErrorAction SilentlyContinue
 
 exit 0

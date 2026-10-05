@@ -1135,6 +1135,15 @@ def _check_pretooluse_hooks(project_folder: Path) -> _CheckResult:
 
 # ---------------------------------------------------------------------------
 # Check 9: PostToolUse delete hook registered.
+#
+# Two shipped shapes count as registered (v0.2.101):
+#   * CURRENT — the single async `post-tool-use-async` dispatcher
+#     registration (any matcher; it routes Bash → post-file-delete — the
+#     routing row is pinned by
+#     tests/test_v02101_async_posttooluse_dispatcher.py).
+#   * LEGACY — a direct Bash-matcher `post-file-delete` registration, which
+#     a not-yet-updated install still carries (and which the next bundle
+#     update retires via vco_lib/hook_retirements.py).
 # ---------------------------------------------------------------------------
 
 
@@ -1159,12 +1168,19 @@ def _check_post_delete_hook(project_folder: Path) -> _CheckResult:
     for entry in post:
         if not isinstance(entry, Mapping):
             continue
-        if str(entry.get("matcher", "")) != "Bash":
-            continue
+        matcher = str(entry.get("matcher", ""))
         for hook in entry.get("hooks") or []:
             if not isinstance(hook, Mapping):
                 continue
-            if "post-file-delete" in str(hook.get("command", "")):
+            command = str(hook.get("command", ""))
+            if "post-tool-use-async" in command:
+                return _CheckResult(
+                    "post_delete_hook",
+                    STATUS_OK,
+                    "PostToolUse → post-tool-use-async dispatcher registered "
+                    "(routes Bash → post-file-delete)",
+                )
+            if matcher == "Bash" and "post-file-delete" in command:
                 return _CheckResult(
                     "post_delete_hook",
                     STATUS_OK,
@@ -1173,7 +1189,8 @@ def _check_post_delete_hook(project_folder: Path) -> _CheckResult:
     return _CheckResult(
         "post_delete_hook",
         STATUS_FAIL,
-        "no Bash-matcher hook pointing at post-file-delete",
+        "no post-tool-use-async dispatcher registration and no Bash-matcher "
+        "hook pointing at post-file-delete",
         fix_hint="re-run install.py to re-render the settings.json hooks block",
     )
 

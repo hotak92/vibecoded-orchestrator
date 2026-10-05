@@ -716,6 +716,23 @@ def parked_hook_conflict_still_present(ctx: ProbeContext) -> Optional[bool]:
         return None
 
 
+def async_subhook_disable_carry_still_owed(ctx: ProbeContext) -> Optional[bool]:
+    """``async_subhook_disable_carry_failed`` — is a parked disable still
+    waiting to be carried into ``VCO_ASYNC_DISABLED_HOOKS``?
+
+    A thin wrapper over :func:`vco_lib.hook_retirements.carry_still_owed`,
+    the SAME computation the bundle update's carry emits from (one home —
+    the probe can never clear an entry the next update would re-emit).
+    ``None`` when launcher.db or the env file cannot be read.
+    """
+    from vco_lib.hook_retirements import carry_still_owed
+
+    try:
+        return carry_still_owed(Path(ctx.folder))
+    except Exception:  # noqa: BLE001 — a probe defect is not a verdict
+        return None
+
+
 def project_hooks_relative_paths_still_present(ctx: ProbeContext) -> Optional[bool]:
     """``project_hooks_relative_paths`` — does a project-own hook still invoke a
     ``.claude/hooks/`` or ``.claude/scripts/`` script by a relative path?
@@ -1146,6 +1163,7 @@ PROBES: dict[str, ProbeFn] = {
     "kg_binding_evidence_still_mismatched": kg_binding_evidence_still_mismatched,
     "kg_unclaimed_classes_still_present": kg_unclaimed_classes_still_present,
     "parked_hook_conflict_still_present": parked_hook_conflict_still_present,
+    "async_subhook_disable_carry_still_owed": async_subhook_disable_carry_still_owed,
     "project_hooks_relative_paths_still_present": project_hooks_relative_paths_still_present,
     "settings_write_refusal_still_applies": settings_write_refusal_still_applies,
     "user_owned_secret_values_still_present": user_owned_secret_values_still_present,

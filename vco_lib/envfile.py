@@ -50,6 +50,7 @@ hand-edited managed blocks, so it keeps its own regex policy
 """
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Iterator, Optional, Tuple
 
 __all__ = [
@@ -58,6 +59,7 @@ __all__ = [
     "parse_env_lines",
     "parse_managed_env_lines",
     "env_value",
+    "upsert_env_key",
 ]
 
 
@@ -181,3 +183,81 @@ def env_value(
         if k == key:
             return v
     return None
+
+
+def upsert_env_key(path: Path, key: str, value: Optional[str]) -> bool:
+    """Set (or with ``value=None`` remove) ONE ``KEY=VALUE`` line in a
+    plain env file, preserving everything else. Returns whether the file
+    content changed.
+
+    MUST MATCH ``launcher/src-tauri/src/commands/claude_env.rs``'s
+    ``write_key``/``build_new_content`` — the launcher GUI writes the same
+    files (``VCO_LEAN_CTX_DEFAULT``, ``VCO_ASYNC_DISABLED_HOOKS``) through
+    that Rust home, and this is the Python side of the SAME format (the
+    cross-language mirror tier: a plain line rule locked by tests on both
+    sides — ``tests/test_v02101_async_subhook_disable.py`` here, the
+    ``claude_env`` unit tests there). Shared semantics:
+
+      * the FIRST occurrence of the key is replaced IN PLACE; any further
+        duplicate occurrences are dropped (one line per key afterwards);
+      * a key that is absent is appended at end-of-file;
+      * ``value=None`` removes every occurrence of the key;
+      * comments, blank lines and unrelated ``K=V`` lines are preserved
+        verbatim; a non-empty result always ends with exactly one newline;
+      * idempotent: when the content already equals the desired output,
+        the file is NOT rewritten (no mtime churn) and ``False`` is
+        returned;
+      * the parent directory is created on the write path; the write goes
+        through ``vco_lib.atomic.atomic_rewrite_text`` — the ONE Python
+        atomic-write home (sibling ``<file>.tmp`` + rename, existing
+        permission bits preserved, new file 0600).
+
+    Unlike the readers above this never parses quotes or ``export``
+    prefixes: it writes the plain ``KEY=VALUE`` form both GUI writers
+    produce, and it matches keys the same way ``parse_kv_line`` does
+    (whole-line key comparison before the first ``=``, comments skipped).
+    """
+    try:
+        original: Optional[str] = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        original = None
+    except OSError as exc:
+        raise OSError(f"cannot read {path}: {exc}") from exc
+
+    def _is_key_line(line: str) -> bool:
+        stripped = line.lstrip()
+        if not stripped or stripped.startswith("#"):
+            return False
+        k = line.split("=", 1)[0].strip()
+        return bool(k) and k == key
+
+    out_lines: list = []
+    replaced = False
+    for line in (original or "").splitlines():
+        if _is_key_line(line):
+            if value is not None and not replaced:
+                out_lines.append(f"{key}={value}")
+                replaced = True
+            # None → drop every occurrence; duplicates → dropped.
+            continue
+        out_lines.append(line)
+    if value is not None and not replaced:
+        out_lines.append(f"{key}={value}")
+
+    new_content = "\n".join(out_lines)
+    if new_content:
+        new_content += "\n"
+    if original is not None and original == new_content:
+        return False
+    if original is None and not new_content:
+        return False  # removing a key from an absent file writes nothing
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    # The ONE atomic-write home (vco_lib/atomic.py — a live os.replace
+    # anywhere else is a lint-gate failure, tests/test_v0292_atomic_one_home).
+    # rewrite_text keeps an EXISTING file's permission bits (a user's
+    # .claude/env mode is theirs) and creates a new one 0600.
+    from vco_lib.atomic import atomic_rewrite_text
+
+    atomic_rewrite_text(path, new_content)
+    return True

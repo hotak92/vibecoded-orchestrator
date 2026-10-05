@@ -10180,7 +10180,7 @@ def install_project_bundle(
                 result["warnings"].append(f"settings.json: {settings_action} — newly "
                                           "shipped hooks NOT added; see UPDATE_DEFERRED.md")
             report_parked_hooks(folder, result, parked, kept_out, dry_run=dry_run,
-                                settings_action=settings_action, log=_log)
+                                settings_action=settings_action, log=_log, log_auto=_log_auto)
             if retired_removed:
                 # Envelope on BOTH paths (dry-run reports what it WOULD
                 # remove); audit rows only after a real write.

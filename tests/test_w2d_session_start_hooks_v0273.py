@@ -12,8 +12,10 @@ fixtures (no real project, no secrets):
     status; graceful "unavailable" line when Weaviate is unreachable.
   * HK-3 — kg-sync-on-edit.sh: runs standalone, no-ops under
     VCT_DISABLE_HOOKS, no-ops on a non-knowledge path.
-  * HK-5 — the kg-update-nudge PostToolUse(*) registration now carries the
-    settings-level guard (asserted against the template).
+  * HK-5 — the nudge still fires on EVERY PostToolUse tool call with no
+    legacy settings-level guard: since v0.2.101 the PostToolUse(*)
+    registration is the post-tool-use-async dispatcher, whose routing
+    table must carry the `*|kg-update-nudge|-` row on both OSes.
 
 All fixtures are synthetic — no project-identifying strings, no secrets.
 """
@@ -337,35 +339,59 @@ class KgSyncOnEditTests(unittest.TestCase):
 
 
 class NudgeGuardRegistrationTests(unittest.TestCase):
-    """HK-5 — the PostToolUse(*) nudge registration is present and current.
+    """HK-5 — the nudge still fires on EVERY PostToolUse, guard-free.
 
-    v0.2.97: the registration no longer carries the settings-level
+    v0.2.97: the registration lost the settings-level
     ``[ -n "$VCT_DISABLE_HOOKS" ] || `` prefix. The IN-SCRIPT guard is the
     one mechanism (every ``templates/hooks/*.{sh,ps1}`` exits 0 on the
     variable — pinned by ``tests/test_hooks_disable_guard.py``, which also
-    covers kg-update-nudge.sh itself). What HK-5 still pins here is that
-    the nudge is REGISTERED at all on the PostToolUse(*) matcher, with the
-    plain shipped command form."""
+    covers kg-update-nudge.sh AND the dispatcher itself).
 
-    def test_posttooluse_star_nudge_is_registered_without_legacy_prefix(self) -> None:
+    v0.2.101 (dispatcher-era equivalent of the old pin): the nudge's own
+    PostToolUse(*) registration merged into the single async
+    ``post-tool-use-async`` dispatcher. What HK-5 pins now is that (a) the
+    PostToolUse(*) registration EXISTS, is the dispatcher, and carries no
+    legacy guard prefix, and (b) the dispatcher's routing table still sends
+    EVERY tool (``*``) to kg-update-nudge on BOTH OSes — so the nudge's
+    per-tool-call bookkeeping cannot silently disappear with the merge."""
+
+    def _star_registration(self) -> str:
         linux = REPO_ROOT / "templates" / "settings.json.linux.template"
         data = json.loads(linux.read_text(encoding="utf-8"))
-        found = False
         for group in data["hooks"].get("PostToolUse", []):
             if group.get("matcher") == "*":
                 for hook in group.get("hooks", []):
                     cmd = hook.get("command", "")
-                    if "kg-update-nudge.sh" in cmd:
-                        found = True
-                        self.assertNotIn(
-                            'VCT_DISABLE_HOOKS',
-                            cmd,
-                            "HK-5 (v0.2.97): the settings-level guard prefix "
-                            "was retired; the in-script guard "
-                            "(tests/test_hooks_disable_guard.py) owns the "
-                            "VCT_DISABLE_HOOKS opt-out.",
-                        )
-        self.assertTrue(found, "PostToolUse(*) nudge registration not found")
+                    if hook.get("async"):
+                        return cmd
+        self.fail("no async PostToolUse(*) registration found")
+
+    def test_posttooluse_star_dispatcher_is_registered_without_legacy_prefix(self) -> None:
+        cmd = self._star_registration()
+        self.assertIn(
+            "post-tool-use-async.sh", cmd,
+            "the PostToolUse(*) async registration must be the merged "
+            f"dispatcher (v0.2.101); got {cmd!r}",
+        )
+        self.assertNotIn(
+            'VCT_DISABLE_HOOKS',
+            cmd,
+            "HK-5 (v0.2.97): the settings-level guard prefix was retired; "
+            "the in-script guard (tests/test_hooks_disable_guard.py) owns "
+            "the VCT_DISABLE_HOOKS opt-out.",
+        )
+
+    def test_dispatcher_still_routes_every_tool_to_the_nudge(self) -> None:
+        for ext in ("sh", "ps1"):
+            dispatcher = HOOKS / f"post-tool-use-async.{ext}"
+            self.assertTrue(dispatcher.is_file(), f"missing {dispatcher}")
+            self.assertIn(
+                "*|kg-update-nudge|-",
+                dispatcher.read_text(encoding="utf-8", errors="replace"),
+                f"{dispatcher.name}: the routing table lost the wildcard "
+                "kg-update-nudge row — the nudge would stop seeing tool "
+                "calls (HK-5's PostToolUse bookkeeping leg)",
+            )
 
 
 if __name__ == "__main__":

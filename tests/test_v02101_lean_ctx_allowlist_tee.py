@@ -45,6 +45,12 @@ PS1_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.ps1"
 TEE_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.sh"
 TEE_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.ps1"
 ALLOWLIST = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-allowlist.txt"
+# The ONE PowerShell home for the env-file quote rule (shared by
+# lean-ctx-rewrite.ps1 and post-tool-use-async.ps1).
+ONE_QUOTE_PAIR_HELPER = (
+    REPO_ROOT / "templates" / "hooks" / "_lib" / "strip-one-quote-pair.ps1"
+)
+DISPATCHER_PS1 = REPO_ROOT / "templates" / "hooks" / "post-tool-use-async.ps1"
 
 _HAS_PWSH = sys.platform != "win32" and subprocess.run(
     ["which", "pwsh"], capture_output=True).returncode == 0
@@ -914,6 +920,166 @@ class TestTeeWrapperPs1:
         res = self._run("true", tmp_path, ttl="0")
         assert res.returncode == 0, res.stderr
         assert old_log.exists(), "ps1: TTL 0 = keep forever"
+
+
+# ─── .claude/env knob parsing: one-quote-pair rule parity ────────────────
+#
+# The .sh sibling SOURCES .claude/env, so the shell removes one quote pair
+# (`VCO_LEAN_CTX_DEFAULT="off"` and `='off'` both arrive as `off`). The .ps1
+# sibling SCANS the raw line, so it must strip exactly ONE surrounding
+# quote pair — single or double, only when the first and last chars are the
+# SAME char — the canonical rule of vco_lib/envfile._strip_one_quote_pair,
+# whose PowerShell home is the SHARED helper
+# templates/hooks/_lib/strip-one-quote-pair.ps1 (dotted by lean-ctx-rewrite.ps1
+# and post-tool-use-async.ps1; the POSIX siblings need no helper — they SOURCE
+# the file).
+# The old Windows code used `.Trim('"').Trim("'")`, which strips ALL leading/
+# trailing quote chars of EITHER kind: a well-formed pair already read as
+# `off` there, but an UNBALANCED / mixed pair (`="off'`) over-stripped to
+# `off` on Windows while the .sh (bad shell quoting → keeps a quote char)
+# kept compressing. These arms pin the strict rule on BOTH siblings; the
+# .ps1 unbalanced arm is the one red against the pre-fix `.Trim()` code.
+
+_OFF_VALUES = ['"off"', "'off'", "off"]
+_UNBALANCED_OFF = 'VCO_LEAN_CTX_DEFAULT="off\'\n'
+
+
+class TestEnvKnobQuoteParsingSh:
+    @pytest.mark.parametrize("val", _OFF_VALUES)
+    def test_quoted_or_bare_off_disables(self, val, tmp_path):
+        res = _run_sh_hook("npm install", tmp_path,
+                           env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"VCO_LEAN_CTX_DEFAULT={val} must disable compression"
+        )
+
+    def test_unbalanced_quote_pair_is_not_off(self, tmp_path):
+        """`="off'` is not a matching pair: sourcing yields `off'` (≠ off),
+        so compression stays ON — the strict one-pair rule."""
+        res = _run_sh_hook("npm install", tmp_path, env_file=_UNBALANCED_OFF)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "a non-matching quote pair must not read as `off`"
+        )
+
+    def test_stdin_consuming_env_line_does_not_eat_payload(self, tmp_path):
+        """`</dev/null` guard (review N-A): a user-editable .claude/env that
+        runs `read` must not consume the PreToolUse payload before the hook
+        reads it below, or an allow-listed command silently runs raw. Red
+        against the pre-fix hook, which sourced without `</dev/null`."""
+        res = _run_sh_hook(
+            "npm install", tmp_path,
+            env_file="read _LC_DRAIN\nVCO_LEAN_CTX_TEE_TTL_HOURS=24\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "a `read` line in .claude/env must not swallow the hook payload"
+        )
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestEnvKnobQuoteParsingPs1:
+    @pytest.mark.parametrize("val", _OFF_VALUES)
+    def test_quoted_or_bare_off_disables(self, val, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file=f"VCO_LEAN_CTX_DEFAULT={val}\n")
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "", (
+            f"ps1: VCO_LEAN_CTX_DEFAULT={val} must disable compression"
+        )
+
+    def test_unbalanced_quote_pair_is_not_off(self, tmp_path):
+        """RED against the pre-fix `.Trim('"').Trim("'")`, which over-stripped
+        the mixed pair to `off` and disabled compression; the strict
+        one-pair rule (matching .sh source semantics +
+        vco_lib/envfile._strip_one_quote_pair) keeps compression ON. This is
+        the arm that discriminates the two rules."""
+        res = _run_ps1_hook("npm install", tmp_path, env_file=_UNBALANCED_OFF)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() != "", (
+            "ps1: a non-matching quote pair must not read as `off`"
+        )
+
+    def test_ttl_one_quote_pair_stripped(self, tmp_path):
+        res = _run_ps1_hook("npm install", tmp_path,
+                            env_file='VCO_LEAN_CTX_TEE_TTL_HOURS="24"\n')
+        wrapped = json.loads(
+            res.stdout)["hookSpecificOutput"]["updatedInput"]["command"]
+        assert wrapped.rstrip().endswith("'24'"), wrapped
+
+
+# ─── the one-quote-pair rule's SHARED PowerShell home ────────────────────
+#
+# Extracted (v0.2.101) so the rule lives in exactly ONE place, dotted by
+# both PowerShell consumers; the POSIX siblings need no helper because they
+# SOURCE .claude/env and the shell already removes one quote pair.
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestOneQuotePairSharedHelper:
+    """Direct unit test of the shared helper, independent of either hook, so
+    a regression in the ONE home reds here before reaching a consumer."""
+
+    def _run(self, raw: str, tmp_path: Path) -> str:
+        script = (
+            ". '" + str(ONE_QUOTE_PAIR_HELPER).replace("'", "''") + "'; "
+            "$raw = [Console]::In.ReadToEnd(); "
+            "[Console]::Out.Write((Strip-OneQuotePair $raw))"
+        )
+        res = subprocess.run(
+            ["pwsh", "-NoProfile", "-Command", script],
+            input=raw, capture_output=True, text=True, cwd=tmp_path,
+            timeout=60,
+        )
+        assert res.returncode == 0, res.stderr
+        return res.stdout
+
+    @pytest.mark.parametrize("raw,expected", [
+        ('"off"', "off"),
+        ("'off'", "off"),
+        ("off", "off"),
+        ('"on"', "on"),
+        ('""', ""),
+        ("''", ""),
+        # non-matching / unbalanced pairs are left EXACTLY as-is
+        ("\"off'", "\"off'"),
+        ("'off\"", "'off\""),
+        ('"off', '"off'),
+        ('off"', 'off"'),
+        ("'", "'"),
+        ("", ""),
+    ])
+    def test_rule_matrix(self, raw, expected, tmp_path):
+        assert self._run(raw, tmp_path) == expected
+
+
+class TestOneQuotePairSingleHome:
+    """The rule lives in ONE place: both PowerShell consumers dot the shared
+    helper and carry no inline copy."""
+
+    def test_helper_defines_the_rule(self):
+        body = ONE_QUOTE_PAIR_HELPER.read_text(encoding="utf-8-sig")
+        assert "function Strip-OneQuotePair" in body, (
+            "the shared home must define the function"
+        )
+        assert "Substring(1, " in body, "the rule body must live here"
+
+    def test_both_ps1_consumers_dot_the_shared_helper(self):
+        for hook in (PS1_HOOK, DISPATCHER_PS1):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "strip-one-quote-pair.ps1" in src, (
+                f"{hook.name} must dot the shared one-quote-pair helper"
+            )
+
+    def test_no_inline_copy_of_the_rule_remains(self):
+        for hook in (PS1_HOOK, DISPATCHER_PS1):
+            src = hook.read_text(encoding="utf-8-sig")
+            assert "$q0 = " not in src, (
+                f"{hook.name} still holds an inline copy of the quote rule"
+            )
+            assert ".Substring(1, " not in src, (
+                f"{hook.name} still holds the inline Substring strip"
+            )
 
 
 if __name__ == "__main__":

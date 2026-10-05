@@ -86,8 +86,15 @@ unset SUPABASE_KEY SUPABASE_URL GITHUB_TOKEN GH_TOKEN OPENAI_API_KEY ANTHROPIC_A
 [ -n "${VCT_DISABLE_HOOKS:-}" ] && exit 0
 # Source .claude/env if present so per-project knobs (VCO_LEAN_CTX_DEFAULT,
 # VCO_LEAN_CTX_TEE_TTL_HOURS) are visible. Plain `KEY=VALUE` shell syntax;
-# hooks run with CWD=project-root.
-[ -f .claude/env ] && . .claude/env
+# hooks run with CWD=project-root. `</dev/null`: the file is user-editable
+# and a stdin-consuming line in it (`read …`) would otherwise EAT the
+# PreToolUse payload before `cat` reads it below, silently forcing the raw
+# path — same guard as templates/hooks/post-tool-use-async.sh (review N-A).
+# MUST MATCH the .ps1 sibling's one-quote-pair strip — the SHARED helper
+# templates/hooks/_lib/strip-one-quote-pair.ps1, dotted by lean-ctx-rewrite.ps1:
+# sourcing gives `"off"`/`'off'` as `off`, so the raw-line scan on the Windows
+# side must strip exactly ONE matching pair.
+[ -f .claude/env ] && . .claude/env </dev/null
 # SF-3 (v0.2.101 review): case-INsensitive "off", matching the .ps1's
 # .ToLowerInvariant() and the launcher GUI mapping — a hand-edited `Off`
 # must not render "off" in the launcher while POSIX keeps compressing.

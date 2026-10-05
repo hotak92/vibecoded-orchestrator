@@ -792,11 +792,46 @@ def test_pretooluse_hooks_no_settings(tmp_path):
 
 
 def test_post_delete_hook_happy(project_folder):
+    """LEGACY shape (a not-yet-updated install): the direct Bash-matcher
+    registration still verifies OK — it stays live until the bundle update
+    retires it (vco_lib/hook_retirements.py, v0.2.101 rows)."""
     result = vd._check_post_delete_hook(project_folder)
     assert result.status == vd.STATUS_OK
 
 
+def test_post_delete_hook_accepts_the_dispatcher_shape(project_folder):
+    """CURRENT shape (v0.2.101): the single async post-tool-use-async
+    registration routes Bash → post-file-delete, and a scrubbed project
+    (direct registration gone) must still verify OK."""
+    settings = json.loads(
+        (project_folder / ".claude" / "settings.json").read_text()
+    )
+    settings["hooks"]["PostToolUse"] = [
+        {
+            "matcher": "*",
+            "hooks": [
+                {
+                    "type": "command",
+                    "command": (
+                        'bash "${CLAUDE_PROJECT_DIR:-.}/.claude/hooks/'
+                        'post-tool-use-async.sh"'
+                    ),
+                    "timeout": 15,
+                    "async": True,
+                }
+            ],
+        }
+    ]
+    (project_folder / ".claude" / "settings.json").write_text(
+        json.dumps(settings), encoding="utf-8"
+    )
+    result = vd._check_post_delete_hook(project_folder)
+    assert result.status == vd.STATUS_OK, result.detail
+    assert "post-tool-use-async" in result.detail
+
+
 def test_post_delete_hook_missing(project_folder):
+    """NEITHER shape registered → FAIL (act + leave-alone both pinned)."""
     settings = json.loads(
         (project_folder / ".claude" / "settings.json").read_text()
     )
