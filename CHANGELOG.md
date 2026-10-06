@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.101] - 2026-10-06
+
 ### Added
 
 - **"Re-render env for all projects" is back as a Preferences action.** The all-projects env re-render, retired as too risky to expose in v0.2.100, is offered again (owner ruling 2026-10-05) as a confirm-gated button in Preferences → "Project environment": it rewrites every project's `.claude/env` and the env block of `.claude/settings.json` from the launcher's current settings through the same per-project soft-fail core the boot hook uses, and the toast reports how many refreshed, warned, failed or were skipped. The per-project repair on each project's Settings tab is unchanged.
@@ -12956,7 +12958,8 @@ follow Keep a Changelog discipline more strictly per release.
 - Default-OFF telemetry (explicit opt-in required; default `.env` writes `VIBECODED_TELEMETRY=false`).
 - Public alias for license validation (`https://api.vibecodedtools.it/validate-tier`); internal Supabase URLs are not committed to public source.
 
-[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.92...HEAD
+[Unreleased]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.101...HEAD
+[0.2.101]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.100...v0.2.101
 [0.2.3]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.1...v0.2.2
 [0.2.1]: https://github.com/hotak92/vibecoded-orchestrator/compare/v0.2.0...v0.2.1

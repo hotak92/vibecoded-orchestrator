@@ -155,6 +155,26 @@ EXTRACTOR_GENERATION_NON_BUMPS: dict[str, str] = {
         "by the 2026-09-09 defect still get their owed walk: decide() rule 4 "
         "fires on crosses_version_boundary(prev, 0.2.95, 0.2.94)."
     ),
+    "0.2.101": (
+        "No extraction-semantics change. `git diff v0.2.100..HEAD` across the "
+        "extractor surface (analyze_code_graph.py, codegraph_{guards,"
+        "content_hash,entities,lang,calls,references,schema,naming}, "
+        "weaviate_mcp/{chunking,code_truncation}.py, schema_versions.py): "
+        "analyze_code_graph.py and every codegraph_* module are UNCHANGED "
+        "(0 lines). schema_versions.py +10/-1 is the launcher-DB "
+        "migration-048 ledger entry (chat-model image-capability column) — "
+        "a launcher DB concern, not an extraction rule (same shape as the "
+        "0.2.96 entry's migration-046 precedent). chunking.py's +137 lines "
+        "are the v0.2.101 QUERY-PREFIX machinery (MODEL_QUERY_PREFIXES + "
+        "query_prefix_for_model) — query-side embedding prefixes applied at "
+        "SEARCH time; stored chunks, entity discovery, naming, hashing and "
+        "truncation are untouched, so a forced re-walk would reproduce "
+        "byte-identical rows. _CHUNKER_REVISION unchanged at v0.2.92.1; "
+        "CODEGRAPH_COLLECTION_SCHEMA_VERSION unchanged at 7. The cycle's "
+        "code-graph work was read-path exactness (weaviate_exact_match, "
+        "calls-as-references) — retrieval correctness over the EXISTING "
+        "graph, gated on its own mechanisms, not extraction."
+    ),
     "0.2.96": (
         "No extraction-semantics change. `git diff v0.2.95..HEAD` across the "
         "same extractor surface (analyze_code_graph.py, codegraph_{guards,"
