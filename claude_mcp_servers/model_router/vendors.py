@@ -236,7 +236,7 @@ ANTHROPIC_FAMILY = AnthropicFamily(
     upstream="https://api.anthropic.com",
     catalog_path="/v1/models",
     catalog_query="limit=100",
-    docs_url="https://docs.anthropic.com/en/api/models-list",
+    docs_url="https://platform.claude.com/docs/en/about-claude/models/overview",
 )
 
 #: The namespace shared by every shipped vendor. Kept as one value because the

@@ -146,32 +146,32 @@
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.anthropic.com",
-      "source_note": "First-party row, read by TWO consumers: vco_lib.vscode_settings.decorate_1m (reads window_1m, so a slot/default naming this model carries the client's own [1m] hint) and the gateway catalog (reads context_window; the plain id is published verbatim AND an '[1m]' companion row is published beside it). An earlier version of this note said the gateway did not advertise these rows; that stopped being true in v0.2.95."
+      "source": "https://platform.claude.com/docs/en/about-claude/models/overview",
+      "source_note": "Citation is the Anthropic models-OVERVIEW index page on platform.claude.com (the docs.anthropic.com models/overview page redirects there): no per-model page for claude-fable-5-1 is published, so the index page that carries that model's window/output row is cited and named as such, rather than implying a page of its own. Its three sibling rows below cite their own per-model pages. First-party row, read by TWO consumers: vco_lib.vscode_settings.decorate_1m (reads window_1m, so a slot/default naming this model carries the client's own [1m] hint) and the gateway catalog (reads context_window; the plain id is published verbatim AND an '[1m]' companion row is published beside it). An earlier version of this note said the gateway did not advertise these rows; that stopped being true in v0.2.95."
     },
     "claude-fable-5": {
       "vendor": "anthropic",
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.anthropic.com",
-      "source_note": "First-party row; see claude-fable-5-1."
+      "source": "https://platform.claude.com/docs/en/models/fable-5/overview.md",
+      "source_note": "First-party row; its own per-model page is cited. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     },
     "claude-opus-5": {
       "vendor": "anthropic",
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.anthropic.com",
-      "source_note": "First-party row; see claude-fable-5-1."
+      "source": "https://platform.claude.com/docs/en/models/opus-5/overview.md",
+      "source_note": "First-party row; its own per-model page is cited. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     },
     "claude-sonnet-5": {
       "vendor": "anthropic",
       "context_window": 1000000,
       "max_output": 128000,
       "window_1m": true,
-      "source": "https://docs.anthropic.com",
-      "source_note": "First-party row; see claude-fable-5-1."
+      "source": "https://platform.claude.com/docs/en/models/sonnet-5/overview.md",
+      "source_note": "First-party row; its own per-model page is cited. Consumers and the [1m]-decoration rule: see claude-fable-5-1."
     }
   }
 }

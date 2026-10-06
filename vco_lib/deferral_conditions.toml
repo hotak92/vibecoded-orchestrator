@@ -331,12 +331,19 @@ clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
 notes = "v0.2.100 (AD-3, L1-F05): a VCO container name is held by a container another compose tool created (its labels name podman-compose vs docker-compose). Never recreated automatically; consent + data check needed. Emitted by `vco_lib.compose_recovery.deferral_entries` inside install.py step 5."
 
+[conditions.compose_network_unknown_project_refused]
+class = "action_required"
+owner = "install.py"
+clear_probe = "owned-drop-when-absent"
+emit_surfaces = ["ledger"]
+notes = "v0.2.101 (NB-15 / FRR:50): compose refused a network while recovering a project whose name could not be determined, so the network's provenance could not be checked against it. Distinct from `compose_network_label_mismatch_attached`: that branch READS the network's labels and finds they name another tool; this branch reads NO label, because there is no project to compare them to. Refusal behaviour is unchanged — the network is never removed, and the row carries the inspect/ps/rm recipe. Emitted by `vco_lib.compose_recovery.heal_deferral_entry` inside install.py step 5."
+
 [conditions.compose_network_label_mismatch_attached]
 class = "action_required"
 owner = "install.py"
 clear_probe = "owned-drop-when-absent"
 emit_surfaces = ["ledger"]
-notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, unreadable, or the project is unknown). The id keeps its v0.2.100 wave-1 name; the row's title/recipe cover both reasons. Emitted by `vco_lib.compose_recovery` inside install.py step 5."
+notes = "v0.2.100 (AD-3, L1-F04/F22; wave-1 review W1R-01; split v0.2.101 NB-15): compose refused a network labelled by a different compose tool and VCO left it alone because it could not PROVE removal safe — `ps -a --filter network=<n> -q` shows containers attached, OR the network's own labels do not name the compose project being recovered (`com.docker.compose.project` / `io.podman.compose.project`: hand-made, another project's, or unreadable). The 'project unknown' case this row used to cover moved to its own id `compose_network_unknown_project_refused` (NB-15). Emitted by `vco_lib.compose_recovery` inside install.py step 5."
 
 [conditions.container_storage_leftover_unsafe]
 class = "action_required"

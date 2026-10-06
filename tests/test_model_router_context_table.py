@@ -90,10 +90,19 @@ EXPECTED_1M_IDS = (
 
 #: Official documentation host per vendor id. A citation anywhere else is
 #: not a vendor page.
+#:
+#: ``anthropic`` moved to ``platform.claude.com``: the four Claude rows used to
+#: cite the bare ``https://docs.anthropic.com`` host (a citation that names no
+#: page), and that host now redirects to ``platform.claude.com``. The rows cite
+#: the real per-model pages there — ``claude-fable-5``/``claude-opus-5``/
+#: ``claude-sonnet-5`` their own ``.../models/<id>/overview`` pages, and
+#: ``claude-fable-5-1`` the ``.../about-claude/models/overview`` index page
+#: because it has no page of its own (its note says so). This prefix is what
+#: keeps a reverted bare-domain citation failing.
 OFFICIAL_DOC_PREFIX = {
     "zai": "https://docs.z.ai/",
     "qwen": "https://docs.qwencloud.com/",
-    "anthropic": "https://docs.anthropic.com",
+    "anthropic": "https://platform.claude.com/",
 }
 
 

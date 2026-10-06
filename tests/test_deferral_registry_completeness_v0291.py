@@ -299,6 +299,11 @@ _V0298_OWNED_ADDITIONS = frozenset({
 # right lifecycle: a run that verifies the GPU present simply drops it.
 _V02101_OWNED_ADDITIONS = frozenset({
     "compose_gpu_device_missing",
+    # v0.2.101 NB-15: the distinct unknown-project network-refusal id. Emitted
+    # by compose_recovery.heal_deferral_entry INSIDE the install.py run that
+    # rebuilds the ledger (family A proper), so owned-drop-when-absent is the
+    # right clear probe: the run that no longer refuses drops the row.
+    "compose_network_unknown_project_refused",
 })
 
 
