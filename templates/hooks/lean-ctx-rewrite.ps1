@@ -229,8 +229,12 @@ try { New-Item -ItemType Directory -Path $rawDir -Force -ErrorAction Stop | Out-
 # OUTPUT that can carry credentials. On POSIX hosts the dir must be
 # PROVABLY 0700 or there is NO wrap at all — fail closed, MUST MATCH the
 # .sh, where a failing os.chmod lands in the nothing() arm. On native
-# Windows the user-profile ACLs are the equivalent protection (files under
-# the user's tree are not world-readable by default).
+# Windows privacy is enforced at tee time by _lib/lean-ctx-tee.ps1 (S5): it
+# applies an owner-only ACL to the tee dir and every tee file and runs the
+# command UNCOMPRESSED if it cannot make them private — inherited ACLs are
+# never trusted (a project outside the user profile inherits its parent's,
+# commonly Users:Modify). The command TEXT written here is
+# non-credential-bearing by construction (allow-list + SEC-RAW gate).
 $isPosix = [System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT
 if ($isPosix) {
     if (-not (Get-Command chmod -ErrorAction SilentlyContinue)) { exit 0 }

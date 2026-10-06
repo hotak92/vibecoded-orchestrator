@@ -18,7 +18,8 @@
 #      before the tee write; the .sh sibling's `bash -c` child never had
 #      that hole), tee the FULL raw output to
 #      <raw-dir>/<utc-ts>-<pid>-<sha8>.log (born 0600 on POSIX hosts, dir
-#      0700 - SF-1), preserve the exit code,
+#      0700 - SF-1; owner-only ACL on native Windows - S5), preserve the
+#      exit code,
 #   4. print the output compressed via `lean-ctx -c cat` fed on stdin
 #      (no dependency on lean-ctx's own tee_mode, which varies by
 #      version); fall back to printing the raw file when compression
@@ -26,7 +27,8 @@
 #   5. end with exactly one pointer line,
 #   6. exit with the ORIGINAL command's exit code.
 #
-# Conservative arms: raw-dir not creatable -> run the command directly,
+# Conservative arms: raw-dir not creatable OR (native Windows) not
+# makeable owner-only-private (S5) -> run the command directly,
 # uncompressed, no pointer; cmd-file unreadable -> loud stderr + exit 2;
 # raw output > 32 MiB -> pointer only; empty output -> pointer only.
 #
@@ -66,17 +68,66 @@ $ttl = [int]$TtlHours
 # SF-1 (v0.2.101 review): raw OUTPUT of allow-listed curl/wget/test runs can
 # carry credentials (SEC-RAW guards the command text, not the output). On
 # POSIX hosts (pwsh on Linux/macOS) tighten the tee dir to 0700 and files to
-# 0600 via chmod; on native Windows there is no POSIX mode and the user
-# profile ACLs are the equivalent protection (files under the user's own
-# tree are not world-readable by default) - documented divergence, same
-# threat outcome. Git never sees the dir (bundle add/update writes /.claude/
-# to .git/info/exclude) and the code graph classifies .claude/state/ as
-# transient (TRANSIENT_STATE_MARKER).
+# 0600 via chmod; on native Windows there is no POSIX mode, so the tee dir
+# and every tee file get an OWNER-ONLY ACL instead (S5, Set-OwnerOnlyAcl
+# below) - inherited ACLs are NOT trusted: a project outside the user
+# profile (D:\work, a mapped share) inherits its parent's ACL, commonly
+# Users:Modify. Any failure to make them private SKIPS compression (the
+# uncompressed pass-through arm below - the CHANGELOG's "skips compression
+# if it cannot make them private" promise). Git never sees the dir (bundle
+# add/update writes /.claude/ to .git/info/exclude) and the code graph
+# classifies .claude/state/ as transient (TRANSIENT_STATE_MARKER).
 function Set-PosixMode([string]$Path, [string]$Mode) {
     if (Get-Command chmod -ErrorAction SilentlyContinue) {
         & chmod $Mode $Path 2>$null
     }
 }
+
+# S5-ACL-BEGIN (v0.2.101 review, S5): the ONE home of the Windows owner-only
+# ACL idiom for tee privacy (no icacls shelling - a second process and a
+# quoting hazard). New-OwnerOnlyAcl builds the security object: inheritance
+# DISABLED with no inherited rules kept (SetAccessRuleProtection($true,
+# $false)) plus exactly ONE allow rule - the CURRENT user's SID,
+# FullControl. Set-OwnerOnlyAcl applies it and converts ANY failure
+# (unsupported filesystem, denied, API unavailable) into $false so the
+# caller takes the existing "no private tee -> no compression" pass-through
+# arm; it never writes to stdout/stderr (the conservative arms of this lib
+# are silent, exit codes preserved). Both are no-ops returning $true on
+# non-Win32 hosts - POSIX modes govern there. Tests extract this block:
+# keep it between the S5-ACL-BEGIN/END markers.
+function New-OwnerOnlyAcl([switch]$Directory) {
+    $sid = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+    $acl = if ($Directory) {
+        [System.Security.AccessControl.DirectorySecurity]::new()
+    } else {
+        [System.Security.AccessControl.FileSecurity]::new()
+    }
+    # Protected DACL, inherited rules NOT kept -> owner-only.
+    $acl.SetAccessRuleProtection($true, $false)
+    $inh = if ($Directory) {
+        [System.Security.AccessControl.InheritanceFlags]::ContainerInherit -bor
+        [System.Security.AccessControl.InheritanceFlags]::ObjectInherit
+    } else {
+        [System.Security.AccessControl.InheritanceFlags]::None
+    }
+    $rule = [System.Security.AccessControl.FileSystemAccessRule]::new(
+        $sid,
+        [System.Security.AccessControl.FileSystemRights]::FullControl,
+        $inh,
+        [System.Security.AccessControl.PropagationFlags]::None,
+        [System.Security.AccessControl.AccessControlType]::Allow)
+    $acl.AddAccessRule($rule)
+    return $acl
+}
+function Set-OwnerOnlyAcl([string]$Path, [switch]$Directory) {
+    if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) { return $true }
+    try {
+        $acl = New-OwnerOnlyAcl -Directory:$Directory
+        Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+# S5-ACL-END
 
 # N-1 (v0.2.101 review): run the command in a CHILD process, not an
 # in-process ScriptBlock - a command text of the form `exit N` would exit
@@ -108,11 +159,16 @@ if (-not (Test-Path -LiteralPath $RawDir)) {
     try { New-Item -ItemType Directory -Path $RawDir -Force -ErrorAction Stop | Out-Null } catch { }
 }
 if (Test-Path -LiteralPath $RawDir) { Set-PosixMode $RawDir "700" }
-if (-not (Test-Path -LiteralPath $RawDir)) {
-    # No state dir -> no tee -> no compression. Run the command as-is and
-    # let its output flow through untouched (MUST MATCH the .sh `exec bash
-    # -c "$CMD"` arm - never assign to $null here, that would swallow the
-    # output and lose it).
+# S5: on native Windows the dir must ALSO be provably owner-only (a
+# no-op returning $true elsewhere - POSIX 0700 governs there). A dir that
+# cannot be made private counts as "no state dir": no tee, no compression.
+$dirOk = (Test-Path -LiteralPath $RawDir)
+if ($dirOk) { $dirOk = Set-OwnerOnlyAcl $RawDir -Directory }
+if (-not $dirOk) {
+    # No state dir (or none that can be made private) -> no tee -> no
+    # compression. Run the command as-is and let its output flow through
+    # untouched (MUST MATCH the .sh `exec bash -c "$CMD"` arm - never
+    # assign to $null here, that would swallow the output and lose it).
     Invoke-TeeCommand | ForEach-Object { Write-Output "$_" }
     $ec = if ($null -ne $LASTEXITCODE) { $LASTEXITCODE } else { 0 }
     exit $ec
@@ -139,7 +195,8 @@ $raw = Join-Path $RawDir ("{0}-{1}-{2}.log" -f $ts, $PID, $ck)
 # SF-1 + NF-4 (re-review): the tee file is BORN 0600 - on POSIX hosts via
 # umask 077 in a child sh (MUST MATCH the .sh sibling's
 # `( umask 077; : >"$RAW" )`, and independent of a working chmod);
-# elsewhere via .NET (native Windows: profile ACLs are the equivalent).
+# on native Windows it is made owner-only immediately after creation (S5,
+# Set-OwnerOnlyAcl) - an ACL that cannot be applied leaves $born false.
 # If the PRIVATE tee cannot be created there is no tee at all: the command
 # runs as-is, uncompressed, output passing through (lossless by not
 # compressing) - the same arm as the .sh pre-create failure.
@@ -151,7 +208,10 @@ if ([System.Environment]::OSVersion.Platform -ne [System.PlatformID]::Win32NT) {
         $born = ($LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath $raw))
     }
 } else {
-    try { [System.IO.File]::WriteAllText($raw, ""); $born = $true } catch { $born = $false }
+    try {
+        [System.IO.File]::WriteAllText($raw, "")
+        $born = Set-OwnerOnlyAcl $raw
+    } catch { $born = $false }
 }
 if (-not $born) {
     Invoke-TeeCommand | ForEach-Object { Write-Output "$_" }

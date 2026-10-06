@@ -45,6 +45,8 @@ PS1_HOOK = REPO_ROOT / "templates" / "hooks" / "lean-ctx-rewrite.ps1"
 TEE_SH = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.sh"
 TEE_PS1 = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-tee.ps1"
 ALLOWLIST = REPO_ROOT / "templates" / "hooks" / "_lib" / "lean-ctx-allowlist.txt"
+ORCH_TEMPLATE = REPO_ROOT / "templates" / "ORCHESTRATOR-CLAUDE.md.template"
+CHANGELOG = REPO_ROOT / "CHANGELOG.md"
 # The ONE PowerShell home for the env-file quote rule (shared by
 # lean-ctx-rewrite.ps1 and post-tool-use-async.ps1).
 ONE_QUOTE_PAIR_HELPER = (
@@ -727,7 +729,8 @@ class TestPs1HookParity:
     def test_hook_creates_private_dir_and_cmdfile(self, tmp_path):
         """SF-1 parity: on POSIX hosts (pwsh) the .ps1 hook tightens the
         tee dir to 0700 and the .cmd file to 0600; on native Windows the
-        profile ACLs are the equivalent (documented in the hook)."""
+        tee wrapper applies owner-only ACLs instead (S5 — see
+        TestTeePs1WindowsOwnerOnlyAcl below)."""
         res = _run_ps1_hook("npm install", tmp_path)
         assert res.stdout.strip(), "wrap expected"
         rawdir = _rawdir(tmp_path / "proj")
@@ -1080,6 +1083,293 @@ class TestOneQuotePairSingleHome:
             assert ".Substring(1, " not in src, (
                 f"{hook.name} still holds the inline Substring strip"
             )
+
+
+# ─── S5: Windows owner-only ACL on the tee dir/files (one home: the lib) ──
+#
+# The CHANGELOG promises "on Windows the hook skips compression if it cannot
+# make them private". The mechanism lives ONCE in lean-ctx-tee.ps1 between the
+# S5-ACL-BEGIN/END markers: New-OwnerOnlyAcl builds a protected DACL
+# (inheritance disabled, no inherited rules kept, one FullControl allow rule
+# for the current user's SID) and Set-OwnerOnlyAcl applies it, converting ANY
+# failure into $false so the caller takes an EXISTING pass-through arm:
+#   - dir call site  -> the "no state dir" arm (no tee at all),
+#   - file call site -> the `$born = $false` arm (no tee, uncompressed).
+# Native Windows enforcement cannot run on a Linux CI host, but the failure
+# half of the .NET ACL stack CAN: WindowsIdentity::GetCurrent() and the
+# FileSecurity/DirectorySecurity constructors throw there, exactly like a
+# Set-Acl failure on an ACL-less Windows filesystem. So the tests extract the
+# marked block (unit level, with the platform gate patched and Set-Acl /
+# New-OwnerOnlyAcl overridden as probe functions) and run PATCHED COPIES of
+# the whole lib (end-to-end level) to genuinely exercise both skip arms.
+# Red-proof (recorded in the fix report): mutating either call site back to
+# `$dirOk = $true` / `$born = $true` flips the corresponding end-to-end arm
+# from pass-through back to compressed output, failing its test.
+
+_ACL_GATE_LINE = (
+    "if ([System.Environment]::OSVersion.Platform -ne "
+    "[System.PlatformID]::Win32NT) { return $true }"
+)
+_BIRTH_PLATFORM_LINE = (
+    "if ([System.Environment]::OSVersion.Platform -ne "
+    "[System.PlatformID]::Win32NT) {\n"
+)
+
+
+def _acl_block() -> str:
+    """Extract the marked one-home block (functions + contract comment)."""
+    src = TEE_PS1.read_text(encoding="utf-8-sig")
+    begin = src.index("# S5-ACL-BEGIN")
+    end = src.index("# S5-ACL-END")
+    block = src[begin:end]
+    assert "function New-OwnerOnlyAcl" in block
+    assert "function Set-OwnerOnlyAcl" in block
+    assert _ACL_GATE_LINE in block
+    return block
+
+
+def _force_win32(block: str) -> str:
+    """Patch the platform gate so the Windows body runs on a Linux host."""
+    assert block.count(_ACL_GATE_LINE) == 1
+    return block.replace(_ACL_GATE_LINE, "if ($false) { return $true }")
+
+
+def _write_patched_lib(tmp_path: Path, *, gate: str,
+                       force_windows_birth: bool = False) -> Path:
+    """A whole-lib copy with Set-OwnerOnlyAcl's platform gate replaced (and
+    optionally the birth branch forced down the Win32NT path) so the real
+    body runs — and throws — on Linux, exactly like a Set-Acl failure on an
+    ACL-less Windows filesystem."""
+    src = TEE_PS1.read_text(encoding="utf-8-sig")
+    assert src.count(_ACL_GATE_LINE) == 1
+    patched = src.replace(_ACL_GATE_LINE, gate)
+    if force_windows_birth:
+        assert patched.count(_BIRTH_PLATFORM_LINE) == 1
+        patched = patched.replace(_BIRTH_PLATFORM_LINE, "if ($false) {\n")
+    lib = tmp_path / "lean-ctx-tee-s5patched.ps1"
+    lib.write_text(patched, encoding="utf-8")
+    return lib
+
+
+def _run_lib(lib: Path, cmd_text: str, tmp_path: Path):
+    """Run a (possibly patched) tee lib end-to-end, fake lean-ctx first."""
+    fake = _make_fake_lean_ctx(tmp_path / "fakebin")
+    rawdir = tmp_path / "raw"
+    rawdir.mkdir(parents=True, exist_ok=True)
+    cmdfile = rawdir / "run.cmd"
+    cmdfile.write_text(cmd_text, encoding="utf-8")
+    env = dict(os.environ)
+    return subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(lib),
+         str(fake), str(rawdir), str(cmdfile), "168"],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=120,
+    )
+
+
+def _run_harness(harness_src: str, tmp_path: Path, target: Path):
+    """Run an extracted-block harness; returns (CompletedProcess, marker)."""
+    harness = tmp_path / "s5-harness.ps1"
+    harness.write_text(harness_src, encoding="utf-8")
+    marker = tmp_path / "acl-marker"
+    env = dict(os.environ)
+    env["ACL_MARKER"] = str(marker)
+    env["ACL_PATH"] = str(target)
+    res = subprocess.run(
+        ["pwsh", "-NoProfile", "-File", str(harness)],
+        capture_output=True, text=True, cwd=tmp_path, env=env, timeout=60,
+    )
+    return res, marker
+
+
+# Set-Acl as a probe FUNCTION: PowerShell resolves functions before cmdlets,
+# so the override captures every call the extracted block would make to the
+# real cmdlet (which cannot succeed on Linux anyway).
+_SET_ACL_PROBE = (
+    "function Set-Acl { param($LiteralPath, $AclObject, $ErrorAction)\n"
+    "    Set-Content -LiteralPath $env:ACL_MARKER -Value "
+    '("$LiteralPath|$($null -ne $AclObject)|$($AclObject.Dir)")\n'
+    "}\n"
+)
+_STUB_NEW_ACL = (
+    "function New-OwnerOnlyAcl([switch]$Directory) {\n"
+    "    return [pscustomobject]@{ Dir = [bool]$Directory }\n"
+    "}\n"
+)
+
+
+@pytest.mark.skipif(not _HAS_PWSH, reason="pwsh not installed")
+class TestTeePs1WindowsOwnerOnlyAcl:
+    def test_non_win32_takes_no_acl_path(self, tmp_path):
+        """(c) On a non-Win32 host Set-OwnerOnlyAcl is a $true no-op and NO
+        ACL call is attempted — the probe Set-Acl override must never fire
+        (marker absent), and the POSIX chmod/umask path governs privacy."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _acl_block() + "\n" + _SET_ACL_PROBE
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "True", (
+            "the non-Win32 early return must be a silent $true no-op"
+        )
+        assert not marker.exists(), (
+            "no ACL call may be attempted off Win32NT"
+        )
+
+    def test_win32_success_path_applies_acl_and_returns_true(self, tmp_path):
+        """(a) With the gate forced (Windows stand-in) and the two
+        Windows-only primitives stubbed, the orchestration runs to success:
+        Set-Acl is invoked ONCE with the target path and a non-null ACL
+        object built by New-OwnerOnlyAcl, and the function returns $true —
+        compression proceeds normally."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _force_win32(_acl_block()) + "\n" + _STUB_NEW_ACL + _SET_ACL_PROBE
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "True"
+        assert marker.exists(), "Set-Acl must be invoked on the Win32 path"
+        recorded = marker.read_text(encoding="utf-8").strip()
+        path, has_acl, is_dir = recorded.split("|")
+        assert path == str(target)
+        assert has_acl == "True", "a non-null ACL object must be applied"
+        assert is_dir == "True", "-Directory must reach New-OwnerOnlyAcl"
+
+    def test_acl_failure_returns_false_silently(self, tmp_path):
+        """Unit level of the skip promise: with the gate forced and NO
+        stubs, the real body throws on Linux (WindowsIdentity/FileSecurity
+        are Windows-only — the same $false the catch produces for a Set-Acl
+        failure on an ACL-less Windows filesystem), and the function reports
+        $false with ZERO stdout/stderr noise (conservative-arm contract)."""
+        target = tmp_path / "target"
+        target.mkdir()
+        harness = (
+            _force_win32(_acl_block()) + "\n"
+            + "[Console]::Out.Write([string](Set-OwnerOnlyAcl $env:ACL_PATH"
+              " -Directory))\n"
+        )
+        res, marker = _run_harness(harness, tmp_path, target)
+        assert res.returncode == 0, res.stderr
+        assert res.stdout.strip() == "False"
+        assert res.stderr.strip() == "", (
+            "an ACL failure must be silent (no stderr noise, ever)"
+        )
+        assert not marker.exists()
+
+    def test_dir_acl_failure_takes_no_state_dir_arm(self, tmp_path):
+        """(b1) END-TO-END skip arm: dir ACL cannot be established -> the
+        EXISTING 'no state dir' pass-through arm fires — raw output, no
+        pointer, no tee file, exit code preserved, stderr silent. Red if the
+        `$dirOk = Set-OwnerOnlyAcl $RawDir -Directory` call site is removed
+        (the patched lib then compresses)."""
+        lib = _write_patched_lib(tmp_path, gate="if ($false) { return $true }")
+        res = _run_lib(lib, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stderr.strip() == "", "ACL failure must be silent"
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"], (
+            f"uncompressed pass-through expected, got: {res.stdout!r}"
+        )
+        assert "[lean-ctx-tee]" not in res.stdout
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        assert not list((tmp_path / "raw").glob("*.log")), (
+            "no tee file may exist when the dir cannot be made private"
+        )
+
+    def test_file_acl_failure_takes_born_false_arm(self, tmp_path):
+        """(b2) END-TO-END skip arm at the FILE call site: dir ACL succeeds
+        (gate patched to honor -Directory) but the file ACL fails -> the
+        EXISTING `$born = $false` arm fires: raw pass-through, no pointer,
+        and the just-created .log stays EMPTY (no output was ever written to
+        a file that could not be made private). Red if
+        `$born = Set-OwnerOnlyAcl $raw` is mutated back to `$born = $true`."""
+        lib = _write_patched_lib(
+            tmp_path, gate="if ($Directory) { return $true }",
+            force_windows_birth=True)
+        res = _run_lib(lib, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert res.stderr.strip() == "", "ACL failure must be silent"
+        assert res.stdout.split() == ["1", "2", "3", "4", "5"], (
+            f"uncompressed pass-through expected, got: {res.stdout!r}"
+        )
+        assert "[lean-ctx-tee]" not in res.stdout
+        assert "COMPRESSED-BY-FAKE" not in res.stdout
+        logs = list((tmp_path / "raw").glob("*.log"))
+        assert len(logs) == 1, "the birth-create ran before the ACL failed"
+        assert logs[0].stat().st_size == 0, (
+            "no output may be written to a tee file that is not private"
+        )
+
+    def test_unpatched_lib_still_compresses_on_posix(self, tmp_path):
+        """The gate is real: on this (non-Win32) host the UNPATCHED lib must
+        keep compressing — the ACL additions are no-ops here, so a passing
+        run is also the (c)-arm's end-to-end evidence (had the lib attempted
+        an ACL on POSIX, it would have failed and passed through raw)."""
+        res = _run_lib(TEE_PS1, "seq 1 5", tmp_path)
+        assert res.returncode == 0, res.stderr
+        assert "COMPRESSED-BY-FAKE" in res.stdout
+        assert _POINTER_RE.search(res.stdout)
+        (log,) = (tmp_path / "raw").glob("*.log")
+        assert stat.S_IMODE(log.stat().st_mode) == 0o600
+
+
+class TestS5OneHomeAndPromiseTexts:
+    """Static pins: the idiom's ONE home, the wired call sites, and the
+    retired 'profile ACLs' claim. The behavioural proof that the call sites
+    FIRE lives in TestTeePs1WindowsOwnerOnlyAcl above (mutating either one
+    reds an end-to-end arm)."""
+
+    def test_acl_idiom_defined_once_in_the_lib(self):
+        lib = TEE_PS1.read_text(encoding="utf-8-sig")
+        assert lib.count("function New-OwnerOnlyAcl") == 1
+        assert lib.count("function Set-OwnerOnlyAcl") == 1
+        assert lib.count("SetAccessRuleProtection($true, $false)") == 1
+        # the owner-only ingredients: inheritance disabled + current user's
+        # SID + FullControl allow, applied via Set-Acl -ErrorAction Stop
+        assert "WindowsIdentity]::GetCurrent().User" in lib
+        assert "FileSystemRights]::FullControl" in lib
+        assert "AccessControlType]::Allow" in lib
+        assert "Set-Acl -LiteralPath $Path -AclObject $acl -ErrorAction Stop" \
+            in lib
+        # never SHELL OUT to icacls (a second process + quoting hazard) —
+        # the word may appear in comments explaining why it is avoided
+        code_lines = [ln for ln in lib.splitlines()
+                      if not ln.lstrip().startswith("#")]
+        assert not any("icacls" in ln for ln in code_lines)
+
+    def test_no_second_home_of_the_idiom(self):
+        for other in (PS1_HOOK, TEE_SH, SH_HOOK):
+            src = other.read_text(encoding="utf-8-sig")
+            assert "SetAccessRuleProtection" not in src, other.name
+            assert "function Set-OwnerOnlyAcl" not in src, other.name
+            assert "function New-OwnerOnlyAcl" not in src, other.name
+
+    def test_both_enforcement_points_wired(self):
+        lib = TEE_PS1.read_text(encoding="utf-8-sig")
+        assert lib.count("$dirOk = Set-OwnerOnlyAcl $RawDir -Directory") == 1
+        assert lib.count("$born = Set-OwnerOnlyAcl $raw") == 1
+
+    def test_profile_acl_claim_retired_everywhere(self):
+        for f in (TEE_PS1, PS1_HOOK, SH_HOOK, TEE_SH, ORCH_TEMPLATE,
+                  CHANGELOG):
+            src = f.read_text(encoding="utf-8-sig")
+            assert "profile ACLs are the equivalent" not in src, f
+            assert "user-profile ACLs are the equivalent" not in src, f
+
+    def test_promise_texts_name_the_real_mechanism(self):
+        tpl = ORCH_TEMPLATE.read_text(encoding="utf-8-sig")
+        assert "owner-only ACL" in tpl
+        assert "skips compression" in tpl
+        ch = CHANGELOG.read_text(encoding="utf-8-sig")
+        unreleased = ch.split("## [", 2)[1]  # the [Unreleased] block
+        assert "owner-only ACL" in unreleased
+        assert "skips compression if it cannot make them private" in unreleased
 
 
 if __name__ == "__main__":

@@ -250,7 +250,9 @@ try:
     os.makedirs(_rawdir, 0o700, exist_ok=True)
     # SF-1: the dir holds raw command OUTPUT that can carry credentials
     # (SEC-RAW guards the command text, not the output) — 0700 even when
-    # an older run left it 0755.
+    # an older run left it 0755. (Native Windows sibling: owner-only ACL
+    # enforced by _lib/lean-ctx-tee.ps1 — S5; uncompressed pass-through
+    # when it cannot be made private.)
     os.chmod(_rawdir, 0o700)
     _ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
     _ck = format(zlib.crc32(cmd.encode("utf-8", "replace")) & 0xFFFFFFFF, "08x")
